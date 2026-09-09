@@ -6,6 +6,8 @@ The initial runtime implements accepted work contracts, durable attempts, owned 
 
 Workflow code, skills, schemas, and operating documentation are released together. Consumers pin a release and full Git commit in `.devflow/workflow.lock`. Runtime records, credentials, machine bindings, and usage evidence stay outside this repository.
 
+The happy path stays short: capture or reuse one backlog issue, implement, run applicable checks and independent gates, then deliver. Immediate implementation still gets an issue; corrections reuse the same record. Git, GitHub CLI, uv, ccusage and native task tools perform their existing jobs. Python owns the durable work/evidence state and cross-tool consistency rules, including candidate changes and uncertain-action recovery.
+
 ## Try the package
 
 The development runtime requires Python 3.12+, Git, and uv on a local POSIX host. GitHub operations also use the authenticated GitHub CLI; usage collection uses npx. Native role tasks use the active owner's supported task tools and user-selected model settings.

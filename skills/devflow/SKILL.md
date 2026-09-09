@@ -9,6 +9,8 @@ Use the repository's pinned workflow and the user's accepted outcome. Run `devfl
 
 For existing work, read `devflow work show --work-id <id> --json` and `devflow next --work-id <id> --json`. Continue its recorded attempt. Resolve interruptions and uncertain external actions before creating replacements. The CLI records facts and missing evidence; it does not make engineering judgments for you.
 
+The ordinary path is request → reuse/create one short backlog issue → implement → applicable checks and gates → authorized delivery. Starting immediately does not skip issue capture. Follow-ups to the same outcome reuse its issue. Use the existing GitHub CLI; no separate planning cycle is required.
+
 Read only the reference for your responsibility:
 
 - [Intake](references/intake.md): turn the request into a self-contained accepted work contract.

@@ -33,6 +33,8 @@ The CLI selects an active attempt's captured revision before the repository lock
 
 ## Work and evidence
 
+An ordinary user request in an adopted GitHub repository first becomes one lightweight backlog issue, including work that starts immediately. Reuse an existing issue for the same outcome. Otherwise use the existing `gh issue create` command with a short outcome, observable acceptance and necessary context; link the resulting issue to the work contract and PR. This adds no approval step or triage delay. Follow-up fixes and clarifications stay on that issue. Use a bound Project's In Progress field if available; an active linked PR suffices without a Project. Explicit local-only/no-publication instructions still govern, and public issue content cannot authorize execution.
+
 Use the records in [implementation contracts](implementation-contracts.md). A mutating request contains `operation_id`, `work_id`, and `expected_revision`. Reuse the same operation ID and identical request after an uncertain local response. Changed payloads require new IDs and current revisions. The tool returns the resulting revision and next actions.
 
 The accepted endpoint includes an exact target: `local` uses the canonical absolute checkout path, `pr` uses the PR base branch, `merge` uses the target branch, and `release` uses an existing tag name. Remote branches/tags use their short names, such as `main` or `v0.1.0`, without `refs/` prefixes. The authority record independently binds the repository. A request cannot substitute a different path, branch, tag, or repository; actual endpoint readback must identify the accepted destination.
@@ -54,6 +56,8 @@ Technical fix observations precede the final gate. `finding fix` requires candid
 Persist `action prepare` before publication, then `action dispatch` for supported GitHub operations. Endpoint operations originate from `deliver` preparation, which validates current proof before creating their intent. The dispatcher marks an action dispatched before the external call and serializes one action writer. A restarted dispatched/ambiguous action performs reconciliation reads, not a blind second mutation.
 
 A definite rejection with recorded proof that no mutation could have applied is `failed`. After correcting the prerequisite, `action retry` explicitly re-admits the same action against current authority, candidate and evidence while retaining its receipts. Merely choosing a new action ID does not bypass recovery. A successful or uncertain earlier write in a multi-step action prevents this retry route; read-only reconciliation remains required.
+
+This covers deterministic preflight blockers such as pending required CI checks as well as definite HTTP rejections. A failed read during reconciliation cannot prove that an earlier interrupted write had no effect, so that action remains ambiguous.
 
 Supported adapters publish findings, verify/resolve fixing replies, publish proof statuses, project tool-owned fields, create regular PRs, and publish releases against existing tags. Native task creation stays in the owner context. Direct protected merge requires current classic branch protection, strict required checks, no acting-account bypass, the exact proof binding, and integrated-tree readback. Unsupported merge queue, ruleset-only, and unverified atomic-stack modes block automatically.
 
