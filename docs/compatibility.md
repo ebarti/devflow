@@ -1,0 +1,19 @@
+# Releases and compatibility
+
+One workflow release contains code, schemas, skill/role instructions, tests, and operating docs. Release tags describe versions; consuming repositories pin the full Git commit as well. Installation verifies the clean committed source archive, extracts a separate immutable release, and records a content manifest. Running releases verify their content before being selected.
+
+Change the workflow through a reviewed PR and applicable tests. A consumer upgrades through its own profile/lock PR. Active attempts retain their recorded package revision, profile and instruction hashes, and actual model segments. A workflow change is evaluated using the already-admitted policy, not the proposed weakened replacement.
+
+Version 0.1 uses persisted record/schema version 1. Unknown major/schema versions, unrelated SQLite files, or corrupt artifacts block mutation. Backups use a SQLite-consistent snapshot, including committed WAL data. Restore requires no active claim and preserves a safety snapshot. Future schema migrations must be transactional and tested against actual old fixtures before being shipped; no future-version migration is claimed today.
+
+The runtime targets local POSIX hosts with Python 3.12+, Git, GitHub CLI, uv, and npx. Native desktop tasks are operated by the active owner through its available tools. No model API credentials are introduced. The host bridge can be tested separately from GitHub and core-state behavior; a synthetic adapter test is not proof of desktop visibility.
+
+Automatic direct merge currently supports classic branch protection with strict required checks and enforce-admins, plus the required `devflow/verified` binding. Ruleset-only enforcement, merge queues, and atomic stacks remain blocked until their profile/backend conformance is implemented and proven. A verified PR can still be prepared for an explicitly authorized human delivery path; the tool does not mislabel that as an automatic merge.
+
+GitHub Project projection supports bound text, number, date, and single-select fields. Item/field inventory and readback are paginated. Other field types return an explicit unsupported-field result. The adapter never selects fields by display names or overwrites unrelated fields. Source issue text is retained: automated whole-body replacement is blocked because its API provides no documented atomic compare-and-swap for preserving concurrent edits.
+
+PR and release creation use correlation markers and reconciliation. Release publication requires a preexisting tag pointing to the expected commit, checked before and after. GitHub does not provide an atomic tag-still-exists precondition for release creation; a concurrent tag race can therefore become exposed-unverified and must be reconciled. Tag or asset uploads are not implicit operations of release publication.
+
+Managed installation changes only the separately approved paths and plan digest. Its journal supports interrupted apply/rollback recovery. Shared consumers, unexpected target edits, symlink escape, source changes, or manifest tampering block the operation. There is no global legacy-policy migration until its consumer inventory and repository adoption are explicitly prepared and approved.
+
+JobCtrl enrollment, its harness repairs, backlog/Project migration, protection changes, and stabilization are tracked separately from creating this reusable package. Creating the package does not imply those external state changes have happened.

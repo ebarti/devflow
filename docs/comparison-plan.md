@@ -57,4 +57,4 @@ Only a candidate selected for normal delivery is exposed to users; duplicate att
 
 Record work/scope IDs, workflow and model-policy versions, actual execution segments, candidate refs, gate evidence, and accounting versions from stabilization onward. Add experiment, case, pair and arm IDs only for the later comparison. Preserve each attempt's assigned arm and include its retries or rescue work; a fallback does not turn a failed challenger into a successful control run.
 
-Defects link to the affected candidate and introducing work, with separate introducing, detecting, missed-gate, and fixing provenance. This supports diagnosis without claiming that one model alone caused an individual bug. See the [metrics contract](/Users/eloibarti/Documents/Codex/2026-09-09/jobctrl-workflow-assessment/metrics-contract.md) for definitions and historical attribution.
+Defects link to the affected candidate and introducing work, with separate introducing, detecting, missed-gate, and fixing provenance. This supports diagnosis without claiming that one model alone caused an individual bug. See the [metrics contract](metrics-contract.md) for definitions and historical attribution.
