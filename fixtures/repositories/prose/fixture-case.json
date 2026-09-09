@@ -1,0 +1,7 @@
+{
+  "edit_path": "README.md",
+  "original_text": "Original local handoff.\n",
+  "accepted_text": "Reviewed local handoff.\n",
+  "recipe_id": "prose",
+  "output_marker": "PROSE_INVARIANT_OBSERVED"
+}

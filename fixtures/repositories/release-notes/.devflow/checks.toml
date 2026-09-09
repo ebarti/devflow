@@ -1,0 +1,6 @@
+schema_version = 1
+[checks.notes]
+kind = "static"
+description = "Changelog contains exactly the accepted heading and bullet; sentinel is preserved"
+scenarios = ["A01"]
+argv = ["sh", "scripts/check_notes.sh"]

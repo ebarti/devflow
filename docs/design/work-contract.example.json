@@ -61,6 +61,6 @@
   },
   "endpoint": {
     "kind": "pr",
-    "target": "synthetic-test-repository"
+    "target": "main"
   }
 }
