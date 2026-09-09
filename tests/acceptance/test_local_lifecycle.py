@@ -223,8 +223,9 @@ def test_real_candidate_change_blocks_prepared_local_delivery(tmp_path):
     git(scenario.root, "add", "README.md")
     git(scenario.root, "commit", "-qm", "docs: change candidate after preparation")
     dispatched = scenario.dispatch(action)
-    assert dispatched["status"] == "ambiguous"
+    assert dispatched["status"] == "failed"
     assert dispatched["observation"]["error_code"] == "candidate_drift"
+    assert dispatched["observation"]["no_mutation"] is True
     assert scenario.state["delivery_id"] is None
     assert scenario.state["lifecycle"] == "active"
     with pytest.raises(WorkflowError, match="confirmed prepared action"):

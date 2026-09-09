@@ -285,6 +285,9 @@ def test_definite_failed_action_can_be_explicitly_retried_with_receipts_retained
     failed = dispatch(s, action, remote)
     assert failed["status"] == "failed"
     assert remote.writes == []
+    with pytest.raises(WorkflowError, match="action retry"):
+        dispatch(s, action, remote)
+    assert len(s.state["actions"][action["action_id"]]["receipts"]) == 1
     s.call("action.retry", action_id=action["action_id"])
     completed = dispatch(s, action, remote)
     assert completed["status"] == "confirmed"
@@ -305,7 +308,7 @@ def test_earlier_uncertainty_forbids_retry_after_later_definite_read_failure(tmp
     assert dispatch(s, action, remote)["status"] == "ambiguous"
     with pytest.raises(WorkflowError):
         s.call("action.retry", action_id=action["action_id"])
-    assert dispatch(s, action, remote)["status"] == "failed"
-    with pytest.raises(WorkflowError, match="Every earlier result"):
+    assert dispatch(s, action, remote)["status"] == "ambiguous"
+    with pytest.raises(WorkflowError, match="Only a definitely failed"):
         s.call("action.retry", action_id=action["action_id"])
     assert remote.writes == []

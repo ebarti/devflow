@@ -114,6 +114,29 @@ def _endpoint_observation(state, kind, value, verified):
 
 
 def _perform(state, action, repository, *, github_factory, git_factory, reconcile):
+    remote_started = False
+    remote = None
+
+    def tracked_remote(*args):
+        nonlocal remote_started, remote
+        remote_started = True
+        remote = github_factory(*args)
+        return remote
+
+    try:
+        return _perform_operation(
+            state, action, repository, github_factory=tracked_remote,
+            git_factory=git_factory, reconcile=reconcile,
+        )
+    except WorkflowError as exc:
+        # Checkout checks precede remote construction. Once an adapter exists,
+        # only its complete operation history can establish that no write began.
+        if not remote_started or getattr(remote, "_mutation_may_have_applied", None) is False:
+            exc.details["no_mutation"] = True
+        raise
+
+
+def _perform_operation(state, action, repository, *, github_factory, git_factory, reconcile):
     operation, payload, refs = (
         action["operation"],
         action["payload"],
@@ -373,6 +396,10 @@ def dispatch_action(
             }
         if action["status"] == "invalidated":
             raise WorkflowError("stale_action", "Action was invalidated")
+        if action["status"] == "failed":
+            raise WorkflowError(
+                "retry_required", "Use action retry to re-admit a definitely failed action"
+            )
         if state["revision"] != request["expected_revision"]:
             raise WorkflowError("stale_revision", "Work changed before action dispatch")
         if action["payload"]["scope_hash"] != state["scope_hash"] or (
@@ -422,7 +449,9 @@ def dispatch_action(
                 "independent_readback": False,
                 "no_mutation": exc.details.get("no_mutation") is True,
             }
-            status = "failed" if observation["no_mutation"] else "ambiguous"
+            # A read-only reconciliation cannot establish that the earlier
+            # interrupted invocation did not write, even if this read did not.
+            status = "failed" if observation["no_mutation"] and not reconcile else "ambiguous"
             external_id = None
         receipt = {
             "schema_version": 1,
