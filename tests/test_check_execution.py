@@ -307,3 +307,31 @@ def test_concurrent_identical_requests_share_one_completed_execution(tmp_path):
         results = list(executor.map(invoke, [1, 2]))
     assert results[0] == results[1]
     assert counter.read_text().splitlines() == ["run"]
+
+
+def test_result_draft_flush_failure_preserves_previous_result(tmp_path, monkeypatch):
+    import devflow.check_execution as execution
+
+    previous = execution._write_draft(tmp_path, "synthetic", {"result": "retained"})
+
+    def fail(_):
+        raise OSError("synthetic result flush failure")
+
+    monkeypatch.setattr(execution, "flush_descriptor", fail)
+    with pytest.raises(OSError, match="result flush failure"):
+        execution._write_draft(tmp_path, "synthetic", {"result": "replacement"})
+    assert json.loads(previous.read_text()) == {"result": "retained"}
+    assert list(tmp_path.iterdir()) == [previous]
+
+
+def test_sigkill_after_result_draft_publication_leaves_recoverable_json(tmp_path):
+    code = '''
+import os, signal, sys
+from pathlib import Path
+from devflow.check_execution import _write_draft
+_write_draft(Path(sys.argv[1]), "synthetic", {"result": "retained"})
+os.kill(os.getpid(), signal.SIGKILL)
+'''
+    result = subprocess.run([sys.executable, "-c", code, str(tmp_path)], timeout=30)
+    assert result.returncode == -signal.SIGKILL
+    assert json.loads((tmp_path / "synthetic.result.json").read_text()) == {"result": "retained"}

@@ -287,3 +287,82 @@ def test_installed_revision_checks_metadata_and_full_content(source, tmp_path):
     skill.write_text("altered release")
     with pytest.raises(WorkflowError, match="does not match its marker"):
         installation.installed_release(root)
+
+
+def test_release_flush_failure_leaves_targets_and_prior_release_intact(source, tmp_path, monkeypatch):
+    import os
+    import stat
+    from pathlib import Path
+
+    first = apply_install(plan(source, tmp_path))
+    (source / "skills/devflow/SKILL.md").write_text("Synthetic second release\n")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "test: second release")
+    second = plan(source, tmp_path)
+    original = installation.flush_descriptor
+
+    def fail_file(fd):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("synthetic release file flush failure")
+        original(fd)
+
+    monkeypatch.setattr(installation, "flush_descriptor", fail_file)
+    with pytest.raises(OSError, match="release file flush failure"):
+        apply_install(second)
+    assert not Path(second["release_dir"]).exists()
+    assert (tmp_path / "host/skills/devflow").resolve() == Path(first["release_dir"]) / "skills/devflow"
+    assert (tmp_path / "host/skills/devflow/SKILL.md").read_text() == "Synthetic workflow\n"
+
+
+def test_sigkill_after_release_rename_can_resume_original_plan(source, tmp_path):
+    import json
+    import signal
+    import sys
+    from pathlib import Path
+
+    manifest = plan(source, tmp_path)
+    plan_path = tmp_path / "approved.json"
+    plan_path.write_text(json.dumps(manifest))
+    code = '''
+import json, os, signal, sys
+from pathlib import Path
+import devflow.installation as installation
+manifest=json.loads(Path(sys.argv[1]).read_text())
+rename=installation.os.rename
+def kill_after_rename(source, target):
+    rename(source, target)
+    os.kill(os.getpid(), signal.SIGKILL)
+installation.os.rename=kill_after_rename
+installation.apply_install(manifest, approved_paths=manifest['owned_paths'],
+    approved_root=manifest['install_root'], approved_plan_id=manifest['plan_id'])
+'''
+    result = subprocess.run([sys.executable, "-c", code, str(plan_path)], timeout=30)
+    assert result.returncode == -signal.SIGKILL
+    assert Path(manifest["release_dir"]).exists()
+    assert not (tmp_path / "host/skills/devflow").exists()
+    recovered = apply_install(manifest)
+    assert recovered["status"] == "applied"
+    assert (tmp_path / "host/skills/devflow/SKILL.md").read_text() == "Synthetic workflow\n"
+
+
+def test_release_directory_flush_failure_requires_successful_retry(source, tmp_path, monkeypatch):
+    from pathlib import Path
+
+    manifest = plan(source, tmp_path)
+    release = Path(manifest["release_dir"])
+    original = installation.flush_directory
+
+    def fail_publication(path):
+        if Path(path) == release.parent:
+            raise OSError("synthetic release namespace flush failure")
+        original(path)
+
+    monkeypatch.setattr(installation, "flush_directory", fail_publication)
+    for _ in range(2):
+        with pytest.raises(OSError, match="namespace flush failure"):
+            apply_install(manifest)
+        assert release.exists()
+        assert not (tmp_path / "host/skills/devflow").exists()
+    monkeypatch.setattr(installation, "flush_directory", original)
+    assert apply_install(manifest)["status"] == "applied"
+    assert (tmp_path / "host/skills/devflow/SKILL.md").read_text() == "Synthetic workflow\n"

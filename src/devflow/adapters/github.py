@@ -240,6 +240,49 @@ class GitHubRepository:
             if "pull_request" not in issue
         ]
 
+    def reconcile_backlog_issue(
+        self, capture_id: str, *, issue_number: int | None = None
+    ) -> dict | None:
+        """Find a capture by its stable marker, including closed issues, without search indexing."""
+        marker = f"<!-- devflow-backlog:{_identifier(capture_id)} -->"
+        matches = (
+            [self.issue(issue_number)]
+            if issue_number is not None
+            else [issue for issue in self.issues() if marker in (issue.get("body") or "")]
+        )
+        if len(matches) > 1:
+            raise WorkflowError("duplicate_backlog", "More than one issue has this capture marker")
+        if not matches:
+            return None
+        issue = matches[0]
+        expected_root = f"https://api.github.com/{self.root}"
+        if (
+            "pull_request" in issue
+            or issue.get("repository_url", "").lower() != expected_root.lower()
+            or type(issue.get("number")) is not int
+            or not issue.get("node_id")
+            or (issue_number is not None and issue["number"] != issue_number)
+        ):
+            raise WorkflowError("backlog_identity", "Readback is not an issue in the bound repository")
+        return {
+            "node_id": issue["node_id"],
+            "number": issue["number"],
+            "url": issue["html_url"],
+            "repository": f"github:{self.owner}/{self.name}",
+        }
+
+    def create_backlog_issue(self, capture_id: str, *, title: str, body: str) -> dict:
+        """One gh-backed write; caller must have durably admitted it and must reconcile on loss."""
+        marker = f"<!-- devflow-backlog:{_identifier(capture_id)} -->"
+        self._api(
+            f"{self.root}/issues", method="POST",
+            payload={"title": title, "body": f"{body.rstrip()}\n\n{marker}"},
+        )
+        result = self.reconcile_backlog_issue(capture_id)
+        if result is None:
+            raise WorkflowError("ambiguous_backlog", "Created issue is not yet observable; reconcile")
+        return result
+
     def dependencies(self, number: int) -> list[dict]:
         return self._pages(f"{self.root}/issues/{int(number)}/dependencies/blocked_by")
 

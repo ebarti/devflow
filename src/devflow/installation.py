@@ -20,6 +20,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from devflow.durability import flush_descriptor, flush_directory
 from devflow.errors import WorkflowError
 
 
@@ -217,8 +218,14 @@ def _open_directory(path):
                 os.mkdir(part, mode=0o700, dir_fd=descriptor)
                 child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                 dir_fd=descriptor)
+            try:
+                flush_descriptor(descriptor)
+            except BaseException:
+                os.close(child)
+                raise
             os.close(descriptor)
             descriptor = child
+        flush_descriptor(descriptor)
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -239,7 +246,7 @@ def _write_entry(path, state):
             if stat.S_ISDIR(metadata.st_mode):
                 raise WorkflowError("install_collision", "Refusing to remove user directory")
             os.unlink(path.name, dir_fd=directory)
-            os.fsync(directory)
+            flush_descriptor(directory)
             return
         if state["kind"] == "symlink":
             os.symlink(state["target"], temporary, dir_fd=directory)
@@ -249,10 +256,10 @@ def _write_entry(path, state):
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(base64.b64decode(state["content"]))
                 stream.flush()
-                os.fsync(stream.fileno())
                 os.fchmod(stream.fileno(), state["mode"])
+                flush_descriptor(stream.fileno())
         os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
-        os.fsync(directory)
+        flush_descriptor(directory)
     finally:
         try:
             os.unlink(temporary, dir_fd=directory)
@@ -353,6 +360,7 @@ def _transition(manifest, direction):
     for index in order:
         positions = _positions(current)
         if positions[index] in {desired, "both"}:
+            os.close(_open_directory(Path(current["operations"][index]["path"]).parent))
             continue
         current["journal"] = {"direction": direction, "positions": positions,
                               "pending_index": index}
@@ -381,8 +389,9 @@ def _install_release(manifest):
         metadata = installed_release(release)
         if metadata["tree"] != manifest["tree"]:
             raise WorkflowError("install_release", "Installed tree differs from approved source")
+        flush_directory(release.parent)
         return
-    release.parent.mkdir(parents=True, exist_ok=True)
+    os.close(_open_directory(release.parent))
     temporary = Path(tempfile.mkdtemp(prefix=".release-", dir=release.parent))
     try:
         with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
@@ -395,7 +404,16 @@ def _install_release(manifest):
             if path.is_file():
                 executable = contents.get(str(path.relative_to(temporary)), {}).get("executable")
                 path.chmod(0o555 if executable else 0o444)
+        for path in temporary.rglob("*"):
+            if path.is_file():
+                with path.open("rb") as stream:
+                    flush_descriptor(stream.fileno())
+        for path in sorted((p for p in temporary.rglob("*") if p.is_dir()),
+                           key=lambda p: len(p.parts), reverse=True):
+            flush_directory(path)
+        flush_directory(temporary)
         os.rename(temporary, release)
+        flush_directory(release.parent)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
@@ -449,6 +467,9 @@ def apply_install(manifest, *, approved_paths, approved_root, approved_plan_id):
     if saved["status"] == "applied":
         if any(position not in {"after", "both"} for position in _positions(saved)):
             raise WorkflowError("install_conflict", "Applied target changed")
+        for operation in saved["operations"]:
+            os.close(_open_directory(Path(operation["path"]).parent))
+        _persist(saved)
         return saved
     try:
         return _transition(saved, "apply")
@@ -471,6 +492,9 @@ def rollback_install(manifest, *, approved_paths, approved_root, approved_plan_i
     if saved["status"] == "rolled_back":
         if any(position not in {"before", "both"} for position in _positions(saved)):
             raise WorkflowError("install_conflict", "Rolled-back target changed")
+        for operation in saved["operations"]:
+            os.close(_open_directory(Path(operation["path"]).parent))
+        _persist(saved)
         return saved
     return _transition(saved, "rollback")
 

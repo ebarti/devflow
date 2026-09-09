@@ -6,13 +6,15 @@ Design revision: 2026-09-09. These are proposed interfaces, not installed comman
 
 ## 1. Package and repository interfaces
 
-The reusable package exposes a CLI with JSON input/output and readable output by default. Mutating commands accept `--request-file` for structured input; avoid interpolating issue text, paths or comment bodies into shell commands. Each request contains an `operation_id`, `work_id` and `expected_revision`. Success returns the new revision, durable IDs, pending external actions and observed receipts. An identical operation ID with identical payload returns the recorded result; reuse with a different payload is an error.
+The reusable package exposes a CLI with JSON input/output and readable output by default. Mutating commands accept `--request-file` for structured input; avoid interpolating issue text, paths or comment bodies into shell commands. Attempt mutations contain an `operation_id`, `work_id` and `expected_revision`. Pre-attempt backlog capture instead uses the stable work ID plus its initial issue request; the tool fills its append-only sequence. Success returns the new revision, durable IDs, pending external actions and observed receipts. An identical operation ID with identical payload returns the recorded result; reuse with a different payload is an error.
 
 The initial commands are:
 
 | Command | Required input | Result / state effect |
 | --- | --- | --- |
 | `devflow doctor` | Repository path, installed package and host capability report | Checks tool versions, profile, bindings, private store, permissions and required capabilities; no mutations |
+| `devflow backlog capture/show/list/retry` | Stable work ID; first capture also needs existing issue number or sanitized title/body | Journals before gh creation; discovers saved requests; reconciles uncertainty; explicit retry only after proven non-mutation |
+| `devflow work list` | Repository | Discovers recorded work IDs and lifecycle without the previous conversation |
 | `devflow work prepare` | Issue/local intake reference | Normalizes the request; reports missing Ready fields; no invented requirements |
 | `devflow work ready` | Accepted contract, source revision and recorded user/queue authority | Stores immutable scope, verifies prerequisites and marks Ready |
 | `devflow work start` | Ready work ID, host/current task ID, expected revision | Claims one attempt, captures effective policy/configuration and schedules workspace/task actions |
@@ -141,7 +143,9 @@ Issue/Project synchronization updates only the tool-owned summary and derived fi
 
 Proposed private root: `~/.local/state/devflow/`. The store contains `state.sqlite3`, `evidence/<sha256>`, `policy/<sha256>`, `backups/` and `install-manifests/`. User bindings/model preferences live under `~/.config/devflow/`. Repositories contain no generated execution ledger or session data. Files are owner-readable/writable; paths are resolved and checked against the enrolled roots.
 
-SQLite uses transactional writes, foreign keys and an active-attempt uniqueness constraint. The audit trail records old/new revision and event identity. Outbox actions and local transitions commit together. Evidence files are installed atomically by digest before references become committed. Startup reports missing/corrupt evidence instead of silently treating it as a successful check.
+SQLite uses transactional writes, explicit EXTRA/fullfsync durability, foreign keys and an active-attempt uniqueness constraint. The audit trail records old/new revision and event identity. Outbox actions and local transitions commit together. Evidence bytes and directory entries are flushed before references become committed. Installer releases/journals and check drafts use the same flush-before-acknowledgment boundary; snapshots validate before durable publication. Startup reports missing/corrupt evidence instead of silently treating it as a successful check. Crash tests cover actual process death and injected storage failures, not a physical power cut or failed storage hardware.
+
+Backlog capture is a pre-attempt outbox: a schema-versioned private operation fact retains the stable repository/work identity, initial sanitized payload/hash, monotonic sequence, prepared/dispatched/ambiguous/failed/confirmed state and observed issue identity. Facts append to the existing operation table; no shared-store schema upgrade strands an older pinned attempt. Dispatch commits before calling gh. Confirmed capture replays; interrupted capture reconciles the exact marker across all issue pages. A later failed read cannot erase historical mutation uncertainty. Capture never derives publication authority from issue content.
 
 No automatic deletion of worktrees, evidence or historical records is part of the reset. Owned temporary fixtures may be removed after their cleanup token and real path are independently verified. Maintenance can later propose a retention policy with an explicit deletion scope. Installer rollback restores managed configuration; it does not erase user work or GitHub history.
 

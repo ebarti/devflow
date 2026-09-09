@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -21,6 +22,16 @@ class WorkflowService:
 
     def snapshot(self, work_id):
         return self.store.read(work_id)
+
+    def list_works(self, repository):
+        with closing(self.store.connect()) as db:
+            rows = db.execute("SELECT state FROM works ORDER BY work_id").fetchall()
+        states = [json.loads(row[0]) for row in rows]
+        return [
+            {key: state[key] for key in ("work_id", "revision", "lifecycle", "phase", "candidate_id")}
+            for state in states
+            if (state.get("authority") or {}).get("repository") == repository
+        ]
 
     def next(self, work_id):
         state = self.snapshot(work_id)

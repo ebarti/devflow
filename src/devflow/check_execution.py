@@ -12,6 +12,7 @@ from uuid import uuid4
 from devflow.adapters.git import GitRepository
 from devflow.checks import run_check
 from devflow.domain.rules import input_signature
+from devflow.durability import durable_directory, flush_descriptor, flush_directory
 from devflow.errors import WorkflowError
 from devflow.profiles import assert_admitted_profile
 from devflow.validation import canonical_json, digest
@@ -21,8 +22,9 @@ def _private_directory(root, name):
     path = root / name
     if path.is_symlink():
         raise WorkflowError("unsafe_state", "Check execution directories cannot be symlinks")
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    durable_directory(path)
     os.chmod(path, 0o700)
+    flush_directory(path)
     return path
 
 
@@ -58,11 +60,11 @@ def _write_draft(directory, key, draft):
         with os.fdopen(descriptor, "w") as stream:
             stream.write(canonical_json(draft))
             stream.flush()
-            os.fsync(stream.fileno())
+            flush_descriptor(stream.fileno())
         os.replace(temporary, destination)
         directory_fd = os.open(directory, os.O_RDONLY)
         try:
-            os.fsync(directory_fd)
+            flush_descriptor(directory_fd)
         finally:
             os.close(directory_fd)
     finally:

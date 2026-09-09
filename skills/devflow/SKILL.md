@@ -7,9 +7,9 @@ description: Implement, review, verify, and deliver work in repositories enrolle
 
 Use the repository's pinned workflow and the user's accepted outcome. Run `devflow doctor --repository <checkout> --json` first. A missing profile does not authorize enrollment; follow the repository's existing workflow until adoption is authorized. An installed version mismatch requires selecting the pinned release, not updating the lock to match the current tool.
 
-For existing work, read `devflow work show --work-id <id> --json` and `devflow next --work-id <id> --json`. Continue its recorded attempt. Resolve interruptions and uncertain external actions before creating replacements. The CLI records facts and missing evidence; it does not make engineering judgments for you.
+For existing work, use `devflow backlog list --json` and `devflow work list --json` to recover IDs when needed, then read `devflow work show --work-id <id> --json` and `devflow next --work-id <id> --json`. Continue its recorded attempt. Resolve interruptions and uncertain external actions before creating replacements. The CLI records facts and missing evidence; it does not make engineering judgments for you.
 
-The ordinary path is request → reuse/create one short backlog issue → implement → applicable checks and gates → authorized delivery. Starting immediately does not skip issue capture. Follow-ups to the same outcome reuse its issue. Use the existing GitHub CLI; no separate planning cycle is required.
+The ordinary path is request → reuse/create one short backlog issue → implement → applicable checks and gates → authorized delivery. Starting immediately does not skip issue capture. Follow-ups reuse its issue. Use `devflow backlog capture`, which journals the request around the existing GitHub CLI; no separate planning cycle is required. After interruption, rerun with the saved work ID; an uncertain creation gets readback before any replacement.
 
 Read only the reference for your responsibility:
 

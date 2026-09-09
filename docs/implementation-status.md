@@ -6,7 +6,7 @@ This page records the reusable package boundary as of 2026-09-09. The [implement
 
 | Surface | Implementation and evidence | Remaining deployment proof |
 | --- | --- | --- |
-| Work/state contracts | JSON Schema validation, pure transition rules, immutable records, optimistic revisions, SQLite claims, backup/restore; contract, race and recovery tests | Real adopter work must meet its accepted endpoint |
+| Work/state contracts | JSON Schema validation, pure transition rules, immutable records, optimistic revisions, SQLite claims, flushed backup/restore, pre-attempt issue capture journal and work discovery; contract, race, SIGKILL and storage-failure tests | Real adopter work must meet its accepted endpoint; physical power-cut and failed-device recovery are not claimed |
 | Git ownership and checks | Stable repository identity, dedicated clean checkout registration, candidate snapshots, process-group timeout, fresh JUnit evidence, durable execution admission, replay without rerun; temporary Git, real subprocess, concurrent request and SIGKILL tests | Product-specific recipes and actual product scenarios belong to each adopter |
 | Native host bridge | Structured assignments, pending/final task IDs, correlation markers, result identity and cursor-aware wait inputs; adapter tests | Actual visible owner/review/QA task canary requires native launch authorization; no desktop visibility claim from fixtures |
 | Findings and delivery | Candidate-bound independent results, technical fix verification before final gates, mandatory due publication/closure, PR/release/status/Project adapters and readback | Live endpoint canaries and permission/protection conformance remain separately observable gates |

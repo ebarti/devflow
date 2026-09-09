@@ -34,7 +34,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--version", action="version", version=__version__)
     result.add_argument(
         "command",
-        help="doctor, work, next, candidate, check, gate, finding, "
+        help="doctor, backlog, work, next, candidate, check, gate, finding, "
         "fix, action, assignment, host, artifact, profile, usage, outcome, "
         "report, install, validate, or deliver",
     )
@@ -286,6 +286,15 @@ def dispatch(args) -> dict:
 
         return quality_report(request["works"], cutoff=request["cutoff"])
     service = _service(args)
+    if args.command == "backlog":
+        from devflow.adapters.git import GitRepository
+        from devflow.backlog import capture
+        from devflow.profiles import load_profile
+
+        repository = load_profile(args.repository).repository["repository"]["id"]
+        if GitRepository(args.repository).identity() != repository:
+            raise WorkflowError("repository_mismatch", "Checkout differs from the backlog repository")
+        return capture(service.store, repository, request, action=args.action)
     if command == "work.start":
         from devflow.provenance import validate_start_snapshot
 
@@ -294,6 +303,11 @@ def dispatch(args) -> dict:
         )
     if command == "work.show":
         return _state(service, request, args)
+    if command == "work.list":
+        from devflow.profiles import load_profile
+
+        repository = load_profile(args.repository).repository["repository"]["id"]
+        return {"works": service.list_works(repository)}
     if command == "next":
         return service.next(request["work_id"])
     if command == "artifact.put":

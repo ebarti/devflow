@@ -11,6 +11,7 @@ from contextlib import closing, contextmanager
 from decimal import Decimal
 from pathlib import Path
 
+from devflow.durability import durable_directory, flush_descriptor, flush_directory
 from devflow.errors import WorkflowError
 from devflow.validation import canonical_json
 
@@ -23,10 +24,11 @@ class SQLiteStore:
         for path in (self.root, self.root / "artifacts", self.root / "backups"):
             if path.is_symlink():
                 raise WorkflowError("unsafe_state", "State directories must not be symlinks")
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            durable_directory(path)
             if path.stat().st_uid != os.getuid():
                 raise WorkflowError("unsafe_state", "State directory is not owned by current user")
             os.chmod(path, 0o700)
+            flush_directory(path)
         self.path = self.root / "state.sqlite3"
         if self.path.is_symlink():
             raise WorkflowError("unsafe_state", "Database must not be a symlink")
@@ -43,13 +45,24 @@ class SQLiteStore:
             )
         os.chmod(self.path, 0o600)
         self.migrate()
+        flush_directory(self.root)
 
     def connect(self):
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        connection.row_factory = sqlite3.Row
+        try:
+            self._configure(connection)
+            connection.row_factory = sqlite3.Row
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    @staticmethod
+    def _configure(connection):
+        connection.execute("PRAGMA synchronous=EXTRA")
+        connection.execute("PRAGMA fullfsync=ON")
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
-        return connection
 
     def migrate(self):
         with closing(self.connect()) as db:
@@ -146,14 +159,14 @@ class SQLiteStore:
             with os.fdopen(fd, "wb") as stream:
                 stream.write(content)
                 stream.flush()
-                os.fsync(stream.fileno())
+                flush_descriptor(stream.fileno())
             try:
                 os.link(temporary, path)
             except FileExistsError:
                 self.require_artifact(key)
             directory_fd = os.open(path.parent, os.O_RDONLY)
             try:
-                os.fsync(directory_fd)
+                flush_descriptor(directory_fd)
             finally:
                 os.close(directory_fd)
         finally:
@@ -182,12 +195,24 @@ class SQLiteStore:
 
     def backup(self):
         path = self.root / "backups" / f"state-{uuid.uuid4().hex}.sqlite3"
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        with closing(self.connect()) as source, closing(sqlite3.connect(path)) as target:
-            source.backup(target)
-            if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                raise WorkflowError("backup_failed", "Backup integrity check failed")
+        temporary = path.with_suffix(".pending")
+        try:
+            fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            os.close(fd)
+            with closing(self.connect()) as source, closing(sqlite3.connect(temporary)) as target:
+                self._configure(target)
+                source.backup(target)
+                if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise WorkflowError("backup_failed", "Backup integrity check failed")
+            fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                flush_descriptor(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, path)
+            flush_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
         return path
 
     def restore(self, backup_path: Path):
@@ -209,6 +234,19 @@ class SQLiteStore:
                     raise WorkflowError(
                         "active_restore",
                         "Cannot replace a store while an attempt owns an active claim",
+                    )
+                captures = {}
+                for row in current.execute(
+                    "SELECT result FROM operations WHERE operation_id LIKE 'backlog:%' "
+                    "ORDER BY operation_id"
+                ):
+                    state = json.loads(row[0])
+                    if state.get("kind") == "backlog_capture":
+                        captures[(state["repository"], state["work_id"])] = state
+                if any(state["status"] in {"dispatched", "ambiguous"}
+                       for state in captures.values()):
+                    raise WorkflowError(
+                        "active_restore", "Reconcile uncertain backlog writes before restoring state"
                     )
             self.backup()
             with closing(self.connect()) as target:
