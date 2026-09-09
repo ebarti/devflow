@@ -1,0 +1,156 @@
+{
+  "version": 2,
+  "title": "Development workflow architecture",
+  "diagrams": [
+    {
+      "id": "components",
+      "title": "Responsibilities and integrations",
+      "kind": "flowchart",
+      "data": {
+        "direction": "LR",
+        "nodes": [
+          {
+            "id": "issues",
+            "label": "GitHub issues and dependencies"
+          },
+          {
+            "id": "owner",
+            "label": "Visible owner task"
+          },
+          {
+            "id": "roles",
+            "label": "Visible review and QA tasks"
+          },
+          {
+            "id": "engine",
+            "label": "devflow state and evidence tool"
+          },
+          {
+            "id": "store",
+            "label": "Private execution and usage records"
+          },
+          {
+            "id": "checks",
+            "label": "Existing checks and product QA"
+          },
+          {
+            "id": "github",
+            "label": "PR findings, CI and delivery"
+          },
+          {
+            "id": "usage",
+            "label": "ccusage and response records"
+          }
+        ],
+        "edges": [
+          {
+            "from": "issues",
+            "to": "owner",
+            "label": "Accepted work"
+          },
+          {
+            "from": "owner",
+            "to": "roles",
+            "label": "Native task tools"
+          },
+          {
+            "from": "owner",
+            "to": "engine",
+            "label": "Commands and receipts"
+          },
+          {
+            "from": "roles",
+            "to": "engine",
+            "label": "Gates and findings"
+          },
+          {
+            "from": "engine",
+            "to": "store",
+            "label": "State and provenance"
+          },
+          {
+            "from": "engine",
+            "to": "checks",
+            "label": "Selected recipes"
+          },
+          {
+            "from": "engine",
+            "to": "github",
+            "label": "Publish, verify, deliver"
+          },
+          {
+            "from": "usage",
+            "to": "engine",
+            "label": "Deterministic accounting"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lifecycle",
+      "title": "Work lifecycle and repair",
+      "kind": "flowchart",
+      "data": {
+        "direction": "LR",
+        "nodes": [
+          {
+            "id": "backlog",
+            "label": "Backlog"
+          },
+          {
+            "id": "ready",
+            "label": "Ready with accepted contract"
+          },
+          {
+            "id": "implement",
+            "label": "Implement"
+          },
+          {
+            "id": "verify",
+            "label": "Independent verification"
+          },
+          {
+            "id": "deliver",
+            "label": "Deliver"
+          },
+          {
+            "id": "done",
+            "label": "Done with endpoint readback"
+          }
+        ],
+        "edges": [
+          {
+            "from": "backlog",
+            "to": "ready",
+            "label": "Prepare and authorize"
+          },
+          {
+            "from": "ready",
+            "to": "implement",
+            "label": "Claim one owner"
+          },
+          {
+            "from": "implement",
+            "to": "verify",
+            "label": "Freeze candidate and evidence"
+          },
+          {
+            "from": "verify",
+            "to": "implement",
+            "label": "Repair failed acceptance"
+          },
+          {
+            "from": "verify",
+            "to": "deliver",
+            "label": "Gates and finding obligations complete"
+          },
+          {
+            "from": "deliver",
+            "to": "done",
+            "label": "Confirm actual endpoint"
+          }
+        ]
+      }
+    }
+  ]
+}

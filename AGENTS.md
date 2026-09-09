@@ -1,0 +1,11 @@
+# Developer Workflow contributor instructions
+
+Read `docs/architecture.md` and the relevant contract in `docs/implementation-contracts.md` before changing behavior. `docs/implementation-plan.md` defines acceptance; do not silently narrow it.
+
+Work on a task branch, preserve unrelated changes, and use Conventional Commits. Keep executable rules, skill instructions, schemas, and operating docs consistent. Reuse standard Git, GitHub, and native host capabilities. Do not introduce hidden model calls for deterministic work.
+
+Run focused regression tests for changed invariants and `git diff --check`. User-facing and high-risk paths require independent review and QA with no unresolved Blocker/High findings. Delegate bounded independent work when useful; preserve shared edits. Use the user's model settings and explicit session overrides.
+
+Publish confirmed code findings as PR review comments within authorized publication scope; fix, verify, reply, resolve, and independently read back each fixed thread. Do not silently discard earlier findings.
+
+Do not commit credentials, execution databases, logs, user artifacts, or machine bindings. Synthetic fixtures must be clearly synthetic. Install or enroll only within the user's authorized scope; always prepare a concrete manifest. Product repos retain their own profiles and safeguards.

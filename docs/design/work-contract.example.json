@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "record_type": "work_contract",
+  "work_id": "W-example",
+  "scope_revision": 1,
+  "source": {
+    "kind": "local_intake",
+    "reference": "synthetic-fixture",
+    "stable_id": "fixture-001"
+  },
+  "kind": "bug",
+  "title": "Preserve unrelated directories during E2E cleanup",
+  "outcome": "Cleanup removes only the workspace allocated to its own test attempt.",
+  "acceptance": [
+    {
+      "id": "AC-1",
+      "expected": "An unrelated sentinel directory and its contents survive an invalid cleanup request.",
+      "invariant": "Cleanup requires valid ownership before any recursive deletion."
+    },
+    {
+      "id": "AC-2",
+      "expected": "Ordinary, isolated and screenshot test modes use the same ownership boundary.",
+      "invariant": "An optional execution flag cannot disable ownership validation."
+    }
+  ],
+  "scope": {
+    "paths": [
+      "apps/web/e2e/fixtures",
+      "scripts/docs-screenshot-environment.mjs"
+    ],
+    "boundaries": [
+      "Use synthetic temporary data only.",
+      "Preserve existing screenshot behavior."
+    ]
+  },
+  "context": [
+    {
+      "summary": "Current source conditionally checks isolation before cleanup; reproduce without touching user data.",
+      "reference": "synthetic source fixture for W05"
+    }
+  ],
+  "dependencies": [],
+  "risk": {
+    "tier": 3,
+    "reason": "Destructive filesystem cleanup in a test harness."
+  },
+  "verification": {
+    "recipes": [
+      "harness-ownership",
+      "web-e2e-owned-workspace"
+    ],
+    "scenarios": [
+      "foreign-directory-sentinel",
+      "symlink-escape",
+      "forged-workspace-state",
+      "all-execution-modes"
+    ],
+    "documentation_owners": [
+      "docs/local-reliability-qa.md"
+    ]
+  },
+  "endpoint": {
+    "kind": "pr",
+    "target": "synthetic-test-repository"
+  }
+}

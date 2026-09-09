@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "record_type": "action_receipt",
+  "action_id": "A-resolve-001",
+  "attempt_id": "AT-001",
+  "operation": "resolve_thread",
+  "payload_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+  "expected_revision": 7,
+  "status": "confirmed",
+  "external_id": "synthetic-review-thread",
+  "observations": [
+    "Synthetic example of a separate readback reporting isResolved=true."
+  ],
+  "recorded_at": "2026-09-09T18:01:00Z"
+}

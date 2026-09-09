@@ -1,0 +1,2006 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devflow:contracts:v1",
+  "title": "Proposed devflow persisted and exchanged records v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/WorkContract"
+    },
+    {
+      "$ref": "#/$defs/Authority"
+    },
+    {
+      "$ref": "#/$defs/Attempt"
+    },
+    {
+      "$ref": "#/$defs/Candidate"
+    },
+    {
+      "$ref": "#/$defs/Assignment"
+    },
+    {
+      "$ref": "#/$defs/CheckEvidence"
+    },
+    {
+      "$ref": "#/$defs/GateResult"
+    },
+    {
+      "$ref": "#/$defs/Finding"
+    },
+    {
+      "$ref": "#/$defs/ActionReceipt"
+    },
+    {
+      "$ref": "#/$defs/Delivery"
+    },
+    {
+      "$ref": "#/$defs/ExecutionSegment"
+    },
+    {
+      "$ref": "#/$defs/Usage"
+    },
+    {
+      "$ref": "#/$defs/WorkflowSnapshot"
+    },
+    {
+      "$ref": "#/$defs/ObservationEvidence"
+    },
+    {
+      "$ref": "#/$defs/FixVerification"
+    }
+  ],
+  "$defs": {
+    "Acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "expected": {
+          "type": "string",
+          "minLength": 1
+        },
+        "invariant": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "id",
+        "expected",
+        "invariant"
+      ]
+    },
+    "Context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reference": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "summary",
+        "reference"
+      ]
+    },
+    "Endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "local",
+            "pr",
+            "merge",
+            "release"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "kind",
+        "target"
+      ]
+    },
+    "WorkContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "work_contract"
+        },
+        "work_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "scope_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "github_issue",
+                "local_intake"
+              ]
+            },
+            "reference": {
+              "type": "string",
+              "minLength": 1
+            },
+            "stable_id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind",
+            "reference",
+            "stable_id"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "feature",
+            "bug",
+            "investigation",
+            "operation",
+            "editorial"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "type": "string",
+          "minLength": 1
+        },
+        "acceptance": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Acceptance"
+          },
+          "minItems": 1
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "paths": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 0
+            },
+            "boundaries": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 0
+            }
+          },
+          "required": [
+            "paths",
+            "boundaries"
+          ]
+        },
+        "context": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Context"
+          },
+          "minItems": 1
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0
+        },
+        "risk": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tier": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "tier",
+            "reason"
+          ]
+        },
+        "verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "recipes": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            "scenarios": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 0
+            },
+            "documentation_owners": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 0
+            }
+          },
+          "required": [
+            "recipes",
+            "scenarios",
+            "documentation_owners"
+          ]
+        },
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint"
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "work_id",
+        "scope_revision",
+        "source",
+        "kind",
+        "title",
+        "outcome",
+        "acceptance",
+        "scope",
+        "context",
+        "dependencies",
+        "risk",
+        "verification",
+        "endpoint"
+      ]
+    },
+    "Authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "authority"
+        },
+        "authority_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "source_kind": {
+          "enum": [
+            "user_instruction",
+            "adopted_queue_policy"
+          ]
+        },
+        "source_reference": {
+          "type": "string",
+          "minLength": 1
+        },
+        "work_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "scope_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allowed_operations": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "create_tasks",
+              "edit",
+              "check",
+              "publish_pr",
+              "publish_findings",
+              "push",
+              "merge",
+              "release",
+              "publish_status"
+            ]
+          }
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revoked": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "authority_id",
+        "source_kind",
+        "source_reference",
+        "work_id",
+        "scope_hash",
+        "repository",
+        "allowed_operations",
+        "expires_at",
+        "revoked"
+      ]
+    },
+    "Attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "attempt"
+        },
+        "attempt_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "work_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "scope_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "authority_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "host_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "owner_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "phase": {
+          "enum": [
+            "implement",
+            "verify",
+            "deliver"
+          ]
+        },
+        "blocker": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "next_action": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "code",
+                "reason",
+                "next_action"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workflow_snapshot_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "model_policy_snapshot_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "enum": [
+            "active",
+            "done",
+            "canceled",
+            "failed"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "attempt_id",
+        "work_id",
+        "scope_hash",
+        "authority_id",
+        "host_id",
+        "owner_task_id",
+        "phase",
+        "blocker",
+        "workflow_snapshot_id",
+        "model_policy_snapshot_id",
+        "revision",
+        "started_at",
+        "status"
+      ]
+    },
+    "Candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "candidate"
+        },
+        "candidate_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "attempt_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "scope_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "base_sha": {
+          "type": "string",
+          "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+        },
+        "head_sha": {
+          "type": "string",
+          "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+        },
+        "tree_sha": {
+          "type": "string",
+          "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+        },
+        "clean": {
+          "const": true
+        },
+        "dependency_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "environment_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "candidate_id",
+        "attempt_id",
+        "scope_hash",
+        "repository",
+        "base_sha",
+        "head_sha",
+        "tree_sha",
+        "clean",
+        "dependency_hash",
+        "environment_hash",
+        "created_at"
+      ]
+    },
+    "Assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "assignment"
+        },
+        "assignment_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "action_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "attempt_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "role": {
+          "enum": [
+            "owner",
+            "implementation_worker",
+            "review",
+            "qa"
+          ]
+        },
+        "owner_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "client_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "candidate_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "owned_paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0
+        },
+        "workspace_reference": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "prepared",
+            "pending_setup",
+            "running",
+            "completed",
+            "blocked"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "assignment_id",
+        "action_id",
+        "attempt_id",
+        "role",
+        "owner_task_id",
+        "task_id",
+        "client_id",
+        "candidate_id",
+        "owned_paths",
+        "workspace_reference",
+        "status"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "running",
+                  "completed"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "task_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CheckEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "check_evidence"
+        },
+        "evidence_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "candidate_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "input_signature": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "recipe_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "recipe_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "acceptance_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 0
+        },
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "environment_profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "process_status": {
+          "enum": [
+            "success",
+            "failure",
+            "not_started",
+            "interrupted"
+          ]
+        },
+        "execution_status": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "BLOCKED",
+            "SKIPPED"
+          ]
+        },
+        "executed_assertions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped_assertions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0
+        },
+        "artifact_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "evidence_id",
+        "candidate_id",
+        "input_signature",
+        "recipe_id",
+        "recipe_version",
+        "acceptance_ids",
+        "argv",
+        "cwd",
+        "environment_profile",
+        "started_at",
+        "ended_at",
+        "process_status",
+        "execution_status",
+        "executed_assertions",
+        "skipped_assertions",
+        "observations",
+        "artifact_hash"
+      ]
+    },
+    "GateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "gate_result"
+        },
+        "gate_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "assignment_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "producer_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "enum": [
+            "review",
+            "qa"
+          ]
+        },
+        "candidate_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "scope_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "workflow_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "status": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "BLOCKED"
+          ]
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 1
+        },
+        "finding_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 0
+        },
+        "blocking_finding_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 0
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "fix_verification_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 0
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "gate_id",
+        "assignment_id",
+        "producer_task_id",
+        "role",
+        "candidate_id",
+        "scope_hash",
+        "workflow_hash",
+        "status",
+        "evidence_ids",
+        "finding_ids",
+        "blocking_finding_ids",
+        "limitations",
+        "completed_at",
+        "fix_verification_ids"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "PASS"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "blocking_finding_ids": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "finding"
+        },
+        "finding_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "work_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "candidate_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "invariant_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "severity": {
+          "enum": [
+            "blocker",
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 1
+        },
+        "detector": {
+          "enum": [
+            "user",
+            "owner",
+            "review",
+            "qa",
+            "ci",
+            "monitor"
+          ]
+        },
+        "detected_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "disposition": {
+          "enum": [
+            "open",
+            "fix_pending",
+            "verified_fixed",
+            "deferred",
+            "duplicate",
+            "not_a_defect"
+          ]
+        },
+        "publication": {
+          "enum": [
+            "pending_pr",
+            "due",
+            "published",
+            "blocked_anchor"
+          ]
+        },
+        "pr_reference": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "comment_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "fix_reference": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "fix_evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 0
+        },
+        "resolution_readback": {
+          "type": "boolean"
+        },
+        "related_work_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "fix_verification_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 0
+        },
+        "closure": {
+          "enum": [
+            "not_due",
+            "pending",
+            "resolved",
+            "reopened",
+            "blocked"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "finding_id",
+        "work_id",
+        "candidate_id",
+        "invariant_id",
+        "severity",
+        "summary",
+        "evidence_ids",
+        "detector",
+        "detected_at",
+        "disposition",
+        "publication",
+        "pr_reference",
+        "thread_id",
+        "comment_id",
+        "fix_reference",
+        "fix_evidence_ids",
+        "resolution_readback",
+        "related_work_id",
+        "fix_verification_ids",
+        "closure"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "publication": {
+                "const": "published"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "pr_reference": {
+                "type": "string",
+                "minLength": 1
+              },
+              "thread_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "comment_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "disposition": {
+                "const": "verified_fixed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "fix_reference": {
+                "type": "string",
+                "minLength": 1
+              },
+              "fix_evidence_ids": {
+                "minItems": 1
+              },
+              "fix_verification_ids": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "closure": {
+                "const": "resolved"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "resolution_readback": {
+                "const": true
+              },
+              "publication": {
+                "const": "published"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ActionReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "action_receipt"
+        },
+        "action_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "attempt_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "operation": {
+          "enum": [
+            "prepare_workspace",
+            "launch_role",
+            "send_role",
+            "publish_pr",
+            "publish_finding",
+            "reply_finding",
+            "resolve_thread",
+            "merge",
+            "release",
+            "sync_projection",
+            "publish_status"
+          ]
+        },
+        "payload_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "confirmed",
+            "ambiguous",
+            "failed",
+            "pending_setup"
+          ]
+        },
+        "external_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0
+        },
+        "recorded_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "action_id",
+        "attempt_id",
+        "operation",
+        "payload_hash",
+        "expected_revision",
+        "status",
+        "external_id",
+        "observations",
+        "recorded_at"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "confirmed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "external_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "observations": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "delivery"
+        },
+        "delivery_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "work_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "attempt_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "candidate_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "authority_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint"
+        },
+        "gate_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 0
+        },
+        "action_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "receipt_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "observed_result": {
+          "type": "string",
+          "minLength": 1
+        },
+        "delivered_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "merge_binding": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "source_heads": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "pr_reference": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "source_ref": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "head_sha": {
+                        "type": "string",
+                        "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                      }
+                    },
+                    "required": [
+                      "pr_reference",
+                      "source_ref",
+                      "head_sha"
+                    ]
+                  },
+                  "minItems": 1
+                },
+                "target_ref": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "target_sha": {
+                  "type": "string",
+                  "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                },
+                "expected_integrated_tree": {
+                  "type": "string",
+                  "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                },
+                "protection_snapshot_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "merge_method": {
+                  "enum": [
+                    "merge",
+                    "squash",
+                    "rebase"
+                  ]
+                }
+              },
+              "required": [
+                "source_heads",
+                "target_ref",
+                "target_sha",
+                "expected_integrated_tree",
+                "protection_snapshot_hash",
+                "merge_method"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resulting_merge": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "commit_sha": {
+                  "type": "string",
+                  "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                },
+                "tree_sha": {
+                  "type": "string",
+                  "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                },
+                "target_ancestry_verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "commit_sha",
+                "tree_sha",
+                "target_ancestry_verified"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "verified",
+            "exposed_unverified",
+            "queued"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "delivery_id",
+        "work_id",
+        "attempt_id",
+        "candidate_id",
+        "authority_id",
+        "endpoint",
+        "gate_ids",
+        "action_id",
+        "receipt_id",
+        "observed_result",
+        "delivered_at",
+        "merge_binding",
+        "resulting_merge",
+        "status"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "endpoint": {
+                "properties": {
+                  "kind": {
+                    "const": "merge"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "merge_binding": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "source_heads": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "pr_reference": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "source_ref": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "head_sha": {
+                          "type": "string",
+                          "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                        }
+                      },
+                      "required": [
+                        "pr_reference",
+                        "source_ref",
+                        "head_sha"
+                      ]
+                    },
+                    "minItems": 1
+                  },
+                  "target_ref": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "target_sha": {
+                    "type": "string",
+                    "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                  },
+                  "expected_integrated_tree": {
+                    "type": "string",
+                    "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                  },
+                  "protection_snapshot_hash": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "merge_method": {
+                    "enum": [
+                      "merge",
+                      "squash",
+                      "rebase"
+                    ]
+                  }
+                },
+                "required": [
+                  "source_heads",
+                  "target_ref",
+                  "target_sha",
+                  "expected_integrated_tree",
+                  "protection_snapshot_hash",
+                  "merge_method"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "verified"
+              },
+              "endpoint": {
+                "properties": {
+                  "kind": {
+                    "const": "merge"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "resulting_merge": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "commit_sha": {
+                    "type": "string",
+                    "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                  },
+                  "tree_sha": {
+                    "type": "string",
+                    "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+                  },
+                  "target_ancestry_verified": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "commit_sha",
+                  "tree_sha",
+                  "target_ancestry_verified"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ExecutionSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "execution_segment"
+        },
+        "segment_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "attempt_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reasoning_effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "service_tier": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "model_policy_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_reference": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "segment_id",
+        "attempt_id",
+        "task_id",
+        "role",
+        "model_id",
+        "reasoning_effort",
+        "service_tier",
+        "workflow_hash",
+        "model_policy_hash",
+        "started_at",
+        "ended_at",
+        "source_reference"
+      ]
+    },
+    "Usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "usage"
+        },
+        "response_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "segment_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "recorded_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "uncached_input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_read_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_write_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reasoning_output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ccusage_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "price_snapshot_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "api_equivalent_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "estimated_codex_credits": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "allocations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "work_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+              },
+              "weight": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              }
+            },
+            "required": [
+              "work_id",
+              "weight"
+            ]
+          },
+          "minItems": 0
+        },
+        "attribution_status": {
+          "enum": [
+            "complete",
+            "partial",
+            "unallocated"
+          ]
+        },
+        "pricing_status": {
+          "enum": [
+            "complete",
+            "missing_rate",
+            "unsupported_format"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "response_id",
+        "task_id",
+        "segment_id",
+        "recorded_at",
+        "uncached_input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "ccusage_version",
+        "price_snapshot_id",
+        "api_equivalent_usd",
+        "estimated_codex_credits",
+        "allocations",
+        "attribution_status",
+        "pricing_status"
+      ]
+    },
+    "WorkflowSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "record_type",
+        "snapshot_id",
+        "package_version",
+        "workflow_hash",
+        "model_policy_hash",
+        "instruction_sources",
+        "repository_profile_reference",
+        "effective_settings_reference",
+        "captured_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "workflow_snapshot"
+        },
+        "snapshot_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "package_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "model_policy_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "instruction_sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "reference",
+              "hash"
+            ],
+            "properties": {
+              "reference": {
+                "type": "string",
+                "minLength": 1
+              },
+              "hash": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            }
+          }
+        },
+        "repository_profile_reference": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effective_settings_reference": {
+          "type": "string",
+          "minLength": 1
+        },
+        "captured_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "ObservationEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "observation_evidence"
+        },
+        "evidence_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "candidate_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "producer_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "acceptance_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 0
+        },
+        "source_references": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "artifact_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "evidence_id",
+        "candidate_id",
+        "producer_task_id",
+        "acceptance_ids",
+        "source_references",
+        "observations",
+        "artifact_hash",
+        "observed_at"
+      ]
+    },
+    "FixVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "fix_verification"
+        },
+        "verification_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "finding_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "candidate_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "assignment_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "producer_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "minItems": 1
+        },
+        "result": {
+          "enum": [
+            "verified",
+            "not_verified"
+          ]
+        },
+        "verified_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "verification_id",
+        "finding_id",
+        "candidate_id",
+        "assignment_id",
+        "producer_task_id",
+        "evidence_ids",
+        "result",
+        "verified_at"
+      ]
+    }
+  }
+}
