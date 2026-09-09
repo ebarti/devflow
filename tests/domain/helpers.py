@@ -34,7 +34,15 @@ def contract(work_id="synthetic-work", tier=0, endpoint="local"):
         dependencies=[],
         risk={"tier": tier, "reason": "Synthetic tier"},
         verification={"recipes": ["unit"], "scenarios": ["A01"], "documentation_owners": []},
-        endpoint={"kind": endpoint, "target": "synthetic-target"},
+        endpoint={
+            "kind": endpoint,
+            "target": {
+                "local": "/synthetic/worktree",
+                "pr": "main",
+                "merge": "main",
+                "release": "v1-approved",
+            }[endpoint],
+        },
     )
 
 
@@ -68,6 +76,7 @@ def workflow_snapshot():
         "workflow_snapshot",
         snapshot_id="snapshot-1",
         package_version="0.1.0",
+        package_revision="a" * 40,
         workflow_hash=H,
         model_policy_hash=H,
         instruction_sources=[{"reference": "fixture:instructions", "hash": H}],
@@ -79,15 +88,27 @@ def workflow_snapshot():
 
 class Scenario:
     def __init__(
-        self, path, tier=0, endpoint="local", work_id="synthetic-work", start=True, scenarios=None
+        self,
+        path,
+        tier=0,
+        endpoint="local",
+        work_id="synthetic-work",
+        start=True,
+        scenarios=None,
+        repository="synthetic/repository",
     ):
         self.service = WorkflowService(path)
         self.work_id = work_id
+        self.repository = repository
         self.sequence = itertools.count()
         self.contract = contract(work_id, tier, endpoint)
         if scenarios is not None:
             self.contract["verification"]["scenarios"] = scenarios
-        self.call("work.ready", record=self.contract, authority=authority(self.contract))
+        self.call(
+            "work.ready",
+            record=self.contract,
+            authority=authority(self.contract, repository=repository),
+        )
         if start:
             self.start()
 
@@ -153,7 +174,7 @@ class Scenario:
             candidate_id=identity,
             attempt_id=self.state["attempt"]["attempt_id"],
             scope_hash=self.state["scope_hash"],
-            repository="synthetic/repository",
+            repository=self.repository,
             base_sha=SHA,
             head_sha=tree,
             tree_sha=tree,
@@ -289,6 +310,7 @@ class Scenario:
             "head_sha": c["head_sha"],
             "tree_sha": c["tree_sha"],
             "endpoint": self.contract["endpoint"],
+            "path": self.contract["endpoint"]["target"],
             "verified": True,
             "independent_readback": True,
         }

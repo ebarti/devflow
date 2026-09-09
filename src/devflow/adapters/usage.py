@@ -78,7 +78,8 @@ class CcusageAdapter:
         import os
 
         root = Path(data_root).resolve(strict=True)
-        if not root.is_dir() or report not in {"session", "daily"}:
+        # CODEX_HOME is a comma-separated list in ccusage, not an opaque path.
+        if not root.is_dir() or "," in str(root) or report not in {"session", "daily"}:
             raise WorkflowError("usage_scope", "A scoped directory and supported report are required")
         env = dict(os.environ, CODEX_HOME=str(root))
 
@@ -88,11 +89,18 @@ class CcusageAdapter:
                 raise WorkflowError("ccusage_failed", "ccusage failed; private output was suppressed")
             return result.stdout
 
-        version = run(["npx", "ccusage@latest", "--version"]).strip()
-        if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", version):
-            raise WorkflowError("ccusage_version", "Unrecognized resolved ccusage version")
+        def resolved_version():
+            output = run(["npx", "ccusage@latest", "--version"]).strip()
+            # The native 20.x collector reports "ccusage 20.0.20"; older
+            # supported wrappers may print bare SemVer. Both name one version.
+            match = re.fullmatch(r"(?:ccusage[ \t]+)?(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)", output)
+            if not match:
+                raise WorkflowError("ccusage_version", "Unrecognized resolved ccusage version")
+            return match.group(1)
+
+        version = resolved_version()
         raw = run(["npx", "ccusage@latest", "codex", report, "--json"])
-        if run(["npx", "ccusage@latest", "--version"]).strip() != version:
+        if resolved_version() != version:
             raise WorkflowError("ccusage_version", "Latest ccusage version changed during collection")
         try:
             summary = json.loads(raw, parse_float=Decimal)
@@ -105,30 +113,53 @@ class CcusageAdapter:
 
 
 def reconcile_usage(records, summary):
-    """Reconcile supported ccusage totals without attributing summary rows.
+    """Reconcile one identical scoped population; never attribute summary rows.
 
-    The caller must supply the identical scoped population/window. Unknown summary
-    shapes are explicitly unsupported. ccusage inputTokens denotes inclusive input.
+    Native ccusage 20.x names its disjoint uncached input `inputTokens` and its
+    cache partitions `cacheReadTokens`/`cacheCreationTokens`. The separately
+    recognized legacy shape uses inclusive input and `cachedInputTokens`.
+    Upstream omissions, including unsupported cache-write counters, stay mismatches.
     """
     totals = summary.get("totals", {})
-    required = ("inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens")
-    if not all(key in totals for key in required):
-        return {"status": "unsupported_format", "reason": "Missing supported inclusive ccusage totals"}
+    native_fields = ("inputTokens", "cacheReadTokens", "cacheCreationTokens", "outputTokens",
+                     "reasoningOutputTokens", "totalTokens")
+    legacy_fields = ("inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens")
+    if not isinstance(totals, dict):
+        return {"status": "unsupported_format", "reason": "Missing supported ccusage totals"}
+    if all(key in totals for key in native_fields):
+        summary_format = "ccusage-native-disjoint-v20"
+    elif all(key in totals for key in legacy_fields):
+        summary_format = "ccusage-legacy-inclusive"
+    else:
+        return {"status": "unsupported_format", "reason": "Missing supported ccusage totals"}
     unique = {}
     for row in records:
         key = row["response_id"]
         if key in unique and unique[key] != row:
             raise WorkflowError("usage_conflict", "Conflicting response during reconciliation")
         unique[key] = row
-    observed = {
-        "inputTokens": sum(sum(row[key] for key in PARTITIONS[:3]) for row in unique.values()),
-        "cachedInputTokens": sum(row["cache_read_tokens"] for row in unique.values()),
-        "cacheWriteInputTokens": sum(row["cache_write_tokens"] for row in unique.values()),
-        "outputTokens": sum(row["output_tokens"] for row in unique.values()),
-        "reasoningOutputTokens": sum(row["reasoning_output_tokens"] for row in unique.values()),
-    }
-    if observed["cacheWriteInputTokens"] and "cacheWriteInputTokens" not in totals:
-        return {"status": "unsupported_format", "reason": "ccusage did not expose cache-write totals"}
+    partitions = {key: sum(row[key] for row in unique.values()) for key in PARTITIONS}
+    reasoning = sum(row["reasoning_output_tokens"] for row in unique.values())
+    if summary_format == "ccusage-native-disjoint-v20":
+        observed = {
+            "inputTokens": partitions["uncached_input_tokens"],
+            "cacheReadTokens": partitions["cache_read_tokens"],
+            "cacheCreationTokens": partitions["cache_write_tokens"],
+            "outputTokens": partitions["output_tokens"],
+            "reasoningOutputTokens": reasoning,
+            "totalTokens": sum(partitions.values()),
+        }
+    else:
+        observed = {
+            "inputTokens": sum(partitions[key] for key in PARTITIONS[:3]),
+            "cachedInputTokens": partitions["cache_read_tokens"],
+            "cacheWriteInputTokens": partitions["cache_write_tokens"],
+            "outputTokens": partitions["output_tokens"],
+            "reasoningOutputTokens": reasoning,
+        }
+        if observed["cacheWriteInputTokens"] and "cacheWriteInputTokens" not in totals:
+            return {"status": "unsupported_format", "reason": "ccusage did not expose cache-write totals"}
     differences = {key: observed[key] - decimal(totals.get(key, 0)) for key in observed}
     return {"status": "matched" if not any(differences.values()) else "mismatch",
+            "summary_format": summary_format,
             "differences": differences, "unique_responses": len(unique)}

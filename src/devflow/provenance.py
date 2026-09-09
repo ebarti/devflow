@@ -10,8 +10,34 @@ from pathlib import Path
 from devflow import __version__
 from devflow.errors import WorkflowError
 from devflow.installation import installed_release
-from devflow.profiles import digest, load_profile
+from devflow.profiles import assert_admitted_profile, digest, load_profile
 from devflow.runtime import package_root
+from devflow.validation import validate_record
+
+
+def validate_start_snapshot(repository: Path, snapshot: dict, require_artifact) -> None:
+    """Reject an unresumable or unsubstantiated policy before claiming work."""
+    validate_record(snapshot, "workflow_snapshot")
+    profile = load_profile(repository)
+    release = installed_release(package_root())
+    if (
+        snapshot["package_revision"] != release["revision"]
+        or release["revision"] != profile.lock["revision"]
+        or snapshot["package_version"] != __version__
+    ):
+        raise WorkflowError("release_mismatch", "Attempt must capture the executing pinned release")
+    assert_admitted_profile(profile, snapshot["repository_profile_reference"])
+    for source in snapshot["instruction_sources"]:
+        require_artifact(source["hash"])
+    if snapshot["effective_settings_reference"] != f"sha256:{snapshot['model_policy_hash']}":
+        raise WorkflowError("settings_mismatch", "Observed settings must bind their stored bytes")
+    require_artifact(snapshot["model_policy_hash"])
+    expected = digest(
+        {"package_version": __version__, "release": profile.lock,
+         "instructions": snapshot["instruction_sources"], "profile": profile.fingerprint}
+    )
+    if snapshot["workflow_hash"] != expected:
+        raise WorkflowError("snapshot_mismatch", "Workflow hash must bind captured package and inputs")
 
 
 def capture_snapshot(repository: Path, request: dict, put_artifact) -> dict:

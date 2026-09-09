@@ -50,6 +50,8 @@ Users need not fill these records manually. They ask for work or select a Ready 
 | Usage | Unique response identity, task/turn/segment, timestamp, disjoint token partitions, effective pricing inputs, allocation weights | Each response is counted once per portfolio; weights sum to at most one, remainder explicitly unallocated |
 | External action | ID, command, payload hash, expected remote state, prepared/dispatched/confirmed/ambiguous/failed, receipts | An uncertain result is reconciled before repeating the mutation |
 
+Endpoint target syntax is explicit: a `local` target is the canonical absolute checkout path; a `pr` target is its base branch; a `merge` target is its destination branch; a `release` target is its exact preexisting tag. Remote refs are short names without a `refs/` prefix. Repository identity comes from the admitted authority. Preparation, dispatch and readback must agree on this destination; copying the accepted endpoint into a receipt does not establish which destination was actually affected.
+
 The JSON Schema validates record shape. Pure domain functions enforce cross-record rules and references. For example, JSON Schema cannot prove a fixing commit is contained in a remote PR; the Git/GitHub adapter supplies that observation and the transition rule requires it.
 
 Scope identity is a SHA-256 hash of canonical normalized accepted fields, excluding mutable presentation, counters and timestamps. Workflow identity includes the installed package, used skill/reference bytes, applicable instructions and repository profile. Model-routing policy is hashed separately. Candidate identity uses actual Git refs/tree; it is not the workflow version.

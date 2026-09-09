@@ -286,6 +286,12 @@ def dispatch(args) -> dict:
 
         return quality_report(request["works"], cutoff=request["cutoff"])
     service = _service(args)
+    if command == "work.start":
+        from devflow.provenance import validate_start_snapshot
+
+        validate_start_snapshot(
+            args.repository, request.get("workflow_snapshot", {}), service.store.require_artifact
+        )
     if command == "work.show":
         return _state(service, request, args)
     if command == "next":

@@ -1819,6 +1819,7 @@
         "record_type",
         "snapshot_id",
         "package_version",
+        "package_revision",
         "workflow_hash",
         "model_policy_hash",
         "instruction_sources",

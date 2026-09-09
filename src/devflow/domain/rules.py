@@ -3,6 +3,7 @@
 from copy import deepcopy
 from datetime import datetime
 
+from devflow.domain.endpoints import readback_matches, validate_action_target, validate_endpoint
 from devflow.errors import WorkflowError
 from devflow.validation import digest, validate_record
 
@@ -108,6 +109,7 @@ def blank(work_id):
         "fix_observations": {},
         "actions": {},
         "receipts": {},
+        "receipt_observations": {},
         "blocker": None,
         "delivery_id": None,
     }
@@ -315,7 +317,9 @@ def missing_scenarios(state, evidence=None):
     return sorted(set(state["contract"]["verification"]["scenarios"]) - covered)
 
 
-def prepare_action(state, operation, payload, expected_remote_state, now, action_id=None):
+def prepare_action(
+    state, operation, payload, expected_remote_state, now, action_id=None, *, terminal=False
+):
     require(operation in ACTION_OPERATIONS, "unknown_action", f"Unsupported action {operation}")
     active(state)
     authority(state, now, PERMISSIONS[operation])
@@ -333,13 +337,20 @@ def prepare_action(state, operation, payload, expected_remote_state, now, action
         )
         if payload["role"] in {"review", "qa"}:
             current_candidate(state, payload["candidate_id"])
+    validate_action_target(state, operation, payload, expected_remote_state, terminal=terminal)
     fingerprint = digest(
-        {"operation": operation, "payload": payload, "expected_remote_state": expected_remote_state}
+        {
+            "operation": operation,
+            "payload": payload,
+            "expected_remote_state": expected_remote_state,
+            "terminal_delivery": terminal,
+        }
     )
     action_id = action_id or f"action-{fingerprint[:24]}"
     for existing_action in state["actions"].values():
         if (
             existing_action["operation"] == operation
+            and existing_action.get("terminal_delivery", False) == terminal
             and existing_action["payload_hash"] == digest(payload)
             and existing_action["expected_remote_state"] == expected_remote_state
             and existing_action["status"] != "invalidated"
@@ -347,6 +358,11 @@ def prepare_action(state, operation, payload, expected_remote_state, now, action
             return existing_action
     existing = state["actions"].get(action_id)
     if existing:
+        require(
+            existing.get("terminal_delivery", False) == terminal,
+            "action_conflict",
+            "Action delivery purpose changed",
+        )
         require(
             existing["payload_hash"] == digest(payload),
             "action_conflict",
@@ -360,6 +376,7 @@ def prepare_action(state, operation, payload, expected_remote_state, now, action
         return existing
     action = {
         "action_id": action_id,
+        "terminal_delivery": terminal,
         "attempt_id": state["attempt"]["attempt_id"],
         "operation": operation,
         "payload": payload,
@@ -441,14 +458,61 @@ def next_actions(state):
                 for a in state["assignments"].values()
                 if a["role"] == role and a["candidate_id"] == state["candidate_id"]
             ]
-            result.append(
-                {
-                    "kind": "wait_roles" if assignments else "launch_role",
-                    "role": role,
-                    "candidate_id": state["candidate_id"],
-                    "assignments": assignments,
-                }
+            live = [a for a in assignments if a["status"] in {"running", "pending_setup"}]
+            if live:
+                result.append(
+                    {
+                        "kind": "wait_roles",
+                        "role": role,
+                        "candidate_id": state["candidate_id"],
+                        "assignments": live,
+                    }
+                )
+                continue
+            gate_id = state.get("gate_ids", {}).get(role)
+            gate = get(state, "gate_result", gate_id) if gate_id else None
+            peers = assignments or [a for a in state["assignments"].values() if a["role"] == role]
+            peer = (
+                state["assignments"].get(gate["assignment_id"])
+                if gate
+                else next((a for a in peers if a["task_id"]), None)
             )
+            rerun = {
+                "kind": "launch_role",
+                "role": role,
+                "candidate_id": state["candidate_id"],
+                "assignments": peers,
+            }
+            if peer and peer["task_id"]:
+                rerun.update(
+                    operation="send_role",
+                    reuse_task_id=peer["task_id"],
+                    assignment_id=peer["assignment_id"],
+                )
+            if gate and gate["status"] != "PASS" and state["phase"] == "implement":
+                result.append(
+                    {
+                        "kind": "request_user_action"
+                        if gate["status"] == "BLOCKED"
+                        else "implement",
+                        "role": role,
+                        "gate_id": gate_id,
+                        "limitations": gate["limitations"],
+                        "reason": "Address the completed gate result before requesting its rerun",
+                        "rerun": rerun,
+                    }
+                )
+            elif peer and peer["status"] == "blocked":
+                result.append(
+                    {
+                        "kind": "request_user_action",
+                        "role": role,
+                        "reason": "The assigned role task is blocked",
+                        "rerun": rerun,
+                    }
+                )
+            else:
+                result.append(rerun)
         return result
     if state["contract"]["endpoint"]["kind"] != "local":
         unpublished = [
@@ -672,6 +736,18 @@ def verify_delivery(state, record, observation):
         "stale_delivery",
         "Prepared delivery binding has changed",
     )
+    require(
+        action.get("terminal_delivery") is True,
+        "unprepared_delivery",
+        "Terminal delivery requires its evaluated delivery intent",
+    )
+    validate_action_target(
+        state,
+        action["operation"],
+        action["payload"],
+        action["expected_remote_state"],
+        terminal=True,
+    )
     expected_operation = {
         "local": "local_delivery",
         "pr": "publish_pr",
@@ -689,7 +765,6 @@ def verify_delivery(state, record, observation):
         "candidate_id": candidate["candidate_id"],
         "head_sha": candidate["head_sha"],
         "tree_sha": candidate["tree_sha"],
-        "endpoint": record["endpoint"],
         "verified": record["status"] == "verified",
         "independent_readback": True,
     }
@@ -712,6 +787,11 @@ def verify_delivery(state, record, observation):
             "next_action": "Reconcile the actual endpoint before reporting completion",
         }
         return
+    require(
+        readback_matches(record["endpoint"], observation),
+        "unverified_endpoint",
+        "Actual endpoint target readback does not match the accepted target",
+    )
     gates = valid_gates(state)
     expected_gates = {gates[role]["gate_id"] for role in required_roles(state) if role in gates}
     require(
@@ -842,6 +922,7 @@ def record_receipt(state, request):
     action["receipts"].append(receipt_id)
     action["status"] = record["status"]
     action["observation"] = deepcopy(request.get("observation", {}))
+    state.setdefault("receipt_observations", {})[receipt_id] = deepcopy(action["observation"])
     if record["status"] == "failed":
         state["blocker"] = {
             "code": "action_failed",
@@ -851,12 +932,74 @@ def record_receipt(state, request):
     return receipt_id
 
 
+def validate_action_admission(state, action, now):
+    authority(state, now, PERMISSIONS[action["operation"]])
+    validate_action_target(
+        state,
+        action["operation"],
+        action["payload"],
+        action["expected_remote_state"],
+        terminal=action.get("terminal_delivery", False),
+    )
+    if action["operation"] in {"local_delivery", "merge", "release"}:
+        require(
+            action.get("terminal_delivery") is True,
+            "unprepared_delivery",
+            "Endpoint action lacks an evaluated delivery intent",
+        )
+    require(
+        action["payload"]["scope_hash"] == state["scope_hash"],
+        "stale_scope",
+        "Prepared scope changed",
+    )
+    if action["payload"]["candidate_id"] is not None:
+        current_candidate(state, action["payload"]["candidate_id"])
+    if action.get("terminal_delivery"):
+        require(
+            not missing_scenarios(state),
+            "missing_scenarios",
+            "Delivery scenarios changed after action preparation",
+        )
+        require(
+            not missing_checks(state)
+            and not blocking_findings(state, state["candidate_id"])
+            and set(required_roles(state)) <= set(valid_gates(state)),
+            "stale_delivery",
+            "Delivery proof changed after action preparation",
+        )
+        require(
+            set(action["payload"].get("gate_ids", []))
+            == {valid_gates(state)[role]["gate_id"] for role in required_roles(state)},
+            "stale_delivery",
+            "Prepared gate set changed",
+        )
+        require(
+            state["blocker"] is None,
+            "blocked_delivery",
+            "Blocked work cannot dispatch delivery",
+        )
+        if action["operation"] != "local_delivery":
+            require(
+                all(
+                    f["publication"] == "published"
+                    and (
+                        not technically_fixed(state, f, state["candidate_id"])
+                        or (f["closure"] == "resolved" and f["resolution_readback"])
+                    )
+                    for f in state["findings"].values()
+                ),
+                "publication_due",
+                "Publication and closure must finish before dispatch",
+            )
+
+
 def transition(original, command, request, now, dependency_states=None):
     state = deepcopy(original)
     details = {}
     if command in {"work.ready", "work.amend"}:
         record = validate_record(request["record"], "work_contract")
         require(record["work_id"] == state["work_id"], "wrong_work", "Contract work mismatch")
+        validate_endpoint(record["endpoint"])
         if command == "work.ready":
             require(
                 state["lifecycle"] == "backlog",
@@ -1322,52 +1465,39 @@ def transition(original, command, request, now, dependency_states=None):
                 "reconcile_required",
                 "Already dispatched or uncertain actions must be reconciled without repeating the mutation",
             )
-            authority(state, now, PERMISSIONS[action["operation"]])
-            require(
-                action["payload"]["scope_hash"] == state["scope_hash"],
-                "stale_scope",
-                "Prepared scope changed",
-            )
-            if action["payload"]["candidate_id"] is not None:
-                current_candidate(state, action["payload"]["candidate_id"])
-            if action["operation"] in {"merge", "release", "local_delivery"}:
-                require(
-                    not missing_scenarios(state),
-                    "missing_scenarios",
-                    "Delivery scenarios changed after action preparation",
-                )
-                require(
-                    not missing_checks(state)
-                    and not blocking_findings(state, state["candidate_id"])
-                    and set(required_roles(state)) <= set(valid_gates(state)),
-                    "stale_delivery",
-                    "Delivery proof changed after action preparation",
-                )
-                require(
-                    set(action["payload"].get("gate_ids", []))
-                    == {valid_gates(state)[role]["gate_id"] for role in required_roles(state)},
-                    "stale_delivery",
-                    "Prepared gate set changed",
-                )
-                require(
-                    state["blocker"] is None,
-                    "blocked_delivery",
-                    "Blocked work cannot dispatch delivery",
-                )
-                if action["operation"] != "local_delivery":
-                    require(
-                        all(
-                            f["publication"] == "published"
-                            and (
-                                not technically_fixed(state, f, state["candidate_id"])
-                                or (f["closure"] == "resolved" and f["resolution_readback"])
-                            )
-                            for f in state["findings"].values()
-                        ),
-                        "publication_due",
-                        "Publication and closure must finish before dispatch",
-                    )
+            validate_action_admission(state, action, now)
             action["status"] = "dispatched"
+            details["action"] = action
+        elif command == "action.retry":
+            action = state["actions"].get(request["action_id"])
+            require(
+                action is not None and action["status"] == "failed",
+                "retry_forbidden",
+                "Only a definitely failed action may be explicitly retried",
+            )
+            observations = state.get("receipt_observations", {})
+            require(
+                bool(action["receipts"])
+                and all(
+                    state["receipts"][identity]["status"] == "failed"
+                    and observations.get(identity, {}).get("no_mutation") is True
+                    for identity in action["receipts"]
+                ),
+                "reconcile_required",
+                "Every earlier result must prove no mutation; uncertainty requires reconciliation",
+            )
+            # Clear only the failed-action blocker; other failures or user blockers remain.
+            if (
+                state["blocker"]
+                and state["blocker"]["code"] == "action_failed"
+                and not any(
+                    a["status"] == "failed" and a["action_id"] != action["action_id"]
+                    for a in state["actions"].values()
+                )
+            ):
+                state["blocker"] = None
+            validate_action_admission(state, action, now)
+            action["status"] = "prepared"
             details["action"] = action
         elif command == "action.record":
             details["receipt_id"] = record_receipt(state, request)
@@ -1466,6 +1596,32 @@ def transition(original, command, request, now, dependency_states=None):
                         valid_gates(state)[role]["gate_id"] for role in required_roles(state)
                     ],
                 }
+                if endpoint["kind"] == "pr":
+                    requested_refs = request.get("expected_remote_state", {})
+                    earlier = []
+                    for previous in state["actions"].values():
+                        previous_values = {
+                            **previous["expected_remote_state"],
+                            **previous["payload"],
+                        }
+                        if (
+                            previous["operation"] == "publish_pr"
+                            and previous["status"] == "confirmed"
+                            and not previous.get("terminal_delivery")
+                            and readback_matches(endpoint, previous.get("observation", {}))
+                            and all(
+                                previous_values.get(key) == requested_refs.get(key)
+                                for key in ("head_ref", "base_ref", "title", "body")
+                            )
+                        ):
+                            earlier.append(previous["action_id"])
+                    require(
+                        len(earlier) <= 1,
+                        "publication_conflict",
+                        "Existing PR publication correlation is ambiguous",
+                    )
+                    if earlier:
+                        payload["publication_action_id"] = earlier[0]
                 if endpoint["kind"] == "merge":
                     require(
                         bool(request.get("merge_binding")),
@@ -1474,7 +1630,12 @@ def transition(original, command, request, now, dependency_states=None):
                     )
                     payload["merge_binding"] = request["merge_binding"]
                 details["action"] = prepare_action(
-                    state, operation, payload, request.get("expected_remote_state", {}), now
+                    state,
+                    operation,
+                    payload,
+                    request.get("expected_remote_state", {}),
+                    now,
+                    terminal=True,
                 )
                 state["phase"] = "deliver"
         elif command == "work.reconcile":

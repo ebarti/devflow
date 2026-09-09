@@ -279,7 +279,7 @@ def test_gate_order_uses_admission_order_not_lexicographic_id(tmp_path):
     s.assignment()
     s.gate(identity="z-pass")
     s.gate(identity="a-fail", status="FAIL")
-    assert s.service.next(s.work_id)["actions"][0]["kind"] == "wait_roles"
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "implement"
 
 
 def test_qa_static_only_does_not_establish_product_pass(tmp_path):
@@ -395,7 +395,7 @@ def test_old_gate_reimport_does_not_replace_later_failed_gate(tmp_path):
     passed = s.gate()
     s.gate(identity="failure", status="FAIL")
     s.call("gate.record", record=passed)
-    assert s.service.next(s.work_id)["actions"][0]["kind"] == "wait_roles"
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "implement"
 
 
 def test_historic_candidate_id_cannot_rollback_current_snapshot(tmp_path):
@@ -469,3 +469,59 @@ def test_cancel_is_possible_when_historical_artifact_is_missing(tmp_path):
     assert s.state["lifecycle"] == "canceled"
     with s.service.store.connect() as db:
         assert db.execute("SELECT count(*) FROM claims").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "status,next_kind", [("FAIL", "implement"), ("BLOCKED", "request_user_action")]
+)
+def test_finished_nonpassing_gate_routes_to_action_then_reuses_same_peer(
+    tmp_path, status, next_kind
+):
+    s = Scenario(tmp_path, tier=1)
+    s.candidate()
+    s.check()
+    assignment = s.assignment()
+    s.gate(identity="nonpassing", status=status)
+    next_action = s.service.next(s.work_id)["actions"][0]
+    assert next_action["kind"] == next_kind
+    assert next_action["rerun"]["reuse_task_id"] == assignment["task_id"]
+    assert next_action["rerun"]["operation"] == "send_role"
+    # Repair/check admission permits the same peer to evaluate the next gate.
+    s.check("after-repair")
+    rerun = s.service.next(s.work_id)["actions"][0]
+    assert rerun["kind"] == "launch_role"
+    assert rerun["operation"] == "send_role"
+    assert rerun["reuse_task_id"] == assignment["task_id"]
+    s.assignment()
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "wait_roles"
+    s.gate(identity="repaired", evidence_ids=["after-repair"])
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "deliver"
+
+
+def test_missing_release_pin_rejected_before_active_claim(tmp_path):
+    s = Scenario(tmp_path, start=False)
+    from helpers import workflow_snapshot
+
+    snapshot = workflow_snapshot()
+    snapshot.pop("package_revision")
+    attempt = record(
+        "attempt",
+        attempt_id="attempt-1",
+        work_id=s.work_id,
+        scope_hash=s.state["scope_hash"],
+        authority_id="auth-1",
+        host_id="synthetic-host",
+        owner_task_id="synthetic-owner",
+        phase="implement",
+        blocker=None,
+        workflow_snapshot_id="snapshot-1",
+        model_policy_snapshot_id="snapshot-1",
+        revision=s.state["revision"],
+        started_at=NOW,
+        status="active",
+    )
+    with pytest.raises(WorkflowError, match="package_revision"):
+        s.call("work.start", record=attempt, workflow_snapshot=snapshot)
+    assert s.state["lifecycle"] == "ready"
+    with s.service.store.connect() as database:
+        assert database.execute("SELECT count(*) FROM claims").fetchone()[0] == 0

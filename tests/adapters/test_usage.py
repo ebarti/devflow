@@ -80,3 +80,66 @@ def test_reconciliation_never_uses_summary_for_response_attribution():
     assert reconcile_usage([], summary)["status"] == "matched"
     summary["totals"]["outputTokens"] = 1
     assert reconcile_usage([], summary)["status"] == "mismatch"
+
+
+def test_real_native_version_prefix_and_disjoint_session_shape(tmp_path):
+    """Captured shape from an isolated, synthetic ccusage20.0.20 runtime canary."""
+    import json
+
+    from devflow.adapters.usage import reconcile_usage
+
+    summary = {"sessions": [], "totals": {
+        "cacheCreationTokens": 0, "cacheReadTokens": 20, "costUSD": 0.0005025,
+        "inputTokens": 80, "outputTokens": 40, "reasoningOutputTokens": 30, "totalTokens": 140,
+    }}
+    outputs = iter(["ccusage 20.0.20\n", json.dumps(summary), "ccusage 20.0.20\n"])
+
+    def runner(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=next(outputs))
+
+    collected = CcusageAdapter(runner).collect(data_root=tmp_path)
+    assert collected["ccusage_version"] == "20.0.20"
+    record = {"response_id": "synthetic-response", "uncached_input_tokens": 80,
+              "cache_read_tokens": 20, "cache_write_tokens": 0, "output_tokens": 40,
+              "reasoning_output_tokens": 30}
+    reconciled = reconcile_usage([record, record], collected["summary"])
+    assert reconciled["status"] == "matched"
+    assert reconciled["unique_responses"] == 1
+    assert all(value == 0 for value in reconciled["differences"].values())
+    # This release omitted native cache_write_input_tokens in the runtime canary.
+    # Preserve our recorded partition and expose mismatch; never turn it into zero.
+    record.update(uncached_input_tokens=70, cache_write_tokens=10)
+    reconciled = reconcile_usage([record], collected["summary"])
+    assert reconciled["status"] == "mismatch"
+    assert reconciled["differences"]["cacheCreationTokens"] == 10
+    assert reconciled["differences"]["inputTokens"] == -10
+    assert reconciled["differences"]["totalTokens"] == 0
+
+
+def test_comma_in_data_root_cannot_expand_collection_scope(tmp_path):
+    import pytest
+
+    from devflow.errors import WorkflowError
+
+    selected = tmp_path / "scope,other"
+    selected.mkdir()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("A comma path must be rejected before ccusage interprets it as multiple roots")
+
+    with pytest.raises(WorkflowError, match="scoped directory"):
+        CcusageAdapter(forbidden).collect(data_root=selected)
+
+
+def test_branded_collector_version_drift_is_rejected(tmp_path):
+    import pytest
+
+    from devflow.errors import WorkflowError
+
+    outputs = iter(["ccusage 20.0.20", "{}", "ccusage 20.0.21"])
+
+    def runner(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=next(outputs))
+
+    with pytest.raises(WorkflowError, match="version changed"):
+        CcusageAdapter(runner).collect(data_root=tmp_path)

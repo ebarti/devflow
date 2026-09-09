@@ -96,7 +96,7 @@ class LocalLifecycle:
         )
         self.call("work.ready", record=self.contract, authority=authority)
         snapshot = record(
-            "workflow_snapshot", snapshot_id="synthetic-policy", package_version="0.1.0",
+            "workflow_snapshot", snapshot_id="synthetic-policy", package_version="0.1.0", package_revision="a" * 40,
             workflow_hash=digest(self.profile.sources), model_policy_hash=digest("synthetic-user-settings"),
             instruction_sources=list(self.profile.sources),
             repository_profile_reference="sha256:" + self.profile.fingerprint,
@@ -242,7 +242,7 @@ def test_simulated_release_exposed_unverified_cannot_become_verified(tmp_path):
     class SimulatedUnverifiedRemote:
         def publish_release(self, **kwargs):
             calls.append(kwargs)
-            return {"release_id": "synthetic-release", "status": "exposed_unverified"}
+            return {"release_id": "synthetic-release", "status": "exposed_unverified", "tag": "v0-test", "commit_sha": scenario.candidate["head_sha"]}
 
     dispatched = scenario.dispatch(action, github_factory=lambda *args: SimulatedUnverifiedRemote())
     assert len(calls) == 1

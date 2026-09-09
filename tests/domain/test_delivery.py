@@ -1,4 +1,3 @@
-
 import pytest
 from helpers import NOW, SHA, H, Scenario, record
 
@@ -8,7 +7,11 @@ from devflow.errors import WorkflowError
 def prepared_delivery(s, *, status="verified", observation_delta=None, record_delta=None):
     state = s.state
     candidate = state["records"]["candidate:" + state["candidate_id"]]
-    refs = {"head_sha": candidate["head_sha"], "target_ref": "main", "target_sha": SHA}
+    refs = (
+        {"head_sha": candidate["head_sha"], "target_ref": "main", "target_sha": SHA}
+        if s.contract["endpoint"]["kind"] == "merge"
+        else {}
+    )
     binding = None
     actual = None
     extra = {}
@@ -44,6 +47,9 @@ def prepared_delivery(s, *, status="verified", observation_delta=None, record_de
         "head_sha": candidate["head_sha"],
         "tree_sha": candidate["tree_sha"],
         "endpoint": s.contract["endpoint"],
+        {"local": "path", "pr": "base_ref", "merge": "target_ref", "release": "tag"}[
+            s.contract["endpoint"]["kind"]
+        ]: s.contract["endpoint"]["target"],
         "verified": status == "verified",
         "independent_readback": True,
         "refs": refs,

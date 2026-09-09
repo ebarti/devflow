@@ -56,8 +56,36 @@ class GitHubRepository:
         self.owner, self.name = owner, name
         self.root = f"repos/{owner}/{name}"
         self.runner, self.sleep = runner or subprocess.run, sleep
+        self._mutation_may_have_applied = False
 
     def _api(
+        self,
+        endpoint: str,
+        *,
+        method: str = "GET",
+        payload: dict | None = None,
+        read_only: bool | None = None,
+    ) -> object:
+        readonly = method == "GET" if read_only is None else read_only
+        previous_mutation = self._mutation_may_have_applied
+        if not readonly:
+            self._mutation_may_have_applied = True
+        try:
+            return self._api_request(
+                endpoint, method=method, payload=payload, read_only=read_only
+            )
+        except WorkflowError as exc:
+            # A definite rejection can establish nonexecution only for this call.
+            # Earlier writes in a multi-step action still require reconciliation.
+            if not readonly and exc.details.get("http_status") in {
+                400, 401, 403, 404, 405, 409, 410, 422
+            }:
+                self._mutation_may_have_applied = previous_mutation
+            if not self._mutation_may_have_applied:
+                exc.details["no_mutation"] = True
+            raise
+
+    def _api_request(
         self,
         endpoint: str,
         *,
@@ -128,7 +156,8 @@ class GitHubRepository:
                     status = int(match.group(1)) if match else None
                 if status == 403:
                     raise WorkflowError(
-                        "github_forbidden", "GitHub permission or policy denied the operation"
+                        "github_forbidden", "GitHub permission or policy denied the operation",
+                        {"http_status": status},
                     )
                 if status in {400, 401, 404, 405, 409, 410, 422}:
                     raise WorkflowError(
@@ -1180,7 +1209,8 @@ class GitHubRepository:
         except WorkflowError as exc:
             if exc.code == "github_forbidden":
                 raise WorkflowError(
-                    "project_permission_missing", "Project read/write scope is not granted"
+                    "project_permission_missing", "Project read/write scope is not granted",
+                    exc.details,
                 ) from exc
             raise
 
@@ -1319,7 +1349,8 @@ class GitHubRepository:
         except WorkflowError as exc:
             if exc.code == "github_forbidden":
                 raise WorkflowError(
-                    "project_permission_missing", "Project read/write scope is not granted"
+                    "project_permission_missing", "Project read/write scope is not granted",
+                    exc.details,
                 ) from exc
             raise
         supported = {

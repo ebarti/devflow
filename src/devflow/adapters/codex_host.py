@@ -76,7 +76,9 @@ class NativeHostBridge:
                 )
             return assignment | {
                 "task_id": task_id,
-                "client_id": client_id or assignment.get("client_id"),
+                # The pending identity remains in receipt/assignment history; a
+                # runnable assignment carries only the actual native task identity.
+                "client_id": None,
                 "status": "running",
             }
         if client_id:

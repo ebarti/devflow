@@ -58,7 +58,7 @@ def setup_run(tmp_path, *, kill_parent=False):
     contract.update(
         work_id="synthetic-work",
         risk={"tier": 0, "reason": "Synthetic static command"},
-        endpoint={"kind": "local", "target": "synthetic-check"},
+        endpoint={"kind": "local", "target": str(repository.resolve())},
     )
     contract["verification"] = {
         "recipes": ["synthetic"],
@@ -94,6 +94,7 @@ def setup_run(tmp_path, *, kill_parent=False):
         "record_type": "workflow_snapshot",
         "snapshot_id": "snapshot-1",
         "package_version": "0.1.0",
+        "package_revision": "a" * 40,
         "workflow_hash": "a" * 64,
         "model_policy_hash": "a" * 64,
         "instruction_sources": [{"reference": "synthetic:instructions", "hash": "a" * 64}],

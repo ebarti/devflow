@@ -35,7 +35,9 @@ The CLI selects an active attempt's captured revision before the repository lock
 
 Use the records in [implementation contracts](implementation-contracts.md). A mutating request contains `operation_id`, `work_id`, and `expected_revision`. Reuse the same operation ID and identical request after an uncertain local response. Changed payloads require new IDs and current revisions. The tool returns the resulting revision and next actions.
 
-`work prepare` reports missing contract fields without creating state or inventing authority. `work ready` accepts the work contract plus a separately recorded user instruction or adopted queue policy. `snapshot capture` stores the actual used instruction bytes, profile, full package revision, and observed nonsecret settings. `work start` claims an attempt and returns a workspace intent.
+The accepted endpoint includes an exact target: `local` uses the canonical absolute checkout path, `pr` uses the PR base branch, `merge` uses the target branch, and `release` uses an existing tag name. Remote branches/tags use their short names, such as `main` or `v0.1.0`, without `refs/` prefixes. The authority record independently binds the repository. A request cannot substitute a different path, branch, tag, or repository; actual endpoint readback must identify the accepted destination.
+
+`work prepare` reports missing contract fields without creating state or inventing authority. `work ready` accepts the work contract plus a separately recorded user instruction or adopted queue policy. `snapshot capture` stores the actual used instruction bytes, profile, full package revision, and observed nonsecret settings. `work start` verifies the snapshot's executing revision, admitted profile and stored inputs before claiming an attempt and returning a workspace intent. A missing or mismatched pin is rejected before creating an active claim.
 
 Register the dedicated checkout against that intent, verify it is clean, and record the actual workspace receipt. `candidate capture` reads real Git head/tree/base and ownership. `check run` executes an admitted recipe and records process and assertion outcomes separately. A later failed result supersedes an earlier passing result for that recipe. Named scenarios and acceptance must be covered by current passing evidence.
 
@@ -43,19 +45,27 @@ The check runner durably admits an execution before starting its process. An ide
 
 Role launch intents are executed by the active owner through supported native task tools. Record pending setup separately from the final task ID. A task title alone cannot reconcile a lost creation response. Use the assignment marker and observed prompt/context. Review and QA return structured results from their registered independent identities; the owner does not supply a substitute PASS.
 
+When a final task ID arrives, its current assignment no longer carries the pending setup ID; receipts retain that history. `next` waits only on live assignments. A completed nonpassing result identifies the needed correction or blocker and retains the same task for its eventual rerun.
+
 Technical fix observations precede the final gate. `finding fix` requires candidate-contained Git readback; independent `fix record` verifies the regression. Publication and thread closure are separate recorded obligations. Every confirmed code finding is published when a PR exists within the authorized endpoint. A local-only outcome retains pending publication visibly.
 
 ## External actions and delivery
 
 Persist `action prepare` before publication, then `action dispatch` for supported GitHub operations. Endpoint operations originate from `deliver` preparation, which validates current proof before creating their intent. The dispatcher marks an action dispatched before the external call and serializes one action writer. A restarted dispatched/ambiguous action performs reconciliation reads, not a blind second mutation.
 
+A definite rejection with recorded proof that no mutation could have applied is `failed`. After correcting the prerequisite, `action retry` explicitly re-admits the same action against current authority, candidate and evidence while retaining its receipts. Merely choosing a new action ID does not bypass recovery. A successful or uncertain earlier write in a multi-step action prevents this retry route; read-only reconciliation remains required.
+
 Supported adapters publish findings, verify/resolve fixing replies, publish proof statuses, project tool-owned fields, create regular PRs, and publish releases against existing tags. Native task creation stays in the owner context. Direct protected merge requires current classic branch protection, strict required checks, no acting-account bypass, the exact proof binding, and integrated-tree readback. Unsupported merge queue, ruleset-only, and unverified atomic-stack modes block automatically.
+
+An early PR publication can make findings reviewable before final acceptance. It cannot itself complete the work. Terminal PR delivery evaluates current proof in a fresh intent and independently reconciles the existing PR using its original publication identity, without creating another PR.
 
 Record the adapter receipt and observation, then finalize the corresponding finding or delivery transition. Done requires the accepted endpoint, current gates, required publication/closure, and independently observed result. A queued or exposed-unverified result remains active with a blocker. See [contracts](implementation-contracts.md) for exact merge bindings and source/target race rules.
 
 ## Usage and outcomes
 
 `usage collect` invokes `npx ccusage@latest` on an explicitly supplied data root, records its version, and rejects a version change during collection. `usage import` parses explicitly supplied native response JSONL with segment/allocation and price snapshots. It ignores cumulative counters and deduplicates response identities. Preserve price snapshots as private artifacts; never substitute session totals for per-response attribution.
+
+The 20.0.20 collector was exercised with isolated synthetic session and daily inputs. Its report's input count is uncached; cache-read and cache-creation counts are separate. Comma-containing input roots are rejected because the collector interprets commas as multiple roots. That collector version omitted cache-write usage and noncompact JSONL in separate probes; reconciliation retains these discrepancies instead of trusting zero totals. Actual user-data compatibility and allocation coverage must still be established on explicitly selected inputs.
 
 `usage record` stores normalized records in an attempt. `report usage` produces exact token partitions, known cost subtotals, unknown totals when prices are incomplete, and explicit unallocated usage. Reasoning tokens are included in output tokens, not added again. USD and estimated Codex credits are separate from an actual subscription invoice.
 

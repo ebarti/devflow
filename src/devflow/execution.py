@@ -15,10 +15,13 @@ from pathlib import Path
 
 from devflow.adapters.git import GitRepository
 from devflow.adapters.github import GitHubRepository
+from devflow.domain.endpoints import TARGET_FIELD, validate_action_target
 from devflow.domain.rules import (
+    PERMISSIONS,
     authority,
     blocking_findings,
     missing_checks,
+    missing_scenarios,
     required_roles,
     technically_fixed,
     valid_gates,
@@ -80,6 +83,7 @@ def _call(service, command, state, operation_id, **fields):
 def _proof_ready(state):
     if (
         missing_checks(state)
+        or missing_scenarios(state)
         or blocking_findings(state, state["candidate_id"])
         or not (set(required_roles(state)) <= set(valid_gates(state)))
     ):
@@ -97,14 +101,36 @@ def _remote(state, factory):
     return factory(*identity[7:].split("/"))
 
 
+def _endpoint_observation(state, kind, value, verified):
+    field = TARGET_FIELD[kind]
+    actual = value.get(field)
+    verified = bool(verified and actual == state["contract"]["endpoint"]["target"])
+    return {
+        "endpoint": {"kind": kind, "target": actual},
+        field: actual,
+        "verified": verified,
+        "status": "verified" if verified else "exposed_unverified",
+    }
+
+
 def _perform(state, action, repository, *, github_factory, git_factory, reconcile):
     operation, payload, refs = (
         action["operation"],
         action["payload"],
         action["expected_remote_state"],
     )
+    validate_action_target(
+        state,
+        operation,
+        payload,
+        refs,
+        repository_path=str(Path(repository).resolve()),
+        terminal=action.get("terminal_delivery", False),
+    )
     candidate = state["records"]["candidate:" + state["candidate_id"]]
-    observe_candidate(repository, candidate, git_factory)
+    observed_checkout = observe_candidate(repository, candidate, git_factory)
+    if action.get("terminal_delivery"):
+        _proof_ready(state)
     base = {
         "action_id": action["action_id"],
         "payload_hash": action["payload_hash"],
@@ -116,10 +142,8 @@ def _perform(state, action, repository, *, github_factory, git_factory, reconcil
     if operation == "local_delivery":
         return {
             **base,
-            "verified": True,
-            "endpoint": state["contract"]["endpoint"],
-            "status": "verified",
-            "external_id": str(Path(repository).resolve()),
+            **_endpoint_observation(state, "local", observed_checkout, True),
+            "external_id": observed_checkout["path"],
         }
     github = _remote(state, github_factory)
     if operation == "publish_finding":
@@ -217,9 +241,7 @@ def _perform(state, action, repository, *, github_factory, git_factory, reconcil
         verified = value["status"] == "verified"
         return {
             **base,
-            "status": value["status"],
-            "verified": verified,
-            "endpoint": state["contract"]["endpoint"],
+            **_endpoint_observation(state, "merge", value, verified),
             "refs": refs,
             "protection_verified": verified,
             "required_checks_verified": verified,
@@ -234,23 +256,45 @@ def _perform(state, action, repository, *, github_factory, git_factory, reconcil
         }
     if operation == "publish_pr":
         values = {**refs, **payload}
-        method = github.reconcile_pr if reconcile else github.publish_pr
+        publication_id = payload.get("publication_action_id", action["action_id"])
+        if publication_id != action["action_id"]:
+            publication = state["actions"].get(publication_id)
+            if (
+                publication is None
+                or publication["operation"] != "publish_pr"
+                or publication["status"] != "confirmed"
+                or not action.get("terminal_delivery")
+            ):
+                raise WorkflowError(
+                    "publication_conflict", "Terminal PR correlation is not a confirmed publication"
+                )
+            method = github.reconcile_pr
+        else:
+            method = github.reconcile_pr if reconcile else github.publish_pr
         value = method(
             head_ref=values["head_ref"],
             base_ref=values["base_ref"],
             expected_head=candidate["head_sha"],
             title=values["title"],
             body=values["body"],
-            action_id=action["action_id"],
+            action_id=publication_id,
         )
         if value is None:
             raise WorkflowError("ambiguous_action", "PR publication is not uniquely confirmed")
         return {
             **base,
             **value,
-            "verified": True,
-            "endpoint": state["contract"]["endpoint"],
+            **base,
+            **_endpoint_observation(
+                state,
+                "pr",
+                value,
+                value.get("status") == "published"
+                and value.get("head_sha") == candidate["head_sha"],
+            ),
             "refs": refs,
+            "remote": value,
+            "publication_action_id": publication_id,
             "external_id": str(value["pr_number"]),
         }
     if operation == "release":
@@ -268,9 +312,16 @@ def _perform(state, action, repository, *, github_factory, git_factory, reconcil
         return {
             **base,
             **value,
-            "verified": value["status"] == "published",
-            "endpoint": state["contract"]["endpoint"],
+            **base,
+            **_endpoint_observation(
+                state,
+                "release",
+                value,
+                value.get("status") == "published"
+                and value.get("commit_sha") == candidate["head_sha"],
+            ),
             "refs": refs,
+            "remote": value,
             "external_id": str(value["release_id"]),
         }
     if operation == "sync_projection":
@@ -328,7 +379,21 @@ def dispatch_action(
             action["payload"]["candidate_id"] != state["candidate_id"]
         ):
             raise WorkflowError("stale_action", "Action scope or candidate changed")
-        authority(state, datetime.now(UTC))
+        authority(state, datetime.now(UTC), PERMISSIONS[action["operation"]])
+        validate_action_target(
+            state,
+            action["operation"],
+            action["payload"],
+            action["expected_remote_state"],
+            repository_path=str(Path(repository).resolve()),
+            terminal=action.get("terminal_delivery", False),
+        )
+        if action["operation"] in {"local_delivery", "merge", "release"} and not action.get(
+            "terminal_delivery"
+        ):
+            raise WorkflowError(
+                "unprepared_delivery", "Endpoint action lacks its evaluated delivery intent"
+            )
         reconcile = action["status"] != "prepared"
         if not reconcile:
             _call(
@@ -355,8 +420,10 @@ def dispatch_action(
                 "error_code": exc.code,
                 "message": str(exc),
                 "independent_readback": False,
+                "no_mutation": exc.details.get("no_mutation") is True,
             }
-            status, external_id = "ambiguous", None
+            status = "failed" if observation["no_mutation"] else "ambiguous"
+            external_id = None
         receipt = {
             "schema_version": 1,
             "record_type": "action_receipt",
