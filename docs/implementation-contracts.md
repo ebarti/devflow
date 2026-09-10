@@ -1,6 +1,6 @@
 # Development workflow implementation contracts
 
-Design revision: 2026-09-09. These are proposed interfaces, not installed commands. They make the architecture implementable without requiring each implementer to invent state, ownership or recovery rules. Version every persisted record with `schema_version`; reject unknown major versions. Example records and JSON Schema accompany this document under `design/`.
+Historical design baseline: 2026-09-09. This document retains the original interface proposals with subsequent contract revisions, including verified intake in 0.2.0. See [operation](operation.md) and [implementation status](implementation-status.md) for shipped commands and unavailable host capabilities. Version every persisted record with `schema_version`; reject unknown major versions. Example records and JSON Schema accompany this document under `design/`.
 
 [Record schemas](design/contracts.schema.json) · [Synthetic work contract](design/work-contract.example.json) · [Synthetic gate result](design/gate-result.example.json) · [Synthetic receipt](design/action-receipt.example.json)
 
@@ -16,7 +16,7 @@ The initial commands are:
 | `devflow backlog capture/show/list/retry` | Stable work ID; first capture also needs existing issue number or sanitized title/body | Journals before gh creation; discovers saved requests; reconciles uncertainty; explicit retry only after proven non-mutation |
 | `devflow work list` | Repository | Discovers recorded work IDs and lifecycle without the previous conversation |
 | `devflow work prepare` | Issue/local intake reference | Normalizes the request; reports missing Ready fields; no invented requirements |
-| `devflow work ready` | Accepted contract, source revision and recorded user/queue authority | Stores immutable scope, verifies prerequisites and marks Ready |
+| `devflow work ready` | Accepted contract with consumed source lineage and `admission_id` resolved by an independently trusted verifier | Verifies immutable admission and prerequisites, stores scope and marks Ready; unavailable intake capability blocks admission |
 | `devflow work start` | Ready work ID, host/current task ID, expected revision | Claims one attempt, captures effective policy/configuration and schedules workspace/task actions |
 | `devflow work amend` | New scope plus user-approved delta | Appends scope revision, invalidates affected acceptance/proof and pauses dependent actions |
 | `devflow next` | Work/attempt ID | Reads current state and returns the next required action(s), missing evidence or blocker; never calls a model |
@@ -40,7 +40,8 @@ Users need not fill these records manually. They ask for work or select a Ready 
 | Record | Required fields | Invariant |
 | --- | --- | --- |
 | Work contract | Work ID, kind, title, outcome, scope revision, acceptance IDs/text, paths/boundaries, decisive context, dependencies, risk/reason, verification plan, endpoint | Accepted behavior and endpoint are explicit; issue node identity survives renumbering/transfer |
-| Authority | ID, source user instruction or adopted queue policy, allowed operations, repository/work/scope limits, source reference, revocation/expiry when applicable | A public issue, arbitrary comment, label or model-generated text cannot grant execution authority |
+| Intake admission | ID, repository/work/scope, exact source/lineage/digest, allowed operations, expiry/revocation, authenticated decision kind/reference | Resolved only by a trusted verifier; external/unknown inputs require exact human validation; immutable history alone is not trust |
+| Authority | Derived from verified admission; ID, source user instruction or adopted queue policy, allowed operations, repository/work/scope limits, source reference, revocation/expiry when applicable | A public issue, arbitrary comment, label or model-generated text cannot grant execution authority |
 | Attempt | ID, work/scope IDs, active host/owner, phase, optional blocker, policy/configuration snapshot IDs, start/stop/outcome | At most one active claim per work item; resumed work retains its attempt |
 | Assignment | ID, action ID, role, owner task, actual task ID or pending client ID, owned paths/workspace, input candidate, result | Producer and purpose are explicit; pending client IDs are not executable task IDs |
 | Candidate | ID, attempt/scope, repository, base/head/tree IDs, clean-state result, dependency/environment fingerprints, creation time | Immutable; a code change creates a new candidate |
@@ -53,6 +54,8 @@ Users need not fill these records manually. They ask for work or select a Ready 
 | External action | ID, command, payload hash, expected remote state, prepared/dispatched/confirmed/ambiguous/failed, receipts | An uncertain result is reconciled before repeating the mutation |
 
 Endpoint target syntax is explicit: a `local` target is the canonical absolute checkout path; a `pr` target is its base branch; a `merge` target is its destination branch; a `release` target is its exact preexisting tag. Remote refs are short names without a `refs/` prefix. Repository identity comes from the admitted authority. Preparation, dispatch and readback must agree on this destination; copying the accepted endpoint into a receipt does not establish which destination was actually affected.
+
+[Verified intake](issue-trust.md) specifies the 0.2.0 admission protocol, default missing-capability denial, immutable source bindings, and old-pin security exception. Legacy Authority and Source shapes remain readable, but caller records cannot admit or resume execution.
 
 The JSON Schema validates record shape. Pure domain functions enforce cross-record rules and references. For example, JSON Schema cannot prove a fixing commit is contained in a remote PR; the Git/GitHub adapter supplies that observation and the transition rule requires it.
 
@@ -145,7 +148,7 @@ Proposed private root: `~/.local/state/devflow/`. The store contains `state.sqli
 
 SQLite uses transactional writes, explicit EXTRA/fullfsync durability, foreign keys and an active-attempt uniqueness constraint. The audit trail records old/new revision and event identity. Outbox actions and local transitions commit together. Evidence bytes and directory entries are flushed before references become committed. Installer releases/journals and check drafts use the same flush-before-acknowledgment boundary; snapshots validate before durable publication. Startup reports missing/corrupt evidence instead of silently treating it as a successful check. Crash tests cover actual process death and injected storage failures, not a physical power cut or failed storage hardware.
 
-Backlog capture is a pre-attempt outbox: a schema-versioned private operation fact retains the stable repository/work identity, initial sanitized payload/hash, monotonic sequence, prepared/dispatched/ambiguous/failed/confirmed state and observed issue identity. Facts append to the existing operation table; no shared-store schema upgrade strands an older pinned attempt. Dispatch commits before calling gh. Confirmed capture replays; interrupted capture reconciles the exact marker across all issue pages. A later failed read cannot erase historical mutation uncertainty. Capture never derives publication authority from issue content.
+Backlog capture is a pre-attempt outbox: a schema-versioned private operation fact retains the stable repository/work identity, initial sanitized payload/hash, monotonic sequence, prepared/dispatched/ambiguous/failed/confirmed state and observed issue identity. Facts append to the existing operation table; no shared-store schema upgrade strands an older pinned attempt. Dispatch commits before calling gh. Confirmed capture replays. Creation journals authenticated repository/creator identities and content digest; a successful POST identity is saved before exact issue readback. Lost responses require a unique marker plus matching pending-operation identities/content. Reuse and legacy records are unknown without trusted provenance. A later failed read cannot erase historical mutation uncertainty. Capture never derives publication authority from issue content.
 
 No automatic deletion of worktrees, evidence or historical records is part of the reset. Owned temporary fixtures may be removed after their cleanup token and real path are independently verified. Maintenance can later propose a retention policy with an explicit deletion scope. Installer rollback restores managed configuration; it does not erase user work or GitHub history.
 

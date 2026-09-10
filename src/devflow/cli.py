@@ -73,8 +73,12 @@ def parser() -> argparse.ArgumentParser:
 
 def _service(args):
     from devflow.application.commands import WorkflowService
+    from devflow.profiles import load_profile
 
-    return WorkflowService(args.state_dir)
+    repository = None
+    if (args.repository / ".devflow").exists():
+        repository = load_profile(args.repository).repository["repository"]["id"]
+    return WorkflowService(args.state_dir, repository=repository)
 
 
 def _state(service, request, args):
@@ -96,6 +100,9 @@ def _doctor(args):
         "state_exists": (args.state_dir / "state.sqlite3").exists(),
         "native_host": "owner-provided native task tools required",
         "automatic_merge": "requires live protection and adapter conformance",
+        "execution_admission": "trusted_intake_unavailable",
+        "human_validation": "human_validation_unavailable",
+        "execution_enabled": False,
     }
     try:
         profile = load_profile(args.repository)
@@ -111,7 +118,7 @@ def _doctor(args):
             profile, state_dir=args.state_dir, work_id=args.work_id, release_root=args.release_root
         )
         result["selected_runtime"] = runtime or "current pinned release"
-        result["status"] = "PASS" if all(tools.values()) else "BLOCKED"
+        result["status"] = "BLOCKED"
     except WorkflowError as exc:
         result.update({"status": "BLOCKED", "profile": exc.as_dict()})
     return result
@@ -234,23 +241,44 @@ def dispatch(args) -> dict:
             raise WorkflowError("work_mismatch", "Flag and request work identities differ")
         request["work_id"] = args.work_id
     command = args.command + ("." + args.action if args.action else "")
+    if args.command not in {
+        "doctor", "backlog", "work", "next", "candidate", "check", "gate", "finding",
+        "fix", "action", "assignment", "host", "artifact", "profile", "usage", "outcome",
+        "report", "install", "validate", "deliver", "workspace", "snapshot", "segment", "evidence",
+    }:
+        raise WorkflowError("unknown_command", "Unknown workflow command")
     if command == "doctor":
         return _doctor(args)
-    if args.command not in {"install", "profile", "usage", "report", "validate", "artifact"}:
-        from devflow.profiles import load_profile
-        from devflow.runtime import selected_runtime
+    from devflow.admission import BOOKKEEPING, READ_ONLY
 
-        needs_enrollment = command not in {"work.prepare", "work.show", "next", "host.prepare", "host.record", "host.wait", "host.result", "host.reconcile"}
-        if needs_enrollment or (args.repository / ".devflow").exists():
-            runtime = selected_runtime(
-                load_profile(args.repository),
-                state_dir=args.state_dir,
-                work_id=request.get("work_id"),
-                release_root=args.release_root,
-            )
-            if runtime:
-                os.execvp(runtime[0], runtime + args.original_argv)
+    service = None
+    if command not in BOOKKEEPING | READ_ONLY | {"backlog.capture", "backlog.retry", "action.dispatch"}:
+        service = _service(args)
+        service.preflight(command, request)
+    # Security exception to attempt-pin retention: this entry point never execs
+    # an older runtime. Safe recovery uses the current reader; new execution must
+    # pass current admission even when the historical attempt has an older pin.
+    if args.command not in {"install", "profile", "usage", "report", "validate", "artifact", "host"}:
+        from devflow.profiles import load_profile
+
+        if command not in {"work.prepare", "work.show", "next"} or (args.repository / ".devflow").exists():
+            load_profile(args.repository)
     if args.command == "host":
+        if args.action == "prepare":
+            state = _state(service, request, args)
+            assignment = request["assignment"]
+            action = state["actions"].get(assignment.get("action_id"))
+            if (
+                state["assignments"].get(assignment.get("assignment_id")) != assignment
+                or not action or action["operation"] != "launch_role"
+            ):
+                raise WorkflowError("assignment_mismatch", "Native launch needs its current recorded assignment")
+            service.require_action_dispatch(state, action, request.get("expected_revision"))
+            if (
+                assignment.get("attempt_id") != state["attempt"]["attempt_id"]
+                or assignment.get("candidate_id") != state["candidate_id"]
+            ):
+                raise WorkflowError("assignment_mismatch", "Native launch needs its current recorded assignment")
         return _host(args.action, request)
     if args.command == "install":
         return _installation(args.action, request, args)
@@ -285,7 +313,7 @@ def dispatch(args) -> dict:
         from devflow.metrics import quality_report
 
         return quality_report(request["works"], cutoff=request["cutoff"])
-    service = _service(args)
+    service = service or _service(args)
     if args.command == "backlog":
         from devflow.adapters.git import GitRepository
         from devflow.backlog import capture

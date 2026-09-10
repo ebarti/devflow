@@ -17,8 +17,6 @@ from devflow.adapters.git import GitRepository
 from devflow.adapters.github import GitHubRepository
 from devflow.domain.endpoints import TARGET_FIELD, validate_action_target
 from devflow.domain.rules import (
-    PERMISSIONS,
-    authority,
     blocking_findings,
     missing_checks,
     missing_scenarios,
@@ -388,25 +386,24 @@ def dispatch_action(
                 "revision": state["revision"],
                 "receipt_id": action["receipts"][-1],
             }
-        if action["operation"] in {"launch_role", "send_role", "prepare_workspace"}:
+        reconcile = action["status"] in {"dispatched", "ambiguous", "pending_setup"}
+        native = action["operation"] in {"launch_role", "send_role", "prepare_workspace"}
+        if native and reconcile:
+            # Recovery is safe even after cancellation or a scope/candidate change;
+            # never return an executable intent for an uncertain native operation.
+            return {
+                "action_id": action_id, "status": action["status"], "reconcile_only": True,
+                "reason": "Read native task/workspace state; never repeat an uncertain creation",
+            }
+        service.require_action_dispatch(
+            state, action, request.get("expected_revision"), reconcile=reconcile
+        )
+        if native:
             return {
                 "action": action,
                 "requires_native_owner": True,
                 "reason": "Use native task tools or workspace register, then record actual receipt",
             }
-        if action["status"] == "invalidated":
-            raise WorkflowError("stale_action", "Action was invalidated")
-        if action["status"] == "failed":
-            raise WorkflowError(
-                "retry_required", "Use action retry to re-admit a definitely failed action"
-            )
-        if state["revision"] != request["expected_revision"]:
-            raise WorkflowError("stale_revision", "Work changed before action dispatch")
-        if action["payload"]["scope_hash"] != state["scope_hash"] or (
-            action["payload"]["candidate_id"] != state["candidate_id"]
-        ):
-            raise WorkflowError("stale_action", "Action scope or candidate changed")
-        authority(state, datetime.now(UTC), PERMISSIONS[action["operation"]])
         validate_action_target(
             state,
             action["operation"],

@@ -104,3 +104,70 @@ def test_post_write_readback_rejection_remains_ambiguous_until_observed(tmp_path
     server.deny = False
     result = dispatch(scenario, action, server)
     assert result["status"] == "confirmed" and server.merge_count == 1
+
+
+def test_unavailable_intake_can_reconcile_an_uncertain_write_without_redispatch(tmp_path):
+    from devflow.application.commands import WorkflowService
+
+    class LostReadback(Server):
+        deny = True
+
+        def runner(self, argv, **kwargs):
+            method = argv[argv.index("--method") + 1]
+            if self.merge_count and method == "GET" and self.deny:
+                raise WorkflowError("github_forbidden", "Synthetic read denied", {"http_status": 403})
+            return super().runner(argv, **kwargs)
+
+    server = LostReadback()
+    scenario, action = prepared(tmp_path, server)
+    assert dispatch(scenario, action, server)["status"] == "ambiguous"
+    scenario.service = WorkflowService(scenario.service.store.root)
+    server.deny = False
+    assert dispatch(scenario, action, server)["status"] == "confirmed"
+    assert server.merge_count == 1
+    assert scenario.service.next(scenario.work_id)["actions"][-1]["reason"] == "trusted_intake_unavailable"
+
+
+def test_work_blocker_prevents_supported_nonterminal_external_write(tmp_path):
+    class StatusServer(Server):
+        def route(self, method, endpoint, payload):
+            if method == "POST" and endpoint == f"repos/fixture/repo/statuses/{HEAD}":
+                self.writes.append(("status", payload))
+                status = {"id": 3, **payload}
+                self.statuses.insert(0, status)
+                return status
+            return super().route(method, endpoint, payload)
+
+    server = StatusServer()
+    scenario, _ = prepared(tmp_path, server)
+    action = scenario.call("action.prepare", operation="publish_status", payload={
+        "state": "pending", "binding_hash": proof_binding(scenario.state),
+    })["action"]
+    blocker = {"code": "missing_input", "reason": "Synthetic required input",
+               "next_action": "Request synthetic decision"}
+    scenario.call("work.block", blocker=blocker)
+    with pytest.raises(WorkflowError) as caught:
+        dispatch(scenario, action, server)
+    assert caught.value.code == "blocked_work"
+    assert server.writes == []
+    assert scenario.state["actions"][action["action_id"]]["status"] == "prepared"
+    assert scenario.service.next(scenario.work_id)["actions"] == [
+        {"kind": "request_user_action", "blocker": blocker}]
+
+
+def test_work_blocker_preserves_external_reconciliation_and_confirmed_replay(tmp_path):
+    server = Server()
+    scenario, _ = prepared(tmp_path, server)
+    binding = proof_binding(scenario.state)
+    action = scenario.call("action.prepare", operation="publish_status", payload={
+        "state": "pending", "binding_hash": binding,
+    })["action"]
+    scenario.call("action.begin", action_id=action["action_id"])
+    server.statuses[0].update(state="pending", description="devflow:" + binding)
+    blocker = {"code": "missing_input", "reason": "Synthetic required input",
+               "next_action": "Request synthetic decision"}
+    scenario.call("work.block", blocker=blocker)
+    assert dispatch(scenario, action, server)["status"] == "confirmed"
+    assert dispatch(scenario, action, server)["status"] == "confirmed"
+    assert server.writes == []
+    assert scenario.state["blocker"] == blocker

@@ -35,6 +35,9 @@ The package is installed as a pinned local tool and a managed skill. The install
 
 ## 3. Who owns each fact
 
+Security revision (0.2.0): [verified intake](issue-trust.md) owns the authenticated admission boundary. Authority is derived from one immutable admission resolved by a constructor-injected trusted verifier. The shipped CLI has no such host capability and blocks execution, including old pinned attempts. Source lineage and exact consumed material survive owned issue projections; neither issue authorship nor host-supplied JSON authenticates a human.
+
+
 | Fact | Source of truth | Other representations |
 | --- | --- | --- |
 | Requested behavior, acceptance and public bug evidence | GitHub issue, identified by host/repository/node ID | Immutable admitted revision in the private execution store |
@@ -132,12 +135,12 @@ Report cost in tokens, API-equivalent USD and estimated Codex credits, with sepa
 
 A clean switch is the goal. Install the new package under a pinned version, prepare the repository profile, migrate work records, verify the full contract, then activate one workflow owner. Do not leave old and new dispatch policy simultaneously active.
 
-For enrolled repositories, replace current review/fix procedure definitions with thin routes to the shared package. A host-global compatibility entry resolves repository identity and its active attempt/version first: enrolled pinned work uses devflow; non-enrolled repositories and draining legacy attempts use the frozen legacy package with their existing settings. Keep global native role definitions available for those legacy consumers; devflow's visible role tasks use its own references plus the user's resolved role settings. This is one active authority per attempt, not a global switch imposed on every repository.
+For enrolled repositories, replace current review/fix procedure definitions with thin routes to the shared package. A host-global compatibility entry resolves repository identity and its active attempt/version first: enrolled pinned work uses devflow; non-enrolled repositories use the frozen legacy package with their existing settings. For enrolled work, the 0.2.0 security exception blocks old-pin execution until current verified re-admission. Keep global native role definitions available for those legacy consumers; devflow's visible role tasks use its own references plus the user's resolved role settings. This is one active authority per attempt, not a global switch imposed on every repository.
 
 Retain the useful review rubric and regression knowledge as targeted references. Replace mandatory per-PR hidden workers with one outcome owner and visible independent verification. Reduce enrolled repositories' AGENTS to project facts, data/authority invariants and routing. Convert QA documentation into a short router plus the detailed owning catalog, and the Markdown backlog into an index of canonical issues and preserved decision history.
 
 Shared Codex/Claude definitions require a consumer-aware migration. Before changing a shared target, snapshot its current bytes and references. Non-migrated consumers remain bound to that frozen legacy package; Codex moves to the new package. Remove retired Codex entry points and duplicate active definitions, but do not break another consumer's symlink. Adoption by other repositories or hosts is explicit.
 
-Drain already-running legacy work or explicitly reconcile and transfer it. New work uses the pinned workflow version; existing attempts never acquire new instructions silently. Rollback restores managed links/config and repository profile refs from the install manifest, preserves new work/evidence, and stops new admissions while compatibility is checked. Product commits and published review history are never undone as an installer rollback.
+Reconcile legacy work and retain its historical snapshots. For enrolled work, the explicit 0.2.0 security change blocks further old-pin execution and requires verified re-admission; it does not silently rewrite historical instructions. Rollback restores managed links/config and repository profile refs from the install manifest, preserves new work/evidence, and stops new admissions while compatibility is checked. Product commits and published review history are never undone as an installer rollback.
 
 The implementation plan specifies package files, repository edits, migration accounting and acceptance tests. A completed design is not a verified runtime. JobHunter adoption must prove task visibility, native-tool handoffs, finding closure, interrupted recovery, real product-path checks, deterministic accounting and instruction removal before ordinary work is called stabilized.

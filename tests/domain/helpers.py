@@ -1,10 +1,15 @@
 """Synthetic test records; never points at a real repository or host task."""
 
 import itertools
+import json
+from contextlib import closing
+from copy import deepcopy
 from datetime import datetime, timezone
 
 from devflow.application.commands import WorkflowService
 from devflow.domain.rules import input_signature, scope_hash
+from devflow.errors import WorkflowError
+from devflow.validation import digest
 
 H = "a" * 64
 SHA = "b" * 40
@@ -15,16 +20,79 @@ def record(record_type, **fields):
     return {"schema_version": 1, "record_type": record_type, **fields}
 
 
+def synthetic_source(source):
+    """Fabricated local provenance for regression fixtures, never a real host receipt."""
+    source.setdefault("lineage", [{
+        "kind": "local_intake", "repository_id": "synthetic-repository-id",
+        "source_id": source["stable_id"], "creator_id": "synthetic-human-id",
+        "revision": "synthetic-1", "content_digest": digest("synthetic input"), "origin": "internal",
+    }])
+    source["consumed_digest"] = digest(source["lineage"])
+    return source
+
+
+class SyntheticVerifier:
+    """Test-only decision controller. No CLI flag or production adapter selects it."""
+
+    def __init__(self):
+        self.decisions = {}
+
+    def resolve(self, admission_id):
+        if admission_id not in self.decisions:
+            raise WorkflowError("human_validation_unavailable", "No synthetic decision registered")
+        return deepcopy(self.decisions[admission_id])
+
+    def admit(self, contract, auth, *, decision_kind="trusted_first_party"):
+        admission = record(
+            "intake_admission", admission_id=auth["authority_id"],
+            source=deepcopy(contract["source"]), source_digest=digest(contract["source"]),
+            decision_kind=decision_kind, decision_reference=auth["source_reference"],
+            **{key: auth[key] for key in (
+                "repository", "work_id", "scope_hash", "allowed_operations", "expires_at", "revoked"
+            )},
+        )
+        self.decisions[admission["admission_id"]] = admission
+        return admission
+
+
+class SyntheticWorkflowService(WorkflowService):
+    """Legacy regression setup only: explicitly mint synthetic controller fixtures.
+
+    Rehydrating fake decisions from test state is deliberately not production trust.
+    Security tests use WorkflowService + separately registered SyntheticVerifier.
+    """
+
+    def __init__(self, path):
+        verifier = SyntheticVerifier()
+        super().__init__(path, trusted_verifier=verifier)
+        with closing(self.store.connect()) as db:
+            for row in db.execute("SELECT payload FROM records WHERE record_key LIKE 'intake_admission:%'"):
+                admission = json.loads(row[0])
+                verifier.decisions[admission["admission_id"]] = admission
+                self.repository = admission["repository"]
+
+    def execute(self, command, request):
+        if command in {"work.ready", "work.amend"} and "authority" in request:
+            contract, auth = request["record"], request["authority"]
+            self.repository = auth["repository"]
+            if "lineage" not in contract["source"]:
+                synthetic_source(contract["source"])
+                auth["scope_hash"] = scope_hash(contract)
+            admission = self.trusted_verifier.admit(contract, auth)
+            request = {**request, "admission_id": admission["admission_id"]}
+        return super().execute(command, request)
+
+
 def contract(work_id="synthetic-work", tier=0, endpoint="local"):
     return record(
         "work_contract",
         work_id=work_id,
         scope_revision=1,
-        source={
+        source=synthetic_source({
             "kind": "local_intake",
             "reference": "synthetic:user:instruction",
             "stable_id": work_id,
-        },
+        }),
         kind="editorial" if tier == 0 else "feature",
         title="Synthetic outcome",
         outcome="Synthetic invariant remains true",
@@ -97,7 +165,7 @@ class Scenario:
         scenarios=None,
         repository="synthetic/repository",
     ):
-        self.service = WorkflowService(path)
+        self.service = SyntheticWorkflowService(path)
         self.work_id = work_id
         self.repository = repository
         self.sequence = itertools.count()
