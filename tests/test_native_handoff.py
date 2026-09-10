@@ -58,7 +58,7 @@ def host_prepare(scenario, assignment, revision, tmp_path, monkeypatch, capsys):
 @pytest.mark.parametrize("change,code", [
     ("cancel", "invalid_state"), ("amend", "stale_action"),
     ("fail", "retry_required"), ("revision", "stale_revision"),
-    ("candidate", "stale_action"),
+    ("candidate", "stale_action"), ("block", "blocked_work"),
 ])
 def test_native_handoff_requires_current_executable_action(
     tmp_path, monkeypatch, capsys, entry, change, code
@@ -72,6 +72,11 @@ def test_native_handoff_requires_current_executable_action(
         scenario.confirm(action, status="failed", external_id=None, observation={"no_mutation": True})
     elif change == "candidate":
         scenario.candidate()
+    elif change == "block":
+        scenario.call("work.block", blocker={
+            "code": "missing_input", "reason": "Synthetic required input",
+            "next_action": "Request synthetic decision",
+        })
     revision = scenario.state["revision"] - (change == "revision")
     if entry == "dispatch":
         with pytest.raises(WorkflowError) as caught:
@@ -100,7 +105,7 @@ def test_current_native_handoff_remains_available_with_synthetic_admission(
 
 
 @pytest.mark.parametrize("status", ["dispatched", "ambiguous", "pending_setup"])
-@pytest.mark.parametrize("change", ["cancel", "amend"])
+@pytest.mark.parametrize("change", ["cancel", "amend", "block"])
 def test_uncertain_native_operations_remain_recovery_only_after_stop_or_amendment(
     tmp_path, status, change
 ):
@@ -111,10 +116,66 @@ def test_uncertain_native_operations_remain_recovery_only_after_stop_or_amendmen
         scenario.confirm(action, status=status, external_id=None)
     if change == "cancel":
         scenario.call("work.cancel", authority_reference="synthetic:stop")
-    else:
+    elif change == "amend":
         amend(scenario)
+    else:
+        scenario.call("work.block", blocker={
+            "code": "missing_input", "reason": "Synthetic required input",
+            "next_action": "Request synthetic decision",
+        })
     scenario.service = WorkflowService(scenario.service.store.root)
     result = dispatch(scenario, action, revision=0)
     assert result["reconcile_only"] is True
     assert result["status"] == status
     assert not {"action", "native_tool", "requires_native_owner"} & result.keys()
+
+
+def test_blocked_work_suggests_only_recovery_and_the_outstanding_blocker(tmp_path):
+    scenario, prepared, _ = prepared_peer(tmp_path)
+    uncertain = scenario.call("action.prepare", operation="launch_role", payload={
+        "role": "implementation_worker", "purpose": "synthetic uncertain peer",
+    })["action"]
+    scenario.call("action.begin", action_id=uncertain["action_id"])
+    blocker = {"code": "missing_input", "reason": "Synthetic required input",
+               "next_action": "Request synthetic decision"}
+    scenario.call("work.block", blocker=blocker)
+    actions = scenario.service.next(scenario.work_id)["actions"]
+    assert actions == [
+        {"kind": "reconcile_action", "action": scenario.state["actions"][uncertain["action_id"]]},
+        {"kind": "request_user_action", "blocker": blocker},
+    ]
+    assert scenario.state["actions"][prepared["action_id"]]["status"] == "prepared"
+    with pytest.raises(WorkflowError) as caught:
+        scenario.call("action.begin", action_id=prepared["action_id"])
+    assert caught.value.code == "blocked_work"
+    assert scenario.state["actions"][prepared["action_id"]]["status"] == "prepared"
+
+
+def test_multiple_failed_actions_can_be_readmitted_without_waiving_the_blocker(tmp_path):
+    scenario, first, _ = prepared_peer(tmp_path)
+    second = scenario.call("action.prepare", operation="launch_role", payload={
+        "role": "implementation_worker", "purpose": "synthetic second failure",
+    })["action"]
+    for action in (first, second):
+        scenario.confirm(action, status="failed", external_id=None, observation={"no_mutation": True})
+    scenario.call("action.retry", action_id=first["action_id"])
+    assert scenario.state["blocker"]["code"] == "action_failed"
+    with pytest.raises(WorkflowError) as caught:
+        dispatch(scenario, first, scenario.state["revision"])
+    assert caught.value.code == "blocked_work"
+    scenario.call("action.retry", action_id=second["action_id"])
+    assert scenario.state["blocker"] is None
+    assert dispatch(scenario, first, scenario.state["revision"])["requires_native_owner"] is True
+
+
+def test_failed_action_retry_does_not_clear_unrelated_user_blocker(tmp_path):
+    scenario, action, _ = prepared_peer(tmp_path)
+    scenario.confirm(action, status="failed", external_id=None, observation={"no_mutation": True})
+    blocker = {"code": "missing_input", "reason": "Synthetic required input",
+               "next_action": "Request synthetic decision"}
+    scenario.call("work.block", blocker=blocker)
+    scenario.call("action.retry", action_id=action["action_id"])
+    assert scenario.state["blocker"] == blocker
+    with pytest.raises(WorkflowError) as caught:
+        dispatch(scenario, action, scenario.state["revision"])
+    assert caught.value.code == "blocked_work"

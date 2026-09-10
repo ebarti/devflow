@@ -168,6 +168,12 @@ def active(state):
     return state["attempt"]
 
 
+def unblocked(state):
+    require(
+        state["blocker"] is None, "blocked_work", "Resolve the work blocker before new execution"
+    )
+
+
 def current_candidate(state, identity=None):
     require(
         state["candidate_id"] is not None, "missing_candidate", "Record a clean candidate first"
@@ -414,6 +420,11 @@ def next_actions(state):
         for a in state["actions"].values()
         if a["status"] in {"prepared", "ambiguous", "pending_setup", "dispatched"}
     ]
+    if state["blocker"] is not None:
+        return [
+            {"kind": "reconcile_action", "action": action}
+            for action in pending if action["status"] != "prepared"
+        ] + [{"kind": "request_user_action", "blocker": state["blocker"]}]
     if pending:
         return [
             {
@@ -435,8 +446,6 @@ def next_actions(state):
             }
             for a in pending
         ]
-    if state["blocker"]:
-        return [{"kind": "request_user_action", "blocker": state["blocker"]}]
     if state["lifecycle"] == "ready":
         return [{"kind": "prepare_workspace", "reason": "Start the authorized attempt"}]
     if not state["candidate_id"]:
@@ -1479,6 +1488,7 @@ def transition(original, command, request, now, dependency_states=None, *,
                 "reconcile_required",
                 "Already dispatched or uncertain actions must be reconciled without repeating the mutation",
             )
+            unblocked(state)
             validate_action_admission(state, action, now)
             action["status"] = "dispatched"
             details["action"] = action

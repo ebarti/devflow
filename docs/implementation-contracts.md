@@ -1,6 +1,6 @@
 # Development workflow implementation contracts
 
-Design revision: 2026-09-09. These are proposed interfaces, not installed commands. They make the architecture implementable without requiring each implementer to invent state, ownership or recovery rules. Version every persisted record with `schema_version`; reject unknown major versions. Example records and JSON Schema accompany this document under `design/`.
+Historical design baseline: 2026-09-09. This document retains the original interface proposals with subsequent contract revisions, including verified intake in 0.2.0. See [operation](operation.md) and [implementation status](implementation-status.md) for shipped commands and unavailable host capabilities. Version every persisted record with `schema_version`; reject unknown major versions. Example records and JSON Schema accompany this document under `design/`.
 
 [Record schemas](design/contracts.schema.json) · [Synthetic work contract](design/work-contract.example.json) · [Synthetic gate result](design/gate-result.example.json) · [Synthetic receipt](design/action-receipt.example.json)
 
@@ -16,7 +16,7 @@ The initial commands are:
 | `devflow backlog capture/show/list/retry` | Stable work ID; first capture also needs existing issue number or sanitized title/body | Journals before gh creation; discovers saved requests; reconciles uncertainty; explicit retry only after proven non-mutation |
 | `devflow work list` | Repository | Discovers recorded work IDs and lifecycle without the previous conversation |
 | `devflow work prepare` | Issue/local intake reference | Normalizes the request; reports missing Ready fields; no invented requirements |
-| `devflow work ready` | Accepted contract, source revision and recorded user/queue authority | Stores immutable scope, verifies prerequisites and marks Ready |
+| `devflow work ready` | Accepted contract with consumed source lineage and `admission_id` resolved by an independently trusted verifier | Verifies immutable admission and prerequisites, stores scope and marks Ready; unavailable intake capability blocks admission |
 | `devflow work start` | Ready work ID, host/current task ID, expected revision | Claims one attempt, captures effective policy/configuration and schedules workspace/task actions |
 | `devflow work amend` | New scope plus user-approved delta | Appends scope revision, invalidates affected acceptance/proof and pauses dependent actions |
 | `devflow next` | Work/attempt ID | Reads current state and returns the next required action(s), missing evidence or blocker; never calls a model |

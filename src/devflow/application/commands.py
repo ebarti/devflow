@@ -14,7 +14,15 @@ from devflow.admission import (
     UnavailableIntakeVerifier,
     execution_admission,
 )
-from devflow.domain.rules import PERMISSIONS, active, authority, blank, next_actions, transition
+from devflow.domain.rules import (
+    PERMISSIONS,
+    active,
+    authority,
+    blank,
+    next_actions,
+    transition,
+    unblocked,
+)
 from devflow.errors import WorkflowError
 from devflow.validation import canonical_json, digest, validate_record
 
@@ -70,6 +78,7 @@ class WorkflowService:
                 raise WorkflowError("invalid_state", "Action needs its current active attempt")
             if action["status"] != "prepared":
                 raise WorkflowError("reconcile_required", "Uncertain actions permit recovery only")
+            unblocked(state)
             permission = PERMISSIONS[action["operation"]]
             self.require_execution(state, operation=permission)
             authority(state, datetime.now(timezone.utc), permission)

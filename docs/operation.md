@@ -57,7 +57,7 @@ Technical fix observations precede the final gate. `finding fix` requires candid
 
 ## External actions and delivery
 
-Persist `action prepare` before publication, then `action dispatch` for supported GitHub operations. Endpoint operations originate from `deliver` preparation, which validates current proof before creating their intent. The dispatcher marks an action dispatched before the external call and serializes one action writer. A restarted dispatched/ambiguous action performs reconciliation reads, not a blind second mutation.
+Persist `action prepare` before publication, then `action dispatch` for supported GitHub operations. Endpoint operations originate from `deliver` preparation, which validates current proof before creating their intent. The dispatcher marks an action dispatched before the external call and serializes one action writer. A restarted dispatched/ambiguous action performs reconciliation reads, not a blind second mutation. Unresolved work blockers pause new external/native dispatch and `action begin`; `next` lists only recovery and the blocker, while read-only reconciliation and eligible failed-action retries remain available.
 
 A definite rejection with recorded proof that no mutation could have applied is `failed`. After correcting the prerequisite, `action retry` explicitly re-admits the same action against current authority, candidate and evidence while retaining its receipts. Merely choosing a new action ID does not bypass recovery. A successful or uncertain earlier write in a multi-step action prevents this retry route; read-only reconciliation remains required.
 
