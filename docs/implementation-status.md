@@ -1,8 +1,8 @@
 # Initial package implementation status
 
-This page records the reusable package boundary as of 2026-09-09. The [implementation plan](implementation-plan.md) remains the target for the complete rollout. Package publication and repository adoption are separate steps; no JobCtrl cutover is implied.
+This page records the reusable package boundary as of 2026-09-10. The [implementation plan](implementation-plan.md) remains the target for the complete rollout. Package publication and repository adoption are separate steps; no JobCtrl cutover is implied.
 
-Security update 0.2.0: current admission and dispatch deny caller-asserted authority, preserve exact source lineage, and prevent old-pin delegation. The trusted-verifier protocol is exercised with synthetic decisions; **no authenticated production intake/human-validation adapter exists, so managed execution remains blocked**. Capture/readback and safe recovery remain available. See [verified intake](issue-trust.md).
+Conversational intake update 0.3.0 replaces the mandatory independent host verifier with agent-recorded user requests. Direct requests, bug reports/investigations, named issues and bounded current backlog selections can proceed without another approval channel. Immutable scope/source/operation bindings, capture/readback, old-pin protection and safe recovery remain. This is workflow consistency, not independently authenticated human approval. CLI lifecycle proof without a synthetic verifier is tracked separately from the native and protected-delivery gates below; those gates are not satisfied by admission alone. See [conversational intake](issue-trust.md).
 
 ## Implemented package surfaces
 

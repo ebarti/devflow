@@ -2270,12 +2270,16 @@
         "decision_kind": {
           "enum": [
             "trusted_first_party",
-            "human_validation"
+            "human_validation",
+            "user_request"
           ]
         },
         "decision_reference": {
           "type": "string",
           "minLength": 1
+        },
+        "user_request": {
+          "$ref": "#/$defs/UserRequest"
         }
       },
       "required": [
@@ -2292,6 +2296,29 @@
         "source_digest",
         "decision_kind",
         "decision_reference"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "decision_kind": {
+                "const": "user_request"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "user_request"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "user_request"
+              ]
+            }
+          }
+        }
       ]
     },
     "Source": {
@@ -2395,6 +2422,45 @@
         "kind",
         "reference",
         "stable_id"
+      ]
+    },
+    "UserRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reference": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "allowed_operations": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "create_tasks",
+              "edit",
+              "check",
+              "publish_pr",
+              "publish_findings",
+              "push",
+              "merge",
+              "release",
+              "publish_status"
+            ]
+          }
+        }
+      },
+      "required": [
+        "reference",
+        "summary",
+        "allowed_operations"
       ]
     }
   }

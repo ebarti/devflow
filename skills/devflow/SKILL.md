@@ -1,15 +1,19 @@
 ---
 name: devflow
-description: Implement, review, verify, and deliver work in repositories enrolled in devflow, or manage an explicitly requested devflow workflow installation.
+description: Carry out requested repository work, including bug reports, fixes, reviews, named issues, and backlog batches in repositories enrolled in devflow, or manage an explicitly requested devflow installation. Ordinary questions do not start this workflow.
 ---
 
 # Devflow
 
-Use the repository's pinned workflow and the user's accepted outcome. Run `devflow doctor --repository <checkout> --json` first. Missing trusted intake/human validation blocks execution, including old attempts; never bypass it with an older runtime, caller approval flags, or issue labels. A missing profile does not authorize enrollment; follow the repository's existing workflow until adoption is authorized. Resolve version mismatches through a reviewed compatible release; an old pin cannot waive current admission.
+Use this skill when the user requests repository work. Their conversational request, concrete bug report, selected issue, or bounded backlog batch is sufficient authorization for that scope. The agent invokes devflow and fills its records; there is no separate human-validation step. Questions and opening a conversation do not start work.
 
-For existing work, use `devflow backlog list --json` and `devflow work list --json` to recover IDs when needed, then read `devflow work show --work-id <id> --json` and `devflow next --work-id <id> --json`. Continue its recorded attempt. Resolve interruptions and uncertain external actions before creating replacements. The CLI records facts and missing evidence; it does not make engineering judgments for you.
+Use the repository's pinned workflow and accepted outcome. Run `devflow doctor --repository <checkout> --json` once work is requested. Prefer the repository's `scripts/devflow` launcher when present; otherwise use the installed `devflow` command. A missing profile does not authorize enrollment; follow the repository's existing workflow until adoption is authorized. Resolve incompatible pins through a reviewed compatible release.
+
+When the user requests continuation of existing work, use `devflow backlog list --json` and `devflow work list --json` to recover IDs when needed, then read `devflow work show --work-id <id> --json` and `devflow next --work-id <id> --json`. Continue its recorded attempt. Resolve interruptions and uncertain external actions before creating replacements. The CLI records facts and missing evidence; it does not make engineering judgments for you.
 
 The ordinary path is request → reuse/create one short backlog issue → implement → applicable checks and gates → authorized delivery. Starting immediately does not skip issue capture. Follow-ups reuse its issue. Use `devflow backlog capture`, which journals the request around the existing GitHub CLI; no separate planning cycle is required. After interruption, rerun with the saved work ID; an uncertain creation gets readback before any replacement.
+
+For a bug, reproduce or localize the defect, trace its cause, and add meaningful regression proof before claiming it fixed. For a backlog batch, record the matching issue set and requested endpoint, reuse each existing issue, and work in dependency order. The same conversational request can cover every selected member; newly added labels do not create an indefinite queue.
 
 Read only the reference for your responsibility:
 

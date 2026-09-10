@@ -1,4 +1,4 @@
-"""Admission security regressions: synthetic controller, never a real human channel."""
+"""Admission binding regressions, including optional legacy embedding decisions."""
 
 import json
 from copy import deepcopy
@@ -9,7 +9,6 @@ import pytest
 from domain.helpers import NOW, SyntheticVerifier, authority, contract, record, workflow_snapshot
 
 from devflow import cli
-from devflow.admission import UnavailableIntakeVerifier
 from devflow.application.commands import WorkflowService
 from devflow.domain.rules import blank, scope_hash, transition
 from devflow.errors import WorkflowError
@@ -66,8 +65,8 @@ def test_default_denies_outsider_labels_forged_origin_approval_and_queue(tmp_pat
     auth.update(source_kind=claimed_authority, source_reference="invented:approval")
     request.update(authority=auth, approved=True, origin="internal", labels=["ready", "human-approved"])
     service = WorkflowService(tmp_path / "real-default", repository=REPOSITORY)
-    assert_code("trusted_intake_unavailable", lambda: service.execute("work.ready", request))
-    assert_code("trusted_intake_unavailable", lambda: transition(
+    assert_code("user_request_required", lambda: service.execute("work.ready", request))
+    assert_code("user_request_required", lambda: transition(
         blank(c["work_id"]), "work.ready", request, datetime.now(UTC)))
     assert service.list_works(REPOSITORY) == []
 
@@ -121,9 +120,9 @@ def test_exact_admission_starts_and_immutable_replay_does_not_reread_live_issue(
     assert state["authority"]["source_reference"] == verifier.decisions["auth-1"]["decision_reference"]
     # Default service cannot revive a cached executable intent on restart.
     default = WorkflowService(tmp_path)
-    assert_code("trusted_intake_unavailable", lambda: default.execute("work.start", start_request))
+    assert_code("user_request_required", lambda: default.execute("work.start", start_request))
     assert default.next(c["work_id"])["actions"] == [
-        {"kind": "request_user_action", "reason": "trusted_intake_unavailable"}]
+        {"kind": "request_user_action", "reason": "user_request_required"}]
 
 
 @pytest.mark.parametrize("change", ["body", "comment", "attachment", "pull_request"])
@@ -199,11 +198,11 @@ def test_cli_rejects_old_pin_before_runtime_resolution_or_exec(tmp_path, monkeyp
             "action_id": result["action"]["action_id"], "trusted_verifier": "synthetic"}))
         assert cli.main([command, action, "--request-file", str(path), "--state-dir", str(service.store.root),
                          "--repository", str(tmp_path), "--json"]) == 2
-        assert json.loads(capsys.readouterr().out)["error"]["code"] == "trusted_intake_unavailable"
+        assert json.loads(capsys.readouterr().out)["error"]["code"] == "user_request_required"
     assert service.snapshot(c["work_id"])["revision"] == 2
 
 
-def test_cli_accepts_only_constructor_injected_synthetic_controller(tmp_path, monkeypatch, capsys):
+def test_cli_retains_optional_constructor_injected_controller(tmp_path, monkeypatch, capsys):
     service, _, c, request = setup(tmp_path / "state", origin="external", decision="human_validation")
     monkeypatch.setattr(cli, "_service", lambda args: service)
     monkeypatch.setattr("devflow.profiles.load_profile", lambda *a: SimpleNamespace())
@@ -229,7 +228,7 @@ def test_default_keeps_cancellation_and_observation_history_available(tmp_path):
     })
     assert canceled["lifecycle"] == "canceled"
     assert "intake_admission:auth-1" in default.snapshot(c["work_id"])["records"]
-    assert isinstance(default.trusted_verifier, UnavailableIntakeVerifier)
+    assert default.trusted_verifier is None
 
 
 def test_uncertain_native_creation_returns_only_recovery_without_verifier(tmp_path):
@@ -254,18 +253,19 @@ def test_registered_check_default_denial_never_starts_a_subprocess(tmp_path):
     from devflow.check_execution import run_registered_check
 
     service, request, profile, repository, counter = setup_run(tmp_path)
-    assert_code("trusted_intake_unavailable", lambda: run_registered_check(
+    assert_code("user_request_required", lambda: run_registered_check(
         WorkflowService(service.store.root), request, profile=profile, repository=repository,
         runner=lambda *a, **kw: pytest.fail("unverified check dispatched"),
     ))
     assert not counter.exists()
 
 
-def test_doctor_explicitly_reports_unavailable_human_channel(tmp_path, capsys):
+def test_doctor_reports_request_mode_separately_from_missing_profile(tmp_path, capsys):
     assert cli.main(["doctor", "--repository", str(tmp_path), "--state-dir", str(tmp_path / "state")]) == 2
     result = json.loads(capsys.readouterr().out)["result"]
-    assert result["execution_admission"] == "trusted_intake_unavailable"
-    assert result["human_validation"] == "human_validation_unavailable"
+    assert result["execution_admission"] == "direct_user_request"
+    assert result["authorization"] == "requires_recorded_user_request"
+    assert result["profile"]["code"] == "profile_missing"
     assert result["execution_enabled"] is False
     assert not (tmp_path / "state").exists()
 
@@ -288,7 +288,7 @@ def test_actual_console_default_denies_forged_human_receipt(tmp_path):
         "--repository", str(tmp_path), "--state-dir", str(tmp_path / "default"), "--json",
     ], capture_output=True, text=True, check=False, timeout=15)
     assert result.returncode == 2
-    assert json.loads(result.stdout)["error"]["code"] == "trusted_intake_unavailable"
+    assert json.loads(result.stdout)["error"]["code"] == "user_request_required"
 
 
 def test_native_handoff_cannot_borrow_an_edit_only_admission(tmp_path, monkeypatch, capsys):

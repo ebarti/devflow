@@ -93,6 +93,19 @@ def _doctor(args):
     from devflow.runtime import selected_runtime
 
     tools = {name: shutil.which(name) is not None for name in ("git", "gh", "uv", "npx")}
+    capabilities = {
+        name: {
+            "ready": all(tools[tool] for tool in required),
+            "required_tools": required,
+            "missing_tools": [tool for tool in required if not tools[tool]],
+        }
+        for name, required in {
+            "local_execution": ["git"], "github_capture": ["git", "gh"],
+            "managed_launcher": ["uv"], "usage_collection": ["npx"],
+        }.items()
+    }
+    capabilities["local_execution"]["ready"] = False
+    capabilities["github_capture"].update(ready=False, applicable=False)
     result = {
         "package_version": __version__,
         "python": sys.version.split()[0],
@@ -100,12 +113,17 @@ def _doctor(args):
         "state_exists": (args.state_dir / "state.sqlite3").exists(),
         "native_host": "owner-provided native task tools required",
         "automatic_merge": "requires live protection and adapter conformance",
-        "execution_admission": "trusted_intake_unavailable",
-        "human_validation": "human_validation_unavailable",
+        "execution_admission": "direct_user_request",
+        "authorization": "requires_recorded_user_request",
         "execution_enabled": False,
+        "missing_tools": [name for name, available in tools.items() if not available],
+        "capabilities": capabilities,
     }
     try:
         profile = load_profile(args.repository)
+        capabilities["github_capture"]["applicable"] = (
+            profile.repository["repository"]["id"].startswith("github:")
+        )
         result.update(
             {
                 "profile": "valid",
@@ -114,13 +132,25 @@ def _doctor(args):
                 "workflow_lock": profile.lock,
             }
         )
+    except WorkflowError as exc:
+        result.update({"status": "BLOCKED", "profile": exc.as_dict()})
+        return result
+    try:
         runtime = selected_runtime(
             profile, state_dir=args.state_dir, work_id=args.work_id, release_root=args.release_root
         )
         result["selected_runtime"] = runtime or "current pinned release"
-        result["status"] = "BLOCKED"
+        result["execution_enabled"] = runtime is None and tools["git"]
+        capabilities["local_execution"]["ready"] = result["execution_enabled"]
+        capabilities["github_capture"]["ready"] = (
+            result["execution_enabled"] and tools["gh"]
+            and capabilities["github_capture"]["applicable"]
+        )
+        result["status"] = "READY" if result["execution_enabled"] else "BLOCKED"
+        if runtime is not None:
+            result["runtime"] = "Run the compatible pinned release; historical pins do not admit work"
     except WorkflowError as exc:
-        result.update({"status": "BLOCKED", "profile": exc.as_dict()})
+        result.update({"status": "BLOCKED", "runtime": exc.as_dict()})
     return result
 
 
@@ -329,6 +359,27 @@ def dispatch(args) -> dict:
         validate_start_snapshot(
             args.repository, request.get("workflow_snapshot", {}), service.store.require_artifact
         )
+    if command == "work.amend":
+        from devflow.provenance import validate_start_snapshot
+
+        state = _state(service, request, args)
+        if state["attempt"] is not None:
+            snapshot = request.get("workflow_snapshot") if "workflow_snapshot" in request else (
+                state["records"].get("workflow_snapshot:" + state["attempt"]["workflow_snapshot_id"])
+            )
+            try:
+                validate_start_snapshot(args.repository, snapshot, service.store.require_artifact)
+            except WorkflowError as exc:
+                if "workflow_snapshot" not in request and exc.code in {
+                    "release_mismatch", "profile_drift", "invalid_record",
+                }:
+                    raise WorkflowError(
+                        "workflow_snapshot_required",
+                        "Capture the current workflow and settings, then include workflow_snapshot "
+                        "in this active amendment; its existing policy no longer matches.",
+                        {"reason": exc.code},
+                    ) from exc
+                raise
     if command == "work.show":
         return _state(service, request, args)
     if command == "work.list":

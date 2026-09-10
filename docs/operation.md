@@ -2,7 +2,7 @@
 
 The package provides a CLI and a focused host skill. It does not start models or a background scheduler. Run `devflow --help` for input flags. Commands return JSON envelopes; `--json` is recommended for the owner task. Amounts retain exact decimal JSON numbers.
 
-Version 0.2.0 reports `trusted_intake_unavailable` and `human_validation_unavailable` in `doctor`; managed execution is blocked. There is no CLI approval flag or JSON receipt that activates it. [Verified intake](issue-trust.md) explains the constructor-injected host port, source lineage and migration limits.
+Version 0.3.0 uses the agent-interpreted conversational request for work admission. The agent records the request and calls the CLI; the user does not fill out JSON or use a separate approval channel. [Conversational intake](issue-trust.md) explains the scope and consistency boundary. Loading the `using-devflow` entry instructions creates no work, scans no backlog and resumes nothing; detailed workflow references load only for requested repository work.
 
 ## Build and verify
 
@@ -19,7 +19,7 @@ Use a dedicated branch for workflow development. Repository profiles and source 
 
 Prepare a JSON request containing a clean source checkout, its full commit SHA, a separate installation root, explicitly owned target paths, a map of skill links, and any known shared consumers. `devflow install plan --request-file request.json --json` returns the before/after manifest. Review its exact scope and digest. `devflow install apply` and `install rollback` require the manifest plus independent `--approved-root`, repeatable `--approved-path`, and `--approved-plan-id` arguments. The manifest cannot grant its own authority.
 
-Release files live under `<install-root>/releases/<revision>`; isolated Python environments live under `<install-root>/environments/<revision>`. The manifest returns the exact runtime command. Installation does not rewrite model settings. Installing a skill entry and enrolling a product repository are separate operations. A shared global entry must retain a route for non-enrolled repositories and draining attempts before any legacy entry is replaced.
+Release files live under `<install-root>/releases/<revision>`; isolated Python environments live under `<install-root>/environments/<revision>`. The manifest returns the exact runtime command. Its skill-link map can install both `using-devflow` and `devflow` from the reviewed release; the tiny global loader and any command launcher are explicit managed installation targets, not startup actions. Installation does not rewrite model settings. Installing a skill entry and enrolling a product repository are separate operations. A shared global entry must retain a route for non-enrolled repositories and draining attempts before any legacy entry is replaced.
 
 If a process stops during installation, rerun apply or rollback with the original approved plan. The private journal reconciles each actual target against its recorded before/after states. An intervening user edit blocks further writes. Rollback restores managed targets and preserves releases, runtime evidence, worktrees, and GitHub history.
 
@@ -29,13 +29,13 @@ Each enrolled repository commits `.devflow/repository.toml`, `checks.toml`, and 
 
 Named check recipes contain a description, argv array, relative cwd, result kind (`static` or `junit`), and timeout. JUnit recipes use `{report_path}` in their command; the runner supplies a fresh owned report path. Minimum executed tests and maximum skipped tests are explicit. Optional `scenarios` names the predefined scenarios this recipe proves. Work-specific manual QA records additional actual scenario IDs.
 
-`devflow profile inspect --repository checkout --json` validates the files. `doctor` also checks the pinned installation and required local tools. Native task availability, GitHub authorization, and protected merge conformance remain explicit host/enrollment checks. A missing prerequisite is BLOCKED.
+`devflow profile inspect --repository checkout --json` validates the files. `doctor` also checks the pinned installation and local tools. Its `READY` status and `execution_enabled` describe local runtime readiness, not authorization or every external capability. The `capabilities` report lists readiness and missing tools separately for GitHub capture, the managed launcher, and usage collection. For example, a local runtime can be ready while GitHub capture lacks `gh`. Native task availability, GitHub authorization, and protected merge conformance remain explicit host/enrollment checks; an operation with a missing prerequisite cannot proceed.
 
-Doctor reports the historical active-attempt pin before the repository lock and checks its installed content manifest. Version 0.2.0 never delegates commands to that older runtime: the current reader handles recovery, and further execution requires current verified admission. This security exception is explicit; historical snapshots remain unchanged. A source checkout is used for development and installation preparation; ordinary enrolled work runs the immutable release.
+Doctor reports the historical active-attempt pin before the repository lock and checks its installed content manifest. The current entry point never delegates commands to that older runtime: the current reader handles recovery, and further execution requires current admission. This security exception is explicit; historical snapshots remain unchanged. A source checkout is used for development and installation preparation; ordinary enrolled work runs the immutable release.
 
 ## Work and evidence
 
-An ordinary user request in an adopted GitHub repository first becomes one lightweight backlog issue, including work that starts immediately. `devflow backlog capture --request-file request.json --json` wraps the existing GitHub CLI with a durable request/receipt journal. Supply a stable `work_id` and either `issue_number` to reuse an issue, or `title` and `body` with a short outcome, observable acceptance and necessary context. Link the returned issue node ID/URL to the work contract and PR. This adds no approval step or triage delay. Follow-up fixes and clarifications stay on that issue. Use a bound Project's In Progress field if available; an active linked PR suffices without a Project. Explicit local-only/no-publication instructions still govern, and public issue content cannot authorize execution.
+A substantive work request in an adopted GitHub repository first becomes one lightweight backlog issue, including work that starts immediately. A bug report/request to investigate or fix, a named issue, or a bounded selection such as the current P1 backlog also qualifies. Ordinary questions do not create work. The agent records the selected existing batch members under a shared request reference; future queue arrivals are not automatically selected. `devflow backlog capture --request-file request.json --json` wraps the existing GitHub CLI with a durable request/receipt journal. Supply a stable `work_id` and either `issue_number` to reuse an issue, or `title` and `body` with a short outcome, observable acceptance and necessary context. Link the returned issue node ID/URL to the work contract and PR. This adds no approval step or triage delay. Follow-up fixes and clarifications stay on that issue. Use a bound Project's In Progress field if available; an active linked PR suffices without a Project. Explicit local-only/no-publication instructions still govern, and public issue content cannot authorize execution.
 
 The wrapper saves the exact sanitized request before sending, records dispatch before the one creation call, and independently reads the issue back before confirming. It uses an exact capture marker in paginated issue reads, including closed issues; it does not rely on title matching or search-index timing. Existing issue reuse performs only a read and preserves its body. Reusing a work ID with a different initial capture payload is a conflict; follow-ups use the existing issue. The journal appends namespaced operation facts to the existing schema, preserving compatibility with active pinned runtimes.
 
@@ -43,7 +43,23 @@ Use the records in [implementation contracts](implementation-contracts.md). A mu
 
 The accepted endpoint includes an exact target: `local` uses the canonical absolute checkout path, `pr` uses the PR base branch, `merge` uses the target branch, and `release` uses an existing tag name. Remote branches/tags use their short names, such as `main` or `v0.1.0`, without `refs/` prefixes. The authority record independently binds the repository. A request cannot substitute a different path, branch, tag, or repository; actual endpoint readback must identify the accepted destination.
 
-`work prepare` reports missing contract fields without creating state or inventing authority. `work ready` requires a contract and `admission_id` resolved by an independently trusted verifier; the shipped CLI has no such adapter. Caller Authority records and invented queue-policy references cannot admit work. `snapshot capture` stores the actual used instruction bytes, profile, full package revision, and observed nonsecret settings. `work start` verifies the snapshot's executing revision, admitted profile and stored inputs before claiming an attempt and returning a workspace intent. A missing or mismatched pin is rejected before creating an active claim.
+`work prepare` reports missing contract fields without creating state or inventing authority. `work ready` requires a contract and `user_request` with `reference`, `summary`, and `allowed_operations`; it derives and returns `admission_id`, `authority_id`, and `scope_hash`. `work amend` accepts the same request shape for an authorized scope revision without a separate `approved_delta` field. The agent supplies these fields from the conversation. Caller Authority records, labels and invented queue-policy references cannot substitute for a request. `snapshot capture` stores the actual used instruction bytes, profile, full package revision, and observed nonsecret settings. `work start` verifies the snapshot's executing revision, admitted profile and stored inputs before claiming an attempt and returning a workspace intent. A missing or mismatched pin is rejected before creating an active claim.
+
+For example, the agent adds this request fragment to the existing contract/revision envelope and invokes `devflow work ready --request-file ready.json --json` (or `work amend` for an authorized revision):
+
+```json
+{
+  "user_request": {
+    "reference": "conversation:request-42",
+    "summary": "Investigate and fix the reported parser crash; keep the result local.",
+    "allowed_operations": ["edit", "check", "create_tasks"]
+  }
+}
+```
+
+This is an agent-prepared fragment, not a standalone complete work contract or a form for the user. The operations must match the requested endpoint; this local example grants no push, PR, merge or release permission.
+
+The existing managed workspace/candidate lifecycle requires `edit`, including for an investigation contract. An explicitly read-only investigation can use capture and inspection commands while the agent performs the permitted analysis, but it cannot complete that managed lifecycle using only `check`. Do not widen a read-only request's permissions to bypass this limitation.
 
 Register the dedicated checkout against that intent, verify it is clean, and record the actual workspace receipt. `candidate capture` reads real Git head/tree/base and ownership. `check run` executes an admitted recipe and records process and assertion outcomes separately. A later failed result supersedes an earlier passing result for that recipe. Named scenarios and acceptance must be covered by current passing evidence.
 
@@ -83,7 +99,7 @@ Private SQLite state, evidence, and backups stay under the configured state root
 
 ## Recover after a crash or power loss
 
-Open the same repository and configured private state root. Run `backlog list` to discover saved intake requests and `work list` to discover admitted work. Resume intake with `backlog capture --work-id <id> --json`; the saved title/body and dispatch state are sufficient. Inspect an attempt with `work show` and `next`, retaining its historical package revision, checkout, evidence and role identities. Current admission is required before execution resumes; the current reader never delegates to an older runtime. No original request file or owner conversation is needed for these recorded facts.
+When the user requests continuation or recovery, open the same repository and configured private state root. Run `backlog list` to discover saved intake requests and `work list` to discover admitted work. Resume intake with `backlog capture --work-id <id> --json`; the saved title/body and dispatch state are sufficient. Inspect an attempt with `work show` and `next`, retaining its historical package revision, checkout, evidence and role identities. The stored conversational admission supports continuation without another approval or verifier; legacy work first needs current request admission. The current reader never delegates to an older runtime. No original request file or owner conversation is needed for these recorded facts.
 
 ```text
 saved request → saved dispatch → external action → observed result → saved confirmation

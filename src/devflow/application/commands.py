@@ -11,8 +11,8 @@ from devflow.adapters.sqlite_store import SQLiteStore
 from devflow.admission import (
     BOOKKEEPING,
     TrustedIntakeVerifier,
-    UnavailableIntakeVerifier,
     execution_admission,
+    requested_admission,
 )
 from devflow.domain.rules import (
     PERMISSIONS,
@@ -31,20 +31,17 @@ class WorkflowService:
     def __init__(self, state_dir: Path, *, trusted_verifier: TrustedIntakeVerifier | None = None,
                  repository: str | None = None):
         self.store = SQLiteStore(state_dir)
-        self.trusted_verifier = trusted_verifier or UnavailableIntakeVerifier()
+        self.trusted_verifier = trusted_verifier
         self.repository = repository
 
     def preflight(self, command, request):
         if command in {"work.ready", "work.amend"}:
-            contract = request.get("record", {})
-            return execution_admission(
-                blank(request.get("work_id")), contract, request.get("admission_id"),
-                self.trusted_verifier, datetime.now(timezone.utc), repository=self.repository,
+            return requested_admission(
+                blank(request.get("work_id")), request, self.trusted_verifier,
+                datetime.now(timezone.utc), repository=self.repository,
             )
-        # Resolve capability first so a missing adapter fails explicitly even for
-        # legacy/malformed inputs, rather than falling through to an old runtime.
-        if isinstance(self.trusted_verifier, UnavailableIntakeVerifier):
-            self.trusted_verifier.resolve(None)
+        if not isinstance(request.get("work_id"), str) or not request["work_id"]:
+            raise WorkflowError("invalid_request", "A nonempty work_id is required")
         return self.require_execution(self.snapshot(request["work_id"]), operation={
             "host.prepare": "create_tasks", "check.run": "check",
             "workspace.register": "edit", "candidate.capture": "edit",
@@ -239,6 +236,8 @@ class WorkflowService:
                 "lifecycle": updated["lifecycle"],
                 "phase": updated["phase"],
                 "scope_hash": updated["scope_hash"],
+                "admission_id": updated.get("admission_id"),
+                "authority_id": (updated.get("authority") or {}).get("authority_id"),
                 "candidate_id": updated["candidate_id"],
                 "actions": self.permitted_actions(updated),
                 **details,
