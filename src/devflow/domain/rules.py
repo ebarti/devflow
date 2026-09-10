@@ -3,11 +3,13 @@
 from copy import deepcopy
 from datetime import datetime
 
+from devflow.admission import BOOKKEEPING, derived_authority, execution_admission
 from devflow.domain.endpoints import readback_matches, validate_action_target, validate_endpoint
 from devflow.errors import WorkflowError
 from devflow.validation import digest, validate_record
 
 ID_FIELDS = {
+    "intake_admission": "admission_id",
     "work_contract": "scope_revision",
     "outcome_event": "event_id",
     "authority": "authority_id",
@@ -993,9 +995,18 @@ def validate_action_admission(state, action, now):
             )
 
 
-def transition(original, command, request, now, dependency_states=None):
+def transition(original, command, request, now, dependency_states=None, *,
+               trusted_verifier=None, repository=None):
     state = deepcopy(original)
     details = {}
+    admission = None
+    if command not in BOOKKEEPING:
+        contract = request.get("record", {}) if command in {"work.ready", "work.amend"} else state["contract"]
+        admission_id = request.get("admission_id") if command in {"work.ready", "work.amend"} else state.get("admission_id")
+        admission = execution_admission(
+            state, contract or {}, admission_id, trusted_verifier, now,
+            repository=repository or (state.get("authority") or {}).get("repository"),
+        )
     if command in {"work.ready", "work.amend"}:
         record = validate_record(request["record"], "work_contract")
         require(record["work_id"] == state["work_id"], "wrong_work", "Contract work mismatch")
@@ -1039,7 +1050,10 @@ def transition(original, command, request, now, dependency_states=None):
             "Every dependency must be known and Done",
         )
         state["scope_hash"] = scope_hash(record)
-        auth = validate_record(request["authority"], "authority")
+        # Caller-written Authority records are historical claims, never decisions.
+        auth = derived_authority(admission)
+        save(state, admission)
+        state["admission_id"] = admission["admission_id"]
         if original["authority"] is not None:
             require(
                 auth["repository"] == original["authority"]["repository"],
@@ -1216,7 +1230,8 @@ def transition(original, command, request, now, dependency_states=None):
         save(state, record, kind)
     else:
         active(state)
-        authority(state, now)
+        if command not in BOOKKEEPING:
+            authority(state, now)
         if command == "candidate.record":
             record = validate_record(request["record"], "candidate")
             require(
@@ -1261,7 +1276,6 @@ def transition(original, command, request, now, dependency_states=None):
             if not missing_checks(state):
                 state["phase"] = "verify"
         elif command == "check.complete":
-            authority(state, now, "check")
             record = validate_record(request["record"], "check_evidence")
             candidate = current_candidate(state, record["candidate_id"])
             action = state["actions"].get(request["receipt"]["action_id"])

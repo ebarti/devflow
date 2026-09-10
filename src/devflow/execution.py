@@ -388,7 +388,15 @@ def dispatch_action(
                 "revision": state["revision"],
                 "receipt_id": action["receipts"][-1],
             }
+        reconcile = action["status"] in {"dispatched", "ambiguous", "pending_setup"}
+        if not reconcile:
+            service.require_execution(state, operation=PERMISSIONS[action["operation"]])
         if action["operation"] in {"launch_role", "send_role", "prepare_workspace"}:
+            if reconcile:
+                return {
+                    "action_id": action_id, "status": action["status"], "reconcile_only": True,
+                    "reason": "Read native task/workspace state; never repeat an uncertain creation",
+                }
             return {
                 "action": action,
                 "requires_native_owner": True,
@@ -406,7 +414,8 @@ def dispatch_action(
             action["payload"]["candidate_id"] != state["candidate_id"]
         ):
             raise WorkflowError("stale_action", "Action scope or candidate changed")
-        authority(state, datetime.now(UTC), PERMISSIONS[action["operation"]])
+        if not reconcile:
+            authority(state, datetime.now(UTC), PERMISSIONS[action["operation"]])
         validate_action_target(
             state,
             action["operation"],

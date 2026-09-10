@@ -15,9 +15,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from domain.helpers import SyntheticWorkflowService as WorkflowService
 
 from devflow.adapters.git import GitRepository
-from devflow.application.commands import WorkflowService
 from devflow.check_execution import run_registered_check
 from devflow.domain.rules import scope_hash
 from devflow.errors import WorkflowError

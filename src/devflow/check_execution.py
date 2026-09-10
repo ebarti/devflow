@@ -183,6 +183,7 @@ def run_registered_check(service, request, *, profile, repository, runner=None):
             )["action"]
             action = prepared
             expected_revision = prepared["expected_revision"]
+        service.require_execution(state, operation="check")
         # Recheck the pinned policy and actual checkout before the dispatch claim.
         candidate = state["records"]["candidate:" + action["payload"]["candidate_id"]]
         if profile.fingerprint != action["payload"]["profile_hash"]:

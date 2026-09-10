@@ -104,3 +104,25 @@ def test_post_write_readback_rejection_remains_ambiguous_until_observed(tmp_path
     server.deny = False
     result = dispatch(scenario, action, server)
     assert result["status"] == "confirmed" and server.merge_count == 1
+
+
+def test_unavailable_intake_can_reconcile_an_uncertain_write_without_redispatch(tmp_path):
+    from devflow.application.commands import WorkflowService
+
+    class LostReadback(Server):
+        deny = True
+
+        def runner(self, argv, **kwargs):
+            method = argv[argv.index("--method") + 1]
+            if self.merge_count and method == "GET" and self.deny:
+                raise WorkflowError("github_forbidden", "Synthetic read denied", {"http_status": 403})
+            return super().runner(argv, **kwargs)
+
+    server = LostReadback()
+    scenario, action = prepared(tmp_path, server)
+    assert dispatch(scenario, action, server)["status"] == "ambiguous"
+    scenario.service = WorkflowService(scenario.service.store.root)
+    server.deny = False
+    assert dispatch(scenario, action, server)["status"] == "confirmed"
+    assert server.merge_count == 1
+    assert scenario.service.next(scenario.work_id)["actions"][-1]["reason"] == "trusted_intake_unavailable"

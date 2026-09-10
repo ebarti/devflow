@@ -6,9 +6,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from domain.helpers import SyntheticWorkflowService as WorkflowService
 
 from devflow.adapters.git import GitRepository
-from devflow.application.commands import WorkflowService
 from devflow.check_execution import run_registered_check
 from devflow.domain.rules import scope_hash
 from devflow.errors import WorkflowError
@@ -211,14 +211,15 @@ def test_real_subprocess_death_leaves_dispatched_check_and_refuses_rerun(tmp_pat
     script = """
 import json, sys
 from pathlib import Path
-from devflow.application.commands import WorkflowService
+sys.path.insert(0, sys.argv[4])
+from domain.helpers import SyntheticWorkflowService as WorkflowService
 from devflow.check_execution import run_registered_check
 from devflow.profiles import load_profile
 repository=Path(sys.argv[1])
 run_registered_check(WorkflowService(Path(sys.argv[2])),json.loads(Path(sys.argv[3]).read_text()),profile=load_profile(repository),repository=repository)
 """
     child = subprocess.run(
-        [sys.executable, "-c", script, str(repository), str(service.store.root), str(request_path)],
+        [sys.executable, "-c", script, str(repository), str(service.store.root), str(request_path), str(Path(__file__).parent)],
         capture_output=True,
         timeout=15,
     )

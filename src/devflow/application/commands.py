@@ -8,14 +8,61 @@ from decimal import Decimal
 from pathlib import Path
 
 from devflow.adapters.sqlite_store import SQLiteStore
+from devflow.admission import (
+    BOOKKEEPING,
+    TrustedIntakeVerifier,
+    UnavailableIntakeVerifier,
+    execution_admission,
+)
 from devflow.domain.rules import blank, next_actions, transition
 from devflow.errors import WorkflowError
 from devflow.validation import canonical_json, digest, validate_record
 
 
 class WorkflowService:
-    def __init__(self, state_dir: Path):
+    def __init__(self, state_dir: Path, *, trusted_verifier: TrustedIntakeVerifier | None = None,
+                 repository: str | None = None):
         self.store = SQLiteStore(state_dir)
+        self.trusted_verifier = trusted_verifier or UnavailableIntakeVerifier()
+        self.repository = repository
+
+    def preflight(self, command, request):
+        if command in {"work.ready", "work.amend"}:
+            contract = request.get("record", {})
+            return execution_admission(
+                blank(request.get("work_id")), contract, request.get("admission_id"),
+                self.trusted_verifier, datetime.now(timezone.utc), repository=self.repository,
+            )
+        # Resolve capability first so a missing adapter fails explicitly even for
+        # legacy/malformed inputs, rather than falling through to an old runtime.
+        if isinstance(self.trusted_verifier, UnavailableIntakeVerifier):
+            self.trusted_verifier.resolve(None)
+        return self.require_execution(self.snapshot(request["work_id"]), operation={
+            "host.prepare": "create_tasks", "check.run": "check",
+            "workspace.register": "edit", "candidate.capture": "edit",
+        }.get(command))
+
+    def require_execution(self, state, *, operation=None):
+        return execution_admission(
+            state, state.get("contract") or {}, state.get("admission_id"),
+            self.trusted_verifier, datetime.now(timezone.utc),
+            repository=self.repository,
+            operation=operation,
+        )
+
+    def permitted_actions(self, state):
+        actions = next_actions(state)
+        if state["lifecycle"] in {"backlog", "done", "canceled"}:
+            return actions
+        try:
+            self.require_execution(state)
+        except WorkflowError as exc:
+            # Reads still expose uncertain-action recovery without suggesting execution.
+            return [a for a in actions if a["kind"] == "reconcile_action"
+                    and a.get("action", {}).get("status") != "prepared"] + [
+                {"kind": "request_user_action", "reason": exc.code}
+            ]
+        return actions
 
     def put_artifact(self, content: bytes):
         return self.store.put_artifact(content)
@@ -35,7 +82,7 @@ class WorkflowService:
 
     def next(self, work_id):
         state = self.snapshot(work_id)
-        return {"work_id": work_id, "revision": state["revision"], "actions": next_actions(state)}
+        return {"work_id": work_id, "revision": state["revision"], "actions": self.permitted_actions(state)}
 
     def execute(self, command: str, request: dict):
         if command == "work.prepare":
@@ -56,6 +103,8 @@ class WorkflowService:
             raise WorkflowError(
                 "invalid_request", "expected_revision must be a nonnegative integer"
             )
+        if command not in BOOKKEEPING:
+            self.preflight(command, request)
         payload_hash = digest({"command": command, "request": request})
         with self.store.transaction() as db:
             operation = db.execute(
@@ -84,7 +133,8 @@ class WorkflowService:
             }
             try:
                 updated, details = transition(
-                    state, command, request, datetime.now(timezone.utc), dependencies
+                    state, command, request, datetime.now(timezone.utc), dependencies,
+                    trusted_verifier=self.trusted_verifier, repository=self.repository
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise WorkflowError(
@@ -157,7 +207,7 @@ class WorkflowService:
                 "phase": updated["phase"],
                 "scope_hash": updated["scope_hash"],
                 "candidate_id": updated["candidate_id"],
-                "actions": next_actions(updated),
+                "actions": self.permitted_actions(updated),
                 **details,
             }
             db.execute(

@@ -2,6 +2,8 @@
 
 This page records the reusable package boundary as of 2026-09-09. The [implementation plan](implementation-plan.md) remains the target for the complete rollout. Package publication and repository adoption are separate steps; no JobCtrl cutover is implied.
 
+Security update 0.2.0: current admission and dispatch deny caller-asserted authority, preserve exact source lineage, and prevent old-pin delegation. The trusted-verifier protocol is exercised with synthetic decisions; **no authenticated production intake/human-validation adapter exists, so managed execution remains blocked**. Capture/readback and safe recovery remain available. See [verified intake](issue-trust.md).
+
 ## Implemented package surfaces
 
 | Surface | Implementation and evidence | Remaining deployment proof |

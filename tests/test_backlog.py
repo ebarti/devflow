@@ -23,7 +23,9 @@ class Server:
 
     def issue(self, number=1, body="Existing synthetic issue"):
         return {
-            "number": number, "node_id": f"synthetic-{number}", "body": body,
+            "id": number + 100, "number": number, "node_id": f"synthetic-{number}", "body": body,
+            "title": REQUEST["title"], "user": {"id": 10, "node_id": "synthetic-creator"},
+            "updated_at": "2026-09-10T00:00:00Z",
             "repository_url": "https://api.github.com/repos/synthetic/example",
             "html_url": f"https://github.com/synthetic/example/issues/{number}",
         }
@@ -42,7 +44,11 @@ class Server:
             value = self.items[-1] if self.items else {}
         else:
             status = self.read_status
-            if "?" in endpoint:
+            if endpoint == "user":
+                value = {"id": 10, "node_id": "synthetic-creator"}
+            elif endpoint == "repos/synthetic/example":
+                value = {"id": 20, "node_id": "synthetic-repository", "full_name": "synthetic/example"}
+            elif "?" in endpoint:
                 value = self.items
             else:
                 number = int(endpoint.rsplit("/", 1)[1])
@@ -78,7 +84,7 @@ def test_capture_replays_and_resumes_from_saved_request_without_duplicate(setup)
     assert run(action="list")["captures"] == [first]
     with store.connect() as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 1
-        assert db.execute("SELECT count(*) FROM operations").fetchone()[0] == 3
+        assert db.execute("SELECT count(*) FROM operations").fetchone()[0] == 4
     with pytest.raises(WorkflowError, match="different capture request"):
         run({**REQUEST, "body": "Different acceptance"})
 
@@ -113,7 +119,7 @@ def test_definite_rejection_requires_explicit_audited_retry(setup):
     assert server.posts == 2  # One definitely rejected request, one actual creation.
     with store.connect() as db:
         states = [json.loads(row[0])["status"] for row in db.execute("SELECT result FROM operations ORDER BY operation_id")]
-    assert states == ["prepared", "dispatched", "failed", "prepared", "dispatched", "confirmed"]
+    assert states == ["prepared", "dispatched", "failed", "prepared", "dispatched", "dispatched", "confirmed"]
 
 
 def test_uncertain_creation_remains_read_only_after_later_denied_read(setup):
@@ -184,7 +190,9 @@ remote = Path(sys.argv[2])
 def run(argv, **kwargs):
     method = argv[argv.index("--method") + 1]
     if method == "POST":
-        item = {"number": 1, "node_id": "synthetic-1", "body": json.loads(kwargs["input"])["body"],
+        item = {"id": 101, "number": 1, "node_id": "synthetic-1", "body": json.loads(kwargs["input"])["body"],
+                "title": "Synthetic outcome", "user": {"id": 10, "node_id": "synthetic-creator"},
+                "updated_at": "2026-09-10T00:00:00Z",
                 "repository_url": "https://api.github.com/repos/synthetic/example",
                 "html_url": "https://github.com/synthetic/example/issues/1"}
         with remote.open("w") as stream:
@@ -192,7 +200,11 @@ def run(argv, **kwargs):
             stream.flush()
             os.fsync(stream.fileno())
         os.kill(os.getpid(), signal.SIGKILL)
-    return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+    endpoint = argv[argv.index("--method") + 2]
+    value = {"id": 10, "node_id": "synthetic-creator"} if endpoint == "user" else (
+        {"id": 20, "node_id": "synthetic-repository", "full_name": "synthetic/example"}
+        if endpoint == "repos/synthetic/example" else [])
+    return SimpleNamespace(returncode=0, stdout=json.dumps(value), stderr="")
 capture(store, "github:synthetic/example", json.loads(sys.argv[3]),
         github_factory=lambda o,n: GitHubRepository(o,n,runner=run))
 '''
@@ -209,3 +221,110 @@ capture(store, "github:synthetic/example", json.loads(sys.argv[3]),
     assert server.posts == 0
     with store.connect() as db:
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_copied_marker_before_creation_is_not_our_capture(setup):
+    from devflow.backlog import _key
+
+    _, server, run = setup
+    marker = _key(REPOSITORY, REQUEST["work_id"]).split(":")[1]
+    server.items = [server.issue(body=f"Outsider text\n<!-- devflow-backlog:{marker} -->")]
+    server.items[0]["user"] = {"id": 999, "node_id": "synthetic-outsider"}
+    with pytest.raises(WorkflowError, match="pending authenticated creation"):
+        run(REQUEST)
+    assert server.posts == 0
+    assert run(action="show")["status"] == "failed"
+
+
+@pytest.mark.parametrize("change", [
+    {"user": {"id": 999, "node_id": "synthetic-outsider"}},
+    {"title": "Changed after sending"},
+    {"body": "Different consumed content"},
+])
+def test_lost_create_response_requires_expected_creator_and_content(setup, change):
+    _, server, run = setup
+    server.lose_response = True
+    with pytest.raises(WorkflowError, match="interrupted"):
+        run(REQUEST)
+    # Preserve marker while changing content so only exact binding can reject it.
+    if "body" in change:
+        change = {"body": server.items[0]["body"] + change["body"]}
+    server.items[0].update(change)
+    with pytest.raises(WorkflowError, match="creator or content differs"):
+        run()
+    assert run(action="show")["status"] == "ambiguous"
+    assert server.posts == 1
+
+
+def test_lost_response_marker_collision_remains_ambiguous_without_duplicate_write(setup):
+    _, server, run = setup
+    server.lose_response = True
+    with pytest.raises(WorkflowError):
+        run(REQUEST)
+    server.items.append(server.issue(2, body=server.items[0]["body"]))
+    with pytest.raises(WorkflowError, match="More than one issue"):
+        run()
+    assert run(action="show")["status"] == "ambiguous"
+    assert server.posts == 1
+
+
+def test_successful_post_identity_must_match_independent_exact_readback(setup):
+    _, server, run = setup
+    original = server.run
+
+    def corrupt_readback(argv, **kwargs):
+        result = original(argv, **kwargs)
+        if argv[argv.index("--method") + 2].endswith("/issues/1"):
+            issue = json.loads(result.stdout.split("\n\n", 1)[1])
+            issue["id"] = 876
+            result.stdout = "HTTP/2.0 200 Synthetic\n\n" + json.dumps(issue)
+        return result
+
+    server.run = corrupt_readback
+    with pytest.raises(WorkflowError, match="POST identity differs"):
+        run(REQUEST)
+    assert server.posts == 1
+    assert run(action="show")["status"] == "ambiguous"
+
+
+def test_owner_created_projection_preserves_lineage_but_grants_no_trust(setup):
+    _, server, run = setup
+    lineage = [{"source_id": "synthetic-external-report", "origin": "external",
+                "content_digest": "e" * 64, "revision": "external-pr-head"}]
+    result = run({**REQUEST, "body": "Résumé derived from external report", "source_lineage": lineage})
+    assert result["payload"]["source_lineage"] == lineage
+    assert result["issue"]["origin"] == "unknown"
+    assert result["issue"]["capture_mode"] == "created_readback"
+    assert result["issue"]["repository_id"] == 20
+    assert result["issue"]["creator_id"] == 10
+    assert len(result["issue"]["consumed_digest"]) == 64
+    server.items[0]["body"] = "Substantive later change not consumed by replay"
+    assert run() == result
+    assert server.posts == 1
+
+
+def test_existing_outsider_issue_is_unknown_even_with_ready_labels(setup):
+    _, server, run = setup
+    server.items = [server.issue(7)]
+    server.items[0].update(user={"id": 999, "node_id": "synthetic-outsider"},
+                           labels=[{"name": "ready"}, {"name": "human-approved"}])
+    result = run({"work_id": REQUEST["work_id"], "issue_number": 7})
+    assert result["issue"]["origin"] == "unknown"
+    assert result["issue"]["capture_mode"] == "reused_unknown"
+    assert result["issue"]["creator_id"] == 999
+    assert server.posts == 0
+
+
+def test_legacy_confirmed_capture_replays_without_inventing_provenance(setup):
+    from devflow.backlog import _append, _key
+    from devflow.validation import digest
+
+    store, _, run = setup
+    payload = {"title": REQUEST["title"], "body": REQUEST["body"], "issue_number": None}
+    legacy = _append(store, _key(REPOSITORY, REQUEST["work_id"]), {
+        "kind": "backlog_capture", "schema_version": 1, "repository": REPOSITORY,
+        "work_id": REQUEST["work_id"], "payload": payload, "payload_hash": digest(payload),
+        "status": "confirmed", "capture_id": "legacy", "issue": {"number": 7},
+    })
+    assert run(REQUEST) == legacy
+    assert "origin" not in legacy["issue"]

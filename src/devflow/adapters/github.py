@@ -20,6 +20,7 @@ from typing import Callable
 from urllib.parse import quote
 
 from devflow.errors import WorkflowError
+from devflow.validation import digest
 
 _COMMENT_FIELDS = """id databaseId:fullDatabaseId body path line originalLine subjectType
     commit { oid } originalCommit { oid }"""
@@ -240,48 +241,88 @@ class GitHubRepository:
             if "pull_request" not in issue
         ]
 
+    def backlog_creation_context(self) -> dict:
+        repository, principal = self._api(self.root), self._api("user")
+        if (
+            not isinstance(repository, dict) or not isinstance(principal, dict)
+            or repository.get("full_name", "").lower() != f"{self.owner}/{self.name}".lower()
+            or type(repository.get("id")) is not int or not repository.get("node_id")
+            or type(principal.get("id")) is not int or not principal.get("node_id")
+        ):
+            raise WorkflowError("backlog_identity", "Authenticated creation identity is unavailable")
+        return {"repository_id": repository["id"], "repository_node_id": repository["node_id"],
+                "creator_id": principal["id"], "creator_node_id": principal["node_id"]}
+
+    @staticmethod
+    def backlog_body(capture_id, body):
+        return f"{body.rstrip()}\n\n<!-- devflow-backlog:{_identifier(capture_id)} -->"
+
+    def _backlog_observation(self, issue, repository):
+        creator = issue.get("user") or {}
+        expected_root = f"https://api.github.com/{self.root}"
+        if (
+            "pull_request" in issue
+            or issue.get("repository_url", "").lower() != expected_root.lower()
+            or type(issue.get("number")) is not int or type(issue.get("id")) is not int
+            or not issue.get("node_id") or type(creator.get("id")) is not int
+            or not creator.get("node_id") or not isinstance(issue.get("title"), str)
+            or not isinstance(issue.get("body"), str) or not issue.get("updated_at")
+            or type(repository.get("id")) is not int or not repository.get("node_id")
+            or repository.get("full_name", "").lower() != f"{self.owner}/{self.name}".lower()
+        ):
+            raise WorkflowError("backlog_identity", "Readback is not an issue in the bound repository")
+        return {
+            "id": issue["id"], "node_id": issue["node_id"], "number": issue["number"],
+            "url": issue["html_url"], "repository": f"github:{self.owner}/{self.name}",
+            "repository_id": repository["id"], "repository_node_id": repository["node_id"],
+            "creator_id": creator["id"], "creator_node_id": creator["node_id"],
+            "consumed_digest": digest({"title": issue["title"], "body": issue["body"]}),
+            "revision": issue["updated_at"], "origin": "unknown",
+        }
+
     def reconcile_backlog_issue(
-        self, capture_id: str, *, issue_number: int | None = None
+        self, capture_id: str, *, issue_number: int | None = None, expected: dict | None = None
     ) -> dict | None:
-        """Find a capture by its stable marker, including closed issues, without search indexing."""
+        """Markers correlate pending writes; they never establish origin or authority."""
         marker = f"<!-- devflow-backlog:{_identifier(capture_id)} -->"
         matches = (
-            [self.issue(issue_number)]
-            if issue_number is not None
-            else [issue for issue in self.issues() if marker in (issue.get("body") or "")]
+            [self.issue(issue_number)] if issue_number is not None else
+            [issue for issue in self.issues() if marker in (issue.get("body") or "")]
         )
         if len(matches) > 1:
             raise WorkflowError("duplicate_backlog", "More than one issue has this capture marker")
         if not matches:
             return None
+        if issue_number is None and expected is None:
+            raise WorkflowError("unverified_backlog", "Marker has no pending authenticated creation")
         issue = matches[0]
-        expected_root = f"https://api.github.com/{self.root}"
-        if (
-            "pull_request" in issue
-            or issue.get("repository_url", "").lower() != expected_root.lower()
-            or type(issue.get("number")) is not int
-            or not issue.get("node_id")
-            or (issue_number is not None and issue["number"] != issue_number)
-        ):
-            raise WorkflowError("backlog_identity", "Readback is not an issue in the bound repository")
-        return {
-            "node_id": issue["node_id"],
-            "number": issue["number"],
-            "url": issue["html_url"],
-            "repository": f"github:{self.owner}/{self.name}",
-        }
+        observed = self._backlog_observation(issue, self._api(self.root))
+        if issue_number is not None and observed["number"] != issue_number:
+            raise WorkflowError("backlog_identity", "Readback differs from the exact issue")
+        if expected is not None:
+            if marker not in issue["body"] or any(
+                observed[key] != expected[key] for key in (
+                    "repository_id", "repository_node_id", "creator_id", "creator_node_id", "consumed_digest"
+                )
+            ):
+                raise WorkflowError("backlog_creation_mismatch", "Pending creation creator or content differs")
+            if expected.get("issue") and any(
+                observed[key] != expected["issue"][key] for key in ("id", "node_id", "number")
+            ):
+                raise WorkflowError("backlog_creation_mismatch", "POST identity differs from exact readback")
+        return {**observed, "capture_mode": "created_readback" if expected else "reused_unknown"}
 
     def create_backlog_issue(self, capture_id: str, *, title: str, body: str) -> dict:
-        """One gh-backed write; caller must have durably admitted it and must reconcile on loss."""
-        marker = f"<!-- devflow-backlog:{_identifier(capture_id)} -->"
-        self._api(
+        """Return POST identity for durable journaling before independent readback."""
+        created = self._api(
             f"{self.root}/issues", method="POST",
-            payload={"title": title, "body": f"{body.rstrip()}\n\n{marker}"},
+            payload={"title": title, "body": self.backlog_body(capture_id, body)},
         )
-        result = self.reconcile_backlog_issue(capture_id)
-        if result is None:
-            raise WorkflowError("ambiguous_backlog", "Created issue is not yet observable; reconcile")
-        return result
+        if not isinstance(created, dict) or any(
+            not created.get(key) for key in ("id", "node_id", "number")
+        ):
+            raise WorkflowError("ambiguous_backlog", "POST identity unavailable; reconcile pending creation")
+        return {key: created[key] for key in ("id", "node_id", "number")}
 
     def dependencies(self, number: int) -> list[dict]:
         return self._pages(f"{self.root}/issues/{int(number)}/dependencies/blocked_by")

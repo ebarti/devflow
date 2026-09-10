@@ -2,6 +2,8 @@
 
 A reusable development workflow with a local `devflow` CLI, a focused host skill, repository profiles, and explicit execution evidence.
 
+Version 0.2.0 deliberately blocks managed execution: no authenticated intake or independent human-validation adapter is available in the CLI. `doctor` reports this as `BLOCKED`. Capture and safe recovery remain available. See [verified intake](docs/issue-trust.md) for the trust boundary and the security exception to old runtime pins.
+
 The initial runtime implements accepted work contracts, durable attempts, owned Git checkouts, candidate-bound checks and independent gates, finding publication/closure, delivery receipts, and deterministic usage/outcome reports. An interrupted external action is reconciled before another mutation. A changed candidate cannot inherit a previous candidate's passing gate.
 
 Workflow code, skills, schemas, and operating documentation are released together. Consumers pin a release and full Git commit in `.devflow/workflow.lock`. Runtime records, credentials, machine bindings, and usage evidence stay outside this repository.
@@ -23,7 +25,7 @@ uv run devflow validate record --request-file docs/design/work-contract.example.
 uv run pytest -q
 ```
 
-For installation, prepare a manifest from a clean full commit, review its exact paths and digest, and apply it with separately supplied scope arguments. Enrolled repositories commit three small `.devflow` profile/lock files. Each active attempt retains its original package revision when a repository upgrades. See [operation](docs/operation.md) for installation, request structure, commands, recovery, and delivery.
+For installation, prepare a manifest from a clean full commit, review its exact paths and digest, and apply it with separately supplied scope arguments. Enrolled repositories commit three small `.devflow` profile/lock files. Historical attempt pins remain recorded; 0.2.0 requires re-admission before further execution and never delegates to an older runtime. See [operation](docs/operation.md) for installation, request structure, commands, recovery, and delivery.
 
 The [host skill](skills/devflow/SKILL.md) selects the relevant intake, implementation, review, QA, or delivery reference. It introduces no background scheduler, hidden model calls, API keys, or model override. Private execution state stays outside the source checkout.
 

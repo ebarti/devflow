@@ -5,7 +5,7 @@ description: Implement, review, verify, and deliver work in repositories enrolle
 
 # Devflow
 
-Use the repository's pinned workflow and the user's accepted outcome. Run `devflow doctor --repository <checkout> --json` first. A missing profile does not authorize enrollment; follow the repository's existing workflow until adoption is authorized. An installed version mismatch requires selecting the pinned release, not updating the lock to match the current tool.
+Use the repository's pinned workflow and the user's accepted outcome. Run `devflow doctor --repository <checkout> --json` first. Missing trusted intake/human validation blocks execution, including old attempts; never bypass it with an older runtime, caller approval flags, or issue labels. A missing profile does not authorize enrollment; follow the repository's existing workflow until adoption is authorized. Resolve version mismatches through a reviewed compatible release; an old pin cannot waive current admission.
 
 For existing work, use `devflow backlog list --json` and `devflow work list --json` to recover IDs when needed, then read `devflow work show --work-id <id> --json` and `devflow next --work-id <id> --json`. Continue its recorded attempt. Resolve interruptions and uncertain external actions before creating replacements. The CLI records facts and missing evidence; it does not make engineering judgments for you.
 

@@ -3,8 +3,8 @@ from copy import deepcopy
 
 import pytest
 from helpers import NOW, H, Scenario, authority, record, workflow_snapshot
+from helpers import SyntheticWorkflowService as WorkflowService
 
-from devflow.application.commands import WorkflowService
 from devflow.domain.rules import scope_hash
 from devflow.errors import WorkflowError
 
@@ -368,7 +368,7 @@ def test_ready_rejects_missing_authority_unknown_dependency_and_revocation(tmp_p
     c["dependencies"] = []
     auth = authority(c)
     auth["revoked"] = True
-    with pytest.raises(WorkflowError, match="authority"):
+    with pytest.raises(WorkflowError, match="revoked"):
         service.execute("work.ready", {**request, "authority": auth})
 
 

@@ -168,3 +168,7 @@ Proposed deployment defaults are a private `developer-workflow` source repositor
 Runtime acceptance still has to be demonstrated by implementation. In particular, the actual host canary, GitHub comment/file-anchor behavior under the selected permissions, interrupted recovery, harness fixes and installed ccusage compatibility are implementation gates. A missing capability must produce its designed blocked state, never a silent substitute that drops inspectability or evidence.
 
 Model comparison remains deferred until W09's workflow stability criteria are satisfied. The comparison plan and metrics contract retain same-case duplication and historical attribution; they do not determine model settings for the reset.
+
+## Security admission revision (0.2.0)
+
+The [verified intake contract](issue-trust.md) supersedes caller-supplied authority admission and old-pin execution retention. Package acceptance requires default CLI/application denial, constructor-injected synthetic protocol proof, exact source/scope/operation/expiry/revocation binding, unchanged replay, external lineage through owned projections, old-pin bypass regression, and capture correlation/recovery without duplicate writes. An independently authenticated real host intake/human-validation capability remains unavailable and mandatory before managed execution activation; synthetic tests cannot pass that deployment gate.

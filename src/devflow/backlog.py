@@ -79,7 +79,7 @@ def capture(store, repository, request, *, action="capture", github_factory=GitH
     key = _key(repository, work_id)
     with _action_lock(store.root, key):
         state = _read(store, key)
-        supplied = any(k in request for k in ("title", "body", "issue_number"))
+        supplied = any(k in request for k in ("title", "body", "issue_number", "source_lineage"))
         if supplied:
             title, body, number = request.get("title"), request.get("body"), request.get("issue_number")
             if number is not None and (type(number) is not int or number < 1):
@@ -90,7 +90,12 @@ def capture(store, repository, request, *, action="capture", github_factory=GitH
                 or "<!-- devflow-backlog:" in body
             ):
                 raise WorkflowError("invalid_request", "Capture needs a short title and sanitized issue body")
-            payload = {"title": title, "body": body, "issue_number": number}
+            lineage = request.get("source_lineage", [])
+            if not isinstance(lineage, list) or not all(isinstance(item, dict) for item in lineage):
+                raise WorkflowError("invalid_request", "Source lineage must be a list of observations")
+            payload = {"title": title, "body": body, "issue_number": number, "source_lineage": lineage}
+            if state and "source_lineage" not in state["payload"] and not lineage:
+                payload.pop("source_lineage")
             payload_hash = digest(payload)
             if state and state["payload_hash"] != payload_hash:
                 raise WorkflowError("capture_conflict", "This work already has a different capture request; reuse it")
@@ -118,16 +123,36 @@ def capture(store, repository, request, *, action="capture", github_factory=GitH
         uncertain = state["status"] in {"dispatched", "ambiguous"}
         try:
             result = remote.reconcile_backlog_issue(
-                state["capture_id"], issue_number=state["payload"]["issue_number"]
+                state["capture_id"], issue_number=(
+                    state.get("creation_expected", {}).get("issue", {}).get("number")
+                    if uncertain and state.get("creation_expected", {}).get("issue")
+                    else state["payload"]["issue_number"]
+                ),
+                expected=state.get("creation_expected") if uncertain else None
             )
             if result is None:
                 if uncertain:
                     raise WorkflowError(
                         "ambiguous_backlog", "Issue creation is uncertain; reconcile later, never create a replacement"
                     )
-                state = _append(store, key, state, status="dispatched", no_mutation=False)
-                result = remote.create_backlog_issue(
-                    state["capture_id"], title=state["payload"]["title"], body=state["payload"]["body"]
+                # Persist authenticated transport identities before the one write.
+                # They establish creation correlation, never human origin.
+                expected = {
+                    **remote.backlog_creation_context(),
+                    "consumed_digest": digest({
+                        "title": state["payload"]["title"],
+                        "body": remote.backlog_body(state["capture_id"], state["payload"]["body"]),
+                    }),
+                }
+                state = _append(store, key, state, status="dispatched", no_mutation=False,
+                                creation_expected=expected)
+                created = remote.create_backlog_issue(
+                    state["capture_id"], title=state["payload"]["title"], body=state["payload"]["body"],
+                )
+                expected = {**expected, "issue": created}
+                state = _append(store, key, state, creation_expected=expected)
+                result = remote.reconcile_backlog_issue(
+                    state["capture_id"], issue_number=created["number"], expected=expected
                 )
         except WorkflowError as exc:
             no_mutation = not uncertain and (
