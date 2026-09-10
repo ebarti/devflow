@@ -328,3 +328,46 @@ def test_legacy_confirmed_capture_replays_without_inventing_provenance(setup):
     })
     assert run(REQUEST) == legacy
     assert "origin" not in legacy["issue"]
+
+
+def test_existing_issue_with_null_body_remains_unknown_read_only_capture(setup):
+    from devflow.validation import digest
+
+    _, server, run = setup
+    server.items = [server.issue(7, body=None)]
+    result = run({"work_id": REQUEST["work_id"], "issue_number": 7})
+    assert result["issue"]["capture_mode"] == "reused_unknown"
+    assert result["issue"]["origin"] == "unknown"
+    assert result["issue"]["consumed_digest"] == digest({"title": REQUEST["title"], "body": None})
+    assert server.items[0]["body"] is None
+    assert server.posts == 0
+
+
+@pytest.mark.parametrize("body", [0, False, [], {}])
+def test_existing_issue_rejects_nonstring_nonnull_body(setup, body):
+    _, server, run = setup
+    server.items = [server.issue(7, body=body)]
+    with pytest.raises(WorkflowError) as caught:
+        run({"work_id": REQUEST["work_id"], "issue_number": 7})
+    assert caught.value.code == "backlog_identity"
+    assert server.posts == 0
+
+
+def test_created_issue_cleared_body_mismatches_exact_expected_content(setup):
+    _, server, run = setup
+    original = server.run
+
+    def cleared_body(argv, **kwargs):
+        if argv[argv.index("--method") + 2].endswith("/issues/1"):
+            server.items[0]["body"] = None
+        return original(argv, **kwargs)
+
+    server.run = cleared_body
+    with pytest.raises(WorkflowError) as caught:
+        run(REQUEST)
+    assert caught.value.code == "backlog_creation_mismatch"
+    assert run(action="show")["status"] == "ambiguous"
+    with pytest.raises(WorkflowError) as recovered:
+        run()
+    assert recovered.value.code == "backlog_creation_mismatch"
+    assert server.posts == 1

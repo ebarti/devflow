@@ -14,7 +14,7 @@ from devflow.admission import (
     UnavailableIntakeVerifier,
     execution_admission,
 )
-from devflow.domain.rules import blank, next_actions, transition
+from devflow.domain.rules import PERMISSIONS, active, authority, blank, next_actions, transition
 from devflow.errors import WorkflowError
 from devflow.validation import canonical_json, digest, validate_record
 
@@ -49,6 +49,30 @@ class WorkflowService:
             repository=self.repository,
             operation=operation,
         )
+
+    def require_action_dispatch(self, state, action, expected_revision, *, reconcile=False):
+        """Validate the current intent before external dispatch or native handoff."""
+        if action["status"] == "invalidated":
+            raise WorkflowError("stale_action", "Action was invalidated")
+        if action["status"] == "failed":
+            raise WorkflowError(
+                "retry_required", "Use action retry to re-admit a definitely failed action"
+            )
+        if type(expected_revision) is not int or state["revision"] != expected_revision:
+            raise WorkflowError("stale_revision", "Work changed before action dispatch")
+        if action["payload"]["scope_hash"] != state["scope_hash"] or (
+            action["payload"]["candidate_id"] != state["candidate_id"]
+        ):
+            raise WorkflowError("stale_action", "Action scope or candidate changed")
+        if not reconcile:
+            attempt = active(state)
+            if attempt["status"] != "active" or action["attempt_id"] != attempt["attempt_id"]:
+                raise WorkflowError("invalid_state", "Action needs its current active attempt")
+            if action["status"] != "prepared":
+                raise WorkflowError("reconcile_required", "Uncertain actions permit recovery only")
+            permission = PERMISSIONS[action["operation"]]
+            self.require_execution(state, operation=permission)
+            authority(state, datetime.now(timezone.utc), permission)
 
     def permitted_actions(self, state):
         actions = next_actions(state)

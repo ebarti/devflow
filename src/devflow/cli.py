@@ -271,8 +271,11 @@ def dispatch(args) -> dict:
             if (
                 state["assignments"].get(assignment.get("assignment_id")) != assignment
                 or not action or action["operation"] != "launch_role"
-                or action["status"] != "prepared"
-                or assignment.get("attempt_id") != state["attempt"]["attempt_id"]
+            ):
+                raise WorkflowError("assignment_mismatch", "Native launch needs its current recorded assignment")
+            service.require_action_dispatch(state, action, request.get("expected_revision"))
+            if (
+                assignment.get("attempt_id") != state["attempt"]["attempt_id"]
                 or assignment.get("candidate_id") != state["candidate_id"]
             ):
                 raise WorkflowError("assignment_mismatch", "Native launch needs its current recorded assignment")

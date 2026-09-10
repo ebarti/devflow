@@ -266,7 +266,8 @@ class GitHubRepository:
             or type(issue.get("number")) is not int or type(issue.get("id")) is not int
             or not issue.get("node_id") or type(creator.get("id")) is not int
             or not creator.get("node_id") or not isinstance(issue.get("title"), str)
-            or not isinstance(issue.get("body"), str) or not issue.get("updated_at")
+            or "body" not in issue or (issue["body"] is not None and not isinstance(issue["body"], str))
+            or not issue.get("updated_at")
             or type(repository.get("id")) is not int or not repository.get("node_id")
             or repository.get("full_name", "").lower() != f"{self.owner}/{self.name}".lower()
         ):
@@ -300,7 +301,7 @@ class GitHubRepository:
         if issue_number is not None and observed["number"] != issue_number:
             raise WorkflowError("backlog_identity", "Readback differs from the exact issue")
         if expected is not None:
-            if marker not in issue["body"] or any(
+            if marker not in (issue["body"] or "") or any(
                 observed[key] != expected[key] for key in (
                     "repository_id", "repository_node_id", "creator_id", "creator_node_id", "consumed_digest"
                 )
