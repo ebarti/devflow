@@ -16,7 +16,7 @@ import hashlib, json, pathlib, sys
 key = sys.argv[2]
 if len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
     raise ValueError("artifact key must be SHA-256")
-raw = (pathlib.Path(sys.argv[1]) / "artifacts" / key).read_bytes()
+raw = (pathlib.Path(sys.argv[1]).expanduser() / "artifacts" / key).read_bytes()
 if hashlib.sha256(raw).hexdigest() != key:
     raise ValueError("artifact hash mismatch")
 artifact = json.loads(raw)
