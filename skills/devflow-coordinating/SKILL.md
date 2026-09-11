@@ -7,9 +7,11 @@ description: Coordinate a defined repository request, named issue, bounded backl
 
 Input: authorized scope, acceptance/check plan, endpoint and existing work ID. Output: durable assignments, imported producer results and the next stage. The original user conversation owns coordination.
 
-Run the pinned launcher and `doctor`. For continuation, recover through `backlog list`/`work list`, then `work show` and `next`; reuse work, attempt, candidate, action and role identities. Read the skill named by each action. Do not start another work item to escape an unresolved operation.
+For continuation, recover through `backlog list`/`work list`, then `work show` and `next`; reuse work, attempt, candidate, action and role identities. Classify the explicitly requested completed-PR recovery below before ordinary doctor preflight. Read the skill named by each action. Do not start another work item to escape an unresolved operation.
 
 If a verified PR outcome is already Done and the user requests further repair or update of that same PR, use [completed PR continuation](references/completed-pr.md). `work reopen` records the new authority and continuation; ordinary `work amend` cannot reactivate terminal work. Keep the earlier delivery as history.
+
+When that owned checkout retains an older pin, use the reviewed installed release to read state and PR identity, capture the explicit upgrade and reopen the same work before requiring ordinary readiness. Then require that release's `doctor --work-id <existing-id>` to be READY before activating a role. Pre-admission BLOCKED caused by the historical pin is an expected diagnostic; missing tools, invalid profile/release, unresolved operations and failed admission still block. Do not execute the old release or change its pin before authority. For all other enrolled work, run the pinned launcher and `doctor`, including the existing `--work-id` for continuation.
 
 If definition/check coverage is missing, hand off to [defining-work](../devflow-defining-work/SKILL.md) or [planning](../devflow-planning/SKILL.md). Admit the conversational request and snapshot through the [intake procedure](../devflow-defining-work/references/intake.md). Preserve the actual entry phase for review-only/delivery-only work.
 

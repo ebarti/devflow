@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -15,6 +16,7 @@ from test_user_request_console import Console, git, initialize_git
 from test_user_request_console import installed as installed  # noqa: F401
 from test_work_reopen import REPOSITORY, reopen_request
 
+from devflow import __version__
 from devflow.installation import apply_install, plan_install
 from devflow.validation import digest
 
@@ -32,7 +34,7 @@ def historical_release(tmp_path_factory):
         shutil.copyfile(root / name, source / name)
     for name in ("src/devflow/__init__.py", "pyproject.toml", "uv.lock"):
         path = source / name
-        path.write_text(path.read_text().replace('"0.5.2"', '"0.4.0"'))
+        path.write_text(path.read_text().replace(f'"{__version__}"', '"0.4.0"'))
     initialize_git(source)
     git(source, "add", ".")
     git(source, "commit", "-qm", "test: synthetic historical PR workflow pin")
@@ -442,7 +444,7 @@ def test_old_pin_cli_integrates_policy_rebinds_worker_and_delivers_same_pr(
     worker = reopened["assignments"]["worker"]
     original_task = worker["task_id"]
     (console.root / ".devflow/workflow.lock").write_text(
-        f'schema_version=1\nversion="0.5.2"\nrevision="{console.package_revision}"\n'
+        f'schema_version=1\nversion="{__version__}"\nrevision="{console.package_revision}"\n'
     )
     (console.root / "AGENTS.md").write_text("Synthetic integrated workflow instructions.\n")
     docs = console.root / "docs/developer"
@@ -524,3 +526,67 @@ def test_old_pin_cli_integrates_policy_rebinds_worker_and_delivers_same_pr(
     assert console.counter.read_text() == "run\n" * 4
     remote = json.loads(console.remote.read_text())
     assert len(remote["prs"]) == 1 and [w[0] for w in remote["writes"]] == ["POST", "PATCH"]
+
+
+def test_completed_old_pin_reopen_precedes_same_work_doctor(tmp_path, installed, historical_release):
+    console = PRConsole(tmp_path, historical_release)
+    console.finish()
+    before = console.show()
+    (tmp_path / "pre-admission-state.json").write_text(json.dumps(before, indent=2) + "\n")
+    original_lock = (console.root / ".devflow/workflow.lock").read_bytes()
+    original_head = git(console.root, "rev-parse", "HEAD")
+    original_remote = console.remote.read_bytes()
+    console.release, console.package_revision = installed
+    diagnostics = []
+
+    def doctor(work_id=None):
+        argv = [sys.executable, "-m", "devflow.cli", "doctor", "--repository", str(console.root),
+                "--state-dir", str(console.state_dir), "--release-root", str(historical_release[0].parents[1]),
+                "--json"]
+        if work_id:
+            argv += ["--work-id", work_id]
+        process = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=30,
+                                 cwd=console.root, env={**os.environ, "PYTHONPATH": str(console.release / "src"),
+                                 "PYTHONDONTWRITEBYTECODE": "1", "CODEX_THREAD_ID": PARENT,
+                                 "PATH": str(console.bin) + os.pathsep + os.environ["PATH"]})
+        diagnostics.append({"argv": argv, "exit_code": process.returncode,
+                            "stdout": process.stdout, "stderr": process.stderr})
+        (tmp_path / "doctor-order-evidence.json").write_text(json.dumps(diagnostics, indent=2) + "\n")
+        response = json.loads(process.stdout)
+        assert response["ok"], response
+        return process.returncode, response["result"]
+
+    for work_id in (None, before["work_id"]):
+        code, diagnostic = doctor(work_id)
+        assert code == 2 and diagnostic["status"] == "BLOCKED"
+        assert diagnostic["profile"] == "valid" and not diagnostic["execution_enabled"]
+        assert str(historical_release[0]) in diagnostic["selected_runtime"]
+        assert console.show() == before
+    assert console.call("next", {"work_id": before["work_id"]})["actions"][0]["kind"] == "done"
+    snapshot = console.call("snapshot.capture", {
+        "snapshot_id": "preflight-continuation", "continuation_work_id": before["work_id"],
+        "effective_settings": {"model": "synthetic-worker", "reasoning_effort": "high",
+                               "source_reference": "synthetic:actual-test-settings"}})
+    assert console.show() == before
+    assert snapshot["continuation_upgrade"]["prior_package_revision"] == historical_release[1]
+    request, _ = reopen_request(before)
+    console.call("work.reopen", request | {"workflow_snapshot": snapshot})
+    admitted = console.show()
+    code, diagnostic = doctor(before["work_id"])
+    assert code == 0 and diagnostic["status"] == "READY" and diagnostic["execution_enabled"]
+    assert diagnostic["selected_runtime"] == "current pinned release"
+    assert diagnostic["package_version"] == __version__
+    assert diagnostic["workflow_lock"]["revision"] == historical_release[1]
+    code, diagnostic = doctor()
+    assert code == 2 and diagnostic["status"] == "BLOCKED" and not diagnostic["execution_enabled"]
+    assert str(historical_release[0]) in diagnostic["selected_runtime"]
+    assert console.show() == admitted
+    assert admitted["lifecycle"] == "active" and admitted["work_id"] == before["work_id"]
+    assert admitted["attempt"]["attempt_id"] == before["attempt"]["attempt_id"]
+    assert admitted["assignments"] == before["assignments"]
+    assert all(admitted["records"][key] == value for key, value in before["records"].items())
+    assert (console.root / ".devflow/workflow.lock").read_bytes() == original_lock
+    assert git(console.root, "rev-parse", "HEAD") == original_head
+    assert git(console.root, "status", "--porcelain") == ""
+    assert console.remote.read_bytes() == original_remote
+    (tmp_path / "post-admission-state.json").write_text(json.dumps(admitted, indent=2) + "\n")
