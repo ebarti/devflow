@@ -1,6 +1,6 @@
 # Development workflow implementation contracts
 
-Historical design baseline: 2026-09-09. This document retains the original interface proposals with subsequent contract revisions, including verified intake in 0.2.0. See [operation](operation.md) and [implementation status](implementation-status.md) for shipped commands and unavailable host capabilities. Version every persisted record with `schema_version`; reject unknown major versions. Example records and JSON Schema accompany this document under `design/`.
+Historical design baseline: 2026-09-09. This document retains the original interface proposals with subsequent contract revisions, including the 0.3.0 conversational request contract that supersedes the mandatory independent verifier in 0.2.0. See [operation](operation.md) and [implementation status](implementation-status.md) for shipped commands and unavailable host capabilities. Version every persisted record with `schema_version`; reject unknown major versions. Example records and JSON Schema accompany this document under `design/`.
 
 [Record schemas](design/contracts.schema.json) · [Synthetic work contract](design/work-contract.example.json) · [Synthetic gate result](design/gate-result.example.json) · [Synthetic receipt](design/action-receipt.example.json)
 
@@ -16,9 +16,9 @@ The initial commands are:
 | `devflow backlog capture/show/list/retry` | Stable work ID; first capture also needs existing issue number or sanitized title/body | Journals before gh creation; discovers saved requests; reconciles uncertainty; explicit retry only after proven non-mutation |
 | `devflow work list` | Repository | Discovers recorded work IDs and lifecycle without the previous conversation |
 | `devflow work prepare` | Issue/local intake reference | Normalizes the request; reports missing Ready fields; no invented requirements |
-| `devflow work ready` | Accepted contract with consumed source lineage and `admission_id` resolved by an independently trusted verifier | Verifies immutable admission and prerequisites, stores scope and marks Ready; unavailable intake capability blocks admission |
+| `devflow work ready` | Accepted contract with consumed source lineage and `user_request` (`reference`, `summary`, `allowed_operations`) | Derives immutable request admission/authority and verifies prerequisites, stores scope and marks Ready; missing request blocks admission |
 | `devflow work start` | Ready work ID, host/current task ID, expected revision | Claims one attempt, captures effective policy/configuration and schedules workspace/task actions |
-| `devflow work amend` | New scope plus user-approved delta | Appends scope revision, invalidates affected acceptance/proof and pauses dependent actions |
+| `devflow work amend` | New scope plus `user_request` recording the authorized amendment; current `workflow_snapshot` when an active attempt's pin/profile changed | Validates the snapshot, preserves historical records, appends scope revision and invalidates affected acceptance/proof and prepared actions |
 | `devflow next` | Work/attempt ID | Reads current state and returns the next required action(s), missing evidence or blocker; never calls a model |
 | `devflow action record` | Action ID plus native-host result or external readback | Binds actual task/worktree/PR IDs; reconciles action state |
 | `devflow candidate record` | Work/attempt ID and owned checkout | Captures clean base/head/tree plus input fingerprints; freezes a candidate |
@@ -40,8 +40,8 @@ Users need not fill these records manually. They ask for work or select a Ready 
 | Record | Required fields | Invariant |
 | --- | --- | --- |
 | Work contract | Work ID, kind, title, outcome, scope revision, acceptance IDs/text, paths/boundaries, decisive context, dependencies, risk/reason, verification plan, endpoint | Accepted behavior and endpoint are explicit; issue node identity survives renumbering/transfer |
-| Intake admission | ID, repository/work/scope, exact source/lineage/digest, allowed operations, expiry/revocation, authenticated decision kind/reference | Resolved only by a trusted verifier; external/unknown inputs require exact human validation; immutable history alone is not trust |
-| Authority | Derived from verified admission; ID, source user instruction or adopted queue policy, allowed operations, repository/work/scope limits, source reference, revocation/expiry when applicable | A public issue, arbitrary comment, label or model-generated text cannot grant execution authority |
+| Intake admission | ID, repository/work/scope, exact source/lineage/digest, allowed operations, decision kind/reference, `user_request` | Default `user_request` decision is agent-interpreted conversational direction, stored immutably for consistency; optional legacy verifier decisions retain their expiry/revocation rules |
+| Authority | Derived from immutable admission; ID, source user instruction including a bounded existing batch selection, allowed operations, repository/work/scope limits, source reference, revocation/expiry when applicable | A public issue, arbitrary comment, label or model-generated text cannot grant execution authority |
 | Attempt | ID, work/scope IDs, active host/owner, phase, optional blocker, policy/configuration snapshot IDs, start/stop/outcome | At most one active claim per work item; resumed work retains its attempt |
 | Assignment | ID, action ID, role, owner task, actual task ID or pending client ID, owned paths/workspace, input candidate, result | Producer and purpose are explicit; pending client IDs are not executable task IDs |
 | Candidate | ID, attempt/scope, repository, base/head/tree IDs, clean-state result, dependency/environment fingerprints, creation time | Immutable; a code change creates a new candidate |
@@ -55,7 +55,7 @@ Users need not fill these records manually. They ask for work or select a Ready 
 
 Endpoint target syntax is explicit: a `local` target is the canonical absolute checkout path; a `pr` target is its base branch; a `merge` target is its destination branch; a `release` target is its exact preexisting tag. Remote refs are short names without a `refs/` prefix. Repository identity comes from the admitted authority. Preparation, dispatch and readback must agree on this destination; copying the accepted endpoint into a receipt does not establish which destination was actually affected.
 
-[Verified intake](issue-trust.md) specifies the 0.2.0 admission protocol, default missing-capability denial, immutable source bindings, and old-pin security exception. Legacy Authority and Source shapes remain readable, but caller records cannot admit or resume execution.
+[Conversational intake](issue-trust.md) specifies the 0.3.0 request admission protocol, immutable source bindings, bounded batch selection and retained old-pin exception. The agent supplies the request from conversation; it is not independent human authentication. Legacy Authority and Source shapes remain readable, but they cannot substitute for a user request. Continuation validates the stored admission without a separate approval channel or synthetic verifier.
 
 The JSON Schema validates record shape. Pure domain functions enforce cross-record rules and references. For example, JSON Schema cannot prove a fixing commit is contained in a remote PR; the Git/GitHub adapter supplies that observation and the transition rule requires it.
 

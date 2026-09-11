@@ -3,7 +3,12 @@
 from copy import deepcopy
 from datetime import datetime
 
-from devflow.admission import BOOKKEEPING, derived_authority, execution_admission
+from devflow.admission import (
+    BOOKKEEPING,
+    derived_authority,
+    execution_admission,
+    requested_admission,
+)
 from devflow.domain.endpoints import readback_matches, validate_action_target, validate_endpoint
 from devflow.errors import WorkflowError
 from devflow.validation import digest, validate_record
@@ -1009,15 +1014,21 @@ def transition(original, command, request, now, dependency_states=None, *,
     state = deepcopy(original)
     details = {}
     admission = None
-    if command not in BOOKKEEPING:
-        contract = request.get("record", {}) if command in {"work.ready", "work.amend"} else state["contract"]
-        admission_id = request.get("admission_id") if command in {"work.ready", "work.amend"} else state.get("admission_id")
+    if command in {"work.ready", "work.amend"}:
+        admission = requested_admission(state, request, trusted_verifier, now, repository=repository)
+    elif command not in BOOKKEEPING:
         admission = execution_admission(
-            state, contract or {}, admission_id, trusted_verifier, now,
+            state, state["contract"] or {}, state.get("admission_id"), trusted_verifier, now,
             repository=repository or (state.get("authority") or {}).get("repository"),
         )
     if command in {"work.ready", "work.amend"}:
         record = validate_record(request["record"], "work_contract")
+        if "workflow_snapshot" in request:
+            require(
+                command == "work.amend" and state["lifecycle"] == "active",
+                "invalid_request",
+                "Only active amendments accept a workflow snapshot",
+            )
         require(record["work_id"] == state["work_id"], "wrong_work", "Contract work mismatch")
         validate_endpoint(record["endpoint"])
         if command == "work.ready":
@@ -1043,7 +1054,7 @@ def transition(original, command, request, now, dependency_states=None, *,
                 "Scope revisions must increase by one",
             )
             require(
-                bool(request.get("approved_delta")),
+                admission["decision_kind"] == "user_request" or bool(request.get("approved_delta")),
                 "missing_authority",
                 "Amendment requires recorded user-approved delta",
             )
@@ -1089,6 +1100,10 @@ def transition(original, command, request, now, dependency_states=None, *,
             if action["status"] == "prepared":
                 action["status"] = "invalidated"
         if state["attempt"]:
+            if "workflow_snapshot" in request:
+                snapshot = save(state, request["workflow_snapshot"], "workflow_snapshot")
+                state["attempt"]["workflow_snapshot_id"] = snapshot["snapshot_id"]
+                state["attempt"]["model_policy_snapshot_id"] = snapshot["snapshot_id"]
             state["attempt"]["scope_hash"] = state["scope_hash"]
             state["attempt"]["authority_id"] = auth["authority_id"]
             state["phase"] = "implement"

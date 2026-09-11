@@ -1,17 +1,18 @@
-"""Execution admission through an independently trusted host decision.
+"""Durable execution scope for an agent-recorded conversational user request.
 
-The default has no authenticated intake/human channel. Request JSON, GitHub
-identity, labels, and local signatures cannot implement this port. An embedding
-host must supply a verifier whose decision store the consuming agent cannot mint
-or rewrite. The shipped CLI deliberately has no such adapter.
+The agent interprets the actual user request. This module enforces its recorded
+scope and operations; caller JSON does not authenticate a human. Issue content,
+labels and queue selection alone cannot create a user request.
 """
 
 from copy import deepcopy
 from datetime import datetime
 from typing import Protocol
 
+from jsonschema import Draft202012Validator
+
 from devflow.errors import WorkflowError
-from devflow.validation import digest, validate_record
+from devflow.validation import digest, schema, validate_record
 
 # These commands only retain observations or stop work. Reconciliation which
 # resumes execution is intentionally absent.
@@ -48,19 +49,85 @@ class UnavailableIntakeVerifier:
         )
 
 
+def user_request_admission(state, contract, user_request, repository):
+    """Derive a replayable binding, not a proof of human authentication."""
+    from devflow.domain.rules import scope_hash
+
+    validator = Draft202012Validator({
+        "$ref": "#/$defs/UserRequest", "$defs": schema()["$defs"],
+    })
+    error = next(validator.iter_errors(user_request), None)
+    if error:
+        raise WorkflowError("invalid_user_request", f"user_request: {error.message}")
+    validate_record(contract, "work_contract")
+    if not repository:
+        raise WorkflowError("admission_repository_required", "Execution needs a bound repository")
+    if contract["work_id"] != state["work_id"]:
+        raise WorkflowError("admission_binding", "Request and contract work differ")
+    admission = {
+        "schema_version": 1, "record_type": "intake_admission",
+        "repository": repository, "work_id": state["work_id"],
+        "scope_hash": scope_hash(contract), "source": deepcopy(contract["source"]),
+        "source_digest": digest(contract["source"]), "decision_kind": "user_request",
+        "decision_reference": user_request["reference"], "user_request": deepcopy(user_request),
+        "allowed_operations": list(user_request["allowed_operations"]),
+        "expires_at": None, "revoked": False,
+    }
+    admission["admission_id"] = "request-" + digest(admission)
+    return admission
+
+
+def requested_admission(state, request, verifier, now, *, repository):
+    """Ready/amend accepts either a direct request or an explicit embedding port."""
+    contract = request.get("record", {})
+    if "user_request" in request:
+        allowed = {"operation_id", "work_id", "expected_revision", "record", "user_request",
+                   "approved_delta", "workflow_snapshot"}
+        if set(request) - allowed:
+            raise WorkflowError("invalid_request", "Unknown fields in user-request admission")
+        admission = user_request_admission(state, contract, request["user_request"], repository)
+        return execution_admission(
+            state, contract, admission["admission_id"], verifier, now,
+            repository=repository, requested=admission,
+        )
+    if verifier is None or isinstance(verifier, UnavailableIntakeVerifier):
+        raise WorkflowError(
+            "user_request_required",
+            "Record the user's work request with reference, summary and allowed_operations; "
+            "issue data, labels and legacy approval fields do not authorize work.",
+        )
+    return execution_admission(
+        state, contract, request.get("admission_id"), verifier, now, repository=repository,
+    )
+
+
 def execution_admission(state, contract, admission_id, verifier, now, *, repository=None,
-                        operation=None):
+                        operation=None, requested=None):
     """One predicate for admission, continuation and actual dispatch.
 
-    Only the verifier supplies the admission. Stored copies establish immutability,
-    not trust: every new execution resolves the live decision again.
+    Direct requests resume from their immutable stored binding. Optional embedding
+    decisions still resolve live; historical admissions never become direct requests.
     """
     from devflow.domain.rules import scope_hash
 
-    admission = deepcopy((verifier or UnavailableIntakeVerifier()).resolve(admission_id))
+    stored = state["records"].get("intake_admission:" + str(admission_id))
+    admission = requested or stored
+    if admission is not None and admission.get("decision_kind") == "user_request":
+        validate_record(admission, "intake_admission")
+        expected = user_request_admission(state, contract, admission["user_request"], repository)
+        if admission != expected:
+            raise WorkflowError("admission_binding", "Stored user request differs from its exact binding")
+        admission = deepcopy(admission)
+    elif verifier is not None and not isinstance(verifier, UnavailableIntakeVerifier):
+        admission = deepcopy(verifier.resolve(admission_id))
+    else:
+        raise WorkflowError(
+            "user_request_required",
+            "No recorded user-request admission covers this work; record a request with ready or amend.",
+        )
     validate_record(admission, "intake_admission")
     if repository is None:
-        raise WorkflowError("admission_repository_required", "Trusted execution needs a bound repository")
+        raise WorkflowError("admission_repository_required", "Execution needs a bound repository")
     source = contract.get("source", {})
     lineage = source.get("lineage", [])
     if (

@@ -2,7 +2,7 @@
 
 A reusable development workflow with a local `devflow` CLI, a focused host skill, repository profiles, and explicit execution evidence.
 
-Version 0.2.0 deliberately blocks managed execution: no authenticated intake or independent human-validation adapter is available in the CLI. `doctor` reports this as `BLOCKED`. Capture and safe recovery remain available. See [verified intake](docs/issue-trust.md) for the trust boundary and the security exception to old runtime pins.
+Version 0.3.0 accepts conversational work requests through the agent: ask for a change, report a bug to investigate or fix, name an issue, or select a bounded batch such as the current P1 backlog. The agent creates or reuses the issue and starts within the requested scope without a separate approval channel. Its persisted request supports workflow consistency; it does not independently authenticate a human. See [conversational intake](docs/issue-trust.md).
 
 The initial runtime implements accepted work contracts, durable attempts, owned Git checkouts, candidate-bound checks and independent gates, finding publication/closure, delivery receipts, and deterministic usage/outcome reports. An interrupted external action is reconciled before another mutation. A changed candidate cannot inherit a previous candidate's passing gate.
 
@@ -10,7 +10,7 @@ Workflow code, skills, schemas, and operating documentation are released togethe
 
 The happy path stays short: capture or reuse one backlog issue, implement, run applicable checks and independent gates, then deliver. Immediate implementation still gets an issue; corrections reuse the same record. Git, GitHub CLI, uv, ccusage and native task tools perform their existing jobs. Python owns the durable work/evidence state and cross-tool consistency rules, including candidate changes and uncertain-action recovery.
 
-`backlog capture` journals the request before calling `gh`; a restart recovers its issue by a stable marker. `backlog list` and `work list` rediscover unfinished requests and attempts without the original conversation. State, evidence and installer records use explicit disk flushes before acknowledgment. See [crash recovery](docs/operation.md#recover-after-a-crash-or-power-loss) for resumption and the storage boundary.
+`backlog capture` journals the request before calling `gh`; a restart recovers its issue by a stable marker. When the user requests recovery, `backlog list` and `work list` rediscover unfinished requests and attempts without the original conversation. State, evidence and installer records use explicit disk flushes before acknowledgment. See [crash recovery](docs/operation.md#recover-after-a-crash-or-power-loss) for resumption and the storage boundary.
 
 ## Try the package
 
@@ -25,9 +25,9 @@ uv run devflow validate record --request-file docs/design/work-contract.example.
 uv run pytest -q
 ```
 
-For installation, prepare a manifest from a clean full commit, review its exact paths and digest, and apply it with separately supplied scope arguments. Enrolled repositories commit three small `.devflow` profile/lock files. Historical attempt pins remain recorded; 0.2.0 requires re-admission before further execution and never delegates to an older runtime. See [operation](docs/operation.md) for installation, request structure, commands, recovery, and delivery.
+For installation, prepare a manifest from a clean full commit, review its exact paths and digest, and apply it with separately supplied scope arguments. Enrolled repositories commit three small `.devflow` profile/lock files. Historical attempt pins remain recorded; legacy work requires current admission before further execution, and the current reader never delegates to an older runtime. See [operation](docs/operation.md) for installation, request structure, commands, recovery, and delivery.
 
-The [host skill](skills/devflow/SKILL.md) selects the relevant intake, implementation, review, QA, or delivery reference. It introduces no background scheduler, hidden model calls, API keys, or model override. Private execution state stays outside the source checkout.
+A tiny global instruction routes new chats to the [using-devflow entry skill](skills/using-devflow/SKILL.md). This loads instructions only: ordinary questions and unused sessions create no work and do not scan or resume backlog. For requested repository work, the [host skill](skills/devflow/SKILL.md) loads the relevant intake, implementation, review, QA, or delivery reference. There are no hooks, startup actions, automatic scheduling, or new service. It introduces no hidden model calls, API keys, or model override. Private execution state stays outside the source checkout.
 
 ## Verification and adoption
 

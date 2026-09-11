@@ -125,7 +125,7 @@ def test_unavailable_intake_can_reconcile_an_uncertain_write_without_redispatch(
     server.deny = False
     assert dispatch(scenario, action, server)["status"] == "confirmed"
     assert server.merge_count == 1
-    assert scenario.service.next(scenario.work_id)["actions"][-1]["reason"] == "trusted_intake_unavailable"
+    assert scenario.service.next(scenario.work_id)["actions"][-1]["reason"] == "user_request_required"
 
 
 def test_work_blocker_prevents_supported_nonterminal_external_write(tmp_path):
