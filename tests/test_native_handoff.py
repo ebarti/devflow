@@ -101,7 +101,19 @@ def test_current_native_handoff_remains_available_with_synthetic_admission(
         status, response = host_prepare(scenario, assignment, revision, tmp_path, monkeypatch, capsys)
         assert status == 0
         assert response["result"]["native_tool"] == "create_thread"
-    assert scenario.state["revision"] == revision  # Preparing a handoff never launched a task.
+    # The native call has not happened, but its intent must be durable before
+    # the executable handoff is returned. A second request must not relaunch.
+    assert scenario.state["revision"] == revision + 1
+    assert scenario.state["actions"][action["action_id"]]["status"] == "dispatched"
+    if entry == "dispatch":
+        replay = dispatch(scenario, action, revision)
+    else:
+        status, response = host_prepare(scenario, assignment, revision, tmp_path, monkeypatch, capsys)
+        assert status == 0
+        replay = response["result"]
+    assert replay["reconcile_only"] is True
+    assert "native_tool" not in replay
+    assert scenario.state["revision"] == revision + 1
 
 
 @pytest.mark.parametrize("status", ["dispatched", "ambiguous", "pending_setup"])
@@ -141,8 +153,9 @@ def test_blocked_work_suggests_only_recovery_and_the_outstanding_blocker(tmp_pat
     scenario.call("work.block", blocker=blocker)
     actions = scenario.service.next(scenario.work_id)["actions"]
     assert actions == [
-        {"kind": "reconcile_action", "action": scenario.state["actions"][uncertain["action_id"]]},
-        {"kind": "request_user_action", "blocker": blocker},
+        {"kind": "reconcile_action", "action": scenario.state["actions"][uncertain["action_id"]],
+         "skill": "devflow-coordinating", "role_skill": "devflow-implementing"},
+        {"kind": "request_user_action", "blocker": blocker, "skill": "devflow-coordinating"},
     ]
     assert scenario.state["actions"][prepared["action_id"]]["status"] == "prepared"
     with pytest.raises(WorkflowError) as caught:

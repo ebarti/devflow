@@ -53,6 +53,15 @@
     },
     {
       "$ref": "#/$defs/IntakeAdmission"
+    },
+    {
+      "$ref": "#/$defs/UsageAccounting"
+    },
+    {
+      "$ref": "#/$defs/GateIngestion"
+    },
+    {
+      "$ref": "#/$defs/GateResultRecovery"
     }
   ],
   "$defs": {
@@ -458,6 +467,19 @@
             "canceled",
             "failed"
           ]
+        },
+        "execution_mode": {
+          "enum": [
+            "subagent",
+            "native_thread"
+          ]
+        },
+        "entry_phase": {
+          "enum": [
+            "implement",
+            "verify",
+            "deliver"
+          ]
         }
       },
       "required": [
@@ -530,6 +552,10 @@
         "created_at": {
           "type": "string",
           "format": "date-time"
+        },
+        "workflow_snapshot_id": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
@@ -624,8 +650,94 @@
             "pending_setup",
             "running",
             "completed",
-            "blocked"
+            "blocked",
+            "pending_startup",
+            "ready",
+            "unavailable",
+            "replaced",
+            "interrupted"
           ]
+        },
+        "host_kind": {
+          "enum": [
+            "subagent",
+            "native_thread"
+          ]
+        },
+        "coordinator_agent_name": {
+          "type": "string",
+          "pattern": "^/root(?:/[a-z0-9_]+)*$"
+        },
+        "task_name": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "agent_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role_policy": {
+          "type": "object"
+        },
+        "brief": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50000
+        },
+        "startup_observation": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "scope_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "replaces_assignment_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replaced_by_assignment_id": {
+          "type": "string"
+        },
+        "unavailable_observation": {
+          "type": "object"
+        },
+        "replacement_observation": {
+          "type": "object"
+        },
+        "implementation_result": {
+          "type": "object"
+        },
+        "captured_candidate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "control_observation": {
+          "type": "object"
+        },
+        "gate_action_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_snapshot_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "continuation_of": {
+          "type": "string",
+          "minLength": 1
+        },
+        "continuation_reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "result_recovery_id": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [
@@ -660,6 +772,34 @@
               "task_id": {
                 "type": "string",
                 "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "host_kind"
+            ],
+            "properties": {
+              "host_kind": {
+                "const": "subagent"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "coordinator_agent_name",
+              "task_name",
+              "agent_name",
+              "role_policy",
+              "brief",
+              "startup_observation",
+              "scope_hash"
+            ],
+            "properties": {
+              "client_id": {
+                "type": "null"
               }
             }
           }
@@ -885,6 +1025,14 @@
             "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
           },
           "minItems": 0
+        },
+        "assignment_action_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "producer_result_artifact_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
         }
       },
       "required": [
@@ -1064,6 +1212,17 @@
             "reopened",
             "blocked"
           ]
+        },
+        "followup_reference": {
+          "type": "string",
+          "minLength": 1
+        },
+        "deferral_rationale": {
+          "type": "string",
+          "minLength": 1
+        },
+        "followup_observation": {
+          "$ref": "#/$defs/FollowupObservation"
         }
       },
       "required": [
@@ -1192,7 +1351,8 @@
             "sync_projection",
             "publish_status",
             "local_delivery",
-            "run_check"
+            "run_check",
+            "push_branch"
           ]
         },
         "payload_hash": {
@@ -1611,7 +1771,10 @@
           "minLength": 1
         },
         "service_tier": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         },
         "workflow_hash": {
@@ -2461,6 +2624,333 @@
         "reference",
         "summary",
         "allowed_operations"
+      ]
+    },
+    "UsageAccounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "usage_accounting"
+        },
+        "accounting_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_reference": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "complete",
+            "partial",
+            "unknown",
+            "unavailable"
+          ]
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "segment_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "usage_response_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "recorded_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "accounting_id",
+        "attempt_id",
+        "candidate_id",
+        "source_reference",
+        "status",
+        "limitations",
+        "segment_ids",
+        "usage_response_ids",
+        "recorded_at"
+      ]
+    },
+    "GateIngestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "gate_ingestion"
+        },
+        "gate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "historical": {
+          "type": "boolean"
+        },
+        "mismatches": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "candidate",
+              "scope",
+              "implementation",
+              "activation",
+              "evidence",
+              "findings"
+            ]
+          }
+        },
+        "current_candidate_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "producer_assignment": {
+          "$ref": "#/$defs/Assignment"
+        },
+        "implementation_action_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "admitted_revision": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "gate_id",
+        "historical",
+        "mismatches",
+        "current_candidate_id",
+        "producer_assignment"
+      ]
+    },
+    "FollowupObservation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "github_issue"
+            },
+            "reference": {
+              "type": "string",
+              "minLength": 1
+            },
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "issue_number": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "issue_id": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "issue_node_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "state": {
+              "const": "open"
+            },
+            "is_pull_request": {
+              "const": false
+            },
+            "source_reference": {
+              "type": "string",
+              "minLength": 1
+            },
+            "observed_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "required": [
+            "kind",
+            "reference",
+            "repository",
+            "issue_number",
+            "issue_id",
+            "issue_node_id",
+            "state",
+            "is_pull_request",
+            "source_reference",
+            "observed_at"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "work_item"
+            },
+            "reference": {
+              "type": "string",
+              "minLength": 1
+            },
+            "work_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "lifecycle": {
+              "enum": [
+                "backlog",
+                "ready",
+                "active"
+              ]
+            },
+            "observed_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "required": [
+            "kind",
+            "reference",
+            "work_id",
+            "lifecycle",
+            "observed_at"
+          ]
+        }
+      ]
+    },
+    "GateResultRecovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "gate_result_recovery"
+        },
+        "recovery_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "assignment_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gate_action_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "producer_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_snapshot_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "artifact_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "implementation_action_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "original_result": {
+          "type": "object"
+        },
+        "validation_error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "additionalProperties": false
+        },
+        "available_evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "recovery_id",
+        "assignment_id",
+        "gate_action_id",
+        "producer_task_id",
+        "candidate_id",
+        "workflow_snapshot_id",
+        "created_at",
+        "scope_hash",
+        "artifact_hash",
+        "implementation_action_ids",
+        "original_result",
+        "validation_error",
+        "available_evidence_ids"
       ]
     }
   }

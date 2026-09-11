@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
         "command",
         help="doctor, backlog, work, next, candidate, check, gate, finding, "
         "fix, action, assignment, host, artifact, profile, usage, outcome, "
-        "report, install, validate, or deliver",
+        "report, install, skill, validate, or deliver",
     )
     result.add_argument("action", nargs="?", help="Subcommand, such as ready, record, or run")
     result.add_argument("--request-file", help="Structured JSON input file, or - for stdin")
@@ -111,7 +111,7 @@ def _doctor(args):
         "python": sys.version.split()[0],
         "tools": tools,
         "state_exists": (args.state_dir / "state.sqlite3").exists(),
-        "native_host": "owner-provided native task tools required",
+        "native_host": "coordinator-provided subagent tools and native startup metadata required",
         "automatic_merge": "requires live protection and adapter conformance",
         "execution_admission": "direct_user_request",
         "authorization": "requires_recorded_user_request",
@@ -172,6 +172,88 @@ def _host(action: str, request: dict):
             assignment, request["result"], observed_task_id=request["observed_task_id"]
         )
     raise WorkflowError("unknown_command", f"Unknown host command: {action}")
+
+
+def _managed_host(action, request, service):
+    """CLI-owned policy resolution and startup observations; all writes stay journaled."""
+    from devflow.adapters.codex_host import NativeHostBridge, require_native_coordinator
+
+    if action == "assign":
+        from devflow.model_policy import resolve_role_policy
+
+        policy = resolve_role_policy(
+            request["role"], config_path=Path(request.get("config_path", "~/.codex/config.toml")).expanduser(),
+            overrides=request.get("overrides"), role_name=request.get("role_name"),
+        )
+        return service.execute("host.assign", request | {"role_policy": policy})
+    state = service.snapshot(request["work_id"])
+    assignment = state["assignments"].get(request["assignment_id"])
+    if assignment is None:
+        raise WorkflowError("unknown_assignment", "No recorded role assignment exists")
+    if action == "prepare":
+        from devflow.execution import _action_lock
+
+        with _action_lock(service.store.root, assignment["action_id"]):
+            state = service.snapshot(request["work_id"])
+            assignment = state["assignments"][request["assignment_id"]]
+            current_action = state["actions"][assignment["action_id"]]
+            if current_action["status"] != "prepared":
+                return {"reconcile_only": True, "action_id": current_action["action_id"],
+                        "assignment": assignment}
+            service.require_action_dispatch(state, current_action, request.get("expected_revision"))
+            require_native_coordinator(assignment, os.environ.get("CODEX_THREAD_ID"))
+            recovery = state["records"].get("gate_result_recovery:" + assignment.get("result_recovery_id", ""))
+            intent = NativeHostBridge().prepare_assignment(assignment, assignment["brief"], recovery=recovery)
+            begun = service.execute("action.begin", request | {"action_id": current_action["action_id"]})
+            return {"revision": begun["revision"], "intent": intent, "assignment": assignment}
+    if action == "startup":
+        from devflow.provenance import observe_subagent_startup
+
+        observation = observe_subagent_startup(assignment, request, service.put_artifact)
+        return service.execute("host.startup", request | {"observation": observation})
+    if action == "wait":
+        return NativeHostBridge.wait_target(assignment)
+    if action in {"record", "activate", "resume", "recover-result", "unavailable", "observe", "result"}:
+        return service.execute("host." + action, request)
+    if action == "reconcile":
+        # The supported inventory contains agent_name/status only. Persist that
+        # observation through the same pending-startup path as a spawn receipt.
+        return service.execute("host.record", request)
+    raise WorkflowError("unknown_command", f"Unknown managed host command: {action}")
+
+
+def _legacy_host_prepare(request, service):
+    from devflow.execution import _action_lock
+
+    assignment = request["assignment"]
+    state = service.snapshot(request["work_id"])
+    if (state["assignments"].get(assignment.get("assignment_id")) != assignment
+            or not assignment.get("action_id")):
+        raise WorkflowError("assignment_mismatch", "Native launch needs its current recorded assignment")
+    with _action_lock(service.store.root, assignment["action_id"]):
+        state = service.snapshot(request["work_id"])
+        action = state["actions"].get(assignment.get("action_id"))
+        if (state["assignments"].get(assignment.get("assignment_id")) != assignment
+                or not action or action["operation"] != "launch_role"):
+            raise WorkflowError("assignment_mismatch", "Native launch needs its current recorded assignment")
+        if assignment.get("host_kind") == "subagent":
+            raise WorkflowError("managed_host_required", "Subagent control requires the assignment_id API")
+        if action["status"] in {"dispatched", "pending_setup", "ambiguous", "confirmed"}:
+            return {"reconcile_only": True, "action_id": action["action_id"], "status": action["status"]}
+        service.require_action_dispatch(state, action, request.get("expected_revision"))
+        if (assignment.get("attempt_id") != state["attempt"]["attempt_id"]
+                or assignment.get("candidate_id") != state["candidate_id"]):
+            raise WorkflowError("assignment_mismatch", "Native launch needs its current recorded assignment")
+        intent = _host("prepare", request)
+        # Historical host.prepare requests had no caller operation_id. Derive a
+        # stable begin identity from their already journaled attempt/action.
+        begun = service.execute("action.begin", {
+            "operation_id": request.get("operation_id") or (
+                "native-begin:" + action["attempt_id"] + ":" + action["action_id"]
+            ), "work_id": request["work_id"], "expected_revision": request["expected_revision"],
+            "action_id": action["action_id"],
+        })
+        return intent | {"revision": begun["revision"]}
 
 
 def _installation(action: str, request: dict, args):
@@ -274,11 +356,15 @@ def dispatch(args) -> dict:
     if args.command not in {
         "doctor", "backlog", "work", "next", "candidate", "check", "gate", "finding",
         "fix", "action", "assignment", "host", "artifact", "profile", "usage", "outcome",
-        "report", "install", "validate", "deliver", "workspace", "snapshot", "segment", "evidence",
+        "report", "install", "skill", "validate", "deliver", "workspace", "snapshot", "segment", "evidence",
     }:
         raise WorkflowError("unknown_command", "Unknown workflow command")
     if command == "doctor":
         return _doctor(args)
+    if args.command == "skill":
+        from devflow.skill_routing import resolve_request
+
+        return resolve_request(args.action, request, args)
     from devflow.admission import BOOKKEEPING, READ_ONLY
 
     service = None
@@ -294,21 +380,10 @@ def dispatch(args) -> dict:
         if command not in {"work.prepare", "work.show", "next"} or (args.repository / ".devflow").exists():
             load_profile(args.repository)
     if args.command == "host":
+        if "assignment_id" in request or args.action == "assign":
+            return _managed_host(args.action, request, service or _service(args))
         if args.action == "prepare":
-            state = _state(service, request, args)
-            assignment = request["assignment"]
-            action = state["actions"].get(assignment.get("action_id"))
-            if (
-                state["assignments"].get(assignment.get("assignment_id")) != assignment
-                or not action or action["operation"] != "launch_role"
-            ):
-                raise WorkflowError("assignment_mismatch", "Native launch needs its current recorded assignment")
-            service.require_action_dispatch(state, action, request.get("expected_revision"))
-            if (
-                assignment.get("attempt_id") != state["attempt"]["attempt_id"]
-                or assignment.get("candidate_id") != state["candidate_id"]
-            ):
-                raise WorkflowError("assignment_mismatch", "Native launch needs its current recorded assignment")
+            return _legacy_host_prepare(request, service)
         return _host(args.action, request)
     if args.command == "install":
         return _installation(args.action, request, args)
@@ -458,6 +533,10 @@ def dispatch(args) -> dict:
             "next": service.next(state["work_id"]),
             "findings": list(state["findings"].values()),
         }
+    if command == "finding.defer":
+        from devflow.deferrals import defer_finding
+
+        return defer_finding(service, request)
     return service.execute(command, request)
 
 

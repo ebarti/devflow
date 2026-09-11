@@ -18,4 +18,4 @@ For an explicitly read-only investigation, use capture and inspection capabiliti
 
 Create a focused investigation when uncertainty prevents a reliable implementation contract. Project fields are derived from the work record. A newly created issue is not automatically Ready. Keep private context and credentials outside public issue bodies.
 
-At startup capture the actual workflow/profile and effective model settings. Register one owner and one attempt. Use the current attempt when resuming; dates and task titles are not identity.
+At startup capture the actual workflow/profile and effective coordinator settings. Register the original user conversation as coordinator and retain one attempt. New attempts default to subagent execution and record their actual entry phase. Review-only and delivery-only entry reuse valid existing evidence without fabricating an implementation assignment. Resolve each delegated role's policy independently at dispatch. Use the current attempt when resuming; dates and task titles are not identity. Historical attempts without execution mode keep their native-thread identity and receipts.

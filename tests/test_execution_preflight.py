@@ -152,7 +152,7 @@ def test_work_blocker_prevents_supported_nonterminal_external_write(tmp_path):
     assert server.writes == []
     assert scenario.state["actions"][action["action_id"]]["status"] == "prepared"
     assert scenario.service.next(scenario.work_id)["actions"] == [
-        {"kind": "request_user_action", "blocker": blocker}]
+        {"kind": "request_user_action", "blocker": blocker, "skill": "devflow-coordinating"}]
 
 
 def test_work_blocker_preserves_external_reconciliation_and_confirmed_replay(tmp_path):
@@ -171,3 +171,28 @@ def test_work_blocker_preserves_external_reconciliation_and_confirmed_replay(tmp
     assert dispatch(scenario, action, server)["status"] == "confirmed"
     assert server.writes == []
     assert scenario.state["blocker"] == blocker
+
+
+def test_inline_rejection_diagnostics_survive_same_action_retry(tmp_path):
+    from adapters.test_github_anchor_compatibility import REJECTION, CompatibilityServer
+
+    scenario, _ = prepared(tmp_path, Server())
+    scenario.finding(severity="low")
+    server = CompatibilityServer(error={"message": "private-content", "errors": [
+        {"field": "line", "code": "invalid", "value": "private-content"}]})
+    action = scenario.call("action.prepare", operation="publish_finding", payload={
+        "finding_id": "finding-1", "pr_number": 1, "body": "Synthetic defect",
+        "path": "renamed.py", "line": 9, "side": "RIGHT",
+    })["action"]
+    result = dispatch(scenario, action, server)
+    assert result["status"] == "failed"
+    assert result["observation"]["details"] == {"http_status": 422,
+        "validation_errors": [{"field": "line", "code": "invalid"}]}
+    assert "private-content" not in str(result)
+    server.error = REJECTION
+    scenario.call("action.retry", action_id=action["action_id"])
+    assert dispatch(scenario, action, server)["status"] == "confirmed"
+    assert len(server.threads) == 1
+    receipts = scenario.state["actions"][action["action_id"]]["receipts"]
+    assert [scenario.state["receipts"][identity]["status"] for identity in receipts] == [
+        "failed", "confirmed"]

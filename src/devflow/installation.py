@@ -17,6 +17,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 import uuid
 from pathlib import Path
 
@@ -64,6 +65,13 @@ def _archive(source, revision):
         raise WorkflowError("install_source", "Release metadata path is reserved for the installer")
     if not {"pyproject.toml", "uv.lock", "skills/devflow/SKILL.md"}.issubset(files):
         raise WorkflowError("install_source", "Release lacks package lock or skill entry")
+    project = tomllib.loads((Path(source) / "pyproject.toml").read_text())["project"]
+    version = re.match(r"^(\d+)\.(\d+)\.(\d+)", project.get("version", ""))
+    if version and tuple(map(int, version.groups())) >= (0, 5, 0):
+        from devflow.skill_routing import STAGE_SKILLS
+
+        if not {f"skills/{name}/SKILL.md" for name in STAGE_SKILLS}.issubset(files):
+            raise WorkflowError("install_source", "Release lacks the complete stage skill catalog")
     return tree, archive, files
 
 

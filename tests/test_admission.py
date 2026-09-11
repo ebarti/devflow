@@ -122,7 +122,7 @@ def test_exact_admission_starts_and_immutable_replay_does_not_reread_live_issue(
     default = WorkflowService(tmp_path)
     assert_code("user_request_required", lambda: default.execute("work.start", start_request))
     assert default.next(c["work_id"])["actions"] == [
-        {"kind": "request_user_action", "reason": "user_request_required"}]
+        {"kind": "request_user_action", "reason": "user_request_required", "skill": "devflow-coordinating"}]
 
 
 @pytest.mark.parametrize("change", ["body", "comment", "attachment", "pull_request"])

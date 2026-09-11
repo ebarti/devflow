@@ -1,14 +1,14 @@
 # Development workflow reset: implementation and cutover plan
 
-Design revision: 2026-09-09. Reusable package; JobHunter/JobCtrl first. This is a build specification and migration plan, not authorization to start implementation, create repositories/tasks, change credentials, publish PRs or activate automations. Existing scoped authorization remains effective; the implementation kickoff records the remaining concrete endpoints once rather than asking again at every step.
+Design baseline: 2026-09-09; role-execution revision: 2026-09-11. Reusable package; JobHunter/JobCtrl first. This is a build specification and migration plan, not authorization to start implementation, create repositories/tasks, change credentials, publish PRs or activate automations. Existing scoped authorization remains effective; the implementation kickoff records the remaining concrete endpoints once rather than asking again at every step.
 
 ## 1. Decisions fixed by the design
 
 | Decision | Choice | Why |
 | --- | --- | --- |
-| Packaging | Separate reusable `developer-workflow` repository, `devflow` Python CLI, one host skill and repository profiles | One versioned owner for executable rules and instructions; JobCtrl stays a consumer |
+| Packaging | Separate reusable `developer-workflow` repository, `devflow` Python CLI, stage skills and repository profiles | One versioned owner for executable rules and instructions; JobCtrl stays a consumer |
 | Planning records | GitHub issues and native dependencies; one selected Project as a projection | A self-contained work record close to code and review history |
-| Execution | Visible Codex owner/review/QA tasks; native task-tool bridge | Satisfies inspectability with currently available host capabilities |
+| Execution | Original conversation coordinates bounded implementation/review/QA subagents through native tools | Keeps the user's conversation as owner and records independent role identities without creating peer conversations |
 | Local state | Private SQLite and content-addressed evidence, one enrolled execution host per repository | Durable recovery across task/worktree boundaries without a new service |
 | Verification | Existing test tools/CI; explicit command recipes; candidate-bound independent gates | Preserve quality while removing reconstruction and speculative repetition |
 | Automatic merge | Strict protected target freshness plus required per-head `devflow/verified` status and integrated-tree readback | Bind accepted proof to the code actually exposed despite remote writers |
@@ -45,9 +45,9 @@ developer-workflow/
     reporting.py                   deterministic queries, JSON/CSV/Markdown
     installation.py                manifests, managed links and rollback
   schemas/                         versioned contracts and migration fixtures
-  skills/devflow/SKILL.md           short entry point and command routing
-  skills/devflow/references/
-    intake.md / implementation.md / review.md / qa.md / delivery.md
+  skills/using-devflow/SKILL.md     mandatory applicability and named stage routing
+  skills/devflow-*/SKILL.md         definition, planning, coordination and role/delivery skills
+  skills/devflow/SKILL.md           forwarding compatibility entry
   tests/
     domain/ contract/ adapters/ acceptance/ migration/
   fixtures/repositories/           tiny distinct repository profiles
@@ -90,7 +90,7 @@ These source findings were inspected on `worktree/ee27`. The pre-existing `worke
 | `~/.agents/definitions/review-prs/reviewer.md` | Retain the valuable rubric as the devflow review reference, with one canonical copy |
 | `~/.agents/skills/review-prs` and host-specific review skill adapters | Use a thin repository/attempt-aware router: enrolled pinned work uses devflow review; other repositories and draining attempts retain frozen legacy behavior |
 | `~/.agents/skills/fix-pr-review-comments/SKILL.md` | The same router selects devflow repair/finding lifecycle for enrolled work, replacing mandatory hidden workers and loose resolution there |
-| `~/.codex/agents/reviewer.toml`, `qa.toml`, `pr-fixer.toml`, `qa-fixer.toml`, `fixer.toml`, `implementer.toml` and configured PR-review role | Keep legacy native definitions for non-adopting consumers; devflow visible role tasks use package references and user-resolved settings. Do not globally rewrite another repository's role behavior |
+| `~/.codex/agents/reviewer.toml`, `qa.toml`, `pr-fixer.toml`, `qa-fixer.toml`, `fixer.toml`, `implementer.toml` and configured PR-review role | Keep native definitions for other consumers; devflow resolves user role settings into explicit generic subagent launches with package references. Do not globally rewrite another repository's role behavior |
 | `~/.agents/skills/systematic-debugging-for-all/SKILL.md` | Keep diagnosis/invariant discipline; repository-aware routing uses devflow state/verification for enrolled work and preserves legacy instructions elsewhere |
 | `~/.codex/skills/gh-stack/SKILL.md` | Keep the proven Git operation reference; it supplies commands, not an additional development lifecycle |
 | Existing Claude adapters/links, including `~/.claude/commands/fix-prs.md` | Inventory and pin to a frozen legacy package before shared targets move; do not silently alter a non-adopting client |
@@ -104,7 +104,7 @@ Each row is a separately reviewable deliverable with explicit dependencies and p
 | ID | Outcome and ownership | Depends on | Required proof |
 | --- | --- | --- | --- |
 | W01 | Implement contracts, pure state rules and SQLite claims/revisions in the reusable package | Accepted design | Contract examples; duplicate-claim race; stale revision; scope amendment; Done rejection without delivery receipt; transactional migration/backup recovery |
-| W02 | Implement host intents/receipts, owned workspace assignments, role briefs and `next` | W01 | Visible owner/review/QA tasks on a synthetic canary; pending client ID handling; lost launch response causes no duplicate; task result matches candidate; interrupt/resume keeps work |
+| W02 | Implement host intents/receipts, owned workspace assignments, role briefs and `next` | W01 | Original coordinator plus implementation/review/QA subagents on a bounded native canary; actual identity/settings verified before product work; lost launch response causes no duplicate; result matches candidate; interrupt/resume keeps work; historical thread receipts remain readable |
 | W03 | Implement GitHub/Git adapters, proof status and finding lifecycle | W01, W02 receipt contract | Paginated threads; idempotent publication/resolution; acyclic technical fix/gate/closure; protected target/head races; actual merged-tree mapping; stack backend per-head enforcement and recovery |
 | W04 | Implement deterministic usage, provenance and reports | W01, W02 task identity | Replay import idempotency, mixed models/settings, one task reused across outcomes, partial prices, archived records, response allocation, linked repair and non-overlapping totals |
 | W05 | Implement JobCtrl check profile and repair the two harness defects | Accepted design; can proceed independently of W02-W04 | Sentinel/symlink/forged-state cleanup fixtures; required extension launch failure is nonpassing; one actual isolated browser/product path; affected existing tests |
@@ -119,7 +119,7 @@ W01-W04 and W06 belong to the reusable repository; W05 and JobCtrl profile/doc c
 
 | ID | Scenario | Observable pass condition |
 | --- | --- | --- |
-| A01 | Feature from a Ready issue | Owner completes the original acceptance and endpoint; linked review/QA tasks are inspectable; final receipt identifies the delivered candidate |
+| A01 | Feature from a Ready issue | Original conversation coordinates delegated implementation and required independent review/QA; registered role results are inspectable; final receipt identifies the delivered candidate |
 | A02 | Bug reported by the user | Reproducer identifies the violated invariant; meaningful regression fails on the bad candidate and passes after repair; origin/detection/fix provenance remains distinct |
 | A03 | Review/QA catches several issues | All severities receive distinct due PR review threads; confirmed fixes have commit/proof/reply/resolution/readback; no finding disappears in a summary |
 | A04 | Retry after owner or host interruption | Same work/attempt resumes with current refs and existing proof; no duplicate owner, PR, comment or deleted checkout |
@@ -138,10 +138,11 @@ W01-W04 and W06 belong to the reusable repository; W05 and JobCtrl profile/doc c
 | A17 | New package fails after cutover | Managed links/config restore; current code/evidence/GitHub history survive; admissions stop until compatible |
 | A18 | Second repository with different commands | Same package completes a fixture workflow from its profile; no JobCtrl-specific branch in the generic engine |
 | A19 | Ordinary small editorial request | Applicable static check and endpoint only; no invented unit tests, review/QA tasks or full-stack cycle |
-| A20 | Model defaults changed by the user | Effective change is recorded as a new segment; no hidden package pin or experiment changes the user's selection |
+| A20 | Coordinator and role model settings differ or change | Explicit role settings resolve independently of the coordinator's active overrides; actual startup model/effort matches the role policy; a policy change preserves prior segments and uses a recorded replacement when the native tool cannot retune an existing agent |
 | A21 | Another writer advances target or source during merge | Server rejects stale unverified integration, or a newly evaluated candidate is used; actual merge tree matches the recorded integrated tree; mismatches remain exposed-unverified |
 | A22 | High finding is repaired, including a local-only request | Independent technical fix verification removes the finding's technical block before final gate evaluation; later remote publication/closure is due only at its authorized boundary |
 | A23 | JobCtrl enrolled, another repository not enrolled, same Codex host | The first uses its pinned devflow version, the second retains frozen legacy instructions/settings; rollback preserves both routes and active-attempt versions |
+| A24 | Subagent spawn/startup is interrupted or reports a mismatch | Dispatch is journaled before the native call; an uncertain response never causes a duplicate spawn; product work waits for verified parent/path/session/settings; replacement retains prior identity and evidence; historical attempts keep their original execution mode |
 
 Core tests use `uv run pytest tests/domain tests/contract tests/adapters tests/migration`. Acceptance tests use `uv run pytest tests/acceptance` with fake adapters for deterministic failures and a separately enabled synthetic host/GitHub canary for actual integration. These are planned package commands, not tests already run.
 
@@ -174,3 +175,9 @@ Model comparison remains deferred until W09's workflow stability criteria are sa
 The [conversational intake contract](issue-trust.md) replaces the 0.2.0 mandatory independent host verifier. Direct work requests, bug reports/investigation requests, named issues and bounded current backlog selections authorize agent-recorded work without separate approval. One reference may cover the selected batch; future queue items are not automatically selected. The agent interprets authority; persisted request records enforce consistency rather than independently authenticating a human.
 
 Package acceptance requires CLI lifecycle proof without a synthetic verifier: request admission, start, candidate/check execution and continuation; rejection of missing requests and legacy authority substitutes; immutable repository/work/scope/source/operation bindings; unchanged replay; external lineage preservation; old-pin bypass protection; and capture/recovery without duplicate uncertain writes. Entry instructions load in new chats, but ordinary questions and unused sessions create no work or backlog scan/resumption. No hooks, startup actions, automatic scheduling or new service are part of this revision. Native desktop visibility and protected-merge conformance remain independent adoption gates; successful conversational intake cannot stand in for them.
+
+## Stage skill revision (0.5.0)
+
+Eight independently discoverable entries replace the umbrella/reference architecture: using-devflow plus defining-work, planning, coordinating, implementing, reviewing, verifying and delivering. Each defines trigger, inputs, actual output, failure/re-entry behavior and named next skill. Ordinary design discussion applies a method without executing work; direct review preserves its entry; editorial work retains proportional verification. Package and installer retain every stage and immutable pin routing.
+
+Acceptance adds cold design-only and direct-role forward tests, actual next-action skill routing, complete installed discovery, implementation-completion-before-check ordering, all-status independent result persistence before repair, historical result recovery, guarded journaled branch publication, API anchor compatibility without duplicate writes, linked deferrals and explicit accounting completeness. Test interrupted/rejected operations by resuming the same action/attempt; preserve prior failures. A new ordinary adopter backlog run follows reviewed merge and verified local adoption. Stop at its first confirmed workflow failure, preserve state, fix the cause and resume the failed stage. Native forward tests and the ordinary run remain separate from deterministic package proof.

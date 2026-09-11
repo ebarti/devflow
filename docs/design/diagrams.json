@@ -15,11 +15,11 @@
           },
           {
             "id": "owner",
-            "label": "Visible owner task"
+            "label": "Original conversation coordinator"
           },
           {
             "id": "roles",
-            "label": "Visible review and QA tasks"
+            "label": "Implementation, review and QA subagents"
           },
           {
             "id": "engine",
@@ -51,7 +51,7 @@
           {
             "from": "owner",
             "to": "roles",
-            "label": "Native task tools"
+            "label": "Native subagent tools"
           },
           {
             "from": "owner",
@@ -127,7 +127,7 @@
           {
             "from": "ready",
             "to": "implement",
-            "label": "Claim one owner"
+            "label": "Register coordinator and delegate"
           },
           {
             "from": "implement",
