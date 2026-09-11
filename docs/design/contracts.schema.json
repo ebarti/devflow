@@ -2720,7 +2720,9 @@
               "candidate",
               "scope",
               "implementation",
-              "activation"
+              "activation",
+              "evidence",
+              "findings"
             ]
           }
         },

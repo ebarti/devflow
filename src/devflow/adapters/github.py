@@ -151,7 +151,9 @@ class GitHubRepository:
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
-            "X-GitHub-Api-Version: 2026-03-10",
+            # Merge reconciliation requires the PR's merge_commit_sha, removed
+            # in 2026-03-10. Retain the supported schema this adapter implements.
+            "X-GitHub-Api-Version: 2022-11-28",
         ]
         if payload is not None:
             argv += ["--input", "-"]

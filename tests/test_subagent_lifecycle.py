@@ -984,3 +984,88 @@ def test_low_findings_remain_optional_but_unobserved_deferrals_do_not(tmp_path):
         deferral_rationale="Unverified historical deferral",
     )
     assert next_actions(state)[0]["kind"] == "resolve_findings"
+
+
+@pytest.mark.parametrize("later_change", ["failing_check", "high_finding"])
+def test_original_pass_import_survives_later_readiness_invalidation(tmp_path, later_change):
+    from devflow.domain.rules import valid_gates
+
+    s, worker = staged_candidate(tmp_path, tier=1)
+    reviewer = s.start_role("review")
+    original = staged_gate(s, reviewer)
+    if later_change == "failing_check":
+        s.check("check-later", status="FAIL")
+        reason = "evidence"
+    else:
+        s.finding(severity="high")
+        reason = "findings"
+    s.cli("host assign", assignment_id=worker["assignment_id"], role="implementation_worker",
+          owned_paths=["src"], brief="Repair the observed regression", config_path=str(s.config),
+          expect="gate_result_required")
+    s.cli("gate record", record=original)
+    assert s.state["records"][f"gate_result:{original['gate_id']}"] == original
+    ingestion = s.state["records"][f"gate_ingestion:{original['gate_id']}"]
+    assert ingestion["historical"] and reason in ingestion["mismatches"]
+    assert not valid_gates(s.state)
+    assert s.state["assignments"][reviewer["assignment_id"]]["status"] == "completed"
+    next_action = s.service.next(s.work_id)["actions"][0]
+    assert next_action["role"] == "implementation_worker"
+    assert next_action["assignment_id"] == worker["assignment_id"]
+    s.cli("deliver", expect="not_ready_to_deliver")
+    repair = s.assign(identity=worker["assignment_id"])
+    assert repair["task_id"] == worker["task_id"]
+
+
+def complete_stage_accounting(s):
+    worker_segment = next(r for r in s.state["records"].values()
+                          if r.get("record_type") == "execution_segment")
+    owner_segment = worker_segment | {"segment_id": "owner-accounted-segment", "task_id": PARENT,
+                                      "role": "owner", "source_reference": "synthetic:owner-session"}
+    s.call("segment.record", record=owner_segment)
+    rows = []
+    for index, segment in enumerate((worker_segment, owner_segment)):
+        row = record("usage", response_id=f"accounted-response-{index}", task_id=segment["task_id"],
+                     segment_id=segment["segment_id"], recorded_at=NOW, uncached_input_tokens=12,
+                     cache_read_tokens=0, cache_write_tokens=0, output_tokens=3, reasoning_output_tokens=1,
+                     ccusage_version="synthetic-1", price_snapshot_id=None, api_equivalent_usd=None,
+                     estimated_codex_credits=None, allocations=[{"work_id": s.work_id, "weight": 1}],
+                     attribution_status="complete", pricing_status="missing_rate")
+        s.call("usage.record", record=row)
+        rows.append(row)
+    accounting = s.call("usage.account", status="complete", source_reference="synthetic:collector",
+                        limitations=["Price rates unavailable; costs remain unknown"])["accounting"]
+    return accounting, rows
+
+
+def test_complete_accounting_expires_when_new_participant_has_unaccounted_segment(tmp_path):
+    from devflow.domain.rules import current_accounting
+
+    s, _ = staged_candidate(tmp_path, tier=1)
+    old, _ = complete_stage_accounting(s)
+    reviewer = s.start_role("review")
+    s.cli("gate record", record=staged_gate(s, reviewer))
+    assert current_accounting(s.state) is None
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "record_accounting"
+    s.cli("deliver", expect="not_ready_to_deliver")
+    assert s.state["records"][f"usage_accounting:{old['accounting_id']}"] == old
+    unavailable = s.call("usage.account", status="unavailable", source_reference="synthetic:collector",
+                         limitations=["Reviewer usage collection unavailable"])["accounting"]
+    assert s.cli("deliver")["action"]["payload"]["accounting_id"] == unavailable["accounting_id"]
+
+
+def test_new_attributed_usage_invalidates_prepared_complete_accounting_delivery(tmp_path):
+    from devflow.domain.rules import current_accounting
+
+    s, _ = staged_candidate(tmp_path, tier=0)
+    old, rows = complete_stage_accounting(s)
+    prepared = s.cli("deliver")["action"]
+    assert prepared["payload"]["accounting_id"] == old["accounting_id"]
+    s.call("usage.record", record=rows[0] | {"response_id": "late-attributed-response"})
+    assert current_accounting(s.state) is None
+    assert s.state["actions"][prepared["action_id"]]["status"] == "invalidated"
+    s.cli("action begin", action_id=prepared["action_id"], expect="reconcile_required")
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "record_accounting"
+    refreshed = s.call("usage.account", status="complete", source_reference="synthetic:refreshed-collector",
+                       limitations=["Prices remain unknown"])["accounting"]
+    assert "late-attributed-response" in refreshed["usage_response_ids"]
+    assert s.cli("deliver")["action"]["payload"]["accounting_id"] == refreshed["accounting_id"]

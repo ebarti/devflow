@@ -158,11 +158,37 @@ def unresolved_delivery_findings(state):
                      and f.get("deferral_rationale") and f.get("followup_observation"))]
 
 
+def accounting_sources(state):
+    segments = [r for r in state["records"].values() if r.get("record_type") == "execution_segment"
+                and r["attempt_id"] == state["attempt"]["attempt_id"]]
+    segment_ids = {r["segment_id"] for r in segments}
+    usage = [r for r in state["records"].values() if r.get("record_type") == "usage"
+             and r.get("segment_id") in segment_ids
+             and any(a["work_id"] == state["work_id"] and a["weight"] > 0 for a in r["allocations"])]
+    tasks = {state["attempt"]["owner_task_id"]} | {
+        a["task_id"] for a in state["assignments"].values() if a.get("task_id")}
+    return segments, usage, tasks
+
+
+def complete_accounting_sources(segments, usage, tasks):
+    return bool(usage) and (
+        {r["segment_id"] for r in segments} <= {r["segment_id"] for r in usage}
+        and tasks <= {r["task_id"] for r in segments}
+        and all(r.get("source_reference") for r in segments)
+    )
+
+
 def current_accounting(state):
     identity = state.get("accounting_id")
     entry = state["records"].get(f"usage_accounting:{identity}") if identity else None
     if (entry and entry["attempt_id"] == state["attempt"]["attempt_id"]
             and entry["candidate_id"] == state["candidate_id"]):
+        if entry["status"] == "complete":
+            segments, usage, tasks = accounting_sources(state)
+            if (not complete_accounting_sources(segments, usage, tasks)
+                    or set(entry["segment_ids"]) != {r["segment_id"] for r in segments}
+                    or set(entry["usage_response_ids"]) != {r["response_id"] for r in usage}):
+                return None
         return entry
     return None
 
@@ -562,6 +588,22 @@ def role_gate(state, role):
     return None
 
 
+def invalidated_gate_repairs(state):
+    latest = {}
+    for item in state["records"].values():
+        if item.get("record_type") != "gate_ingestion":
+            continue
+        gate = get(state, "gate_result", item["gate_id"])
+        if gate["candidate_id"] != state["candidate_id"]:
+            continue
+        previous = latest.get(gate["role"])
+        if previous is None or item["admitted_revision"] > previous["admitted_revision"]:
+            latest[gate["role"]] = item
+    return [item["gate_id"] for item in latest.values()
+            if {"evidence", "findings"}.intersection(item["mismatches"])
+            and item["implementation_action_id"] == implementation_action_id(state)]
+
+
 def gate_needs_repair(state, gate):
     if not stage_contract(state):
         return state["phase"] == "implement"
@@ -772,6 +814,13 @@ def next_actions(state):
         worker = workers[-1] if workers else None
         if not worker or not implementation_completed(state):
             return [role_next(state, "implementation_worker")]
+    invalidated = invalidated_gate_repairs(state) if stage_contract(state) else []
+    if invalidated:
+        if implementation_required(state):
+            return [role_next(state, "implementation_worker") | {"gate_ids": invalidated,
+                    "reason": "Later evidence or findings invalidated the imported producer PASS"}]
+        return [{"kind": "request_user_action", "gate_ids": invalidated,
+                 "reason": "Review-only proof was invalidated after the producer finished"}]
     missing = missing_checks(state)
     if missing:
         return [
@@ -1009,6 +1058,24 @@ def record_fix(state, record, *, historical=False):
         finding["disposition"] = "fix_pending"
 
 
+def validate_gate_readiness(state, record, evidence):
+    """Readiness may change after a producer finishes; its original result cannot."""
+    evidence_records(state, record["evidence_ids"], record["candidate_id"],
+                     record["producer_task_id"], passing=True)
+    require(not record["blocking_finding_ids"] and not blocking_findings(state, record["candidate_id"]),
+            "blocking_findings", "High/Blocker findings require independent technical fix verification first")
+    require(not missing_checks(state), "missing_checks", "Required command evidence is incomplete")
+    covered = set().union(*(set(e["acceptance_ids"]) for e in evidence))
+    require({a["id"] for a in state["contract"]["acceptance"]} <= covered,
+            "missing_acceptance", "Gate evidence must cover every acceptance criterion")
+    if record["role"] == "qa":
+        require(not missing_scenarios(state, evidence), "missing_scenarios",
+                "QA evidence must cover every required scenario")
+        require(any(e["record_type"] == "observation_evidence" or e.get("executed_assertions", 0) > 0
+                    for e in evidence), "missing_product_proof",
+                "QA needs executed assertions or independent product observations")
+
+
 def record_gate(state, record):
     validate_record(record, "gate_result")
     existing = state["records"].get(f"gate_result:{record['gate_id']}")
@@ -1076,7 +1143,7 @@ def record_gate(state, record):
         record["evidence_ids"],
         record["candidate_id"],
         record["producer_task_id"],
-        record["status"] == "PASS" and not historical,
+        record["status"] == "PASS" and not historical and not producer.get("gate_action_id"),
     )
     for identity in record["finding_ids"] + record["blocking_finding_ids"]:
         require(identity in state["findings"], "unknown_finding", "Gate references unknown finding")
@@ -1088,36 +1155,20 @@ def record_gate(state, record):
             "stale_fix",
             "Gate fix verification does not match assignment/candidate",
         )
+    proof_invalidated = False
     if record["status"] == "PASS" and not historical:
-        require(
-            not record["blocking_finding_ids"]
-            and not blocking_findings(state, record["candidate_id"]),
-            "blocking_findings",
-            "High/Blocker findings require independent technical fix verification first",
-        )
-        require(
-            not missing_checks(state), "missing_checks", "Required command evidence is incomplete"
-        )
-        covered = set().union(*(set(e["acceptance_ids"]) for e in evidence))
-        require(
-            {a["id"] for a in state["contract"]["acceptance"]} <= covered,
-            "missing_acceptance",
-            "Gate evidence must cover every acceptance criterion",
-        )
-    if record["status"] == "PASS" and record["role"] == "qa" and not historical:
-        require(
-            not missing_scenarios(state, evidence),
-            "missing_scenarios",
-            "QA evidence must cover every required scenario",
-        )
-        require(
-            any(
-                e["record_type"] == "observation_evidence" or e.get("executed_assertions", 0) > 0
-                for e in evidence
-            ),
-            "missing_product_proof",
-            "QA needs executed assertions or independent product observations",
-        )
+        try:
+            validate_gate_readiness(state, record, evidence)
+        except WorkflowError as exc:
+            readiness_errors = {"stale_evidence", "nonpassing_evidence", "blocking_findings",
+                                "missing_checks", "missing_acceptance", "missing_scenarios",
+                                "missing_product_proof"}
+            if not producer.get("gate_action_id") or exc.code not in readiness_errors:
+                raise
+            # A producer-authenticated result is evidence even after newer facts
+            # invalidate its PASS. Persist it before authorizing any repair.
+            mismatches.append("findings" if exc.code == "blocking_findings" else "evidence")
+            historical = proof_invalidated = True
     save(state, record)
     save(state, {
         "schema_version": 1, "record_type": "gate_ingestion",
@@ -1127,11 +1178,15 @@ def record_gate(state, record):
         "implementation_action_id": implementation_action_id(state),
         "admitted_revision": state["revision"] + 1,
     })
-    if not historical:
-        state["gate_ids"][record["role"]] = record["gate_id"]
+    if not historical or proof_invalidated:
         if assignment["status"] in {"running", "completed"}:
             save_assignment(state, assignment | {"status": "completed"})
-        state["phase"] = "verify" if record["status"] == "PASS" else "implement"
+        if proof_invalidated:
+            state["gate_ids"].pop(record["role"], None)
+            state["phase"] = "implement"
+        else:
+            state["gate_ids"][record["role"]] = record["gate_id"]
+            state["phase"] = "verify" if record["status"] == "PASS" else "implement"
 
 
 def verify_delivery(state, record, observation):
@@ -1649,19 +1704,9 @@ def transition(original, command, request, now, dependency_states=None, *,
         limitations = request.get("limitations", [])
         require(status == "complete" or (limitations and all(str(x).strip() for x in limitations)),
                 "invalid_accounting", "Incomplete accounting needs explicit limitations")
-        segments = [r for r in state["records"].values() if r.get("record_type") == "execution_segment"
-                    and r["attempt_id"] == state["attempt"]["attempt_id"]]
+        segments, usage, tasks = accounting_sources(state)
         segment_ids = {r["segment_id"] for r in segments}
-        usage = [r for r in state["records"].values() if r.get("record_type") == "usage"
-                 and r.get("segment_id") in segment_ids
-                 and any(a["work_id"] == state["work_id"] and a["weight"] > 0
-                         for a in r["allocations"])]
-        tasks = {state["attempt"]["owner_task_id"]} | {
-            a["task_id"] for a in state["assignments"].values() if a.get("task_id")}
-        covered = {r["segment_id"] for r in usage}
-        require(status != "complete" or (usage and segment_ids <= covered
-                and tasks <= {r["task_id"] for r in segments}
-                and all(r.get("source_reference") for r in segments)),
+        require(status != "complete" or complete_accounting_sources(segments, usage, tasks),
                 "incomplete_accounting", "Complete coverage needs imported usage for every registered task segment")
         accounting = {"schema_version": 1, "record_type": "usage_accounting",
                       "accounting_id": "accounting-" + digest(request)[:24],
@@ -2368,6 +2413,15 @@ def transition(original, command, request, now, dependency_states=None, *,
             state["blocker"] = deepcopy(blocker)
         else:
             raise WorkflowError("unknown_command", f"Unsupported command: {command}")
+    if state["lifecycle"] == "active" and stage_contract(state):
+        accounting = current_accounting(state)
+        accounting_id = accounting["accounting_id"] if accounting else None
+        for action in state["actions"].values():
+            if (action["status"] == "prepared" and action.get("terminal_delivery")
+                    and action["payload"].get("accounting_id") != accounting_id):
+                # No mutation has happened yet: stale accounting cannot dispatch,
+                # and the next command must be able to prepare a fresh intent.
+                action["status"] = "invalidated"
     timestamp = now.isoformat()
     old_phase = original["phase"] if original["lifecycle"] == "active" else None
     new_phase = state["phase"] if state["lifecycle"] == "active" else None

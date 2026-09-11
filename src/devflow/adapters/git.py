@@ -55,9 +55,8 @@ class GitRepository:
             raise WorkflowError("invalid_git_output", "Git returned an invalid object ID")
         return value
 
-    def identity(self) -> str:
-        """Stable remote or common-Git-directory identity across linked worktrees."""
-        remote = self._run("config", "--get", "remote.origin.url", allowed=(0, 1)).stdout.strip()
+    @staticmethod
+    def _remote_identity(remote: str) -> str | None:
         if remote:
             if "://" in remote:
                 parsed = urlsplit(remote)
@@ -84,8 +83,31 @@ class GitRepository:
                 return (
                     "github:" if host.lower() == "github.com" else f"git:{host.lower()}/"
                 ) + name.lower()
+        return None
+
+    def identity(self) -> str:
+        """Stable remote or common-Git-directory identity across linked worktrees."""
+        remote = self._run("config", "--get", "remote.origin.url", allowed=(0, 1)).stdout.strip()
+        identity = self._remote_identity(remote)
+        if identity is not None:
+            return identity
         common = self._run("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
         return "local:" + str(Path(common).resolve())
+
+    def _transport_identity(self, remote: str) -> str:
+        identity = self._remote_identity(remote)
+        if identity is not None:
+            return identity
+        parsed = urlsplit(remote)
+        if parsed.scheme == "file" and not parsed.netloc and not parsed.query and not parsed.fragment:
+            from urllib.parse import unquote
+
+            path = Path(unquote(parsed.path))
+        elif not parsed.scheme:
+            path = Path(remote)
+        else:
+            raise WorkflowError("push_remote_conflict", "Unsupported origin transport identity")
+        return "file:" + str((self.path / path).resolve())
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         a, b = self.resolve(ancestor), self.resolve(descendant)
@@ -107,13 +129,20 @@ class GitRepository:
         validate_endpoint({"kind": "pr", "target": head_ref})
         ref = "refs/heads/" + head_ref
         self._run("check-ref-format", ref)
+        configured = self._run("config", "--get-all", "remote.origin.url").stdout.splitlines()
+        pushurl = self._run("config", "--get-all", "remote.origin.pushurl",
+                            allowed=(0, 1)).stdout.splitlines()
         fetch = self._run("remote", "get-url", "--all", "origin").stdout.splitlines()
         push = self._run("remote", "get-url", "--push", "--all", "origin").stdout.splitlines()
-        if len(fetch) != 1 or push != fetch or fetch[0].startswith("-"):
+        if (len(configured) != 1 or pushurl or len(fetch) != 1 or push != fetch
+                or not configured[0] or configured[0].startswith("-")
+                or self._transport_identity(configured[0]) != self._transport_identity(fetch[0])):
             raise WorkflowError("push_remote_conflict", "Origin must have one identical fetch/push URL")
-        # Resolve once and use this literal URL for both reads and the mutation,
-        # avoiding configured mirror/refspec/follow-tags and pushurl redirection.
-        return ref, fetch[0]
+        # Validate Git's effective route against the admitted repository, then
+        # submit the original URL so Git applies insteadOf exactly once. An
+        # explicit pushurl is unsupported: it can mask pushInsteadOf during the
+        # named-remote readback while a literal-URL push follows that rewrite.
+        return ref, configured[0]
 
     def _read_remote_head(self, url: str, ref: str) -> str | None:
         output = self._run("ls-remote", "--refs", "--exit-code", url, ref,

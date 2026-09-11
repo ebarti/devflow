@@ -127,3 +127,45 @@ def test_source_branch_binding_is_exact(repo, remote):
         repo.push_branch(head_ref="task/other", expected_head=repo.resolve("HEAD"),
                          remote_head_sha=None)
     assert git(remote, "for-each-ref") == ""
+
+
+@pytest.mark.parametrize("rewrite_kind", ["insteadOf", "pushInsteadOf"])
+def test_public_origin_rewrite_cannot_publish_to_another_repository(repo, remote, rewrite_kind):
+    admitted = "https://github.com/synthetic/authorized.git"
+    git(repo.path, "remote", "set-url", "origin", admitted)
+    git(repo.path, "config", f"url.{remote.as_uri()}.{rewrite_kind}", admitted)
+    assert repo.identity() == "github:synthetic/authorized"
+    with pytest.raises(WorkflowError) as error:
+        push(repo)
+    assert error.value.code == "push_remote_conflict"
+    assert repo._mutation_may_have_applied is False
+    assert git(remote, "for-each-ref") == ""
+
+
+def test_explicit_pushurl_cannot_hide_literal_push_rewrite(repo, remote):
+    admitted = "https://github.com/synthetic/authorized.git"
+    git(repo.path, "remote", "set-url", "origin", admitted)
+    git(repo.path, "config", "remote.origin.pushurl", admitted)
+    git(repo.path, "config", f"url.{remote.as_uri()}.pushInsteadOf", admitted)
+    # A named remote's explicit pushurl suppresses pushInsteadOf. A literal URL
+    # does not, so checking only remote get-url would authorize a different push.
+    assert git(repo.path, "remote", "get-url", "--push", "origin") == admitted
+    with pytest.raises(WorkflowError) as error:
+        repo._push_target("task/publish")
+    assert error.value.code == "push_remote_conflict"
+    assert git(remote, "for-each-ref") == ""
+
+
+@pytest.mark.parametrize("rewritten", [
+    "git@github.com:synthetic/authorized.git",
+    "ssh://git@github.com/synthetic/authorized.git",
+])
+def test_equivalent_ssh_rewrite_keeps_original_url_for_one_expansion(repo, remote, rewritten):
+    admitted = "https://github.com/synthetic/authorized.git"
+    git(repo.path, "remote", "set-url", "origin", admitted)
+    git(repo.path, "config", f"url.{rewritten}.insteadOf", admitted)
+    # The expanded URL must not be submitted again: Git would apply this second
+    # rewrite and send the actual command to a different repository.
+    git(repo.path, "config", f"url.{remote.as_uri()}.insteadOf", rewritten)
+    assert git(repo.path, "remote", "get-url", "origin") == rewritten
+    assert repo._push_target("task/publish") == ("refs/heads/task/publish", admitted)

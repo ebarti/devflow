@@ -53,8 +53,16 @@ class Server:
         method, endpoint = argv[argv.index("--method") + 1 : argv.index("--method") + 3]
         payload = json.loads(kwargs["input"]) if kwargs.get("input") else None
         self.calls.append((method, endpoint, payload))
-        data = self.route(method, endpoint, payload)
-        return subprocess.CompletedProcess(argv, 0, json.dumps(copy.deepcopy(data)), "")
+        data = copy.deepcopy(self.route(method, endpoint, payload))
+        versions = [value.split(": ", 1)[1] for value in argv
+                    if value.startswith("X-GitHub-Api-Version: ")]
+        assert len(versions) == 1 and versions[0] in {"2022-11-28", "2026-03-10"}
+        # GitHub 2026-03-10 removes this field from all PR response objects.
+        # Keep this server version-aware so merge tests exercise the requested
+        # schema instead of silently returning the older field after an upgrade.
+        if versions[0] == "2026-03-10" and isinstance(data, dict):
+            data.pop("merge_commit_sha", None)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
 
     def route(self, method, endpoint, payload):
         if endpoint == "graphql":
