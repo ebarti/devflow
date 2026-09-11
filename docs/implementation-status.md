@@ -1,6 +1,6 @@
 # Package implementation status
 
-This page records the reusable package boundary through the 0.5.0 stage-skill revision, with the initial 2026-09-10 rollout baseline retained below. The [implementation plan](implementation-plan.md) remains the target for the complete rollout. Package publication and repository adoption are separate steps; package tests alone do not establish JobCtrl cutover.
+This page records the reusable package boundary through the 0.5.1 check-evidence handoff correction, with the initial 2026-09-10 rollout baseline retained below. Version 0.5.1 clarifies retained artifact retrieval and request-file syntax without changing executable workflow transitions. The [implementation plan](implementation-plan.md) remains the target for the complete rollout. Package publication and repository adoption are separate steps; package tests alone do not establish JobCtrl cutover.
 
 Conversational intake update 0.3.0 replaces the mandatory independent host verifier with agent-recorded user requests. Direct requests, bug reports/investigations, named issues and bounded current backlog selections can proceed without another approval channel. Immutable scope/source/operation bindings, capture/readback, old-pin protection and safe recovery remain. This is workflow consistency, not independently authenticated human approval. CLI lifecycle proof without a synthetic verifier is tracked separately from the native and protected-delivery gates below; those gates are not satisfied by admission alone. See [conversational intake](issue-trust.md).
 

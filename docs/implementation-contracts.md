@@ -179,7 +179,9 @@ Issue/Project synchronization updates only the tool-owned summary and derived fi
 
 ## 8. Local storage, retention and failure behavior
 
-Proposed private root: `~/.local/state/devflow/`. The store contains `state.sqlite3`, `evidence/<sha256>`, `policy/<sha256>`, `backups/` and `install-manifests/`. User bindings/model preferences live under `~/.config/devflow/`. Repositories contain no generated execution ledger or session data. Files are owner-readable/writable; paths are resolved and checked against the enrolled roots.
+Proposed private root: `~/.local/state/devflow/`. The store contains `state.sqlite3`, `artifacts/<sha256>`, `policy/<sha256>`, `backups/` and `install-manifests/`. User bindings/model preferences live under `~/.config/devflow/`. Repositories contain no generated execution ledger or session data. Files are owner-readable/writable; paths are resolved and checked against the enrolled roots.
+
+Registered check evidence hashes address retained JSON artifacts, containing the original command `output` and, when available, `junit` text plus `report_sha256`. The runner archives them before removing its temporary report directory. Review/QA handoffs supply the evidence ID, artifact hash and explicit state root; readers verify the hash and inspect that artifact. Expanded argv paths are historical execution metadata, not retained report locations. See [check evidence inspection](../skills/devflow-verifying/references/check-evidence.md).
 
 SQLite uses transactional writes, explicit EXTRA/fullfsync durability, foreign keys and an active-attempt uniqueness constraint. The audit trail records old/new revision and event identity. Outbox actions and local transitions commit together. Evidence bytes and directory entries are flushed before references become committed. Installer releases/journals and check drafts use the same flush-before-acknowledgment boundary; snapshots validate before durable publication. Startup reports missing/corrupt evidence instead of silently treating it as a successful check. Crash tests cover actual process death and injected storage failures, not a physical power cut or failed storage hardware.
 
