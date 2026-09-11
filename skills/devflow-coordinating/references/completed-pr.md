@@ -6,8 +6,15 @@ require conflict repair or a PR update first. Keep that managed endpoint `pr`;
 the separately authorized native merge retains its own actual intent, receipt
 and independent integrated-tree readback. This does not enable automatic merge.
 
-Read `work show` and `next`, the original delivery and current PR/source/target
-state. Use `work reopen --request-file reopen.json --json` with the existing
+Classify this explicitly requested completed-PR recovery before ordinary doctor
+preflight. Read `work show` and `next`, the original delivery and current
+PR/source/target state. When the owned checkout retains an older pin, use the
+reviewed installed release's reader for these read-only commands and the explicit
+upgrade below. A generic doctor before admission correctly reports BLOCKED for
+that historical pin. This is not permission to run the old release, change the
+pin before authority or ignore other failures.
+
+Use `work reopen --request-file reopen.json --json` with the existing
 work ID and expected revision, the bounded work `record`, a fresh recorded
 `user_request` and a `continuation`. Reuse the same issue, PR, work and attempt.
 An independent new product defect follows its linked repair outcome instead.
@@ -29,6 +36,28 @@ A competing owner, stale revision, unresolved side effect or outstanding
 producer result blocks continuation. Preserve and reconcile those obligations;
 reopening cannot clear them as a shortcut.
 
+If the executing workflow or profile changed, capture the reviewed
+`workflow_snapshot` and include it explicitly. For a completed PR whose owned
+checkout still has the older pin, include `continuation_work_id` in the
+`snapshot capture` request. Invoke the reviewed installed release's own
+`scripts/devflow` launcher with `--repository` pointing to the owned checkout
+and the existing `--state-dir`. The repository launcher still selects its
+on-branch pin until integration. This records the old pin and prior snapshot while
+capturing the checkout's existing profile and custom recipes for the executing
+release. Only `work reopen` may consume this upgrade binding. Preserve the
+original snapshot; do not silently replace its pin or claim old gates used the
+new instructions. Integrate the reviewed repository pin through the admitted
+repair after reopening.
+
+After successful admission, invoke that reviewed release's
+`doctor --work-id <existing-id> --repository <owned-checkout> --state-dir <existing-store> --json`
+and require READY before role activation. The same now-active work ID selects
+its newly admitted snapshot even while the actual repository lock remains old.
+Without `--work-id`, generic doctor still reports BLOCKED for that old lock.
+Preserve any inspected pre-admission diagnostic. This ordering exception applies
+only to the validated completed-PR upgrade; missing tools, invalid profiles or
+releases, unresolved operations and failed capture/admission remain blockers.
+
 For conflict repair or other candidate changes on a subagent attempt, enter
 `implement`, activate a bounded implementation worker and capture its real result. Earlier candidates,
 checks and gates remain historical. Require current affected checks and
@@ -46,19 +75,6 @@ with `candidate_id`, `head_sha`, `tree_sha`, `dependency_hash` and
 `environment_hash` from that retained candidate. Fresh authorization alone does not
 require a fictitious worker, but changed inputs cannot inherit stale PASS.
 Follow `next` for required proof and fresh remote-state checks.
-
-If the executing workflow or profile changed, capture the reviewed
-`workflow_snapshot` and include it explicitly. For a completed PR whose owned
-checkout still has the older pin, include `continuation_work_id` in the
-`snapshot capture` request. Invoke the reviewed installed release's own
-`scripts/devflow` launcher with `--repository` pointing to the owned checkout
-and the existing `--state-dir`. The repository launcher still selects its
-on-branch pin until integration. This records the old pin and prior snapshot while
-capturing the checkout's existing profile and custom recipes for the executing
-release. Only `work reopen` may consume this upgrade binding. Preserve the
-original snapshot; do not silently replace its pin or claim old gates used the
-new instructions. Integrate the reviewed repository pin through the admitted
-repair after reopening.
 
 When that admitted integration changes the pin, profile or captured instructions,
 the worker pauses before candidate capture and returns its actual BLOCKED partial
