@@ -202,6 +202,7 @@ class Scenario:
     def start(self):
         a = record(
             "attempt",
+            execution_mode="native_thread",
             attempt_id=f"attempt-{self.work_id}",
             work_id=self.work_id,
             scope_hash=scope_hash(self.contract),

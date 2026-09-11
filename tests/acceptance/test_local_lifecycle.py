@@ -104,6 +104,7 @@ class LocalLifecycle:
         )
         attempt = record(
             "attempt", attempt_id="synthetic-attempt", work_id=self.work_id,
+            execution_mode="native_thread",
             scope_hash=scope_hash(self.contract), authority_id=authority["authority_id"],
             host_id="synthetic-host", owner_task_id="synthetic-explicit-owner",
             phase="implement", blocker=None, workflow_snapshot_id=snapshot["snapshot_id"],

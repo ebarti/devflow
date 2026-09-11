@@ -128,7 +128,7 @@ class Console:
     def show(self):
         return self.call("work.show", {"work_id": self.contract["work_id"]})
 
-    def start(self, operations=None):
+    def start(self, operations=None, *, execution_mode="native_thread", owner_task_id="synthetic-owner"):
         self.ready_request = ready_request(
             self.contract, user_request=user_request(allowed_operations=operations or ["edit", "check"]),
         )
@@ -142,7 +142,8 @@ class Console:
         attempt = record(
             "attempt", attempt_id="console-attempt", work_id=self.contract["work_id"],
             scope_hash=self.ready["scope_hash"], authority_id=self.ready["authority_id"],
-            host_id="synthetic-host", owner_task_id="synthetic-owner", phase="implement",
+            host_id="synthetic-host", owner_task_id=owner_task_id, phase="implement",
+            execution_mode=execution_mode,
             blocker=None, workflow_snapshot_id=snapshot["snapshot_id"],
             model_policy_snapshot_id=snapshot["snapshot_id"], revision=self.revision,
             started_at=datetime.now(UTC).isoformat(), status="active",

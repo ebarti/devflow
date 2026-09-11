@@ -44,6 +44,7 @@ class WorkflowService:
             raise WorkflowError("invalid_request", "A nonempty work_id is required")
         return self.require_execution(self.snapshot(request["work_id"]), operation={
             "host.prepare": "create_tasks", "check.run": "check",
+            "host.assign": "create_tasks", "host.activate": "create_tasks",
             "workspace.register": "edit", "candidate.capture": "edit",
         }.get(command))
 
@@ -180,6 +181,12 @@ class WorkflowService:
                 "work.reconcile",
             }
             for key, record in updated["records"].items():
+                startup = record.get("startup_observation")
+                if startup and (key not in state["records"] or command in proof_commands):
+                    self.store.require_artifact(startup["artifact_hash"])
+                unavailable = record.get("unavailable_observation")
+                if unavailable and unavailable.get("artifact_hash") and key not in state["records"]:
+                    self.store.require_artifact(unavailable["artifact_hash"])
                 if "artifact_hash" in record and (
                     key not in state["records"]
                     or (

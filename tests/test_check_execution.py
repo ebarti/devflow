@@ -105,6 +105,7 @@ def setup_run(tmp_path, *, kill_parent=False):
     attempt = {
         "schema_version": 1,
         "record_type": "attempt",
+        "execution_mode": "native_thread",
         "attempt_id": "attempt-1",
         "work_id": contract["work_id"],
         "scope_hash": scope_hash(contract),

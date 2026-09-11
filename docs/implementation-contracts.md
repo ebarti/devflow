@@ -1,6 +1,6 @@
 # Development workflow implementation contracts
 
-Historical design baseline: 2026-09-09. This document retains the original interface proposals with subsequent contract revisions, including the 0.3.0 conversational request contract that supersedes the mandatory independent verifier in 0.2.0. See [operation](operation.md) and [implementation status](implementation-status.md) for shipped commands and unavailable host capabilities. Version every persisted record with `schema_version`; reject unknown major versions. Example records and JSON Schema accompany this document under `design/`.
+Historical design baseline: 2026-09-09. This document retains the original interface proposals with subsequent contract revisions, including the 0.3.0 conversational request contract and the 2026-09-11 coordinator/subagent contract. Those revisions supersede the mandatory independent verifier and owner-as-implementer/visible-peer launch rules for new work. See [operation](operation.md) and [implementation status](implementation-status.md) for shipped commands and unavailable host capabilities. Version every persisted record with `schema_version`; reject unknown major versions. Example records and JSON Schema accompany this document under `design/`.
 
 [Record schemas](design/contracts.schema.json) · [Synthetic work contract](design/work-contract.example.json) · [Synthetic gate result](design/gate-result.example.json) · [Synthetic receipt](design/action-receipt.example.json)
 
@@ -17,10 +17,17 @@ The initial commands are:
 | `devflow work list` | Repository | Discovers recorded work IDs and lifecycle without the previous conversation |
 | `devflow work prepare` | Issue/local intake reference | Normalizes the request; reports missing Ready fields; no invented requirements |
 | `devflow work ready` | Accepted contract with consumed source lineage and `user_request` (`reference`, `summary`, `allowed_operations`) | Derives immutable request admission/authority and verifies prerequisites, stores scope and marks Ready; missing request blocks admission |
-| `devflow work start` | Ready work ID, host/current task ID, expected revision | Claims one attempt, captures effective policy/configuration and schedules workspace/task actions |
+| `devflow work start` | Ready work ID, host/original coordinator identity, expected revision and actual entry phase | Claims one attempt, defaults new execution to subagents, captures effective policy/configuration and schedules workspace/assignment actions |
 | `devflow work amend` | New scope plus `user_request` recording the authorized amendment; current `workflow_snapshot` when an active attempt's pin/profile changed | Validates the snapshot, preserves historical records, appends scope revision and invalidates affected acceptance/proof and prepared actions |
 | `devflow next` | Work/attempt ID | Reads current state and returns the next required action(s), missing evidence or blocker; never calls a model |
-| `devflow action record` | Action ID plus native-host result or external readback | Binds actual task/worktree/PR IDs; reconciles action state |
+| `devflow action record` | Action ID plus native-host result or external readback | Binds observed identities and worktree/PR IDs; reconciles action state without inventing a host readback |
+| `devflow host assign` | Bounded role/ownership/brief, coordinator identity and selected saved settings/explicit overrides | Resolves policy and journals the assignment and action |
+| `devflow host prepare` | Journaled assignment and action | Journals action begin before returning the supported spawn or follow-up intent |
+| `devflow host record` | Assignment/action plus actual supported-tool receipt | Records the receipt; a spawn receipt alone does not activate product work |
+| `devflow host startup` | Assignment and explicit child session evidence path | Validates parent, canonical agent identity and actual model/effort before binding the native UUID |
+| `devflow host activate` | Assignment with verified startup evidence | Releases the bounded product brief to the verified agent |
+| `devflow host observe` | Assignment plus exact canonical agent path, fresh native status and source reference | Records running/interrupted/completed control state; interruption retains the verified identity for reuse and native completion does not supply implementation proof |
+| `devflow host result` | Verified implementation assignment and completion evidence | Records implementation completion; independent review/QA continue through gate recording |
 | `devflow candidate record` | Work/attempt ID and owned checkout | Captures clean base/head/tree plus input fingerprints; freezes a candidate |
 | `devflow check run` | Candidate and selected recipe/scenario | Runs the existing command with isolated inputs and records status/assertions/evidence |
 | `devflow gate record` | Registered role assignment, candidate and structured gate result | Validates identity, scope, producer, evidence links and findings; never converts missing evidence to PASS |
@@ -42,8 +49,8 @@ Users need not fill these records manually. They ask for work or select a Ready 
 | Work contract | Work ID, kind, title, outcome, scope revision, acceptance IDs/text, paths/boundaries, decisive context, dependencies, risk/reason, verification plan, endpoint | Accepted behavior and endpoint are explicit; issue node identity survives renumbering/transfer |
 | Intake admission | ID, repository/work/scope, exact source/lineage/digest, allowed operations, decision kind/reference, `user_request` | Default `user_request` decision is agent-interpreted conversational direction, stored immutably for consistency; optional legacy verifier decisions retain their expiry/revocation rules |
 | Authority | Derived from immutable admission; ID, source user instruction including a bounded existing batch selection, allowed operations, repository/work/scope limits, source reference, revocation/expiry when applicable | A public issue, arbitrary comment, label or model-generated text cannot grant execution authority |
-| Attempt | ID, work/scope IDs, active host/owner, phase, optional blocker, policy/configuration snapshot IDs, start/stop/outcome | At most one active claim per work item; resumed work retains its attempt |
-| Assignment | ID, action ID, role, owner task, actual task ID or pending client ID, owned paths/workspace, input candidate, result | Producer and purpose are explicit; pending client IDs are not executable task IDs |
+| Attempt | ID, work/scope IDs, active host/original coordinator, phase, `entry_phase`, `execution_mode`, optional blocker, policy/configuration snapshot IDs, start/stop/outcome | At most one active claim per work item; resumed work retains its attempt; missing historical `execution_mode` means `native_thread` |
+| Assignment | ID, action ID, role, `host_kind`, `coordinator_agent_name`, `task_name`, `agent_name`, `role_policy`, `brief`, `startup_observation`, optional `replaces_assignment_id`/`replacement_observation`, owned paths/workspace, input candidate and result | Product work requires observed parent/agent/settings; canonical agent path controls the subagent and verified native UUID provides attribution; historical native-thread IDs/receipts remain intact |
 | Candidate | ID, attempt/scope, repository, base/head/tree IDs, clean-state result, dependency/environment fingerprints, creation time | Immutable; a code change creates a new candidate |
 | Check evidence | ID, candidate/input signature, recipe/version, scenario/acceptance IDs, argv/cwd/environment profile, start/end, status, assertion counts or manual observations, evidence hash | PASS proves the named scenario ran; setup-only success is not execution proof |
 | Gate | ID, role assignment, candidate/scope/policy hashes, PASS/FAIL/BLOCKED, required evidence IDs, finding IDs, limitations | Independent producer; complete required evidence; PASS has no unresolved gate-blocking finding |
@@ -81,19 +88,44 @@ A profile change in an unreviewed candidate cannot lower its own required checks
 
 PR creation, an AI final message, GitHub issue closure, a card moved to Done, test command exit 0 and an expired lease are not completion events.
 
-Define/Implement/Verify/Deliver remain optional reporting labels; they do not mandate four separate tasks, plans or approvals. A review-only operation starts at Verify. A merge-only operation starts at Deliver after importing and validating existing proof. A canceled operation is not a successfully delivered outcome.
+Define/Implement/Verify/Deliver remain optional reporting labels; they do not mandate four separate tasks, plans or approvals. New attempts default to `execution_mode=subagent`; `entry_phase` preserves the actual entry. A review-only operation starts at Verify. A merge-only operation starts at Deliver after importing and validating existing proof. Neither fabricates an implementation assignment; a required repair activates a real implementation worker. Tier 0 skips independent gates while retaining applicable implementation and static-check requirements. A canceled operation is not a successfully delivered outcome.
 
-## 4. Host action bridge and task communication
+## 4. Host action bridge and subagent communication
 
-The host port has five responsibilities: create a visible task, send a brief/follow-up, wait/read a result, identify the actual task and observe its state. It uses native Codex tools in the active owner context. The CLI provides prepared intents and receives receipts; it does not connect to undocumented desktop storage or treat native tools as an external service.
+The original user conversation is the coordinator. It owns admission, assignments, evidence integration and authorized delivery. A bounded `implementation_worker` owns implementation and repairs; independent `review` and `qa` subagents own their required gates. The coordinator, implementation worker, reviewer and QA have distinct verified identities. Review-only/delivery-only entry preserves valid existing proof without inventing implementation. New subagent work does not create visible peer tasks.
 
-A launch brief contains a stable action/assignment ID. Persist `prepared` before invoking the host. Record `pending_setup` with a returned client ID, then bind the final task ID only when observed. After a lost response, locate the task through the supported inventory and verify its assignment marker/context; a title match alone is insufficient. If the task cannot be uniquely identified, retain an ambiguous action and request resolution instead of creating duplicates.
+The supported control surface is `agents.spawn_agent`, `agents.followup_task`, `agents.send_message`, `agents.wait_agent`, `agents.list_agents` and `agents.interrupt_agent`. The CLI provides durable prepared intents and receives actual observations. It does not call an undocumented desktop API or reinterpret native tools as shell commands. All control targets use the exact canonical `agent_name`; the native session UUID is separately observed for attribution.
 
-Each role result contains work/scope/candidate/assignment IDs, producer role, technical fix-verification observations, gate status, evidence references, findings and limitations. Import its independent fix-verification observations first, then evaluate its gate against that resulting technical state in the same transaction. Persist both before the completion notification. The owner imports results from the registered task; it cannot replace an unavailable QA result with its own PASS.
+### Role policy
 
-Review and QA use the user's effective role defaults, resolved at dispatch and recorded with the result. The package does not hardcode cheaper models or lower effort. Reruns reuse the same role task when available, with an explicit candidate change. If that task is unavailable, record the replacement and transfer only the relevant brief/evidence. Workstream reuse is scoped to the same outcome; unrelated issues do not accumulate in one forever-growing reviewer conversation.
+Resolve each model/effort field in this order: explicit user role/session override; selected configured role file; saved subagent default; saved global default. The active coordinator's settings and opening-chat overrides are excluded. The default mapping is `implementation_worker` → `implementer`, `review` → `reviewer`, and `qa` → `qa`. An explicit alternative role name selects that configuration. Honor `[agents.<role_name>].config_file`, resolving relative paths from the global configuration directory; otherwise check adjacent `agents/<role_name>.toml`. `[agents].default_subagent_model` takes precedence over the root saved model.
 
-Shared runtime resources are reservations, not guesses: unique test app directory, ports, database/profile paths and cleanup token per attempt/check. The owner of each resource is recorded. One task cannot clean another's fixture merely because a conventional path name matches.
+The settings resolver requires a nonempty model and supported reasoning effort; missing or invalid resolved values are explicit errors. It stores normalized role, selected role name, model, reasoning effort, `agent_type=default`, policy hash and allowlisted source/hash/settings evidence. Source hashes cover only used settings and references, including a selected configured-file route. Full TOML files, secrets, environment contents and legacy developer instructions never enter policy provenance. An override record documents the supplied choice without claiming independent user authentication. Saved dispatch policy and actual execution observation are separate facts.
+
+Launch the generic native agent with explicit model/effort and `fork_turns=none`. Load the selected workflow role reference through the self-contained brief. A fixed custom native role or a full-history fork can override the requested model policy; selecting a configured role name therefore does not select that fixed native agent type.
+
+### Journaled startup and activation
+
+1. Journal the bounded assignment, resolved policy and launch action. `host prepare` records `action.begin` before returning a launch intent; a prepared action alone is insufficient to invoke the host.
+2. Spawn with a bootstrap-only message asking the child to report its own session metadata path and wait. Do not include executable product work in this initial message. Record the actual spawn receipt. It supplies `task_name` and nickname, not a native UUID or proof of effective model settings.
+3. Validate the explicitly supplied child session file through `host startup`. Read only allowlisted `session_meta` and `turn_context` evidence; verify parent UUID, exact canonical agent path and actual model/effort against the assignment and policy. Bind the observed native UUID only after this check. Missing settings block activation. Unknown service tier remains unknown.
+4. Release the bounded product brief through `host activate` only after startup validation. Preserve work/scope/assignment identity, acceptance, repository/base/head, owned paths, constraints, check/evidence references, role responsibility and expected result. The implementation result is recorded through `host result`; review/QA return candidate-bound gate records.
+
+The session source path, normalized observation and evidence hashes remain in private local evidence. Do not commit session metadata or copy unfiltered session contents. `agents.list_agents` returns canonical paths/status and cannot independently establish native UUIDs, parent UUIDs or model settings. A nickname, a claimed UUID in prose or a fabricated readback does not satisfy startup validation.
+
+### Results, reruns and recovery
+
+Each independent role result contains work/scope/candidate/assignment IDs, producer identity, technical fix-verification observations, gate status, evidence references, findings and limitations. Import independent fix-verification observations first, then evaluate the gate against that resulting technical state in the same transaction. Persist both before the completion notification. The coordinator imports results only from the registered verified producer; it cannot replace an unavailable QA result with its own PASS. Implementation completion is separate from independent gate completion.
+
+Reuse the same available implementation agent for repairs and the same available review/QA agents for targeted candidate reruns. `followup_task` has no model-override parameter. Changing role policy requires an explicit recorded replacement and fresh startup verification, rather than relabeling an existing execution. An unavailable-agent replacement preserves the original identity, results and history, records `replaces_assignment_id` and the actual `replacement_observation`, and transfers only the bounded brief/evidence. Workstream reuse stays within the same outcome.
+
+After `interrupt_agent`, obtain fresh `list_agents` inventory: the interrupt response contains the previous status. Pass the exact agent's status and source reference through `host observe`. `interrupted` retains its UUID and startup proof for the same assignment's follow-up. A native completed status permits control reuse but does not substitute for candidate-bound implementation completion. Actual target-error evidence is required to mark an agent unavailable; an inventory omission is insufficient.
+
+A lost spawn receipt leaves an ambiguous action. Reconcile supported inventory and actual startup evidence before any replacement; inventory absence alone does not prove a failed spawn. Do not duplicate an agent because its response was lost or a single inventory observation omitted it. Preserve uncertainty when the host cannot uniquely establish the outcome.
+
+Historical attempts missing `execution_mode` continue as `native_thread`, preserving original task IDs, pending client IDs, receipts and evidence. A historical pending client ID is not an executable native task ID. Do not rewrite those records as subagent observations or use historical visible-task instructions to launch new subagent work.
+
+Shared runtime resources are reservations: unique test app directory, ports, database/profile paths and cleanup token per attempt/check. Each mutable resource has a recorded owner. Subagents sharing a checkout preserve others' edits; one agent cannot clean another's fixture because a conventional path name matches.
 
 ## 5. Evidence reuse and invalidation
 
@@ -155,8 +187,10 @@ No automatic deletion of worktrees, evidence or historical records is part of th
 | Failure | Required behavior |
 | --- | --- |
 | Duplicate start / two owners | One claim succeeds; the other receives the existing attempt and does not launch another implementation |
-| Owner task interrupted | Preserve phase/actions/candidate; resume/reconcile under the same attempt |
-| Lost create-task response | Inspect native task inventory and assignment marker; block if ambiguous |
+| Coordinator interrupted | Preserve phase/actions/candidate and verified role identities; resume/reconcile under the same attempt |
+| Lost subagent spawn response | Reconcile supported inventory and startup evidence; absence alone does not permit a duplicate; block if ambiguous |
+| Role policy changed / role unavailable | Record replacement reason and actual observation, preserve previous identities/evidence, verify the replacement startup before activation |
+| Historical native-thread create response lost | Reconcile original task inventory and assignment marker under its retained host contract; block if ambiguous |
 | GitHub write succeeds, response lost | Reconcile by action/finding identity and remote state before retry |
 | Issue acceptance edited mid-run | Stop dependent delivery, append accepted amendment or retain old scope explicitly |
 | Candidate changes during review | Reject mismatched gate for the new candidate; preserve it as historical evidence |

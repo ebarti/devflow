@@ -77,6 +77,28 @@ def test_actual_model_must_match_segment():
                          segments=segment())
 
 
+def test_later_observed_tier_is_preserved_when_startup_tier_was_unknown(monkeypatch):
+    from devflow.adapters import responses
+
+    native = event()
+    native["payload"].update(model="synthetic-model", service_tier="synthetic-observed-tier")
+    segments = segment()
+    segments["segment-1"]["service_tier"] = None
+    observed = []
+    original = responses.price_usage
+
+    def priced(*args, **kwargs):
+        observed.append((kwargs["model_id"], kwargs["service_tier"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(responses, "price_usage", priced)
+    responses.import_responses([native], ccusage_version="99.1.0", assignments=assignment(),
+                               segments=segments)
+    responses.import_responses([event()], ccusage_version="99.1.0", assignments=assignment(),
+                               segments=segments)
+    assert observed == [("synthetic-model", "synthetic-observed-tier"), ("synthetic-model", None)]
+
+
 def test_openai_response_completed_and_unsupported_summary():
     response = {"type": "response.completed", "task_id": "synthetic-task",
                 "timestamp": "2026-09-01T00:00:00Z", "response": {"id": "r",

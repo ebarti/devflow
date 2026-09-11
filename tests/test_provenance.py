@@ -1,3 +1,4 @@
+import json
 import shutil
 from pathlib import Path
 
@@ -58,3 +59,16 @@ def test_workflow_digest_must_bind_the_captured_inputs(captured):
     snapshot["workflow_hash"] = "f" * 64
     with pytest.raises(WorkflowError, match="bind captured package and inputs"):
         provenance.validate_start_snapshot(repository, snapshot, store.require_artifact)
+
+
+def test_observed_settings_preserve_unknown_service_tier(captured):
+    repository, _, store = captured
+    snapshot = provenance.capture_snapshot(repository, {
+        "snapshot_id": "unknown-tier", "effective_settings": {
+            "model": "synthetic-observed-model", "reasoning_effort": "high",
+            "service_tier": None, "source_reference": "synthetic:native-turn-context",
+        },
+    }, store.put_artifact)
+    settings = json.loads((store.root / "artifacts" / snapshot["model_policy_hash"]).read_bytes())
+    assert settings["service_tier"] is None
+    provenance.validate_start_snapshot(repository, snapshot, store.require_artifact)

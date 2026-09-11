@@ -458,6 +458,19 @@
             "canceled",
             "failed"
           ]
+        },
+        "execution_mode": {
+          "enum": [
+            "subagent",
+            "native_thread"
+          ]
+        },
+        "entry_phase": {
+          "enum": [
+            "implement",
+            "verify",
+            "deliver"
+          ]
         }
       },
       "required": [
@@ -624,8 +637,74 @@
             "pending_setup",
             "running",
             "completed",
-            "blocked"
+            "blocked",
+            "pending_startup",
+            "ready",
+            "unavailable",
+            "replaced",
+            "interrupted"
           ]
+        },
+        "host_kind": {
+          "enum": [
+            "subagent",
+            "native_thread"
+          ]
+        },
+        "coordinator_agent_name": {
+          "type": "string",
+          "pattern": "^/root(?:/[a-z0-9_]+)*$"
+        },
+        "task_name": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "agent_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role_policy": {
+          "type": "object"
+        },
+        "brief": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50000
+        },
+        "startup_observation": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "scope_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "replaces_assignment_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replaced_by_assignment_id": {
+          "type": "string"
+        },
+        "unavailable_observation": {
+          "type": "object"
+        },
+        "replacement_observation": {
+          "type": "object"
+        },
+        "implementation_result": {
+          "type": "object"
+        },
+        "captured_candidate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "control_observation": {
+          "type": "object"
         }
       },
       "required": [
@@ -660,6 +739,34 @@
               "task_id": {
                 "type": "string",
                 "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "host_kind"
+            ],
+            "properties": {
+              "host_kind": {
+                "const": "subagent"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "coordinator_agent_name",
+              "task_name",
+              "agent_name",
+              "role_policy",
+              "brief",
+              "startup_observation",
+              "scope_hash"
+            ],
+            "properties": {
+              "client_id": {
+                "type": "null"
               }
             }
           }
@@ -1611,7 +1718,10 @@
           "minLength": 1
         },
         "service_tier": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1
         },
         "workflow_hash": {

@@ -18,6 +18,7 @@ from devflow.adapters.github import GitHubRepository
 from devflow.domain.endpoints import TARGET_FIELD, validate_action_target
 from devflow.domain.rules import (
     blocking_findings,
+    implementation_completed,
     missing_checks,
     missing_scenarios,
     required_roles,
@@ -378,6 +379,8 @@ def dispatch_action(
         action = state["actions"].get(action_id)
         if not action:
             raise WorkflowError("unknown_action", "No committed intent exists")
+        if action["operation"] in {"local_delivery", "merge", "release"} and not implementation_completed(state):
+            raise WorkflowError("implementation_incomplete", "Terminal dispatch requires the current implementation result")
         if action["status"] == "confirmed":
             return {
                 "action_id": action_id,
@@ -399,8 +402,22 @@ def dispatch_action(
             state, action, request.get("expected_revision"), reconcile=reconcile
         )
         if native:
+            intent = None
+            assignment_id = action["payload"].get("assignment_id")
+            if assignment_id:
+                from devflow.adapters.codex_host import NativeHostBridge, require_native_coordinator
+
+                assignment = state["assignments"][assignment_id]
+                require_native_coordinator(assignment, os.environ.get("CODEX_THREAD_ID"))
+                intent = NativeHostBridge().prepare_assignment(assignment, assignment["brief"])
+            if action["operation"] != "prepare_workspace":
+                _call(service, "action.begin", state, request["operation_id"] + ":begin",
+                      action_id=action_id)
+            updated = service.snapshot(work_id)
             return {
-                "action": action,
+                "action": updated["actions"][action_id],
+                "revision": updated["revision"],
+                "intent": intent,
                 "requires_native_owner": True,
                 "reason": "Use native task tools or workspace register, then record actual receipt",
             }

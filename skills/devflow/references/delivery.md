@@ -1,6 +1,6 @@
 # Delivery
 
-Read current `next`, candidate, authority, required gates, and outstanding findings. Review-only and merge-only work reuse valid existing evidence and start at their actual phase.
+The original user conversation coordinates authorized delivery. Read current `next`, candidate, authority, required gates and outstanding findings. Review-only and merge-only work reuse valid existing evidence and start at their actual phase without fabricating implementation completion. Delegate any required repairs to the bounded implementation worker and obtain applicable independent gate reruns.
 
 Publish each confirmed code finding as its own PR review thread with a stable marker and valid line/file anchor. Reconcile uncertain API responses before retrying. An unanchorable finding remains blocked; a timeline summary does not satisfy its review-comment obligation.
 

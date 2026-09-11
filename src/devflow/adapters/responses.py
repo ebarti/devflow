@@ -128,14 +128,14 @@ def import_responses(events, *, ccusage_version, assignments=None, segments=None
                     or not assignment.get("attempt_id")
                     or segment.get("attempt_id") != assignment["attempt_id"]):
                 raise WorkflowError("usage_assignment", "Response segment/attempt/task does not match")
-            if ((model and model != segment.get("model_id"))
-                    or (tier and tier != segment.get("service_tier"))):
+            if ((model and segment.get("model_id") and model != segment["model_id"])
+                    or (tier and segment.get("service_tier") and tier != segment["service_tier"])):
                 raise WorkflowError("usage_assignment", "Actual response model/tier disagrees with segment")
             start, end = segment.get("started_at"), segment.get("ended_at")
             if ((start and timestamp < _timestamp(start))
                     or (end and timestamp >= _timestamp(end))):
                 raise WorkflowError("usage_assignment", "Response falls outside the assigned segment")
-            model, tier = segment.get("model_id"), segment.get("service_tier")
+            model, tier = model or segment.get("model_id"), tier or segment.get("service_tier")
         allocations = []
         seen_work = set()
         for allocation in assignment.get("allocations", []):

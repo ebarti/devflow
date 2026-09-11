@@ -68,6 +68,158 @@ def require(condition, code, message):
         raise WorkflowError(code, message)
 
 
+def subagent_mode(state):
+    # Absence on historical stored attempts means the original visible-thread bridge.
+    return (state.get("attempt") or {}).get("execution_mode") == "subagent"
+
+
+def implementation_required(state):
+    return subagent_mode(state) and (
+        state["attempt"].get("entry_phase", "implement") == "implement"
+        or any(a["role"] == "implementation_worker" for a in state["assignments"].values())
+    )
+
+
+def implementation_completed(state):
+    if not implementation_required(state):
+        return True
+    return any(a["role"] == "implementation_worker" and a["status"] == "completed"
+               and a.get("scope_hash") == state["scope_hash"]
+               and (a.get("implementation_result") or {}).get("output_candidate_id") == state["candidate_id"]
+               and (a.get("implementation_result") or {}).get("status") == "completed"
+               and state["candidate_id"] is not None for a in state["assignments"].values())
+
+
+def role_next(state, role):
+    peers = [a for a in state["assignments"].values()
+             if a["role"] == role and a["status"] != "replaced"]
+    peer = peers[-1] if peers else None
+    result = {"kind": "launch_role", "role": role, "candidate_id": state["candidate_id"],
+              "assignments": peers}
+    if peer:
+        result["assignment_id"] = peer["assignment_id"]
+        if peer["status"] in {"pending_startup", "pending_setup", "running", "prepared"}:
+            result["kind"] = "wait_roles"
+            if peer["status"] == "running" and peer["candidate_id"] != state["candidate_id"]:
+                result.update(kind="observe_role", agent_name=peer["agent_name"])
+        elif peer["status"] == "ready":
+            result["kind"] = "activate_role"
+        elif peer["status"] in {"unavailable", "blocked"}:
+            result.update(kind="request_user_action", reason="Role needs availability/replacement evidence")
+        elif peer.get("task_id"):
+            result.update(operation="send_role", reuse_task_id=peer["task_id"])
+    return result
+
+
+def save_assignment(state, record):
+    validate_record(record, "assignment")
+    if record.get("task_id"):
+        require(record["task_id"] != state["attempt"]["owner_task_id"],
+                "not_independent", "Coordinator cannot perform delegated product work")
+        require(not any(a.get("task_id") == record["task_id"] and a["role"] != record["role"]
+                        for a in state["assignments"].values()),
+                "not_independent", "Implementation, review and QA require distinct identities")
+    state["assignments"][record["assignment_id"]] = deepcopy(record)
+    state["records"][f"assignment_event:{digest(record)}"] = deepcopy(record)
+
+
+def prepare_subagent_assignment(state, request, now):
+    from devflow.model_policy import validate_role_policy
+
+    require(subagent_mode(state), "host_mode", "This command needs a subagent attempt")
+    policy = request["role_policy"]
+    validate_role_policy(policy)
+    role, identity = request["role"], request["assignment_id"]
+    require(role == policy["role"] and role in {"implementation_worker", "review", "qa"},
+            "role_policy_mismatch", "Assignment role differs from resolved policy")
+    require(bool(request["owned_paths"]) and bool(request["brief"].strip()),
+            "unbounded_assignment", "A role needs explicit ownership and a bounded brief")
+    existing = state["assignments"].get(identity)
+    if existing:
+        require(existing["role"] == role and existing.get("host_kind") == "subagent",
+                "assignment_conflict", "Cannot change an assignment's role or transport")
+        require(existing["role_policy"]["policy_hash"] == policy["policy_hash"],
+                "role_policy_changed", "Changed role policy requires an observed replacement")
+        require(existing["status"] in {"ready", "completed", "blocked", "interrupted"} and existing["task_id"],
+                "assignment_state", "Reuse requires a verified available agent")
+        require(state["actions"][existing["action_id"]]["status"] == "confirmed",
+                "reconcile_required", "Finish the previous host action before preparing a follow-up")
+        assignment = deepcopy(existing)
+        operation = "send_role"
+    else:
+        peers = [a for a in state["assignments"].values()
+                 if a["role"] == role and a["status"] != "replaced"]
+        replaced = state["assignments"].get(request.get("replaces_assignment_id"))
+        require(not peers or (len(peers) == 1 and replaced is peers[0]),
+                "replacement_required", "Reuse the existing role or record its replacement")
+        if replaced:
+            replacement = request.get("replacement_observation")
+            if replacement and replacement.get("reason") == "policy_change":
+                from devflow.adapters.codex_host import observed_agent_status
+
+                require(replaced["role"] == role and replaced["status"] in {"completed", "ready", "interrupted"}
+                        and replaced["role_policy"]["policy_hash"] != policy["policy_hash"]
+                        and replacement.get("agent_name") == replaced["agent_name"]
+                        and bool(replacement.get("source_reference"))
+                        and bool(replacement.get("requested_change_reference"))
+                        and observed_agent_status(replacement.get("agent_status")) in {"completed", "interrupted"},
+                        "replacement_unobserved", "Policy replacement needs an explicit change and a stopped agent")
+                observed_status = observed_agent_status(replacement["agent_status"])
+                replacement = {key: replacement[key] for key in (
+                    "reason", "agent_name", "source_reference", "requested_change_reference"
+                )} | {"agent_status": observed_status,
+                      "status_evidence_kind": "completed_object" if observed_status == "completed" else "string",
+                      "previous_policy_hash": replaced["role_policy"]["policy_hash"],
+                      "replacement_policy_hash": policy["policy_hash"]}
+            else:
+                require(replaced["role"] == role and replaced["status"] == "unavailable"
+                        and replaced.get("unavailable_observation")
+                        and state["actions"][replaced["action_id"]]["status"] == "confirmed",
+                        "replacement_unobserved", "Replacement needs observed unavailability")
+                replacement = deepcopy(replaced["unavailable_observation"])
+        task_name = "df_" + digest([state["attempt"]["owner_task_id"],
+                                   state["attempt"]["attempt_id"], identity])[:24]
+        coordinator = request.get("coordinator_agent_name", "/root")
+        assignment = {
+            "schema_version": 1, "record_type": "assignment", "assignment_id": identity,
+            "attempt_id": state["attempt"]["attempt_id"], "role": role,
+            "owner_task_id": state["attempt"]["owner_task_id"], "task_id": None, "client_id": None,
+            "host_kind": "subagent", "coordinator_agent_name": coordinator,
+            "task_name": task_name, "agent_name": coordinator + "/" + task_name,
+            "role_policy": deepcopy(policy), "startup_observation": None,
+        }
+        if replaced:
+            assignment.update(replaces_assignment_id=replaced["assignment_id"],
+                              replacement_observation=replacement)
+            save_assignment(state, replaced | {"status": "replaced",
+                                               "replaced_by_assignment_id": identity})
+        operation = "launch_role"
+    assignment.update(candidate_id=state["candidate_id"], scope_hash=state["scope_hash"],
+                      owned_paths=request["owned_paths"],
+                      workspace_reference=request.get("workspace_reference"), brief=request["brief"],
+                      status="ready" if existing else "prepared")
+    assignment.pop("implementation_result", None)
+    assignment.pop("captured_candidate_id", None)
+    action = prepare_action(state, operation, {
+        "role": role, "assignment_id": identity, "host_kind": "subagent",
+        "agent_name": assignment["agent_name"], "policy_hash": policy["policy_hash"],
+        "brief_hash": digest(assignment["brief"]), "dispatch_id": request["operation_id"],
+    }, {}, now)
+    assignment["action_id"] = action["action_id"]
+    save_assignment(state, assignment)
+    return {"assignment": assignment, "action": action}
+
+
+def host_receipt(state, assignment, status, external_id, observation, now):
+    action = state["actions"][assignment["action_id"]]
+    record = {"schema_version": 1, "record_type": "action_receipt",
+              **{key: action[key] for key in (
+                  "action_id", "attempt_id", "operation", "payload_hash", "expected_revision")},
+              "status": status, "external_id": external_id,
+              "observations": ["Observed supported host result"], "recorded_at": now.isoformat()}
+    return record_receipt(state, {"record": record, "observation": observation})
+
+
 def scope_hash(contract):
     return digest({k: v for k, v in contract.items() if k not in {"title", "scope_revision"}})
 
@@ -199,6 +351,9 @@ def current_candidate(state, identity=None):
 def independent_assignment(state, assignment_id, producer, candidate_id, role=None):
     assignment = state["assignments"].get(assignment_id)
     require(assignment is not None, "unknown_assignment", "Role assignment is not registered")
+    if subagent_mode(state):
+        require(assignment.get("host_kind") == "subagent" and assignment.get("startup_observation"),
+                "startup_unverified", "Independent result needs observed subagent startup")
     require(
         assignment["role"] in {"review", "qa"},
         "not_independent",
@@ -350,6 +505,11 @@ def prepare_action(
         )
         if payload["role"] in {"review", "qa"}:
             current_candidate(state, payload["candidate_id"])
+            require(implementation_completed(state), "implementation_incomplete",
+                    "Independent roles require the delegated implementation result")
+    if operation == "run_check":
+        require(implementation_completed(state), "implementation_incomplete",
+                "Recorded checks require the delegated implementation result")
     validate_action_target(state, operation, payload, expected_remote_state, terminal=terminal)
     fingerprint = digest(
         {
@@ -454,7 +614,15 @@ def next_actions(state):
     if state["lifecycle"] == "ready":
         return [{"kind": "prepare_workspace", "reason": "Start the authorized attempt"}]
     if not state["candidate_id"]:
-        return [{"kind": "implement"}]
+        if implementation_required(state):
+            return [role_next(state, "implementation_worker")]
+        return [{"kind": "capture_candidate" if subagent_mode(state) else "implement"}]
+    if implementation_required(state):
+        workers = [a for a in state["assignments"].values()
+                   if a["role"] == "implementation_worker" and a["status"] != "replaced"]
+        worker = workers[-1] if workers else None
+        if not worker or not implementation_completed(state):
+            return [role_next(state, "implementation_worker")]
     missing = missing_checks(state)
     if missing:
         return [
@@ -463,12 +631,34 @@ def next_actions(state):
         ]
     blockers = blocking_findings(state, state["candidate_id"])
     if blockers:
-        return [{"kind": "repair_findings", "finding_ids": blockers}]
+        if implementation_required(state):
+            needs_repair = [identity for identity in blockers if (
+                state["findings"][identity]["disposition"] != "fix_pending"
+                or state["fix_observations"].get(identity, {}).get("candidate_id") != state["candidate_id"]
+            )]
+            if needs_repair:
+                return [role_next(state, "implementation_worker") | {"finding_ids": needs_repair}]
+            if not required_roles(state):
+                return [role_next(state, "review") | {"finding_ids": blockers}]
+        else:
+            return [{"kind": "repair_findings", "finding_ids": blockers}]
     gates = valid_gates(state)
     roles = [role for role in required_roles(state) if role not in gates]
     if roles:
         result = []
         for role in roles:
+            if subagent_mode(state):
+                gate_id = state.get("gate_ids", {}).get(role)
+                gate = get(state, "gate_result", gate_id) if gate_id else None
+                if gate and gate["status"] == "FAIL" and state["phase"] == "implement":
+                    result.append(role_next(state, "implementation_worker") if (
+                        implementation_required(state)
+                    ) else {"kind": "request_user_action", "reason": "Review-only gate failed"})
+                elif gate and gate["status"] == "BLOCKED":
+                    result.append({"kind": "request_user_action", "reason": "Role gate is blocked"})
+                else:
+                    result.append(role_next(state, role))
+                continue
             assignments = [
                 a
                 for a in state["assignments"].values()
@@ -557,6 +747,8 @@ def next_actions(state):
 
 
 def record_evidence(state, record):
+    require(implementation_completed(state), "implementation_incomplete",
+            "Recorded verification needs the delegated implementation result")
     validate_record(record)
     require(
         record["record_type"] in {"check_evidence", "observation_evidence"},
@@ -646,6 +838,8 @@ def record_fix(state, record):
 
 
 def record_gate(state, record):
+    require(implementation_completed(state), "implementation_incomplete",
+            "Gate admission requires the current delegated implementation result")
     validate_record(record, "gate_result")
     existing = state["records"].get(f"gate_result:{record['gate_id']}")
     if existing:
@@ -720,6 +914,8 @@ def record_gate(state, record):
 
 
 def verify_delivery(state, record, observation):
+    require(implementation_completed(state), "implementation_incomplete",
+            "Delivery readback requires the current delegated implementation result")
     validate_record(record, "delivery")
     candidate = current_candidate(state, record["candidate_id"])
     require(
@@ -958,6 +1154,8 @@ def validate_action_admission(state, action, now):
         terminal=action.get("terminal_delivery", False),
     )
     if action["operation"] in {"local_delivery", "merge", "release"}:
+        require(implementation_completed(state), "implementation_incomplete",
+                "Terminal dispatch requires the current delegated implementation result")
         require(
             action.get("terminal_delivery") is True,
             "unprepared_delivery",
@@ -1128,7 +1326,12 @@ def transition(original, command, request, now, dependency_states=None, *,
             state["lifecycle"] == "ready", "already_claimed", "Work must be Ready and unclaimed"
         )
         authority(state, now, "edit")
-        record = validate_record(request["record"], "attempt")
+        record = deepcopy(request["record"])
+        record.setdefault("execution_mode", "subagent")
+        record.setdefault("entry_phase", record["phase"])
+        validate_record(record, "attempt")
+        require(record["entry_phase"] == record["phase"], "invalid_attempt",
+                "Entry phase must match the starting phase")
         require(
             record["work_id"] == state["work_id"]
             and record["scope_hash"] == state["scope_hash"]
@@ -1256,7 +1459,130 @@ def transition(original, command, request, now, dependency_states=None, *,
         active(state)
         if command not in BOOKKEEPING:
             authority(state, now)
-        if command == "candidate.record":
+        if command == "host.assign":
+            details.update(prepare_subagent_assignment(state, request, now))
+        elif command == "host.activate":
+            assignment = state["assignments"].get(request["assignment_id"])
+            require(assignment is not None and assignment["status"] == "ready",
+                    "startup_unverified", "Activation requires verified startup")
+            details.update(prepare_subagent_assignment(state, {
+                **request, **{key: assignment[key] for key in (
+                    "role", "role_policy", "brief", "owned_paths", "workspace_reference")},
+            }, now))
+        elif command in {"host.record", "host.startup", "host.unavailable", "host.observe", "host.result"}:
+            assignment = state["assignments"].get(request["assignment_id"])
+            require(assignment is not None and assignment.get("host_kind") == "subagent",
+                    "unknown_assignment", "Expected a recorded subagent assignment")
+            action = state["actions"][assignment["action_id"]]
+            if command in {"host.unavailable", "host.observe"}:
+                from devflow.adapters.codex_host import observed_agent_status
+
+                observation = request["observation"]
+                require(assignment["status"] != "replaced",
+                        "assignment_state", "A replaced assignment cannot become active again")
+                require(observation.get("agent_name") == assignment["agent_name"]
+                        and bool(observation.get("source_reference")),
+                        "unavailability_unobserved", "Record the exact agent's observed unavailability")
+                if "agent_status" in observation:
+                    status = observed_agent_status(observation["agent_status"])
+                    control = {"agent_name": assignment["agent_name"], "agent_status": status,
+                               "source_reference": observation["source_reference"],
+                               "status_evidence_kind": "completed_object" if status == "completed" else "string"}
+                    assignment = assignment | {"control_observation": control}
+                    if (assignment.get("task_id") and action["status"] == "confirmed"
+                            and action["operation"] == "send_role"):
+                        if status in {"running", "interrupted"}:
+                            assignment["status"] = status
+                        elif status == "completed" and assignment["status"] != "ready":
+                            assignment["status"] = "completed"
+                else:
+                    require(command == "host.unavailable"
+                            and observation.get("observation_kind") == "native_target_error"
+                            and bool(observation.get("reason")) and bool(observation.get("artifact_hash"))
+                            and action["status"] == "confirmed",
+                            "unavailability_unobserved", "Unavailability needs native target-error evidence; omission is insufficient")
+                    assignment = assignment | {"status": "unavailable", "unavailable_observation": observation}
+            elif command == "host.result":
+                from devflow.adapters.codex_host import NativeHostBridge
+
+                result = NativeHostBridge.validate_result(
+                    assignment, request["result"], observed_task_id=request["observed_task_id"]
+                )
+                require(assignment["scope_hash"] == state["scope_hash"],
+                        "stale_scope", "Result assignment scope changed")
+                require(assignment["role"] == "implementation_worker",
+                        "wrong_role", "Independent review/QA results use gate record")
+                require(result.get("status") in {"completed", "blocked"}
+                        and bool(result.get("evidence_reference")),
+                        "missing_result_evidence", "Implementation result needs evidence and status")
+                if result["status"] == "completed":
+                    require(result.get("output_candidate_id") is not None
+                            and result["output_candidate_id"] == state["candidate_id"]
+                            and assignment.get("captured_candidate_id") == state["candidate_id"],
+                            "result_mismatch", "Completed implementation must identify the current candidate")
+                assignment = assignment | {"status": result["status"], "implementation_result": result}
+            else:
+                require(action["status"] in {"dispatched", "pending_setup", "ambiguous"},
+                        "reconcile_required", "Host observation requires a dispatched action")
+                require(assignment["scope_hash"] == state["scope_hash"]
+                        and assignment["candidate_id"] == state["candidate_id"],
+                        "stale_action", "Host startup/activation candidate or scope changed")
+                if command == "host.startup":
+                    observation = request["observation"] | {"verified_at": now.isoformat()}
+                    policy = assignment["role_policy"]
+                    require(assignment["status"] == "pending_startup"
+                            and observation.get("parent_thread_id") == assignment["owner_task_id"]
+                            and observation.get("agent_path") == assignment["agent_name"]
+                            and observation.get("model") == policy["model"]
+                            and observation.get("reasoning_effort") == policy["reasoning_effort"]
+                            and observation.get("policy_hash") == policy["policy_hash"]
+                            and bool(observation.get("artifact_hash")),
+                            "startup_mismatch", "Startup identity/settings must match the assignment")
+                    assignment = assignment | {"task_id": observation["task_id"], "status": "ready",
+                                               "startup_observation": observation}
+                    host_receipt(state, assignment, "confirmed", assignment["task_id"], observation, now)
+                    snapshot = get(state, "workflow_snapshot", state["attempt"]["workflow_snapshot_id"])
+                    save(state, {
+                        "schema_version": 1, "record_type": "execution_segment",
+                        "segment_id": "startup-" + digest([assignment["assignment_id"],
+                                                          observation["task_id"]])[:24],
+                        "attempt_id": assignment["attempt_id"], "task_id": observation["task_id"],
+                        "role": assignment["role"], "model_id": observation["model"],
+                        "reasoning_effort": observation["reasoning_effort"],
+                        "service_tier": observation.get("service_tier"),
+                        "workflow_hash": snapshot["workflow_hash"], "model_policy_hash": policy["policy_hash"],
+                        "started_at": observation["started_at"], "ended_at": None,
+                        "source_reference": observation["source_reference"],
+                    }, "execution_segment")
+                elif action["operation"] == "launch_role":
+                    from devflow.adapters.codex_host import NativeHostBridge
+
+                    bridge = NativeHostBridge()
+                    assignment = (bridge.reconcile_launch(assignment, request["inventory"])
+                                  if "inventory" in request else
+                                  bridge.record_launch(assignment, request["response"]))
+                    host_receipt(state, assignment, "pending_setup", assignment["agent_name"],
+                                 {"agent_name": assignment["agent_name"]}, now)
+                else:
+                    from devflow.adapters.codex_host import observed_agent_status
+
+                    matches = [item for item in request["inventory"]
+                               if item.get("agent_name") == assignment["agent_name"]]
+                    require(len(matches) == 1, "activation_unobserved", "Read back the exact agent after follow-up")
+                    status = observed_agent_status(matches[0].get("agent_status"))
+                    require(status in {"running", "completed"}, "activation_unobserved",
+                            "Follow-up agent has not started")
+                    require(assignment.get("startup_observation") and assignment.get("task_id"),
+                            "startup_unverified", "Follow-up requires verified startup")
+                    host_receipt(state, assignment, "confirmed", assignment["task_id"],
+                                 {"agent_name": assignment["agent_name"], "agent_status": status,
+                                  "status_evidence_kind": "completed_object" if (
+                                      status == "completed"
+                                  ) else "string"}, now)
+                    assignment = assignment | {"status": "running"}
+            save_assignment(state, assignment)
+            details["assignment"] = assignment
+        elif command == "candidate.record":
             record = validate_record(request["record"], "candidate")
             require(
                 record["attempt_id"] == state["attempt"]["attempt_id"]
@@ -1265,6 +1591,13 @@ def transition(original, command, request, now, dependency_states=None, *,
                 "candidate_identity",
                 "Candidate attempt/scope/repository mismatch",
             )
+            if implementation_required(state):
+                worker = state["assignments"].get(request.get("assignment_id"))
+                require(worker is not None and worker["role"] == "implementation_worker"
+                        and worker["status"] == "running" and worker.get("startup_observation")
+                        and worker["task_id"] == request.get("producer_task_id")
+                        and worker["scope_hash"] == state["scope_hash"],
+                        "implementation_required", "Candidate needs the verified delegated implementer")
             require(
                 not any(
                     old["record_type"] == "candidate"
@@ -1283,6 +1616,8 @@ def transition(original, command, request, now, dependency_states=None, *,
                 "Historical candidate IDs cannot replace the current snapshot",
             )
             save(state, record)
+            if implementation_required(state):
+                save_assignment(state, worker | {"captured_candidate_id": record["candidate_id"]})
             if state["candidate_id"] != record["candidate_id"]:
                 for action in state["actions"].values():
                     if (
@@ -1423,6 +1758,8 @@ def transition(original, command, request, now, dependency_states=None, *,
             record_gate(state, request["record"])
         elif command == "assignment.record":
             record = validate_record(request["record"], "assignment")
+            require(not subagent_mode(state) and record.get("host_kind") != "subagent",
+                    "managed_host_required", "Subagent assignments use the journaled host commands")
             action = state["actions"].get(record["action_id"])
             require(
                 action is not None and action["operation"] in {"launch_role", "send_role"},
@@ -1456,6 +1793,10 @@ def transition(original, command, request, now, dependency_states=None, *,
                     "not_independent",
                     "Review and QA require distinct peer tasks",
                 )
+            elif record["role"] == "implementation_worker" and record["task_id"]:
+                require(not any(a["task_id"] == record["task_id"] and a["role"] in {"review", "qa"}
+                                for a in state["assignments"].values()),
+                        "not_independent", "Implementation cannot reuse review/QA identity")
             if record["status"] in {"running", "completed"}:
                 require(
                     action["status"] == "confirmed"
@@ -1482,6 +1823,8 @@ def transition(original, command, request, now, dependency_states=None, *,
             # Assignment revisions are projections; their originals remain immutable history.
             state["records"][f"assignment_event:{digest(record)}"] = deepcopy(record)
         elif command == "action.prepare":
+            require(not (subagent_mode(state) and request["operation"] in {"launch_role", "send_role"}),
+                    "managed_host_required", "Prepare subagent roles with host assign or activate")
             require(
                 request["operation"] not in {"merge", "release", "local_delivery"},
                 "delivery_required",
