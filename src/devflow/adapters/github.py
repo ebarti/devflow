@@ -1250,6 +1250,63 @@ class GitHubRepository:
             )
         return observed
 
+    def observe_continuation(self, number, marker):
+        """Read the original open same-repository PR; never infer identity from its title."""
+        if type(number) is not int or number < 1 or not isinstance(marker, str) or not marker:
+            raise WorkflowError("continuation_pr", "A delivered PR number and marker are required")
+        pr = self.pull_request(number)
+        repository = f"{self.owner}/{self.name}".lower()
+        if (pr.get("number") != number or pr.get("state") != "open" or pr.get("merged")
+                or pr.get("draft") is not False or marker not in (pr.get("body") or "")
+                or any((pr[side].get("repo") or {}).get("full_name", "").lower() != repository
+                       for side in ("head", "base"))):
+            raise WorkflowError("continuation_pr", "Original PR identity, marker or open state changed")
+        return {"repository": "github:" + repository, "pr_number": number,
+                "node_id": pr["node_id"], "head_ref": pr["head"]["ref"],
+                "base_ref": pr["base"]["ref"], "head_sha": _sha(pr["head"]["sha"]),
+                "state": "open", "draft": False, "action_marker": marker}
+
+    def update_continued_pr(self, *, binding, expected_head, title, body, reconcile=False):
+        """Update/read back only the delivered PR, preserving its original publication marker."""
+        observed = self.observe_continuation(binding["pr_number"], binding["action_marker"])
+        if any(observed[k] != binding[k] for k in ("repository", "node_id", "head_ref", "base_ref")):
+            raise WorkflowError("continuation_pr", "Continued PR source or target changed")
+        if observed["head_sha"] != _sha(expected_head):
+            raise WorkflowError("stale_head", "Continued PR differs from the current candidate")
+        desired = {"title": self._public_text(title, title=True),
+                   "body": f"{self._public_text(body)}\n\n{binding['action_marker']}"}
+        current = self.pull_request(binding["pr_number"])
+        repository = f"{self.owner}/{self.name}".lower()
+        if (current.get("node_id") != binding["node_id"] or current.get("state") != "open"
+                or current.get("draft") is not False or current.get("merged")
+                or binding["action_marker"] not in (current.get("body") or "")
+                or current["head"]["ref"] != binding["head_ref"]
+                or current["base"]["ref"] != binding["base_ref"]
+                or current["head"]["sha"] != expected_head
+                or any((current[side].get("repo") or {}).get("full_name", "").lower() != repository
+                       for side in ("head", "base"))):
+            raise WorkflowError("continuation_pr", "PR changed immediately before the bounded update")
+        if any(current.get(k) != v for k, v in desired.items()):
+            if reconcile:
+                return None
+            # The read above is part of the mutation precondition, not a replacement PR lookup.
+            try:
+                self._api(f"{self.root}/pulls/{binding['pr_number']}", method="PATCH", payload=desired)
+            except WorkflowError as exc:
+                if exc.code != "ambiguous_github_action":
+                    raise
+        # Independent identity and content readback after both successful and uncertain writes.
+        verified = self.observe_continuation(binding["pr_number"], binding["action_marker"])
+        actual = self.pull_request(binding["pr_number"])
+        if (any(verified[k] != observed[k] for k in observed)
+                or any(actual.get(k) != v for k, v in desired.items())
+                or actual["head"]["sha"] != expected_head
+                or actual["base"]["ref"] != binding["base_ref"]):
+            raise WorkflowError("ambiguous_github_action", "Continued PR update needs reconciliation")
+        return {"status": "published", **{k: verified[k] for k in (
+            "pr_number", "node_id", "head_ref", "head_sha", "base_ref", "action_marker", "draft")},
+                "url": actual["html_url"]}
+
     def tag_commit(self, tag: str) -> str:
         """Resolve an existing remote lightweight/annotated tag without creating or moving it."""
         obj = self._api(f"{self.root}/git/ref/tags/{quote(self._branch(tag), safe='')}")["object"]

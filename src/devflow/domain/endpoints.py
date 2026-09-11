@@ -40,6 +40,15 @@ def validate_endpoint(endpoint):
 def validate_action_target(
     state, operation, payload, refs, *, repository_path=None, terminal=False
 ):
+    continuation = state["records"].get("work_continuation:" + str(state.get("continuation_id")))
+    if continuation and operation in {"push_branch", "publish_pr"}:
+        binding = continuation["pr_observation"]
+        values = {**refs, **payload}
+        if values.get("head_ref") != binding["head_ref"] or (
+                operation == "publish_pr" and values.get("base_ref") != binding["base_ref"]):
+            _reject("Continuation publication must retain its original PR source and admitted target")
+        if values.get("pr_number", binding["pr_number"]) != binding["pr_number"]:
+            _reject("Continuation cannot publish another PR")
     if operation == "push_branch":
         if terminal or state["contract"]["endpoint"]["kind"] not in {"pr", "merge"}:
             _reject("Branch publication requires an accepted PR or merge endpoint")

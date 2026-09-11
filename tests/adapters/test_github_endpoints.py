@@ -190,3 +190,66 @@ def test_reconciliation_never_publishes_missing_objects():
     assert repo.reconcile_pr(**pr_args()) is None
     assert repo.reconcile_release(**release_args()) is None
     assert not server.writes
+
+
+class ContinuedEndpointServer(EndpointServer):
+    def route(self, method, path, body):
+        if method == "PATCH" and path == "pulls/1":
+            self.writes.append((path, body))
+            self.prs[0].update(body)
+            if self.race == "retarget":
+                self.prs[0]["base"]["ref"] = "unexpected"
+            self.maybe_lost("update")
+            return self.prs[0]
+        return super().route(method, path, body)
+
+
+def continued_pr():
+    server = ContinuedEndpointServer()
+    repo = GitHubRepository("fixture", "repo", server.runner)
+    original = repo.publish_pr(**pr_args())
+    binding = repo.observe_continuation(1, original["action_marker"])
+    return server, repo, binding
+
+
+@pytest.mark.parametrize("lost", [None, "update"])
+def test_same_pr_update_reconciles_uncertain_response_and_preserves_original_marker(lost):
+    server, repo, binding = continued_pr()
+    server.lost = lost
+    args = dict(binding=binding, expected_head=HEAD, title="fix: continued outcome", body="Updated proof")
+    updated = repo.update_continued_pr(**args)
+    assert updated["pr_number"] == 1 and updated["action_marker"] == binding["action_marker"]
+    assert repo.update_continued_pr(**args, reconcile=True) == updated
+    assert repo.update_continued_pr(**args) == updated
+    assert len(server.prs) == 1 and len(server.writes) == 2
+    assert server.writes[-1] == ("pulls/1", {"title":"fix: continued outcome",
+                                           "body":"Updated proof\n\n" + binding["action_marker"]})
+
+
+@pytest.mark.parametrize("field", ["node_id", "head_ref", "base_ref", "head_sha", "repository", "pr_number"])
+def test_continued_pr_mismatch_never_updates_or_creates_replacement(field):
+    server, repo, binding = continued_pr()
+    if field == "head_sha":
+        server.prs[0]["head"]["sha"] = OTHER
+    elif field == "pr_number":
+        server.prs[0]["number"] = 2
+    elif field in {"head_ref", "base_ref"}:
+        server.prs[0][field.split("_")[0]]["ref"] = "changed"
+    elif field == "repository":
+        server.prs[0]["head"]["repo"]["full_name"] = "another/repo"
+    else:
+        server.prs[0][field] = "changed"
+    with pytest.raises(WorkflowError):
+        repo.update_continued_pr(binding=binding, expected_head=HEAD, title="New", body="New")
+    assert len(server.writes) == 1 and len(server.prs) == 1
+
+
+def test_continued_pr_target_race_is_unconfirmed_then_read_only_reconciliation_rejects():
+    server, repo, binding = continued_pr()
+    server.race = "retarget"
+    args = dict(binding=binding, expected_head=HEAD, title="New", body="New")
+    with pytest.raises(WorkflowError, match="reconciliation"):
+        repo.update_continued_pr(**args)
+    with pytest.raises(WorkflowError, match="source or target"):
+        repo.update_continued_pr(**args, reconcile=True)
+    assert len(server.writes) == 2

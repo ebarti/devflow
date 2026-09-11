@@ -73,6 +73,14 @@ This is an agent-prepared fragment, not a standalone complete work contract or a
 
 The existing managed workspace/candidate lifecycle requires `edit`, including for an investigation contract. An explicitly read-only investigation can use capture and inspection commands while the agent performs the permitted analysis, but it cannot complete that managed lifecycle using only `check`. Do not widen a read-only request's permissions to bypass this limitation.
 
+### Continue a completed PR
+
+When a new user request requires repair or update after the same PR's verified delivery, use `work reopen` instead of amending terminal work or creating a replacement work ID. Supply the existing revision, bounded contract, fresh request and exact continuation/PR identity through a request file. The [completed PR procedure](../skills/devflow-coordinating/references/completed-pr.md) owns the request fields, entry choice and recovery boundary.
+
+The transition retains the original attempt and delivery, records the new authority and continuation, and reacquires the same owner's claim. A repair enters implementation and obtains a new candidate with current proof. Delivery-only reuse requires identical operative inputs and valid evidence. The managed endpoint remains the existing regular PR; a separately authorized native merge has its own actual receipt and independent readback. Unresolved actions, missing producer results and stale identity cannot be cleared by reopening.
+
+### Capture and check the candidate
+
 Register the dedicated checkout against that intent, verify it is clean, and record the actual workspace receipt. `candidate capture` reads real Git head/tree/base and ownership. `check run` executes an admitted recipe and records process and assertion outcomes separately. A later failed result supersedes an earlier passing result for that recipe. Named scenarios and acceptance must be covered by current passing evidence.
 
 The check runner durably admits an execution before starting its process. An identical completed request returns the same recorded result without rerunning. An interrupted dispatched check remains unresolved until reconciled; it is never blindly repeated. Evidence and the confirmed receipt commit together. If another command changes the revision during execution, the private draft preserves the actual result while stale completion is rejected.

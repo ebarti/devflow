@@ -9,6 +9,8 @@ Input: authorized scope, acceptance/check plan, endpoint and existing work ID. O
 
 Run the pinned launcher and `doctor`. For continuation, recover through `backlog list`/`work list`, then `work show` and `next`; reuse work, attempt, candidate, action and role identities. Read the skill named by each action. Do not start another work item to escape an unresolved operation.
 
+If a verified PR outcome is already Done and the user requests further repair or update of that same PR, use [completed PR continuation](references/completed-pr.md). `work reopen` records the new authority and continuation; ordinary `work amend` cannot reactivate terminal work. Keep the earlier delivery as history.
+
 If definition/check coverage is missing, hand off to [defining-work](../devflow-defining-work/SKILL.md) or [planning](../devflow-planning/SKILL.md). Admit the conversational request and snapshot through the [intake procedure](../devflow-defining-work/references/intake.md). Preserve the actual entry phase for review-only/delivery-only work.
 
 Delegate implementation/repairs to a bounded worker and required review/QA to distinct independent agents. Read [host protocol](references/host-protocol.md) before launch, activation, replacement or native reconciliation. Journal dispatch, verify actual startup identity/settings, then activate the role skill and self-contained brief. Reuse available roles; preserve others' edits and isolate fixtures.

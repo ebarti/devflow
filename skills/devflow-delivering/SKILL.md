@@ -9,6 +9,8 @@ Input: authorized endpoint, current candidate/proof, saved actions and outstandi
 
 Start from `work show` and `next`. Reuse valid evidence for direct delivery without inventing implementation. Send repairs through [coordinating](../devflow-coordinating/SKILL.md) and obtain affected independent gates.
 
+A repair or update after a verified PR outcome is Done uses [completed PR continuation](../devflow-coordinating/references/completed-pr.md). Preserve its existing PR and original delivery. An already valid PR can follow its separately authorized native merge path with current proof and actual readback.
+
 Journal supported mutations before dispatch, including branch publication through `push_branch`. Bind local head, repository, remote ref and expected remote head; use the dispatcher instead of raw `git push`. Publish a regular PR after independent remote head readback. Read [external operations](references/external-operations.md) for mutation and reconciliation mechanics.
 
 On uncertainty, reconcile the same action before retrying. Only definite no-mutation failure permits `action retry`; preserve prior receipts. Do not replace an action/work ID to hide failed dispatch. A changed prerequisite or compatible workflow upgrade does not erase failure.

@@ -26,18 +26,22 @@ PARENT = "11111111-1111-4111-8111-111111111111"
 
 
 class Subagents(Scenario):
-    def __init__(self, path, *, tier=0, phase="implement", package_version=None):
+    def __init__(self, path, *, tier=0, phase="implement", package_version=None,
+                 endpoint="local", repository="synthetic:prose-fixture"):
         self.root = path / "repository"
         shutil.copytree(Path(__file__).parents[1] / "fixtures/repositories/prose", self.root)
+        if repository != "synthetic:prose-fixture":
+            profile = self.root / ".devflow/repository.toml"
+            profile.write_text(profile.read_text().replace("synthetic:prose-fixture", repository))
         self.private = path / "private"
-        self.service = WorkflowService(self.private, repository="synthetic:prose-fixture")
-        self.repository = "synthetic:prose-fixture"
+        self.service = WorkflowService(self.private, repository=repository)
+        self.repository = repository
         self.sequence = itertools.count()
         self.work_id = "synthetic-subagents"
-        self.contract = contract(self.work_id, tier)
+        self.contract = contract(self.work_id, tier, endpoint)
         self.call("work.ready", record=self.contract, user_request={
             "reference": "synthetic:direct-user-request", "summary": "Synthetic delegated outcome",
-            "allowed_operations": ["edit", "check", "create_tasks"],
+            "allowed_operations": ["edit", "check", "create_tasks"] + (["publish_pr"] if endpoint == "pr" else []),
         })
         attempt = record(
             "attempt", attempt_id="synthetic-attempt", work_id=self.work_id,

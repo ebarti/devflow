@@ -25,6 +25,8 @@ The conversation supplies authority. Design-only discussion does not authorize i
 
 For an enrolled repository, prefer its `scripts/devflow` launcher and run `doctor`. Write a request file such as `{"name":"devflow-coordinating"}`, then run `scripts/devflow skill resolve --request-file skill.json --json`. JSON input is not a positional argument. Include the existing `--work-id` for continuation. Read the returned immutable path; do not use a newer global stage over a different attempt pin. Missing or incompatible stages require recorded recovery/upgrade, never a silent downgrade. For an unenrolled repository, use these methods alongside its contributor rules; do not enroll it automatically.
 
+Resolve reference links relative to the file containing them. Discover uncertain paths with `rg --files` before reading them; a stage name does not determine a referenced file's owner or location.
+
 For continuation, coordinating reads `work show` and `next`; each action names its owning skill. Do not scan or resume backlog merely because a conversation opened.
 
 Skill instructions require routing; CLI transitions validate actual outputs. Neither a skill-read acknowledgement nor an instruction hash proves execution compliance or prevents arbitrary shell bypass.

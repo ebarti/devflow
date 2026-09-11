@@ -92,14 +92,30 @@ def observe_subagent_startup(assignment: dict, request: dict, put_artifact) -> d
     return observation | {"artifact_hash": put_artifact(raw)}
 
 
-def validate_start_snapshot(repository: Path, snapshot: dict, require_artifact) -> None:
+def validate_start_snapshot(repository: Path, snapshot: dict, require_artifact, *, continuation_state=None) -> None:
     """Reject an unresumable or unsubstantiated policy before claiming work."""
     validate_record(snapshot, "workflow_snapshot")
     profile = load_profile(repository)
     release = installed_release(package_root())
+    upgrade = snapshot.get("continuation_upgrade")
+    if upgrade:
+        old = (continuation_state or {}).get("records", {}).get("workflow_snapshot:" + upgrade["prior_snapshot_id"])
+        retained = bool(continuation_state and snapshot == continuation_state["records"].get(
+            "workflow_snapshot:" + continuation_state["attempt"]["workflow_snapshot_id"])
+            and any(r.get("record_type") == "work_continuation"
+                    and r["workflow_snapshot_id"] == snapshot["snapshot_id"]
+                    and r["prior_delivery_id"] == upgrade["prior_delivery_id"]
+                    for r in continuation_state["records"].values()))
+        if (not continuation_state or continuation_state["lifecycle"] != "done"
+                or continuation_state["contract"]["endpoint"]["kind"] != "pr"
+                or upgrade["work_id"] != continuation_state["work_id"]
+                or (not retained and upgrade["prior_delivery_id"] != continuation_state["delivery_id"])
+                or not old or old["package_revision"] != upgrade["prior_package_revision"]
+                or upgrade["repository_lock_revision"] != profile.lock["revision"]):
+            raise WorkflowError("snapshot_mismatch", "Explicit snapshot upgrade needs its completed PR and observed branch lock")
     if (
         snapshot["package_revision"] != release["revision"]
-        or release["revision"] != profile.lock["revision"]
+        or (not upgrade and release["revision"] != profile.lock["revision"])
         or snapshot["package_version"] != __version__
     ):
         raise WorkflowError("release_mismatch", "Attempt must capture the executing pinned release")
@@ -117,10 +133,21 @@ def validate_start_snapshot(repository: Path, snapshot: dict, require_artifact) 
         raise WorkflowError("snapshot_mismatch", "Workflow hash must bind captured package and inputs")
 
 
-def capture_snapshot(repository: Path, request: dict, put_artifact) -> dict:
+def capture_snapshot(repository: Path, request: dict, put_artifact, *, continuation_state=None) -> dict:
     profile = load_profile(repository)
     release = installed_release(package_root())
-    if release["revision"] != profile.lock["revision"]:
+    upgrade = None
+    if continuation_state is not None:
+        if (continuation_state["lifecycle"] != "done"
+                or continuation_state["contract"]["endpoint"]["kind"] != "pr"
+                or continuation_state["authority"]["repository"] != profile.repository["repository"]["id"]):
+            raise WorkflowError("invalid_state", "Upgrade capture only accepts this repository's completed PR work")
+        prior = continuation_state["records"]["workflow_snapshot:" + continuation_state["attempt"]["workflow_snapshot_id"]]
+        upgrade = {"work_id": continuation_state["work_id"], "prior_snapshot_id": prior["snapshot_id"],
+                   "prior_package_revision": prior["package_revision"],
+                   "prior_delivery_id": continuation_state["delivery_id"],
+                   "repository_lock_revision": profile.lock["revision"]}
+    elif release["revision"] != profile.lock["revision"]:
         raise WorkflowError("release_mismatch", "Capture must use the repository's pinned release")
     sources = []
     paths = [(profile.root / entry["reference"]) for entry in profile.sources]
@@ -164,6 +191,7 @@ def capture_snapshot(repository: Path, request: dict, put_artifact) -> dict:
         "schema_version": 1,
         "record_type": "workflow_snapshot",
         "snapshot_id": request["snapshot_id"],
+        **({"continuation_upgrade": upgrade} if upgrade else {}),
         "package_version": __version__,
         "package_revision": release["revision"],
         "workflow_hash": workflow_hash,

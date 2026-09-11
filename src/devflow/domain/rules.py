@@ -15,6 +15,7 @@ from devflow.validation import digest, validate_record
 
 ID_FIELDS = {
     "intake_admission": "admission_id",
+    "work_continuation": "continuation_id",
     "work_contract": "scope_revision",
     "outcome_event": "event_id",
     "authority": "authority_id",
@@ -326,7 +327,8 @@ def require_delivery_accountability(state):
 
 def implementation_required(state):
     return subagent_mode(state) and (
-        state["attempt"].get("entry_phase", "implement") == "implement"
+        (state["records"].get("work_continuation:" + str(state.get("continuation_id")), {}).get(
+            "entry_phase", state["attempt"].get("entry_phase", "implement")) == "implement")
         or any(a["role"] == "implementation_worker" for a in state["assignments"].values())
     )
 
@@ -1625,18 +1627,25 @@ def validate_action_admission(state, action, now):
 
 
 def transition(original, command, request, now, dependency_states=None, *,
-               trusted_verifier=None, repository=None, deferral_observation=None, recovery_input=None):
+               trusted_verifier=None, repository=None, deferral_observation=None, recovery_input=None,
+               continuation_observation=None):
     state = deepcopy(original)
     details = {}
     admission = None
-    if command in {"work.ready", "work.amend"}:
+    if command == "work.reopen":
+        from devflow.continuation import reopen_admission
+        admission = reopen_admission(state, request, trusted_verifier, now, repository)
+    elif command in {"work.ready", "work.amend"}:
         admission = requested_admission(state, request, trusted_verifier, now, repository=repository)
     elif command not in BOOKKEEPING:
         admission = execution_admission(
             state, state["contract"] or {}, state.get("admission_id"), trusted_verifier, now,
             repository=repository or (state.get("authority") or {}).get("repository"),
         )
-    if command in {"work.ready", "work.amend"}:
+    if command == "work.reopen":
+        from devflow.continuation import reopen
+        details = reopen(state, request, now, admission, continuation_observation)
+    elif command in {"work.ready", "work.amend"}:
         record = validate_record(request["record"], "work_contract")
         if "workflow_snapshot" in request:
             require(

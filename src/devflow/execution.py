@@ -312,14 +312,22 @@ def _perform_operation(state, action, repository, *, github_factory, git_factory
             method = github.reconcile_pr
         else:
             method = github.reconcile_pr if reconcile else github.publish_pr
-        value = method(
-            head_ref=values["head_ref"],
-            base_ref=values["base_ref"],
-            expected_head=candidate["head_sha"],
-            title=values["title"],
-            body=values["body"],
-            action_id=publication_id,
-        )
+        continuation = state["records"].get("work_continuation:" + str(state.get("continuation_id")))
+        if continuation:
+            value = github.update_continued_pr(
+                binding=continuation["pr_observation"], expected_head=candidate["head_sha"],
+                title=values["title"], body=values["body"],
+                reconcile=reconcile or publication_id != action["action_id"],
+            )
+        else:
+            value = method(
+                head_ref=values["head_ref"],
+                base_ref=values["base_ref"],
+                expected_head=candidate["head_sha"],
+                title=values["title"],
+                body=values["body"],
+                action_id=publication_id,
+            )
         if value is None:
             raise WorkflowError("ambiguous_action", "PR publication is not uniquely confirmed")
         return {
