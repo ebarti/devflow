@@ -434,7 +434,11 @@ def dispatch(args) -> dict:
         validate_start_snapshot(
             args.repository, request.get("workflow_snapshot", {}), service.store.require_artifact
         )
-    if command == "work.amend":
+    if command == "work.reopen":
+        replayed = service.replay(command, request)
+        if replayed is not None:
+            return replayed
+    if command in {"work.amend", "work.reopen"}:
         from devflow.provenance import validate_start_snapshot
 
         state = _state(service, request, args)
@@ -443,7 +447,10 @@ def dispatch(args) -> dict:
                 state["records"].get("workflow_snapshot:" + state["attempt"]["workflow_snapshot_id"])
             )
             try:
-                validate_start_snapshot(args.repository, snapshot, service.store.require_artifact)
+                validate_start_snapshot(
+                    args.repository, snapshot, service.store.require_artifact,
+                    continuation_state=state if command == "work.reopen" else None,
+                )
             except WorkflowError as exc:
                 if "workflow_snapshot" not in request and exc.code in {
                     "release_mismatch", "profile_drift", "invalid_record",
@@ -455,6 +462,27 @@ def dispatch(args) -> dict:
                         {"reason": exc.code},
                     ) from exc
                 raise
+    if command == "work.reopen":
+        from devflow.adapters.git import GitRepository
+        from devflow.adapters.github import GitHubRepository
+        from devflow.execution import _remote
+
+        state = _state(service, request, args)
+        git = GitRepository(args.repository)
+        if git.identity() != service.repository:
+            raise WorkflowError("repository_mismatch", "Continuation checkout differs from its repository")
+        options = request.get("continuation", {})
+        prior = state["records"].get("delivery:" + str(options.get("prior_delivery_id")), {})
+        old_pr = state["actions"].get(prior.get("action_id"), {}).get("observation", {})
+        observation = _remote(state, GitHubRepository).observe_continuation(
+            options.get("pr_number"), old_pr.get("action_marker"),
+        )
+        if options.get("entry_phase") == "deliver":
+            current = git.observe()
+            reuse = request.get("reuse_candidate", {})
+            if not current["clean"] or any(current[k] != reuse.get(k) for k in ("head_sha", "tree_sha")):
+                raise WorkflowError("continuation_reuse", "Deliver reuse requires the unchanged clean checkout")
+        return service.execute(command, request, continuation_observation=observation)
     if command == "work.show":
         return _state(service, request, args)
     if command == "work.list":
@@ -521,7 +549,11 @@ def dispatch(args) -> dict:
     if command == "snapshot.capture":
         from devflow.provenance import capture_snapshot
 
-        return capture_snapshot(args.repository, request, service.put_artifact)
+        return capture_snapshot(
+            args.repository, request, service.put_artifact,
+            continuation_state=service.snapshot(request["continuation_work_id"])
+            if "continuation_work_id" in request else None,
+        )
     if args.command == "report" and not args.action:
         state = _state(service, request, args)
         return {

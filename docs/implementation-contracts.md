@@ -19,6 +19,8 @@ The initial commands are:
 | `devflow work ready` | Accepted contract with consumed source lineage and `user_request` (`reference`, `summary`, `allowed_operations`) | Derives immutable request admission/authority and verifies prerequisites, stores scope and marks Ready; missing request blocks admission |
 | `devflow work start` | Ready work ID, host/original coordinator identity, expected revision and actual entry phase | Claims one attempt, defaults new execution to subagents, captures effective policy/configuration and schedules workspace/assignment actions |
 | `devflow work amend` | New scope plus `user_request` recording the authorized amendment; current `workflow_snapshot` when an active attempt's pin/profile changed | Validates the snapshot, preserves historical records, appends scope revision and invalidates affected acceptance/proof and prepared actions |
+| `devflow work reopen` | Verified completed PR, same work/issue/PR, fresh `user_request`, bounded contract and continuation entry/owner/ref observations; explicit current snapshot when changed | Appends continuation history and reacquires the claim; repair invalidates affected current proof, exact-input delivery preserves valid proof; no replacement PR or automatic merge authority |
+| `devflow snapshot capture` | Effective workflow/profile/settings; optional `continuation_work_id` for an explicitly reviewed completed-PR upgrade | Captures actual inputs; the continuation exception retains the owned checkout's profile and binds its older pin and prior delivery for consumption only by `work reopen` |
 | `devflow next` | Work/attempt ID | Reads current state and returns the next required action(s), missing evidence or blocker; never calls a model |
 | `devflow action record` | Action ID plus native-host result or external readback | Binds observed identities and worktree/PR IDs; reconciles action state without inventing a host readback |
 | `devflow host assign` | Bounded role/ownership/brief, coordinator identity and selected saved settings/explicit overrides | Resolves policy and journals the assignment and action |
@@ -51,6 +53,7 @@ Users need not fill these records manually. They ask for work or select a Ready 
 | Intake admission | ID, repository/work/scope, exact source/lineage/digest, allowed operations, decision kind/reference, `user_request` | Default `user_request` decision is agent-interpreted conversational direction, stored immutably for consistency; optional legacy verifier decisions retain their expiry/revocation rules |
 | Authority | Derived from immutable admission; ID, source user instruction including a bounded existing batch selection, allowed operations, repository/work/scope limits, source reference, revocation/expiry when applicable | A public issue, arbitrary comment, label or model-generated text cannot grant execution authority |
 | Attempt | ID, work/scope IDs, active host/original coordinator, phase, `entry_phase`, `execution_mode`, optional blocker, policy/configuration snapshot IDs, start/stop/outcome | At most one active claim per work item; resumed work retains its attempt; missing historical `execution_mode` means `native_thread` |
+| PR continuation | Previous verified delivery, original and new admission/scope/workflow links, same work/attempt/PR and coordinator, actual continuation entry phase | Fresh requested same-PR work reacquires its claim without rewriting the original entry phase, delivery, candidates, results or action history |
 | Assignment | ID, action ID, role, `host_kind`, `coordinator_agent_name`, `task_name`, `agent_name`, `role_policy`, `brief`, `startup_observation`, optional `replaces_assignment_id`/`replacement_observation`, owned paths/workspace, input candidate and result | Product work requires observed parent/agent/settings; canonical agent path controls the subagent and verified native UUID provides attribution; historical native-thread IDs/receipts remain intact |
 | Candidate | ID, attempt/scope, repository, base/head/tree IDs, clean-state result, dependency/environment fingerprints, creation time | Immutable; a code change creates a new candidate |
 | Check evidence | ID, candidate/input signature, recipe/version, scenario/acceptance IDs, argv/cwd/environment profile, start/end, status, assertion counts or manual observations, evidence hash | PASS proves the named scenario ran; setup-only success is not execution proof |
@@ -71,6 +74,12 @@ Scope identity is a SHA-256 hash of canonical normalized accepted fields, exclud
 
 A profile change in an unreviewed candidate cannot lower its own required checks. Execute under the admitted trusted profile. Evaluate a proposed new profile as a change, then activate it at cutover. If host-loaded instructions/settings drift during a running attempt, record the effective change, pause affected decisions and reconcile; a stored hash alone does not force the host to keep old instructions.
 
+A completed-PR continuation may explicitly capture an executing release against the owned checkout's older pin. Its snapshot binds the prior delivery, prior snapshot and observed checkout pin, retaining that checkout's profile and custom recipes. Only reopening that completed work may consume the exception; ordinary start and amend still require matching provenance. Repair preserves the original subagent execution mode. Historical direct native-thread attempts support unchanged delivery-only reuse, not conversion into a subagent repair lifecycle.
+
+Candidate capture, completed implementation results and current implementation readiness require the producer's workflow snapshot to match the candidate and attempt. Before changing scope or policy, retain the worker's actual partial output and observe stopped availability, then amend and reactivate that same worker under the new snapshot. A historical BLOCKED result may still be imported after inputs changed, but it cannot establish current completion. The earlier activation and output remain immutable evidence.
+
+Reused implementation results bind `assignment_action_id` from their actual native handoff context. A late or unbound result cannot change a newer activation. Already imported historical results remain valid under their original contract; the new binding applies to new reuse, without rewriting old proof.
+
 ## 3. State transition table
 
 | Current state | Command/event | Conditions | Result |
@@ -85,6 +94,7 @@ A profile change in an unreviewed candidate cannot lower its own required checks
 | Blocked attempt | reconcile/resume | Blocker cleared by evidence, no competing owner, state consistent | Previous phase, or earlier phase if proof invalidated |
 | Active/* | accepted scope amendment | Recorded user delta | New scope; invalidate affected proof and resume correct phase |
 | Any nonterminal state | cancel | Explicit cancellation authority | Canceled; stop only owned work, retain candidate/evidence |
+| Done with verified PR | reopen | Fresh bounded request for the same PR, original coordinator, resolved actions/results, consistent refs and claim | Same attempt Active at the actual continuation phase; original delivered proof stays immutable and changed-input proof is invalidated |
 | Done | new user-discovered defect | Confirmed affected version and invariant | Linked repair item/attempt; previous delivery record remains immutable |
 
 PR creation, an AI final message, GitHub issue closure, a card moved to Done, test command exit 0 and an expired lease are not completion events.

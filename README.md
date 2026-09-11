@@ -16,6 +16,8 @@ The happy path stays short: capture or reuse one backlog issue, delegate impleme
 
 Independent rounds retain their original activation through interruptions. If a completed producer's original gate omits required evidence IDs, `host recover-result` journals a correction by that producer using existing evidence, preserving its original judgement and rejected bytes. See [role execution](docs/operation.md#role-execution) for the exact boundary.
 
+Version 0.5.2 adds `work reopen` for a newly requested continuation of the same completed PR. It records fresh authority, preserves the original delivery and attempt history, and reacquires the claim before repair or delivery. Changed inputs require current proof; unchanged delivery can reuse valid evidence. See [completed PR continuation](skills/devflow-coordinating/references/completed-pr.md).
+
 ## Try the package
 
 The development runtime requires Python 3.12+, Git, and uv on a local POSIX host. GitHub operations also use the authenticated GitHub CLI; usage collection uses npx. Role execution uses the coordinator's supported subagent tools and user-selected model settings, with readable child session metadata for startup verification.

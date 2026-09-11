@@ -15,6 +15,7 @@ from devflow.validation import digest, validate_record
 
 ID_FIELDS = {
     "intake_admission": "admission_id",
+    "work_continuation": "continuation_id",
     "work_contract": "scope_revision",
     "outcome_event": "event_id",
     "authority": "authority_id",
@@ -326,9 +327,30 @@ def require_delivery_accountability(state):
 
 def implementation_required(state):
     return subagent_mode(state) and (
-        state["attempt"].get("entry_phase", "implement") == "implement"
+        (state["records"].get("work_continuation:" + str(state.get("continuation_id")), {}).get(
+            "entry_phase", state["attempt"].get("entry_phase", "implement")) == "implement")
         or any(a["role"] == "implementation_worker" for a in state["assignments"].values())
     )
+
+
+def implementation_policy_matches(state, assignment, candidate=None):
+    # Missing historical assignment fields resolve through the immutable attempt,
+    # never through the current (possibly amended) attempt pointer.
+    original = get(state, "attempt", assignment["attempt_id"])
+    snapshot_id = assignment.get("workflow_snapshot_id", original["workflow_snapshot_id"])
+    return snapshot_id == state["attempt"]["workflow_snapshot_id"] and (
+        candidate is None or candidate.get("workflow_snapshot_id", snapshot_id) == snapshot_id
+    )
+
+
+def require_implementation_handoff(state, assignments=None):
+    """An observed stop is not an imported producer result."""
+    workers = assignments if assignments is not None else state["assignments"].values()
+    require(not any(a["role"] == "implementation_worker"
+                    and state["actions"].get(a["action_id"], {}).get("operation") == "send_role"
+                    and state["actions"][a["action_id"]]["status"] == "confirmed"
+                    and not a.get("implementation_result") for a in workers),
+            "implementation_result_required", "Import the original worker output before changing scope/policy or reusing its activation")
 
 
 def implementation_completed(state):
@@ -336,6 +358,7 @@ def implementation_completed(state):
         return True
     return any(a["role"] == "implementation_worker" and a["status"] == "completed"
                and a.get("scope_hash") == state["scope_hash"]
+               and implementation_policy_matches(state, a, state["records"].get("candidate:" + str(state["candidate_id"])))
                and (a.get("implementation_result") or {}).get("output_candidate_id") == state["candidate_id"]
                and (a.get("implementation_result") or {}).get("status") == "completed"
                and state["candidate_id"] is not None for a in state["assignments"].values())
@@ -388,6 +411,9 @@ def prepare_subagent_assignment(state, request, now):
     require_gate_handoff(state, role)
     existing = state["assignments"].get(identity)
     if existing:
+        if (existing["status"] != "interrupted" or existing["scope_hash"] != state["scope_hash"]
+                or not implementation_policy_matches(state, existing)):
+            require_implementation_handoff(state, [existing])
         if existing.get("gate_action_id") or role == "implementation_worker":
             require_gate_handoff(state)
         require(existing["role"] == role and existing.get("host_kind") == "subagent",
@@ -1625,18 +1651,25 @@ def validate_action_admission(state, action, now):
 
 
 def transition(original, command, request, now, dependency_states=None, *,
-               trusted_verifier=None, repository=None, deferral_observation=None, recovery_input=None):
+               trusted_verifier=None, repository=None, deferral_observation=None, recovery_input=None,
+               continuation_observation=None):
     state = deepcopy(original)
     details = {}
     admission = None
-    if command in {"work.ready", "work.amend"}:
+    if command == "work.reopen":
+        from devflow.continuation import reopen_admission
+        admission = reopen_admission(state, request, trusted_verifier, now, repository)
+    elif command in {"work.ready", "work.amend"}:
         admission = requested_admission(state, request, trusted_verifier, now, repository=repository)
     elif command not in BOOKKEEPING:
         admission = execution_admission(
             state, state["contract"] or {}, state.get("admission_id"), trusted_verifier, now,
             repository=repository or (state.get("authority") or {}).get("repository"),
         )
-    if command in {"work.ready", "work.amend"}:
+    if command == "work.reopen":
+        from devflow.continuation import reopen
+        details = reopen(state, request, now, admission, continuation_observation)
+    elif command in {"work.ready", "work.amend"}:
         record = validate_record(request["record"], "work_contract")
         if "workflow_snapshot" in request:
             require(
@@ -1684,6 +1717,11 @@ def transition(original, command, request, now, dependency_states=None, *,
             "unresolved_dependency",
             "Every dependency must be known and Done",
         )
+        if command == "work.amend" and state["attempt"] and (
+                scope_hash(record) != state["scope_hash"]
+                or request.get("workflow_snapshot", {}).get("snapshot_id", state["attempt"]["workflow_snapshot_id"])
+                != state["attempt"]["workflow_snapshot_id"]):
+            require_implementation_handoff(state)
         state["scope_hash"] = scope_hash(record)
         # Caller-written Authority records are historical claims, never decisions.
         auth = derived_authority(admission)
@@ -1955,18 +1993,31 @@ def transition(original, command, request, now, dependency_states=None, *,
                 result = NativeHostBridge.validate_result(
                     assignment, request["result"], observed_task_id=request["observed_task_id"]
                 )
-                require(assignment["scope_hash"] == state["scope_hash"],
-                        "stale_scope", "Result assignment scope changed")
                 require(assignment["role"] == "implementation_worker",
                         "wrong_role", "Independent review/QA results use gate record")
                 require(result.get("status") in {"completed", "blocked"}
                         and bool(result.get("evidence_reference")),
                         "missing_result_evidence", "Implementation result needs evidence and status")
                 if result["status"] == "completed":
+                    require(assignment["scope_hash"] == state["scope_hash"],
+                            "stale_scope", "Completed result assignment scope changed")
+                    require(implementation_policy_matches(state, assignment, state["records"].get(
+                        "candidate:" + str(state["candidate_id"]))),
+                            "stale_policy", "Completed implementation must use the current candidate workflow snapshot")
                     require(result.get("output_candidate_id") is not None
                             and result["output_candidate_id"] == state["candidate_id"]
                             and assignment.get("captured_candidate_id") == state["candidate_id"],
                             "result_mismatch", "Completed implementation must identify the current candidate")
+                # Count actual activations even when interrupted before output; exclude bootstrap.
+                prior_round = any(r.get("record_type") == "assignment"
+                                  and r["assignment_id"] == assignment["assignment_id"]
+                                  and r["action_id"] != assignment["action_id"]
+                                  and state["actions"].get(r["action_id"], {}).get("operation") == "send_role"
+                                  and state["actions"][r["action_id"]]["status"] == "confirmed"
+                                  for r in state["records"].values())
+                if prior_round or "assignment_action_id" in result:
+                    require(result.get("assignment_action_id") == assignment["action_id"],
+                            "implementation_activation_mismatch", "Reused worker output must identify its actual producing activation")
                 assignment = assignment | {"status": result["status"], "implementation_result": result}
             else:
                 require(action["status"] in {"dispatched", "pending_setup", "ambiguous"},
@@ -2053,6 +2104,8 @@ def transition(original, command, request, now, dependency_states=None, *,
                         and worker["task_id"] == request.get("producer_task_id")
                         and worker["scope_hash"] == state["scope_hash"],
                         "implementation_required", "Candidate needs the verified delegated implementer")
+                require(implementation_policy_matches(state, worker, record),
+                        "stale_policy", "Candidate and activated implementation worker must use the current workflow snapshot")
             require(
                 not any(
                     old["record_type"] == "candidate"

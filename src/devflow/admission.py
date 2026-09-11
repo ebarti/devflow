@@ -49,7 +49,7 @@ class UnavailableIntakeVerifier:
         )
 
 
-def user_request_admission(state, contract, user_request, repository):
+def user_request_admission(state, contract, user_request, repository, *, continuation_of=None):
     """Derive a replayable binding, not a proof of human authentication."""
     from devflow.domain.rules import scope_hash
 
@@ -73,6 +73,8 @@ def user_request_admission(state, contract, user_request, repository):
         "allowed_operations": list(user_request["allowed_operations"]),
         "expires_at": None, "revoked": False,
     }
+    if continuation_of is not None:
+        admission["continuation_of"] = deepcopy(continuation_of)
     admission["admission_id"] = "request-" + digest(admission)
     return admission
 
@@ -114,7 +116,10 @@ def execution_admission(state, contract, admission_id, verifier, now, *, reposit
     admission = requested or stored
     if admission is not None and admission.get("decision_kind") == "user_request":
         validate_record(admission, "intake_admission")
-        expected = user_request_admission(state, contract, admission["user_request"], repository)
+        expected = user_request_admission(
+            state, contract, admission["user_request"], repository,
+            continuation_of=admission.get("continuation_of"),
+        )
         if admission != expected:
             raise WorkflowError("admission_binding", "Stored user request differs from its exact binding")
         admission = deepcopy(admission)

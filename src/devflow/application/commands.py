@@ -39,6 +39,10 @@ class WorkflowService:
         self.repository = repository
 
     def preflight(self, command, request):
+        if command == "work.reopen":
+            from devflow.continuation import reopen_admission
+            return reopen_admission(blank(request.get("work_id")), request, self.trusted_verifier,
+                                    datetime.now(timezone.utc), self.repository)
         if command in {"work.ready", "work.amend"}:
             return requested_admission(
                 blank(request.get("work_id")), request, self.trusted_verifier,
@@ -101,6 +105,17 @@ class WorkflowService:
             ])
         return actions
 
+    def replay(self, command, request):
+        """Read an exact acknowledged operation before repeating external observations."""
+        with closing(self.store.connect()) as db:
+            operation = db.execute("SELECT payload_hash,result FROM operations WHERE operation_id=?",
+                                   (request.get("operation_id"),)).fetchone()
+        if operation:
+            if operation[0] != digest({"command": command, "request": request}):
+                raise WorkflowError("operation_conflict", "Operation ID was already used with a different payload")
+            return json.loads(operation[1], parse_float=Decimal)
+        return None
+
     def put_artifact(self, content: bytes):
         return self.store.put_artifact(content)
 
@@ -146,7 +161,7 @@ class WorkflowService:
         validate_record(original | {"evidence_ids": ["recovery-shape-validation"]}, "gate_result")
         return {"original_result": original, "validation_error": error}
 
-    def execute(self, command: str, request: dict, *, deferral_observation=None):
+    def execute(self, command: str, request: dict, *, deferral_observation=None, continuation_observation=None):
         if command == "work.prepare":
             record = request.get("record", {})
             try:
@@ -200,6 +215,7 @@ class WorkflowService:
                     state, command, request, datetime.now(timezone.utc), dependencies,
                     trusted_verifier=self.trusted_verifier, repository=self.repository,
                     deferral_observation=deferral_observation, recovery_input=recovery_input,
+                    continuation_observation=continuation_observation,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise WorkflowError(
@@ -209,6 +225,7 @@ class WorkflowService:
             # or a later defect report. Proof admissions recheck the current candidate's artifacts.
             proof_commands = {
                 "gate.record",
+                "work.reopen",
                 "fix.record",
                 "deliver",
                 "action.begin",

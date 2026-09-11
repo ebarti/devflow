@@ -11,7 +11,18 @@ Confirm branch/worktree ownership and dirty state. Preserve unrelated files and 
 
 Add regression proof and required owning documentation. Run targeted development probes while editing. If another contract/path must change, notify coordinating and persist an amendment before crossing the ownership boundary.
 
+If admitted edits change the workflow pin, profile or captured instructions,
+pause before candidate capture. Return actual BLOCKED partial output under this
+activation so coordinating can import it, observe availability and amend the
+snapshot. Resume through a newly recorded activation of the same worker before
+capturing proof under the new policy; never rewrite the old activation's snapshot.
+
 Commit the intended change and capture the clean candidate using the verified assignment/producer. Return candidate identity and implementation evidence for `host result`. The coordinator must durably admit completion **before** registered `check run` or independent gate recording. Then [devflow-verifying](../devflow-verifying/SKILL.md) executes required recipes on the frozen candidate. Do not reverse this order or relabel an unregistered probe as a registered check.
+
+Include `assignment_action_id` from the actual native handoff context in each
+implementation result, including BLOCKED partial output. Reused activations
+require this binding; a late result from an earlier activation cannot update
+the current one. Preserve already imported historical results as recorded.
 
 Record every confirmed code finding, including self-detected defects, with identity, invariant, severity, anchor and evidence. Return limitations accurately. Preserve failed candidates/results. Reuse this assignment for repairs only after the previous independent round's results are imported.
 

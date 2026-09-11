@@ -62,6 +62,9 @@
     },
     {
       "$ref": "#/$defs/GateResultRecovery"
+    },
+    {
+      "$ref": "#/$defs/WorkContinuation"
     }
   ],
   "$defs": {
@@ -2031,6 +2034,39 @@
         "package_revision": {
           "type": "string",
           "pattern": "^[a-f0-9]{40}$"
+        },
+        "continuation_upgrade": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "work_id",
+            "prior_snapshot_id",
+            "prior_package_revision",
+            "prior_delivery_id",
+            "repository_lock_revision"
+          ],
+          "properties": {
+            "work_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "prior_snapshot_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "prior_package_revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "prior_delivery_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "repository_lock_revision": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
         }
       }
     },
@@ -2443,6 +2479,36 @@
         },
         "user_request": {
           "$ref": "#/$defs/UserRequest"
+        },
+        "continuation_of": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "prior_delivery_id",
+            "prior_revision",
+            "entry_phase",
+            "request_hash"
+          ],
+          "properties": {
+            "prior_delivery_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "prior_revision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "entry_phase": {
+              "enum": [
+                "implement",
+                "deliver"
+              ]
+            },
+            "request_hash": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
         }
       },
       "required": [
@@ -2952,6 +3018,194 @@
         "validation_error",
         "available_evidence_ids"
       ]
+    },
+    "WorkContinuation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "continuation_id",
+        "work_id",
+        "attempt_id",
+        "prior_delivery_id",
+        "prior_admission_id",
+        "prior_authority_id",
+        "prior_scope_hash",
+        "prior_workflow_snapshot_id",
+        "admission_id",
+        "authority_id",
+        "scope_hash",
+        "workflow_snapshot_id",
+        "owner_task_id",
+        "host_id",
+        "prior_candidate_id",
+        "schema_version",
+        "record_type",
+        "prior_revision",
+        "entry_phase",
+        "prior_gate_ids",
+        "prior_check_ids",
+        "prior_accounting_id",
+        "reused_candidate",
+        "created_at",
+        "pr_observation"
+      ],
+      "properties": {
+        "continuation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "work_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prior_delivery_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prior_admission_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prior_authority_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prior_scope_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prior_workflow_snapshot_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "admission_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authority_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_snapshot_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prior_candidate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "work_continuation"
+        },
+        "prior_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "entry_phase": {
+          "enum": [
+            "implement",
+            "deliver"
+          ]
+        },
+        "prior_gate_ids": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "prior_check_ids": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "prior_accounting_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reused_candidate": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "pr_observation": {
+          "type": "object",
+          "required": [
+            "repository",
+            "pr_number",
+            "node_id",
+            "head_ref",
+            "base_ref",
+            "head_sha",
+            "state",
+            "draft",
+            "action_marker"
+          ],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "node_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "head_ref": {
+              "type": "string",
+              "minLength": 1
+            },
+            "base_ref": {
+              "type": "string",
+              "minLength": 1
+            },
+            "head_sha": {
+              "type": "string",
+              "minLength": 1
+            },
+            "action_marker": {
+              "type": "string",
+              "minLength": 1
+            },
+            "state": {
+              "const": "open"
+            },
+            "draft": {
+              "const": false
+            },
+            "pr_number": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      }
     }
   }
 }
