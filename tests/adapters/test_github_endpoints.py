@@ -253,3 +253,51 @@ def test_continued_pr_target_race_is_unconfirmed_then_read_only_reconciliation_r
     with pytest.raises(WorkflowError, match="source or target"):
         repo.update_continued_pr(**args, reconcile=True)
     assert len(server.writes) == 2
+
+
+@pytest.mark.parametrize("unchanged", [False, True])
+@pytest.mark.parametrize("change", ["closed", "draft", "merged", "number", "node", "head_ref", "foreign_head", "foreign_base", "base_ref", "head_sha"])
+def test_final_actual_pr_response_must_establish_the_whole_endpoint(change, unchanged):
+    server, repo, binding = continued_pr()
+    original = server.route
+    reads = 0
+
+    def route(method, path, body):
+        nonlocal reads
+        if method == "GET" and path == "pulls/1":
+            reads += 1
+            if reads == 4:
+                pr = server.prs[0]
+                if change == "closed":
+                    pr["state"] = "closed"
+                elif change == "draft":
+                    pr["draft"] = True
+                elif change == "merged":
+                    pr["merged"] = True
+                elif change == "number":
+                    pr["number"] = 2
+                elif change == "node":
+                    pr["node_id"] = "PR-foreign"
+                elif change == "head_ref":
+                    pr["head"]["ref"] = "another-source"
+                elif change.startswith("foreign_"):
+                    pr[change.split("_")[1]]["repo"]["full_name"] = "foreign/repo"
+                elif change == "base_ref":
+                    pr["base"]["ref"] = "another-target"
+                else:
+                    pr["head"]["sha"] = OTHER
+        return original(method, path, body)
+
+    server.route = route
+    args = dict(binding=binding, expected_head=HEAD,
+                title=pr_args()["title"] if unchanged else "Update", body=pr_args()["body"] if unchanged else "Proof")
+    with pytest.raises(WorkflowError) as exc:
+        repo.update_continued_pr(**args)
+    assert exc.value.code == "ambiguous_github_action"
+    assert exc.value.details.get("no_mutation") is not True
+    assert reads == 4
+    writes = copy.deepcopy(server.writes)
+    with pytest.raises(WorkflowError):
+        repo.update_continued_pr(**args, reconcile=True)
+    assert server.writes == writes and len(server.prs) == 1
+    assert len(writes) == (1 if unchanged else 2)

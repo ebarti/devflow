@@ -79,6 +79,8 @@ When a new user request requires repair or update after the same PR's verified d
 
 The transition retains the original attempt and delivery, records the new authority and continuation, and reacquires the same owner's claim. A repair enters implementation and obtains a new candidate with current proof. Delivery-only reuse requires identical operative inputs and valid evidence. The managed endpoint remains the existing regular PR; a separately authorized native merge has its own actual receipt and independent readback. Unresolved actions, missing producer results and stale identity cannot be cleared by reopening.
 
+If the repair integrates a new pin, profile or captured instructions, the worker returns its real BLOCKED partial output before candidate capture. Import that output and observe its actual availability, capture the normal current snapshot and amend the same work, then rebind and activate the same worker under the new snapshot. Its older activation cannot support a current-policy candidate or completed result. While the owned checkout retains its older pin, invoke the explicitly reviewed release's launcher for the capture/reopen commands, passing the owned repository and existing private store.
+
 ### Capture and check the candidate
 
 Register the dedicated checkout against that intent, verify it is clean, and record the actual workspace receipt. `candidate capture` reads real Git head/tree/base and ownership. `check run` executes an admitted recipe and records process and assertion outcomes separately. A later failed result supersedes an earlier passing result for that recipe. Named scenarios and acceptance must be covered by current passing evidence.

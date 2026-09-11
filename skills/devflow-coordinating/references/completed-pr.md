@@ -50,12 +50,27 @@ Follow `next` for required proof and fresh remote-state checks.
 If the executing workflow or profile changed, capture the reviewed
 `workflow_snapshot` and include it explicitly. For a completed PR whose owned
 checkout still has the older pin, include `continuation_work_id` in the
-`snapshot capture` request. This records the old pin and prior snapshot while
+`snapshot capture` request. Invoke the reviewed installed release's own
+`scripts/devflow` launcher with `--repository` pointing to the owned checkout
+and the existing `--state-dir`. The repository launcher still selects its
+on-branch pin until integration. This records the old pin and prior snapshot while
 capturing the checkout's existing profile and custom recipes for the executing
 release. Only `work reopen` may consume this upgrade binding. Preserve the
 original snapshot; do not silently replace its pin or claim old gates used the
 new instructions. Integrate the reviewed repository pin through the admitted
 repair after reopening.
+
+When that admitted integration changes the pin, profile or captured instructions,
+the worker pauses before candidate capture and returns its actual BLOCKED partial
+result with `assignment_action_id` from its existing native handoff context.
+Import that result and record actual native
+availability before changing scope or policy. Capture a normal current snapshot,
+then amend this same work with the applicable conversational request. Reassign
+and activate the same available worker under the new snapshot and updated brief
+before capturing its candidate and completion. Preserve the original partial
+output and activation; an older worker snapshot cannot establish current proof.
+Import each result with the producing activation's binding; do not attach an
+older result to the worker's latest action after reuse.
 Use the same available roles with verified settings, or their supported observed
 replacement when unavailable.
 

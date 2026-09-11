@@ -145,6 +145,7 @@ class Subagents(Scenario):
 
     def complete(self, worker, **changes):
         result = {"assignment_id": worker["assignment_id"], "candidate_id": worker["candidate_id"],
+                  "assignment_action_id": self.state["assignments"][worker["assignment_id"]]["action_id"],
                   "producer_role": "implementation_worker", "status": "completed",
                   "output_candidate_id": self.state["candidate_id"],
                   "evidence_reference": "synthetic:implementation-evidence", **changes}

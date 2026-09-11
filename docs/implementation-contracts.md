@@ -76,6 +76,10 @@ A profile change in an unreviewed candidate cannot lower its own required checks
 
 A completed-PR continuation may explicitly capture an executing release against the owned checkout's older pin. Its snapshot binds the prior delivery, prior snapshot and observed checkout pin, retaining that checkout's profile and custom recipes. Only reopening that completed work may consume the exception; ordinary start and amend still require matching provenance. Repair preserves the original subagent execution mode. Historical direct native-thread attempts support unchanged delivery-only reuse, not conversion into a subagent repair lifecycle.
 
+Candidate capture, completed implementation results and current implementation readiness require the producer's workflow snapshot to match the candidate and attempt. Before changing scope or policy, retain the worker's actual partial output and observe stopped availability, then amend and reactivate that same worker under the new snapshot. A historical BLOCKED result may still be imported after inputs changed, but it cannot establish current completion. The earlier activation and output remain immutable evidence.
+
+Reused implementation results bind `assignment_action_id` from their actual native handoff context. A late or unbound result cannot change a newer activation. Already imported historical results remain valid under their original contract; the new binding applies to new reuse, without rewriting old proof.
+
 ## 3. State transition table
 
 | Current state | Command/event | Conditions | Result |

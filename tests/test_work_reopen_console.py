@@ -411,3 +411,116 @@ def test_cli_deliver_reuses_exact_proof_and_updates_same_pr(tmp_path, installed)
         after["records"]["delivery:original-delivery"]
         == before["records"]["delivery:original-delivery"]
     )
+
+
+def test_old_pin_cli_integrates_policy_rebinds_worker_and_delivers_same_pr(
+    tmp_path, installed, historical_release, monkeypatch
+):
+    original_class = PRConsole
+    retained = []
+    trace = []
+
+    class TracedConsole(original_class):
+        def __init__(self, *args):
+            super().__init__(*args)
+            retained.append(self)
+
+        def call(self, command, request=None, *, error=None, env=None):
+            value = super().call(command, request, error=error, env=env)
+            trace.append({"command": command, "request": deepcopy(request), "expected_error": error,
+                          "result": deepcopy(value)})
+            (tmp_path / "integration-command-trace.json").write_text(json.dumps(trace, indent=2) + "\n")
+            return value
+
+    monkeypatch.setattr(sys.modules[__name__], "PRConsole", TracedConsole)
+    test_old_pin_cli_preserves_custom_recipes_and_admits_conflict_paths(
+        tmp_path, installed, historical_release
+    )
+    console = retained[0]
+    reopened = console.show()
+    original_records = deepcopy(reopened["records"])
+    worker = reopened["assignments"]["worker"]
+    original_task = worker["task_id"]
+    (console.root / ".devflow/workflow.lock").write_text(
+        f'schema_version=1\nversion="0.5.2"\nrevision="{console.package_revision}"\n'
+    )
+    (console.root / "AGENTS.md").write_text("Synthetic integrated workflow instructions.\n")
+    docs = console.root / "docs/developer"
+    docs.mkdir(parents=True)
+    (docs / "workflow.md").write_text("Synthetic admitted workflow integration.\n")
+    git(console.root, "add", ".")
+    git(console.root, "commit", "-qm", "test: integrate admitted current workflow inputs")
+
+    # The actual partial producer output records the integration without inventing a candidate.
+    partial_path = tmp_path / "original-partial-result.json"
+    partial = {"assignment_id": "worker", "candidate_id": worker["candidate_id"],
+               "assignment_action_id": worker["action_id"],
+               "producer_role": "implementation_worker", "status": "blocked",
+               "output_candidate_id": None, "evidence_reference": str(partial_path)}
+    partial_path.write_text(json.dumps(partial, indent=2) + "\n")
+    console.mutate("host.result", assignment_id="worker", observed_task_id=original_task, result=partial)
+    console.mutate("host.observe", assignment_id="worker", observation={
+        "agent_name": worker["agent_name"], "agent_status": {"completed": "Synthetic actual stopped output"},
+        "source_reference": "synthetic:observed-stop-after-original-partial-output"})
+    imported = console.show()
+    assert imported["assignments"]["worker"]["implementation_result"] == partial
+    assert imported["candidate_id"] is None
+    partial_record_keys = [k for k,v in imported["records"].items() if v.get("implementation_result") == partial]
+    assert partial_record_keys
+
+    snapshot = console.call("snapshot.capture", {
+        "snapshot_id": "integrated-snapshot",
+        "effective_settings": {"model": "synthetic-worker", "reasoning_effort": "high",
+                               "source_reference": "synthetic:observed-settings"},
+        "instruction_paths": [str(console.root / "AGENTS.md")]})
+    assert "continuation_upgrade" not in snapshot
+    amended = deepcopy(reopened["contract"])
+    amended["scope_revision"] += 1
+    user_request = reopened["records"]["intake_admission:" + reopened["admission_id"]]["user_request"]
+    console.mutate("work.amend", record=amended, user_request=user_request, workflow_snapshot=snapshot)
+    after_amend = console.show()
+    assert after_amend["assignments"]["worker"]["workflow_snapshot_id"] == "continuation-snapshot"
+    assert after_amend["attempt"]["workflow_snapshot_id"] == "integrated-snapshot"
+    assert after_amend["candidate_id"] is None
+
+    current = console.mutate("host.assign", assignment_id="worker", role="implementation_worker",
+                             owned_paths=amended["scope"]["paths"], workspace_reference=str(console.root),
+                             brief="Verify the actual integration under the newly captured current policy",
+                             config_path=str(console.config))["assignment"]
+    assert current["task_id"] == original_task and current["agent_name"] == worker["agent_name"]
+    assert current["workflow_snapshot_id"] == "integrated-snapshot"
+    prepared = console.mutate("host.prepare", assignment_id="worker")
+    assert prepared["intent"]["native_tool"] == "followup_task"
+    assert '"workflow_snapshot_id": "integrated-snapshot"' in prepared["intent"]["arguments"]["message"]
+    console.mutate("host.record", assignment_id="worker", inventory=[{
+        "agent_name": current["agent_name"], "agent_status": "running"}])
+    console.mutate("candidate.capture", candidate_id="integrated-candidate", base_ref=console.base,
+                   dependency_hash=digest("dependencies"), environment_hash=digest("environment"),
+                   ownership_token="synthetic-console-owner", assignment_id="worker", producer_task_id=original_task)
+    console.mutate("host.result", assignment_id="worker", observed_task_id=original_task, result={
+        "assignment_id": "worker", "candidate_id": current["candidate_id"], "producer_role": "implementation_worker",
+        "assignment_action_id": current["action_id"],
+        "status": "completed", "output_candidate_id": "integrated-candidate",
+        "evidence_reference": "synthetic:completed-current-policy-integration"})
+    for recipe in amended["verification"]["recipes"]:
+        console.mutate("check.run", recipe_id=recipe, acceptance_ids=["A01"])
+    console.mutate("usage.account", status="unknown", source_reference="synthetic:continued-period",
+                   limitations=["Synthetic host"])
+    remote = json.loads(console.remote.read_text())
+    remote["head"] = git(console.root, "rev-parse", "HEAD")
+    remote["prs"][0]["head"]["sha"] = remote["head"]
+    console.remote.write_text(json.dumps(remote))
+    console.deliver("integrated-delivery", body="Current-policy integration and original custom checks verified")
+    after = console.show()
+    (tmp_path / "integrated-final-state.json").write_text(json.dumps(after, indent=2) + "\n")
+    assert after["lifecycle"] == "done"
+    assert after["attempt"]["attempt_id"] == reopened["attempt"]["attempt_id"]
+    assert after["attempt"]["entry_phase"] == reopened["attempt"]["entry_phase"]
+    assert after["assignments"]["worker"]["workflow_snapshot_id"] == after["records"][
+        "candidate:integrated-candidate"]["workflow_snapshot_id"] == after["attempt"]["workflow_snapshot_id"]
+    assert all(after["records"][k] == v for k,v in original_records.items())
+    assert all(after["records"][k] == imported["records"][k] for k in partial_record_keys)
+    assert partial_path.read_text() == json.dumps(partial, indent=2) + "\n"
+    assert console.counter.read_text() == "run\n" * 4
+    remote = json.loads(console.remote.read_text())
+    assert len(remote["prs"]) == 1 and [w[0] for w in remote["writes"]] == ["POST", "PATCH"]

@@ -1254,7 +1254,10 @@ class GitHubRepository:
         """Read the original open same-repository PR; never infer identity from its title."""
         if type(number) is not int or number < 1 or not isinstance(marker, str) or not marker:
             raise WorkflowError("continuation_pr", "A delivered PR number and marker are required")
-        pr = self.pull_request(number)
+        return self._continuation_observation(self.pull_request(number), number, marker)
+
+    def _continuation_observation(self, pr, number, marker):
+        """Validate one complete actual response; never splice fields across observations."""
         repository = f"{self.owner}/{self.name}".lower()
         if (pr.get("number") != number or pr.get("state") != "open" or pr.get("merged")
                 or pr.get("draft") is not False or marker not in (pr.get("body") or "")
@@ -1298,12 +1301,16 @@ class GitHubRepository:
         # Independent identity and content readback after both successful and uncertain writes.
         verified = self.observe_continuation(binding["pr_number"], binding["action_marker"])
         actual = self.pull_request(binding["pr_number"])
-        if (any(verified[k] != observed[k] for k in observed)
+        try:
+            final = self._continuation_observation(actual, binding["pr_number"], binding["action_marker"])
+        except WorkflowError as exc:
+            raise WorkflowError("ambiguous_github_action", "Final PR endpoint readback needs reconciliation") from exc
+        if (final != verified or any(verified[k] != observed[k] for k in observed)
                 or any(actual.get(k) != v for k, v in desired.items())
                 or actual["head"]["sha"] != expected_head
                 or actual["base"]["ref"] != binding["base_ref"]):
             raise WorkflowError("ambiguous_github_action", "Continued PR update needs reconciliation")
-        return {"status": "published", **{k: verified[k] for k in (
+        return {"status": "published", **{k: final[k] for k in (
             "pr_number", "node_id", "head_ref", "head_sha", "base_ref", "action_marker", "draft")},
                 "url": actual["html_url"]}
 
