@@ -112,6 +112,57 @@ def test_original_blocked_output_survives_scope_policy_change_and_reactivation(t
     assert s.state == current
 
 
+@pytest.mark.parametrize("resumed_status", ["blocked", "completed"])
+def test_interrupted_without_output_requires_resumed_activation_binding(tmp_path, resumed_status):
+    s = Subagents(tmp_path, package_version="0.5.2")
+    original = s.start_role()
+    late = {"assignment_id": original["assignment_id"], "candidate_id": original["candidate_id"],
+            "producer_role": "implementation_worker", "status": "blocked", "output_candidate_id": None,
+            "evidence_reference": "synthetic:late-first-activation"}
+    s.cli("host observe", assignment_id=original["assignment_id"], observation={
+        "agent_name": original["agent_name"], "agent_status": "interrupted",
+        "source_reference": "synthetic:actual-interruption-before-output"})
+    reused = s.assign(identity=original["assignment_id"])
+    assert reused["action_id"] != original["action_id"]
+    assert reused["task_id"] == original["task_id"]
+    assert reused["workflow_snapshot_id"] == original["workflow_snapshot_id"]
+    assert reused["candidate_id"] == original["candidate_id"] is None
+    s.cli("host prepare", assignment_id=reused["assignment_id"])
+    s.cli("host record", assignment_id=reused["assignment_id"], inventory=[{
+        "agent_name": reused["agent_name"], "agent_status": "running"}])
+    before = s.state
+    assert not any(r.get("implementation_result") for r in before["records"].values())
+    for result in (late, late | {"assignment_action_id": original["action_id"]}):
+        s.cli("host result", assignment_id=original["assignment_id"], observed_task_id=original["task_id"],
+              result=result, expect="implementation_activation_mismatch")
+        # The full persisted state includes revision, assignments and immutable records.
+        assert s.state == before
+    correct = late | {"assignment_action_id": reused["action_id"], "status": resumed_status,
+                      "evidence_reference": "synthetic:actual-resumed-output"}
+    if resumed_status == "completed":
+        s.capture(reused)
+        correct["output_candidate_id"] = s.state["candidate_id"]
+    s.cli("host result", assignment_id=reused["assignment_id"], observed_task_id=reused["task_id"], result=correct)
+    assert s.state["assignments"][reused["assignment_id"]]["implementation_result"] == correct
+    assert s.state["assignments"][reused["assignment_id"]]["status"] == resumed_status
+    assert implementation_completed(s.state) == (resumed_status == "completed")
+    assert all(s.state["records"][key] == value for key, value in before["records"].items())
+
+
+@pytest.mark.parametrize("status", ["blocked", "completed"])
+def test_initial_legacy_activation_result_may_omit_action_binding(tmp_path, status):
+    s = Subagents(tmp_path, package_version="0.4.0")
+    worker = s.start_role()
+    if status == "completed":
+        s.capture(worker)
+    result = {"assignment_id": worker["assignment_id"], "candidate_id": worker["candidate_id"],
+              "producer_role": "implementation_worker", "status": status,
+              "output_candidate_id": s.state["candidate_id"], "evidence_reference": "synthetic:legacy-first-result"}
+    s.cli("host result", assignment_id=worker["assignment_id"], observed_task_id=worker["task_id"], result=result)
+    assert s.state["assignments"][worker["assignment_id"]]["implementation_result"] == result
+    assert implementation_completed(s.state) == (status == "completed")
+
+
 def test_historical_native_thread_delivery_keeps_its_existing_proof(tmp_path):
     from domain.helpers import Scenario
     from test_work_reopen import REPOSITORY, complete_pr, reopen_request, reopen_service

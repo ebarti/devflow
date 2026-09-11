@@ -2008,10 +2008,12 @@ def transition(original, command, request, now, dependency_states=None, *,
                             and result["output_candidate_id"] == state["candidate_id"]
                             and assignment.get("captured_candidate_id") == state["candidate_id"],
                             "result_mismatch", "Completed implementation must identify the current candidate")
+                # Count actual activations even when interrupted before output; exclude bootstrap.
                 prior_round = any(r.get("record_type") == "assignment"
                                   and r["assignment_id"] == assignment["assignment_id"]
                                   and r["action_id"] != assignment["action_id"]
-                                  and r.get("implementation_result")
+                                  and state["actions"].get(r["action_id"], {}).get("operation") == "send_role"
+                                  and state["actions"][r["action_id"]]["status"] == "confirmed"
                                   for r in state["records"].values())
                 if prior_round or "assignment_action_id" in result:
                     require(result.get("assignment_action_id") == assignment["action_id"],
