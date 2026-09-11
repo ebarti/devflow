@@ -36,18 +36,6 @@ A lost or uncertain spawn must reconcile before another launch. A single invento
 
 New attempts default to subagent execution. Historical attempts with missing `execution_mode` stay `native_thread`. Preserve their original IDs, receipts, evidence and control contract, including pending client IDs that were never executable task IDs. Do not rewrite historical task runs as subagents or use their visible-task launch instructions for new work.
 
-## Continue an interrupted round
-
-After `interrupt_agent`, record fresh interrupted inventory with `host observe`.
-For unchanged assignment scope/candidate/policy, `host resume` with
-`assignment_id` and a bounded `reason` prepares a continuation. Then use
-`host prepare`, invoke the returned `followup_task`, and `host record`.
-This preserves the original gate activation ID, including after repeated
-interruptions. Return the actual original result before any new assignment,
-candidate, repair or replacement. Resuming is not a new independent gate round.
-
-Before a workflow/profile amendment changes inputs, collect and import pending
-original output. If the role was stopped before completing its proof, a bounded
-continuation reports its actual partial/BLOCKED evidence without further product
-work. Preserve that outcome; do not invent PASS or rewrite its original policy.
-Then amend the same attempt and continue from `next` under the reviewed snapshot.
+For an interrupted round or malformed completed output, use the bounded
+[result-recovery protocol](result-recovery.md). Preserve the original producer,
+activation, bytes and rejected import before changing any workflow input.

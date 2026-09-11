@@ -59,6 +59,9 @@
     },
     {
       "$ref": "#/$defs/GateIngestion"
+    },
+    {
+      "$ref": "#/$defs/GateResultRecovery"
     }
   ],
   "$defs": {
@@ -729,6 +732,10 @@
           "minLength": 1
         },
         "continuation_reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "result_recovery_id": {
           "type": "string",
           "minLength": 1
         }
@@ -2848,6 +2855,102 @@
             "observed_at"
           ]
         }
+      ]
+    },
+    "GateResultRecovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "gate_result_recovery"
+        },
+        "recovery_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "assignment_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gate_action_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "producer_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_snapshot_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "artifact_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "implementation_action_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "original_result": {
+          "type": "object"
+        },
+        "validation_error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "additionalProperties": false
+        },
+        "available_evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "recovery_id",
+        "assignment_id",
+        "gate_action_id",
+        "producer_task_id",
+        "candidate_id",
+        "workflow_snapshot_id",
+        "created_at",
+        "scope_hash",
+        "artifact_hash",
+        "implementation_action_ids",
+        "original_result",
+        "validation_error",
+        "available_evidence_ids"
       ]
     }
   }

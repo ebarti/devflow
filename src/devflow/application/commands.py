@@ -49,6 +49,7 @@ class WorkflowService:
         return self.require_execution(self.snapshot(request["work_id"]), operation={
             "host.prepare": "create_tasks", "check.run": "check",
             "host.assign": "create_tasks", "host.activate": "create_tasks", "host.resume": "create_tasks",
+            "host.recover-result": "create_tasks",
             "workspace.register": "edit", "candidate.capture": "edit",
         }.get(command))
 
@@ -120,6 +121,31 @@ class WorkflowService:
         state = self.snapshot(work_id)
         return {"work_id": work_id, "revision": state["revision"], "actions": self.permitted_actions(state)}
 
+    def read_recovery_original(self, request):
+        artifact_hash = request.get("original_result_artifact_hash")
+        self.store.require_artifact(artifact_hash)
+        try:
+            fd = os.open(self.store.root / "artifacts" / artifact_hash, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as stream:
+                content = stream.read()
+            if hashlib.sha256(content).hexdigest() != artifact_hash:
+                raise WorkflowError("corrupt_artifact", "Original result changed during recovery")
+            original = json.loads(content, parse_float=Decimal)
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise WorkflowError("invalid_result_recovery", "Recovery requires parseable original gate JSON") from exc
+        try:
+            validate_record(original, "gate_result")
+        except WorkflowError as exc:
+            error = {"code": exc.code, "message": str(exc)}
+        else:
+            raise WorkflowError("valid_result", "Import the schema-valid original verdict before further work")
+        if (not isinstance(original, dict) or "producer_result_artifact_hash" in original
+                or original.get("evidence_ids", []) != []):
+            raise WorkflowError("invalid_result_recovery", "Recovery only supports bare producer JSON with absent or empty evidence_ids")
+        # This bounded recovery repairs missing evidence serialization, never substantive fields.
+        validate_record(original | {"evidence_ids": ["recovery-shape-validation"]}, "gate_result")
+        return {"original_result": original, "validation_error": error}
+
     def execute(self, command: str, request: dict, *, deferral_observation=None):
         if command == "work.prepare":
             record = request.get("record", {})
@@ -167,11 +193,13 @@ class WorkflowService:
                 row[0]: json.loads(row[1], parse_float=Decimal)["lifecycle"]
                 for row in db.execute("SELECT work_id,state FROM works")
             }
+            recovery_input = (self.read_recovery_original(request)
+                              if command == "host.recover-result" else None)
             try:
                 updated, details = transition(
                     state, command, request, datetime.now(timezone.utc), dependencies,
                     trusted_verifier=self.trusted_verifier, repository=self.repository,
-                    deferral_observation=deferral_observation,
+                    deferral_observation=deferral_observation, recovery_input=recovery_input,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise WorkflowError(

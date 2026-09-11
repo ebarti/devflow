@@ -25,6 +25,7 @@ ID_FIELDS = {
     "observation_evidence": "evidence_id",
     "gate_result": "gate_id",
     "gate_ingestion": "gate_id",
+    "gate_result_recovery": "recovery_id",
     "finding": "finding_id",
     "fix_verification": "verification_id",
     "delivery": "delivery_id",
@@ -108,9 +109,13 @@ def require_gate_handoff(state, role=None):
 
 def validate_role_continuation(state, payload):
     assignment = state["assignments"].get(payload.get("assignment_id"))
+    recovering = bool(payload.get("result_recovery_id"))
+    observed_status = (assignment or {}).get("control_observation", {}).get("agent_status")
+    allowed_statuses = {"completed", "interrupted"} if recovering else {"interrupted"}
     require(assignment is not None and assignment in pending_gate_results(state)
-            and assignment["status"] in {"interrupted", "ready"}
-            and assignment.get("control_observation", {}).get("agent_status") == "interrupted"
+            and observed_status in allowed_statuses
+            and assignment["status"] in {observed_status, "ready"}
+            and assignment.get("control_observation", {}).get("agent_status") == observed_status
             and assignment.get("startup_observation")
             and assignment["candidate_id"] == state["candidate_id"]
             and assignment["scope_hash"] == state["scope_hash"]
@@ -119,6 +124,9 @@ def validate_role_continuation(state, payload):
             and payload.get("policy_hash") == assignment["role_policy"]["policy_hash"]
             and payload.get("brief_hash") == digest(assignment["brief"]),
             "invalid_continuation", "Resume needs the observed interrupted producer on its original candidate, scope and policy")
+    if recovering:
+        recovery = get(state, "gate_result_recovery", payload["result_recovery_id"])
+        validate_result_recovery(state, assignment, recovery)
     previous = state["actions"].get(payload.get("previous_action_id"), {})
     require(previous.get("status") == "confirmed"
             and previous.get("payload", {}).get("assignment_id") == assignment["assignment_id"],
@@ -138,6 +146,8 @@ def resume_subagent_assignment(state, request, now):
                "brief_hash": digest(assignment["brief"]), "dispatch_id": request["operation_id"],
                "continuation_of": assignment.get("gate_action_id"),
                "previous_action_id": assignment["action_id"], "reason": request["reason"]}
+    if assignment.get("result_recovery_id"):
+        payload["result_recovery_id"] = assignment["result_recovery_id"]
     validate_role_continuation(state, payload)
     action = prepare_action(state, "send_role", payload, {}, now)
     resumed = assignment | {"status": "ready", "action_id": action["action_id"],
@@ -145,6 +155,118 @@ def resume_subagent_assignment(state, request, now):
                             "continuation_reason": request["reason"]}
     save_assignment(state, resumed)
     return {"assignment": resumed, "action": action}
+
+
+def implementation_actions(state):
+    return sorted(a["action_id"] for a in state["actions"].values()
+                  if a["operation"] in {"launch_role", "send_role"}
+                  and a["payload"].get("role") == "implementation_worker")
+
+
+def validate_result_recovery(state, assignment, recovery):
+    original = recovery["original_result"]
+    snapshot_id = assignment.get("workflow_snapshot_id", state["attempt"]["workflow_snapshot_id"])
+    snapshot = get(state, "workflow_snapshot", snapshot_id)
+    require(recovery["gate_action_id"] == assignment.get("gate_action_id")
+            and recovery["assignment_id"] == assignment["assignment_id"]
+            and recovery["producer_task_id"] == assignment["task_id"]
+            and recovery["candidate_id"] == assignment["candidate_id"] == state["candidate_id"]
+            and recovery["scope_hash"] == assignment["scope_hash"] == state["scope_hash"]
+            and recovery["workflow_snapshot_id"] == snapshot_id == state["attempt"]["workflow_snapshot_id"]
+            and original.get("workflow_hash") == snapshot["workflow_hash"]
+            and recovery["implementation_action_ids"] == implementation_actions(state),
+            "invalid_result_recovery", "Recovery must retain the original producer, activation and inputs")
+
+
+def recover_subagent_result(state, request, recovery_input, now):
+    require(stage_contract(state), "host_mode", "Result recovery needs a 0.5 subagent attempt")
+    require(set(request) == {"work_id", "operation_id", "expected_revision", "assignment_id",
+                             "original_result_artifact_hash"},
+            "invalid_request", "Recovery accepts only an assignment and original artifact hash")
+    assignment = state["assignments"].get(request["assignment_id"])
+    require(assignment is not None and assignment in pending_gate_results(state)
+            and assignment["status"] == "completed"
+            and assignment.get("control_observation", {}).get("agent_status") == "completed"
+            and assignment.get("control_observation", {}).get("source_reference")
+            and recovery_input is not None,
+            "invalid_result_recovery", "Observe the completed pending producer and preserve its malformed original JSON")
+    original = recovery_input["original_result"]
+    gate_action = state["actions"][assignment["gate_action_id"]]
+    require(not any(state["actions"][identity]["expected_revision"] > gate_action["expected_revision"]
+                    for identity in implementation_actions(state)),
+            "invalid_result_recovery", "Implementation changed after the original gate activation")
+    require(all(original.get(k) == v for k, v in {
+        "assignment_id": assignment["assignment_id"], "assignment_action_id": assignment["gate_action_id"],
+        "producer_task_id": assignment["task_id"], "candidate_id": assignment["candidate_id"],
+        "scope_hash": assignment["scope_hash"], "role": assignment["role"],
+    }.items()) and original.get("status") in {"PASS", "FAIL", "BLOCKED"},
+            "invalid_result_recovery", "Original JSON must identify this producer, activation and verdict")
+    if assignment.get("result_recovery_id"):
+        recovery = get(state, "gate_result_recovery", assignment["result_recovery_id"])
+        previous = state["actions"][assignment["action_id"]]
+        require(recovery["artifact_hash"] == request["original_result_artifact_hash"]
+                and recovery["original_result"] == original,
+                "invalid_result_recovery", "Repeated recovery must reuse its immutable original artifact")
+        require(previous["status"] == "confirmed"
+                and previous["payload"].get("result_recovery_id") == recovery["recovery_id"],
+                "reconcile_required", "Reconcile the prior recovery follow-up before another correction")
+    else:
+        recovery = {
+            "schema_version": 1, "record_type": "gate_result_recovery",
+            "recovery_id": "recovery-" + digest([request["operation_id"], recovery_input])[:24],
+            "assignment_id": assignment["assignment_id"], "gate_action_id": assignment["gate_action_id"],
+            "producer_task_id": assignment["task_id"], "candidate_id": assignment["candidate_id"],
+            "scope_hash": assignment["scope_hash"],
+            "workflow_snapshot_id": assignment.get("workflow_snapshot_id", state["attempt"]["workflow_snapshot_id"]),
+            "implementation_action_ids": implementation_actions(state),
+            "artifact_hash": request["original_result_artifact_hash"], **recovery_input,
+            "created_at": now.isoformat(),
+            "available_evidence_ids": sorted(r["evidence_id"] for r in state["records"].values()
+                                             if r.get("record_type") in {"check_evidence", "observation_evidence"}
+                                             and r["candidate_id"] == assignment["candidate_id"]),
+        }
+    validate_result_recovery(state, assignment, recovery)
+    require(recovery["available_evidence_ids"], "invalid_result_recovery",
+            "Recovery needs existing candidate evidence to serialize")
+    save(state, recovery, "gate_result_recovery")
+    payload = {"role": assignment["role"], "assignment_id": assignment["assignment_id"],
+               "host_kind": "subagent", "agent_name": assignment["agent_name"],
+               "policy_hash": assignment["role_policy"]["policy_hash"],
+               "brief_hash": digest(assignment["brief"]), "dispatch_id": request["operation_id"],
+               "continuation_of": assignment["gate_action_id"],
+               "previous_action_id": assignment["action_id"], "result_recovery_id": recovery["recovery_id"]}
+    validate_role_continuation(state, payload)
+    action = prepare_action(state, "send_role", payload, {}, now)
+    resumed = assignment | {"status": "ready", "action_id": action["action_id"],
+                            "continuation_of": assignment["gate_action_id"],
+                            "result_recovery_id": recovery["recovery_id"]}
+    save_assignment(state, resumed)
+    return {"assignment": resumed, "action": action, "recovery": recovery}
+
+
+def validate_corrected_result(state, producer, record):
+    recoveries = [r for r in state["records"].values()
+                  if r.get("record_type") == "gate_result_recovery"
+                  and r["assignment_id"] == record["assignment_id"]
+                  and r["gate_action_id"] == record.get("assignment_action_id")]
+    if not recoveries:
+        return
+    recovery = recoveries[0]
+    original = recovery["original_result"]
+    mutable = {"evidence_ids", "limitations", "producer_result_artifact_hash"}
+    require({k: v for k, v in record.items() if k not in mutable}
+            == {k: v for k, v in original.items() if k not in mutable}
+            and record.get("limitations", [])[:len(original.get("limitations", []))]
+            == original.get("limitations", [])
+            and set(original.get("evidence_ids", [])) <= set(record["evidence_ids"])
+            and set(record["evidence_ids"]) <= set(recovery["available_evidence_ids"]),
+            "result_recovery_mismatch", "Corrected result must preserve the original verdict, findings and limitations")
+    action = state["actions"].get(producer["action_id"], {})
+    require(producer.get("result_recovery_id") == recovery["recovery_id"]
+            and state["assignments"].get(producer["assignment_id"], {}).get("action_id") == producer["action_id"]
+            and action.get("status") == "confirmed"
+            and action.get("payload", {}).get("result_recovery_id") == recovery["recovery_id"],
+            "result_recovery_unconfirmed", "Record the original producer's recovery follow-up before importing its correction")
 
 
 def unresolved_delivery_findings(state):
@@ -337,6 +459,7 @@ def prepare_subagent_assignment(state, request, now):
     assignment.pop("gate_action_id", None)
     assignment.pop("continuation_of", None)
     assignment.pop("continuation_reason", None)
+    assignment.pop("result_recovery_id", None)
     action = prepare_action(state, operation, {
         "role": role, "assignment_id": identity, "host_kind": "subagent",
         "agent_name": assignment["agent_name"], "policy_hash": policy["policy_hash"],
@@ -803,7 +926,11 @@ def next_actions(state):
     if waiting:
         return [{"kind": "resume_role" if a["status"] == "interrupted" else "import_gate_result", "role": a["role"],
                  "assignment_id": a["assignment_id"], "assignment_action_id": a["gate_action_id"],
-                 "candidate_id": a["candidate_id"]} for a in waiting]
+                 "candidate_id": a["candidate_id"],
+                 **({"recovery_command": "devflow host recover-result",
+                     "recovery_reason": "Only if original JSON was rejected for evidence serialization"}
+                    if a.get("control_observation", {}).get("agent_status") == "completed" else {})}
+                for a in waiting]
     if not state["candidate_id"]:
         if implementation_required(state):
             return [role_next(state, "implementation_worker")]
@@ -1099,6 +1226,7 @@ def record_gate(state, record):
                and a["status"] in {"running", "completed", "interrupted", "unavailable", "replaced"}]
     require(matches, "not_independent", "Gate needs its original activated producer assignment")
     producer = matches[-1]
+    validate_corrected_result(state, producer, record)
     require(producer["task_id"] != state["attempt"]["owner_task_id"],
             "not_independent", "Coordinator cannot supply an independent gate")
     if subagent_mode(state):
@@ -1497,7 +1625,7 @@ def validate_action_admission(state, action, now):
 
 
 def transition(original, command, request, now, dependency_states=None, *,
-               trusted_verifier=None, repository=None, deferral_observation=None):
+               trusted_verifier=None, repository=None, deferral_observation=None, recovery_input=None):
     state = deepcopy(original)
     details = {}
     admission = None
@@ -1776,6 +1904,8 @@ def transition(original, command, request, now, dependency_states=None, *,
             authority(state, now)
         if command == "host.assign":
             details.update(prepare_subagent_assignment(state, request, now))
+        elif command == "host.recover-result":
+            details.update(recover_subagent_result(state, request, recovery_input, now))
         elif command == "host.resume":
             details.update(resume_subagent_assignment(state, request, now))
         elif command == "host.activate":

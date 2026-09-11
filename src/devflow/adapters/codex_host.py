@@ -38,9 +38,9 @@ class NativeHostBridge:
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         return f"[devflow-assignment:{digest}]"
 
-    def prepare_assignment(self, assignment: dict, brief: str) -> dict:
+    def prepare_assignment(self, assignment: dict, brief: str, *, recovery=None) -> dict:
         if assignment.get("host_kind") == "subagent":
-            return self.prepare_subagent(assignment, brief)
+            return self.prepare_subagent(assignment, brief, recovery=recovery)
         if assignment.get("status") != "prepared" or assignment.get("task_id"):
             raise WorkflowError("assignment_state", "Only a prepared unbound assignment can launch")
         if assignment.get("client_id"):
@@ -180,7 +180,7 @@ class NativeHostBridge:
             )
         return result
 
-    def prepare_subagent(self, assignment: dict, brief: str) -> dict:
+    def prepare_subagent(self, assignment: dict, brief: str, *, recovery=None) -> dict:
         from devflow.model_policy import validate_role_policy
 
         policy = assignment["role_policy"]
@@ -196,7 +196,19 @@ class NativeHostBridge:
             if assignment.get("workflow_snapshot_id"):
                 context["workflow_snapshot_id"] = assignment["workflow_snapshot_id"]
             instruction = "Startup is verified. Begin the bounded assignment below. "
-            if assignment.get("continuation_of"):
+            if assignment.get("result_recovery_id"):
+                if not recovery or recovery["recovery_id"] != assignment["result_recovery_id"]:
+                    raise WorkflowError("invalid_result_recovery", "Recovery requires its durable original record")
+                instruction = (
+                    "Serialization recovery only for your completed original result. Do not rerun product "
+                    "checks, edit product files, repair findings or begin a new review round. Return bare "
+                    "corrected gate JSON. Preserve every original identity, verdict, finding, timestamp "
+                    "and limitation exactly. Only supplement evidence_ids with actual already recorded "
+                    "candidate evidence; limitations may append a correction explanation. Do not erase "
+                    "historical limitations. If evidence cannot be identified, report that limitation.\n"
+                )
+                brief = json.dumps(recovery)
+            elif assignment.get("continuation_of"):
                 instruction = ("Resume this interrupted activation and preserve its original gate identity. "
                                "This continues the same candidate and review round. Reason: "
                                + assignment["continuation_reason"] + "\n")

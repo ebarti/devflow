@@ -202,7 +202,8 @@ def _managed_host(action, request, service):
                         "assignment": assignment}
             service.require_action_dispatch(state, current_action, request.get("expected_revision"))
             require_native_coordinator(assignment, os.environ.get("CODEX_THREAD_ID"))
-            intent = NativeHostBridge().prepare_assignment(assignment, assignment["brief"])
+            recovery = state["records"].get("gate_result_recovery:" + assignment.get("result_recovery_id", ""))
+            intent = NativeHostBridge().prepare_assignment(assignment, assignment["brief"], recovery=recovery)
             begun = service.execute("action.begin", request | {"action_id": current_action["action_id"]})
             return {"revision": begun["revision"], "intent": intent, "assignment": assignment}
     if action == "startup":
@@ -212,7 +213,7 @@ def _managed_host(action, request, service):
         return service.execute("host.startup", request | {"observation": observation})
     if action == "wait":
         return NativeHostBridge.wait_target(assignment)
-    if action in {"record", "activate", "resume", "unavailable", "observe", "result"}:
+    if action in {"record", "activate", "resume", "recover-result", "unavailable", "observe", "result"}:
         return service.execute("host." + action, request)
     if action == "reconcile":
         # The supported inventory contains agent_name/status only. Persist that

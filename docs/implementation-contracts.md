@@ -31,6 +31,7 @@ The initial commands are:
 | `devflow candidate record` | Work/attempt ID and owned checkout | Captures clean base/head/tree plus input fingerprints; freezes a candidate |
 | `devflow check run` | Candidate and selected recipe/scenario | Runs the existing command with isolated inputs and records status/assertions/evidence |
 | `devflow gate record` | Registered role assignment, candidate and structured gate result | Validates identity, scope, producer, evidence links and findings; never converts missing evidence to PASS |
+| `devflow host recover-result` | Completed producer assignment and stored original result artifact with missing/empty evidence IDs | Derives that schema rejection, preserves original judgement and activation, and journals a bounded correction using existing evidence without rerunning product work |
 | `devflow finding record/publish/close` | Finding record or ID, candidate, relevant fix/proof | Registers publication obligations; performs idempotent publish/verified-close transitions |
 | `devflow deliver` | Candidate, requested endpoint and expected remote refs | Evaluates all conditions, performs the authorized action and independent readback |
 | `devflow work reconcile` | Attempt ID | Repairs stale projections and resolves ambiguous actions from live evidence; preserves work |
@@ -38,7 +39,7 @@ The initial commands are:
 | `devflow report` | Work/cohort and observation window | Deterministic status, cost, quality, intervention and missing-data report |
 | `devflow install plan/apply/rollback` | Version, consumer inventory and explicit installation scope | Previews or updates only manifest-owned files/links; records rollback material |
 
-`next` chooses from a closed vocabulary: `prepare_scope`, `resolve_dependency`, `prepare_workspace`, `implement`, `run_check`, `publish_candidate`, `launch_role`, `wait_roles`, `repair_findings`, `publish_findings`, `close_fixed_threads`, `deliver`, `reconcile_action`, `request_user_action`, `done`. It does not synthesize arbitrary shell commands. Engineering instructions come from the role brief and repository recipe.
+`next` chooses from a closed vocabulary: `prepare_scope`, `prepare_workspace`, `launch_role`, `activate_role`, `observe_role`, `resume_role`, `wait_roles`, `import_gate_result`, `request_user_action`, `resolve_findings`, `capture_candidate`, `implement`, `repair_findings`, `run_check`, `push_branch`, `publish_candidate`, `publish_findings`, `close_fixed_threads`, `record_accounting`, `deliver`, `reconcile_action`, `done`. It does not synthesize arbitrary shell commands. Engineering instructions come from the owning stage skill, role brief and repository recipe. A completed producer's `import_gate_result` action includes the bounded recovery command when applicable; valid original output still imports directly.
 
 Users need not fill these records manually. They ask for work or select a Ready issue. The host skill captures engineering judgments once, and the CLI fills IDs, timestamps, hashes, refs, task links and accounting automatically.
 

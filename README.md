@@ -14,6 +14,8 @@ The happy path stays short: capture or reuse one backlog issue, delegate impleme
 
 `backlog capture` journals the request before calling `gh`; a restart recovers its issue by a stable marker. When the user requests recovery, `backlog list` and `work list` rediscover unfinished requests and attempts without the original conversation. State, evidence and installer records use explicit disk flushes before acknowledgment. See [crash recovery](docs/operation.md#recover-after-a-crash-or-power-loss) for resumption and the storage boundary.
 
+Independent rounds retain their original activation through interruptions. If a completed producer's original gate omits required evidence IDs, `host recover-result` journals a correction by that producer using existing evidence, preserving its original judgement and rejected bytes. See [role execution](docs/operation.md#role-execution) for the exact boundary.
+
 ## Try the package
 
 The development runtime requires Python 3.12+, Git, and uv on a local POSIX host. GitHub operations also use the authenticated GitHub CLI; usage collection uses npx. Role execution uses the coordinator's supported subagent tools and user-selected model settings, with readable child session metadata for startup verification.

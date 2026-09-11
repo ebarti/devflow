@@ -1069,3 +1069,148 @@ def test_new_attributed_usage_invalidates_prepared_complete_accounting_delivery(
                        limitations=["Prices remain unknown"])["accounting"]
     assert "late-attributed-response" in refreshed["usage_response_ids"]
     assert s.cli("deliver")["action"]["payload"]["accounting_id"] == refreshed["accounting_id"]
+
+
+def malformed_completed_result(s, peer, **changes):
+    original = staged_gate(s, peer, "BLOCKED")
+    original.pop("producer_result_artifact_hash")
+    original.update({"evidence_ids": [], **changes})
+    artifact = s.service.put_artifact(json.dumps(original).encode())
+    s.cli("host observe", assignment_id=peer["assignment_id"], observation={
+        "agent_name": peer["agent_name"], "agent_status": {"completed": "Original result preserved"},
+        "source_reference": "synthetic:completed-original-output",
+    })
+    return original, artifact
+
+
+@pytest.mark.parametrize("continuation", ["none", "interrupted", "completed_again"])
+def test_completed_malformed_result_recovers_same_activation_and_keeps_original(tmp_path, continuation):
+    s, worker = staged_candidate(tmp_path)
+    peer = s.start_role("review")
+    original, artifact = malformed_completed_result(s, peer)
+    s.cli("gate record", record=original | {"producer_result_artifact_hash": artifact}, expect="invalid_record")
+    old_snapshot = s.state["attempt"]["workflow_snapshot_id"]
+    prepared = s.cli("host recover-result", assignment_id=peer["assignment_id"],
+                     original_result_artifact_hash=artifact)
+    recovery = prepared["recovery"]
+    assert recovery["artifact_hash"] == artifact
+    assert recovery["validation_error"]["code"] == "invalid_record"
+    assert recovery["original_result"] == original
+    assert recovery["available_evidence_ids"] == ["check-1"]
+    assert not any(r.get("record_type") == "gate_result" for r in s.state["records"].values())
+    premature = original | {"evidence_ids": ["check-1"]}
+    premature_hash = s.service.put_artifact(json.dumps(premature).encode())
+    s.cli("gate record", record=premature | {"producer_result_artifact_hash": premature_hash},
+          expect="result_recovery_unconfirmed")
+    intent = s.cli("host prepare", assignment_id=peer["assignment_id"])["intent"]
+    assert intent["native_tool"] == "followup_task"
+    assert intent["arguments"]["target"] == peer["agent_name"]
+    assert "Serialization recovery only" in intent["arguments"]["message"]
+    assert peer["brief"] not in intent["arguments"]["message"]
+    assert original["assignment_action_id"] in intent["arguments"]["message"]
+    assert s.cli("host prepare", assignment_id=peer["assignment_id"])["reconcile_only"]
+    corrected_peer = s.cli("host record", assignment_id=peer["assignment_id"], inventory=[{
+        "agent_name": peer["agent_name"], "agent_status": "running",
+    }])["assignment"]
+    assert corrected_peer["task_id"] == peer["task_id"]
+    assert corrected_peer["gate_action_id"] == peer["gate_action_id"]
+    if continuation == "interrupted":
+        s.cli("host observe", assignment_id=peer["assignment_id"], observation={
+            "agent_name": peer["agent_name"], "agent_status": "interrupted",
+            "source_reference": "synthetic:interrupted-serialization-recovery",
+        })
+        resumed = s.cli("host resume", assignment_id=peer["assignment_id"], reason="Finish serialization")
+        assert resumed["action"]["payload"]["result_recovery_id"] == recovery["recovery_id"]
+        resumed_intent = s.cli("host prepare", assignment_id=peer["assignment_id"])["intent"]
+        assert "Serialization recovery only" in resumed_intent["arguments"]["message"]
+        assert peer["brief"] not in resumed_intent["arguments"]["message"]
+        s.cli("host record", assignment_id=peer["assignment_id"], inventory=[{
+            "agent_name": peer["agent_name"], "agent_status": "running",
+        }])
+    elif continuation == "completed_again":
+        # The first correction itself still lacks evidence linkage; preserve that output too.
+        still_malformed = original | {"limitations": original["limitations"] + ["Evidence still omitted"]}
+        second_hash = s.service.put_artifact(json.dumps(still_malformed).encode())
+        s.cli("gate record", record=still_malformed | {"producer_result_artifact_hash": second_hash},
+              expect="invalid_record")
+        s.cli("host observe", assignment_id=peer["assignment_id"], observation={
+            "agent_name": peer["agent_name"], "agent_status": {"completed": "Evidence still omitted"},
+            "source_reference": "synthetic:completed-first-correction",
+        })
+        s.cli("host recover-result", assignment_id=peer["assignment_id"],
+              original_result_artifact_hash=second_hash, expect="invalid_result_recovery")
+        repeated = s.cli("host recover-result", assignment_id=peer["assignment_id"],
+                         original_result_artifact_hash=artifact)
+        assert repeated["recovery"] == recovery
+        assert repeated["action"]["action_id"] != prepared["action"]["action_id"]
+        assert repeated["action"]["payload"]["previous_action_id"] == prepared["action"]["action_id"]
+        assert sum(r.get("record_type") == "gate_result_recovery" for r in s.state["records"].values()) == 1
+        s.cli("gate record", record=premature | {"producer_result_artifact_hash": premature_hash},
+              expect="result_recovery_unconfirmed")
+        repeated_intent = s.cli("host prepare", assignment_id=peer["assignment_id"])["intent"]
+        assert "Serialization recovery only" in repeated_intent["arguments"]["message"]
+        assert peer["brief"] not in repeated_intent["arguments"]["message"]
+        # A lost native response cannot prepare a third continuation.
+        s.cli("host observe", assignment_id=peer["assignment_id"], observation={
+            "agent_name": peer["agent_name"], "agent_status": {"completed": "Uncertain response"},
+            "source_reference": "synthetic:ambiguous-followup",
+        })
+        s.cli("host recover-result", assignment_id=peer["assignment_id"],
+              original_result_artifact_hash=artifact, expect="invalid_result_recovery")
+        assert s.cli("host prepare", assignment_id=peer["assignment_id"])["reconcile_only"]
+        s.cli("host record", assignment_id=peer["assignment_id"], inventory=[{
+            "agent_name": peer["agent_name"], "agent_status": "running",
+        }])
+    corrected = original | {"evidence_ids": ["check-1"],
+                            "limitations": original["limitations"] + ["Corrected evidence serialization"]}
+    corrected_hash = s.service.put_artifact(json.dumps(corrected).encode())
+    s.cli("gate record", record=corrected | {"producer_result_artifact_hash": corrected_hash})
+    assert s.state["records"]["gate_result:" + original["gate_id"]]["status"] == "BLOCKED"
+    assert s.state["attempt"]["workflow_snapshot_id"] == old_snapshot
+    assert json.loads((s.private / "artifacts" / artifact).read_bytes()) == original
+    s.cli("host recover-result", assignment_id=peer["assignment_id"],
+          original_result_artifact_hash=artifact, expect="invalid_result_recovery")
+
+
+@pytest.mark.parametrize("changes,expected", [
+    ({"producer_task_id": "wrong-producer"}, "invalid_result_recovery"),
+    ({"assignment_action_id": "wrong-action"}, "invalid_result_recovery"),
+    ({"candidate_id": "wrong-candidate"}, "invalid_result_recovery"),
+    ({"workflow_hash": "f" * 64}, "invalid_result_recovery"),
+    ({"completed_at": None}, "invalid_record"),
+    ({"evidence_ids": [""]}, "invalid_result_recovery"),
+    ({"producer_task_id": "33333333-3333-4333-8333-333333333333"}, "invalid_result_recovery"),
+])
+def test_recovery_rejects_wrong_original_identity_or_unrepairable_fields(tmp_path, changes, expected):
+    s, _ = staged_candidate(tmp_path)
+    peer = s.start_role("review")
+    _, artifact = malformed_completed_result(s, peer, **changes)
+    s.cli("host recover-result", assignment_id=peer["assignment_id"],
+          original_result_artifact_hash=artifact, expect=expected)
+    assert not any(r.get("record_type") == "gate_result_recovery" for r in s.state["records"].values())
+
+
+def test_recovery_rejects_valid_adverse_verdict_and_arbitrary_prompt(tmp_path):
+    s, _ = staged_candidate(tmp_path)
+    peer = s.start_role("review")
+    _, artifact = malformed_completed_result(s, peer)
+    valid = staged_gate(s, peer, "BLOCKED")
+    s.cli("host recover-result", assignment_id=peer["assignment_id"],
+          original_result_artifact_hash=valid["producer_result_artifact_hash"], expect="valid_result")
+    s.cli("host recover-result", assignment_id=peer["assignment_id"],
+          original_result_artifact_hash=artifact, reason="Rerun product checks", expect="invalid_request")
+
+
+@pytest.mark.parametrize("changes", [
+    {"status": "PASS"}, {"limitations": []}, {"finding_ids": ["fabricated-finding"]},
+    {"completed_at": "2026-09-12T00:00:00Z"}, {"evidence_ids": ["new-check-after-recovery"]},
+])
+def test_recovery_rejects_result_laundering_even_before_followup(tmp_path, changes):
+    s, _ = staged_candidate(tmp_path)
+    peer = s.start_role("review")
+    original, artifact = malformed_completed_result(s, peer)
+    s.cli("host recover-result", assignment_id=peer["assignment_id"], original_result_artifact_hash=artifact)
+    corrected = original | {"evidence_ids": ["check-1"]} | changes
+    corrected_hash = s.service.put_artifact(json.dumps(corrected).encode())
+    s.cli("gate record", record=corrected | {"producer_result_artifact_hash": corrected_hash},
+          expect="result_recovery_mismatch")
