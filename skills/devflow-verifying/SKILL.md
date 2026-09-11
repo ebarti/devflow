@@ -13,6 +13,8 @@ Check the coverage map against owning contracts. Include mirrored registries, sc
 
 For managed implementation, require candidate capture and durable `host result` before registered `check run`. Run the smallest applicable recipes/scenarios; high-risk changes retain the relevant full matrix. Tier 0 uses static checks without invented independent gates. Record process outcomes separately from executed assertions.
 
+Use [retained check artifacts](references/check-evidence.md) for later inspection and handoff. Supply the evidence ID, hash and explicit state root; temporary paths in argv are not enduring evidence locators. Preserve the original artifact when extracting report text into an owned private file.
+
 Exercise the real product/operational path in owned isolated resources. Record setup, actions, expected/observed result, candidate/environment and evidence. Probe failure/recovery where the contract depends on them. A screenshot or green unit suite alone cannot establish persistence, transport or integration.
 
 Missing capability, inaccessible fixture, failed launch or skipped required assertion means FAIL/BLOCKED. Preserve unrelated data/processes and failed evidence. A human-found major regression needs a meaningful fixture or explicit checklist item. QA does not edit implementation while judging it.
