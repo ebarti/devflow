@@ -1,6 +1,8 @@
 """Transaction coordinator. External mutations are returned as durable intents only."""
 
+import hashlib
 import json
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -22,8 +24,10 @@ from devflow.domain.rules import (
     next_actions,
     transition,
     unblocked,
+    validate_action_admission,
 )
 from devflow.errors import WorkflowError
+from devflow.skill_routing import route_actions
 from devflow.validation import canonical_json, digest, validate_record
 
 
@@ -44,7 +48,7 @@ class WorkflowService:
             raise WorkflowError("invalid_request", "A nonempty work_id is required")
         return self.require_execution(self.snapshot(request["work_id"]), operation={
             "host.prepare": "create_tasks", "check.run": "check",
-            "host.assign": "create_tasks", "host.activate": "create_tasks",
+            "host.assign": "create_tasks", "host.activate": "create_tasks", "host.resume": "create_tasks",
             "workspace.register": "edit", "candidate.capture": "edit",
         }.get(command))
 
@@ -80,9 +84,10 @@ class WorkflowService:
             permission = PERMISSIONS[action["operation"]]
             self.require_execution(state, operation=permission)
             authority(state, datetime.now(timezone.utc), permission)
+            validate_action_admission(state, action, datetime.now(timezone.utc))
 
     def permitted_actions(self, state):
-        actions = next_actions(state)
+        actions = route_actions(next_actions(state))
         if state["lifecycle"] in {"backlog", "done", "canceled"}:
             return actions
         try:
@@ -90,9 +95,9 @@ class WorkflowService:
         except WorkflowError as exc:
             # Reads still expose uncertain-action recovery without suggesting execution.
             return [a for a in actions if a["kind"] == "reconcile_action"
-                    and a.get("action", {}).get("status") != "prepared"] + [
+                    and a.get("action", {}).get("status") != "prepared"] + route_actions([
                 {"kind": "request_user_action", "reason": exc.code}
-            ]
+            ])
         return actions
 
     def put_artifact(self, content: bytes):
@@ -115,7 +120,7 @@ class WorkflowService:
         state = self.snapshot(work_id)
         return {"work_id": work_id, "revision": state["revision"], "actions": self.permitted_actions(state)}
 
-    def execute(self, command: str, request: dict):
+    def execute(self, command: str, request: dict, *, deferral_observation=None):
         if command == "work.prepare":
             record = request.get("record", {})
             try:
@@ -165,7 +170,8 @@ class WorkflowService:
             try:
                 updated, details = transition(
                     state, command, request, datetime.now(timezone.utc), dependencies,
-                    trusted_verifier=self.trusted_verifier, repository=self.repository
+                    trusted_verifier=self.trusted_verifier, repository=self.repository,
+                    deferral_observation=deferral_observation,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise WorkflowError(
@@ -181,6 +187,22 @@ class WorkflowService:
                 "work.reconcile",
             }
             for key, record in updated["records"].items():
+                producer_artifact = record.get("producer_result_artifact_hash")
+                if producer_artifact and (key not in state["records"] or command in proof_commands):
+                    self.store.require_artifact(producer_artifact)
+                    try:
+                        fd = os.open(self.store.root / "artifacts" / producer_artifact,
+                                     os.O_RDONLY | os.O_NOFOLLOW)
+                        with os.fdopen(fd, "rb") as stream:
+                            original = stream.read()
+                        if hashlib.sha256(original).hexdigest() != producer_artifact:
+                            raise WorkflowError("corrupt_artifact", "Producer artifact changed during import")
+                        producer_result = json.loads(original, parse_float=Decimal)
+                    except (OSError, ValueError, UnicodeError) as exc:
+                        raise WorkflowError("invalid_producer_result", "Producer artifact must contain original gate JSON") from exc
+                    expected = {k: v for k, v in record.items() if k != "producer_result_artifact_hash"}
+                    if producer_result != expected:
+                        raise WorkflowError("producer_result_mismatch", "Imported gate differs from original producer JSON")
                 startup = record.get("startup_observation")
                 if startup and (key not in state["records"] or command in proof_commands):
                     self.store.require_artifact(startup["artifact_hash"])

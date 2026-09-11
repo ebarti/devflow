@@ -18,7 +18,7 @@ from devflow.validation import digest, schema, validate_record
 # resumes execution is intentionally absent.
 BOOKKEEPING = frozenset({
     "work.cancel", "work.block", "action.record", "check.complete", "finding.record",
-    "outcome.record", "usage.record", "segment.record",
+    "outcome.record", "usage.record", "usage.account", "segment.record", "gate.record",
 })
 READ_ONLY = frozenset({
     "doctor", "work.prepare", "work.show", "work.list", "next", "backlog.list",

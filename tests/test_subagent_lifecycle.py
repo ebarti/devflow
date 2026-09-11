@@ -26,7 +26,7 @@ PARENT = "11111111-1111-4111-8111-111111111111"
 
 
 class Subagents(Scenario):
-    def __init__(self, path, *, tier=0, phase="implement"):
+    def __init__(self, path, *, tier=0, phase="implement", package_version=None):
         self.root = path / "repository"
         shutil.copytree(Path(__file__).parents[1] / "fixtures/repositories/prose", self.root)
         self.private = path / "private"
@@ -46,7 +46,10 @@ class Subagents(Scenario):
             workflow_snapshot_id="snapshot-1", model_policy_snapshot_id="snapshot-1",
             revision=self.state["revision"], started_at=NOW, status="active",
         )
-        started = self.call("work.start", record=attempt, workflow_snapshot=workflow_snapshot())
+        snapshot = workflow_snapshot()
+        if package_version:
+            snapshot["package_version"] = package_version
+        started = self.call("work.start", record=attempt, workflow_snapshot=snapshot)
         self.confirm(started["action"], external_id="synthetic-workspace")
         self.config = path / "config.toml"
         self.config.write_text('model="synthetic-coordinator"\nmodel_reasoning_effort="max"\n')
@@ -316,7 +319,8 @@ def test_gate_cannot_consume_proof_while_a_new_implementation_turn_is_active(tmp
         evidence_ids=[evidence["evidence_id"]], finding_ids=[], blocking_finding_ids=[],
         limitations=[], completed_at=NOW, fix_verification_ids=[],
     )
-    s.cli("gate record", record=gate, expect="implementation_incomplete")
+    s.cli("gate record", record=gate)
+    assert s.state["records"]["gate_ingestion:stale-implementation-gate"]["historical"]
     assert "review" not in s.state["gate_ids"]
 
 
@@ -636,3 +640,347 @@ def test_bootstrap_control_observation_cannot_bypass_product_activation(tmp_path
     s.capture(active)
     s.complete(active)
     assert s.service.next(s.work_id)["actions"][0]["kind"] == "run_check"
+
+
+def staged_gate(s, peer, status="PASS", *, identity=None, findings=None, evidence_ids=None):
+    gate = record(
+        "gate_result", gate_id=identity or f"gate-{peer['role']}-{status}",
+        assignment_id=peer["assignment_id"], producer_task_id=peer["task_id"], role=peer["role"],
+        candidate_id=peer["candidate_id"], scope_hash=peer["scope_hash"],
+        workflow_hash=s.state["records"]["workflow_snapshot:" + peer.get(
+            "workflow_snapshot_id", s.state["attempt"]["workflow_snapshot_id"])]["workflow_hash"],
+        status=status, evidence_ids=evidence_ids or ["check-1"], finding_ids=findings or [],
+        blocking_finding_ids=[], limitations=["Synthetic producer limitation"] if status != "PASS" else [],
+        completed_at=NOW, fix_verification_ids=[],
+        **({"assignment_action_id": peer["gate_action_id"]} if peer.get("gate_action_id") else {}),
+    )
+    if peer.get("gate_action_id"):
+        gate["producer_result_artifact_hash"] = s.service.put_artifact(json.dumps(gate).encode())
+    return gate
+
+
+def staged_candidate(tmp_path, *, tier=2, version="0.5.0", phase="implement"):
+    s = Subagents(tmp_path, tier=tier, phase=phase, package_version=version)
+    worker = s.start_role() if phase == "implement" else None
+    s.capture(worker)
+    if worker:
+        s.complete(worker)
+    s.check()
+    return s, worker
+
+
+@pytest.mark.parametrize("first_status,second_status", [("FAIL", "BLOCKED"), ("BLOCKED", "FAIL")])
+def test_initial_nonpassing_results_are_each_imported_before_repair(tmp_path, first_status, second_status):
+    s, worker = staged_candidate(tmp_path)
+    reviewer = s.start_role("review")
+    qa = s.start_role("qa")
+    for peer in (reviewer, qa):
+        s.cli("host observe", assignment_id=peer["assignment_id"], observation={
+            "agent_name": peer["agent_name"], "agent_status": {"completed": "Synthetic result"},
+            "source_reference": "synthetic:completed-independent-result",
+        })
+    s.cli("host assign", assignment_id=worker["assignment_id"], role="implementation_worker",
+          owned_paths=["src"], brief="Repair synthetic defects", config_path=str(s.config),
+          expect="gate_result_required")
+    s.cli("host activate", assignment_id=reviewer["assignment_id"], expect="startup_unverified")
+    first = staged_gate(s, reviewer, first_status)
+    s.cli("gate record", record=first)
+    # One import must work while the second result is still missing: no all-gates deadlock.
+    assert s.state["records"][f"gate_result:{first['gate_id']}"] == first
+    assert [a["role"] for a in s.service.next(s.work_id)["actions"]] == ["qa"]
+    s.cli("host assign", assignment_id=worker["assignment_id"], role="implementation_worker",
+          owned_paths=["src"], brief="Repair synthetic defects", config_path=str(s.config),
+          expect="gate_result_required")
+    second = staged_gate(s, qa, second_status)
+    s.cli("gate record", record=second)
+    reused = s.assign(identity=worker["assignment_id"])
+    assert reused["task_id"] == worker["task_id"]
+    assert s.state["records"][f"gate_result:{second['gate_id']}"] == second
+
+
+def test_completed_or_unavailable_independent_agent_cannot_be_replaced_before_import(tmp_path):
+    s, _ = staged_candidate(tmp_path, tier=1)
+    peer = s.start_role("review")
+    artifact = s.service.put_artifact(b"Synthetic native unavailable evidence")
+    s.cli("host unavailable", assignment_id=peer["assignment_id"], observation={
+        "agent_name": peer["agent_name"], "source_reference": "synthetic:target-error",
+        "observation_kind": "native_target_error", "reason": "Synthetic unavailable target",
+        "artifact_hash": artifact,
+    })
+    s.cli("host assign", assignment_id="replacement-review", role="review", owned_paths=["src"],
+          brief="Synthetic replacement", config_path=str(s.config), replaces_assignment_id=peer["assignment_id"],
+          expect="gate_result_required")
+    s.cli("gate record", record=staged_gate(s, peer, "BLOCKED"))
+    # Result ingestion preserves unavailable control state so replacement can still be justified.
+    replacement = s.assign("review", "replacement-review", replaces_assignment_id=peer["assignment_id"])
+    assert replacement["replaces_assignment_id"] == peer["assignment_id"]
+
+
+@pytest.mark.parametrize("status", ["PASS", "FAIL", "BLOCKED"])
+def test_late_old_release_gate_preserves_producer_result_during_new_implementation(tmp_path, status):
+    s, worker = staged_candidate(tmp_path, version="0.4.0")
+    peer = s.start_role("review")
+    result = staged_gate(s, peer, status)
+    # Reproduce the 0.4.0 sequence: implementation could start before the producer gate was imported.
+    s.assign(identity=worker["assignment_id"])
+    s.cli("host prepare", assignment_id=worker["assignment_id"])
+    repair = s.cli("host record", assignment_id=worker["assignment_id"], inventory=[{
+        "agent_name": worker["agent_name"], "agent_status": "running",
+    }])["assignment"]
+    s.capture(repair, identity="candidate-2", tree="c" * 40)
+    phase = s.state["phase"]
+    s.cli("gate record", record=result)
+    assert s.state["records"][f"gate_result:{result['gate_id']}"] == result
+    assert not s.state["gate_ids"] and s.state["phase"] == phase
+    history = s.state["records"][f"gate_ingestion:{result['gate_id']}"]
+    assert history["historical"] and set(history["mismatches"]) == {"candidate", "implementation"}
+    assert history["producer_assignment"]["task_id"] == peer["task_id"]
+    assert s.state["assignments"][repair["assignment_id"]]["status"] == "running"
+
+
+def test_activation_result_cannot_be_omitted_or_overwritten(tmp_path):
+    s, _ = staged_candidate(tmp_path, tier=1)
+    peer = s.start_role("review")
+    result = staged_gate(s, peer, "FAIL")
+    missing = {k: v for k, v in result.items() if k != "assignment_action_id"}
+    s.cli("gate record", record=missing, expect="gate_activation_mismatch")
+    s.cli("gate record", record=result)
+    s.cli("gate record", record=result | {"gate_id": "rewritten", "status": "PASS"},
+          expect="gate_result_conflict")
+
+
+def test_stage_accounting_and_medium_disposition_are_explicit_delivery_requirements(tmp_path):
+    s, _ = staged_candidate(tmp_path, tier=0)
+    finding = s.finding(severity="medium")
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "resolve_findings"
+    s.cli("deliver", expect="not_ready_to_deliver")
+    with pytest.raises(WorkflowError, match="Deferral needs"):
+        s.call("finding.defer", finding_id=finding["finding_id"], rationale="Follow up later")
+    from test_deferrals import issue
+
+    with patch("devflow.adapters.github.GitHubRepository.issue", return_value=issue()):
+        s.cli("finding defer", finding_id=finding["finding_id"],
+              followup_reference="https://github.com/synthetic/fixture/issues/23", rationale="Bounded follow-up")
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "record_accounting"
+    with pytest.raises(WorkflowError, match="every registered task segment"):
+        s.call("usage.account", status="complete", source_reference="synthetic:collector", limitations=[])
+    with pytest.raises(WorkflowError, match="explicit limitations"):
+        s.call("usage.account", status="unknown", source_reference="synthetic:collector")
+    accounting = s.call("usage.account", status="unavailable", source_reference="synthetic:collector",
+                        limitations=["Synthetic collector unavailable; token and cost totals are unknown"])["accounting"]
+    assert accounting["usage_response_ids"] == []
+    assert not any("cost" in k or "tokens" in k for k in accounting)
+    delivered = s.deliver()
+    assert delivered["lifecycle"] == "done"
+    delivery = s.state["records"]["delivery:delivery-1"]
+    prepared = s.state["actions"][delivery["action_id"]]
+    assert prepared["payload"]["accounting_id"] == accounting["accounting_id"]
+
+
+@pytest.mark.parametrize("phase", ["verify", "deliver"])
+def test_stage_direct_review_and_delivery_skip_invented_implementation(tmp_path, phase):
+    s, worker = staged_candidate(tmp_path, tier=0, phase=phase)
+    assert worker is None
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "record_accounting"
+    s.call("usage.account", status="unknown", source_reference="synthetic:legacy-proof",
+           limitations=["No usage source was provided for the prior work"])
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "deliver"
+
+
+def test_last_passing_gate_does_not_hide_first_failure_or_a_late_finding(tmp_path):
+    s, worker = staged_candidate(tmp_path)
+    review = s.start_role("review")
+    qa = s.start_role("qa")
+    s.cli("gate record", record=staged_gate(s, review, "FAIL"))
+    finding = s.finding(severity="medium")
+    s.cli("gate record", record=staged_gate(s, qa))
+    actions = s.service.next(s.work_id)["actions"]
+    assert actions[0]["role"] == "implementation_worker"
+    assert actions[0]["assignment_id"] == worker["assignment_id"]
+    assert finding["finding_id"] in s.state["findings"]
+
+
+def test_late_gate_keeps_linked_findings_and_historical_fix_proof(tmp_path):
+    s, worker = staged_candidate(tmp_path, tier=1, version="0.4.0")
+    reviewer = s.start_role("review")
+    finding = s.finding(severity="medium")
+    fix = record("fix_verification", verification_id="synthetic-late-fix",
+                 finding_id=finding["finding_id"], candidate_id=reviewer["candidate_id"],
+                 assignment_id=reviewer["assignment_id"], producer_task_id=reviewer["task_id"],
+                 result="verified", evidence_ids=["check-1"],
+                 verified_at=NOW)
+    s.assign(identity=worker["assignment_id"])
+    gate = staged_gate(s, reviewer, "FAIL", findings=[finding["finding_id"]])
+    gate["fix_verification_ids"] = [fix["verification_id"]]
+    s.cli("gate record", record=gate, fix_verifications=[fix])
+    assert s.state["records"][f"fix_verification:{fix['verification_id']}"] == fix
+    assert s.state["findings"][finding["finding_id"]]["disposition"] == "open"
+    assert s.state["records"][f"gate_result:{gate['gate_id']}"]["finding_ids"] == [finding["finding_id"]]
+
+
+def test_gate_requires_durable_original_producer_artifact(tmp_path):
+    s, _ = staged_candidate(tmp_path, tier=1)
+    peer = s.start_role("review")
+    gate = staged_gate(s, peer, "BLOCKED")
+    missing = {k: v for k, v in gate.items() if k != "producer_result_artifact_hash"}
+    s.cli("gate record", record=missing, expect="producer_result_required")
+    s.cli("gate record", record=gate | {"producer_result_artifact_hash": "e" * 64},
+          expect="missing_artifact")
+    assert f"gate_result:{gate['gate_id']}" not in s.state["records"]
+    s.cli("gate record", record=gate)
+
+
+def test_complete_accounting_requires_all_task_segments_but_accepts_unknown_prices(tmp_path):
+    s, _ = staged_candidate(tmp_path, tier=0)
+    worker_segment = next(r for r in s.state["records"].values()
+                          if r.get("record_type") == "execution_segment")
+    owner_segment = worker_segment | {"segment_id": "synthetic-owner-segment", "task_id": PARENT,
+                                      "role": "owner", "source_reference": "synthetic:owner-session"}
+    s.call("segment.record", record=owner_segment)
+    for index, segment in enumerate((worker_segment, owner_segment)):
+        usage = record("usage", response_id=f"synthetic-usage-{index}", task_id=segment["task_id"],
+                       segment_id=segment["segment_id"], recorded_at=NOW, uncached_input_tokens=12,
+                       cache_read_tokens=0, cache_write_tokens=0, output_tokens=3, reasoning_output_tokens=1,
+                       ccusage_version="synthetic-1", price_snapshot_id=None, api_equivalent_usd=None,
+                       estimated_codex_credits=None, allocations=[{"work_id": s.work_id, "weight": 1}],
+                       attribution_status="complete", pricing_status="missing_rate")
+        s.call("usage.record", record=usage)
+        if index == 0:
+            with pytest.raises(WorkflowError, match="every registered task segment"):
+                s.call("usage.account", status="complete", source_reference="synthetic:collector")
+    result = s.call("usage.account", status="complete", source_reference="synthetic:collector",
+                    limitations=["Price rates unavailable; costs remain unknown"])["accounting"]
+    assert result["status"] == "complete" and len(result["usage_response_ids"]) == 2
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "deliver"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("limitations", ["Coordinator rewrote the producer's limitation"]),
+    ("completed_at", "2026-01-01T00:00:00Z"),
+    ("status", "FAIL"),
+])
+def test_gate_import_rejects_rewritten_producer_fields(tmp_path, field, value):
+    s, _ = staged_candidate(tmp_path, tier=1)
+    peer = s.start_role("review")
+    gate = staged_gate(s, peer, "BLOCKED")
+    s.cli("gate record", record=gate | {field: value}, expect="producer_result_mismatch")
+    assert f"gate_result:{gate['gate_id']}" not in s.state["records"]
+    unrelated = s.service.put_artifact(b"Synthetic unrelated bytes")
+    s.cli("gate record", record=gate | {"producer_result_artifact_hash": unrelated},
+          expect="invalid_producer_result")
+    s.cli("gate record", record=gate)
+
+
+def resume_interrupted(s, peer):
+    s.cli("host observe", assignment_id=peer["assignment_id"], observation={
+        "agent_name": peer["agent_name"], "agent_status": "interrupted",
+        "source_reference": "synthetic:observed-stop-for-workflow-diagnosis",
+    })
+    prepared = s.cli("host resume", assignment_id=peer["assignment_id"],
+                     reason="Synthetic workflow cause repaired; finish the original observations")
+    original_round = peer["gate_action_id"]
+    assert prepared["action"]["payload"]["continuation_of"] == original_round
+    assert prepared["assignment"]["gate_action_id"] == original_round
+    intent = s.cli("host prepare", assignment_id=peer["assignment_id"])["intent"]
+    assert intent["native_tool"] == "followup_task"
+    assert original_round in intent["arguments"]["message"]
+    assert "Resume this interrupted activation" in intent["arguments"]["message"]
+    assert s.state["actions"][prepared["action"]["action_id"]]["status"] == "dispatched"
+    assert s.cli("host prepare", assignment_id=peer["assignment_id"])["reconcile_only"]
+    resumed = s.cli("host record", assignment_id=peer["assignment_id"], inventory=[{
+        "agent_name": peer["agent_name"], "agent_status": "running",
+    }])["assignment"]
+    assert resumed["gate_action_id"] == original_round and resumed["action_id"] != original_round
+    return resumed
+
+
+def test_interrupted_independent_round_resumes_without_erasing_pending_gate(tmp_path):
+    s, worker = staged_candidate(tmp_path)
+    reviewer = s.start_role("review")
+    qa = s.start_role("qa")
+    resumed = resume_interrupted(s, reviewer)
+    # A second interruption still continues the same original producer activation.
+    resumed = resume_interrupted(s, resumed)
+    s.cli("host assign", assignment_id=worker["assignment_id"], role="implementation_worker",
+          owned_paths=["src"], brief="Cannot repair before original results", config_path=str(s.config),
+          expect="gate_result_required")
+    s.capture(worker, identity="forbidden-candidate", tree="c" * 40, expect="gate_result_required")
+    original = staged_gate(s, reviewer, "BLOCKED")
+    s.cli("gate record", record=original)
+    s.cli("gate record", record=staged_gate(s, qa))
+    assert s.state["records"][f"gate_result:{original['gate_id']}"] == original
+    assert not s.state["records"][f"gate_ingestion:{original['gate_id']}"]["historical"]
+    s.cli("host resume", assignment_id=reviewer["assignment_id"], reason="Not an interrupted pending round",
+          expect="invalid_continuation")
+    assert s.state["assignments"][reviewer["assignment_id"]]["status"] == "completed"
+
+
+def test_same_attempt_upgrade_binds_new_gates_to_new_snapshot_and_retains_initial_record(tmp_path):
+    s, worker = staged_candidate(tmp_path, tier=1)
+    reviewer = s.start_role("review")
+    old_result = staged_gate(s, reviewer, "FAIL")
+    s.cli("gate record", record=old_result)
+    original_attempt = s.state["records"]["attempt:synthetic-attempt"]
+    amended = s.contract | {"scope_revision": 2}
+    upgraded = workflow_snapshot() | {"snapshot_id": "snapshot-upgrade", "package_version": "0.5.1",
+                                      "workflow_hash": "d" * 64, "package_revision": "d" * 40}
+    s.call("work.amend", record=amended, workflow_snapshot=upgraded, user_request={
+        "reference": "synthetic:resume-after-reviewed-workflow-fix", "summary": "Resume the same outcome",
+        "allowed_operations": ["edit", "check", "create_tasks"],
+    })
+    s.contract = amended
+    assert s.state["attempt"]["workflow_snapshot_id"] == "snapshot-upgrade"
+    assert s.state["records"]["attempt:synthetic-attempt"] == original_attempt
+    updated_worker = s.assign(identity=worker["assignment_id"])
+    s.cli("host prepare", assignment_id=updated_worker["assignment_id"])
+    updated_worker = s.cli("host record", assignment_id=updated_worker["assignment_id"], inventory=[{
+        "agent_name": updated_worker["agent_name"], "agent_status": "running",
+    }])["assignment"]
+    s.capture(updated_worker, identity="candidate-upgrade", tree="c" * 40)
+    s.complete(updated_worker)
+    s.check("check-upgrade")
+    new_review = s.assign("review", reviewer["assignment_id"])
+    s.cli("host prepare", assignment_id=new_review["assignment_id"])
+    new_review = s.cli("host record", assignment_id=new_review["assignment_id"], inventory=[{
+        "agent_name": new_review["agent_name"], "agent_status": "running",
+    }])["assignment"]
+    assert new_review["workflow_snapshot_id"] == "snapshot-upgrade"
+    gate = staged_gate(s, new_review, identity="gate-after-upgrade", evidence_ids=["check-upgrade"])
+    assert gate["workflow_hash"] == upgraded["workflow_hash"]
+    s.cli("gate record", record=gate)
+    assert s.state["gate_ids"]["review"] == gate["gate_id"]
+    assert s.state["records"]["candidate:candidate-upgrade"]["workflow_snapshot_id"] == "snapshot-upgrade"
+    assert s.state["records"][f"gate_result:{old_result['gate_id']}"] == old_result
+    # A delayed result from this intermediate policy must match neither the initial
+    # attempt snapshot nor a later upgrade: its own activation owns the binding.
+    later_review = s.assign("review", reviewer["assignment_id"])
+    s.cli("host prepare", assignment_id=later_review["assignment_id"])
+    later_review = s.cli("host record", assignment_id=later_review["assignment_id"], inventory=[{
+        "agent_name": later_review["agent_name"], "agent_status": "running",
+    }])["assignment"]
+    delayed = staged_gate(s, later_review, "BLOCKED", identity="delayed-middle-policy",
+                          evidence_ids=["check-upgrade"])
+    s.call("work.amend", record=amended | {"scope_revision": 3},
+           workflow_snapshot=upgraded | {"snapshot_id": "snapshot-next", "package_version": "0.5.2",
+                                         "workflow_hash": "e" * 64}, user_request={
+               "reference": "synthetic:second-workflow-upgrade", "summary": "Preserve late prior observations",
+               "allowed_operations": ["edit", "check", "create_tasks"],
+           })
+    s.cli("gate record", record=delayed)
+    assert s.state["records"]["gate_ingestion:delayed-middle-policy"]["historical"]
+    assert not s.state["gate_ids"]
+    assert s.state["records"]["gate_result:delayed-middle-policy"] == delayed
+
+
+def test_low_findings_remain_optional_but_unobserved_deferrals_do_not(tmp_path):
+    from devflow.domain.rules import next_actions
+
+    s, _ = staged_candidate(tmp_path, tier=0)
+    finding = s.finding(severity="low")
+    assert s.service.next(s.work_id)["actions"][0]["kind"] == "record_accounting"
+    state = s.state
+    state["findings"][finding["finding_id"]].update(
+        disposition="deferred", followup_reference="https://github.com/synthetic/fixture/issues/23",
+        deferral_rationale="Unverified historical deferral",
+    )
+    assert next_actions(state)[0]["kind"] == "resolve_findings"

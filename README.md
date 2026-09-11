@@ -1,12 +1,12 @@
 # Developer Workflow
 
-A reusable development workflow with a local `devflow` CLI, a focused host skill, repository profiles, and explicit execution evidence.
+A reusable development workflow with a local `devflow` CLI, independently discoverable stage skills, repository profiles, and explicit execution evidence.
 
-Version 0.4.0 keeps the user's initial conversation as the coordinator and delegates implementation, review, and QA to subagents. Each role receives explicit settings resolved from the user's configuration and overrides. The coordinator verifies the child's actual identity, model, and reasoning effort before releasing its bounded work. Role settings are independent of the coordinator's active model selection. See [role execution](docs/operation.md#role-execution).
+Version 0.5.0 requires the entry skill before task action, then selects definition, planning, coordination, implementation, review, verification or delivery. Each stage owns its inputs, outputs and next handoff. Design discussion uses the methodology without starting execution. The original conversation coordinates verified subagents; role settings remain independent of its active model. See [stage routing](docs/operation.md#stage-skills) and [role execution](docs/operation.md#role-execution).
 
 Conversational intake accepts a requested change, bug investigation or fix, named issue, or bounded batch such as the current P1 backlog. The coordinator creates or reuses the issue and starts within the requested scope without a separate approval channel. Its persisted request supports workflow consistency; it does not independently authenticate a human. See [conversational intake](docs/issue-trust.md).
 
-The initial runtime implements accepted work contracts, durable attempts, owned Git checkouts, candidate-bound checks and independent gates, finding publication/closure, delivery receipts, and deterministic usage/outcome reports. An interrupted external action is reconciled before another mutation. A changed candidate cannot inherit a previous candidate's passing gate.
+The runtime implements accepted work contracts, durable attempts, owned Git checkouts, candidate-bound checks and independent gates, finding publication/closure, delivery receipts, and deterministic usage/outcome reports. An interrupted external action is reconciled before another mutation. A changed candidate cannot inherit a previous candidate's passing gate. Every independent result is retained before repair; late results remain historical. Branch pushes are journaled with exact remote-ref expectations. Delivery requires linked real deferrals and an explicit accounting completeness record, including unavailable/unknown limits.
 
 Workflow code, skills, schemas, and operating documentation are released together. Consumers pin a release and full Git commit in `.devflow/workflow.lock`. Runtime records, credentials, machine bindings, and usage evidence stay outside this repository.
 
@@ -29,7 +29,7 @@ uv run pytest -q
 
 For installation, prepare a manifest from a clean full commit, review its exact paths and digest, and apply it with separately supplied scope arguments. Enrolled repositories commit three small `.devflow` profile/lock files. Historical attempt pins remain recorded; legacy work requires current admission before further execution, and the current reader never delegates to an older runtime. See [operation](docs/operation.md) for installation, request structure, commands, recovery, and delivery.
 
-A tiny global instruction routes new chats to the [using-devflow entry skill](skills/using-devflow/SKILL.md). This loads instructions only: ordinary questions and unused sessions create no work and do not scan or resume backlog. For requested repository work, the [host skill](skills/devflow/SKILL.md) loads the relevant intake, implementation, review, QA, or delivery reference. There are no hooks, automatic scheduling, or new service. The package introduces no model API keys and does not rewrite user settings. Subagent launches and their resolved settings are recorded explicitly. Private execution state stays outside the source checkout.
+A small global instruction requires reading [using-devflow](skills/using-devflow/SKILL.md) before responding or acting and when intent changes. It creates no work or automatic backlog scan. `skill list` exposes the entry, seven stages and the forwarding `devflow` compatibility name; `skill resolve` returns the selected release’s actual file. `next` names each action’s owning skill. These instructions require routing; they do not intercept arbitrary shell calls or establish compliance from a read acknowledgement. No hooks or scheduler are installed.
 
 ## Verification and adoption
 

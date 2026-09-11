@@ -188,15 +188,24 @@ class NativeHostBridge:
         if assignment.get("task_id"):
             if assignment.get("status") != "ready" or not assignment.get("startup_observation"):
                 raise WorkflowError("assignment_state", "Only verified ready agents may receive work")
+            context = {key: assignment[key] for key in (
+                "assignment_id", "attempt_id", "candidate_id", "scope_hash", "role",
+                "owned_paths", "workspace_reference"
+            )}
+            context["assignment_action_id"] = assignment.get("continuation_of", assignment["action_id"])
+            if assignment.get("workflow_snapshot_id"):
+                context["workflow_snapshot_id"] = assignment["workflow_snapshot_id"]
+            instruction = "Startup is verified. Begin the bounded assignment below. "
+            if assignment.get("continuation_of"):
+                instruction = ("Resume this interrupted activation and preserve its original gate identity. "
+                               "This continues the same candidate and review round. Reason: "
+                               + assignment["continuation_reason"] + "\n")
             return {
                 "native_tool": "followup_task", "operation": "send_role",
                 "assignment_id": assignment["assignment_id"], "action_id": assignment["action_id"],
                 "arguments": {"target": assignment["agent_name"], "message": (
-                    self.marker(assignment) + "\n" + json.dumps({key: assignment[key] for key in (
-                        "assignment_id", "attempt_id", "candidate_id", "scope_hash", "role",
-                        "owned_paths", "workspace_reference"
-                    )}) + "\nStartup is verified. Begin the bounded assignment below. "
-                    "Do not spawn agents. Preserve others' edits in this shared checkout.\n\n" + brief
+                    self.marker(assignment) + "\n" + json.dumps(context) + "\n" + instruction
+                    + "Do not spawn agents. Preserve others' edits in this shared checkout.\n\n" + brief
                 )},
             }
         if assignment.get("status") != "prepared":

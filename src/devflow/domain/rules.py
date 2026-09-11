@@ -24,12 +24,14 @@ ID_FIELDS = {
     "check_evidence": "evidence_id",
     "observation_evidence": "evidence_id",
     "gate_result": "gate_id",
+    "gate_ingestion": "gate_id",
     "finding": "finding_id",
     "fix_verification": "verification_id",
     "delivery": "delivery_id",
     "workflow_snapshot": "snapshot_id",
     "execution_segment": "segment_id",
     "usage": "response_id",
+    "usage_accounting": "accounting_id",
 }
 ACTION_OPERATIONS = {
     "run_check",
@@ -37,6 +39,7 @@ ACTION_OPERATIONS = {
     "launch_role",
     "send_role",
     "publish_pr",
+    "push_branch",
     "publish_finding",
     "reply_finding",
     "resolve_thread",
@@ -51,6 +54,7 @@ PERMISSIONS = {
     "launch_role": "create_tasks",
     "send_role": "create_tasks",
     "publish_pr": "publish_pr",
+    "push_branch": "publish_pr",
     "publish_finding": "publish_findings",
     "reply_finding": "publish_findings",
     "resolve_thread": "publish_findings",
@@ -71,6 +75,105 @@ def require(condition, code, message):
 def subagent_mode(state):
     # Absence on historical stored attempts means the original visible-thread bridge.
     return (state.get("attempt") or {}).get("execution_mode") == "subagent"
+
+
+def stage_contract(state):
+    """Stronger handoffs apply to the attempt's pin, never rewrite old releases."""
+    if not subagent_mode(state):
+        return False
+    snapshot = state["records"].get(
+        "workflow_snapshot:" + state["attempt"]["workflow_snapshot_id"], {}
+    )
+    version = snapshot.get("package_version", "0.0.0").split("-")[0].split(".")
+    return len(version) == 3 and all(v.isdigit() for v in version) and tuple(map(int, version)) >= (0, 5, 0)
+
+
+def pending_gate_results(state):
+    if not stage_contract(state):
+        return []
+    imported = {(r["assignment_id"], r.get("assignment_action_id"))
+                for r in state["records"].values() if r.get("record_type") == "gate_result"}
+    return [a for a in state["assignments"].values()
+            if a["role"] in {"review", "qa"} and a.get("gate_action_id")
+            and (a["assignment_id"], a["gate_action_id"]) not in imported]
+
+
+def require_gate_handoff(state, role=None):
+    pending = pending_gate_results(state)
+    if role in {"review", "qa"}:
+        pending = [a for a in pending if a["role"] == role]
+    require(not pending, "gate_result_required",
+            "Import every activated independent producer's PASS/FAIL/BLOCKED result before repair or reuse")
+
+
+def validate_role_continuation(state, payload):
+    assignment = state["assignments"].get(payload.get("assignment_id"))
+    require(assignment is not None and assignment in pending_gate_results(state)
+            and assignment["status"] in {"interrupted", "ready"}
+            and assignment.get("control_observation", {}).get("agent_status") == "interrupted"
+            and assignment.get("startup_observation")
+            and assignment["candidate_id"] == state["candidate_id"]
+            and assignment["scope_hash"] == state["scope_hash"]
+            and payload.get("continuation_of") == assignment["gate_action_id"]
+            and payload.get("role") == assignment["role"]
+            and payload.get("policy_hash") == assignment["role_policy"]["policy_hash"]
+            and payload.get("brief_hash") == digest(assignment["brief"]),
+            "invalid_continuation", "Resume needs the observed interrupted producer on its original candidate, scope and policy")
+    previous = state["actions"].get(payload.get("previous_action_id"), {})
+    require(previous.get("status") == "confirmed"
+            and previous.get("payload", {}).get("assignment_id") == assignment["assignment_id"],
+            "reconcile_required", "Reconcile the previous host action before continuing its round")
+    return assignment
+
+
+def resume_subagent_assignment(state, request, now):
+    require(subagent_mode(state), "host_mode", "Resume needs a subagent attempt")
+    assignment = state["assignments"].get(request["assignment_id"])
+    require(assignment is not None and assignment["status"] == "interrupted"
+            and isinstance(request.get("reason"), str) and bool(request["reason"].strip()),
+            "invalid_continuation", "Observe interruption and provide a bounded continuation reason")
+    payload = {"role": assignment["role"], "assignment_id": assignment["assignment_id"],
+               "host_kind": "subagent", "agent_name": assignment["agent_name"],
+               "policy_hash": assignment["role_policy"]["policy_hash"],
+               "brief_hash": digest(assignment["brief"]), "dispatch_id": request["operation_id"],
+               "continuation_of": assignment.get("gate_action_id"),
+               "previous_action_id": assignment["action_id"], "reason": request["reason"]}
+    validate_role_continuation(state, payload)
+    action = prepare_action(state, "send_role", payload, {}, now)
+    resumed = assignment | {"status": "ready", "action_id": action["action_id"],
+                            "continuation_of": assignment["gate_action_id"],
+                            "continuation_reason": request["reason"]}
+    save_assignment(state, resumed)
+    return {"assignment": resumed, "action": action}
+
+
+def unresolved_delivery_findings(state):
+    if not stage_contract(state):
+        return []
+    return [f["finding_id"] for f in state["findings"].values()
+            if (f["severity"] == "medium" or f["disposition"] == "deferred")
+            and f["disposition"] not in {"duplicate", "not_a_defect"}
+            and not technically_fixed(state, f, state["candidate_id"])
+            and not (f["disposition"] == "deferred" and f.get("followup_reference")
+                     and f.get("deferral_rationale") and f.get("followup_observation"))]
+
+
+def current_accounting(state):
+    identity = state.get("accounting_id")
+    entry = state["records"].get(f"usage_accounting:{identity}") if identity else None
+    if (entry and entry["attempt_id"] == state["attempt"]["attempt_id"]
+            and entry["candidate_id"] == state["candidate_id"]):
+        return entry
+    return None
+
+
+def require_delivery_accountability(state):
+    if stage_contract(state):
+        require_gate_handoff(state)
+        require(not unresolved_delivery_findings(state), "unresolved_findings",
+                "Medium findings require a verified fix or a linked follow-up with rationale")
+        require(current_accounting(state) is not None, "accounting_required",
+                "Record usage coverage or explicit unknown/unavailable accounting before delivery")
 
 
 def implementation_required(state):
@@ -134,8 +237,11 @@ def prepare_subagent_assignment(state, request, now):
             "role_policy_mismatch", "Assignment role differs from resolved policy")
     require(bool(request["owned_paths"]) and bool(request["brief"].strip()),
             "unbounded_assignment", "A role needs explicit ownership and a bounded brief")
+    require_gate_handoff(state, role)
     existing = state["assignments"].get(identity)
     if existing:
+        if existing.get("gate_action_id") or role == "implementation_worker":
+            require_gate_handoff(state)
         require(existing["role"] == role and existing.get("host_kind") == "subagent",
                 "assignment_conflict", "Cannot change an assignment's role or transport")
         require(existing["role_policy"]["policy_hash"] == policy["policy_hash"],
@@ -153,6 +259,7 @@ def prepare_subagent_assignment(state, request, now):
         require(not peers or (len(peers) == 1 and replaced is peers[0]),
                 "replacement_required", "Reuse the existing role or record its replacement")
         if replaced:
+            require_gate_handoff(state)
             replacement = request.get("replacement_observation")
             if replacement and replacement.get("reason") == "policy_change":
                 from devflow.adapters.codex_host import observed_agent_status
@@ -195,11 +302,15 @@ def prepare_subagent_assignment(state, request, now):
                                                "replaced_by_assignment_id": identity})
         operation = "launch_role"
     assignment.update(candidate_id=state["candidate_id"], scope_hash=state["scope_hash"],
+                      workflow_snapshot_id=state["attempt"]["workflow_snapshot_id"],
                       owned_paths=request["owned_paths"],
                       workspace_reference=request.get("workspace_reference"), brief=request["brief"],
                       status="ready" if existing else "prepared")
     assignment.pop("implementation_result", None)
     assignment.pop("captured_candidate_id", None)
+    assignment.pop("gate_action_id", None)
+    assignment.pop("continuation_of", None)
+    assignment.pop("continuation_reason", None)
     action = prepare_action(state, operation, {
         "role": role, "assignment_id": identity, "host_kind": "subagent",
         "agent_name": assignment["agent_name"], "policy_hash": policy["policy_hash"],
@@ -429,6 +540,35 @@ def blocking_findings(state, candidate_id):
     ]
 
 
+def implementation_action_id(state):
+    workers = [a for a in state["assignments"].values()
+               if a["role"] == "implementation_worker" and a["status"] != "replaced"]
+    return workers[-1]["action_id"] if workers else None
+
+
+def role_gate(state, role):
+    identity = state.get("gate_ids", {}).get(role)
+    if identity:
+        return get(state, "gate_result", identity)
+    if stage_contract(state):
+        # Finding imports invalidate PASS proof, but cannot erase an unaddressed failure.
+        gates = [r for r in state["records"].values() if r.get("record_type") == "gate_result"
+                 and r["role"] == role and r["candidate_id"] == state["candidate_id"]
+                 and not state["records"].get(f"gate_ingestion:{r['gate_id']}", {}).get("historical")]
+        latest = max(gates, key=lambda r: state["records"].get(
+            f"gate_ingestion:{r['gate_id']}", {}).get("admitted_revision", -1), default=None)
+        if latest and latest["status"] != "PASS":
+            return latest
+    return None
+
+
+def gate_needs_repair(state, gate):
+    if not stage_contract(state):
+        return state["phase"] == "implement"
+    ingestion = state["records"].get(f"gate_ingestion:{gate['gate_id']}", {})
+    return ingestion.get("implementation_action_id") == implementation_action_id(state)
+
+
 def required_roles(state):
     tier = state["contract"]["risk"]["tier"]
     return [] if tier == 0 else ["review"] if tier == 1 else ["review", "qa"]
@@ -498,6 +638,10 @@ def prepare_action(
     if payload["candidate_id"] is not None:
         current_candidate(state, payload["candidate_id"])
     if operation in {"launch_role", "send_role"}:
+        if payload.get("continuation_of"):
+            validate_role_continuation(state, payload)
+        else:
+            require_gate_handoff(state, payload.get("role"))
         require(
             payload.get("role") in {"review", "qa", "implementation_worker"},
             "wrong_role",
@@ -613,6 +757,11 @@ def next_actions(state):
         ]
     if state["lifecycle"] == "ready":
         return [{"kind": "prepare_workspace", "reason": "Start the authorized attempt"}]
+    waiting = pending_gate_results(state)
+    if waiting:
+        return [{"kind": "resume_role" if a["status"] == "interrupted" else "import_gate_result", "role": a["role"],
+                 "assignment_id": a["assignment_id"], "assignment_action_id": a["gate_action_id"],
+                 "candidate_id": a["candidate_id"]} for a in waiting]
     if not state["candidate_id"]:
         if implementation_required(state):
             return [role_next(state, "implementation_worker")]
@@ -648,9 +797,8 @@ def next_actions(state):
         result = []
         for role in roles:
             if subagent_mode(state):
-                gate_id = state.get("gate_ids", {}).get(role)
-                gate = get(state, "gate_result", gate_id) if gate_id else None
-                if gate and gate["status"] == "FAIL" and state["phase"] == "implement":
+                gate = role_gate(state, role)
+                if gate and gate["status"] == "FAIL" and gate_needs_repair(state, gate):
                     result.append(role_next(state, "implementation_worker") if (
                         implementation_required(state)
                     ) else {"kind": "request_user_action", "reason": "Review-only gate failed"})
@@ -743,24 +891,40 @@ def next_actions(state):
                 "reason": "Required scenarios lack execution evidence",
             }
         ]
+    unresolved = unresolved_delivery_findings(state)
+    if unresolved:
+        return [{"kind": "resolve_findings", "finding_ids": unresolved,
+                 "reason": "Verify a fix or defer to linked follow-up work with rationale"}]
+    if stage_contract(state) and not current_accounting(state):
+        return [{"kind": "record_accounting", "candidate_id": state["candidate_id"]}]
     return [{"kind": "deliver", "candidate_id": state["candidate_id"]}]
 
 
 def record_evidence(state, record):
-    require(implementation_completed(state), "implementation_incomplete",
+    historical = record.get("candidate_id") != state["candidate_id"]
+    require(historical or implementation_completed(state), "implementation_incomplete",
             "Recorded verification needs the delegated implementation result")
+    if historical and not subagent_mode(state):
+        current_candidate(state, record.get("candidate_id"))
     validate_record(record)
     require(
         record["record_type"] in {"check_evidence", "observation_evidence"},
         "invalid_record",
         "Expected evidence record",
     )
-    candidate = current_candidate(state, record["candidate_id"])
+    candidate = (get(state, "candidate", record["candidate_id"]) if historical
+                 else current_candidate(state, record["candidate_id"]))
     existing = state["records"].get(f"{record['record_type']}:{record['evidence_id']}")
     if existing:
         require(existing == record, "immutable_record", "Evidence identity already exists")
         return
-    acceptance_ids = {a["id"] for a in state["contract"]["acceptance"]}
+    contract = state["contract"]
+    if historical:
+        contracts = [r for r in state["records"].values() if r.get("record_type") == "work_contract"
+                     and scope_hash(r) == candidate["scope_hash"]]
+        require(contracts, "stale_scope", "Historical evidence needs its admitted scope")
+        contract = contracts[-1]
+    acceptance_ids = {a["id"] for a in contract["acceptance"]}
     require(
         set(record["acceptance_ids"]) <= acceptance_ids,
         "unknown_acceptance",
@@ -786,7 +950,7 @@ def record_evidence(state, record):
                 "PASS requires successful execution and assertions or observations",
             )
     save(state, record)
-    if record["record_type"] == "check_evidence":
+    if record["record_type"] == "check_evidence" and not historical:
         previous_id = state["check_ids"].get(record["recipe_id"])
         previous = get(state, "check_evidence", previous_id) if previous_id else None
         state["check_ids"][record["recipe_id"]] = record["evidence_id"]
@@ -796,7 +960,15 @@ def record_evidence(state, record):
             state["gate_ids"] = {}
 
 
-def record_fix(state, record):
+def record_fix(state, record, *, historical=False):
+    if historical:
+        validate_record(record, "fix_verification")
+        require(record["finding_id"] in state["findings"], "unknown_finding", "Unknown historical finding")
+        get(state, "candidate", record["candidate_id"])
+        evidence_records(state, record["evidence_ids"], record["candidate_id"],
+                         record["producer_task_id"], passing=False)
+        save(state, record)
+        return
     validate_record(record, "fix_verification")
     existing = state["records"].get(f"fix_verification:{record['verification_id']}")
     if existing:
@@ -838,34 +1010,73 @@ def record_fix(state, record):
 
 
 def record_gate(state, record):
-    require(implementation_completed(state), "implementation_incomplete",
-            "Gate admission requires the current delegated implementation result")
     validate_record(record, "gate_result")
     existing = state["records"].get(f"gate_result:{record['gate_id']}")
     if existing:
         require(existing == record, "immutable_record", "Gate identity already exists")
         return
-    current_candidate(state, record["candidate_id"])
-    independent_assignment(
-        state,
-        record["assignment_id"],
-        record["producer_task_id"],
-        record["candidate_id"],
-        record["role"],
-    )
-    snapshot = get(state, "workflow_snapshot", state["attempt"]["workflow_snapshot_id"])
-    require(
-        record["scope_hash"] == state["scope_hash"]
-        and record["workflow_hash"] == snapshot["workflow_hash"],
-        "stale_policy",
-        "Gate scope or policy mismatch",
-    )
+    if not subagent_mode(state):
+        current_candidate(state, record["candidate_id"])
+        independent_assignment(state, record["assignment_id"], record["producer_task_id"],
+                               record["candidate_id"], record["role"])
+    candidate = get(state, "candidate", record["candidate_id"])
+    assignment = state["assignments"].get(record["assignment_id"])
+    candidates = [r for r in state["records"].values() if r.get("record_type") == "assignment"
+                  and r["assignment_id"] == record["assignment_id"]]
+    if assignment:
+        candidates.append(assignment)
+    matches = [a for a in candidates if a["candidate_id"] == record["candidate_id"]
+               and a["task_id"] == record["producer_task_id"] and a["role"] == record["role"]
+               and (not record.get("assignment_action_id")
+                    or a.get("gate_action_id", a["action_id"]) == record["assignment_action_id"])
+               and a["status"] in {"running", "completed", "interrupted", "unavailable", "replaced"}]
+    require(matches, "not_independent", "Gate needs its original activated producer assignment")
+    producer = matches[-1]
+    require(producer["task_id"] != state["attempt"]["owner_task_id"],
+            "not_independent", "Coordinator cannot supply an independent gate")
+    if subagent_mode(state):
+        require(producer.get("startup_observation"), "startup_unverified",
+                "Independent result needs observed subagent startup")
+    if producer.get("gate_action_id"):
+        require(bool(record.get("producer_result_artifact_hash")), "producer_result_required",
+                "Import the original producer output artifact with its structured gate result")
+        require(not any(r.get("record_type") == "gate_result"
+                        and r["assignment_id"] == record["assignment_id"]
+                        and r.get("assignment_action_id") == producer["gate_action_id"]
+                        for r in state["records"].values()),
+                "gate_result_conflict", "An activation already has its immutable producer result")
+        require(record.get("assignment_action_id") == producer["gate_action_id"],
+                "gate_activation_mismatch", "Gate must identify its original activation action")
+    attempt = get(state, "attempt", candidate["attempt_id"])
+    snapshot_id = producer.get("workflow_snapshot_id", candidate.get(
+        "workflow_snapshot_id", attempt["workflow_snapshot_id"]))
+    snapshot = get(state, "workflow_snapshot", snapshot_id)
+    require(candidate.get("workflow_snapshot_id", snapshot_id) == snapshot_id,
+            "stale_policy", "Candidate and producer workflow snapshots differ")
+    require(record["scope_hash"] == candidate["scope_hash"] == producer.get("scope_hash", candidate["scope_hash"])
+            and record["workflow_hash"] == snapshot["workflow_hash"],
+            "stale_policy", "Gate must retain its original scope and workflow policy")
+    mismatches = []
+    if record["candidate_id"] != state["candidate_id"]:
+        mismatches.append("candidate")
+    if record["scope_hash"] != state["scope_hash"]:
+        mismatches.append("scope")
+    if not implementation_completed(state):
+        mismatches.append("implementation")
+    if (not assignment or producer["action_id"] != assignment["action_id"]
+            or assignment["status"] == "replaced"):
+        mismatches.append("activation")
+    historical = bool(mismatches)
+    if historical:
+        require(subagent_mode(state), "stale_candidate", "Historical import needs a subagent producer")
+    else:
+        current_candidate(state, record["candidate_id"])
     evidence = evidence_records(
         state,
         record["evidence_ids"],
         record["candidate_id"],
         record["producer_task_id"],
-        record["status"] == "PASS",
+        record["status"] == "PASS" and not historical,
     )
     for identity in record["finding_ids"] + record["blocking_finding_ids"]:
         require(identity in state["findings"], "unknown_finding", "Gate references unknown finding")
@@ -877,7 +1088,7 @@ def record_gate(state, record):
             "stale_fix",
             "Gate fix verification does not match assignment/candidate",
         )
-    if record["status"] == "PASS":
+    if record["status"] == "PASS" and not historical:
         require(
             not record["blocking_finding_ids"]
             and not blocking_findings(state, record["candidate_id"]),
@@ -893,7 +1104,7 @@ def record_gate(state, record):
             "missing_acceptance",
             "Gate evidence must cover every acceptance criterion",
         )
-    if record["status"] == "PASS" and record["role"] == "qa":
+    if record["status"] == "PASS" and record["role"] == "qa" and not historical:
         require(
             not missing_scenarios(state, evidence),
             "missing_scenarios",
@@ -908,12 +1119,23 @@ def record_gate(state, record):
             "QA needs executed assertions or independent product observations",
         )
     save(state, record)
-    state["gate_ids"][record["role"]] = record["gate_id"]
-    state["assignments"][record["assignment_id"]]["status"] = "completed"
-    state["phase"] = "verify" if record["status"] == "PASS" else "implement"
+    save(state, {
+        "schema_version": 1, "record_type": "gate_ingestion",
+        "gate_id": record["gate_id"], "historical": historical, "mismatches": mismatches,
+        "current_candidate_id": state["candidate_id"],
+        "producer_assignment": deepcopy(producer),
+        "implementation_action_id": implementation_action_id(state),
+        "admitted_revision": state["revision"] + 1,
+    })
+    if not historical:
+        state["gate_ids"][record["role"]] = record["gate_id"]
+        if assignment["status"] in {"running", "completed"}:
+            save_assignment(state, assignment | {"status": "completed"})
+        state["phase"] = "verify" if record["status"] == "PASS" else "implement"
 
 
 def verify_delivery(state, record, observation):
+    require_delivery_accountability(state)
     require(implementation_completed(state), "implementation_incomplete",
             "Delivery readback requires the current delegated implementation result")
     validate_record(record, "delivery")
@@ -1168,7 +1390,19 @@ def validate_action_admission(state, action, now):
     )
     if action["payload"]["candidate_id"] is not None:
         current_candidate(state, action["payload"]["candidate_id"])
+    if action["operation"] in {"launch_role", "send_role"}:
+        if action["payload"].get("continuation_of"):
+            validate_role_continuation(state, action["payload"])
+        else:
+            require_gate_handoff(state, action["payload"].get("role"))
+        if action["payload"].get("role") in {"review", "qa"}:
+            require(implementation_completed(state), "implementation_incomplete",
+                    "Independent dispatch needs the completed implementation candidate")
+    if action["operation"] == "run_check":
+        require(implementation_completed(state), "implementation_incomplete",
+                "Check dispatch needs the completed implementation candidate")
     if action.get("terminal_delivery"):
+        require_delivery_accountability(state)
         require(
             not missing_scenarios(state),
             "missing_scenarios",
@@ -1208,7 +1442,7 @@ def validate_action_admission(state, action, now):
 
 
 def transition(original, command, request, now, dependency_states=None, *,
-               trusted_verifier=None, repository=None):
+               trusted_verifier=None, repository=None, deferral_observation=None):
     state = deepcopy(original)
     details = {}
     admission = None
@@ -1404,6 +1638,42 @@ def transition(original, command, request, now, dependency_states=None, *,
                 "Unknown attribution must not invent an origin candidate",
             )
         save(state, record)
+    elif command == "usage.account":
+        active(state)
+        candidate = current_candidate(state)
+        status = request["status"]
+        require(status in {"complete", "partial", "unknown", "unavailable"},
+                "invalid_accounting", "Unknown accounting coverage status")
+        require(bool(request.get("source_reference", "").strip()),
+                "invalid_accounting", "Accounting needs a source reference")
+        limitations = request.get("limitations", [])
+        require(status == "complete" or (limitations and all(str(x).strip() for x in limitations)),
+                "invalid_accounting", "Incomplete accounting needs explicit limitations")
+        segments = [r for r in state["records"].values() if r.get("record_type") == "execution_segment"
+                    and r["attempt_id"] == state["attempt"]["attempt_id"]]
+        segment_ids = {r["segment_id"] for r in segments}
+        usage = [r for r in state["records"].values() if r.get("record_type") == "usage"
+                 and r.get("segment_id") in segment_ids
+                 and any(a["work_id"] == state["work_id"] and a["weight"] > 0
+                         for a in r["allocations"])]
+        tasks = {state["attempt"]["owner_task_id"]} | {
+            a["task_id"] for a in state["assignments"].values() if a.get("task_id")}
+        covered = {r["segment_id"] for r in usage}
+        require(status != "complete" or (usage and segment_ids <= covered
+                and tasks <= {r["task_id"] for r in segments}
+                and all(r.get("source_reference") for r in segments)),
+                "incomplete_accounting", "Complete coverage needs imported usage for every registered task segment")
+        accounting = {"schema_version": 1, "record_type": "usage_accounting",
+                      "accounting_id": "accounting-" + digest(request)[:24],
+                      "attempt_id": state["attempt"]["attempt_id"],
+                      "candidate_id": candidate["candidate_id"], "status": status,
+                      "source_reference": request["source_reference"], "limitations": limitations,
+                      "segment_ids": sorted(segment_ids),
+                      "usage_response_ids": sorted(r["response_id"] for r in usage),
+                      "recorded_at": now.isoformat()}
+        save(state, accounting)
+        state["accounting_id"] = accounting["accounting_id"]
+        details["accounting"] = accounting
     elif command in {"usage.record", "segment.record"}:
         require(
             state["attempt"] is not None,
@@ -1461,6 +1731,8 @@ def transition(original, command, request, now, dependency_states=None, *,
             authority(state, now)
         if command == "host.assign":
             details.update(prepare_subagent_assignment(state, request, now))
+        elif command == "host.resume":
+            details.update(resume_subagent_assignment(state, request, now))
         elif command == "host.activate":
             assignment = state["assignments"].get(request["assignment_id"])
             require(assignment is not None and assignment["status"] == "ready",
@@ -1580,10 +1852,18 @@ def transition(original, command, request, now, dependency_states=None, *,
                                       status == "completed"
                                   ) else "string"}, now)
                     assignment = assignment | {"status": "running"}
+                    if stage_contract(state) and assignment["role"] in {"review", "qa"}:
+                        assignment["gate_action_id"] = action["payload"].get("continuation_of", action["action_id"])
             save_assignment(state, assignment)
             details["assignment"] = assignment
         elif command == "candidate.record":
+            require_gate_handoff(state)
             record = validate_record(request["record"], "candidate")
+            if stage_contract(state):
+                require(record.get("workflow_snapshot_id", state["attempt"]["workflow_snapshot_id"])
+                        == state["attempt"]["workflow_snapshot_id"],
+                        "stale_policy", "Candidate must bind the current workflow snapshot")
+                record = record | {"workflow_snapshot_id": state["attempt"]["workflow_snapshot_id"]}
             require(
                 record["attempt_id"] == state["attempt"]["attempt_id"]
                 and record["scope_hash"] == state["scope_hash"]
@@ -1726,6 +2006,37 @@ def transition(original, command, request, now, dependency_states=None, *,
             state["findings"][record["finding_id"]] = deepcopy(record)
             state["gate_ids"] = {}
             state["phase"] = "implement"
+        elif command == "finding.defer":
+            finding = state["findings"].get(request["finding_id"])
+            require(finding is not None, "unknown_finding", "Unknown finding")
+            from devflow.deferrals import validate_issue_observation
+
+            reference = request.get("followup_reference", "")
+            rationale = request.get("rationale", "")
+            linked_work = request.get("related_work_id")
+            require(isinstance(rationale, str) and bool(rationale.strip()),
+                    "followup_required", "Deferral needs a linked issue or unresolved follow-up work and rationale")
+            if linked_work:
+                lifecycle = (dependency_states or {}).get(linked_work)
+                require(linked_work != state["work_id"] and lifecycle in {"backlog", "ready", "active"}
+                        and reference in {"", f"work:{linked_work}"},
+                        "unverified_followup", "Follow-up work must exist, remain unresolved, and match the reference")
+                reference = f"work:{linked_work}"
+                observation = {"kind": "work_item", "work_id": linked_work, "reference": reference,
+                               "lifecycle": lifecycle, "observed_at": now.isoformat()}
+            else:
+                observation = validate_issue_observation(reference, deferral_observation)
+                prior = finding.get("followup_observation", {})
+                require(prior.get("reference") != reference or all(
+                    prior.get(key) == observation[key] for key in ("issue_id", "issue_node_id")),
+                    "followup_identity_changed", "The same issue URL cannot silently acquire another stable identity")
+            require(finding["disposition"] not in {"verified_fixed", "duplicate", "not_a_defect"},
+                    "invalid_disposition", "Only unresolved findings can be deferred")
+            finding.update(disposition="deferred", followup_reference=reference,
+                           related_work_id=linked_work, deferral_rationale=rationale,
+                           followup_observation=deepcopy(observation))
+            validate_record(finding, "finding")
+            state["records"][f"finding_event:{digest(finding)}"] = deepcopy(finding)
         elif command == "finding.fix":
             finding = state["findings"].get(request["finding_id"])
             require(finding is not None, "unknown_finding", "Unknown finding")
@@ -1753,9 +2064,21 @@ def transition(original, command, request, now, dependency_states=None, *,
         elif command == "fix.record":
             record_fix(state, request["record"])
         elif command == "gate.record":
+            gate = request["record"]
+            peer = state["assignments"].get(gate["assignment_id"], {})
+            historical = subagent_mode(state) and (
+                gate["candidate_id"] != state["candidate_id"] or not implementation_completed(state)
+                or peer.get("status") == "replaced"
+                or (gate.get("assignment_action_id")
+                    and gate["assignment_action_id"] != peer.get("gate_action_id", peer.get("action_id")))
+            )
             for fix in request.get("fix_verifications", []):
-                record_fix(state, fix)
-            record_gate(state, request["record"])
+                require(fix["producer_task_id"] == gate["producer_task_id"]
+                        and fix["assignment_id"] == gate["assignment_id"]
+                        and fix["candidate_id"] == gate["candidate_id"],
+                        "stale_fix", "Gate fix must retain its original producer and candidate")
+                record_fix(state, fix, historical=historical)
+            record_gate(state, gate)
         elif command == "assignment.record":
             record = validate_record(request["record"], "assignment")
             require(not subagent_mode(state) and record.get("host_kind") != "subagent",
@@ -1978,6 +2301,8 @@ def transition(original, command, request, now, dependency_states=None, *,
                         valid_gates(state)[role]["gate_id"] for role in required_roles(state)
                     ],
                 }
+                if stage_contract(state):
+                    payload["accounting_id"] = current_accounting(state)["accounting_id"]
                 if endpoint["kind"] == "pr":
                     requested_refs = request.get("expected_remote_state", {})
                     earlier = []

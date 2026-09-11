@@ -4,7 +4,8 @@ All bodies travel over stdin. Runners follow subprocess.run's keyword contract.
 Reads retry transient transport failures at most three times; writes are attempted
 once and must reconcile through independent reads before they can be confirmed.
 The application must persist an outbox intent before calling a mutating method.
-No tokens, response bodies or subprocess stderr are copied into adapter errors.
+Only allowlisted validation diagnostics are copied into adapter errors; never raw
+response bodies, tokens or subprocess stderr.
 """
 
 from __future__ import annotations
@@ -44,6 +45,51 @@ def _sha(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", value):
         raise WorkflowError("invalid_sha", "An exact Git object ID is required")
     return value
+
+
+def _rejection_details(output: str, status: int) -> dict:
+    """Expose useful schema diagnostics without echoing submitted/private values."""
+    details = {"http_status": status}
+    try:
+        data = json.loads(output)
+    except (TypeError, ValueError):
+        return details
+    if not isinstance(data, dict):
+        return details
+    fields = {"position", "positioning", "subject_type", "line", "side", "path",
+              "commit_id", "body", "in_reply_to", "pull_request_review_id"}
+    codes = {"missing", "missing_field", "invalid", "unprocessable", "already_exists",
+             "custom", "not_permitted"}
+    errors = data.get("errors", [])
+    if not isinstance(errors, list):
+        errors = []
+    normalized = []
+    for error in errors:
+        if isinstance(error, dict):
+            item = {key: error[key] for key, allowed in (("field", fields), ("code", codes))
+                    if isinstance(error.get(key), str) and error[key] in allowed}
+            if item:
+                normalized.append(item)
+    # GitHub's schema-union rejection sometimes uses a single message string.
+    messages = [data.get("message", "")] + [
+        error.get("message", "") if isinstance(error, dict) else error for error in errors
+    ]
+    combined = "\n".join(message for message in messages if isinstance(message, str))
+    for field in sorted(fields):
+        for phrase, code in (("wasn't supplied", "missing_field"),
+                             ("is not a permitted key", "not_permitted")):
+            if re.search(r"(?:[\"']?" + re.escape(field) + r"[\"']?) " + phrase,
+                         combined):
+                normalized.append({"field": field, "code": code})
+    if normalized:
+        details["validation_errors"] = normalized[:30]
+    missing_position = any(e.get("field") in {"position", "positioning"}
+                           and e.get("code") == "missing_field" for e in normalized)
+    incompatible_line = any(e.get("field") in {"line", "subject_type"}
+                            and e.get("code") == "not_permitted" for e in normalized)
+    if status == 422 and missing_position and incompatible_line:
+        details["position_compatibility_rejection"] = True
+    return details
 
 
 class GitHubRepository:
@@ -105,7 +151,7 @@ class GitHubRepository:
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
-            "X-GitHub-Api-Version: 2022-11-28",
+            "X-GitHub-Api-Version: 2026-03-10",
         ]
         if payload is not None:
             argv += ["--input", "-"]
@@ -162,7 +208,8 @@ class GitHubRepository:
                     )
                 if status in {400, 401, 404, 405, 409, 410, 422}:
                     raise WorkflowError(
-                        "github_rejected", "GitHub rejected the operation", {"http_status": status}
+                        "github_rejected", "GitHub rejected the operation",
+                        _rejection_details(output, status)
                     )
                 retry_after = headers.get("retry-after", "")
                 delay = float(retry_after) if retry_after.isdigit() else 2**attempt
@@ -460,25 +507,35 @@ class GitHubRepository:
         )
 
     @staticmethod
-    def _valid_anchor(file: dict, line: int, side: str) -> bool:
+    def _anchor_position(file: dict, line: int, side: str) -> int | None:
+        """Map exact side/line to GitHub's file-relative unified-diff position.
+
+        Positions count every line after the first hunk header, including later
+        hunk headers and no-newline markers. Removed lines belong only to LEFT.
+        """
         old = new = None
+        position = 0
         for entry in file.get("patch", "").splitlines():
             hunk = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", entry)
+            if old is not None:
+                position += 1
             if hunk:
                 old, new = map(int, hunk.groups())
             elif old is not None:
-                if entry.startswith("\\"):
-                    continue
                 prefix = entry[:1]
                 if prefix not in {"+", "-", " "}:
                     continue
                 if side == "LEFT" and prefix != "+" and old == line:
-                    return True
+                    return position
                 if side == "RIGHT" and prefix != "-" and new == line:
-                    return True
+                    return position
                 old += prefix != "+"
                 new += prefix != "-"
-        return False
+        return None
+
+    @staticmethod
+    def _valid_anchor(file: dict, line: int, side: str) -> bool:
+        return GitHubRepository._anchor_position(file, line, side) is not None
 
     def publish_finding(
         self,
@@ -528,7 +585,33 @@ class GitHubRepository:
         try:
             self._api(f"{self.root}/pulls/{int(number)}/comments", method="POST", payload=payload)
         except WorkflowError as exc:
-            if exc.code != "ambiguous_github_action":
+            if (line is not None and exc.details.get("no_mutation") is True
+                    and exc.details.get("position_compatibility_rejection") is True):
+                # Only a definite schema rejection permits a different wire form.
+                # Re-read head and diff; never guess a position or duplicate an
+                # uncertain first write. Context lines have no unique legacy side.
+                current = self.pull_request(number)
+                current_files = self._pages(f"{self.root}/pulls/{int(number)}/files")
+                matches = [file for file in current_files if file["filename"] == path]
+                if (current["head"]["sha"] != expected_head or current["state"] != "open"
+                        or len(matches) != 1 or matches[0] != matching[0]
+                        or self.pull_request(number)["head"]["sha"] != expected_head):
+                    raise WorkflowError("stale_head", "PR diff changed before compatibility retry")
+                position = self._anchor_position(matches[0], line, side)
+                # Legacy position cannot express LEFT on unchanged context.
+                entry = matches[0]["patch"].splitlines()[position]
+                if side == "LEFT" and not entry.startswith("-"):
+                    raise WorkflowError("blocked_anchor", "Legacy anchor cannot preserve LEFT context")
+                fallback = {key: value for key, value in payload.items()
+                            if key not in {"line", "side", "subject_type"}}
+                fallback["position"] = position
+                try:
+                    self._api(f"{self.root}/pulls/{int(number)}/comments",
+                              method="POST", payload=fallback)
+                except WorkflowError as fallback_error:
+                    if fallback_error.code != "ambiguous_github_action":
+                        raise
+            elif exc.code != "ambiguous_github_action":
                 raise
         observed = self._find_publication(number, marker, rendered, path, line, side, expected_head)
         if observed is None:

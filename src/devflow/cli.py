@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
         "command",
         help="doctor, backlog, work, next, candidate, check, gate, finding, "
         "fix, action, assignment, host, artifact, profile, usage, outcome, "
-        "report, install, validate, or deliver",
+        "report, install, skill, validate, or deliver",
     )
     result.add_argument("action", nargs="?", help="Subcommand, such as ready, record, or run")
     result.add_argument("--request-file", help="Structured JSON input file, or - for stdin")
@@ -212,7 +212,7 @@ def _managed_host(action, request, service):
         return service.execute("host.startup", request | {"observation": observation})
     if action == "wait":
         return NativeHostBridge.wait_target(assignment)
-    if action in {"record", "activate", "unavailable", "observe", "result"}:
+    if action in {"record", "activate", "resume", "unavailable", "observe", "result"}:
         return service.execute("host." + action, request)
     if action == "reconcile":
         # The supported inventory contains agent_name/status only. Persist that
@@ -355,11 +355,15 @@ def dispatch(args) -> dict:
     if args.command not in {
         "doctor", "backlog", "work", "next", "candidate", "check", "gate", "finding",
         "fix", "action", "assignment", "host", "artifact", "profile", "usage", "outcome",
-        "report", "install", "validate", "deliver", "workspace", "snapshot", "segment", "evidence",
+        "report", "install", "skill", "validate", "deliver", "workspace", "snapshot", "segment", "evidence",
     }:
         raise WorkflowError("unknown_command", "Unknown workflow command")
     if command == "doctor":
         return _doctor(args)
+    if args.command == "skill":
+        from devflow.skill_routing import resolve_request
+
+        return resolve_request(args.action, request, args)
     from devflow.admission import BOOKKEEPING, READ_ONLY
 
     service = None
@@ -528,6 +532,10 @@ def dispatch(args) -> dict:
             "next": service.next(state["work_id"]),
             "findings": list(state["findings"].values()),
         }
+    if command == "finding.defer":
+        from devflow.deferrals import defer_finding
+
+        return defer_finding(service, request)
     return service.execute(command, request)
 
 

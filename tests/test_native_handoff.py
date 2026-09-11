@@ -153,8 +153,9 @@ def test_blocked_work_suggests_only_recovery_and_the_outstanding_blocker(tmp_pat
     scenario.call("work.block", blocker=blocker)
     actions = scenario.service.next(scenario.work_id)["actions"]
     assert actions == [
-        {"kind": "reconcile_action", "action": scenario.state["actions"][uncertain["action_id"]]},
-        {"kind": "request_user_action", "blocker": blocker},
+        {"kind": "reconcile_action", "action": scenario.state["actions"][uncertain["action_id"]],
+         "skill": "devflow-coordinating", "role_skill": "devflow-implementing"},
+        {"kind": "request_user_action", "blocker": blocker, "skill": "devflow-coordinating"},
     ]
     assert scenario.state["actions"][prepared["action_id"]]["status"] == "prepared"
     with pytest.raises(WorkflowError) as caught:

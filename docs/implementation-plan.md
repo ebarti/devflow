@@ -6,7 +6,7 @@ Design baseline: 2026-09-09; role-execution revision: 2026-09-11. Reusable packa
 
 | Decision | Choice | Why |
 | --- | --- | --- |
-| Packaging | Separate reusable `developer-workflow` repository, `devflow` Python CLI, one host skill and repository profiles | One versioned owner for executable rules and instructions; JobCtrl stays a consumer |
+| Packaging | Separate reusable `developer-workflow` repository, `devflow` Python CLI, stage skills and repository profiles | One versioned owner for executable rules and instructions; JobCtrl stays a consumer |
 | Planning records | GitHub issues and native dependencies; one selected Project as a projection | A self-contained work record close to code and review history |
 | Execution | Original conversation coordinates bounded implementation/review/QA subagents through native tools | Keeps the user's conversation as owner and records independent role identities without creating peer conversations |
 | Local state | Private SQLite and content-addressed evidence, one enrolled execution host per repository | Durable recovery across task/worktree boundaries without a new service |
@@ -45,9 +45,9 @@ developer-workflow/
     reporting.py                   deterministic queries, JSON/CSV/Markdown
     installation.py                manifests, managed links and rollback
   schemas/                         versioned contracts and migration fixtures
-  skills/devflow/SKILL.md           short entry point and command routing
-  skills/devflow/references/
-    intake.md / implementation.md / review.md / qa.md / delivery.md
+  skills/using-devflow/SKILL.md     mandatory applicability and named stage routing
+  skills/devflow-*/SKILL.md         definition, planning, coordination and role/delivery skills
+  skills/devflow/SKILL.md           forwarding compatibility entry
   tests/
     domain/ contract/ adapters/ acceptance/ migration/
   fixtures/repositories/           tiny distinct repository profiles
@@ -175,3 +175,9 @@ Model comparison remains deferred until W09's workflow stability criteria are sa
 The [conversational intake contract](issue-trust.md) replaces the 0.2.0 mandatory independent host verifier. Direct work requests, bug reports/investigation requests, named issues and bounded current backlog selections authorize agent-recorded work without separate approval. One reference may cover the selected batch; future queue items are not automatically selected. The agent interprets authority; persisted request records enforce consistency rather than independently authenticating a human.
 
 Package acceptance requires CLI lifecycle proof without a synthetic verifier: request admission, start, candidate/check execution and continuation; rejection of missing requests and legacy authority substitutes; immutable repository/work/scope/source/operation bindings; unchanged replay; external lineage preservation; old-pin bypass protection; and capture/recovery without duplicate uncertain writes. Entry instructions load in new chats, but ordinary questions and unused sessions create no work or backlog scan/resumption. No hooks, startup actions, automatic scheduling or new service are part of this revision. Native desktop visibility and protected-merge conformance remain independent adoption gates; successful conversational intake cannot stand in for them.
+
+## Stage skill revision (0.5.0)
+
+Eight independently discoverable entries replace the umbrella/reference architecture: using-devflow plus defining-work, planning, coordinating, implementing, reviewing, verifying and delivering. Each defines trigger, inputs, actual output, failure/re-entry behavior and named next skill. Ordinary design discussion applies a method without executing work; direct review preserves its entry; editorial work retains proportional verification. Package and installer retain every stage and immutable pin routing.
+
+Acceptance adds cold design-only and direct-role forward tests, actual next-action skill routing, complete installed discovery, implementation-completion-before-check ordering, all-status independent result persistence before repair, historical result recovery, guarded journaled branch publication, API anchor compatibility without duplicate writes, linked deferrals and explicit accounting completeness. Test interrupted/rejected operations by resuming the same action/attempt; preserve prior failures. A new ordinary adopter backlog run follows reviewed merge and verified local adoption. Stop at its first confirmed workflow failure, preserve state, fix the cause and resume the failed stage. Native forward tests and the ordinary run remain separate from deterministic package proof.

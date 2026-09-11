@@ -20,9 +20,11 @@ Record policy changes as new execution segments. No model or effort is hardcoded
 2. Send only the bootstrap prompt: report the child's own session metadata path and wait. Do not ask it to inspect, edit, review or test the product before validation. Record the actual receipt through `host record`.
 3. The spawn response supplies `task_name` and nickname, without a native UUID. Inventory supplies canonical paths and statuses. Use the returned exact canonical agent path as `agent_name`; do not infer a UUID, effective model or parent from a nickname or inventory.
 4. Use `host startup` with the child's explicit local session path. It validates allowlisted `session_meta` and `turn_context` evidence: parent UUID, exact canonical agent path, actual model and reasoning effort. Bind the observed native UUID for attribution only after validation. Missing effective settings block activation; an unknown service tier stays unknown. Keep the source and normalized evidence private and uncommitted.
-5. After startup passes, `host activate` prepares `send_role`; `host prepare` durably begins it and returns `followup_task`. Invoke that native follow-up, then `host record` with actual inventory to mark the agent running. The bounded brief includes work/scope/assignment identity, acceptance, repository/base/head, owned paths, constraints, check/evidence references, role reference and expected result. Preserve others' edits in shared checkouts and isolate mutable fixtures/resources.
+5. After startup passes, `host activate` prepares `send_role`; `host prepare` durably begins it and returns `followup_task`. Invoke that native follow-up, then `host record` with actual inventory to mark the agent running. The bounded brief includes work/scope/assignment identity, acceptance, repository/base/head, owned paths, constraints, check/evidence references, role skill and expected result. Preserve others' edits in shared checkouts and isolate mutable fixtures/resources.
 
-Capture the candidate using the verified running implementation assignment and producer identity. Then `host result` binds completion to that captured `output_candidate_id` before verification proceeds. Native metadata proves observed execution, not correctness. Review/QA submit candidate-bound results through `gate record`; the coordinator cannot substitute its own PASS. Independent producers must differ from the coordinator, implementation worker and one another.
+For reuse after initial activation, `host assign` itself prepares `send_role`; follow it with `host prepare`, the returned native follow-up and `host record`. Do not call `host activate` a second time for that already-prepared action.
+
+Capture the candidate using the verified running implementation assignment and producer identity. Then `host result` binds completion to that captured `output_candidate_id` before verification proceeds. Native metadata proves observed execution, not correctness. Review/QA submit every PASS/FAIL/BLOCKED through `gate record`, bound to the current activation `assignment_action_id`, before repair or replacement; the coordinator cannot substitute its own PASS. Independent producers must differ from the coordinator, implementation worker and one another.
 
 ## Reuse and reconcile
 
@@ -33,3 +35,19 @@ Follow-up has no model override. A changed policy requires an explicitly recorde
 A lost or uncertain spawn must reconcile before another launch. A single inventory omission does not prove absence or a failed spawn; do not create duplicates from it. Never manufacture a readback or call an unobserved identity verified. Preserve the ambiguous action when supported observations cannot resolve it.
 
 New attempts default to subagent execution. Historical attempts with missing `execution_mode` stay `native_thread`. Preserve their original IDs, receipts, evidence and control contract, including pending client IDs that were never executable task IDs. Do not rewrite historical task runs as subagents or use their visible-task launch instructions for new work.
+
+## Continue an interrupted round
+
+After `interrupt_agent`, record fresh interrupted inventory with `host observe`.
+For unchanged assignment scope/candidate/policy, `host resume` with
+`assignment_id` and a bounded `reason` prepares a continuation. Then use
+`host prepare`, invoke the returned `followup_task`, and `host record`.
+This preserves the original gate activation ID, including after repeated
+interruptions. Return the actual original result before any new assignment,
+candidate, repair or replacement. Resuming is not a new independent gate round.
+
+Before a workflow/profile amendment changes inputs, collect and import pending
+original output. If the role was stopped before completing its proof, a bounded
+continuation reports its actual partial/BLOCKED evidence without further product
+work. Preserve that outcome; do not invent PASS or rewrite its original policy.
+Then amend the same attempt and continue from `next` under the reviewed snapshot.

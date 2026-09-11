@@ -115,6 +115,7 @@ def _endpoint_observation(state, kind, value, verified):
 def _perform(state, action, repository, *, github_factory, git_factory, reconcile):
     remote_started = False
     remote = None
+    git_adapters = []
 
     def tracked_remote(*args):
         nonlocal remote_started, remote
@@ -122,15 +123,25 @@ def _perform(state, action, repository, *, github_factory, git_factory, reconcil
         remote = github_factory(*args)
         return remote
 
+    def tracked_git(path):
+        adapter = git_factory(path)
+        git_adapters.append(adapter)
+        return adapter
+
     try:
         return _perform_operation(
             state, action, repository, github_factory=tracked_remote,
-            git_factory=git_factory, reconcile=reconcile,
+            git_factory=tracked_git, reconcile=reconcile,
         )
     except WorkflowError as exc:
         # Checkout checks precede remote construction. Once an adapter exists,
         # only its complete operation history can establish that no write began.
-        if not remote_started or getattr(remote, "_mutation_may_have_applied", None) is False:
+        git_may_have_written = any(
+            getattr(adapter, "_mutation_may_have_applied", False) for adapter in git_adapters
+        )
+        if not git_may_have_written and (
+            not remote_started or getattr(remote, "_mutation_may_have_applied", None) is False
+        ):
             exc.details["no_mutation"] = True
         raise
 
@@ -167,6 +178,14 @@ def _perform_operation(state, action, repository, *, github_factory, git_factory
             **_endpoint_observation(state, "local", observed_checkout, True),
             "external_id": observed_checkout["path"],
         }
+    if operation == "push_branch":
+        git = git_factory(repository)
+        method = git.reconcile_push if reconcile else git.push_branch
+        value = method(head_ref=payload["head_ref"], expected_head=candidate["head_sha"],
+                       remote_head_sha=refs["remote_head_sha"])
+        if value is None:
+            raise WorkflowError("ambiguous_git_action", "Remote push remains unresolved; do not repeat")
+        return {**base, **value, "refs": refs}
     github = _remote(state, github_factory)
     if operation == "publish_finding":
         finding = state["findings"][payload["finding_id"]]
@@ -462,6 +481,9 @@ def dispatch_action(
                 "message": str(exc),
                 "independent_readback": False,
                 "no_mutation": exc.details.get("no_mutation") is True,
+                "details": {key: value for key, value in exc.details.items()
+                            if key in {"http_status", "validation_errors",
+                                       "position_compatibility_rejection"}},
             }
             # A read-only reconciliation cannot establish that the earlier
             # interrupted invocation did not write, even if this read did not.

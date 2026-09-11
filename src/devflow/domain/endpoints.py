@@ -40,6 +40,23 @@ def validate_endpoint(endpoint):
 def validate_action_target(
     state, operation, payload, refs, *, repository_path=None, terminal=False
 ):
+    if operation == "push_branch":
+        if terminal or state["contract"]["endpoint"]["kind"] not in {"pr", "merge"}:
+            _reject("Branch publication requires an accepted PR or merge endpoint")
+        if (set(payload) - {"scope_hash", "candidate_id"} != {"head_ref"}
+                or set(refs) != {"head_sha", "remote_head_sha"}):
+            _reject("Push requires one branch and exact source/old remote head bindings")
+        head_ref = validate_endpoint({"kind": "pr", "target": payload["head_ref"]})
+        if head_ref == state["contract"]["endpoint"]["target"] or head_ref in {"main", "master"}:
+            _reject("Push source cannot be the accepted target or a canonical branch")
+        candidate = state["records"].get("candidate:" + str(state.get("candidate_id")))
+        if not candidate or refs["head_sha"] != candidate["head_sha"]:
+            _reject("Push source must match the current candidate")
+        remote_head = refs["remote_head_sha"]
+        if remote_head is not None and (not isinstance(remote_head, str) or not re.fullmatch(
+                r"[a-f0-9]{40}|[a-f0-9]{64}", remote_head)):
+            _reject("Old remote head must be an exact object ID or explicit null for creation")
+        return
     if operation not in ENDPOINT_OPERATIONS:
         return
     endpoint = state["contract"]["endpoint"]

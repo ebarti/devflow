@@ -25,6 +25,7 @@ class GitRepository:
     def __init__(self, path: str | Path, runner: Callable | None = None):
         self.path = Path(path).resolve()
         self.runner = runner or subprocess.run
+        self._mutation_may_have_applied = False
 
     def _run(self, *args: str, allowed: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
         try:
@@ -99,6 +100,89 @@ class GitRepository:
             "tree_sha": self.resolve(head, "tree"),
             "clean": not bool(status),
         }
+
+    def _push_target(self, head_ref: str) -> tuple[str, str]:
+        from devflow.domain.endpoints import validate_endpoint
+
+        validate_endpoint({"kind": "pr", "target": head_ref})
+        ref = "refs/heads/" + head_ref
+        self._run("check-ref-format", ref)
+        fetch = self._run("remote", "get-url", "--all", "origin").stdout.splitlines()
+        push = self._run("remote", "get-url", "--push", "--all", "origin").stdout.splitlines()
+        if len(fetch) != 1 or push != fetch or fetch[0].startswith("-"):
+            raise WorkflowError("push_remote_conflict", "Origin must have one identical fetch/push URL")
+        # Resolve once and use this literal URL for both reads and the mutation,
+        # avoiding configured mirror/refspec/follow-tags and pushurl redirection.
+        return ref, fetch[0]
+
+    def _read_remote_head(self, url: str, ref: str) -> str | None:
+        output = self._run("ls-remote", "--refs", "--exit-code", url, ref,
+                           allowed=(0, 2)).stdout.splitlines()
+        if not output:
+            return None
+        matches = [line.split("\t") for line in output]
+        if (len(matches) != 1 or len(matches[0]) != 2 or matches[0][1] != ref
+                or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", matches[0][0])):
+            raise WorkflowError("invalid_git_output", "Remote ref readback was not unique and exact")
+        return matches[0][0]
+
+    def reconcile_push(self, *, head_ref: str, expected_head: str,
+                       remote_head_sha: str | None) -> dict | None:
+        """Read-only recovery: an absent/divergent ref never authorizes another push."""
+        ref, url = self._push_target(head_ref)
+        actual = self._read_remote_head(url, ref)
+        if actual != expected_head:
+            return None
+        return {"status": "pushed", "head_ref": head_ref, "remote_head_sha": actual,
+                "external_id": ref, "independent_readback": True}
+
+    def push_branch(self, *, head_ref: str, expected_head: str,
+                    remote_head_sha: str | None) -> dict:
+        """Publish one exact source SHA with an exact old-ref lease, never rewrite history."""
+        ref, url = self._push_target(head_ref)
+        if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", expected_head):
+            raise WorkflowError("invalid_sha", "Push requires an exact source object ID")
+        if remote_head_sha is not None and not re.fullmatch(
+                r"[a-f0-9]{40}|[a-f0-9]{64}", remote_head_sha):
+            raise WorkflowError("invalid_sha", "Push requires an exact old remote object ID or null")
+        observed = self.observe()
+        if (self._run("symbolic-ref", "--quiet", "HEAD").stdout.strip() != ref
+                or self.resolve(ref) != expected_head or observed["head_sha"] != expected_head
+                or not observed["clean"]):
+            raise WorkflowError("candidate_drift", "Push source differs from the clean candidate branch")
+        actual = self._read_remote_head(url, ref)
+        if actual == expected_head:
+            return {"status": "pushed", "head_ref": head_ref, "remote_head_sha": actual,
+                    "external_id": ref, "independent_readback": True}
+        if actual != remote_head_sha:
+            raise WorkflowError("stale_remote", "Remote branch differs from its expected old head")
+        if actual is not None and not self.is_ancestor(actual, expected_head):
+            raise WorkflowError("non_fast_forward", "Push cannot replace unrelated remote history")
+        self._mutation_may_have_applied = True
+        try:
+            result = self._run("-c", "push.followTags=false", "push", "--porcelain",
+                               "--no-follow-tags", "--recurse-submodules=no",
+                               f"--force-with-lease={ref}:{remote_head_sha or ''}",
+                               url, f"{expected_head}:{ref}", allowed=(0, 1))
+        except WorkflowError:
+            # The server may have accepted the update before transport failed.
+            result = None
+        if result is not None and result.returncode:
+            # Only a complete per-ref porcelain rejection proves nonexecution.
+            rejected = [line.split("\t") for line in result.stdout.splitlines()
+                        if line.startswith("!\t")]
+            if (len(rejected) == 1 and len(rejected[0]) == 3
+                    and rejected[0][1] == f"{expected_head}:{ref}"
+                    and rejected[0][2].startswith(("[rejected]", "[remote rejected]"))):
+                self._mutation_may_have_applied = False
+                raise WorkflowError("push_rejected", "Remote rejected the exact branch update",
+                                    {"no_mutation": True})
+        # Independent read even after a successful process or a lost response.
+        actual = self._read_remote_head(url, ref)
+        if actual != expected_head:
+            raise WorkflowError("ambiguous_git_action", "Push outcome unresolved; reconcile this action")
+        return {"status": "pushed", "head_ref": head_ref, "remote_head_sha": actual,
+                "external_id": ref, "independent_readback": True}
 
     def _ownership_file(self, action_id: str) -> Path:
         common = self._run("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()

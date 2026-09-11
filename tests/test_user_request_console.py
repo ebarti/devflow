@@ -309,7 +309,7 @@ def test_console_historical_pin_cannot_resume_without_recorded_request(console):
     assert current["revision"] == state["revision"]
     assert current["records"]["workflow_snapshot:console-snapshot"]["package_version"] == "0.2.0"
     assert console.call("next", {"work_id": state["work_id"]})["actions"] == [
-        {"kind": "request_user_action", "reason": "user_request_required"},
+        {"kind": "request_user_action", "reason": "user_request_required", "skill": "devflow-coordinating"},
     ]
 
 

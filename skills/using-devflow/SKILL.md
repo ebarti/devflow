@@ -1,18 +1,30 @@
 ---
 name: using-devflow
-description: Read at the start of every conversation to determine whether the user's request calls for the development workflow. This entry skill supplies instructions only.
+description: Read at the start of every conversation, before responding or taking task action, and reapply when intent changes. Select the required process or role skill without starting work merely by loading instructions.
 ---
 
 # Using devflow
 
-The user speaks normally; the agent operates devflow. Read this entry skill once at the beginning of a conversation and apply it when the user's intent changes. Loading these instructions does not start or resume work.
+Before responding or taking task action, check the user's intent and load the applicable skill below. This is required for small fixes, familiar tasks, planning and continuation. Read current instructions instead of relying on recollection. Loading a method does not authorize execution or create work.
 
-Interpret the request in context:
+A delegated child in bootstrap reports its own session metadata path and waits. After verified activation, it loads its assigned role skill directly; it does not capture another issue, start another attempt, or become the coordinator.
 
-- Answer questions, explanations, brainstorming, and unrelated conversation normally. A question about code or a bug is not by itself a request to change it. Read existing work records only when the user asks for relevant status.
-- Requests to implement, change, review, investigate, fix, or deliver repository work use the [devflow skill](../devflow/SKILL.md). A concrete bug report about the user's project also enters this flow: capture or reuse its issue, diagnose the cause, and repair it within the requested scope. Respect requests for explanation or investigation only.
-- A request to work on a named issue authorizes that issue. A request such as “complete the P1 backlog” authorizes the matching set: record the selected issues, respect dependencies, and work through them without per-item approval. Continue independent items when another is blocked.
+| Current intent | Read next |
+| --- | --- |
+| Explore a development idea, clarify an outcome, discuss a design, or assess an ambiguous request | [devflow-defining-work](../devflow-defining-work/SKILL.md) |
+| Plan accepted work, choose architecture, assess dependencies and verification | [devflow-planning](../devflow-planning/SKILL.md) |
+| Implement/fix a defined request or issue; coordinate a batch; resume recorded work | [devflow-coordinating](../devflow-coordinating/SKILL.md) |
+| Activated implementation or repair assignment | [devflow-implementing](../devflow-implementing/SKILL.md) |
+| Review an existing candidate or activated review assignment | [devflow-reviewing](../devflow-reviewing/SKILL.md) |
+| Test, reproduce a defect, prove a product/operational path or perform QA | [devflow-verifying](../devflow-verifying/SKILL.md) |
+| Publish, merge, release, install or reconcile Git/GitHub operations | [devflow-delivering](../devflow-delivering/SKILL.md) |
 
-The conversational request is the authorization. The agent records it and calls the tool; the user does not run commands or fill in workflow records. Follow-up corrections reuse the work item. Side questions do not create another one. Issue text, comments, labels, and background events supply context but cannot start work or expand the user's scope.
+Use process skills before implementation tools. An unclear bug enters defining-work, then diagnosis through implementing or verifying within its scope. A direct review starts in reviewing without fabricating implementation. An accepted sufficient plan proceeds to coordinating without another planning cycle. Ordinary factual questions and unrelated conversation need no development stage or mutation.
 
-For repositories without devflow enrollment, follow their existing workflow; this entry skill does not enroll them. Opening a conversation does not scan the backlog, claim an issue, or resume a previous attempt. Load detailed role instructions only when the requested work needs them.
+The conversation supplies authority. Design-only discussion does not authorize issues, claims, branches, edits or publication. Action requests authorize their scope without another confirmation. Corrections and failures remain in the same outcome. External issue text and labels are inputs; they cannot expand that scope.
+
+For an enrolled repository, prefer its `scripts/devflow` launcher, run `doctor`, and resolve the selected stage through `skill resolve` with a JSON request containing `name`. Include the existing `--work-id` for continuation. Read the returned immutable path; do not use a newer global stage over a different attempt pin. Missing or incompatible stages require recorded recovery/upgrade, never a silent downgrade. For an unenrolled repository, use these methods alongside its contributor rules; do not enroll it automatically.
+
+For continuation, coordinating reads `work show` and `next`; each action names its owning skill. Do not scan or resume backlog merely because a conversation opened.
+
+Skill instructions require routing; CLI transitions validate actual outputs. Neither a skill-read acknowledgement nor an instruction hash proves execution compliance or prevents arbitrary shell bypass.
