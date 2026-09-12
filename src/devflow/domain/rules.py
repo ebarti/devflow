@@ -24,6 +24,7 @@ ID_FIELDS = {
     "assignment": "assignment_id",
     "check_evidence": "evidence_id",
     "observation_evidence": "evidence_id",
+    "operational_recovery": "recovery_id",
     "gate_result": "gate_id",
     "gate_ingestion": "gate_id",
     "gate_result_recovery": "recovery_id",
@@ -508,6 +509,63 @@ def host_receipt(state, assignment, status, external_id, observation, now):
 
 def scope_hash(contract):
     return digest({k: v for k, v in contract.items() if k not in {"title", "scope_revision"}})
+
+
+def operative_workflow(snapshot):
+    return {k: v for k, v in snapshot.items()
+            if k not in {"snapshot_id", "captured_at", "continuation_upgrade"}}
+
+
+def recover_operational_blocker(state, request, now):
+    """Recover an operational stop without manufacturing product evidence."""
+    authority(state, now, "edit")
+    require(state["candidate_id"] is None and state["phase"] == "implement"
+            and state["blocker"] is not None and subagent_mode(state),
+            "invalid_recovery_state", "Operational recovery requires blocked pre-candidate implementation")
+    require(not request.get("evidence_ids"), "invalid_request",
+            "Operational recovery cannot substitute for candidate evidence")
+    require(not any(a["status"] in {"prepared", "dispatched", "ambiguous", "pending_setup"}
+                    for a in state["actions"].values()),
+            "reconcile_required", "Resolve every outstanding operation before operational recovery")
+    require_gate_handoff(state)
+    require_implementation_handoff(state)
+    require(not any(a["status"] in {"prepared", "running", "pending_startup", "pending_setup"}
+                    for a in state["assignments"].values()),
+            "recovery_worker_unavailable", "Stop every active producer before operational recovery")
+    record = validate_record(request["operational_recovery"], "operational_recovery")
+    worker = state["assignments"].get(record["assignment_id"])
+    require(worker is not None and worker["role"] == "implementation_worker"
+            and worker.get("host_kind") == "subagent" and worker.get("startup_observation")
+            and worker.get("task_id") == record["producer_task_id"]
+            and worker["attempt_id"] == state["attempt"]["attempt_id"]
+            and worker["scope_hash"] == state["scope_hash"]
+            and implementation_policy_matches(state, worker),
+            "recovery_worker_mismatch", "Recovery must retain the verified current implementation worker")
+    action = state["actions"].get(worker["action_id"], {})
+    result = worker.get("implementation_result", {})
+    stopped = worker.get("control_observation", {})
+    require(action.get("operation") == "send_role" and action.get("status") == "confirmed"
+            and record["assignment_action_id"] == worker["action_id"]
+            and result.get("assignment_action_id") == worker["action_id"]
+            and result.get("status") == "blocked" and result.get("output_candidate_id") is None,
+            "recovery_result_mismatch", "Import the original activation's partial BLOCKED output")
+    require(worker["status"] in {"blocked", "completed"}
+            and stopped.get("agent_status") == "completed"
+            and stopped.get("assignment_action_id") == worker["action_id"]
+            and stopped.get("status_evidence_kind") == "completed_object"
+            and stopped.get("source_reference"),
+            "recovery_worker_unavailable", "Observe the original activation stopped and available before recovery")
+    snapshot = get(state, "workflow_snapshot", state["attempt"]["workflow_snapshot_id"])
+    expected = {"work_id": state["work_id"], "attempt_id": state["attempt"]["attempt_id"],
+                "blocked_revision": state["revision"], "blocker_hash": digest(state["blocker"]),
+                "scope_hash": state["scope_hash"], "workflow_snapshot_id": snapshot["snapshot_id"],
+                "workflow_snapshot_hash": digest(snapshot), "result_hash": digest(result),
+                "availability_hash": digest(stopped)}
+    require(all(record[key] == value for key, value in expected.items()),
+            "stale_recovery", "Recovery proof does not match the current blocker, revision or operative inputs")
+    save(state, record)
+    state["blocker"] = None
+    return {"operational_recovery": record}
 
 
 def input_signature(candidate, evidence):
@@ -1722,6 +1780,11 @@ def transition(original, command, request, now, dependency_states=None, *,
                 or request.get("workflow_snapshot", {}).get("snapshot_id", state["attempt"]["workflow_snapshot_id"])
                 != state["attempt"]["workflow_snapshot_id"]):
             require_implementation_handoff(state)
+        blocked_noop = False
+        if command == "work.amend" and state["blocker"] and scope_hash(record) == state["scope_hash"]:
+            current_snapshot = (get(state, "workflow_snapshot", state["attempt"]["workflow_snapshot_id"])
+                                if state["attempt"] else {})
+            blocked_noop = operative_workflow(request.get("workflow_snapshot", current_snapshot)) == operative_workflow(current_snapshot)
         state["scope_hash"] = scope_hash(record)
         # Caller-written Authority records are historical claims, never decisions.
         auth = derived_authority(admission)
@@ -1748,7 +1811,7 @@ def transition(original, command, request, now, dependency_states=None, *,
         state["candidate_id"] = None
         state["gate_ids"] = {}
         state["check_ids"] = {}
-        state["blocker"] = None
+        state["blocker"] = deepcopy(original["blocker"]) if blocked_noop else None
         for action in state["actions"].values():
             if action["status"] == "prepared":
                 action["status"] = "invalidated"
@@ -1971,6 +2034,7 @@ def transition(original, command, request, now, dependency_states=None, *,
                 if "agent_status" in observation:
                     status = observed_agent_status(observation["agent_status"])
                     control = {"agent_name": assignment["agent_name"], "agent_status": status,
+                               "assignment_action_id": assignment["action_id"],
                                "source_reference": observation["source_reference"],
                                "status_evidence_kind": "completed_object" if status == "completed" else "string"}
                     assignment = assignment | {"control_observation": control}
@@ -2576,13 +2640,19 @@ def transition(original, command, request, now, dependency_states=None, *,
         elif command == "work.reconcile":
             # Reconciliation never invents a remote readback or clears an uncertain action.
             if request.get("clear_blocker"):
-                require(
-                    bool(request.get("evidence_ids")),
-                    "missing_evidence",
-                    "Clearing a blocker requires evidence",
-                )
-                evidence_records(state, request["evidence_ids"], state["candidate_id"])
-                state["blocker"] = None
+                if "operational_recovery" in request:
+                    details.update(recover_operational_blocker(state, request, now))
+                else:
+                    require(
+                        bool(request.get("evidence_ids")),
+                        "missing_evidence",
+                        "Clearing a blocker requires evidence",
+                    )
+                    evidence_records(state, request["evidence_ids"], state["candidate_id"])
+                    state["blocker"] = None
+            else:
+                require("operational_recovery" not in request, "invalid_request",
+                        "Operational recovery requires clear_blocker")
         elif command == "work.block":
             blocker = request["blocker"]
             require(

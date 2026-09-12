@@ -65,6 +65,9 @@
     },
     {
       "$ref": "#/$defs/WorkContinuation"
+    },
+    {
+      "$ref": "#/$defs/OperationalRecovery"
     }
   ],
   "$defs": {
@@ -3206,6 +3209,107 @@
           "additionalProperties": false
         }
       }
+    },
+    "OperationalRecovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "operational_recovery"
+        },
+        "recovery_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "work_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_snapshot_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "assignment_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "assignment_action_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "producer_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_reference": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "blocker_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "scope_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "workflow_snapshot_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "result_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "availability_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "artifact_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "blocked_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "schema_version",
+        "record_type",
+        "recovery_id",
+        "work_id",
+        "attempt_id",
+        "workflow_snapshot_id",
+        "assignment_id",
+        "assignment_action_id",
+        "producer_task_id",
+        "source_reference",
+        "summary",
+        "blocker_hash",
+        "scope_hash",
+        "workflow_snapshot_hash",
+        "result_hash",
+        "availability_hash",
+        "artifact_hash",
+        "blocked_revision",
+        "observed_at"
+      ]
     }
   }
 }

@@ -94,10 +94,13 @@ Reused implementation results bind `assignment_action_id` from their actual nati
 | Active/Deliver | deliver | Current authority, remote refs and required checks match; no Blocker/High; readback succeeds | Done with delivery record |
 | Active/* | external blocker | Missing access, dependency, user decision, unavailable gate or ambiguous action | Same phase with explicit blocker |
 | Blocked attempt | reconcile/resume | Blocker cleared by evidence, no competing owner, state consistent | Previous phase, or earlier phase if proof invalidated |
+| Blocked delegated Implement, no candidate | reconcile with `operational_recovery` | Current edit authority; exact work/attempt/revision/blocker/scope/snapshot; verified original activation, imported BLOCKED output and stopped availability; valid remediation artifact; no pending action or producer result | Immutable recovery record and history; clear matching blocker while preserving phase, attempt, authority, policy, worker and original output |
 | Active/* | accepted scope amendment | Recorded user delta | New scope; invalidate affected proof and resume correct phase |
 | Any nonterminal state | cancel | Explicit cancellation authority | Canceled; stop only owned work, retain candidate/evidence |
 | Done with verified PR | reopen | Fresh bounded request for the same PR, original coordinator, resolved actions/results, consistent refs and claim | Same attempt Active at the actual continuation phase; original delivered proof stays immutable and changed-input proof is invalidated |
 | Done | new user-discovered defect | Confirmed affected version and invariant | Linked repair item/attempt; previous delivery record remains immutable |
+
+An amendment with unchanged operative scope/source and workflow inputs retains an existing blocker. Title, scope revision, snapshot ID, capture timestamp and continuation metadata alone do not establish operational recovery. Historical records remain readable. The separate [operational recovery contract](../skills/devflow-coordinating/references/operational-recovery.md) does not relax candidate-bound ObservationEvidence or implementation completion guards.
 
 PR creation, an AI final message, GitHub issue closure, a card moved to Done, test command exit 0 and an expired lease are not completion events.
 
