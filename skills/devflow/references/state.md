@@ -29,7 +29,7 @@ The database defaults to `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.loca
 
 Use stable IDs for created records. Retrying a creation with the same stored facts returns the existing record; different facts under that ID fail. After a work, run or finding has been updated, read its current state instead of replaying an outdated creation. Give each distinct run, result or usage observation its own ID. Work, runs and findings can be updated; updates retain change history. Finish a started run with `run update`, preserving its ID. Updating start/end timestamps recalculates duration unless you explicitly supply it. An optional stable `--event-id` makes an update retry explicit. Updating fields already at the requested values is a no-op.
 
-Writes accept `--file /path/to/record.json`, containing one JSON object with snake_case keys. Flags override fields in that file. A JSON `null` clears an optional update field. Use `--help` on the specific command for its flags. Timestamps use ISO 8601 with a timezone. Optional facts remain unknown when omitted; the helper supplies record timestamps, not inferred status or model settings.
+Writes accept `--file /path/to/record.json`, containing one JSON object with snake_case keys. Flags override fields in that file. Clear optional fields with JSON `null`, or a blocker with `--blocker ''`. Use `--help` on the specific command for its flags. Timestamps use ISO 8601 with a timezone. Optional facts remain unknown when omitted; the helper supplies record timestamps, not inferred status or model settings.
 
 ## Useful fields
 
