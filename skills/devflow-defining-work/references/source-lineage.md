@@ -16,9 +16,17 @@ source readback; do not invent them or drop that material to pass preparation.
 
 Given `capture` and `other_consumed_observations` (an empty list only when no
 other material was consumed), run this mapping with the executing release's
-Python environment:
+Python environment. Direct Python helpers bypass the managed launcher's
+bytecode setting. Keep the preface below before any `devflow` import, including
+in a surrounding helper, so importing the package cannot add cache files to the
+marked release. Selecting its virtual environment alone does not suppress
+bytecode; direct invocation with `python -B` also provides that protection.
 
 ```python
+import sys
+
+sys.dont_write_bytecode = True
+
 from copy import deepcopy
 
 from devflow.validation import digest

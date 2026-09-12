@@ -73,8 +73,10 @@ class IntakeConsole:
         code = recipe.read_text().split("```python\n")[1].split("```")[0]
         script = ("import json,sys\ncapture,other_consumed_observations=json.load(sys.stdin)\n"
                   + code + "\nprint(json.dumps(source))\n")
+        helper_env = {key: value for key, value in self.env.items()
+                      if key not in {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"}}
         run = subprocess.run([sys.executable, "-c", script], input=json.dumps([capture, other]),
-                             capture_output=True, text=True, check=False, timeout=30, env=self.env)
+                             capture_output=True, text=True, check=False, timeout=30, env=helper_env)
         (self.path / "documented-mapping.json").write_text(json.dumps({
             "capture": capture, "other_consumed_observations": other, "executed_code": code,
             "exit_code": run.returncode, "stdout": run.stdout, "stderr": run.stderr}, indent=2) + "\n")
