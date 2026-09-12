@@ -289,6 +289,8 @@ def main():
         kind = getattr(args, "record_type", args.command)
         if kind in FIELDS:
             values.update({key: getattr(args, key) for key in FIELDS[kind].split() if getattr(args, key, None) is not None})
+            if kind == "work" and getattr(args, "blocker", None) == "":
+                values["blocker"] = None
         with closing(connect(args.db)) as db, db:
             db.execute("BEGIN IMMEDIATE")
             if args.command == "metrics":
