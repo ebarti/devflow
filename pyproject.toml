@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "developer-workflow"
-version = "0.5.3"
+version = "0.5.4"
 description = "Versioned development workflow and execution evidence"
 requires-python = ">=3.12"
 dependencies = ["jsonschema>=4.23,<5"]

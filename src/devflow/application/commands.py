@@ -15,6 +15,7 @@ from devflow.admission import (
     TrustedIntakeVerifier,
     execution_admission,
     requested_admission,
+    source_prerequisites,
 )
 from devflow.domain.rules import (
     PERMISSIONS,
@@ -168,7 +169,8 @@ class WorkflowService:
                 validate_record(record, "work_contract")
             except WorkflowError as exc:
                 return {"ready": False, "missing": [str(exc)], "authority_required": True}
-            return {"ready": False, "missing": [], "authority_required": True, "record": record}
+            return {"ready": False, "missing": source_prerequisites(record["source"]),
+                    "authority_required": True, "record": record}
         if command == "next":
             return self.next(request["work_id"])
         for key in ("operation_id", "work_id", "expected_revision"):

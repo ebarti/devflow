@@ -103,6 +103,17 @@ def requested_admission(state, request, verifier, now, *, repository):
     )
 
 
+def source_prerequisites(source):
+    """Execution prerequisites beyond the legacy-compatible Source schema."""
+    lineage = source.get("lineage", [])
+    missing = []
+    if not lineage:
+        missing.append("source.lineage")
+    if source.get("consumed_digest") != digest(lineage):
+        missing.append("source.consumed_digest")
+    return missing
+
+
 def execution_admission(state, contract, admission_id, verifier, now, *, repository=None,
                         operation=None, requested=None):
     """One predicate for admission, continuation and actual dispatch.
@@ -136,8 +147,7 @@ def execution_admission(state, contract, admission_id, verifier, now, *, reposit
     source = contract.get("source", {})
     lineage = source.get("lineage", [])
     if (
-        not lineage
-        or source.get("consumed_digest") != digest(lineage)
+        source_prerequisites(source)
         or admission["source"] != source
         or admission["source_digest"] != digest(source)
     ):
