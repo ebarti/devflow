@@ -1,7 +1,0 @@
-{
-  "edit_path": "CHANGELOG.md",
-  "original_text": "# Changelog\n- Original local note.\n",
-  "accepted_text": "# Changelog\n- Clarify the local handoff.\n",
-  "recipe_id": "notes",
-  "output_marker": "NOTES_INVARIANT_OBSERVED"
-}
