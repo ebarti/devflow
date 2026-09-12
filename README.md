@@ -70,4 +70,4 @@ bash scripts/check-install.sh
 
 Devflow CI runs only this installation smoke check. It does not run package test suites, review/QA gates or delivery automation. Target projects retain their own check policies.
 
-[Architecture](docs/architecture.md) · [Contributor guide](docs/implementation-plan.md)
+[Architecture](docs/architecture.md)
