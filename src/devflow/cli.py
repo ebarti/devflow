@@ -397,6 +397,7 @@ def dispatch(args) -> dict:
         validate_record(request)
         return {"valid": True, "record_type": request["record_type"]}
     if command == "work.prepare":
+        from devflow.admission import source_prerequisites
         from devflow.validation import validate_record
 
         record = request.get("record", {})
@@ -404,7 +405,8 @@ def dispatch(args) -> dict:
             validate_record(record, "work_contract")
         except WorkflowError as exc:
             return {"ready": False, "missing": [str(exc)], "authority_required": True}
-        return {"ready": False, "missing": [], "authority_required": True, "record": record}
+        return {"ready": False, "missing": source_prerequisites(record["source"]),
+                "authority_required": True, "record": record}
     if command == "report.usage":
         from devflow.reporting import usage_report
 

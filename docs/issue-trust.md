@@ -20,6 +20,8 @@ One request reference can authorize the existing members selected by a bounded b
 
 The source retains its lineage array and `consumed_digest`. Consumed issue content, comments, attachments and external PR heads retain exact identity, revision and digest where recorded. Changed consumed inputs or scope require a corresponding amendment within user authorization. Mutable presentation metadata or unrelated issue edits do not silently amend the accepted contract.
 
+The [capture-to-source recipe](../skills/devflow-defining-work/references/source-lineage.md) maps confirmed issue metadata into a lineage observation and preserves inherited and other consumed material. The aggregate source digest hashes the entire lineage list, not just the captured issue content. `work prepare` reports missing lineage or an absent/incorrect aggregate without creating state or authority; `work ready` retains the same exact-source admission guard. Historical schema readability does not imply execution readiness.
+
 Start, resumption, candidate/check work, action preparation/retry/begin and native handoff preparation validate the stored admission's bindings and operation limits. Default continuation needs no synthetic or independent verifier and no repeated approval for the same authorized work. Optional constructor-injected `TrustedIntakeVerifier` support remains for legacy embedding integrations; it is not required by the conversational CLI path.
 
 ## Capture is bookkeeping

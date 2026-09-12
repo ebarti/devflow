@@ -15,7 +15,7 @@ The initial commands are:
 | `devflow doctor` | Repository path, installed package and host capability report | Checks tool versions, profile, bindings, private store, permissions and required capabilities; no mutations |
 | `devflow backlog capture/show/list/retry` | Stable work ID; first capture also needs existing issue number or sanitized title/body | Journals before gh creation; discovers saved requests; reconciles uncertainty; explicit retry only after proven non-mutation |
 | `devflow work list` | Repository | Discovers recorded work IDs and lifecycle without the previous conversation |
-| `devflow work prepare` | Issue/local intake reference | Normalizes the request; reports missing Ready fields; no invented requirements |
+| `devflow work prepare` | Proposed work contract | Reports schema errors and missing execution-source lineage/aggregate digest using the admission prerequisite; returns the unchanged valid record, creates no state/authority and never grants Ready |
 | `devflow work ready` | Accepted contract with consumed source lineage and `user_request` (`reference`, `summary`, `allowed_operations`) | Derives immutable request admission/authority and verifies prerequisites, stores scope and marks Ready; missing request blocks admission |
 | `devflow work start` | Ready work ID, host/original coordinator identity, expected revision and actual entry phase | Claims one attempt, defaults new execution to subagents, captures effective policy/configuration and schedules workspace/assignment actions |
 | `devflow work amend` | New scope plus `user_request` recording the authorized amendment; current `workflow_snapshot` when an active attempt's pin/profile changed | Validates the snapshot, preserves historical records, appends scope revision and invalidates affected acceptance/proof and prepared actions |
@@ -43,7 +43,7 @@ The initial commands are:
 
 `next` chooses from a closed vocabulary: `prepare_scope`, `prepare_workspace`, `launch_role`, `activate_role`, `observe_role`, `resume_role`, `wait_roles`, `import_gate_result`, `request_user_action`, `resolve_findings`, `capture_candidate`, `implement`, `repair_findings`, `run_check`, `push_branch`, `publish_candidate`, `publish_findings`, `close_fixed_threads`, `record_accounting`, `deliver`, `reconcile_action`, `done`. It does not synthesize arbitrary shell commands. Engineering instructions come from the owning stage skill, role brief and repository recipe. A completed producer's `import_gate_result` action includes the bounded recovery command when applicable; valid original output still imports directly.
 
-Users need not fill these records manually. They ask for work or select a Ready issue. The host skill captures engineering judgments once, and the CLI fills IDs, timestamps, hashes, refs, task links and accounting automatically.
+Users need not fill these records manually. They ask for work or select a Ready issue. The agent assembles the observed source and its aggregate digest and captures engineering judgments; the CLI derives the workflow identities and records timestamps, refs, task links and accounting.
 
 ## 2. Records and invariants
 
@@ -69,6 +69,8 @@ Endpoint target syntax is explicit: a `local` target is the canonical absolute c
 [Conversational intake](issue-trust.md) specifies the 0.3.0 request admission protocol, immutable source bindings, bounded batch selection and retained old-pin exception. The agent supplies the request from conversation; it is not independent human authentication. Legacy Authority and Source shapes remain readable, but they cannot substitute for a user request. Continuation validates the stored admission without a separate approval channel or synthetic verifier.
 
 The JSON Schema validates record shape. Pure domain functions enforce cross-record rules and references. For example, JSON Schema cannot prove a fixing commit is contained in a remote PR; the Git/GitHub adapter supplies that observation and the transition rule requires it.
+
+Source lineage remains optional for historical schema reads. Preparation and execution admission share the stronger prerequisite: nonempty `source.lineage` and `source.consumed_digest == devflow.validation.digest(lineage)`. Preparation names missing or incorrect fields in `missing`; admission still rejects incomplete source with `admission_source`. The agent uses the [capture-to-source recipe](../skills/devflow-defining-work/references/source-lineage.md) to preserve exact observed IDs, revisions, origins and issue content digests separately from the lineage aggregate. Neither the recipe nor preparation invents provenance or supplies conversational authority.
 
 Scope identity is a SHA-256 hash of canonical normalized accepted fields, excluding mutable presentation, counters and timestamps. Workflow identity includes the installed package, used skill/reference bytes, applicable instructions and repository profile. Model-routing policy is hashed separately. Candidate identity uses actual Git refs/tree; it is not the workflow version.
 
