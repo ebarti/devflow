@@ -21,6 +21,8 @@ Prepare a JSON request containing a clean source checkout, its full commit SHA, 
 
 Release files live under `<install-root>/releases/<revision>`; isolated Python environments live under `<install-root>/environments/<revision>`. The manifest returns the exact runtime command. Its skill-link map can install both `using-devflow` and `devflow` from the reviewed release; the tiny global loader and any command launcher are explicit managed installation targets, not startup actions. Installation does not rewrite model settings. Installing a skill entry and enrolling a product repository are separate operations. A shared global entry must retain a route for non-enrolled repositories and draining attempts before any legacy entry is replaced.
 
+Direct Python helpers using an installed package must suppress bytecode before importing `devflow`: use `python -B` or set `sys.dont_write_bytecode = True` before package imports, as the [source mapping recipe](../skills/devflow-defining-work/references/source-lineage.md) does. The managed launcher's environment guard does not automatically apply to direct virtual-environment Python calls. Read-only source files do not prevent new cache files in their directories; those files correctly invalidate the release marker. Preserve the complete installed file set and use the normal integrity-checked CLI afterward.
+
 If a process stops during installation, rerun apply or rollback with the original approved plan. The private journal reconciles each actual target against its recorded before/after states. An intervening user edit blocks further writes. Rollback restores managed targets and preserves releases, runtime evidence, worktrees, and GitHub history.
 
 ## Repository profile and pin
