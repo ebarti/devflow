@@ -1,28 +1,14 @@
 ---
 name: devflow-coordinating
-description: Coordinate a defined repository request, named issue, bounded backlog batch or existing attempt. Own admission, durable stage handoffs, native subagent startup and recovery.
+description: Carry a defined development request or bounded batch through execution, track its outcomes, and recover interrupted work.
 ---
 
 # Coordinate the outcome
 
-Input: authorized scope, acceptance/check plan, endpoint and existing work ID. Output: durable assignments, imported producer results and the next stage. The original user conversation owns coordination.
+Use the user's request and target project instructions to choose the next useful action. Reuse the [work record](../devflow/references/state.md) for the same outcome; record scope, progress, evidence and the concrete next step. Do not scan or resume a backlog merely because the skill loaded.
 
-For continuation, recover through `backlog list`/`work list`, then `work show` and `next`; reuse work, attempt, candidate, action and role identities. Classify the explicitly requested completed-PR recovery below before ordinary doctor preflight. Read the skill named by each action. Do not start another work item to escape an unresolved operation.
+Handle small work directly. If delegation is authorized and useful, use native host capabilities with bounded ownership, sufficient context and the user's model settings. Tell collaborators they share the codebase and must preserve others' edits. Do not create agents just to satisfy a stage diagram.
 
-If a verified PR outcome is already Done and the user requests further repair or update of that same PR, use [completed PR continuation](references/completed-pr.md). `work reopen` records the new authority and continuation; ordinary `work amend` cannot reactivate terminal work. Keep the earlier delivery as history.
+Use [implementation](../devflow-implementing/SKILL.md), [review](../devflow-reviewing/SKILL.md), [verification](../devflow-verifying/SKILL.md) and [delivery](../devflow-delivering/SKILL.md) as the request and project policy require. Record actual role runs and outcomes, including failed or limited results, before repairs obscure them. Keep findings linked to their fixes and follow-up evidence.
 
-When that owned checkout retains an older pin, use the reviewed installed release to read state and PR identity, capture the explicit upgrade and reopen the same work before requiring ordinary readiness. Then require that release's `doctor --work-id <existing-id>` to be READY before activating a role. Pre-admission BLOCKED caused by the historical pin is an expected diagnostic; missing tools, invalid profile/release, unresolved operations and failed admission still block. Do not execute the old release or change its pin before authority. For all other enrolled work, run the pinned launcher and `doctor`, including the existing `--work-id` for continuation.
-
-If definition/check coverage is missing, hand off to [defining-work](../devflow-defining-work/SKILL.md) or [planning](../devflow-planning/SKILL.md). Admit the conversational request and snapshot through the [intake procedure](../devflow-defining-work/references/intake.md). Preserve the actual entry phase for review-only/delivery-only work.
-
-Delegate implementation/repairs to a bounded worker and required review/QA to distinct independent agents. Read [host protocol](references/host-protocol.md) before launch, activation, replacement or native reconciliation. Journal dispatch, verify actual startup identity/settings, then activate the role skill and self-contained brief. Reuse available roles; preserve others' edits and isolate fixtures.
-
-The worker returns a captured candidate and producer result. Persist `host result` before recorded `check run` or independent gates. Preliminary implementation probes do not replace candidate-bound registered verification.
-
-Before review/QA handoff, supply each check's evidence ID, artifact hash and explicit private state root. Verify that its [retained check artifact](../devflow-verifying/references/check-evidence.md) is readable. Command argv and temporary report paths are execution history; CLI response envelopes are not the underlying test output.
-
-For every activated review/QA round, import its actual PASS, FAIL or BLOCKED and findings before repair, candidate replacement or rerun. Bind the result to activation `assignment_action_id`; do not overwrite it when reusing an assignment. Save the producer’s bare gate-result JSON as an artifact; import exactly its parsed fields plus `producer_result_artifact_hash` (no hash inside the original JSON). Import independent fix observations before evaluating its gate. Completion messages notify after durable integration. Late results remain historical and cannot validate the current candidate.
-
-On failure, preserve the cause, original response and state. Collect outstanding independent results before repair. If the user asks to stop at the first failure, stop active work through supported host control, observe stopped status, record the blocker and reconcile before resuming the same attempt. Use [result recovery](references/result-recovery.md) for interrupted rounds or malformed completed output; preserve the producer and activation. Before an amendment changes scope or policy, stop affected active roles and record their actual status. Import the implementation worker's partial/BLOCKED output and independent round results before changing those inputs, then rebind and activate the available roles under the new snapshot. Clearing a blocker does not establish a fix.
-
-Handoff: checks/QA → [verifying](../devflow-verifying/SKILL.md); implementation/repair → [implementing](../devflow-implementing/SKILL.md); review → [reviewing](../devflow-reviewing/SKILL.md); endpoint → [delivering](../devflow-delivering/SKILL.md). Missing capability is a durable blocker, never a substitute PASS.
+When the user requests continuation, read the existing record and inspect the actual checkout, artifacts and external state. Reconcile uncertain actions before retrying them; a saved intention is not proof of completion. Resume the same outcome and preserve previous results. Report what is implemented, checked, published or blocked with the evidence and next action needed.

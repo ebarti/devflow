@@ -1,22 +1,14 @@
 ---
 name: devflow-reviewing
-description: Independently review an existing code candidate or verify a claimed repair. Use for direct review requests and activated review gates, including all PASS, FAIL and BLOCKED results.
+description: Review an existing code change for actionable defects, contract violations and meaningful coverage, or verify a claimed repair.
 ---
 
-# Review independently
+# Review the candidate
 
-Input: a specific candidate/PR and acceptance/contracts; for a managed gate, its verified independent assignment and activation action. Output: evidence, every confirmed finding, fix observations, limits and a candidate-bound verdict.
+Establish the actual diff and relevant project contracts. Trace changed behavior through callers and consumers, including realistic failure paths. Seek evidence that could disprove the implementation's claim; passing tests alone do not establish the claimed coverage.
 
-A direct read-only review begins here without inventing implementation. For a managed gate, use [coordinating](../devflow-coordinating/SKILL.md) to establish the entry phase and verified role. A bootstrap child reports metadata and waits. The reviewer differs from coordinator, implementer and QA, and does not repair the candidate being judged.
+Report actionable findings with severity, location, concrete trigger, impact and supporting evidence. Separate confirmed defects from uncertainties and optional improvements. State what was inspected and what remains unverified. Follow project rules for required independence and checks; do not manufacture a review gate.
 
-Confirm repository, base/head/tree, scope and activation. Review correctness, security, data integrity, compatibility and meaningful coverage. Try to prove a suspected defect harmless before confirming it. Record severity, invariant, exact anchor, trigger, impact and evidence for every confirmed finding, including lower severities.
+Retain the review result and findings in the [shared helper](../devflow/references/state.md), tied to the candidate commit and actual reviewer run when known. Preserve earlier findings when verifying a repair; record the fix and new evidence instead of silently replacing the original judgement.
 
-Inspect [retained check artifacts](../devflow-verifying/references/check-evidence.md) by their recorded hashes and explicit state root. Read their original output/JUnit fields; paths in command argv may have been removed after execution. Reuse unchanged-candidate evidence without rerunning a passing check to recreate its temporary report.
-
-Verify repairs from the candidate and regression evidence. Return independent fix observations before final gate evaluation; a resolved GitHub flag is not technical fix proof.
-
-Produce the original structured PASS/FAIL/BLOCKED with work/scope/candidate/assignment IDs, `assignment_action_id`, producer, evidence, findings and limitations. PASS requires applicable evidence and no unresolved blockers. Every status must be imported through `gate record` before repair or advancement. A late result remains bound to its original activation as history.
-
-Handoff to [coordinating](../devflow-coordinating/SKILL.md) for durable import, then [implementing](../devflow-implementing/SKILL.md) for repairs or [delivering](../devflow-delivering/SKILL.md) for publication. Reuse this reviewer for affected reruns. A technical verdict grants no merge authority.
-
-Save the original bare gate-result JSON unchanged as a private artifact before import. The imported record adds only `producer_result_artifact_hash`; the file itself contains no self-hash. The importer checks every original field, including verdict and limits.
+Publish review comments only within authorized external scope. Verify a claimed repair against the original trigger and relevant adjacent behavior before marking its finding resolved. Return concise findings and limits to the requesting agent or user.
