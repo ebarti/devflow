@@ -266,7 +266,7 @@ def parser():
     listing.add_argument("--status")
     listing.add_argument("--repository")
     work.add_parser("show").add_argument("--id", required=True)
-    records = commands.add_parser("record").add_subparsers(dest="kind", required=True)
+    records = commands.add_parser("record").add_subparsers(dest="record_type", required=True)
     for kind in ("run", "result", "finding", "usage"):
         fields(records.add_parser(kind), kind)
     finding = commands.add_parser("finding").add_subparsers(dest="action", required=True)
@@ -286,7 +286,7 @@ def main():
             values = json.loads(Path(args.file).read_text())
             if not isinstance(values, dict):
                 raise ValueError("--file must contain one JSON object")
-        kind = getattr(args, "kind", args.command)
+        kind = getattr(args, "record_type", args.command)
         if kind in FIELDS:
             values.update({key: getattr(args, key) for key in FIELDS[kind].split() if getattr(args, key, None) is not None})
         with closing(connect(args.db)) as db, db:
