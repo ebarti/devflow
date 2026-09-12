@@ -1,6 +1,6 @@
 # Architecture
 
-The host discovers nine sibling skill directories. An agent selects the skill that fits the user's request, applies its engineering method, and invokes existing tools directly. The main [devflow skill](../skills/devflow/SKILL.md) owns the shared helper instructions.
+The host discovers eight sibling skill directories. An agent selects the skill that fits the user's request, applies its engineering method, and invokes existing tools directly. The main [devflow skill](../skills/devflow/SKILL.md) owns the shared helper instructions.
 
 `skills/devflow/scripts/state.py` uses Python's standard library to store local records in SQLite and query metrics. The agent supplies observed outcomes and usage estimates. The helper runs no agents, Git commands, project checks or external operations.
 

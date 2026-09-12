@@ -8,7 +8,7 @@ trap 'rm -rf "$install_fixture"' EXIT HUP INT TERM
 destination="$install_fixture/skills"
 
 sh "$source_root/scripts/install.sh" "$destination"
-for name in devflow using-devflow devflow-defining-work devflow-planning \
+for name in devflow devflow-defining-work devflow-planning \
     devflow-coordinating devflow-implementing devflow-reviewing devflow-verifying \
     devflow-delivering; do
     test -f "$destination/$name/SKILL.md"

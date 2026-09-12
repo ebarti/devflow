@@ -31,7 +31,6 @@ Ask for the outcome you want, for example: “Use devflow to fix the retry bug i
 | Skill | Use |
 | --- | --- |
 | [devflow](skills/devflow/SKILL.md) | Shared method, role selection and state helper |
-| [using-devflow](skills/using-devflow/SKILL.md) | Alias for choosing a role |
 | [devflow-defining-work](skills/devflow-defining-work/SKILL.md) | Clarify outcomes and investigate unclear requests |
 | [devflow-planning](skills/devflow-planning/SKILL.md) | Plan consequential changes and coverage |
 | [devflow-coordinating](skills/devflow-coordinating/SKILL.md) | Carry out a defined request and recover ongoing work |
