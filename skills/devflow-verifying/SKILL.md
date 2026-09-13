@@ -5,10 +5,10 @@ description: Reproduce a defect, exercise product behavior, run project checks, 
 
 # Verify the outcome
 
-Identify the behavior and candidate being checked. Use the target project's existing commands and QA policies directly. Choose checks that can falsify the claim, covering affected integration and failure/recovery paths when relevant. Respect the user's requested scope and explicit check limits.
+Start from the user's acceptance conditions and current candidate. Use the target project's existing commands and QA policies, respecting explicit scope and check limits. For a product-use claim, exercise the actual application entry point in each required mode and inspect the user-visible or persisted result. Include failure/recovery behavior when relevant.
 
-For product scenarios, record setup, actions, expected and observed behavior, candidate/environment and useful evidence. Use owned isolated resources and preserve unrelated data and processes. Tests that share a runtime or database must restore their owned state; verify cleanup and the affected neighboring scenarios. A screenshot, successful launch or green unit suite proves only what it actually exercised.
+Record the candidate/environment, setup, actions, expected and observed result, and any simulated dependencies. Use owned isolated resources and preserve unrelated data and processes. Tests sharing a runtime or database must restore their owned state; verify cleanup and affected neighboring scenarios. Passing checks, healthy services and simulated dependencies do not establish unexercised product behavior.
 
-Distinguish a product failure from an unavailable tool, blocked environment or skipped assertion. Preserve failed output and explain the evidence boundary. For repairs, reproduce the original trigger and verify the relevant invariant; add regression coverage where the project requires it or it materially protects behavior.
+For each acceptance condition, report verified, failed or unverified with its evidence. Continue required verification within the authorized scope; if blocked, name the unexercised scenario and the blocker. For repairs, reproduce the original trigger, verify the invariant and retain failed output. Add regression coverage where the project requires it or it materially protects behavior.
 
-Record each meaningful result and finding with the [shared helper](../devflow/references/state.md). Retain useful artifacts at durable locations and record references, rather than claiming temporary paths remain available. Return the observed outcome and limits; do not turn missing proof into a passing result.
+Record meaningful results and findings with the [shared helper](../devflow/references/state.md). Retain useful artifacts at durable locations and record their references. Return the observed outcomes and limits; an unverified required scenario keeps verification incomplete regardless of other passing checks.
