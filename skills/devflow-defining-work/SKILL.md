@@ -11,4 +11,4 @@ For an unclear bug, trace the reported behavior to its source and identify the i
 
 Match the output to the request. Design-only discussion remains discussion. A clear action request proceeds within its authorized scope without another approval. Use [planning](../devflow-planning/SKILL.md) when consequential choices need a plan, or [implementing](../devflow-implementing/SKILL.md) for a bounded change.
 
-For substantive authorized work, create or update a short [work record](../devflow/references/state.md) with the outcome and context. Reuse an existing issue when relevant; create an external issue only when requested or required within the target project's authorized workflow. Loading this skill alone creates nothing.
+For substantive authorized implementation, follow [issue ownership](../devflow/references/ownership.md): reuse or create its issue, assign an accountable user and claim it for the actual owning task. Preserve explicit local-only or alternative-tracker scope. Keep the outcome and context in the same [work record](../devflow/references/state.md). Loading this skill alone creates nothing.

@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import uuid
+from urllib.parse import urlsplit
 
 
 FIELDS = {
@@ -64,9 +65,16 @@ def connect(path):
                     db.execute(statement)
                     statement = ""
             db.execute(f"PRAGMA application_id={APP_ID}")
-            db.execute("PRAGMA user_version=2")
-        elif version != 2 or db.execute("PRAGMA application_id").fetchone()[0] != APP_ID:
+            db.execute("PRAGMA user_version=3")
+        elif version not in {2, 3} or db.execute("PRAGMA application_id").fetchone()[0] != APP_ID:
             raise ValueError("not a supported workflow.sqlite3 database; use import-legacy for version-1 state.sqlite3")
+        elif version == 2:
+            db.execute("""CREATE TABLE claims (
+                resource TEXT PRIMARY KEY NOT NULL,
+                work_id TEXT NOT NULL UNIQUE REFERENCES works(id), owner TEXT NOT NULL,
+                source_ref TEXT, claimed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )""")
+            db.execute("PRAGMA user_version=3")
         db.commit()
         return db
     except BaseException:
@@ -117,6 +125,63 @@ def insert(db, table, values):
 def history(db, identity, work_id, entity, entity_id, action, details, **extra):
     insert(db, "history", dict(id=identity, work_id=work_id, entity=entity,
            entity_id=entity_id, action=action, recorded_at=now(), details=encode(details), **extra))
+
+
+def claim_for(db, work_id):
+    found = db.execute("SELECT * FROM claims WHERE work_id=?", (work_id,)).fetchone()
+    return dict(found) if found else None
+
+
+def issue_resource(issue):
+    parsed = urlsplit(issue)
+    parts = parsed.path.strip("/").split("/")
+    if (parsed.scheme not in {"http", "https"} or not parsed.netloc
+            or parsed.username or parsed.password or len(parts) != 4
+            or not parts[0] or not parts[1] or parts[2] != "issues"
+            or not parts[3].isdigit() or int(parts[3]) < 1):
+        raise ValueError("issue must be a full GitHub issue URL")
+    return "issue:" + parsed.netloc.lower() + "/" + "/".join(
+        [parts[0].lower(), parts[1].lower(), "issues", str(int(parts[3]))])
+
+
+def require_owner(db, work_id, owner):
+    saved = claim_for(db, work_id)
+    if not saved or saved["owner"] != owner:
+        raise ValueError("work ownership mismatch: " + encode(saved))
+    return saved
+
+
+def claim_work(db, work_id, owner, source_ref=None):
+    if not owner or not owner.strip():
+        raise ValueError("owner must be the actual host task or coordinator ID")
+    work = row(db, "works", work_id)
+    if not work:
+        raise ValueError("unknown work: " + work_id)
+    resource = issue_resource(work["issue"]) if work["issue"] else "work:" + work_id
+    found = db.execute("SELECT * FROM claims WHERE resource=? OR work_id=?", (resource, work_id)).fetchone()
+    if found:
+        saved = dict(found)
+        if (saved["work_id"], saved["owner"], saved["resource"]) != (work_id, owner, resource):
+            raise ValueError("already claimed: " + encode(saved))
+        db.execute("UPDATE claims SET updated_at=?,source_ref=COALESCE(?,source_ref) WHERE work_id=?", (now(), source_ref, work_id))
+        return {"replayed": True, "claim": claim_for(db, work_id)}
+    timestamp = now()
+    values = dict(resource=resource, work_id=work_id, owner=owner,
+                  source_ref=source_ref, claimed_at=timestamp, updated_at=timestamp)
+    insert(db, "claims", values)
+    history(db, uuid.uuid4().hex, work_id, "claim", resource, "claim", values)
+    return {"replayed": False, "claim": values}
+
+
+def release_work(db, work_id, owner):
+    if not row(db, "works", work_id):
+        raise ValueError("unknown work: " + work_id)
+    if not claim_for(db, work_id):
+        return {"released": False, "claim": None}
+    saved = require_owner(db, work_id, owner)
+    db.execute("DELETE FROM claims WHERE work_id=? AND owner=?", (work_id, owner))
+    history(db, uuid.uuid4().hex, work_id, "claim", saved["resource"], "release", saved)
+    return {"released": True, "claim": saved}
 
 
 def record(db, kind, supplied):
@@ -202,6 +267,9 @@ def update(db, kind, supplied, event_id):
     old = row(db, TABLES[kind], identity)
     if old is None:
         raise ValueError("unknown " + kind + ": " + identity)
+    if kind == "work" and claim_for(db, identity) and any(
+            key in values and values[key] != old[key] for key in ("issue", "repository")):
+        raise ValueError("release ownership before changing a work's issue or repository")
     merged = {key: old.get(key) for key in FIELDS[kind].split() if key in old}
     merged.update(values)
     if kind == "run" and {"started_at", "ended_at"}.intersection(values) and "duration_seconds" not in values:
@@ -265,7 +333,15 @@ def parser():
     listing = work.add_parser("list")
     listing.add_argument("--status")
     listing.add_argument("--repository")
+    listing.add_argument("--claimed", action="store_true")
+    listing.add_argument("--owner")
     work.add_parser("show").add_argument("--id", required=True)
+    for action in ("claim", "release"):
+        command = work.add_parser(action)
+        command.add_argument("--id", required=True)
+        command.add_argument("--owner", required=True)
+        if action == "claim":
+            command.add_argument("--source-ref")
     records = commands.add_parser("record").add_subparsers(dest="record_type", required=True)
     for kind in ("run", "result", "finding", "usage"):
         fields(records.add_parser(kind), kind)
@@ -299,16 +375,28 @@ def main():
                 from legacy import import_legacy
                 result = import_legacy(db, args.source, args.db)
             elif args.command == "work" and args.action == "list":
-                filters = {key: getattr(args, key) for key in ("status", "repository") if getattr(args, key)}
+                filters = {"works." + key: getattr(args, key) for key in ("status", "repository") if getattr(args, key)}
+                if args.owner:
+                    filters["claims.owner"] = args.owner
                 where = " WHERE " + " AND ".join(key + "=?" for key in filters) if filters else ""
-                result = [dict(item) for item in db.execute("SELECT * FROM works" + where + " ORDER BY created_at,id", tuple(filters.values()))]
+                if args.claimed:
+                    where += (" AND " if where else " WHERE ") + "claims.owner IS NOT NULL"
+                query = """SELECT works.*,claims.owner,claims.source_ref AS owner_ref,
+                    claims.updated_at AS ownership_observed_at FROM works
+                    LEFT JOIN claims ON claims.work_id=works.id"""
+                result = [dict(item) for item in db.execute(query + where + " ORDER BY works.created_at,works.id", tuple(filters.values()))]
             elif args.command == "work" and args.action == "show":
                 result = row(db, "works", args.id)
                 if result is None:
                     raise ValueError("unknown work: " + args.id)
+                result["claim"] = claim_for(db, args.id)
                 for table in ("runs", "results", "findings", "history"):
                     result[table] = [dict(item) for item in db.execute(f"SELECT * FROM {table} WHERE work_id=? ORDER BY recorded_at,id", (args.id,))]
                 result["usage"] = [dict(item) for item in db.execute("SELECT u.*,a.weight FROM usage u JOIN usage_allocations a ON a.usage_id=u.id WHERE a.work_id=? ORDER BY u.recorded_at,u.id", (args.id,))]
+            elif args.command == "work" and args.action == "claim":
+                result = claim_work(db, args.id, args.owner, args.source_ref)
+            elif args.command == "work" and args.action == "release":
+                result = release_work(db, args.id, args.owner)
             elif args.command in {"work", "finding", "run"} and args.action == "update":
                 result = update(db, kind, values, args.event_id)
             else:
