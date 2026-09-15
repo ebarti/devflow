@@ -18,6 +18,8 @@ Fields are ordinary queryable columns; optional `details` holds extra JSON conte
 
 Schema 3 adds claims transactionally to existing schema 2 databases. Claims are unique by canonical issue URL and work ID. A different owner cannot claim or release the same reservation; retries by its owner retain it. Changing a claimed work's issue/repository requires release first. Claim/release history is preserved. Claims coordinate one shared database and do not expire automatically or establish live host activity.
 
+`works.details.github` retains the selected Project, Status mappings and any unresolved creation attempt. Creation records its attempt before calling GitHub and saves the issue URL before further updates. A missing result requires reconciliation, never an automatic second create. Project Status and assignment are read back before success; labels and other Project fields are untouched.
+
 Record timestamps are supplied automatically when omitted. Observation times accept timezone-aware ISO 8601 values. A run's duration can be derived from its supplied start/end timestamps; no elapsed duration is guessed for an unfinished run. Evidence references are locators, not copied or validated artifacts.
 
 Metrics query stored rows directly. Global usage counts each unique observation once, including unallocated usage; a work report sums its weighted allocations. Cached input and reasoning output are subsets of input/output totals. Dollar and credit values are agent-supplied estimates, with no automatic collection or pricing lookup. Reports include missing-field counts for recorded observations; they cannot measure entirely missing observations. Summed run duration is agent time, not wall-clock completion time.

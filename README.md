@@ -4,7 +4,7 @@ Small development skills for an agent, with Python helpers for work ownership, G
 
 ## Prerequisites
 
-Supply Python 3.12+, a POSIX shell, Git, a host that discovers `SKILL.md` directories, and the tools required by your projects. GitHub work requires `gh` authenticated to the relevant account and repository. Other host and service tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
+Supply Python 3.12+, a POSIX shell, Git, a host that discovers `SKILL.md` directories, and the tools required by your projects. GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
 
 ## Install
 
@@ -50,7 +50,7 @@ flowchart LR
     Agent --> Helper[Python state helper]
     Helper --> DB[(Local SQLite)]
     Agent --> GitHub[GitHub helper through gh]
-    GitHub --> Issues[Issue assignee and status]
+    GitHub --> Issues[Issue assignee and Project Status]
     GitHub --> DB
 ```
 
@@ -66,9 +66,9 @@ flowchart LR
     Deliver --> Record[Update issue and release claim]
 ```
 
-Independent issues follow this flow concurrently in separate worktrees. A coordinator may own several issues and dispatch their workers; each issue keeps one owner and work ID. The GitHub helper assigns the accountable user and maintains `status: in progress`, `in review`, `blocked`, `paused` or `done` labels. Use `state.py work list --claimed` to see actual task owners and their last observations. See [ownership and interruption handling](skills/devflow/references/ownership.md).
+Independent issues follow this flow concurrently in separate worktrees. A coordinator may own several issues and dispatch their workers; each issue keeps one owner and work ID. One GitHub helper creates or reuses the issue, assigns the accountable user, adds it to the existing Project and updates its Status using the board's existing options. Use `state.py work list --claimed` to see task owners and their last observations. See [ownership and interruption handling](skills/devflow/references/ownership.md).
 
-The state helper stores work, claims, runs, results, findings and supplied usage. Claims prevent duplicate ownership within a shared database; status and timestamps are observations, not live agent health. The GitHub helper updates assignment/labels through `gh` and verifies them before recording success. There is no scheduler or automatic token collector.
+The state helper stores work, claims, runs, results, findings and supplied usage. Claims prevent duplicate ownership within a shared database; status and timestamps are observations, not live agent health. The GitHub helper verifies issue assignment and Project Status before recording success. There is no scheduler or automatic token collector.
 
 The default database is `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.local/state/devflow/workflow.sqlite3` when that variable is unset. See [helper commands](skills/devflow/references/state.md) and [storage contracts](docs/implementation-contracts.md).
 

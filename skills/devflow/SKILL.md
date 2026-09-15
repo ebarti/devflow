@@ -21,6 +21,6 @@ Select only the role needed:
 
 For substantive work, use [the state helper](references/state.md) to retain a short outcome, relevant runs/results/findings and useful recovery context. Invoke the Python script while following the skill; it only records and queries data. Reuse the work ID for repairs and continuation. Record known usage or estimates with their provenance; leave unavailable values unknown. Do not create bookkeeping for ordinary questions.
 
-For implementation or delivery, follow [issue ownership](references/ownership.md): the coordinating task claims the work and keeps its GitHub assignee and status current. Independent requested issues can run concurrently with separate work IDs and worktrees. Delegated workers reuse their coordinator's claim.
+For implementation or delivery, follow [issue ownership](references/ownership.md): the coordinating task creates or reuses the issue, claims the work and maintains its assignee and existing Project's Status. Independent requested issues can run concurrently with separate work IDs and worktrees. Delegated workers reuse their coordinator's claim.
 
 For requested installation, run `bash scripts/install.sh [SKILLS_DIRECTORY]` from the source clone. It defaults to `~/.agents/skills`, links sibling skills and preserves conflicting paths. Update the source clone to update linked skills. Installation does not change global instructions or configure project tools.
