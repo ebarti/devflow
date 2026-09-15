@@ -69,3 +69,20 @@ CREATE INDEX results_work ON results(work_id);
 CREATE INDEX findings_work ON findings(work_id);
 CREATE INDEX allocations_work ON usage_allocations(work_id);
 CREATE INDEX history_work ON history(work_id);
+CREATE TABLE runtime_sessions (
+ id TEXT PRIMARY KEY NOT NULL, parent_id TEXT, role TEXT, model TEXT, effort TEXT, turn_id TEXT,
+ bound_at TEXT NOT NULL, closed_at TEXT, last_seen_at TEXT, transcript_path TEXT, cursor INTEGER NOT NULL DEFAULT 0,
+ input_tokens INTEGER, cached_input_tokens INTEGER, cache_write_tokens INTEGER,
+ output_tokens INTEGER, reasoning_output_tokens INTEGER
+);
+CREATE TABLE runtime_scopes (
+ session_id TEXT NOT NULL REFERENCES runtime_sessions(id),
+ work_id TEXT NOT NULL REFERENCES works(id), PRIMARY KEY(session_id,work_id)
+);
+CREATE TABLE runtime_events (
+ id TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL REFERENCES runtime_sessions(id),
+ work_id TEXT REFERENCES works(id), kind TEXT NOT NULL, turn_id TEXT, name TEXT,
+ status TEXT, started_at TEXT, ended_at TEXT, duration_seconds REAL,
+ fingerprint TEXT, source_ref TEXT
+);
+CREATE INDEX runtime_events_work ON runtime_events(work_id,kind);
