@@ -13,8 +13,9 @@ for name in devflow devflow-defining-work devflow-planning \
     devflow-delivering; do
     test -f "$destination/$name/SKILL.md"
 done
-for name in state.py legacy.py schema.sql; do
+for name in state.py github.py legacy.py schema.sql; do
     test -r "$destination/devflow/scripts/$name"
 done
 python3 -B "$destination/devflow/scripts/state.py" --help > /dev/null
+python3 -B "$destination/devflow/scripts/github.py" --help > /dev/null
 printf 'Installation check passed.\n'

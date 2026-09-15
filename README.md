@@ -1,10 +1,10 @@
 # Devflow
 
-Small development skills for an agent, with a Python helper that records work and reports metrics. The agent follows the relevant skill and uses its host tools, Git, GitHub CLI and project commands directly.
+Small development skills for an agent, with Python helpers for work ownership, GitHub issue status and metrics. The agent follows the relevant skill and uses its host tools, Git, GitHub CLI and project commands directly.
 
 ## Prerequisites
 
-Supply Python 3.12+, a POSIX shell, Git, a host that discovers `SKILL.md` directories, and the tools required by your projects. GitHub work requires `gh` authenticated to the relevant account and repository. Other host and service tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
+Supply Python 3.12+, a POSIX shell, Git, a host that discovers `SKILL.md` directories, and the tools required by your projects. GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
 
 ## Install
 
@@ -49,20 +49,28 @@ flowchart LR
     Agent --> Tools[Host tools, Git, gh, project commands]
     Agent --> Helper[Python state helper]
     Helper --> DB[(Local SQLite)]
+    Agent --> GitHub[GitHub helper through gh]
+    GitHub --> Issues[Issue assignee and Project Status]
+    GitHub --> DB
 ```
 
 Enter at the role that fits the request. A small fix needs no separate planning exercise; a review-only request starts with review. Project rules determine checks, independent review and delivery requirements.
 
 ```mermaid
 flowchart LR
-    Request[Requested outcome] --> Work[Define or implement]
+    Request[Implementation request] --> Claim[Claim issue and set in progress]
+    Claim --> Work[Define or implement]
     Work --> Check[Check as project requires]
     Check -->|Repair needed| Work
     Check --> Deliver[Deliver within requested scope]
-    Deliver --> Record[Record outcome and evidence]
+    Deliver --> Record[Update issue and release claim]
 ```
 
-The helper stores work, runs, results, findings and agent-supplied usage. It does not execute tools or enforce a workflow. Its default database is `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.local/state/devflow/workflow.sqlite3` when that variable is unset. See [helper commands](skills/devflow/references/state.md) and [storage contracts](docs/implementation-contracts.md).
+Independent issues follow this flow concurrently in separate worktrees. A coordinator may own several issues and dispatch their workers; each issue keeps one owner and work ID. One GitHub helper creates or reuses the issue, assigns the accountable user, adds it to the existing Project and updates its Status using the board's existing options. Use `state.py work list --claimed` to see task owners and their last observations. See [ownership and interruption handling](skills/devflow/references/ownership.md).
+
+The state helper stores work, claims, runs, results, findings and supplied usage. Claims prevent duplicate ownership within a shared database; status and timestamps are observations, not live agent health. The GitHub helper verifies issue assignment and Project Status before recording success. There is no scheduler or automatic token collector.
+
+The default database is `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.local/state/devflow/workflow.sqlite3` when that variable is unset. See [helper commands](skills/devflow/references/state.md) and [storage contracts](docs/implementation-contracts.md).
 
 ## Installation smoke check
 

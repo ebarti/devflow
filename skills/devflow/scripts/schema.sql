@@ -59,6 +59,11 @@ CREATE TABLE history (
 CREATE TABLE imports (
  source TEXT PRIMARY KEY NOT NULL, imported_at TEXT NOT NULL, report TEXT NOT NULL
 );
+CREATE TABLE claims (
+ resource TEXT PRIMARY KEY NOT NULL,
+ work_id TEXT NOT NULL UNIQUE REFERENCES works(id), owner TEXT NOT NULL,
+ source_ref TEXT, claimed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE INDEX runs_work ON runs(work_id);
 CREATE INDEX results_work ON results(work_id);
 CREATE INDEX findings_work ON findings(work_id);

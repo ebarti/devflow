@@ -5,6 +5,7 @@ The standard-library helper uses SQLite at `$XDG_STATE_HOME/devflow/workflow.sql
 | Table | Stored facts |
 | --- | --- |
 | `works` | Stable outcome ID, title, repository/issue/branch/commit, status, stage, blocker, timing and context |
+| `claims` | Unique work/issue reservation, actual owning task, private task locator and observation times |
 | `runs` | Work, actual agent/role/model/effort, status, timing, duration and source reference |
 | `results` | Work/run, kind, observed status, commit, evidence reference and summary |
 | `findings` | Work, summary, severity, status, commit, evidence, fix and thread references |
@@ -14,6 +15,10 @@ The standard-library helper uses SQLite at `$XDG_STATE_HOME/devflow/workflow.sql
 | `imports` | Source import identity and report |
 
 Fields are ordinary queryable columns; optional `details` holds extra JSON context. Missing facts remain SQL `NULL`. Creation records use caller-supplied stable IDs: replay matching stored facts is a no-op, conflicting reuse fails. Work/run/finding updates retain change history and support optional stable event IDs. A started run can be completed under the same ID. Related rows and history commit in one transaction. The helper records facts without enforcing stage order, authorization or a passing gate.
+
+Schema 3 adds claims transactionally to existing schema 2 databases. Claims are unique by canonical issue URL and work ID. A different owner cannot claim or release the same reservation; retries by its owner retain it. Changing a claimed work's issue/repository requires release first. Claim/release history is preserved. Claims coordinate one shared database and do not expire automatically or establish live host activity.
+
+`works.details.github` retains the selected Project, Status mappings and any unresolved creation attempt. Creation records its attempt before calling GitHub and saves the issue URL before further updates. A missing result requires reconciliation, never an automatic second create. Project Status and assignment are read back before success; labels and other Project fields are untouched.
 
 Record timestamps are supplied automatically when omitted. Observation times accept timezone-aware ISO 8601 values. A run's duration can be derived from its supplied start/end timestamps; no elapsed duration is guessed for an unfinished run. Evidence references are locators, not copied or validated artifacts.
 

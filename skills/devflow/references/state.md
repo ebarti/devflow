@@ -18,6 +18,8 @@ The database defaults to `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.loca
 | `work update` | `--id`, changed fields | Save current progress, blocker or endpoint |
 | `work list` | None | List records; optionally filter by `--status` or `--repository` |
 | `work show` | `--id` | Read work with its runs, results, findings, allocated usage and history |
+| `work claim` | `--id`, `--owner` | Atomically reserve the work/issue for one actual host task |
+| `work release` | `--id`, `--owner` | Release that owner's claim, retaining its history |
 | `record run` | `--id`, `--work-id` | Record an actual agent/role run |
 | `run update` | `--id`, changed fields | Finish or correct the same run |
 | `record result` | `--id`, `--work-id`, `--kind`, `--status` | Record check, review, QA or delivery observations |
@@ -28,6 +30,8 @@ The database defaults to `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.loca
 | `import-legacy SOURCE` | Source database path | Explicitly import historical records |
 
 Use stable IDs for created records. Retrying a creation with the same stored facts returns the existing record; different facts under that ID fail. After a work, run or finding has been updated, read its current state instead of replaying an outdated creation. Give each distinct run, result or usage observation its own ID. Work, runs and findings can be updated; updates retain change history. Finish a started run with `run update`, preserving its ID. Updating start/end timestamps recalculates duration unless you explicitly supply it. An optional stable `--event-id` makes an update retry explicit. Updating fields already at the requested values is a no-op.
+
+`work list --claimed` shows issue owners, task locators and ownership observation times; `--owner` filters by task ID. `work show` includes the current claim. Use full GitHub issue URLs: claims normalize host/repository case and issue numbers, so another work ID cannot claim the same issue. Release before changing a claimed work's issue or repository. See [ownership and GitHub updates](ownership.md) for parallel work and interruption handling. Schema 2 records migrate transactionally to schema 3 by adding the claims table; existing records are preserved.
 
 Writes accept `--file /path/to/record.json`, containing one JSON object with snake_case keys. Flags override fields in that file. Clear optional fields with JSON `null`, or a blocker with `--blocker ''`. Use `--help` on the specific command for its flags. Timestamps use ISO 8601 with a timezone. Optional facts remain unknown when omitted; the helper supplies record timestamps, not inferred status or model settings.
 

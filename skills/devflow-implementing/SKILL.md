@@ -7,6 +7,8 @@ description: Implement a defined feature or repair a defect in the requested rep
 
 Read the owning code, documentation and project rules. Confirm the working branch and dirty state; preserve unrelated work and collaborators' edits. Make the smallest coherent change that satisfies the requested behavior.
 
+Use the coordinator's work ID and assigned file scope. For a direct implementation request without a coordinator, first [claim the issue and update its tracker](../devflow/references/ownership.md). Never compete with another task's active claim; report results to the owning coordinator when delegated.
+
 For defects, reproduce or trace the failing invariant before editing. Follow the data through its source, transformations and consumers; fix the owning layer. A cosmetic change cannot establish a missing persistence or integrity guarantee.
 
 Update affected contracts and documentation. Run the target project's applicable checks in proportion to the change, respecting explicit user limits. Use [verification](../devflow-verifying/SKILL.md) when product behavior needs direct evidence; distinguish a blocked check from a proven defect.
