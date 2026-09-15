@@ -28,6 +28,8 @@ The installer reports conflicting paths and preserves them. Update the original 
 
 Ask for the outcome you want, for example: “Use devflow to fix the retry bug in this repository.” Or invoke a role such as `$devflow-reviewing` for a specific review. Skills are independently discoverable; loading one does not create work, issues or agents, or resume a backlog.
 
+Delegated implementation defaults to **Sol / high** (`gpt-5.6-sol`). Explicit user or project choices override it. Other roles keep their selected models.
+
 | Skill | Use |
 | --- | --- |
 | [devflow](skills/devflow/SKILL.md) | Shared method, role selection and state helper |

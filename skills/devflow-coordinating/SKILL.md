@@ -7,7 +7,9 @@ description: Carry a defined development request or bounded batch through execut
 
 Use the user's request and target project instructions to choose the next useful action. Reuse the [work record](../devflow/references/state.md) for the same outcome; record scope, progress, evidence and the concrete next step. Do not scan or resume a backlog merely because the skill loaded.
 
-Handle small work directly. If delegation is authorized and useful, use native host capabilities with bounded ownership, sufficient context and the user's model settings. Tell collaborators they share the codebase and must preserve others' edits. Do not create agents just to satisfy a stage diagram.
+Handle small work directly. When delegation is authorized and useful, default implementation workers to **Sol / high** (`gpt-5.6-sol`, effort `high`), preserving explicit user or project overrides. On Codex, use a configurable `worker` role and pass `model`, `reasoning_effort` and `fork_turns: "none"` explicitly; fixed role profiles can override the model. Keep other roles on their existing settings.
+
+Give each worker a concise brief: one observable outcome, owned files/modules, required context and dependencies, and exact checks or manual steps with expected results. Include the relevant [implementation instructions](../devflow-implementing/SKILL.md). Tell workers they share the codebase and must preserve others' edits. Delegate only independent work concurrently; do not create agents just to satisfy stages.
 
 Use [implementation](../devflow-implementing/SKILL.md), [review](../devflow-reviewing/SKILL.md), [verification](../devflow-verifying/SKILL.md) and [delivery](../devflow-delivering/SKILL.md) as the request and project policy require. Preserve the user's acceptance conditions through delegation. Before reporting completion, match each required behavior and mode to observed evidence; review approval or passing checks cannot replace an unexercised product scenario. Continue authorized verification. Record actual role outcomes before repairs obscure them, linking findings to fixes and follow-up evidence.
 
