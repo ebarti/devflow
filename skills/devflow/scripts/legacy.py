@@ -70,7 +70,7 @@ def import_legacy(db, source_path, destination_path):
                        repository=candidate.get("repository") or (state.get("authority") or {}).get("repository"),
                        issue=source_info.get("reference"), commit=candidate.get("head_sha"),
                        status=state.get("lifecycle"), stage=state.get("phase"), blocker=blocker,
-                       started_at=attempt.get("started_at"),
+                       started_at=attempt.get("started_at"), ended_at=None,
                        details={"legacy_source": source_name, "legacy_revision": state.get("revision")}))
                 imported["work"] += 1
             for key, action in unresolved:
