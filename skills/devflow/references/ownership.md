@@ -17,7 +17,7 @@ backlog need no claim.
 Run the bundled `github.py` beside `state.py`:
 
 ```sh
-python3 ~/.agents/skills/devflow/scripts/github.py start https://github.com/OWNER/REPO/issues/NUMBER \
+python3.12 ~/.agents/skills/devflow/scripts/github.py start https://github.com/OWNER/REPO/issues/NUMBER \
   --project https://github.com/users/OWNER/projects/NUMBER --work-id WORK_ID --owner HOST_TASK_ID
 ```
 
@@ -48,7 +48,7 @@ authorized work. Do not create a new work ID to bypass ownership of the same iss
 The owner updates status at actual transitions:
 
 ```sh
-python3 ~/.agents/skills/devflow/scripts/github.py set --work-id WORK_ID --owner HOST_TASK_ID \
+python3.12 ~/.agents/skills/devflow/scripts/github.py set --work-id WORK_ID --owner HOST_TASK_ID \
   --status in-review --release
 ```
 
@@ -75,7 +75,7 @@ delegate independent slices with disjoint file ownership. Keep ready work moving
 while other items wait for checks, review or input, within the host's capacity.
 
 ```sh
-python3 ~/.agents/skills/devflow/scripts/state.py work list --claimed
+python3.12 ~/.agents/skills/devflow/scripts/state.py work list --claimed
 ```
 
 This lists owners and last observations, not live process health. Claims have no

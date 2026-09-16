@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.12
 """Record supplied workflow facts in SQLite. This script does not execute work."""
 
 import argparse

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.12
 """Create or reuse an issue, assign it and update its existing GitHub Project."""
 
 import argparse

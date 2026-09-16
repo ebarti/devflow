@@ -4,8 +4,8 @@ Invoke this helper from the agent while following a Devflow skill. Resolve `scri
 
 ```sh
 DEVFLOW_STATE="$HOME/.agents/skills/devflow/scripts/state.py"
-python3 "$DEVFLOW_STATE" work create --id retry-fix --title "Fix retry behavior" --status active
-python3 "$DEVFLOW_STATE" work show --id retry-fix
+python3.12 "$DEVFLOW_STATE" work create --id retry-fix --title "Fix retry behavior" --status active
+python3.12 "$DEVFLOW_STATE" work show --id retry-fix
 ```
 
 The database defaults to `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.local/state/devflow/workflow.sqlite3` when unset. Place `--db /path/to/workflow.sqlite3` before the command to select another database. All output is JSON. The helper records supplied facts; it does not run the work, collect usage or decide completion.
@@ -46,12 +46,12 @@ Writes accept `--file /path/to/record.json`, containing one JSON object with sna
 All record types accept `--details` as JSON for concise extra context, such as acceptance conditions or a next action. Observation types accept `--recorded-at`. Keep evidence at a durable location and record its reference; the helper does not copy artifacts. Avoid storing credentials or unnecessary private content.
 
 ```sh
-python3 "$DEVFLOW_STATE" record result --id retry-check-1 --work-id retry-fix \
+python3.12 "$DEVFLOW_STATE" record result --id retry-check-1 --work-id retry-fix \
   --kind check --status passed --summary "Original retry scenario passed" \
   --evidence-ref /path/to/retained-check-output.txt
-python3 "$DEVFLOW_STATE" work update --id retry-fix --status done \
+python3.12 "$DEVFLOW_STATE" work update --id retry-fix --status done \
   --details '{"outcome":"Requested retry behavior verified"}'
-python3 "$DEVFLOW_STATE" metrics --work-id retry-fix
+python3.12 "$DEVFLOW_STATE" metrics --work-id retry-fix
 ```
 
 Use real observed facts in place of these illustrative values. A recorded passing result or completed status does not itself prove the behavior.
@@ -79,7 +79,7 @@ On requested continuation, use `work list` and `work show`, then inspect the act
 Legacy import is optional and explicit:
 
 ```sh
-python3 "$DEVFLOW_STATE" import-legacy /path/to/old/state.sqlite3
+python3.12 "$DEVFLOW_STATE" import-legacy /path/to/old/state.sqlite3
 ```
 
 Import is one-time per canonical source path, not a live sync. It reads the old database without changing it, normalizes useful history and retains artifact references. Its report identifies skipped records by ID/count; retain the original archive for those records. The new default database has a different filename; an existing `state.sqlite3` is never implicitly migrated. Imported historical results do not establish current checks or authorization.
