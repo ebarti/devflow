@@ -4,14 +4,14 @@ Small development skills for an agent, with Python helpers for work ownership, G
 
 ## Prerequisites
 
-Supply Python 3.12+, a POSIX shell, Git, a host that discovers `SKILL.md` directories, and the tools required by your projects. GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
+Supply Python 3.12+, a POSIX shell, Git, a host that discovers `SKILL.md` directories, and the tools required by your projects. Candidate trials use Codex CLI. GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
 
 ## Install
 
-Keep the clone at a stable location; installed skills are symlinks into it.
+Keep a release checkout at a stable location; installed skills are symlinks into it.
 
 ```sh
-git clone git@github.com:ebarti/devflow.git
+git clone --branch v0.1.0 https://github.com/ebarti/devflow.git
 cd devflow
 bash scripts/install.sh
 ```
@@ -24,13 +24,35 @@ The defaults are `~/.agents/skills` and `$CODEX_HOME/hooks.json` (`~/.codex/hook
 bash scripts/install.sh /path/to/host/skills /path/to/codex-home
 ```
 
-Update the original clone to update linked skills. To switch an existing installation to another checkout, run this from that checkout:
+To switch an existing installation to another checkout, run this from that checkout:
 
 ```sh
 bash scripts/install.sh --force
 ```
 
 `--force` replaces only bundled skill symlinks, including broken links. Regular files, directories and other hooks are preserved. Without it, conflicting paths stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
+
+## Upgrade
+
+Choose a [release tag](https://github.com/ebarti/devflow/releases) and upgrade the existing checkout between tasks:
+
+```sh
+bash scripts/update.sh v0.1.0
+```
+
+The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill links owned by this checkout are removed; other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
+
+## Candidate trials
+
+From a development worktree, use a new trial directory for each candidate and a separate target-project worktree:
+
+```sh
+python3.12 scripts/candidate.py /path/to/trial -C /path/to/project-worktree
+```
+
+The launcher isolates skills, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit.
+
+Publish a new release tag after the installation smoke check and the selected product trial pass. Release tags remain fixed; normal installations advance only through an explicit upgrade.
 
 ## Start
 

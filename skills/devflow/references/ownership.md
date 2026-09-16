@@ -14,7 +14,7 @@ in the task context or repository/issue links; use `gh project list` and
 if the intended Project is ambiguous. Discussion, read-only review and untouched
 backlog need no claim.
 
-Run the bundled `github.py` beside `state.py`:
+Run the bundled `github.py` beside `state.py` in the selected installation. The examples use the default location:
 
 ```sh
 python3.12 ~/.agents/skills/devflow/scripts/github.py start https://github.com/OWNER/REPO/issues/NUMBER \

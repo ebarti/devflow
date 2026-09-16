@@ -8,6 +8,6 @@ The host discovers eight sibling skill directories. An agent selects the skill t
 
 `telemetry.py` installs lifecycle hooks and records bound sessions' runtime events and token-counter deltas. Claims attach coordinators; child tasks inherit an unambiguous issue. Shared usage remains unallocated. The collector is content-free and never steers a tool or starts model work. `measurements.py` derives timings, outcomes, recovery and coverage from the same database.
 
-The installer links skills and merges the collector into the host's hook configuration. Other hooks are preserved; the host owns hook trust. Updating the source clone updates linked skills. Project policies and model settings stay with their existing owners.
+The installer links skills from a release checkout and merges the collector into the host's hook configuration. Other hooks are preserved; the host owns hook trust. Explicit upgrades select a release tag, refresh installation and remove obsolete owned links. Candidate sessions use separate configuration, skills and SQLite. Project policies and model settings stay with their existing owners.
 
 See the [README diagrams](../README.md#how-it-works), [storage contract](implementation-contracts.md) and [helper commands](../skills/devflow/references/state.md).
