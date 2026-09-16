@@ -25,6 +25,8 @@ TABLES = {"work": "works", "run": "runs", "result": "results", "finding": "findi
 NUMBERS = {"duration_seconds", "estimated_cost_usd", "estimated_credits"}
 TOKENS = {"input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens", "reasoning_output_tokens"}
 APP_ID = 0x44564632
+ACTIVE = {"active", "running", "in-progress"}
+FINISHED = {"done", "completed", "canceled", "cancelled"}
 
 
 def now():
@@ -40,6 +42,18 @@ def instant(value):
     if result.tzinfo is None:
         raise ValueError("timestamps must include a timezone")
     return result
+
+
+def timestamps(values, prior=None):
+    prior = prior or {}
+    status = values.get("status")
+    if status in ACTIVE:
+        if "started_at" not in values and not prior.get("started_at"):
+            values["started_at"] = now()
+        if prior.get("status") in FINISHED and "ended_at" not in values:
+            values["ended_at"] = None
+    if status in FINISHED and "ended_at" not in values and not prior.get("ended_at"):
+        values["ended_at"] = now()
 
 
 def connect(path):
@@ -65,8 +79,8 @@ def connect(path):
                     db.execute(statement)
                     statement = ""
             db.execute(f"PRAGMA application_id={APP_ID}")
-            db.execute("PRAGMA user_version=3")
-        elif version not in {2, 3} or db.execute("PRAGMA application_id").fetchone()[0] != APP_ID:
+            db.execute("PRAGMA user_version=4")
+        elif version not in {2, 3, 4} or db.execute("PRAGMA application_id").fetchone()[0] != APP_ID:
             raise ValueError("not a supported workflow.sqlite3 database; use import-legacy for version-1 state.sqlite3")
         elif version == 2:
             db.execute("""CREATE TABLE claims (
@@ -75,6 +89,15 @@ def connect(path):
                 source_ref TEXT, claimed_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )""")
             db.execute("PRAGMA user_version=3")
+        if version in {2, 3}:
+            schema = Path(__file__).with_name("schema.sql").read_text()
+            statement = ""
+            for line in schema[schema.index("CREATE TABLE runtime_sessions"):].splitlines(True):
+                statement += line
+                if sqlite3.complete_statement(statement):
+                    db.execute(statement)
+                    statement = ""
+            db.execute("PRAGMA user_version=4")
         db.commit()
         return db
     except BaseException:
@@ -164,12 +187,16 @@ def claim_work(db, work_id, owner, source_ref=None):
         if (saved["work_id"], saved["owner"], saved["resource"]) != (work_id, owner, resource):
             raise ValueError("already claimed: " + encode(saved))
         db.execute("UPDATE claims SET updated_at=?,source_ref=COALESCE(?,source_ref) WHERE work_id=?", (now(), source_ref, work_id))
+        from telemetry import bind
+        bind(db, owner, [work_id], "coordinator", extend=True)
         return {"replayed": True, "claim": claim_for(db, work_id)}
     timestamp = now()
     values = dict(resource=resource, work_id=work_id, owner=owner,
                   source_ref=source_ref, claimed_at=timestamp, updated_at=timestamp)
     insert(db, "claims", values)
     history(db, uuid.uuid4().hex, work_id, "claim", resource, "claim", values)
+    from telemetry import bind
+    bind(db, owner, [work_id], "coordinator", extend=True)
     return {"replayed": False, "claim": values}
 
 
@@ -228,6 +255,8 @@ def record(db, kind, supplied):
             compare.discard("work_id")
         if values.get("recorded_at") is None:
             compare.discard("recorded_at")
+        if kind in {"work", "run"}:
+            compare -= {key for key in ("started_at", "ended_at") if key not in values}
         same = all(prior.get(key) == values.get(key) for key in compare)
         if allocations is not None:
             saved = [dict(item) for item in db.execute("SELECT work_id,weight FROM usage_allocations WHERE usage_id=? ORDER BY work_id", (values["id"],))]
@@ -236,6 +265,9 @@ def record(db, kind, supplied):
             raise ValueError("record ID already exists with different facts")
         return {"replayed": True, "record": prior}
     timestamp = now()
+    if kind in {"work", "run"}:
+        timestamps(values)
+        validate(kind, values)
     if kind == "work":
         values.update(created_at=timestamp, updated_at=timestamp)
     else:
@@ -243,6 +275,9 @@ def record(db, kind, supplied):
         if kind == "finding":
             values["updated_at"] = timestamp
     insert(db, TABLES[kind], values)
+    if kind == "work":
+        history(db, uuid.uuid4().hex, values["id"], "work", values["id"], "create", {},
+                occurred_at=timestamp, stage=values.get("stage"), status=values.get("status"))
     if allocations is not None:
         for allocation in allocations:
             insert(db, "usage_allocations", dict(usage_id=values["id"], **allocation))
@@ -270,12 +305,14 @@ def update(db, kind, supplied, event_id):
     if kind == "work" and claim_for(db, identity) and any(
             key in values and values[key] != old[key] for key in ("issue", "repository")):
         raise ValueError("release ownership before changing a work's issue or repository")
+    changes = {"before": {key: old.get(key) for key in values}, "after": dict(values)}
+    if kind in {"work", "run"}:
+        timestamps(values, old)
     merged = {key: old.get(key) for key in FIELDS[kind].split() if key in old}
     merged.update(values)
     if kind == "run" and {"started_at", "ended_at"}.intersection(values) and "duration_seconds" not in values:
         merged["duration_seconds"] = None
     validate(kind, merged)
-    changes = {"before": {key: old.get(key) for key in values}, "after": dict(values)}
     if kind == "run" and merged.get("duration_seconds") != old.get("duration_seconds"):
         if "duration_seconds" not in values:
             changes["derived_duration_seconds"] = {"before": old.get("duration_seconds"), "after": merged.get("duration_seconds")}
@@ -290,7 +327,9 @@ def update(db, kind, supplied, event_id):
         values["updated_at"] = now()
     assignment = ",".join(f'"{key}"=?' for key in values)
     db.execute(f"UPDATE {TABLES[kind]} SET {assignment} WHERE id=?", (*values.values(), identity))
-    history(db, key, identity if kind == "work" else old["work_id"], kind, identity, "update", changes)
+    history(db, key, identity if kind == "work" else old["work_id"], kind, identity, "update", changes,
+            occurred_at=now(), stage=values.get("stage", old.get("stage")),
+            previous_stage=old.get("stage"), status=values.get("status", old.get("status")))
     return {"replayed": False, "record": row(db, TABLES[kind], identity)}
 
 
@@ -309,6 +348,8 @@ def metrics(db, work_id=None):
     sums = ",".join(f'SUM(u.{key}*{weight}) AS {key},COUNT(*)-COUNT(u.{key}) AS missing_{key}_count' for key in columns)
     report["usage"] = dict(db.execute(f"SELECT COUNT(*) AS observations,{sums} FROM {source}", args).fetchone())
     report["usage"]["basis"] = "allocated share" if work_id else "distinct observations, including unallocated usage"
+    from measurements import summarize
+    report.update(summarize(db, work_id))
     report["limitations"] = ["Missing observations cannot be counted; missing-field counts cover recorded observations only.",
                               "Run duration is summed agent time, not elapsed wall time; unfinished runs have no inferred duration.",
                               "Input/output totals already include cached/reasoning subsets. Cost and credits are supplied estimates."]

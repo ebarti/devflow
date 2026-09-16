@@ -6,6 +6,8 @@ The host discovers eight sibling skill directories. An agent selects the skill t
 
 `skills/devflow/scripts/github.py` uses the authenticated `gh` CLI to create or reuse issues, assign the responsible user and update their existing Project's Status. It records creation attempts, verifies ownership before writing and reads back remote results before recording success or releasing claims. The agent supplies outcomes and usage estimates; neither helper starts agents or runs project checks. Host task locators remain local. Claims have no automatic expiry, heartbeat or cross-host exclusion.
 
-The installer links skill directories into a supplied destination. Updating the source clone updates the linked skills. Project policies and user-selected model settings stay with their existing owners.
+`telemetry.py` installs lifecycle hooks and records bound sessions' runtime events and token-counter deltas. Claims attach coordinators; child tasks inherit an unambiguous issue. Shared usage remains unallocated. The collector is content-free and never steers a tool or starts model work. `measurements.py` derives timings, outcomes, recovery and coverage from the same database.
+
+The installer links skills and merges the collector into the host's hook configuration. Other hooks are preserved; the host owns hook trust. Updating the source clone updates linked skills. Project policies and model settings stay with their existing owners.
 
 See the [README diagrams](../README.md#how-it-works), [storage contract](implementation-contracts.md) and [helper commands](../skills/devflow/references/state.md).

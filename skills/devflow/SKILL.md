@@ -23,4 +23,4 @@ For substantive work, use [the state helper](references/state.md) to retain a sh
 
 For implementation or delivery, follow [issue ownership](references/ownership.md): the coordinating task creates or reuses the issue, claims the work and maintains its assignee and existing Project's Status. Independent requested issues can run concurrently with separate work IDs and worktrees. Delegated workers reuse their coordinator's claim.
 
-For requested installation, run `bash scripts/install.sh [SKILLS_DIRECTORY]` from the source clone. It defaults to `~/.agents/skills`, links sibling skills and preserves conflicting paths. Update the source clone to update linked skills. Installation does not change global instructions or configure project tools.
+For requested installation, run `bash scripts/install.sh [SKILLS_DIRECTORY] [CODEX_HOME]` from the source clone. It links sibling skills and installs content-free metrics hooks, preserving other hooks and conflicting skill paths. Review and trust the hooks through the host's hook controls. Update the source clone to update linked skills. Installation does not change agent instructions or project tools.

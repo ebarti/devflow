@@ -7,15 +7,17 @@ install_fixture=$(mktemp -d)
 trap 'rm -rf "$install_fixture"' EXIT HUP INT TERM
 destination="$install_fixture/skills"
 
-sh "$source_root/scripts/install.sh" "$destination"
+sh "$source_root/scripts/install.sh" "$destination" "$install_fixture/codex"
 for name in devflow devflow-defining-work devflow-planning \
     devflow-coordinating devflow-implementing devflow-reviewing devflow-verifying \
     devflow-delivering; do
     test -f "$destination/$name/SKILL.md"
 done
-for name in state.py github.py legacy.py schema.sql; do
+for name in state.py github.py legacy.py telemetry.py measurements.py schema.sql; do
     test -r "$destination/devflow/scripts/$name"
 done
 python3 -B "$destination/devflow/scripts/state.py" --help > /dev/null
 python3 -B "$destination/devflow/scripts/github.py" --help > /dev/null
+python3 -B "$destination/devflow/scripts/telemetry.py" --help > /dev/null
+test -s "$install_fixture/codex/hooks.json"
 printf 'Installation check passed.\n'

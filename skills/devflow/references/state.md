@@ -62,7 +62,15 @@ Record each unique observation once, with a source reference and estimation basi
 
 `--work-id` allocates the full observation to one work. Alternatively, `--allocations` accepts a JSON array such as `[{"work_id":"retry-fix","weight":0.5}]`. Weights are between zero and one and sum to at most one; the remainder stays unallocated. Without either option, the observation is unallocated.
 
-Metrics count work statuses, result kinds/statuses, and finding severities/statuses. They sum known run duration and usage values while reporting missing-field counts. Global usage includes each observation once; per-work usage applies its allocation weight. Summed run duration is agent time, not elapsed wall time. Missing observations cannot be counted, and unknown values are not zero.
+Metrics report work, ownership, roles/models, delivery, result/finding outcomes, phase transitions, recovery, timings and field coverage. Active and terminal work/run status updates stamp missing start/end times. Global usage counts each observation once; per-work usage applies its allocation weight. Unknown values remain unknown.
+
+Installed hooks collect bound sessions' turns, tool attempts, permission requests, interruptions, compactions and cumulative token-counter deltas. Claims bind their coordinator automatically; child tasks inherit a single issue. For other tasks, run `telemetry.py bind --session-id SESSION_ID --work-id WORK_ID --role ROLE`. A session with several issues has unallocated usage; use separate worker sessions for issue attribution.
+
+Hooks store identifiers, counts, timestamps and command fingerprints, not prompts, commands or tool-output text. They neither call a model nor alter tool decisions. Transcript parsing is an adapter for the current local format; missing counters or a reset remain visible gaps. Replay and partial transcript lines do not add duplicate usage. Trust installed hooks using `/hooks`; untrusted hooks do not collect anything. A fresh task may be needed after installing them.
+
+Collection starts at binding and closes when a released task's turn ends. Reclaiming or explicitly binding resumes collection; unrelated later conversations are ignored. Runtime runs represent observed turns, including tool waits. Shared coordinator usage is reported globally without an invented issue split.
+
+Tool completion is separate from check/review acceptance. Record those outcomes and findings explicitly. Runtime turn duration includes tool waits; phase duration includes time spent in that recorded phase. Repeated calls are not necessarily retries. Complete overhead, counterfactual savings, defect escape rate and human intent are not inferred. Costs require supplied estimates and provenance.
 
 ## Recovery and import
 

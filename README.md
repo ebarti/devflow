@@ -16,13 +16,13 @@ cd devflow
 bash scripts/install.sh
 ```
 
-The default destination is `~/.agents/skills`. Supply another host's skill directory when needed:
+The defaults are `~/.agents/skills` and `$CODEX_HOME/hooks.json` (`~/.codex/hooks.json` when unset). Supply custom locations when needed:
 
 ```sh
-bash scripts/install.sh /path/to/host/skills
+bash scripts/install.sh /path/to/host/skills /path/to/codex-home
 ```
 
-The installer reports conflicting paths and preserves them. Update the original clone to update its linked skills. Installation writes skill links only; it does not change global instructions, host configuration or target repositories.
+The installer preserves conflicting skill paths and other hooks. Update the original clone to update linked skills. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
 
 ## Start
 
@@ -68,7 +68,9 @@ flowchart LR
 
 Independent issues follow this flow concurrently in separate worktrees. A coordinator may own several issues and dispatch their workers; each issue keeps one owner and work ID. One GitHub helper creates or reuses the issue, assigns the accountable user, adds it to the existing Project and updates its Status using the board's existing options. Use `state.py work list --claimed` to see task owners and their last observations. See [ownership and interruption handling](skills/devflow/references/ownership.md).
 
-The state helper stores work, claims, runs, results, findings and supplied usage. Claims prevent duplicate ownership within a shared database; status and timestamps are observations, not live agent health. The GitHub helper verifies issue assignment and Project Status before recording success. There is no scheduler or automatic token collector.
+The state helper stores work, claims, runs, results and findings. Runtime hooks collect bound tasks' turns, tool timings, interruptions, compactions and token-counter deltas without storing prompt or command text. Claims attach coordinators automatically; children inherit a single issue. Multi-issue coordinator usage stays unallocated. There is no scheduler.
+
+`state.py metrics` reports outcomes, roles/models, delivery, ownership, recovery, timing, usage and coverage; add `--work-id ID` for one issue. Missing observations stay unknown. Check acceptance and finding decisions remain explicit records. Costs require supplied estimates; complete workflow overhead and savings are not inferred. See [metrics and collection](skills/devflow/references/state.md).
 
 The default database is `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.local/state/devflow/workflow.sqlite3` when that variable is unset. See [helper commands](skills/devflow/references/state.md) and [storage contracts](docs/implementation-contracts.md).
 
