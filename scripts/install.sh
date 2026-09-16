@@ -41,4 +41,12 @@ for skill in "$source_root"/skills/*; do
     fi
 done
 "$devflow_python" -B "$destination/devflow/scripts/telemetry.py" install --codex-home "$codex_directory"
+# Remove only obsolete links owned by this checkout.
+for target in "$destination"/*; do
+    [ -L "$target" ] || continue
+    previous="$source_root/skills/${target##*/}"
+    if [ "$(readlink "$target")" = "$previous" ] && [ ! -e "$previous" ]; then
+        unlink "$target"
+    fi
+done
 printf 'Skills installed in %s\nKeep this checkout at %s.\n' "$destination" "$source_root"
