@@ -15,6 +15,7 @@ fi
 source_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 destination=${1:-"${HOME}/.agents/skills"}
 codex_directory=${2:-"${CODEX_HOME:-${HOME}/.codex}"}
+devflow_python=${DEVFLOW_PYTHON:-python3.12}
 
 # Check all conflicts before changing any links; force only replaces symlinks.
 for skill in "$source_root"/skills/*; do
@@ -39,5 +40,5 @@ for skill in "$source_root"/skills/*; do
         ln -s "$skill" "$target"
     fi
 done
-python3 -B "$destination/devflow/scripts/telemetry.py" install --codex-home "$codex_directory"
+"$devflow_python" -B "$destination/devflow/scripts/telemetry.py" install --codex-home "$codex_directory"
 printf 'Skills installed in %s\nKeep this checkout at %s.\n' "$destination" "$source_root"

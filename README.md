@@ -16,6 +16,8 @@ cd devflow
 bash scripts/install.sh
 ```
 
+The installer uses `python3.12`; set `DEVFLOW_PYTHON` to select another supported interpreter. Hooks record its resolved absolute executable path at installation, so later `PATH` changes do not switch Python. Reinstall to change the interpreter. The helpers use only the standard library; no pip dependencies are required.
+
 The defaults are `~/.agents/skills` and `$CODEX_HOME/hooks.json` (`~/.codex/hooks.json` when unset). Supply custom locations when needed:
 
 ```sh

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.12
 """Collect content-free local runtime observations for explicitly bound work."""
 import argparse
 from contextlib import closing
@@ -280,7 +280,8 @@ def install(codex_home):
     path = Path(codex_home).expanduser() / "hooks.json"
     original = json.loads(path.read_text()) if path.exists() else {}
     hooks = original.setdefault("hooks", {})
-    command = "python3 -B " + shlex.quote(str(Path(__file__).absolute())) + " hook"
+    command = shlex.join([str(Path(sys.executable).resolve()), "-B",
+                          str(Path(__file__).absolute()), "hook"])
     for name in EVENTS:
         groups = hooks.setdefault(name, [])
         for group in groups:
