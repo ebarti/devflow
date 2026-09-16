@@ -66,6 +66,8 @@ Metrics report work, ownership, roles/models, delivery, result/finding outcomes,
 
 Installed hooks collect bound sessions' turns, tool attempts, permission requests, interruptions, compactions and cumulative token-counter deltas. Claims bind their coordinator automatically; child tasks inherit a single issue. For other tasks, run `telemetry.py bind --session-id SESSION_ID --work-id WORK_ID --role ROLE`. A session with several issues has unallocated usage; use separate worker sessions for issue attribution.
 
+Worker completion also collects native tool-call records from its transcript when individual tool hooks are unavailable. Stable call IDs prevent duplicates; transcript completion alone means returned, not acceptance. Only structured exit codes or explicit errors establish tool success or failure.
+
 Hooks store identifiers, counts, timestamps and command fingerprints, not prompts, commands or tool-output text. They neither call a model nor alter tool decisions. Transcript parsing is an adapter for the current local format; missing counters or a reset remain visible gaps. Replay and partial transcript lines do not add duplicate usage. Trust installed hooks using `/hooks`; untrusted hooks do not collect anything. A fresh task may be needed after installing them.
 
 Collection starts at binding and closes when a released task's turn ends. Reclaiming or explicitly binding resumes collection; unrelated later conversations are ignored. Runtime runs represent observed turns, including tool waits. Shared coordinator usage is reported globally without an invented issue split.

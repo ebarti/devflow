@@ -149,7 +149,35 @@ def tokens(db, session, payload, timestamp, position, turn_id):
     session.update(values)
 
 
-def collect_transcript(db, session, transcript):
+def collect_tool(db, session, payload, timestamp, turn_id, position):
+    kind = payload.get("type")
+    calls = {"function_call", "custom_tool_call"}
+    completions = {"function_call_output", "custom_tool_call_output"}
+    call_id = payload.get("call_id")
+    if kind not in calls | completions or not call_id:
+        return
+    key = "tool:" + session["id"] + ":" + call_id
+    saved = state.row(db, "runtime_events", key)
+    if saved and saved["ended_at"]:
+        return  # Preserve completed hook observations and make replay a no-op.
+    source = session["transcript_path"] + "#byte=" + str(position)
+    if kind in calls:
+        name = payload.get("name")
+        event(db, session["id"], key, "tool", timestamp, turn_id, name=name,
+              fingerprint=identity(name, payload.get("arguments", payload.get("input"))),
+              status="started", source_ref=source)
+    else:
+        output = payload.get("output")
+        if isinstance(output, str):
+            try:
+                output = json.loads(output)
+            except ValueError:
+                pass
+        event(db, session["id"], key, "tool", None, turn_id,
+              ended_at=timestamp, status=tool_status(output), source_ref=source)
+
+
+def collect_transcript(db, session, transcript, collect_tools=False):
     if not transcript:
         return
     path = Path(transcript).expanduser()
@@ -174,6 +202,9 @@ def collect_transcript(db, session, transcript):
                 session["model"] = payload.get("model") or session["model"]
                 session["effort"] = payload.get("effort") or payload.get("reasoning_effort") or session["effort"]
                 active_turn = payload.get("turn_id") or active_turn
+            if (collect_tools and item.get("type") == "response_item" and timestamp
+                    and state.instant(timestamp) >= state.instant(session["bound_at"])):
+                collect_tool(db, session, payload, timestamp, active_turn, position)
             if item.get("type") == "event_msg":
                 name = payload.get("type")
                 active_turn = payload.get("turn_id") or active_turn
@@ -226,7 +257,7 @@ def handle(db, payload):
                 bind(db, child, scope(db, parent), payload.get("agent_type"), parent)
             session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (child,)).fetchone())
             if name == "SubagentStop":
-                collect_transcript(db, session, payload.get("agent_transcript_path"))
+                collect_transcript(db, session, payload.get("agent_transcript_path"), collect_tools=True)
                 # The parent's turn ID is not the child's turn ID.
                 session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (child,)).fetchone())
                 turn(db, session, session["turn_id"], stamp, "completed")

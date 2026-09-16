@@ -129,7 +129,7 @@ def summarize(db, work_id=None):
             "latest_observation": max((s["last_seen_at"] for s in sessions if s["last_seen_at"]), default=None),
             "session_coverage": coverage(sessions, ["model", "effort", "transcript_path", "last_seen_at", "input_tokens", "output_tokens"]),
             "tool_coverage": coverage(tools, ["started_at", "ended_at", "duration_seconds"]),
-            "basis": "Local hooks only; repeated calls are not necessarily retries. Shared sessions stay unallocated. Collector time excludes process startup and commit."
+            "basis": "Local hooks and worker transcripts; worker tool observations arrive at completion. Repeated calls are not necessarily retries. Shared sessions stay unallocated. Collector time excludes process startup and commit."
         },
         "coverage": {
             "works": coverage(works, ["issue", "branch", "commit", "started_at", "ended_at"]),
@@ -141,4 +141,3 @@ def summarize(db, work_id=None):
         "unavailable": ["Complete workflow overhead and counterfactual savings", "Unobserved waiting and blocked time",
                         "Defect escape rate", "Human intervention intent", "Dollar cost without supplied prices"],
     }
-
