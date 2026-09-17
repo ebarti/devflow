@@ -5,29 +5,32 @@ description: Carry a defined development request or bounded batch through execut
 
 # Coordinate the outcome
 
-Use the user's request and target project instructions to choose the next useful action. Reuse the [work record](../devflow/references/state.md) for the same outcome; record scope, progress, evidence and the concrete next step. Do not scan or resume a backlog merely because the skill loaded.
+Carry a defined request or bounded batch to its requested endpoint. The coordinator owns scope, planning, dispatch, verification and delivery; every implementation change, including small fixes and review or QA repairs, runs in the [implementation worker](../devflow/references/implementation-worker.md), never in the coordinator.
 
-Claim implementation work through [issue ownership](../devflow/references/ownership.md) before dispatching it. Maintain the issue's assignee and its existing Project's Status, and release ownership when the task stops. For a requested batch, a coordinator may own several issues and keep independent ready work moving concurrently with separate work IDs/worktrees. Respect dependencies and host capacity. One issue keeps one coordinating owner across its delegated roles.
+## Steps
 
-Before spawning, inspect existing agents. Reuse an agent for related work in the same role, work ID and worktree; implementation reuse requires Sol/high. Use `agents.followup_task` with its existing ID or path to continue a finished or idle agent. Use `agents.send_message` for corrections to its active task; do not assign overlapping work. Prefer the original implementer for repairs and the original reviewer/verifier for rechecks, preserving required independence. Spawn only when no suitable agent is available or independent work must run concurrently.
+1. **Establish the outcome.** Use the user's request and target project instructions to choose the next useful action. Reuse the [work record](../devflow/references/state.md) for the same outcome; record scope, progress, evidence and the concrete next step. Do not scan or resume a backlog merely because the skill loaded.
 
-Delegate every implementation change, including small fixes and review/QA repairs, to a **Sol / high** subagent. The coordinator owns scope, planning, dispatch, verification and delivery; it does not implement changes itself. When a new implementation worker is needed, spawn it with these literal arguments, adding its `task_name` and `message`:
+2. **Claim before dispatching.** Follow [issue ownership](../devflow/references/ownership.md): claim the issue, maintain its assignee and existing Project Status, and release ownership when the task stops. For a requested batch, a coordinator may own several issues and keep independent ready work moving concurrently with separate work IDs and worktrees, respecting dependencies and host capacity. One issue keeps one coordinating owner across its delegated roles.
 
-```json
-{
-  "agent_type": "worker",
-  "model": "gpt-5.6-sol",
-  "reasoning_effort": "high",
-  "fork_turns": "none"
-}
+3. **Choose the agent.** Reuse an existing agent when the [worker reference](../devflow/references/implementation-worker.md#reuse) allows it; otherwise spawn the implementation worker with the arguments, model precedence and prerequisites defined there. Do not omit those arguments or let a worker inherit the coordinator's model. If spawning fails or the model is unavailable, stop and ask the user as the reference describes; do not implement directly or substitute a model silently. Coordinator, review and verification models remain unchanged.
+
+4. **Brief the worker** as the reference specifies: the statement that it is the implementation worker for this work ID and must not delegate, one observable outcome, owned files or modules, required context and dependencies, and exact checks or manual steps with expected results. Include the relevant [implementation instructions](../devflow-implementing/SKILL.md). Tell workers they share the codebase and must preserve others' edits. Delegate only independent work concurrently; do not create agents just to satisfy stages.
+
+5. **Keep metrics attributable.** Hooks attach to the claiming coordinator and inherit its issue for child tasks when there is exactly one issue. For a multi-issue coordinator, bind each child explicitly with `telemetry.py bind --session-id CHILD_ID --work-id WORK_ID --role ROLE`; shared coordinator usage remains unallocated. Keep recording semantic check and review outcomes and findings; tool completion alone cannot establish product acceptance. Use `state.py metrics --work-id WORK_ID` to inspect coverage before the final report.
+
+6. **Verify and deliver.** Use [review](../devflow-reviewing/SKILL.md), [verification](../devflow-verifying/SKILL.md) and [delivery](../devflow-delivering/SKILL.md) as the request and project policy require, routing every repair back to the implementation worker. Preserve the user's acceptance conditions through delegation. Before reporting completion, match each required behavior and mode to observed evidence; review approval or passing checks cannot replace an unexercised product scenario. Continue authorized verification. Record actual role outcomes before repairs obscure them, linking findings to fixes and follow-up evidence.
+
+7. **Continue interrupted work on request.** Read the existing record and inspect the actual checkout, artifacts and external state. Reconcile uncertain actions before retrying them; a saved intention is not proof of completion. Resume the same outcome and preserve previous results. Report what is implemented, checked, published or blocked with the evidence and the next action needed.
+
+## Example brief
+
+```text
+You are the implementation worker for work ID retry-fix (gpt-5.6-sol, effort high). Do not delegate implementation.
+Issue: https://github.com/OWNER/REPO/issues/12. Worktree: /path/to/worktrees/retry-fix, shared with other agents; preserve their edits.
+Outcome: client.fetch() retries a timed-out request at most twice with backoff, then raises RetryExhausted.
+Owned files: src/client/retry.py, tests/test_retry.py. Do not edit other modules.
+Context: retries currently repeat forever; the reproduction in the issue times out after 60 s.
+Checks: `pytest tests/test_retry.py -q` passes, and the new test fails on the previous commit.
+Report: changed files, each check with its observed output, and anything left unverified.
 ```
-
-Use the configurable `worker` role, not a fixed `implementer`, `fixer` or QA role that can override the model. Do not omit these arguments or inherit the coordinator's model. If spawning fails, report the failure instead of implementing directly or silently substituting another model. Coordinator, review and verification models remain unchanged.
-
-Give each worker a concise brief: one observable outcome, owned files/modules, required context and dependencies, and exact checks or manual steps with expected results. Include the relevant [implementation instructions](../devflow-implementing/SKILL.md). Tell workers they share the codebase and must preserve others' edits. Delegate only independent work concurrently; do not create agents just to satisfy stages.
-
-Metrics hooks attach to the claiming coordinator and inherit its issue for child tasks when there is exactly one issue. For a multi-issue coordinator, bind each child explicitly with `telemetry.py bind --session-id CHILD_ID --work-id WORK_ID --role ROLE`. Shared coordinator usage remains unallocated. Keep recording semantic check/review outcomes and findings; tool completion alone cannot establish product acceptance. Use `state.py metrics --work-id WORK_ID` to inspect coverage before the final report.
-
-Use [implementation](../devflow-implementing/SKILL.md), [review](../devflow-reviewing/SKILL.md), [verification](../devflow-verifying/SKILL.md) and [delivery](../devflow-delivering/SKILL.md) as the request and project policy require. Preserve the user's acceptance conditions through delegation. Before reporting completion, match each required behavior and mode to observed evidence; review approval or passing checks cannot replace an unexercised product scenario. Continue authorized verification. Record actual role outcomes before repairs obscure them, linking findings to fixes and follow-up evidence.
-
-When the user requests continuation, read the existing record and inspect the actual checkout, artifacts and external state. Reconcile uncertain actions before retrying them; a saved intention is not proof of completion. Resume the same outcome and preserve previous results. Report what is implemented, checked, published or blocked with the evidence and next action needed.
