@@ -13,6 +13,7 @@ import sys
 import time
 
 import state
+from state import bind, scope
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
           "PermissionRequest", "PreCompact", "PostCompact", "SubagentStart",
@@ -25,37 +26,6 @@ def identity(*parts):
     return hashlib.sha256(state.encode(parts).encode()).hexdigest()
 
 
-def scope(db, session_id):
-    return [r[0] for r in db.execute(
-        "SELECT work_id FROM runtime_scopes WHERE session_id=? ORDER BY work_id", (session_id,))]
-
-
-def bind(db, session_id, work_ids, role=None, parent_id=None, extend=False):
-    if not session_id or not work_ids:
-        raise ValueError("binding needs a session ID and existing work IDs")
-    for work_id in work_ids:
-        if not state.row(db, "works", work_id):
-            raise ValueError("unknown work: " + work_id)
-    saved = db.execute("SELECT * FROM runtime_sessions WHERE id=?", (session_id,)).fetchone()
-    if saved and not extend and set(scope(db, session_id)) != set(work_ids):
-        # Never reassign observations already attributed to another issue.
-        raise ValueError("session already bound; use a separate session for another issue")
-    db.execute("""INSERT INTO runtime_sessions(id,parent_id,role,bound_at)
-        VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET role=COALESCE(excluded.role,role),
-        parent_id=COALESCE(excluded.parent_id,parent_id),
-        bound_at=CASE WHEN closed_at IS NOT NULL THEN excluded.bound_at ELSE bound_at END,
-        closed_at=NULL""",
-        (session_id, parent_id, role, state.now()))
-    if saved and extend and set(work_ids) - set(scope(db, session_id)):
-        for run in db.execute("SELECT * FROM runs WHERE agent=? AND id LIKE 'runtime:%' AND ended_at IS NULL", (session_id,)).fetchall():
-            end = state.now()
-            db.execute("UPDATE runs SET ended_at=?,duration_seconds=?,status='scope-changed' WHERE id=?",
-                       (end, (state.instant(end)-state.instant(run["started_at"])).total_seconds(), run["id"]))
-    for work_id in work_ids:
-        db.execute("INSERT OR IGNORE INTO runtime_scopes VALUES (?,?)", (session_id, work_id))
-    return {"session_id": session_id, "work_ids": scope(db, session_id)}
-
-
 def event(db, session, key, kind, timestamp, turn_id=None, **values):
     work_ids = scope(db, session)
     item = dict(id=key, session_id=session, work_id=work_ids[0] if len(work_ids) == 1 else None,
@@ -63,12 +33,12 @@ def event(db, session, key, kind, timestamp, turn_id=None, **values):
     existing = state.row(db, "runtime_events", key)
     if existing:
         starts = [x for x in (existing["started_at"], timestamp) if x]
-        item["started_at"] = min(starts) if starts else None
+        item["started_at"] = min(starts, key=state.instant) if starts else None
         for name in ("ended_at", "status", "name", "fingerprint", "source_ref"):
             if item.get(name) is None:
                 item[name] = existing[name]
         if existing["ended_at"] and item.get("ended_at"):
-            item["ended_at"] = max(existing["ended_at"], item["ended_at"])
+            item["ended_at"] = max(existing["ended_at"], item["ended_at"], key=state.instant)
     if item.get("ended_at") and item.get("started_at"):
         item["duration_seconds"] = max(0, (state.instant(item["ended_at"]) -
                                           state.instant(item["started_at"])).total_seconds())
@@ -87,7 +57,7 @@ def turn(db, session, turn_id, timestamp, status=None):
     key = "turn:" + session["id"] + ":" + turn_id
     existing = state.row(db, "runtime_events", key)
     if status is None and existing and existing["ended_at"]:
-        if timestamp <= existing["ended_at"]:
+        if state.instant(timestamp) <= state.instant(existing["ended_at"]):
             status = existing["status"]
             timestamp = existing["ended_at"]
         else:
@@ -195,7 +165,17 @@ def collect_transcript(db, session, transcript, collect_tools=False):
             line = stream.readline()
             if not line or not line.endswith(b"\n"):
                 break
-            item = json.loads(line)
+            try:
+                item = json.loads(line)
+                if not isinstance(item, dict):
+                    raise ValueError("transcript line is not an object")
+            except ValueError:
+                # One malformed line must not stall collection: record the gap and move on.
+                event(db, session["id"], identity(session["id"], position, "malformed"), "transcript_gap",
+                      state.now(), active_turn, status="skipped",
+                      source_ref=session["transcript_path"] + "#byte=" + str(position))
+                cursor = stream.tell()
+                continue
             payload = item.get("payload") or {}
             timestamp = item.get("timestamp")
             if item.get("type") == "turn_context":

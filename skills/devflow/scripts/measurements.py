@@ -1,5 +1,6 @@
 """Derived metrics with explicit denominators and missing-data counts."""
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 import json
 import statistics
 
@@ -15,6 +16,14 @@ def distribution(values):
         return {"observations": 0, "total": None, "median": None, "p95": None}
     return {"observations": len(values), "total": sum(values),
             "median": statistics.median(values), "p95": values[max(0, (95 * len(values) + 99) // 100 - 1)]}
+
+
+def moment(value):
+    """Order timestamps by instant; unparseable legacy values sort last."""
+    try:
+        return state.instant(value)
+    except (AttributeError, TypeError, ValueError):
+        return datetime.max.replace(tzinfo=timezone.utc)
 
 
 def elapsed(start, end):
@@ -47,7 +56,7 @@ def summarize(db, work_id=None):
     transitions, recovery = Counter(), Counter()
     for w in works:
         events = sorted((h for h in history if h["entity"] == "work" and h["work_id"] == w["id"]),
-                        key=lambda h: (h.get("occurred_at") or h["recorded_at"], h["id"]))
+                        key=lambda h: (moment(h.get("occurred_at") or h["recorded_at"]), h["id"]))
         previous = None
         for h in events:
             timestamp = h.get("occurred_at") or h["recorded_at"]

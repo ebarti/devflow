@@ -1,5 +1,9 @@
 #!/usr/bin/env python3.12
-"""Record supplied workflow facts in SQLite. This script does not execute work."""
+"""Record supplied workflow facts in SQLite. This script does not execute work.
+
+Claiming a work also binds the owner's runtime session so installed hooks can
+attribute their observations; telemetry.py collects them.
+"""
 
 import argparse
 from contextlib import closing
@@ -174,6 +178,38 @@ def require_owner(db, work_id, owner):
     return saved
 
 
+def scope(db, session_id):
+    return [r[0] for r in db.execute(
+        "SELECT work_id FROM runtime_scopes WHERE session_id=? ORDER BY work_id", (session_id,))]
+
+
+def bind(db, session_id, work_ids, role=None, parent_id=None, extend=False):
+    """Associate a host session with work IDs so installed hooks can attribute observations."""
+    if not session_id or not work_ids:
+        raise ValueError("binding needs a session ID and existing work IDs")
+    for work_id in work_ids:
+        if not row(db, "works", work_id):
+            raise ValueError("unknown work: " + work_id)
+    saved = db.execute("SELECT * FROM runtime_sessions WHERE id=?", (session_id,)).fetchone()
+    if saved and not extend and set(scope(db, session_id)) != set(work_ids):
+        # Never reassign observations already attributed to another issue.
+        raise ValueError("session already bound; use a separate session for another issue")
+    db.execute("""INSERT INTO runtime_sessions(id,parent_id,role,bound_at)
+        VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET role=COALESCE(excluded.role,role),
+        parent_id=COALESCE(excluded.parent_id,parent_id),
+        bound_at=CASE WHEN closed_at IS NOT NULL THEN excluded.bound_at ELSE bound_at END,
+        closed_at=NULL""",
+        (session_id, parent_id, role, now()))
+    if saved and extend and set(work_ids) - set(scope(db, session_id)):
+        for run in db.execute("SELECT * FROM runs WHERE agent=? AND id LIKE 'runtime:%' AND ended_at IS NULL", (session_id,)).fetchall():
+            end = now()
+            db.execute("UPDATE runs SET ended_at=?,duration_seconds=?,status='scope-changed' WHERE id=?",
+                       (end, (instant(end)-instant(run["started_at"])).total_seconds(), run["id"]))
+    for work_id in work_ids:
+        db.execute("INSERT OR IGNORE INTO runtime_scopes VALUES (?,?)", (session_id, work_id))
+    return {"session_id": session_id, "work_ids": scope(db, session_id)}
+
+
 def claim_work(db, work_id, owner, source_ref=None):
     if not owner or not owner.strip():
         raise ValueError("owner must be the actual host task or coordinator ID")
@@ -187,7 +223,6 @@ def claim_work(db, work_id, owner, source_ref=None):
         if (saved["work_id"], saved["owner"], saved["resource"]) != (work_id, owner, resource):
             raise ValueError("already claimed: " + encode(saved))
         db.execute("UPDATE claims SET updated_at=?,source_ref=COALESCE(?,source_ref) WHERE work_id=?", (now(), source_ref, work_id))
-        from telemetry import bind
         bind(db, owner, [work_id], "coordinator", extend=True)
         return {"replayed": True, "claim": claim_for(db, work_id)}
     timestamp = now()
@@ -195,7 +230,6 @@ def claim_work(db, work_id, owner, source_ref=None):
                   source_ref=source_ref, claimed_at=timestamp, updated_at=timestamp)
     insert(db, "claims", values)
     history(db, uuid.uuid4().hex, work_id, "claim", resource, "claim", values)
-    from telemetry import bind
     bind(db, owner, [work_id], "coordinator", extend=True)
     return {"replayed": False, "claim": values}
 
