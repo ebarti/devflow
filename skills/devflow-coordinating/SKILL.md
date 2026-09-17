@@ -9,7 +9,18 @@ Use the user's request and target project instructions to choose the next useful
 
 Claim implementation work through [issue ownership](../devflow/references/ownership.md) before dispatching it. Maintain the issue's assignee and its existing Project's Status, and release ownership when the task stops. For a requested batch, a coordinator may own several issues and keep independent ready work moving concurrently with separate work IDs/worktrees. Respect dependencies and host capacity. One issue keeps one coordinating owner across its delegated roles.
 
-Handle small work directly. When delegation is authorized and useful, default implementation workers to **Sol / high** (`gpt-5.6-sol`, effort `high`), preserving explicit user or project overrides. On Codex, use a configurable `worker` role and pass `model`, `reasoning_effort` and `fork_turns: "none"` explicitly; fixed role profiles can override the model. Keep other roles on their existing settings.
+Delegate every implementation change, including small fixes and review/QA repairs, to a **Sol / high** subagent. The coordinator owns scope, planning, dispatch, verification and delivery; it does not implement changes itself. Spawn each implementation worker with these literal arguments, adding its `task_name` and `message`:
+
+```json
+{
+  "agent_type": "worker",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "high",
+  "fork_turns": "none"
+}
+```
+
+Use the configurable `worker` role, not a fixed `implementer`, `fixer` or QA role that can override the model. Do not omit these arguments or inherit the coordinator's model. If spawning fails, report the failure instead of implementing directly or silently substituting another model. Coordinator, review and verification models remain unchanged.
 
 Give each worker a concise brief: one observable outcome, owned files/modules, required context and dependencies, and exact checks or manual steps with expected results. Include the relevant [implementation instructions](../devflow-implementing/SKILL.md). Tell workers they share the codebase and must preserve others' edits. Delegate only independent work concurrently; do not create agents just to satisfy stages.
 

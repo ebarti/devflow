@@ -5,7 +5,7 @@ description: Use Devflow for a development request, role selection, local work r
 
 # Devflow
 
-Follow the user's requested outcome and the target project's instructions. Start authorized work without an extra approval gate. Discussion alone creates no work; loading a skill creates no issues, agents or backlog activity. Use the host's tools, Git, `gh` and project commands directly, with the user's model settings.
+Follow the user's requested outcome and the target project's instructions. Start authorized work without an extra approval gate. Discussion alone creates no work; loading a skill creates no issues, agents or backlog activity. Use the host's tools, Git, `gh` and project commands. Every implementation change goes to a Sol/high worker through [coordinating](../devflow-coordinating/SKILL.md); other roles retain their selected models.
 
 Select only the role needed:
 
@@ -14,7 +14,7 @@ Select only the role needed:
 | Clarify a request or explore a design | [Defining work](../devflow-defining-work/SKILL.md) |
 | Plan architecture, slices or coverage | [Planning](../devflow-planning/SKILL.md) |
 | Carry out a defined request or continue actual work | [Coordinating](../devflow-coordinating/SKILL.md) |
-| Change or repair code | [Implementing](../devflow-implementing/SKILL.md) |
+| Change or repair code | [Coordinating](../devflow-coordinating/SKILL.md); assigned workers use [Implementing](../devflow-implementing/SKILL.md) |
 | Review an existing candidate | [Reviewing](../devflow-reviewing/SKILL.md) |
 | Reproduce behavior or run project checks | [Verifying](../devflow-verifying/SKILL.md) |
 | Publish, merge or reconcile delivery | [Delivering](../devflow-delivering/SKILL.md) |

@@ -11,4 +11,4 @@ Report actionable findings with severity, location, concrete trigger, impact and
 
 Retain the review result and findings in the [shared helper](../devflow/references/state.md), tied to the candidate commit and actual reviewer run when known. Preserve earlier findings when verifying a repair; record the fix and new evidence instead of silently replacing the original judgement.
 
-Publish review comments only within authorized external scope. Verify a claimed repair against the original trigger and relevant adjacent behavior before marking its finding resolved. Return concise findings and limits to the requesting agent or user.
+Publish review comments only within authorized external scope. Return implementation repairs to [coordinating](../devflow-coordinating/SKILL.md) for a Sol/high worker. Verify a claimed repair against the original trigger and relevant adjacent behavior before marking its finding resolved. Return concise findings and limits to the requesting agent or user.

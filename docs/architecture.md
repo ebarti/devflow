@@ -1,6 +1,6 @@
 # Architecture
 
-The host discovers eight sibling skill directories. An agent selects the skill that fits the user's request, applies its engineering method, and invokes existing tools directly. The main [devflow skill](../skills/devflow/SKILL.md) owns the shared helper instructions.
+The host discovers eight sibling skill directories. An agent selects the skill that fits the user's request, applies its engineering method, and invokes existing tools directly. Coordinators dispatch every implementation change to a worker with explicit Sol/high spawn arguments. The main [devflow skill](../skills/devflow/SKILL.md) owns the shared helper instructions.
 
 `skills/devflow/scripts/state.py` uses Python's standard library to store local records, reserve work for an owning task and query metrics. Issue claims are atomic within a shared SQLite database. Independent work executes outside those short transactions.
 
@@ -8,6 +8,6 @@ The host discovers eight sibling skill directories. An agent selects the skill t
 
 `telemetry.py` installs lifecycle hooks and records bound sessions' runtime events and token-counter deltas. Claims attach coordinators; child tasks inherit an unambiguous issue. Shared usage remains unallocated. The collector is content-free and never steers a tool or starts model work. `measurements.py` derives timings, outcomes, recovery and coverage from the same database.
 
-The installer links skills from a release checkout and merges the collector into the host's hook configuration. Other hooks are preserved; the host owns hook trust. Explicit upgrades select a release tag, refresh installation and remove obsolete owned links. Candidate sessions use separate configuration, skills and SQLite. Project policies and model settings stay with their existing owners.
+The installer links skills from a release checkout and merges the collector into the host's hook configuration. Other hooks are preserved; the host owns hook trust. Explicit upgrades select a release tag, refresh installation and remove obsolete owned links. Candidate sessions use separate configuration, skills and SQLite. Project policies and host model settings stay with their existing owners; the skills specify implementation-worker models at spawn time.
 
 See the [README diagrams](../README.md#how-it-works), [storage contract](implementation-contracts.md) and [helper commands](../skills/devflow/references/state.md).
