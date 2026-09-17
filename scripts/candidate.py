@@ -28,7 +28,7 @@ def main():
                     Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "skills"}
     config = ["[features]\nhooks = true\n"]
     for root in sorted(normal_roots):
-        for name in [*skills, "using-devflow"]:
+        for name in skills:
             path = root / name / "SKILL.md"
             if path.exists():
                 config.append("[[skills.config]]\npath = " + json.dumps(str(path)) + "\nenabled = false\n")

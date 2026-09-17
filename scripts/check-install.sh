@@ -1,6 +1,8 @@
 #!/bin/sh
 # The installation smoke check runs entirely in a temporary directory.
 set -eu
+# Fixture repositories must not inherit the developer's global Git configuration (signing, hooks, templates).
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 source_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 install_fixture=$(mktemp -d)
