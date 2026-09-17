@@ -1,10 +1,10 @@
 # Devflow
 
-Small development skills for an agent, with Python helpers for work ownership, GitHub issue status and metrics. The agent follows the relevant skill and uses its host tools, Git, GitHub CLI and project commands directly.
+Small development skills for OpenAI Codex CLI agents, with Python helpers for work ownership, GitHub issue status and metrics. The agent follows the relevant skill and uses its host tools, Git, GitHub CLI and project commands directly.
 
 ## Prerequisites
 
-Supply Python 3.12+, a POSIX shell, Git, a host that discovers `SKILL.md` directories, and the tools required by your projects. Candidate trials use Codex CLI. GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
+Devflow targets Codex CLI: skills load from its skills directory, metrics hooks use its `hooks.json` and transcript format, and delegation uses its agent tools. Other hosts that discover `SKILL.md` directories can load the role skills, but hooks, metrics, candidate trials and worker spawning are Codex-specific. Supply Python 3.12+, a POSIX shell, Git and the tools required by your projects. Delegated implementation needs a configurable `worker` agent role and access to the worker model; see the [implementation worker reference](skills/devflow/references/implementation-worker.md). GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
 
 ## Install
 
@@ -58,7 +58,7 @@ Publish a new release tag after the installation smoke check and the selected pr
 
 Ask for the outcome you want, for example: “Use devflow to fix the retry bug in this repository.” Or invoke a role such as `$devflow-reviewing` for a specific review. Skills are independently discoverable; loading one does not create work, issues or agents, or resume a backlog.
 
-Every implementation change, including small fixes and review/QA repairs, runs in a **Sol / high** subagent (`gpt-5.6-sol`, effort `high`). The coordinator supplies bounded tasks and exact verification steps; it does not implement changes itself. Spawn arguments explicitly select the model and effort. Reuse agents for related follow-ups in the same role, issue and worktree, preserving required review/QA independence. Other roles keep their selected models.
+Implementation changes, including small fixes and review or QA repairs, run in a dedicated implementation worker; the default is **Sol / high** (`gpt-5.6-sol`, effort `high`). An explicit user or project instruction naming a model or effort takes precedence, the coordinator never falls back to its own model, and when the worker cannot be spawned it stops and asks. Related follow-ups reuse the same agent within one role, issue and worktree while preserving required review and QA independence. Other roles keep their selected models. The [implementation worker reference](skills/devflow/references/implementation-worker.md) is the single definition.
 
 | Skill | Use |
 | --- | --- |
@@ -96,20 +96,26 @@ flowchart LR
     Deliver --> Record[Update issue and release claim]
 ```
 
-Independent issues follow this flow concurrently in separate worktrees. A coordinator may own several issues and dispatch their workers; each issue keeps one owner and work ID. One GitHub helper creates or reuses the issue, assigns the accountable user, adds it to the existing Project and updates its Status using the board's existing options. Use `state.py work list --claimed` to see task owners and their last observations. See [ownership and interruption handling](skills/devflow/references/ownership.md).
+Independent issues follow this flow concurrently in separate worktrees, each with one owner and work ID. The GitHub helper creates or reuses the issue, assigns the accountable user and updates its existing Project Status. Ownership rules, concurrency and interruption handling are defined once in [issue ownership](skills/devflow/references/ownership.md).
 
-The state helper stores work, claims, runs, results and findings. Runtime hooks collect bound tasks' turns, tool timings, interruptions, compactions and token-counter deltas without storing prompt or command text. Claims attach coordinators automatically; children inherit a single issue. Multi-issue coordinator usage stays unallocated. There is no scheduler.
+The state helper stores work, claims, runs, results, findings and usage; installed hooks add content-free runtime observations for bound tasks. What is collected, how usage is attributed and what is deliberately not inferred are defined once in [work records and metrics](skills/devflow/references/state.md).
 
-`state.py metrics` reports outcomes, roles/models, delivery, ownership, recovery, timing, usage and coverage; add `--work-id ID` for one issue. Missing observations stay unknown. Check acceptance and finding decisions remain explicit records. Costs require supplied estimates; complete workflow overhead and savings are not inferred. See [metrics and collection](skills/devflow/references/state.md).
+`state.py metrics` reports outcomes, roles and models, delivery, ownership, recovery, timing, usage and coverage; add `--work-id ID` for one issue.
 
-The default database is `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.local/state/devflow/workflow.sqlite3` when that variable is unset. See [helper commands](skills/devflow/references/state.md) and [storage contracts](docs/implementation-contracts.md).
+The database location and helper commands are documented in [work records and metrics](skills/devflow/references/state.md); storage semantics are in the [storage contract](docs/implementation-contracts.md).
 
-## Installation smoke check
+## Checks
 
 ```sh
 bash scripts/check-install.sh
 ```
 
-Devflow CI runs only this installation smoke check. It does not run package test suites, review/QA gates or delivery automation. Target projects retain their own check policies.
+Devflow CI runs this installation smoke check and the helper unit tests in `tests/`:
+
+```sh
+python3.12 -m unittest discover -s tests
+```
+
+It does not run target projects' suites, review/QA gates or delivery automation; target projects retain their own check policies.
 
 [Architecture](docs/architecture.md)
