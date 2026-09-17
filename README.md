@@ -58,7 +58,7 @@ Publish a new release tag after the installation smoke check and the selected pr
 
 Ask for the outcome you want, for example: “Use devflow to fix the retry bug in this repository.” Or invoke a role such as `$devflow-reviewing` for a specific review. Skills are independently discoverable; loading one does not create work, issues or agents, or resume a backlog.
 
-Every implementation change, including small fixes and review/QA repairs, runs in a **Sol / high** subagent (`gpt-5.6-sol`, effort `high`). The coordinator supplies bounded tasks and exact verification steps; it does not implement changes itself. Spawn arguments explicitly select the model and effort. Other roles keep their selected models.
+Every implementation change, including small fixes and review/QA repairs, runs in a **Sol / high** subagent (`gpt-5.6-sol`, effort `high`). The coordinator supplies bounded tasks and exact verification steps; it does not implement changes itself. Spawn arguments explicitly select the model and effort. Reuse agents for related follow-ups in the same role, issue and worktree, preserving required review/QA independence. Other roles keep their selected models.
 
 | Skill | Use |
 | --- | --- |

@@ -5,7 +5,7 @@ description: Implement a defined feature or repair a defect in the requested rep
 
 # Implement the change
 
-Execute implementation only as a delegated **Sol / high** worker (`gpt-5.6-sol`, effort `high`). A direct implementation request first follows [coordinating](../devflow-coordinating/SKILL.md) to claim the issue and spawn that worker. If an existing worker has the wrong model or effort, return to the coordinator for replacement before editing. A correctly configured implementation worker performs its assigned work directly and does not spawn another implementer.
+Execute implementation only as a delegated **Sol / high** worker (`gpt-5.6-sol`, effort `high`). A direct implementation request first follows [coordinating](../devflow-coordinating/SKILL.md) to claim the issue and reuse or spawn that worker. If an existing worker has the wrong model or effort, return to the coordinator for replacement before editing. A correctly configured implementation worker performs its assigned work directly and does not spawn another implementer.
 
 Read the owning code, documentation and project rules. Confirm the working branch and dirty state; preserve unrelated work and collaborators' edits. Make the smallest coherent change that satisfies the requested behavior.
 

@@ -9,7 +9,9 @@ Use the user's request and target project instructions to choose the next useful
 
 Claim implementation work through [issue ownership](../devflow/references/ownership.md) before dispatching it. Maintain the issue's assignee and its existing Project's Status, and release ownership when the task stops. For a requested batch, a coordinator may own several issues and keep independent ready work moving concurrently with separate work IDs/worktrees. Respect dependencies and host capacity. One issue keeps one coordinating owner across its delegated roles.
 
-Delegate every implementation change, including small fixes and review/QA repairs, to a **Sol / high** subagent. The coordinator owns scope, planning, dispatch, verification and delivery; it does not implement changes itself. Spawn each implementation worker with these literal arguments, adding its `task_name` and `message`:
+Before spawning, inspect existing agents. Reuse an agent for related work in the same role, work ID and worktree; implementation reuse requires Sol/high. Use `agents.followup_task` with its existing ID or path to continue a finished or idle agent. Use `agents.send_message` for corrections to its active task; do not assign overlapping work. Prefer the original implementer for repairs and the original reviewer/verifier for rechecks, preserving required independence. Spawn only when no suitable agent is available or independent work must run concurrently.
+
+Delegate every implementation change, including small fixes and review/QA repairs, to a **Sol / high** subagent. The coordinator owns scope, planning, dispatch, verification and delivery; it does not implement changes itself. When a new implementation worker is needed, spawn it with these literal arguments, adding its `task_name` and `message`:
 
 ```json
 {
