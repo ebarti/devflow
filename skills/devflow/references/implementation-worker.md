@@ -1,16 +1,12 @@
 # Implementation worker
 
-Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The coordinator owns scope, dispatch, verification and delivery and never edits the candidate itself. This reference is the single definition of the worker's model, precedence, spawn arguments, brief and failure handling; the role skills link here instead of restating it.
+Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The coordinator owns scope, dispatch, verification and delivery and never edits the candidate itself. This reference is the single definition of the worker's model, the only override that can change it, spawn arguments, brief and failure handling; the role skills link here instead of restating it.
 
-## Model and precedence
+## Model and override
 
-The default worker is **Sol / high**: model `gpt-5.6-sol`, reasoning effort `high`. Choose the worker's model and effort in this order:
+The worker is **Sol / high**: model `gpt-5.6-sol`, reasoning effort `high`. The only thing that changes it is an explicit, checked-in configuration entry in the target repository that names the Devflow implementation worker's model and effort, for example a `[agents.worker]` table with `model` and `reasoning_effort` in the repository's `.codex/config.toml`. When such an entry exists, pass its values as the spawn arguments. A request in the conversation, prose in agent instruction files and user-level settings are not overrides; if the user wants another model, it goes into the repository's configuration first.
 
-1. An explicit instruction from the user for this task.
-2. The target project's instructions, when they name a model or effort for implementation work.
-3. The default above.
-
-Silently inheriting the coordinator's model is never acceptable, and neither is substituting another model without an instruction from this list. Record the actual model and effort on the worker's run with `state.py record run --model MODEL --effort EFFORT` so metrics reflect what ran. Coordinator, review and verification roles keep their existing models.
+Silently inheriting the coordinator's model is never acceptable, and neither is substituting another model without such an entry. Record the actual model and effort on the worker's run with `state.py record run --model MODEL --effort EFFORT` so metrics reflect what ran. Coordinator, review and verification roles keep their existing models.
 
 ## Prerequisites
 
@@ -18,7 +14,7 @@ On Codex, spawning needs agent support, a configurable `worker` role in the Code
 
 ## Spawning on Codex
 
-When no suitable agent exists, spawn a new worker with these literal arguments, adding `task_name` and `message`, and changing the model or effort only under the precedence above:
+When no suitable agent exists, spawn a new worker with these literal arguments, adding `task_name` and `message`, and changing the model or effort only when the repository configuration above says so:
 
 ```json
 {
@@ -50,4 +46,4 @@ The worker relies on this brief rather than introspecting its own model. A worke
 
 ## When spawning fails
 
-If the `worker` role is missing, the model is unavailable or rejected, or the spawn fails for any other reason, stop: report the exact failure to the user, name the model and effort that were requested, and ask which model and effort to use or what configuration to fix. Do not implement the change directly and do not substitute another model. The user's answer is an explicit instruction under the precedence above; record it in the work record and continue.
+If the `worker` role is missing, the model is unavailable or rejected, or the spawn fails for any other reason, stop: report the exact failure to the user, name the model and effort that were requested, and ask what configuration to fix. Do not implement the change directly and do not substitute another model. A different model takes effect only once it is written into the repository's configuration; a model named in the conversation is not an override. Record the outcome in the work record and continue once the configuration is fixed.
