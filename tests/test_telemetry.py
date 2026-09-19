@@ -135,5 +135,30 @@ class HookTests(TelemetryCase):
         self.assertIsNone(state.row(self.db, "runtime_events", "tool:s2:call-2")["work_id"])  # two issues stay unallocated
 
 
+class BoundaryTests(TelemetryCase):
+    def test_coordinator_sessions_cannot_modify_the_repository(self):
+        state.claim_work(self.db, "w1", "root-1")  # claiming binds root-1 as the coordinator
+        telemetry.bind(self.db, "worker-1", ["w1"], "devflow-implementer")
+
+        def call(session, tool, tool_input, use_id):
+            return telemetry.handle(self.db, {"session_id": session, "hook_event_name": "PreToolUse", "turn_id": "t1",
+                                              "tool_use_id": use_id, "tool_name": tool, "tool_input": tool_input})
+
+        denied = call("root-1", "apply_patch", {"patch": "*** Begin Patch"}, "c1")
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(state.row(self.db, "runtime_events", "boundary:root-1:c1")["status"], "denied")
+        self.assertIsNone(state.row(self.db, "runtime_events", "tool:root-1:c1"))
+        for use_id, command in (("c2", "git -C /repo commit -m x"), ("c3", "sed -i '' 's/a/b/' src/x.py"),
+                                ("c4", "pytest -q > report.txt"), ("c5", "cat notes | tee docs/x.md")):
+            self.assertIsNotNone(call("root-1", "shell", {"command": command}, use_id), command)
+        for use_id, command in (("c6", "pytest -q 2>&1 | tail -5 > /tmp/out.txt"),
+                                ("c7", 'python3.12 state.py record result --id r1 --work-id w1 --kind qa --status passed --summary "a > b"'),
+                                ("c8", "git status && git log --oneline -3 && git worktree add ../wt feature")):
+            self.assertIsNone(call("root-1", "shell", {"command": command}, use_id), command)
+        self.assertIsNone(call("worker-1", "apply_patch", {"patch": "*** Begin Patch"}, "c9"))
+        self.assertEqual(state.row(self.db, "runtime_events", "tool:worker-1:c9")["status"], "started")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM runtime_events WHERE kind='boundary'").fetchone()[0], 5)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import sqlite3
 import sys
@@ -20,6 +21,67 @@ EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
           "SubagentStop", "Stop", "Interrupt", "SessionEnd")
 TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_tokens",
                 "output_tokens", "reasoning_output_tokens")
+# The coordinator holds the claim but never changes the repository itself; these are the
+# common ways a session would, short of a sandbox.
+EDIT_TOOL_WORDS = ("patch", "write", "edit", "create_file")
+MUTATING_GIT = {"commit", "push", "merge", "rebase", "cherry-pick", "revert", "apply", "am",
+                "reset", "restore", "stash", "clean", "rm", "mv", "add", "tag"}
+COMMAND_STARTS = {"&&", "||", "|", ";", "(", "{", "then", "do"}
+SAFE_REDIRECT_PREFIXES = ("/dev/", "/tmp/", "$TMPDIR", "${TMPDIR")
+
+
+def command_text(tool_input):
+    if isinstance(tool_input, dict):
+        for key in ("command", "cmd", "script"):
+            value = tool_input.get(key)
+            if isinstance(value, list):
+                return " ".join(str(item) for item in value)
+            if isinstance(value, str):
+                return value
+    return None
+
+
+def boundary_violation(tool_name, tool_input):
+    """Return why a coordinator may not make this tool call, or None when it is allowed."""
+    lowered = (tool_name or "").lower()
+    if any(word in lowered for word in EDIT_TOOL_WORDS):
+        return f"{tool_name} edits files; dispatch the devflow-implementer worker"
+    command = command_text(tool_input)
+    if not command:
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.split()
+    for index, token in enumerate(tokens):
+        leading = index == 0 or tokens[index - 1] in COMMAND_STARTS
+        if token == "git":
+            rest = tokens[index + 1:]
+            while rest and rest[0].startswith("-"):
+                rest = rest[2:] if rest[0] in ("-C", "-c", "--git-dir", "--work-tree") else rest[1:]
+            if rest and rest[0] in MUTATING_GIT:
+                return f"git {rest[0]} changes the repository; only the implementation worker or the deliverer may"
+        if leading and token in ("patch", "tee"):
+            return f"{token} writes files; dispatch the devflow-implementer worker"
+        if leading and token in ("sed", "perl"):
+            for argument in tokens[index + 1:]:
+                if argument in COMMAND_STARTS:
+                    break
+                if re.match(r"^-[a-zA-Z]*i", argument) or argument.startswith("--in-place"):
+                    return f"{token} in-place edits belong to the devflow-implementer worker"
+        redirect = re.match(r"^(\d*)(>{1,2})(.*)$", token)
+        if redirect:
+            target = redirect.group(3) or (tokens[index + 1] if index + 1 < len(tokens) else "")
+            if not target.startswith("&") and not target.startswith(SAFE_REDIRECT_PREFIXES):
+                return f"shell redirection writes {target or 'a file'}; coordinators only write under temporary paths"
+    return None
+
+
+def deny(reason):
+    message = "Devflow boundary: " + reason
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": message},
+            "systemMessage": message}
 
 
 def identity(*parts):
@@ -232,6 +294,7 @@ def tool_status(response):
 
 def handle(db, payload):
     started = time.monotonic()
+    response = None
     parent = payload.get("session_id")
     saved = db.execute("SELECT * FROM runtime_sessions WHERE id=?", (parent,)).fetchone()
     if not saved or saved["closed_at"]:
@@ -271,14 +334,22 @@ def handle(db, payload):
             if not use_id:
                 raise ValueError("tool hook lacks tool_use_id")
             signature = identity(payload.get("tool_name"), payload.get("tool_input"))
-            tool_key = "tool:" + parent + ":" + use_id
-            tool_started = stamp if name == "PreToolUse" else None
-            previous = state.row(db, "runtime_events", tool_key)
-            if not previous or previous["ended_at"] is None:
-                event(db, parent, tool_key, "tool", tool_started, turn_id,
-                      name=payload.get("tool_name"), fingerprint=signature,
-                      ended_at=stamp if name == "PostToolUse" else None,
-                      status=tool_status(payload.get("tool_response")) if name == "PostToolUse" else "started")
+            reason = None
+            if name == "PreToolUse" and session["role"] == "coordinator":
+                reason = boundary_violation(payload.get("tool_name"), payload.get("tool_input"))
+            if reason:
+                event(db, parent, "boundary:" + parent + ":" + use_id, "boundary", stamp, turn_id,
+                      name=payload.get("tool_name"), fingerprint=signature, status="denied", ended_at=stamp)
+                response = deny(reason)
+            else:
+                tool_key = "tool:" + parent + ":" + use_id
+                tool_started = stamp if name == "PreToolUse" else None
+                previous = state.row(db, "runtime_events", tool_key)
+                if not previous or previous["ended_at"] is None:
+                    event(db, parent, tool_key, "tool", tool_started, turn_id,
+                          name=payload.get("tool_name"), fingerprint=signature,
+                          ended_at=stamp if name == "PostToolUse" else None,
+                          status=tool_status(payload.get("tool_response")) if name == "PostToolUse" else "started")
         else:
             event(db, parent, identity(parent, name, turn_id, payload.get("source"), session["cursor"]), name, stamp,
                   turn_id, name=payload.get("source") or payload.get("trigger"))
@@ -293,6 +364,7 @@ def handle(db, payload):
     # Runtime collector overhead is measured directly, not inferred from coordinator usage.
     event(db, parent, identity(parent, name, turn_id, payload.get("tool_use_id"), stamp),
           "collector", stamp, turn_id, duration_seconds=time.monotonic() - started, status="completed")
+    return response
 
 
 def close_if_released(db, session_id, timestamp):
@@ -358,8 +430,7 @@ def main():
                 return 0
             with closing(state.connect(args.db)) as db, db:
                 db.execute("BEGIN IMMEDIATE")
-                handle(db, payload)
-            result = {}
+                result = handle(db, payload) or {}
         else:
             with closing(state.connect(args.db)) as db, db:
                 db.execute("BEGIN IMMEDIATE")

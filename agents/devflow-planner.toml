@@ -1,7 +1,9 @@
 # Devflow planner. Installed by scripts/install.sh into $CODEX_HOME/agents/. Read-only.
-# No model is pinned: this role follows the session's subagent model and effort.
+# The workflow pins the default model and effort; a project overrides by shipping .codex/agents/devflow-planner.toml.
 name = "devflow-planner"
 description = "Devflow planner: plans architecture, slices and verification for a consequential change so each slice can be handed to the implementation worker. Read-only."
+model = "gpt-6-astra"
+model_reasoning_effort = "xhigh"
 sandbox_mode = "read-only"
 
 developer_instructions = """

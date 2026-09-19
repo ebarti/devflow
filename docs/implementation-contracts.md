@@ -15,7 +15,7 @@ The standard-library helper stores records in one SQLite database; its default l
 | `imports` | Source import identity and report |
 | `runtime_sessions` | Bound task identity, role/model, transcript cursor and cumulative token checkpoint |
 | `runtime_scopes` | Explicit task-to-work associations; several scopes leave usage unallocated |
-| `runtime_events` | Deduplicated turns/tools, observed lifecycle events, counter resets, skipped transcript lines and re-baselines after them, timing and command fingerprints |
+| `runtime_events` | Deduplicated turns/tools, observed lifecycle events, counter resets, skipped transcript lines and re-baselines after them, denied coordinator boundary calls, timing and command fingerprints |
 
 Fields are ordinary queryable columns; optional `details` holds extra JSON context. Missing facts remain SQL `NULL`. Creation records use caller-supplied stable IDs: replay matching stored facts is a no-op, conflicting reuse fails. Work/run/finding updates retain change history and support optional stable event IDs. A started run can be completed under the same ID. Related rows and history commit in one transaction. The helper records facts without enforcing stage order, authorization or a passing gate.
 

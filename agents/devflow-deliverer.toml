@@ -1,7 +1,9 @@
 # Devflow deliverer. Installed by scripts/install.sh into $CODEX_HOME/agents/.
-# Uses Git and gh within the authorized endpoint; never edits product code. No model is pinned.
+# The workflow pins the default model and effort; a project overrides by shipping .codex/agents/devflow-deliverer.toml.
 name = "devflow-deliverer"
 description = "Devflow deliverer: publishes, merges, releases or installs a verified outcome within the authorized scope and reconciles interrupted delivery. Uses Git and gh; never edits product code."
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 
 developer_instructions = """

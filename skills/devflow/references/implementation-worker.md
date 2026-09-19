@@ -1,6 +1,6 @@
 # Implementation worker
 
-Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The coordinator owns scope, dispatch, verification and delivery and never edits the candidate itself. This reference is the single definition of the worker: its agent definition, the only override that can change it, when it is dispatched, the brief it receives, reuse, and failure handling. The role skills link here instead of restating it. The worker is one of the [Devflow agents](agents.md); it is the only one whose definition pins a model.
+Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The coordinator owns scope, dispatch, verification and delivery and never edits the candidate itself. This reference is the single definition of the worker: its agent definition, the only override that can change it, when it is dispatched, the brief it receives, reuse, and failure handling. The role skills link here instead of restating it. The worker is one of the [Devflow agents](agents.md), each of which pins its own default model and effort.
 
 ## The agent definition
 
@@ -17,7 +17,7 @@ Add `task_name` and `message` (the brief). Do not pass `model` or `reasoning_eff
 
 ## Override
 
-The only override is a checked-in, project-scoped definition of the same agent in the target repository: `.codex/agents/devflow-implementer.toml`, which Codex loads for a trusted project in place of the installed definition. A request in the conversation, prose in agent instruction files and user-level settings are not overrides; the coordinator never chooses a model, so there is nothing for them to change. If the user wants another model for a repository, it goes into that repository's agent file first. Record the actual model and effort on the worker's run with `state.py record run --model MODEL --effort EFFORT` so metrics reflect what ran. Coordinator, review and verification roles keep their existing agent types and models.
+The only override is a checked-in, project-scoped definition of the same agent in the target repository: `.codex/agents/devflow-implementer.toml`, which Codex loads for a trusted project in place of the installed definition. A request in the conversation, prose in agent instruction files and user-level settings are not overrides; the coordinator never chooses a model, so there is nothing for them to change. If the user wants another model for a repository, it goes into that repository's agent file first. Record the actual model and effort on the worker's run with `state.py record run --model MODEL --effort EFFORT` so metrics reflect what ran. The other roles run as their own Devflow agent types with the defaults in the [agents reference](agents.md).
 
 ## Prerequisites
 

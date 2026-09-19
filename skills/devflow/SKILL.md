@@ -5,7 +5,7 @@ description: Use Devflow for a development request, role selection, local work r
 
 # Devflow
 
-Follow the user's requested outcome and the target project's instructions. Start authorized work without an extra approval gate. Discussion alone creates no work; loading a skill creates no issues, agents or backlog activity. Use the host's tools, Git, `gh` and project commands. Every delegated action runs as its [Devflow agent type](references/agents.md), spawned by name; implementation runs in the [implementation worker](references/implementation-worker.md), the only agent whose model is pinned, and the other roles follow the session's model.
+Follow the user's requested outcome and the target project's instructions. Start authorized work without an extra approval gate. Discussion alone creates no work; loading a skill creates no issues, agents or backlog activity. Use the host's tools, Git, `gh` and project commands. Every delegated action runs as its [Devflow agent type](references/agents.md), spawned by name, and each definition pins the workflow's default model and effort; implementation runs in the [implementation worker](references/implementation-worker.md). The coordinator is the user's session and only runs the workflow.
 
 Select only the role needed:
 

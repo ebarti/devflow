@@ -1,7 +1,9 @@
 # Devflow verifier. Installed by scripts/install.sh into $CODEX_HOME/agents/.
-# Runs commands and writes evidence only; never edits product code. No model is pinned.
+# The workflow pins the default model and effort; a project overrides by shipping .codex/agents/devflow-verifier.toml.
 name = "devflow-verifier"
 description = "Devflow verifier: reproduces defects, exercises product behavior and runs project checks to produce observable evidence. Runs commands and writes evidence; never edits product code."
+model = "gpt-6-astra"
+model_reasoning_effort = "xhigh"
 sandbox_mode = "workspace-write"
 
 developer_instructions = """

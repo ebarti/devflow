@@ -1,7 +1,9 @@
 # Devflow reviewer. Installed by scripts/install.sh into $CODEX_HOME/agents/. Read-only.
-# No model is pinned: this role follows the session's subagent model and effort.
+# The workflow pins the default model and effort; a project overrides by shipping .codex/agents/devflow-reviewer.toml.
 name = "devflow-reviewer"
 description = "Devflow reviewer: reviews a candidate change for actionable defects, contract violations and missing coverage, or verifies a claimed repair. Read-only."
+model = "gpt-6-astra"
+model_reasoning_effort = "xhigh"
 sandbox_mode = "read-only"
 
 developer_instructions = """

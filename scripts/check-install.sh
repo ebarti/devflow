@@ -38,10 +38,10 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("devflow-*.toml")):
     agents[agent["name"]] = agent
 assert set(agents) == {"devflow-definer", "devflow-planner", "devflow-implementer",
                        "devflow-reviewer", "devflow-verifier", "devflow-deliverer"}, sorted(agents)
-implementer = agents["devflow-implementer"]
-assert (implementer["model"], implementer["model_reasoning_effort"]) == ("gpt-5.6-sol", "high")
-# Only the implementation worker pins a model; the other roles follow the session.
-assert all("model" not in agent for name, agent in agents.items() if name != "devflow-implementer"), sorted(agents)
+# The workflow defines every agent's default model and effort; a project overrides with its own file.
+assert all(agent.get("model") and agent.get("model_reasoning_effort") for agent in agents.values()), sorted(agents)
+assert (agents["devflow-implementer"]["model"], agents["devflow-implementer"]["model_reasoning_effort"]) == ("gpt-5.6-sol", "high")
+assert (agents["devflow-planner"]["model"], agents["devflow-planner"]["model_reasoning_effort"]) == ("gpt-6-astra", "xhigh")
 PY
 "$devflow_python" -B "$destination/devflow/scripts/state.py" --help > /dev/null
 "$devflow_python" -B "$destination/devflow/scripts/github.py" --help > /dev/null

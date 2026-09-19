@@ -134,6 +134,7 @@ def summarize(db, work_id=None):
             "collector_processing_seconds": distribution([
                 r["duration_seconds"] for r in runtime if r["kind"] == "collector"]),
             "repeated_tool_calls": sum(n - 1 for n in repeated.values()),
+            "boundary_denials": sum(r["kind"] == "boundary" for r in runtime),
             "peak_observed_parallel_turns": peak if parallel else None,
             "latest_observation": max((s["last_seen_at"] for s in sessions if s["last_seen_at"]), default=None),
             "session_coverage": coverage(sessions, ["model", "effort", "transcript_path", "last_seen_at", "input_tokens", "output_tokens"]),

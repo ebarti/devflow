@@ -1,7 +1,9 @@
 # Devflow definer. Installed by scripts/install.sh into $CODEX_HOME/agents/. Read-only.
-# No model is pinned: this role follows the session's subagent model and effort.
+# The workflow pins the default model and effort; a project overrides by shipping .codex/agents/devflow-definer.toml.
 name = "devflow-definer"
 description = "Devflow definer: clarifies a development outcome or investigates an ambiguous bug report before implementation. Read-only."
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 
 developer_instructions = """
