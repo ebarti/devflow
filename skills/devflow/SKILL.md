@@ -7,7 +7,7 @@ description: Use Devflow for a development request, role selection, local work r
 
 Follow the user's requested outcome and the target project's instructions. Start authorized work without an extra approval gate. Discussion alone creates no work; loading a skill creates no issues, agents or backlog activity. Use the host's tools, Git, `gh` and project commands.
 
-The main Astra task inspects, asks the user questions and plans. For implementation, hand the inspected plan to one Sol/high execution coordinator; it spawns the implementer (Sol/high), reviewer (Sol/xhigh) and verifier (Sol/xhigh), handles repair loops and finishes at the authorized endpoint. Use the installed [agent types](references/agents.md) and [handoff procedure](../devflow-coordinating/SKILL.md). The main task handles material design decisions; routine execution stays with the coordinator.
+The main Astra task inspects, asks the user questions and plans. For implementation, hand the inspected plan to one Sol/high execution coordinator; it spawns the implementer (Sol/xhigh), reviewer (Sol/xhigh) and verifier (Sol/xhigh), handles repair loops and finishes at the authorized endpoint. Use the installed [agent types](references/agents.md) and [handoff procedure](../devflow-coordinating/SKILL.md). The main task handles material design decisions; routine execution stays with the coordinator.
 
 Select only the role needed:
 

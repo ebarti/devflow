@@ -47,7 +47,7 @@ assert set(agents) == {"devflow-coordinator", "devflow-implementer",
                        "devflow-reviewer", "devflow-verifier"}, sorted(agents)
 # The workflow defines every agent's default model and effort; a project overrides with its own file.
 assert all(agent.get("model") and agent.get("model_reasoning_effort") for agent in agents.values()), sorted(agents)
-for name, effort in {"devflow-coordinator": "high", "devflow-implementer": "high",
+for name, effort in {"devflow-coordinator": "high", "devflow-implementer": "xhigh",
                      "devflow-reviewer": "xhigh", "devflow-verifier": "xhigh"}.items():
     assert (agents[name]["model"], agents[name]["model_reasoning_effort"]) == ("gpt-5.6-sol", effort), name
 PY
