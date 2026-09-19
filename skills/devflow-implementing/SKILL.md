@@ -5,7 +5,7 @@ description: Implement a scoped feature or repair, open its PR early and push su
 
 # Implement the change
 
-Use the assigned outcome, worktree, file scope, branch/base and checks. Direct implementation requests enter through [coordinating](../devflow-coordinating/SKILL.md), which supplies the [worker brief](../devflow/references/implementation-worker.md). Do the work yourself without spawning agents.
+Direct implementation requests enter through [coordinating](../devflow-coordinating/SKILL.md): the main task inspects and plans, then its execution coordinator supplies the [worker brief](../devflow/references/implementation-worker.md). As the assigned implementation worker, use that outcome, worktree, file scope, branch/base and checks; perform the following steps without spawning agents.
 
 1. **Inspect before editing.** Read the owning code, project instructions and relevant contracts. Confirm branch and dirty state. Preserve collaborators' edits and unrelated files. For a defect, reproduce or trace the failing invariant and fix the owning layer.
 

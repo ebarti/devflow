@@ -9,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TELEMETRY_SCRIPT = ROOT / "skills" / "devflow" / "scripts" / "telemetry.py"
 sys.path.insert(0, str(ROOT / "skills" / "devflow" / "scripts"))
 
 import state  # noqa: E402
@@ -107,6 +108,88 @@ class OrderingTests(TelemetryCase):
 
 
 class HookTests(TelemetryCase):
+    def test_batch_coordinator_usage_stays_unallocated_until_a_leaf_is_bound(self):
+        state.record(self.db, "work", {"id": "w2", "title": "two"})
+        for work in ("w1", "w2"):
+            state.claim_work(self.db, work, "main-1")
+        telemetry.handle(self.db, {"session_id": "main-1", "hook_event_name": "SubagentStart",
+                                   "agent_id": "batch-1", "agent_type": "devflow-coordinator"})
+        self.assertEqual(telemetry.scope(self.db, "batch-1"), ["w1", "w2"])
+        telemetry.handle(self.db, {"session_id": "main-1", "agent_id": "batch-1", "turn_id": "t1",
+                                   "hook_event_name": "PreToolUse", "tool_use_id": "dispatch",
+                                   "tool_name": "spawn_agent", "tool_input": {}})
+        self.assertIsNone(state.row(self.db, "runtime_events", "tool:batch-1:dispatch")["work_id"])
+        telemetry.handle(self.db, {"session_id": "batch-1", "hook_event_name": "SubagentStart",
+                                   "agent_id": "leaf-1", "agent_type": "devflow-implementer"})
+        self.assertEqual(telemetry.scope(self.db, "leaf-1"), [])
+        telemetry.bind(self.db, "leaf-1", ["w2"], "devflow-implementer", "batch-1")
+        telemetry.handle(self.db, {"session_id": "main-1", "agent_id": "leaf-1", "turn_id": "t2",
+                                   "hook_event_name": "PreToolUse", "tool_use_id": "edit",
+                                   "tool_name": "apply_patch", "tool_input": {}})
+        self.assertEqual(state.row(self.db, "runtime_events", "tool:leaf-1:edit")["work_id"], "w2")
+
+    def test_native_nested_hooks_attribute_the_actor_and_resume_same_workers(self):
+        state.claim_work(self.db, "w1", "main-1")
+        self.db.commit()
+
+        def hook(agent, role, event, **fields):
+            payload = dict(session_id="main-1", agent_id=agent, agent_type=role,
+                           hook_event_name=event, turn_id=agent + "-turn", **fields)
+            result = subprocess.run([sys.executable, "-B", str(TELEMETRY_SCRIPT),
+                                     "--db", str(self.root / "workflow.sqlite3"), "hook"],
+                                    input=json.dumps(payload), capture_output=True, text=True, check=True,
+                                    env=dict(os.environ, PYTHONPATH=str(ROOT / "skills/devflow/scripts")))
+            return json.loads(result.stdout)
+
+        transcripts = {}
+        roles = {"execution-1": "devflow-coordinator", "worker-1": "devflow-implementer"}
+        for parent, child in [("main-1", "execution-1"), ("execution-1", "worker-1")]:
+            transcript = self.root / (child + ".jsonl")
+            # Native hooks share the root session_id; rollout metadata names the immediate parent.
+            transcript.write_text(json.dumps({"type": "session_meta", "payload": {
+                "session_id": "main-1", "id": child, "parent_thread_id": parent,
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent,
+                                                         "agent_role": roles[child]}}}}}) + "\n")
+            transcripts[child] = str(transcript)
+            self.assertEqual(hook(child, roles[child], "SubagentStart", transcript_path=str(transcript)), {})
+
+        repository = self.root / "native-repository"
+        repository.mkdir()
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run(["git", "init", "-q", str(repository)], env=env, check=True)
+        (repository / "app.txt").write_text("candidate\n")
+        for child, expected in [("execution-1", ""), ("worker-1", "app.txt\n")]:
+            with self.subTest(child=child):
+                response = hook(child, roles[child], "PreToolUse", transcript_path=transcripts[child],
+                                tool_use_id="stage", tool_name="Bash", tool_input={"command": "git add app.txt"})
+                if response.get("hookSpecificOutput", {}).get("permissionDecision") != "deny":
+                    subprocess.run(["git", "add", "app.txt"], cwd=repository, env=env, check=True)
+                self.assertEqual(subprocess.check_output(["git", "diff", "--cached", "--name-only"],
+                                                         cwd=repository, env=env, text=True), expected)
+        self.assertEqual(self.session("worker-1")["parent_id"], "execution-1")
+        self.assertEqual(telemetry.scope(self.db, "worker-1"), ["w1"])
+        self.assertEqual(state.row(self.db, "runtime_events", "tool:worker-1:stage")["work_id"], "w1")
+        self.assertIsNone(state.row(self.db, "runtime_events", "boundary:main-1:stage"))
+
+        state.release_work(self.db, "w1", "main-1")
+        self.db.commit()
+        for child in ("worker-1", "execution-1"):
+            hook(child, roles[child], "SubagentStop", agent_transcript_path=transcripts[child])
+            self.assertIsNotNone(self.session(child)["closed_at"])
+        # Activity without a reclaimed assignment must remain outside collection.
+        self.assertEqual(hook("execution-1", roles["execution-1"], "PreToolUse",
+                              tool_use_id="unrelated", tool_name="apply_patch", tool_input={}), {})
+        self.assertIsNotNone(self.session("execution-1")["closed_at"])
+
+        state.claim_work(self.db, "w1", "main-1")
+        self.db.commit()
+        for child in ("execution-1", "worker-1"):
+            response = hook(child, roles[child], "PreToolUse", transcript_path=transcripts[child],
+                            tool_use_id="resume", tool_name="apply_patch", tool_input={})
+            self.assertIsNone(self.session(child)["closed_at"])
+            self.assertEqual(response.get("hookSpecificOutput", {}).get("permissionDecision"),
+                             "deny" if child == "execution-1" else None)
+
     def test_hooks_attribute_tools_and_turns_to_the_bound_work(self):
         events = [
             {"session_id": "s1", "hook_event_name": "UserPromptSubmit", "turn_id": "t1"},
@@ -138,6 +221,37 @@ class HookTests(TelemetryCase):
 
 
 class BoundaryTests(TelemetryCase):
+    def test_nested_execution_coordinator_keeps_scope_and_delegates_writes(self):
+        state.claim_work(self.db, "w1", "main-1")
+        for parent, child, role in [("main-1", "execution-1", "devflow-coordinator"),
+                                    ("execution-1", "worker-1", "devflow-implementer")]:
+            telemetry.handle(self.db, {"hook_event_name": "SubagentStart", "session_id": parent,
+                                       "agent_id": child, "agent_type": role})
+        self.assertEqual(telemetry.scope(self.db, "worker-1"), ["w1"])
+        self.assertEqual(self.session("worker-1")["parent_id"], "execution-1")
+        self.assertEqual(state.claim_for(self.db, "w1")["owner"], "main-1")
+
+        repository = self.root / "nested-repository"
+        repository.mkdir()
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run(["git", "init", "-q", str(repository)], env=env, check=True)
+        (repository / "app.txt").write_text("candidate\n")
+
+        for session, expected in [("execution-1", ""), ("worker-1", "app.txt\n")]:
+            with self.subTest(session=session):
+                response = telemetry.handle(self.db, {
+                    "session_id": session, "hook_event_name": "PreToolUse", "turn_id": "t1",
+                    "tool_use_id": "stage", "tool_name": "Bash", "tool_input": {"command": "git add app.txt"}})
+                if response is None:
+                    subprocess.run(["git", "add", "app.txt"], cwd=repository, env=env, check=True)
+                staged = subprocess.check_output(["git", "diff", "--cached", "--name-only"],
+                                                 cwd=repository, env=env, text=True)
+                self.assertEqual(staged, expected)
+        boundary = state.row(self.db, "runtime_events", "boundary:execution-1:stage")
+        self.assertIsNotNone(boundary)
+        self.assertEqual(boundary["work_id"], "w1")
+        self.assertEqual(state.row(self.db, "runtime_events", "tool:worker-1:stage")["work_id"], "w1")
+
     def test_later_dry_run_cannot_allow_an_earlier_index_write(self):
         state.claim_work(self.db, "w1", "root-1")
         repository = self.root / "repository"

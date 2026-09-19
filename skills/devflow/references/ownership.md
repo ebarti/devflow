@@ -1,9 +1,11 @@
 # Issue ownership and parallel work
 
-One coordinating task owns changes and tracker updates for an issue. GitHub shows
-the accountable user and the existing Project's Status; the local record identifies the host
-task, its locator, branch and latest ownership observation. Reviewers and delegated
-workers report to that owner and use the same work ID without claiming it again.
+The main task holds one claim per issue. Its execution coordinator acts for that
+owner and maintains records and tracker updates while running, using the supplied
+owner ID and shared database. The main task handles the initial claim and recovery;
+do not run competing tracker updates from both levels. GitHub shows the accountable
+user and existing Project's Status. Leaf workers use the same work ID and never
+claim it again or update the tracker.
 
 ## Start
 
@@ -28,7 +30,7 @@ Status updates share one path. Retrying the same work ID reuses its saved issue;
 an interrupted creation without a saved URL stops for reconciliation. Find the
 created issue and resume with `start ISSUE_URL`; do not issue another create.
 
-Use the actual, globally unique host task/coordinator ID, retained across retries;
+Use the main task's actual, globally unique host ID, retained across retries;
 a generic name such as `/root` cannot distinguish separate tasks. Task locators
 supplied through `--source-ref` stay local. The helper claims the issue, assigns the
 authenticated user, adds it to the selected Project and verifies its Status.
@@ -70,8 +72,8 @@ the local record and retains the claim for reconciliation and retry by its owner
 
 ## Concurrency and interruption
 
-Independent issues use separate work IDs and worktrees. A coordinator may own
-several issues and dispatch their workers concurrently; each issue has one owner.
+Independent issues use separate work IDs and worktrees. A main task may own
+several issues and hand a bounded batch to one execution coordinator; each issue has one owner.
 Dependencies determine which items are ready. Within one issue,
 delegate independent slices with disjoint file ownership. Keep ready work moving
 while other items wait for checks, review or input, within the host's capacity.
@@ -82,9 +84,13 @@ python3.12 ~/.agents/skills/devflow/scripts/state.py work list --claimed
 
 This lists owners and last observations, not live process health. Claims have no
 automatic expiry. On interruption, inspect the host task and current GitHub state.
-After confirming the old owner has stopped, release its claim with
+After confirming the old main task and its delegated execution have stopped, release its claim with
 `state.py work release --id WORK_ID --owner PREVIOUS_HOST_TASK_ID`, then resume with
 the same work ID and the new owner. An active owner must release before handoff.
+
+If an execution coordinator returned blocked and released its claim, the main task
+reclaims the same work before resuming that coordinator. A reply target such as
+`/root` routes messages but is not an ownership ID. Pass both values explicitly.
 
 Local-only work uses `state.py work claim --id WORK_ID --owner HOST_TASK_ID` and
 `work release` directly. Atomic exclusion covers tasks sharing one SQLite database.

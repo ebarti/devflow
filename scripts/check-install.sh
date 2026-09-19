@@ -35,16 +35,21 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("devflow-*.toml")):
         agent = tomllib.load(handle)
     assert agent["name"] == path.stem, path
     assert agent["description"] and agent["developer_instructions"].strip(), path
-    assert agent["sandbox_mode"] in {"read-only", "workspace-write"}, path
-    # Agents return reports; the coordinator records them.
-    assert not re.search(r"state helper|state\.py|github\.py", agent["developer_instructions"]), path
+    if agent["name"] == "devflow-coordinator":
+        # Record/tracker access inherits the main task's existing permissions.
+        assert "sandbox_mode" not in agent and "default_permissions" not in agent, path
+    else:
+        assert agent["sandbox_mode"] in {"read-only", "workspace-write"}, path
+        # Leaves return reports; the execution coordinator records them.
+        assert not re.search(r"state helper|state\.py|github\.py", agent["developer_instructions"]), path
     agents[agent["name"]] = agent
-assert set(agents) == {"devflow-definer", "devflow-planner", "devflow-implementer",
+assert set(agents) == {"devflow-coordinator", "devflow-implementer",
                        "devflow-reviewer", "devflow-verifier"}, sorted(agents)
 # The workflow defines every agent's default model and effort; a project overrides with its own file.
 assert all(agent.get("model") and agent.get("model_reasoning_effort") for agent in agents.values()), sorted(agents)
-assert (agents["devflow-implementer"]["model"], agents["devflow-implementer"]["model_reasoning_effort"]) == ("gpt-5.6-sol", "high")
-assert (agents["devflow-planner"]["model"], agents["devflow-planner"]["model_reasoning_effort"]) == ("gpt-6-astra", "xhigh")
+for name, effort in {"devflow-coordinator": "high", "devflow-implementer": "high",
+                     "devflow-reviewer": "xhigh", "devflow-verifier": "xhigh"}.items():
+    assert (agents[name]["model"], agents[name]["model_reasoning_effort"]) == ("gpt-5.6-sol", effort), name
 PY
 "$devflow_python" -B "$destination/devflow/scripts/state.py" --help > /dev/null
 "$devflow_python" -B "$destination/devflow/scripts/github.py" --help > /dev/null
@@ -87,6 +92,8 @@ ln -s "$source_root/skills/devflow-delivering" "$destination/devflow-delivering"
 ln -s "$install_fixture/unrelated" "$destination/unrelated"
 ln -s "$source_root/agents/devflow-obsolete-install-smoke.toml" "$install_fixture/codex/agents/devflow-obsolete-install-smoke.toml"
 ln -s "$source_root/agents/devflow-deliverer.toml" "$install_fixture/codex/agents/devflow-deliverer.toml"
+ln -s "$source_root/agents/devflow-definer.toml" "$install_fixture/codex/agents/devflow-definer.toml"
+ln -s "$source_root/agents/devflow-planner.toml" "$install_fixture/codex/agents/devflow-planner.toml"
 ln -s "$install_fixture/unrelated" "$install_fixture/codex/agents/unrelated.toml"
 ln -s "$("$devflow_python" -c 'import sys; print(sys.executable)')" "$install_fixture/python override"
 DEVFLOW_PYTHON="$install_fixture/python override" sh "$source_root/scripts/install.sh" --force "$destination" "$install_fixture/codex"
@@ -103,6 +110,8 @@ for agent in "$source_root"/agents/*; do
 done
 test ! -L "$install_fixture/codex/agents/devflow-obsolete-install-smoke.toml"
 test ! -L "$install_fixture/codex/agents/devflow-deliverer.toml"
+test ! -L "$install_fixture/codex/agents/devflow-definer.toml"
+test ! -L "$install_fixture/codex/agents/devflow-planner.toml"
 test -L "$install_fixture/codex/agents/unrelated.toml"
 
 # A file or directory blocks the whole reinstall before any link is changed.
@@ -161,6 +170,15 @@ test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$releas
 "$devflow_python" -B "$source_root/scripts/candidate.py" --prepare-only "$install_fixture/trial" > /dev/null
 test -f "$install_fixture/trial/codex/skills/devflow/SKILL.md"
 test -L "$install_fixture/trial/codex/agents/devflow-implementer.toml"
+test -L "$install_fixture/trial/codex/agents/devflow-coordinator.toml"
+"$devflow_python" -B - "$install_fixture/trial/codex/config.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+assert (config["model"], config["model_reasoning_effort"]) == ("gpt-6-astra", "xhigh")
+PY
 test -s "$install_fixture/trial/codex/hooks.json"
 test -s "$install_fixture/trial/candidate.json"
 printf 'Installation check passed.\n'

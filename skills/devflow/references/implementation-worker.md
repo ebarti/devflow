@@ -1,6 +1,6 @@
 # Implementation worker
 
-Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The worker owns implementation, commits, early PR creation and subsequent pushes. The coordinator owns scope, dispatch, verification and the final authorized merge, and never edits the candidate itself. This reference is the single definition of the worker: its agent definition, the only override that can change it, when it is dispatched, the brief it receives, reuse, and failure handling. The role skills link here instead of restating it. The worker is one of the [Devflow agents](agents.md), each of which pins its own default model and effort.
+Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The worker owns implementation, commits, early PR creation and subsequent pushes. The main task owns inspection and design; its execution coordinator owns dispatch, repair loops, records and the authorized merge. Neither edits the candidate. This reference defines the worker's configuration, brief, reuse and failure handling. The worker is one of the [Devflow agents](agents.md).
 
 ## The agent definition
 
@@ -25,7 +25,7 @@ Codex multi-agent tools enabled (they are on by default), the installed Devflow 
 
 ## When to dispatch
 
-Dispatch a worker only when the plan is sharp. Before spawning, the coordinator holds the accepted outcome, the slice with its owned files and dependencies, and exact checks or manual steps with expected results, produced through [defining work](../../devflow-defining-work/SKILL.md) and [planning](../../devflow-planning/SKILL.md) as the request required. If those cannot be written down yet, the work is not ready for a worker: sharpen the plan instead of delegating the ambiguity. The worker implements against the brief and raises gaps to the coordinator rather than redefining the outcome or inventing its own verification.
+Dispatch a worker only when the plan is sharp. The main task's [inspection](../../devflow-defining-work/SKILL.md) and [plan](../../devflow-planning/SKILL.md) supply the accepted outcome, design rationale, owned files, dependencies and exact checks with expected results. The execution coordinator turns each ready slice into a worker brief. Missing design decisions go back to the main task before dependent implementation. The worker implements against the brief and raises gaps to its coordinator rather than redefining the outcome or inventing verification.
 
 ## Reuse
 
@@ -38,13 +38,13 @@ Each worker receives a concise brief containing:
 - the work ID, repository/worktree and implementation assignment;
 - one observable outcome;
 - owned files or modules, and the note that other agents share the checkout and their edits must be preserved;
-- required context, dependencies, existing PR/stack, branch and base;
+- inspection evidence, design rationale, dependencies, existing PR/stack, branch and base;
 - publication scope, including any explicit local-only, no-commit or no-push limit;
 - exact checks or manual steps with expected results and explicit limits such as no tests;
-- the relevant [implementation instructions](../../devflow-implementing/SKILL.md).
+- the coordinator's reply target and relevant [implementation instructions](../../devflow-implementing/SKILL.md).
 
 Missing or contradictory task inputs are returned to the coordinator before editing. The worker never spawns a coordinator or another worker. Report the exact candidate, PR/base/head and stack order, check results and remaining work. For no-commit scope, identify the complete dirty snapshot and its content hash instead of presenting HEAD as the candidate. See [PR workflow](pr-workflow.md).
 
 ## When spawning fails
 
-Separate transient failures from configuration failures. Exhausted agent capacity, a rate limit or a timeout is transient: wait and retry within the host's capacity, or hand the task to an existing suitable worker under the reuse rules, keep other independent work moving meanwhile, and report only if the failure persists. An unknown or uninstalled `devflow-implementer` agent type, a rejected model, or a permission error is a configuration failure: stop, report the exact failure to the user, name the agent type that was requested, and ask what to fix, such as reinstalling Devflow, enabling multi-agent tools or correcting the repository's override. In neither case implement the change directly or spawn a different agent type or model for the work. Record the outcome in the work record and continue once the configuration is fixed.
+Separate transient failures from configuration failures. For exhausted capacity, a rate limit or timeout, reuse a suitable worker or wait within the host's limits while independent work continues; do not repeatedly retry unchanged conditions. An unknown agent type, rejected model or permission error is a configuration blocker: return the exact failure and requested type to the main task, which handles any user decision. In neither case implement directly or substitute another agent type/model. Record the outcome and resume the same assignment once the prerequisite is fixed.

@@ -29,7 +29,8 @@ def main():
     legacy_skills = ["using-devflow", "devflow-delivering"]
     normal_roots = {Path.home() / ".agents/skills", Path.home() / ".codex/skills",
                     Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "skills"}
-    config = ["[features]\nhooks = true\nmulti_agent = true\n"]
+    config = ['model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n',
+              "[features]\nhooks = true\nmulti_agent = true\n"]
     for root in sorted(normal_roots):
         for name in [*skills, *legacy_skills]:
             path = root / name / "SKILL.md"

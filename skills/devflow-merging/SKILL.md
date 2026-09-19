@@ -5,7 +5,7 @@ description: Merge an authorized PR or gh stack after checking its current revis
 
 # Merge the PR or stack
 
-The coordinator performs this bounded action directly. Implementation has already opened the PRs and pushed repairs. This skill creates no delivery agent and is not a publication stage.
+The execution coordinator performs an authorized merge directly. For a standalone merge-only request, the main task performs it directly without spawning an execution coordinator. Implementation has already opened the PRs and pushed repairs. This skill creates no delivery agent and is not a publication stage.
 
 1. **Resolve the target and authorization.** Identify the requested PR or stack, including exactly which members may merge. Reuse the user's existing authorization. A request to implement or publish does not authorize a merge. Inspect remote state first when a previous attempt may have succeeded.
 

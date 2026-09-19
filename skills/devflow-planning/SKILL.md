@@ -5,13 +5,11 @@ description: Plan architecture, dependencies, implementation slices and verifica
 
 # Plan the change
 
-When the coordinator delegates this role it runs as the read-only `devflow-planner` [agent](../devflow/references/agents.md); the coordinator may also do it directly.
-
 ## Steps
 
-1. **Inspect the affected paths.** Use the accepted outcome and inspect the affected production paths, contracts and dependencies.
+1. **Use the inspection.** Plan in the main task, using the accepted outcome and inspected production paths, contracts and dependencies. Fill material evidence gaps before assigning implementation.
 
-2. **Compare only decisive alternatives.** Compare alternatives only where they change correctness, complexity, compatibility or operational risk. Prefer the smallest coherent design.
+2. **Choose the owning layer.** State where the behavior belongs, the interfaces and invariants that must hold, and why. Compare alternatives only where they change correctness, complexity, compatibility or operational risk. Prefer the smallest coherent design. Settle user decisions directly in the main task.
 
 3. **Slice the work.** Split consequential work into slices with one observable outcome, owned files or modules, dependencies, branch/base and concise verification steps with expected results. Each coherent slice becomes a PR opened after its first meaningful commit. Sequential slices and features developed before prior work merges form one gh stack even when logically independent; follow [PR workflow](../devflow/references/pr-workflow.md).
 
@@ -19,7 +17,7 @@ When the coordinator delegates this role it runs as the read-only `devflow-plann
 
 5. **Keep it proportional.** A small fix may need only a few sentences; a migration needs ordering and recovery. Preserve accepted decisions and mark unresolved facts explicitly. A plan-only request produces the plan without initiating implementation or external work.
 
-6. **Hand off.** For ongoing work, save the plan or its durable reference in the [work record](../devflow/references/state.md); a delegated planner returns the plan and the coordinator saves it. When implementation is already authorized, proceed through [coordinating](../devflow-coordinating/SKILL.md) without another approval step; each slice becomes the brief for the [implementation worker](../devflow/references/implementation-worker.md), which is dispatched only once the slice's verification steps are exact.
+6. **Hand off once.** Save the plan or its durable reference in the [work record](../devflow/references/state.md). Include inspection evidence, design rationale, acceptance conditions, ordered slices, exact checks and expected results, current PR/stack state, explicit limits and the authorized endpoint. When implementation is authorized, [dispatch one execution coordinator](../devflow-coordinating/SKILL.md) for the bounded request or batch. It owns worker dispatch and repair loops; return to planning only for a material design or scope decision.
 
 ## Example slice
 

@@ -21,8 +21,9 @@ EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
           "SubagentStop", "Stop", "Interrupt", "SessionEnd")
 TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_tokens",
                 "output_tokens", "reasoning_output_tokens")
-# The coordinator holds the claim but never changes the repository itself; these are the
-# common ways a session would, short of a sandbox.
+# Neither the main claim holder nor its execution coordinator changes the repository;
+# recognize both roles without restricting their leaf workers.
+COORDINATOR_ROLES = {"coordinator", "devflow-coordinator"}
 EDIT_TOOL_WORDS = ("patch", "write", "edit", "create_file")
 MUTATING_GIT = {"commit", "push", "merge", "rebase", "cherry-pick", "revert", "apply", "am",
                 "reset", "restore", "stash", "clean", "rm", "mv", "add", "tag"}
@@ -111,14 +112,57 @@ def boundary_violation(tool_name, tool_input):
 
 
 def boundary_decision(db, payload):
-    """Why a PreToolUse from a claim-holding coordinator is denied, or None. Read-only."""
+    """Why a bound main/execution coordinator's PreToolUse is denied. Read-only."""
     if payload.get("hook_event_name") != "PreToolUse":
         return None
     saved = db.execute("SELECT role, closed_at FROM runtime_sessions WHERE id=?",
                        (payload.get("session_id"),)).fetchone()
-    if not saved or saved[1] or saved[0] != "coordinator":
+    if not saved or saved[1] or saved[0] not in COORDINATOR_ROLES:
         return None
     return boundary_violation(payload.get("tool_name"), payload.get("tool_input"))
+
+
+def child_binding(db, payload):
+    """Resolve an unbound/resumed child from native hook and rollout identities. Read-only."""
+    child = payload.get("agent_id")
+    if not child:
+        return None
+    saved = db.execute("SELECT parent_id,role,closed_at FROM runtime_sessions WHERE id=?", (child,)).fetchone()
+    if saved and not saved[2]:
+        return None
+    if saved and payload.get("hook_event_name") not in ("SubagentStart", "UserPromptSubmit", "PreToolUse"):
+        return None
+    parent, role = (saved[0], saved[1]) if saved else (None, payload.get("agent_type"))
+    transcript = payload.get("agent_transcript_path") or payload.get("transcript_path")
+    if not parent and transcript:
+        try:
+            with Path(transcript).expanduser().open() as stream:
+                item = json.loads(stream.readline())
+            meta = item.get("payload") or {}
+            if item.get("type") != "session_meta" or meta.get("id") != child:
+                return None
+            source = meta.get("source") or {}
+            spawned = source.get("subagent", {}).get("thread_spawn", {}) if isinstance(source, dict) else {}
+            parent = meta.get("parent_thread_id") or spawned.get("parent_thread_id")
+            role = role or meta.get("agent_role") or spawned.get("agent_role")
+        except (OSError, ValueError, AttributeError):
+            return None
+    if not parent and not transcript:
+        # Legacy hosts supplied the immediate parent and no child transcript at start.
+        parent = payload.get("session_id")
+    if not parent or parent == child:
+        return None
+    active_parent = db.execute("SELECT 1 FROM runtime_sessions WHERE id=? AND closed_at IS NULL", (parent,)).fetchone()
+    if not active_parent:
+        return None
+    work_ids = scope(db, child) if saved else scope(db, parent)
+    if (not work_ids or (len(work_ids) != 1 and role not in COORDINATOR_ROLES)
+            or not set(work_ids).issubset(scope(db, parent))):
+        return None  # A batch needs explicit per-child attribution.
+    if saved and not db.execute("SELECT 1 FROM claims WHERE work_id IN (" +
+                               ",".join("?" for _ in work_ids) + ")", work_ids).fetchone():
+        return None  # Do not reopen a finished assignment for unrelated later activity.
+    return dict(session_id=child, work_ids=work_ids, role=role, parent_id=parent)
 
 
 def record_boundary(db, session_id, payload, stamp):
@@ -346,8 +390,13 @@ def tool_status(response):
 def handle(db, payload, reason=None):
     started = time.monotonic()
     response = None
-    parent = payload.get("session_id")
-    saved = db.execute("SELECT * FROM runtime_sessions WHERE id=?", (parent,)).fetchone()
+    inherited = child_binding(db, payload)
+    if inherited:
+        bind(db, **inherited)
+    # Native hooks share the root session_id across the tree; agent_id identifies the actor.
+    session_id = payload.get("agent_id") or payload.get("session_id")
+    payload = dict(payload, session_id=session_id)
+    saved = db.execute("SELECT * FROM runtime_sessions WHERE id=?", (session_id,)).fetchone()
     if not saved or saved["closed_at"]:
         return None
     session = dict(saved)
@@ -357,17 +406,10 @@ def handle(db, payload, reason=None):
     if name in ("SubagentStart", "SubagentStop"):
         child = payload.get("agent_id")
         if child:
-            child_saved = db.execute("SELECT id FROM runtime_sessions WHERE id=?", (child,)).fetchone()
-            if not child_saved and len(scope(db, parent)) != 1:
-                event(db, parent, identity(child, name, turn_id), name, stamp, turn_id,
-                      name=payload.get("agent_type"), status="unallocated")
-                return None
-            if not child_saved:
-                bind(db, child, scope(db, parent), payload.get("agent_type"), parent)
             session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (child,)).fetchone())
             if name == "SubagentStop":
                 collect_transcript(db, session, payload.get("agent_transcript_path"), collect_tools=True)
-                # The parent's turn ID is not the child's turn ID.
+                # Use the child's collected turn; legacy stop hooks may carry the parent's turn ID.
                 session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (child,)).fetchone())
                 turn(db, session, session["turn_id"], stamp, "completed")
             event(db, child, identity(child, name, session["turn_id"], session["cursor"]), name, stamp,
@@ -384,37 +426,37 @@ def handle(db, payload, reason=None):
             if reason is None:
                 reason = boundary_decision(db, payload)
             if reason:
-                record_boundary(db, parent, payload, stamp)
+                record_boundary(db, session_id, payload, stamp)
                 response = deny(reason)
         session["model"] = payload.get("model") or session["model"]
-        db.execute("UPDATE runtime_sessions SET model=? WHERE id=?", (session["model"], parent))
+        db.execute("UPDATE runtime_sessions SET model=? WHERE id=?", (session["model"], session_id))
         collect_transcript(db, session, payload.get("transcript_path"))
-        session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (parent,)).fetchone())
+        session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (session_id,)).fetchone())
         if name in ("PreToolUse", "PostToolUse"):
             if not response:
                 use_id = payload.get("tool_use_id")
                 signature = identity(payload.get("tool_name"), payload.get("tool_input"))
-                tool_key = "tool:" + parent + ":" + use_id
+                tool_key = "tool:" + session_id + ":" + use_id
                 tool_started = stamp if name == "PreToolUse" else None
                 previous = state.row(db, "runtime_events", tool_key)
                 if not previous or previous["ended_at"] is None:
-                    event(db, parent, tool_key, "tool", tool_started, turn_id,
+                    event(db, session_id, tool_key, "tool", tool_started, turn_id,
                           name=payload.get("tool_name"), fingerprint=signature,
                           ended_at=stamp if name == "PostToolUse" else None,
                           status=tool_status(payload.get("tool_response")) if name == "PostToolUse" else "started")
         else:
-            event(db, parent, identity(parent, name, turn_id, payload.get("source"), session["cursor"]), name, stamp,
+            event(db, session_id, identity(session_id, name, turn_id, payload.get("source"), session["cursor"]), name, stamp,
                   turn_id, name=payload.get("source") or payload.get("trigger"))
         if name in ("Stop", "Interrupt"):
             turn(db, session, turn_id, stamp, "completed" if name == "Stop" else "interrupted")
-            close_if_released(db, parent, stamp)
+            close_if_released(db, session_id, stamp)
         elif name == "SessionEnd":
-            db.execute("UPDATE runtime_sessions SET closed_at=? WHERE id=?", (stamp, parent))
+            db.execute("UPDATE runtime_sessions SET closed_at=? WHERE id=?", (stamp, session_id))
         elif name in ("PreToolUse", "UserPromptSubmit"):
             turn(db, session, turn_id, stamp)
-    db.execute("UPDATE runtime_sessions SET last_seen_at=? WHERE id=?", (stamp, parent))
+    db.execute("UPDATE runtime_sessions SET last_seen_at=? WHERE id=?", (stamp, session_id))
     # Runtime collector overhead is measured directly, not inferred from coordinator usage.
-    event(db, parent, identity(parent, name, turn_id, payload.get("tool_use_id"), stamp),
+    event(db, session_id, identity(session_id, name, turn_id, payload.get("tool_use_id"), stamp),
           "collector", stamp, turn_id, duration_seconds=time.monotonic() - started, status="completed")
     return response
 
@@ -475,8 +517,15 @@ def main():
                 return 0
             with closing(sqlite3.connect(Path(args.db).expanduser().resolve().as_uri() + "?mode=ro", uri=True)) as check:
                 present = check.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_sessions'").fetchone()
-                bound = present and check.execute("SELECT 1 FROM runtime_sessions WHERE id=? AND closed_at IS NULL", (payload.get("session_id"),)).fetchone()
-                reason = boundary_decision(check, payload) if bound else None
+                inherited = child_binding(check, payload) if present else None
+                actor = payload.get("agent_id") or payload.get("session_id")
+                actor_payload = dict(payload, session_id=actor)
+                bound = present and check.execute("SELECT 1 FROM runtime_sessions WHERE id=? AND closed_at IS NULL", (actor,)).fetchone()
+                reason = boundary_decision(check, actor_payload) if bound else None
+                if inherited:
+                    bound = True
+                    if payload.get("hook_event_name") == "PreToolUse" and inherited["role"] in COORDINATOR_ROLES:
+                        reason = boundary_violation(payload.get("tool_name"), payload.get("tool_input"))
             if not bound:
                 print("{}")
                 return 0
@@ -485,6 +534,8 @@ def main():
             try:
                 with closing(state.connect(args.db)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
+                    if inherited:
+                        bind(db, **inherited)
                     handle(db, payload, reason)
             except (ValueError, OSError, sqlite3.Error) as exc:
                 failure = "Devflow metrics collection failed: " + str(exc)
@@ -493,7 +544,9 @@ def main():
                     try:
                         with closing(state.connect(args.db)) as db, db:
                             db.execute("BEGIN IMMEDIATE")
-                            record_boundary(db, payload.get("session_id"), payload, state.now())
+                            if inherited:
+                                bind(db, **inherited)
+                            record_boundary(db, actor, actor_payload, state.now())
                     except (ValueError, OSError, sqlite3.Error):
                         pass  # The denial stands even when it cannot be recorded.
         else:
