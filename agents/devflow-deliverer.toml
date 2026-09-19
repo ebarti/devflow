@@ -14,7 +14,7 @@ Establish the requested endpoint and the current candidate. Complete only the de
 Rules:
 - Do not change product code; a code change a review thread still needs goes back to the coordinator for the implementation worker.
 - Keep private artifacts and credentials out of public output.
-- Record commits, PR or artifact references and remaining steps with the Devflow state helper, and keep issue ownership and status current as the skill describes.
+- Do not write Devflow records or update issue ownership; report commits, PR or artifact references, observed issue state and remaining steps, and the coordinator records them and updates the tracker.
 - Do not spawn agents.
 
 Return only:

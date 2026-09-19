@@ -30,6 +30,23 @@ COMMAND_STARTS = {"&&", "||", "|", ";", "(", "{", "then", "do"}
 SAFE_REDIRECT_PREFIXES = ("/dev/", "/tmp/", "$TMPDIR", "${TMPDIR")
 
 
+def read_only_git(arguments):
+    """True for the inspection forms of otherwise mutating Git subcommands."""
+    subcommand, options = arguments[0], arguments[1:]
+    if subcommand == "tag":
+        listing = ("-l", "--list", "-n", "--contains", "--no-contains", "--points-at", "--merged", "--no-merged")
+        return not any(not option.startswith("-") for option in options) or any(
+            option == flag or option.startswith(flag + "=") or (flag == "-n" and re.match(r"^-n\d*$", option))
+            for option in options for flag in listing)
+    if subcommand == "stash":
+        return bool(options) and options[0] in ("list", "show")
+    if subcommand in ("clean", "add", "rm", "mv"):
+        return any(option == "--dry-run" or re.match(r"^-[a-zA-Z]*n", option) for option in options)
+    if subcommand == "apply":
+        return any(option in ("--check", "--stat", "--numstat", "--summary") for option in options)
+    return False
+
+
 def command_text(tool_input):
     if isinstance(tool_input, dict):
         for key in ("command", "cmd", "script"):
@@ -59,7 +76,7 @@ def boundary_violation(tool_name, tool_input):
             rest = tokens[index + 1:]
             while rest and rest[0].startswith("-"):
                 rest = rest[2:] if rest[0] in ("-C", "-c", "--git-dir", "--work-tree") else rest[1:]
-            if rest and rest[0] in MUTATING_GIT:
+            if rest and rest[0] in MUTATING_GIT and not read_only_git(rest):
                 return f"git {rest[0]} changes the repository; only the implementation worker or the deliverer may"
         if leading and token in ("patch", "tee"):
             return f"{token} writes files; dispatch the devflow-implementer worker"
@@ -75,6 +92,24 @@ def boundary_violation(tool_name, tool_input):
             if not target.startswith("&") and not target.startswith(SAFE_REDIRECT_PREFIXES):
                 return f"shell redirection writes {target or 'a file'}; coordinators only write under temporary paths"
     return None
+
+
+def boundary_decision(db, payload):
+    """Why a PreToolUse from a claim-holding coordinator is denied, or None. Read-only."""
+    if payload.get("hook_event_name") != "PreToolUse":
+        return None
+    saved = db.execute("SELECT role, closed_at FROM runtime_sessions WHERE id=?",
+                       (payload.get("session_id"),)).fetchone()
+    if not saved or saved[1] or saved[0] != "coordinator":
+        return None
+    return boundary_violation(payload.get("tool_name"), payload.get("tool_input"))
+
+
+def record_boundary(db, session_id, payload, stamp):
+    use_id = payload.get("tool_use_id") or stamp
+    event(db, session_id, "boundary:" + session_id + ":" + str(use_id), "boundary", stamp, payload.get("turn_id"),
+          name=payload.get("tool_name"), fingerprint=identity(payload.get("tool_name"), payload.get("tool_input")),
+          status="denied", ended_at=stamp)
 
 
 def deny(reason):
@@ -292,13 +327,13 @@ def tool_status(response):
     return "returned"
 
 
-def handle(db, payload):
+def handle(db, payload, reason=None):
     started = time.monotonic()
     response = None
     parent = payload.get("session_id")
     saved = db.execute("SELECT * FROM runtime_sessions WHERE id=?", (parent,)).fetchone()
     if not saved or saved["closed_at"]:
-        return
+        return None
     session = dict(saved)
     name = payload.get("hook_event_name")
     stamp = state.now()
@@ -310,7 +345,7 @@ def handle(db, payload):
             if not child_saved and len(scope(db, parent)) != 1:
                 event(db, parent, identity(child, name, turn_id), name, stamp, turn_id,
                       name=payload.get("agent_type"), status="unallocated")
-                return
+                return None
             if not child_saved:
                 bind(db, child, scope(db, parent), payload.get("agent_type"), parent)
             session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (child,)).fetchone())
@@ -325,23 +360,24 @@ def handle(db, payload):
             if name == "SubagentStop":
                 close_if_released(db, child, stamp)
     else:
+        if name in ("PreToolUse", "PostToolUse") and not payload.get("tool_use_id"):
+            raise ValueError("tool hook lacks tool_use_id")
+        if name == "PreToolUse":
+            # The boundary is decided and recorded before any collection, so a collector
+            # failure cannot let a coordinator edit through.
+            if reason is None:
+                reason = boundary_decision(db, payload)
+            if reason:
+                record_boundary(db, parent, payload, stamp)
+                response = deny(reason)
         session["model"] = payload.get("model") or session["model"]
         db.execute("UPDATE runtime_sessions SET model=? WHERE id=?", (session["model"], parent))
         collect_transcript(db, session, payload.get("transcript_path"))
         session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (parent,)).fetchone())
         if name in ("PreToolUse", "PostToolUse"):
-            use_id = payload.get("tool_use_id")
-            if not use_id:
-                raise ValueError("tool hook lacks tool_use_id")
-            signature = identity(payload.get("tool_name"), payload.get("tool_input"))
-            reason = None
-            if name == "PreToolUse" and session["role"] == "coordinator":
-                reason = boundary_violation(payload.get("tool_name"), payload.get("tool_input"))
-            if reason:
-                event(db, parent, "boundary:" + parent + ":" + use_id, "boundary", stamp, turn_id,
-                      name=payload.get("tool_name"), fingerprint=signature, status="denied", ended_at=stamp)
-                response = deny(reason)
-            else:
+            if not response:
+                use_id = payload.get("tool_use_id")
+                signature = identity(payload.get("tool_name"), payload.get("tool_input"))
                 tool_key = "tool:" + parent + ":" + use_id
                 tool_started = stamp if name == "PreToolUse" else None
                 previous = state.row(db, "runtime_events", tool_key)
@@ -365,7 +401,6 @@ def handle(db, payload):
     event(db, parent, identity(parent, name, turn_id, payload.get("tool_use_id"), stamp),
           "collector", stamp, turn_id, duration_seconds=time.monotonic() - started, status="completed")
     return response
-
 
 def close_if_released(db, session_id, timestamp):
     active = db.execute("""SELECT 1 FROM claims c JOIN runtime_scopes s ON s.work_id=c.work_id
@@ -425,12 +460,26 @@ def main():
             with closing(sqlite3.connect(Path(args.db).expanduser().resolve().as_uri() + "?mode=ro", uri=True)) as check:
                 present = check.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_sessions'").fetchone()
                 bound = present and check.execute("SELECT 1 FROM runtime_sessions WHERE id=? AND closed_at IS NULL", (payload.get("session_id"),)).fetchone()
+                reason = boundary_decision(check, payload) if bound else None
             if not bound:
                 print("{}")
                 return 0
-            with closing(state.connect(args.db)) as db, db:
-                db.execute("BEGIN IMMEDIATE")
-                result = handle(db, payload) or {}
+            # The boundary is decided before collection and its denial survives any collector failure.
+            result = deny(reason) if reason else {}
+            try:
+                with closing(state.connect(args.db)) as db, db:
+                    db.execute("BEGIN IMMEDIATE")
+                    handle(db, payload, reason)
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                failure = "Devflow metrics collection failed: " + str(exc)
+                result["systemMessage"] = (result["systemMessage"] + " " + failure) if result.get("systemMessage") else failure
+                if reason:
+                    try:
+                        with closing(state.connect(args.db)) as db, db:
+                            db.execute("BEGIN IMMEDIATE")
+                            record_boundary(db, payload.get("session_id"), payload, state.now())
+                    except (ValueError, OSError, sqlite3.Error):
+                        pass  # The denial stands even when it cannot be recorded.
         else:
             with closing(state.connect(args.db)) as db, db:
                 db.execute("BEGIN IMMEDIATE")

@@ -15,7 +15,7 @@ Delegated review runs as the read-only `devflow-reviewer` [agent](../devflow/ref
 
 3. **Report findings.** Report actionable findings with severity, location, concrete trigger, impact and supporting evidence. Separate confirmed defects from uncertainties and optional improvements. State what was inspected and what remains unverified. Follow project rules for required independence and checks; do not manufacture a review gate.
 
-4. **Retain the result.** Record the review result and findings in the [shared helper](../devflow/references/state.md), tied to the candidate commit and actual reviewer run when known. Preserve earlier findings when verifying a repair; record the fix and new evidence instead of silently replacing the original judgement.
+4. **Retain the result.** Return the review result and findings tied to the candidate commit; the coordinator records them with the [shared helper](../devflow/references/state.md) against the actual reviewer run. A delegated reviewer is read-only and writes no Devflow records. Preserve earlier findings when verifying a repair; report the fix and new evidence instead of silently replacing the original judgement.
 
 5. **Route repairs.** Return implementation repairs to [coordinating](../devflow-coordinating/SKILL.md) for the implementation worker; do not edit the candidate yourself.
 
@@ -29,5 +29,5 @@ Delegated review runs as the read-only `devflow-reviewer` [agent](../devflow/ref
 [high] src/client/retry.py:42 sleeps for one backoff interval before the first attempt.
 Trigger: call fetch() against a healthy server. Impact: every request waits before sending.
 Evidence: tests/test_retry.py::test_first_attempt_is_immediate fails at 3f2a1c9.
-Recorded: state.py record finding --id retry-fix-f1 --work-id retry-fix --severity high --status open --commit 3f2a1c9 --summary "First attempt waits for backoff"
+For the coordinator to record: finding retry-fix-f1, severity high, status open, commit 3f2a1c9.
 ```

@@ -98,7 +98,7 @@ flowchart LR
 
 Independent issues follow this flow concurrently in separate worktrees, each with one owner and work ID. The GitHub helper creates or reuses the issue, assigns the accountable user and updates its existing Project Status. Ownership rules, concurrency and interruption handling are defined once in [issue ownership](skills/devflow/references/ownership.md).
 
-The state helper stores work, claims, runs, results, findings and usage; installed hooks add content-free runtime observations for bound tasks. What is collected, how usage is attributed and what is deliberately not inferred are defined once in [work records and metrics](skills/devflow/references/state.md).
+The state helper stores work, claims, runs, results, findings and usage; the coordinator writes those records from what its agents return, and installed hooks add content-free runtime observations for bound tasks. What is collected, how usage is attributed and what is deliberately not inferred are defined once in [work records and metrics](skills/devflow/references/state.md).
 
 `state.py metrics` reports outcomes, roles and models, delivery, ownership, recovery, timing, usage and coverage; add `--work-id ID` for one issue.
 

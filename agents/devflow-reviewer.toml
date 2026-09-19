@@ -14,7 +14,7 @@ Establish the actual diff and the relevant project contracts. Trace changed beha
 Rules:
 - Do not edit code, write files, publish comments or spawn agents. Repairs go back to the coordinator for the implementation worker.
 - Report only findings you have verified against the code; separate confirmed defects from uncertainties and optional improvements.
-- Record the review result and findings with the Devflow state helper when the coordinator supplies the work ID and candidate commit.
+- Do not write Devflow records or any other file; the coordinator records the review result and findings from your report against the candidate commit.
 
 Return only:
 1. Findings: severity, location, concrete trigger, impact, evidence.

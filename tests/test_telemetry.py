@@ -1,5 +1,6 @@
 """Runtime collection: the transcript adapter, hook attribution and timestamp ordering."""
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -148,16 +149,39 @@ class BoundaryTests(TelemetryCase):
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(state.row(self.db, "runtime_events", "boundary:root-1:c1")["status"], "denied")
         self.assertIsNone(state.row(self.db, "runtime_events", "tool:root-1:c1"))
-        for use_id, command in (("c2", "git -C /repo commit -m x"), ("c3", "sed -i '' 's/a/b/' src/x.py"),
-                                ("c4", "pytest -q > report.txt"), ("c5", "cat notes | tee docs/x.md")):
-            self.assertIsNotNone(call("root-1", "shell", {"command": command}, use_id), command)
-        for use_id, command in (("c6", "pytest -q 2>&1 | tail -5 > /tmp/out.txt"),
-                                ("c7", 'python3.12 state.py record result --id r1 --work-id w1 --kind qa --status passed --summary "a > b"'),
-                                ("c8", "git status && git log --oneline -3 && git worktree add ../wt feature")):
-            self.assertIsNone(call("root-1", "shell", {"command": command}, use_id), command)
+        denied = ["git -C /repo commit -m x", "sed -i '' 's/a/b/' src/x.py", "pytest -q > report.txt",
+                  "cat notes | tee docs/x.md", "git tag v1.2.0", "git tag -d v1.1.0", "git stash", "git stash pop",
+                  "git clean -fd", "git apply fix.patch", "git add -A"]
+        allowed = ["pytest -q 2>&1 | tail -5 > /tmp/out.txt",
+                   'python3.12 state.py record result --id r1 --work-id w1 --kind qa --status passed --summary "a > b"',
+                   "git status && git log --oneline -3 && git worktree add ../wt feature",
+                   "git tag --list", "git tag", "git tag -l 'v*'", "git tag --contains abc123", "git stash list",
+                   "git stash show -p stash@{0}", "git clean -nd", "git add --dry-run .", "git apply --check fix.patch"]
+        for number, command in enumerate(denied, start=100):
+            self.assertIsNotNone(call("root-1", "shell", {"command": command}, f"d{number}"), command)
+        for number, command in enumerate(allowed, start=200):
+            self.assertIsNone(call("root-1", "shell", {"command": command}, f"a{number}"), command)
         self.assertIsNone(call("worker-1", "apply_patch", {"patch": "*** Begin Patch"}, "c9"))
         self.assertEqual(state.row(self.db, "runtime_events", "tool:worker-1:c9")["status"], "started")
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM runtime_events WHERE kind='boundary'").fetchone()[0], 5)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM runtime_events WHERE kind='boundary'").fetchone()[0],
+                         len(denied) + 1)
+
+    def test_denial_survives_transcript_collection_failure(self):
+        state.claim_work(self.db, "w1", "root-1")
+        transcript = self.root / "root.jsonl"
+        transcript.write_text("")
+        self.db.execute("UPDATE runtime_sessions SET transcript_path=?, cursor=999 WHERE id='root-1'", (str(transcript),))
+        self.db.commit()  # release the lock for the hook process
+        payload = {"session_id": "root-1", "hook_event_name": "PreToolUse", "turn_id": "t1", "tool_use_id": "c1",
+                   "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch"}, "transcript_path": str(transcript)}
+        completed = subprocess.run(
+            [sys.executable, "-B", str(ROOT / "skills" / "devflow" / "scripts" / "telemetry.py"),
+             "--db", str(self.root / "workflow.sqlite3"), "hook"],
+            input=json.dumps(payload), text=True, capture_output=True, check=True)
+        output = json.loads(completed.stdout)
+        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("transcript truncated", output["systemMessage"])
+        self.assertEqual(state.row(self.db, "runtime_events", "boundary:root-1:c1")["status"], "denied")
 
 
 if __name__ == "__main__":

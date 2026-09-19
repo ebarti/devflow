@@ -25,6 +25,7 @@ for agent in "$source_root"/agents/*.toml; do
 done
 "$devflow_python" -B - "$install_fixture/codex/agents" <<'PY'
 import pathlib
+import re
 import sys
 import tomllib
 
@@ -35,6 +36,8 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("devflow-*.toml")):
     assert agent["name"] == path.stem, path
     assert agent["description"] and agent["developer_instructions"].strip(), path
     assert agent["sandbox_mode"] in {"read-only", "workspace-write"}, path
+    # Agents never write Devflow records; their sandboxes cannot reach the state database.
+    assert not re.search(r"state helper|state\.py|github\.py", agent["developer_instructions"]), path
     agents[agent["name"]] = agent
 assert set(agents) == {"devflow-definer", "devflow-planner", "devflow-implementer",
                        "devflow-reviewer", "devflow-verifier", "devflow-deliverer"}, sorted(agents)

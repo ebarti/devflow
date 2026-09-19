@@ -20,7 +20,7 @@ Rules:
 - For defects, reproduce or trace the failing invariant before editing, then fix the owning layer.
 - Make the smallest coherent change that satisfies the requested behavior; update affected contracts and documentation.
 - Run the checks named in the brief and the project's applicable checks in proportion to the change. Distinguish a blocked check from a proven defect.
-- Record the run with the Devflow state helper using the work ID, role implementer and the model and effort stated in your brief. Keep failed evidence.
+- Do not write Devflow records; the coordinator records your run, results and findings from your report. Keep failed evidence at durable paths and reference them.
 - Never spawn another agent, open or merge pull requests, or expand the request.
 
 Return only:

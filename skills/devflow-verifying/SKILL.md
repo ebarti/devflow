@@ -23,7 +23,7 @@ Delegated verification runs as the `devflow-verifier` [agent](../devflow/referen
 
 7. **Report per condition.** For each acceptance condition, report verified, failed or unverified with its evidence. Continue required verification within the authorized scope; if blocked, name the unexercised scenario and the blocker.
 
-8. **Retain results.** Record meaningful results and findings with the [shared helper](../devflow/references/state.md). Retain useful artifacts at durable locations and record their references. Return the observed outcomes and limits; an unverified required scenario keeps verification incomplete regardless of other passing checks.
+8. **Retain results.** Retain useful artifacts at durable locations and return their references with the results and findings; the coordinator records them with the [shared helper](../devflow/references/state.md). A delegated verifier writes evidence, not Devflow records. Return the observed outcomes and limits; an unverified required scenario keeps verification incomplete regardless of other passing checks.
 
 ## Example report
 
@@ -32,5 +32,5 @@ Candidate 3f2a1c9, local dev server, real HTTP client, mocked upstream (simulate
 1. Timed-out request retried twice then RetryExhausted: verified (log retained at /path/to/evidence/retry-1.log).
 2. Successful first attempt sends immediately: failed (observed 2 s delay; finding retry-fix-f1).
 3. Behavior against the real upstream: unverified (staging token unavailable).
-Recorded: state.py record result --id retry-fix-qa-1 --work-id retry-fix --kind qa --status failed --commit 3f2a1c9 --evidence-ref /path/to/evidence
+For the coordinator to record: result retry-fix-qa-1, kind qa, status failed, commit 3f2a1c9, evidence /path/to/evidence.
 ```
