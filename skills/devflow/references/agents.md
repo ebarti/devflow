@@ -19,6 +19,10 @@ Continue the original agent for related work in the same role, work ID and workt
 
 A trusted repository can supply `.codex/agents/<name>.toml` to override a role's defaults. Record the actual model and effort from the host when available; mark them unknown if unavailable rather than claiming the requested settings were observed.
 
+## Clarifications
+
+The coordinator owns the user conversation. Every brief supplies its agent ID or path for replies. A child sends material questions to that coordinator with `agents.send_message`, including the decision at stake, supported options and dependent work. It continues independent investigation; if blocked or unable to message, it returns partial findings and its questions instead of waiting for a direct user response. Children do not call user-input tools. The coordinator asks the user only when existing context cannot settle the question, then sends the answer to the same running child or resumes that child with `agents.followup_task` after it has finished. Simple clarification stays in the coordinator and requires no definer dispatch.
+
 ## Responsibilities
 
 Agents return reports; the coordinator writes work records, updates the issue, publishes authorized review comments and resolves verified findings. The implementer changes code and owns commits, PR creation and pushes. The definer, planner and reviewer inspect. The verifier runs checks and writes evidence without changing product code or tests. None delegates further. Merge is a bounded coordinator action, with no separate delivery agent.

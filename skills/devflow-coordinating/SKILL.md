@@ -13,11 +13,11 @@ Use the user's session to define scope, dispatch work, assess evidence and maint
 
 2. **Claim the issue.** Follow [ownership](../devflow/references/ownership.md). Maintain the assignee and existing Project Status. Keep the issue in progress while implementation continues, even after its PR opens. Release the claim when the task stops.
 
-3. **Choose the next useful action.** Investigate ambiguity with the definer; use the planner for consequential choices or slicing. A small, clear change needs only a concise implementation brief. Do not dispatch agents to fill mandatory stages. Split features into coherent reviewable PRs. Sequential features or slices started before earlier work merges join the same gh stack, including logically independent features; see [PR workflow](../devflow/references/pr-workflow.md).
+3. **Choose the next useful action.** Handle simple clarification yourself. Use the definer when ambiguity needs repository or evidence investigation, and the planner for consequential choices or slicing. A small, clear change needs only a concise implementation brief. Do not dispatch agents to fill mandatory stages. Split features into coherent reviewable PRs. Sequential features or slices started before earlier work merges join the same gh stack, including logically independent features; see [PR workflow](../devflow/references/pr-workflow.md).
 
 4. **Select and reuse an agent.** Use the named role in the [agents reference](../devflow/references/agents.md). Reuse the original implementer for repairs and the original reviewer/verifier for rechecks when work ID, worktree and role remain compatible. Spawn a new agent by type with `fork_turns: "none"` when needed; the installed definition selects model and effort. Brief it with context it cannot otherwise inherit. Follow the [worker reference](../devflow/references/implementation-worker.md) for reuse and spawn failures.
 
-5. **Supply role-specific inputs.** Every brief includes work ID, repository/worktree, outcome, relevant context, project instructions and explicit limits. Add the inputs below; state unknowns instead of making them up.
+5. **Supply role-specific inputs.** Every brief includes work ID, repository/worktree, outcome, relevant context, project instructions, explicit limits and your agent ID or path for replies. Add the inputs below; state unknowns instead of making them up.
 
    | Role | Additional inputs |
    | --- | --- |
@@ -28,6 +28,8 @@ Use the user's session to define scope, dispatch work, assess evidence and maint
    | Verifier | Candidate identity, acceptance scenarios, environment/build setup, check limits and original failure evidence |
 
    Include the relevant role skill. Tell agents that the checkout is shared and they must preserve others' edits. Parallel work needs disjoint ownership and separate worktrees; sequential unmerged work keeps its branch chain.
+
+   **Handle questions as they arrive.** Agents send questions to you or return them with partial findings; you own the user conversation. Answer from existing context when possible, otherwise ask the user yourself. Relay the answer and any changed constraints to the same agent with `agents.send_message` if it is running, or `agents.followup_task` if it has finished. Record accepted decisions in the brief. Keep independent work moving, but do not dispatch work that depends on an unresolved required decision. A partial report is not a completed definition.
 
 6. **Publish during implementation.** The implementer commits the first meaningful change and opens its PR immediately, then pushes repairs to that same PR. Do not defer publication until review or QA. Preserve explicit local-only/no-commit/no-push instructions. Record the returned PR, base/head SHAs and stack order. A published head must contain the changes being reviewed; dirty work needs an explicit complete snapshot.
 
