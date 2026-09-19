@@ -20,6 +20,16 @@ done
 for name in state.py github.py legacy.py telemetry.py measurements.py schema.sql; do
     test -r "$destination/devflow/scripts/$name"
 done
+test "$(readlink "$install_fixture/codex/agents/devflow-implementer.toml")" = "$source_root/agents/devflow-implementer.toml"
+"$devflow_python" -B - "$install_fixture/codex/agents/devflow-implementer.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    agent = tomllib.load(handle)
+assert (agent["name"], agent["model"], agent["model_reasoning_effort"]) == ("devflow-implementer", "gpt-5.6-sol", "high")
+assert agent["description"] and agent["developer_instructions"].strip()
+PY
 "$devflow_python" -B "$destination/devflow/scripts/state.py" --help > /dev/null
 "$devflow_python" -B "$destination/devflow/scripts/github.py" --help > /dev/null
 "$devflow_python" -B "$destination/devflow/scripts/telemetry.py" --help > /dev/null
@@ -58,6 +68,8 @@ test "$(readlink "$destination/devflow")" = "$install_fixture/previous"
 cp "$install_fixture/codex/hooks.json" "$install_fixture/hooks-before.json"
 ln -s "$source_root/skills/devflow-obsolete-install-smoke" "$destination/devflow-obsolete-install-smoke"
 ln -s "$install_fixture/unrelated" "$destination/unrelated"
+ln -s "$source_root/agents/devflow-obsolete-install-smoke.toml" "$install_fixture/codex/agents/devflow-obsolete-install-smoke.toml"
+ln -s "$install_fixture/unrelated" "$install_fixture/codex/agents/unrelated.toml"
 ln -s "$("$devflow_python" -c 'import sys; print(sys.executable)')" "$install_fixture/python override"
 DEVFLOW_PYTHON="$install_fixture/python override" sh "$source_root/scripts/install.sh" --force "$destination" "$install_fixture/codex"
 for skill in "$source_root"/skills/*; do
@@ -67,6 +79,11 @@ test ! -e "$install_fixture/previous/devflow"
 cmp "$install_fixture/hooks-before.json" "$install_fixture/codex/hooks.json"
 test ! -L "$destination/devflow-obsolete-install-smoke"
 test -L "$destination/unrelated"
+for agent in "$source_root"/agents/*; do
+    test "$(readlink "$install_fixture/codex/agents/${agent##*/}")" = "$agent"
+done
+test ! -L "$install_fixture/codex/agents/devflow-obsolete-install-smoke.toml"
+test -L "$install_fixture/codex/agents/unrelated.toml"
 
 # A file or directory blocks the whole reinstall before any link is changed.
 mkdir "$install_fixture/conflicts"
@@ -90,25 +107,29 @@ done
 # Upgrade a local installation between two release tags; no remote service is used.
 release_source="$install_fixture/releases"
 mkdir "$release_source"
-cp -R "$source_root/scripts" "$source_root/skills" "$release_source/"
+cp -R "$source_root/scripts" "$source_root/skills" "$source_root/agents" "$release_source/"
 mkdir "$release_source/skills/devflow-retired"
 printf '%s\n' 'Temporary installation smoke skill.' > "$release_source/skills/devflow-retired/SKILL.md"
+printf '%s\n' 'name = "devflow-retired"' > "$release_source/agents/devflow-retired.toml"
 git -C "$release_source" init -q
 git -C "$release_source" config user.name 'Installation smoke'
 git -C "$release_source" config user.email 'install@example.invalid'
 git -C "$release_source" add .
 git -C "$release_source" commit -qm 'Initial installation'
 git -C "$release_source" tag v0.0.1
-git -C "$release_source" rm -qr skills/devflow-retired
+git -C "$release_source" rm -qr skills/devflow-retired agents/devflow-retired.toml
 git -C "$release_source" commit -qm 'Remove retired skill'
 git -C "$release_source" tag v0.0.2
 git clone -q "$release_source" "$install_fixture/checkout"
 git -C "$install_fixture/checkout" checkout -q --detach v0.0.1
 sh "$install_fixture/checkout/scripts/install.sh" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > /dev/null
 test -L "$install_fixture/upgraded-skills/devflow-retired"
+test -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
 sh "$install_fixture/checkout/scripts/update.sh" v0.0.2 "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > /dev/null
 test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$release_source" rev-parse v0.0.2)"
 test ! -L "$install_fixture/upgraded-skills/devflow-retired"
+test ! -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+test "$(readlink "$install_fixture/upgraded-codex/agents/devflow-implementer.toml")" = "$install_fixture/checkout/agents/devflow-implementer.toml"
 test "$(readlink "$install_fixture/upgraded-skills/devflow")" = "$install_fixture/checkout/skills/devflow"
 printf '\n# Local edit\n' >> "$install_fixture/checkout/scripts/install.sh"
 if sh "$install_fixture/checkout/scripts/update.sh" v0.0.1 > /dev/null 2>&1; then
@@ -119,6 +140,7 @@ test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$releas
 
 "$devflow_python" -B "$source_root/scripts/candidate.py" --prepare-only "$install_fixture/trial" > /dev/null
 test -f "$install_fixture/trial/codex/skills/devflow/SKILL.md"
+test -L "$install_fixture/trial/codex/agents/devflow-implementer.toml"
 test -s "$install_fixture/trial/codex/hooks.json"
 test -s "$install_fixture/trial/candidate.json"
 printf 'Installation check passed.\n'

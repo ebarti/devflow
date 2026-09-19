@@ -5,7 +5,7 @@ description: Implement a defined feature or repair a defect in the requested rep
 
 # Implement the change
 
-Implementation runs in the delegated [implementation worker](../devflow/references/implementation-worker.md). Your brief names you as that worker for a work ID and states the model and effort you were spawned with; rely on the brief rather than guessing your own configuration, and do the assigned work yourself without spawning another implementer. If your brief and your assignment disagree, report the mismatch to the coordinator before editing. Without such a brief you are not the worker: a direct implementation request follows [coordinating](../devflow-coordinating/SKILL.md), which claims the issue and reuses or spawns the worker.
+Implementation runs in the `devflow-implementer` agent, the delegated [implementation worker](../devflow/references/implementation-worker.md). Your brief names you as that worker for a work ID and states the model and effort of the installed definition; rely on the brief rather than guessing your own configuration, and do the assigned work yourself without spawning another agent. If your brief and your assignment disagree, report the mismatch to the coordinator before editing. Without such a brief you are not the worker: a direct implementation request follows [coordinating](../devflow-coordinating/SKILL.md), which claims the issue and reuses or spawns the worker.
 
 ## Steps
 

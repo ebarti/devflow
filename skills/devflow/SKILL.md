@@ -27,7 +27,7 @@ Select only the role needed:
 
 3. **Own the issue for implementation or delivery.** Follow [issue ownership](references/ownership.md): the coordinating task creates or reuses the issue, claims the work and maintains its assignee and existing Project Status. Independent requested issues can run concurrently with separate work IDs and worktrees. Delegated workers reuse their coordinator's claim.
 
-4. **Install only on request.** Run `bash scripts/install.sh [SKILLS_DIRECTORY] [CODEX_HOME]` from a release checkout, and upgrade with `bash scripts/update.sh TAG [SKILLS_DIRECTORY] [CODEX_HOME]`; keep development trials separate. Installation links sibling skills, removes obsolete links owned by that checkout and refreshes metrics hooks. Review changed hooks through the host's hook controls. Agent instructions and project tools remain with their existing owners.
+4. **Install only on request.** Run `bash scripts/install.sh [SKILLS_DIRECTORY] [CODEX_HOME]` from a release checkout, and upgrade with `bash scripts/update.sh TAG [SKILLS_DIRECTORY] [CODEX_HOME]`; keep development trials separate. Installation links sibling skills and agent definitions, removes obsolete links owned by that checkout and refreshes metrics hooks. Review changed hooks through the host's hook controls. Agent instructions and project tools remain with their existing owners.
 
 ## Example
 

@@ -29,7 +29,7 @@ def main():
     legacy_skills = ["using-devflow"]
     normal_roots = {Path.home() / ".agents/skills", Path.home() / ".codex/skills",
                     Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "skills"}
-    config = ["[features]\nhooks = true\n"]
+    config = ["[features]\nhooks = true\nmulti_agent = true\n"]
     for root in sorted(normal_roots):
         for name in [*skills, *legacy_skills]:
             path = root / name / "SKILL.md"

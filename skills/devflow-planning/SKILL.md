@@ -17,7 +17,7 @@ description: Plan architecture, dependencies, implementation slices and verifica
 
 5. **Keep it proportional.** A small fix may need only a few sentences; a migration needs ordering and recovery. Preserve accepted decisions and mark unresolved facts explicitly. A plan-only request produces the plan without initiating implementation or external work.
 
-6. **Hand off.** For ongoing work, save the plan or its durable reference in the [work record](../devflow/references/state.md). When implementation is already authorized, proceed through [coordinating](../devflow-coordinating/SKILL.md) without another approval step; each slice is implemented by the [implementation worker](../devflow/references/implementation-worker.md).
+6. **Hand off.** For ongoing work, save the plan or its durable reference in the [work record](../devflow/references/state.md). When implementation is already authorized, proceed through [coordinating](../devflow-coordinating/SKILL.md) without another approval step; each slice becomes the brief for the [implementation worker](../devflow/references/implementation-worker.md), which is dispatched only once the slice's verification steps are exact.
 
 ## Example slice
 

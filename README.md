@@ -4,11 +4,11 @@ Small development skills for OpenAI Codex CLI agents, with Python helpers for wo
 
 ## Prerequisites
 
-Devflow targets Codex CLI: skills load from its skills directory, metrics hooks use its `hooks.json` and transcript format, and delegation uses its agent tools. Other hosts that discover `SKILL.md` directories can load the role skills, but hooks, metrics, candidate trials and worker spawning are Codex-specific. Supply Python 3.12+, a POSIX shell, Git and the tools required by your projects. Delegated implementation needs a configurable `worker` agent role and access to the worker model; see the [implementation worker reference](skills/devflow/references/implementation-worker.md). GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
+Devflow targets Codex CLI: skills load from its skills directory, metrics hooks use its `hooks.json` and transcript format, and delegation uses its agent tools. Other hosts that discover `SKILL.md` directories can load the role skills, but hooks, metrics, candidate trials and worker spawning are Codex-specific. Supply Python 3.12+, a POSIX shell, Git and the tools required by your projects. Delegated implementation needs Codex multi-agent tools and access to the worker model; the installer supplies the `devflow-implementer` agent definition. See the [implementation worker reference](skills/devflow/references/implementation-worker.md). GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
 
 ## Install
 
-Keep a release checkout at a stable location; installed skills are symlinks into it.
+Keep a release checkout at a stable location; installed skills and agent definitions are symlinks into it.
 
 ```sh
 git clone --branch v0.1.0 https://github.com/ebarti/devflow.git
@@ -18,7 +18,7 @@ bash scripts/install.sh
 
 The installer uses `python3.12`; set `DEVFLOW_PYTHON` to select another supported interpreter. Hooks record its resolved absolute executable path at installation, so later `PATH` changes do not switch Python. Reinstall to change the interpreter. The helpers use only the standard library; no pip dependencies are required.
 
-The defaults are `~/.agents/skills` and `$CODEX_HOME/hooks.json` (`~/.codex/hooks.json` when unset). Supply custom locations when needed:
+The defaults are `~/.agents/skills` for skills and `$CODEX_HOME` (`~/.codex` when unset) for the agent definitions in `agents/` and the metrics hooks in `hooks.json`. Supply custom locations when needed:
 
 ```sh
 bash scripts/install.sh /path/to/host/skills /path/to/codex-home
@@ -30,7 +30,7 @@ To switch an existing installation to another checkout, run this from that check
 bash scripts/install.sh --force
 ```
 
-`--force` replaces only bundled skill symlinks, including broken links. Regular files, directories and other hooks are preserved. Without it, conflicting paths stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
+`--force` replaces only bundled skill and agent-definition symlinks, including broken links. Regular files, directories, other agent definitions and other hooks are preserved. Without it, conflicting paths stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
 
 ## Upgrade
 
@@ -40,7 +40,7 @@ Choose a [release tag](https://github.com/ebarti/devflow/releases) and upgrade t
 bash scripts/update.sh v0.1.0
 ```
 
-The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill links owned by this checkout are removed; other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
+The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill and agent-definition links owned by this checkout are removed; other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
 
 ## Candidate trials
 
@@ -50,7 +50,7 @@ From a development worktree, use a new trial directory for each candidate and a 
 python3.12 scripts/candidate.py /path/to/trial -C /path/to/project-worktree
 ```
 
-The launcher isolates skills, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit.
+The launcher isolates skills, agent definitions, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit.
 
 Publish a new release tag after the installation smoke check and the selected product trial pass. Release tags remain fixed; normal installations advance only through an explicit upgrade.
 
@@ -58,7 +58,7 @@ Publish a new release tag after the installation smoke check and the selected pr
 
 Ask for the outcome you want, for example: “Use devflow to fix the retry bug in this repository.” Or invoke a role such as `$devflow-reviewing` for a specific review. Skills are independently discoverable; loading one does not create work, issues or agents, or resume a backlog.
 
-Implementation changes, including small fixes and review or QA repairs, run in a dedicated implementation worker: **Sol / high** (`gpt-5.6-sol`, effort `high`). Only an explicit, checked-in configuration entry in the target repository can select a different model or effort; conversation requests and user-level settings do not. The coordinator never falls back to its own model; a transient spawn failure is retried or handed to an existing worker, and a configuration failure stops and asks what to fix. Related follow-ups reuse the same agent within one role, issue and worktree while preserving required review and QA independence. Other roles keep their selected models. The [implementation worker reference](skills/devflow/references/implementation-worker.md) is the single definition.
+Implementation changes, including small fixes and review or QA repairs, run in the `devflow-implementer` agent, whose installed definition pins **Sol / high** (`gpt-5.6-sol`, effort `high`). Coordinators spawn it by agent type and never select a model or effort; only a repository's own checked-in `.codex/agents/devflow-implementer.toml` can change the model, never a conversation request or a user-level setting. A worker is dispatched only once the plan and its verification steps are sharp, implements against that brief, and is reused when the next implementation is the same or closely related; unrelated work gets a new worker. A transient spawn failure is retried or handed to an existing worker, and a configuration failure stops and asks what to fix. Other roles keep their existing agent types and models. The [implementation worker reference](skills/devflow/references/implementation-worker.md) is the single definition.
 
 | Skill | Use |
 | --- | --- |
