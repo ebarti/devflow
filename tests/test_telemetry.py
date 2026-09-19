@@ -38,7 +38,7 @@ class TelemetryCase(unittest.TestCase):
 
 
 class TranscriptTests(TelemetryCase):
-    def test_counter_deltas_resets_partial_and_malformed_lines(self):
+    def test_counter_deltas_skipped_lines_resets_partial_lines_and_replay(self):
         session = self.session()
 
         def stamp(seconds):
@@ -49,14 +49,15 @@ class TranscriptTests(TelemetryCase):
                 "type": "token_count", "turn_id": turn, "info": {"total_token_usage": counts}}})
 
         lines = [
-            json.dumps({"type": "turn_context", "timestamp": stamp(1),
-                        "payload": {"model": "gpt-5.6-sol", "effort": "high", "turn_id": "t1"}}),
-            usage(2, "t1", input_tokens=100, cached_input_tokens=20, output_tokens=10, reasoning_output_tokens=4),
-            "{this line is not JSON",
-            usage(3, "t1", input_tokens=160, cached_input_tokens=30, output_tokens=25, reasoning_output_tokens=9),
-            usage(4, "t2", input_tokens=5, cached_input_tokens=0, output_tokens=1, reasoning_output_tokens=0),
+            json.dumps({"type": "turn_context", "timestamp": stamp(-10),
+                        "payload": {"model": "gpt-5.6-sol", "effort": "high", "turn_id": "t0"}}),
+            usage(-9, "t0", input_tokens=100, cached_input_tokens=20, output_tokens=10, reasoning_output_tokens=4),
+            "{not JSON: this line may have carried the last counter before binding",
+            usage(1, "t1", input_tokens=1100, cached_input_tokens=220, output_tokens=110, reasoning_output_tokens=44),
+            usage(2, "t1", input_tokens=1150, cached_input_tokens=230, output_tokens=125, reasoning_output_tokens=49),
+            usage(3, "t2", input_tokens=5, cached_input_tokens=0, output_tokens=1, reasoning_output_tokens=0),
         ]
-        partial = json.dumps({"type": "event_msg", "timestamp": stamp(5),
+        partial = json.dumps({"type": "event_msg", "timestamp": stamp(4),
                               "payload": {"type": "task_complete", "turn_id": "t2"}})
         complete = "\n".join(lines) + "\n"
         path = self.root / "session.jsonl"
@@ -64,19 +65,21 @@ class TranscriptTests(TelemetryCase):
 
         telemetry.collect_transcript(self.db, session, str(path))
 
+        # The pre-binding counter is a baseline, the skipped line invalidates it, the first counter
+        # after binding re-baselines without charging the hidden 1,000 tokens, and only the next
+        # delta becomes usage.
         recorded = self.rows("SELECT input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens "
                              "FROM usage ORDER BY recorded_at")
         self.assertEqual(recorded, [
-            {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10, "reasoning_output_tokens": 4},
-            {"input_tokens": 60, "cached_input_tokens": 10, "output_tokens": 15, "reasoning_output_tokens": 5}])
-        self.assertEqual(self.rows("SELECT work_id,weight FROM usage_allocations"),
-                         [{"work_id": "w1", "weight": 1.0}] * 2)
-        special = {r["kind"]: r for r in self.rows(
-            "SELECT kind,status,source_ref FROM runtime_events WHERE kind IN ('counter_reset','transcript_gap')")}
-        self.assertEqual(special["counter_reset"]["status"], "gap")
-        self.assertEqual(special["transcript_gap"]["status"], "skipped")
+            {"input_tokens": 50, "cached_input_tokens": 10, "output_tokens": 15, "reasoning_output_tokens": 5}])
+        self.assertEqual(self.rows("SELECT work_id,weight FROM usage_allocations"), [{"work_id": "w1", "weight": 1.0}])
+        gaps = {r["kind"]: r for r in self.rows(
+            "SELECT kind,status,source_ref FROM runtime_events "
+            "WHERE kind IN ('transcript_gap','counter_baseline','counter_reset')")}
+        self.assertEqual({kind: row["status"] for kind, row in gaps.items()},
+                         {"transcript_gap": "skipped", "counter_baseline": "gap", "counter_reset": "gap"})
         offset = len(lines[0]) + 1 + len(lines[1]) + 1
-        self.assertTrue(special["transcript_gap"]["source_ref"].endswith("#byte=" + str(offset)))
+        self.assertTrue(gaps["transcript_gap"]["source_ref"].endswith("#byte=" + str(offset)))
         session = self.session()
         self.assertEqual((session["model"], session["effort"]), ("gpt-5.6-sol", "high"))
         self.assertEqual(session["cursor"], len(complete.encode()))  # the partial line waits
@@ -85,7 +88,7 @@ class TranscriptTests(TelemetryCase):
         path.write_text(complete + partial + "\n")
         telemetry.collect_transcript(self.db, self.session(), str(path))
         self.assertEqual(self.session()["cursor"], len((complete + partial + "\n").encode()))
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 2)  # no replay duplicates
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 1)  # no replay duplicates
         self.assertEqual(state.row(self.db, "runtime_events", "turn:s1:t2")["status"], "completed")
 
 

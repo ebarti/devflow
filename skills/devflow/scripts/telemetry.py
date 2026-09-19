@@ -97,6 +97,17 @@ def tokens(db, session, payload, timestamp, position, turn_id):
         return
     prior = {k: session[k] for k in TOKEN_FIELDS}
     after_binding = state.instant(timestamp) >= state.instant(session["bound_at"])
+    if prior["input_tokens"] is None and db.execute(
+            "SELECT 1 FROM runtime_events WHERE session_id=? AND kind='transcript_gap' LIMIT 1",
+            (session["id"],)).fetchone():
+        # A skipped line broke counter continuity: this counter is the new baseline and allocates
+        # nothing, so usage hidden by the skipped line stays unknown instead of charging the work.
+        if after_binding:
+            event(db, session["id"], identity(session["id"], position, "baseline"), "counter_baseline",
+                  timestamp, turn_id, status="gap",
+                  source_ref=session["transcript_path"] + "#byte=" + str(position))
+        session.update(values)
+        return
     reset = any(prior[k] is not None and values[k] is not None and values[k] < prior[k]
                 for k in TOKEN_FIELDS)
     if reset and after_binding:
@@ -170,10 +181,14 @@ def collect_transcript(db, session, transcript, collect_tools=False):
                 if not isinstance(item, dict):
                     raise ValueError("transcript line is not an object")
             except ValueError:
-                # One malformed line must not stall collection: record the gap and move on.
+                # One malformed line must not stall collection: record the gap and move on. The
+                # skipped line may have carried a counter, so the checkpoint is uncertain until
+                # the next counter re-establishes it without allocating usage.
                 event(db, session["id"], identity(session["id"], position, "malformed"), "transcript_gap",
                       state.now(), active_turn, status="skipped",
                       source_ref=session["transcript_path"] + "#byte=" + str(position))
+                for key in TOKEN_FIELDS:
+                    session[key] = None
                 cursor = stream.tell()
                 continue
             payload = item.get("payload") or {}

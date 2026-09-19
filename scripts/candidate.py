@@ -24,11 +24,14 @@ def main():
             parser.error("trial configuration belongs to another source; use a new trial directory")
     codex_directory.mkdir(parents=True, exist_ok=True)
     skills = sorted(path.name for path in (source / "skills").iterdir() if path.is_dir())
+    # Older installations may still expose skills this checkout no longer ships; a trial must not
+    # load those either, so keep their names here after removing them from skills/.
+    legacy_skills = ["using-devflow"]
     normal_roots = {Path.home() / ".agents/skills", Path.home() / ".codex/skills",
                     Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "skills"}
     config = ["[features]\nhooks = true\n"]
     for root in sorted(normal_roots):
-        for name in skills:
+        for name in [*skills, *legacy_skills]:
             path = root / name / "SKILL.md"
             if path.exists():
                 config.append("[[skills.config]]\npath = " + json.dumps(str(path)) + "\nenabled = false\n")
