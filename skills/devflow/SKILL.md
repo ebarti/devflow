@@ -5,19 +5,19 @@ description: Use Devflow for a development request, role selection, local work r
 
 # Devflow
 
-Follow the user's requested outcome and the target project's instructions. Start authorized work without an extra approval gate. Discussion alone creates no work; loading a skill creates no issues, agents or backlog activity. Use the host's tools, Git, `gh` and project commands. Implementation changes run in the [implementation worker](references/implementation-worker.md) dispatched through coordinating; other roles keep their selected models.
+Follow the user's requested outcome and the target project's instructions. Start authorized work without an extra approval gate. Discussion alone creates no work; loading a skill creates no issues, agents or backlog activity. Use the host's tools, Git, `gh` and project commands. Every delegated action runs as its [Devflow agent type](references/agents.md), spawned by name; implementation runs in the [implementation worker](references/implementation-worker.md), the only agent whose model is pinned, and the other roles follow the session's model.
 
 Select only the role needed:
 
-| Intent | Skill |
-| --- | --- |
-| Clarify a request or explore a design | [Defining work](../devflow-defining-work/SKILL.md) |
-| Plan architecture, slices or coverage | [Planning](../devflow-planning/SKILL.md) |
-| Carry out a defined request or continue actual work | [Coordinating](../devflow-coordinating/SKILL.md) |
-| Change or repair code | [Coordinating](../devflow-coordinating/SKILL.md); the dispatched worker uses [Implementing](../devflow-implementing/SKILL.md) |
-| Review an existing candidate | [Reviewing](../devflow-reviewing/SKILL.md) |
-| Reproduce behavior or run project checks | [Verifying](../devflow-verifying/SKILL.md) |
-| Publish, merge or reconcile delivery | [Delivering](../devflow-delivering/SKILL.md) |
+| Intent | Skill | Delegated as |
+| --- | --- | --- |
+| Clarify a request or explore a design | [Defining work](../devflow-defining-work/SKILL.md) | `devflow-definer` |
+| Plan architecture, slices or coverage | [Planning](../devflow-planning/SKILL.md) | `devflow-planner` |
+| Carry out a defined request or continue actual work | [Coordinating](../devflow-coordinating/SKILL.md) | the session itself |
+| Change or repair code | [Coordinating](../devflow-coordinating/SKILL.md); the dispatched worker uses [Implementing](../devflow-implementing/SKILL.md) | `devflow-implementer` |
+| Review an existing candidate | [Reviewing](../devflow-reviewing/SKILL.md) | `devflow-reviewer` |
+| Reproduce behavior or run project checks | [Verifying](../devflow-verifying/SKILL.md) | `devflow-verifier` |
+| Publish, merge or reconcile delivery | [Delivering](../devflow-delivering/SKILL.md) | `devflow-deliverer` |
 
 ## Steps
 

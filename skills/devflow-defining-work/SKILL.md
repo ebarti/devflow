@@ -5,6 +5,8 @@ description: Clarify a development outcome, investigate an ambiguous bug report,
 
 # Define the work
 
+When the coordinator delegates this role it runs as the read-only `devflow-definer` [agent](../devflow/references/agents.md); the coordinator may also do it directly.
+
 ## Steps
 
 1. **Gather the evidence.** Read the relevant code, owning documentation and user-provided evidence.

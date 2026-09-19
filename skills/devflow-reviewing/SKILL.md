@@ -5,7 +5,7 @@ description: Review an existing code change for actionable defects, contract vio
 
 # Review the candidate
 
-Review does not change the candidate: findings go back to the coordinator, and repairs run in the [implementation worker](../devflow/references/implementation-worker.md).
+Delegated review runs as the read-only `devflow-reviewer` [agent](../devflow/references/agents.md). Review does not change the candidate: findings go back to the coordinator, and repairs run in the [implementation worker](../devflow/references/implementation-worker.md).
 
 ## Steps
 

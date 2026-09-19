@@ -20,15 +20,28 @@ done
 for name in state.py github.py legacy.py telemetry.py measurements.py schema.sql; do
     test -r "$destination/devflow/scripts/$name"
 done
-test "$(readlink "$install_fixture/codex/agents/devflow-implementer.toml")" = "$source_root/agents/devflow-implementer.toml"
-"$devflow_python" -B - "$install_fixture/codex/agents/devflow-implementer.toml" <<'PY'
+for agent in "$source_root"/agents/*.toml; do
+    test "$(readlink "$install_fixture/codex/agents/${agent##*/}")" = "$agent"
+done
+"$devflow_python" -B - "$install_fixture/codex/agents" <<'PY'
+import pathlib
 import sys
 import tomllib
 
-with open(sys.argv[1], "rb") as handle:
-    agent = tomllib.load(handle)
-assert (agent["name"], agent["model"], agent["model_reasoning_effort"]) == ("devflow-implementer", "gpt-5.6-sol", "high")
-assert agent["description"] and agent["developer_instructions"].strip()
+agents = {}
+for path in sorted(pathlib.Path(sys.argv[1]).glob("devflow-*.toml")):
+    with path.open("rb") as handle:
+        agent = tomllib.load(handle)
+    assert agent["name"] == path.stem, path
+    assert agent["description"] and agent["developer_instructions"].strip(), path
+    assert agent["sandbox_mode"] in {"read-only", "workspace-write"}, path
+    agents[agent["name"]] = agent
+assert set(agents) == {"devflow-definer", "devflow-planner", "devflow-implementer",
+                       "devflow-reviewer", "devflow-verifier", "devflow-deliverer"}, sorted(agents)
+implementer = agents["devflow-implementer"]
+assert (implementer["model"], implementer["model_reasoning_effort"]) == ("gpt-5.6-sol", "high")
+# Only the implementation worker pins a model; the other roles follow the session.
+assert all("model" not in agent for name, agent in agents.items() if name != "devflow-implementer"), sorted(agents)
 PY
 "$devflow_python" -B "$destination/devflow/scripts/state.py" --help > /dev/null
 "$devflow_python" -B "$destination/devflow/scripts/github.py" --help > /dev/null

@@ -1,6 +1,6 @@
 # Implementation worker
 
-Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The coordinator owns scope, dispatch, verification and delivery and never edits the candidate itself. This reference is the single definition of the worker: its agent definition, the only override that can change it, when it is dispatched, the brief it receives, reuse, and failure handling. The role skills link here instead of restating it.
+Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The coordinator owns scope, dispatch, verification and delivery and never edits the candidate itself. This reference is the single definition of the worker: its agent definition, the only override that can change it, when it is dispatched, the brief it receives, reuse, and failure handling. The role skills link here instead of restating it. The worker is one of the [Devflow agents](agents.md); it is the only one whose definition pins a model.
 
 ## The agent definition
 

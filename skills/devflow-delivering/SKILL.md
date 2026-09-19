@@ -5,6 +5,8 @@ description: Publish, merge, release or install a requested development outcome,
 
 # Deliver the outcome
 
+Delegated delivery runs as the `devflow-deliverer` [agent](../devflow/references/agents.md), which uses Git and `gh` within the authorized endpoint and never edits product code.
+
 ## Steps
 
 1. **Establish the endpoint.** Establish the requested endpoint and current candidate. Follow target project policies and the user's existing authorization. Complete authorized preparation without another approval gate; do not expand a request to push into permission to merge, release or deploy.

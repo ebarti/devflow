@@ -5,7 +5,7 @@ description: Reproduce a defect, exercise product behavior, run project checks, 
 
 # Verify the outcome
 
-Verification produces evidence about the candidate; it does not change the candidate. Repairs and regression-test changes run in the [implementation worker](../devflow/references/implementation-worker.md).
+Delegated verification runs as the `devflow-verifier` [agent](../devflow/references/agents.md), which runs commands and writes evidence only. Verification produces evidence about the candidate; it does not change the candidate. Repairs and regression-test changes run in the [implementation worker](../devflow/references/implementation-worker.md).
 
 ## Steps
 

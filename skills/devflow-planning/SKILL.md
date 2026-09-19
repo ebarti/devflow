@@ -5,6 +5,8 @@ description: Plan architecture, dependencies, implementation slices and verifica
 
 # Plan the change
 
+When the coordinator delegates this role it runs as the read-only `devflow-planner` [agent](../devflow/references/agents.md); the coordinator may also do it directly.
+
 ## Steps
 
 1. **Inspect the affected paths.** Use the accepted outcome and inspect the affected production paths, contracts and dependencies.
