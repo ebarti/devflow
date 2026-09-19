@@ -4,7 +4,7 @@ Small development skills for OpenAI Codex CLI agents, with Python helpers for wo
 
 ## Prerequisites
 
-Devflow targets Codex CLI: skills load from its skills directory, metrics hooks use its `hooks.json` and transcript format, and delegation uses its agent tools. Other hosts that discover `SKILL.md` directories can load the role skills, but hooks, metrics, candidate trials and worker spawning are Codex-specific. Supply Python 3.12+, a POSIX shell, Git and the tools required by your projects. Delegation needs Codex multi-agent tools and access to the worker model; the installer supplies an agent definition for every delegated action. See the [agents reference](skills/devflow/references/agents.md) and the [implementation worker reference](skills/devflow/references/implementation-worker.md). GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
+Devflow targets Codex CLI: skills load from its skills directory, metrics hooks use its `hooks.json` and transcript format, and delegation uses its agent tools. Other hosts that discover `SKILL.md` directories can load the role skills, but hooks, metrics, candidate trials and worker spawning are Codex-specific. Supply Python 3.12+, a POSIX shell, Git and the tools required by your projects. Delegation needs Codex multi-agent tools and access to the worker model; the installer supplies an agent definition for every delegated action. See the [agents reference](skills/devflow/references/agents.md) and the [implementation worker reference](skills/devflow/references/implementation-worker.md). GitHub work requires authenticated `gh` and sequential stacks use the `gh stack` extension and skill; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not install prerequisites or manage authentication. Check the tools needed for the requested action and report a missing prerequisite as a blocker rather than silently changing the workflow.
 
 ## Install
 
@@ -58,7 +58,13 @@ Publish a new release tag after the installation smoke check and the selected pr
 
 Ask for the outcome you want, for example: “Use devflow to fix the retry bug in this repository.” Or invoke a role such as `$devflow-reviewing` for a specific review. Skills are independently discoverable; loading one does not create work, issues or agents, or resume a backlog.
 
-Implementation changes, including small fixes and review or QA repairs, run in the `devflow-implementer` agent, whose installed definition pins **Sol / high** (`gpt-5.6-sol`, effort `high`). Coordinators spawn it by agent type and never select a model or effort; only a repository's own checked-in `.codex/agents/devflow-implementer.toml` can change the model, never a conversation request or a user-level setting. A worker is dispatched only once the plan and its verification steps are sharp, implements against that brief, and is reused when the next implementation is the same or closely related; unrelated work gets a new worker. A transient spawn failure is retried or handed to an existing worker, and a configuration failure stops and asks what to fix. Definition, planning, review, verification and delivery run as their own Devflow agent types, each pinned to the workflow's default: `gpt-6-astra` where judgment matters (planning, review, verification) and Sol / high where it does not, with a repository overriding any of them through its own agent file. The coordinator is your own session and only runs the workflow, so start feature threads on `gpt-5.6-sol` at high or xhigh; the installed hook denies repository edits from a claim-holding coordinator session. The [agents reference](skills/devflow/references/agents.md) maps every action to its agent, and the [implementation worker reference](skills/devflow/references/implementation-worker.md) is the single definition of the worker.
+Implementation and repairs run in `devflow-implementer`, whose default is **Sol / high** (`gpt-5.6-sol`, effort `high`). It commits the first meaningful change, opens a non-draft PR immediately, and pushes subsequent fixes to that PR. Explicit local-only, no-commit and no-push instructions take precedence.
+
+Split features into coherent reviewable PRs. Features and slices developed sequentially while earlier work remains unmerged form one **gh stack**, even when they are logically independent. Each new branch and PR builds on its unmerged predecessor. See [PR workflow](skills/devflow/references/pr-workflow.md).
+
+Definition, planning, review and verification have their own task-specific agents. Reuse the original implementer for repairs and the original reviewer/verifier for rechecks when the scope is still related. Dispatch only the roles that the work needs. The coordinator is your session: it selects work, records results, maintains the issue and performs the final authorized merge directly. There is no delivery agent or separate publication stage.
+
+The [agents reference](skills/devflow/references/agents.md) lists the five roles, default models and override mechanism. Briefs identify the candidate, required behavior and verification limits. These are workflow instructions; this iteration does not add enforced input/output contracts or sequencing. The installed hook remains a backstop for common coordinator repository writes.
 
 | Skill | Use |
 | --- | --- |
@@ -66,10 +72,10 @@ Implementation changes, including small fixes and review or QA repairs, run in t
 | [devflow-defining-work](skills/devflow-defining-work/SKILL.md) | Clarify outcomes and investigate unclear requests |
 | [devflow-planning](skills/devflow-planning/SKILL.md) | Plan consequential changes and coverage |
 | [devflow-coordinating](skills/devflow-coordinating/SKILL.md) | Carry out a defined request and recover ongoing work |
-| [devflow-implementing](skills/devflow-implementing/SKILL.md) | Implement or repair code |
+| [devflow-implementing](skills/devflow-implementing/SKILL.md) | Implement, open PRs early and push repairs |
 | [devflow-reviewing](skills/devflow-reviewing/SKILL.md) | Review a candidate and verify findings |
 | [devflow-verifying](skills/devflow-verifying/SKILL.md) | Reproduce behavior and run project checks |
-| [devflow-delivering](skills/devflow-delivering/SKILL.md) | Publish, merge or reconcile requested delivery |
+| [devflow-merging](skills/devflow-merging/SKILL.md) | Merge an authorized PR or gh stack |
 
 ## How it works
 
@@ -89,14 +95,18 @@ Enter at the role that fits the request. A small fix needs no separate planning 
 ```mermaid
 flowchart LR
     Request[Implementation request] --> Claim[Claim issue and set in progress]
-    Claim --> Work[Define or implement]
-    Work --> Check[Check as project requires]
-    Check -->|Repair needed| Work
-    Check --> Deliver[Deliver within requested scope]
-    Deliver --> Record[Update issue and release claim]
+    Claim --> Work[Implement a coherent change]
+    Work --> PR[Commit and open PR early]
+    PR --> Check[Review and verify as required]
+    Check -->|Repair needed| Fix[Fix and push to same PR]
+    Fix --> Check
+    PR -->|Next sequential feature| Stack[Add branch and PR to gh stack]
+    Stack --> Check
+    Check --> Merge[Coordinator merges when authorized]
+    Merge --> Record[Update issue and release claim]
 ```
 
-Independent issues follow this flow concurrently in separate worktrees, each with one owner and work ID. The GitHub helper creates or reuses the issue, assigns the accountable user and updates its existing Project Status. Ownership rules, concurrency and interruption handling are defined once in [issue ownership](skills/devflow/references/ownership.md).
+Independent parallel issues use separate worktrees, each with one owner and work ID. Sequential unmerged issues retain that ownership while sharing a PR stack. The GitHub helper creates or reuses the issue, assigns the accountable user and updates its existing Project Status. Ownership rules, concurrency and interruption handling are defined once in [issue ownership](skills/devflow/references/ownership.md).
 
 The state helper stores work, claims, runs, results, findings and usage; the coordinator writes those records from what its agents return, and installed hooks add content-free runtime observations for bound tasks. What is collected, how usage is attributed and what is deliberately not inferred are defined once in [work records and metrics](skills/devflow/references/state.md).
 
@@ -116,6 +126,6 @@ Devflow CI runs this installation smoke check and the helper unit tests in `test
 python3.12 -m unittest discover -s tests
 ```
 
-It does not run target projects' suites, review/QA gates or delivery automation; target projects retain their own check policies.
+It does not run live model-driven workflow trials or target projects' suites, review/QA checks or merges; target projects retain their own check policies.
 
 [Architecture](docs/architecture.md)

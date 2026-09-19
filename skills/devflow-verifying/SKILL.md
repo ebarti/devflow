@@ -9,7 +9,7 @@ Delegated verification runs as the `devflow-verifier` [agent](../devflow/referen
 
 ## Steps
 
-1. **Start from acceptance.** Start from the user's acceptance conditions and current candidate. Use the target project's existing commands and QA policies, respecting explicit scope and check limits.
+1. **Start from acceptance.** Start from the user's acceptance conditions and current candidate. Identify its SHA or complete dirty snapshot. Use the target project's existing commands and QA policies, respecting explicit scope and check limits. Confirm the actual service, CLI or installed build comes from that candidate, or start an owned instance from it; mark affected scenarios unverified when build identity is unknown.
 
 2. **Exercise the real path.** For a product-use claim, exercise the actual application entry point in each required mode and inspect the user-visible or persisted result. Include failure and recovery behavior when relevant. Passing checks, healthy services and simulated dependencies do not establish unexercised product behavior.
 
@@ -17,7 +17,7 @@ Delegated verification runs as the `devflow-verifier` [agent](../devflow/referen
 
 4. **Record what happened.** Record the candidate and environment, setup, actions, expected and observed result, and any simulated dependencies.
 
-5. **Verify repairs at the trigger.** For repairs, reproduce the original trigger, verify the invariant and retain failed output.
+5. **Verify repairs at the trigger.** For repairs, retain the original failure evidence and exercise that trigger against the candidate. Reproduce on the previous revision in isolation if needed and permitted; a repaired candidate need not fail first.
 
 6. **Protect behavior.** Add regression coverage where the project requires it or where it materially protects behavior, routing the test change, like any repair, through [coordinating](../devflow-coordinating/SKILL.md) to the implementation worker.
 

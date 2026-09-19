@@ -1,5 +1,6 @@
 """Runtime collection: the transcript adapter, hook attribution and timestamp ordering."""
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -137,6 +138,33 @@ class HookTests(TelemetryCase):
 
 
 class BoundaryTests(TelemetryCase):
+    def test_later_dry_run_cannot_allow_an_earlier_index_write(self):
+        state.claim_work(self.db, "w1", "root-1")
+        repository = self.root / "repository"
+        repository.mkdir()
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run(["git", "init", "-q", str(repository)], env=env, check=True)
+        (repository / "app.txt").write_text("candidate\n")
+        command = "git add app.txt && git clean -n"
+        result = telemetry.handle(self.db, {
+            "session_id": "root-1", "hook_event_name": "PreToolUse", "turn_id": "t1",
+            "tool_use_id": "compound-write", "tool_name": "Bash", "tool_input": {"command": command}})
+        if result is None:
+            subprocess.run(["/bin/sh", "-c", command], cwd=repository, env=env, check=True)
+        staged = subprocess.check_output(["git", "diff", "--cached", "--name-only"],
+                                         cwd=repository, env=env, text=True)
+        self.assertEqual(staged, "", "the hook allowed the compound command to stage app.txt")
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_git_inspection_flags_are_scoped_to_the_command_and_options(self):
+        commands = ["git add app.txt;git clean -n", "git add app.txt\ngit clean -n",
+                    "git add app.txt || git clean -n", "git add app.txt | git clean -n",
+                    "git add -- -n", "git tag -- -n", "git apply --stat --apply fix.patch",
+                    "git apply --check fix.patch && git add app.txt"]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNotNone(telemetry.boundary_violation("Bash", {"command": command}))
+
     def test_coordinator_sessions_cannot_modify_the_repository(self):
         state.claim_work(self.db, "w1", "root-1")  # claiming binds root-1 as the coordinator
         telemetry.bind(self.db, "worker-1", ["w1"], "devflow-implementer")
@@ -156,7 +184,9 @@ class BoundaryTests(TelemetryCase):
                    'python3.12 state.py record result --id r1 --work-id w1 --kind qa --status passed --summary "a > b"',
                    "git status && git log --oneline -3 && git worktree add ../wt feature",
                    "git tag --list", "git tag", "git tag -l 'v*'", "git tag --contains abc123", "git stash list",
-                   "git stash show -p stash@{0}", "git clean -nd", "git add --dry-run .", "git apply --check fix.patch"]
+                   "git stash show -p stash@{0}", "git clean -nd", "git add --dry-run .", "git apply --check fix.patch",
+                   "git add --dry-run .;git clean -n", "git tag --list -- -n",
+                   "gh pr merge 36 --squash --match-head-commit abc123", "gh stack merge 7 --yes --squash"]
         for number, command in enumerate(denied, start=100):
             self.assertIsNotNone(call("root-1", "shell", {"command": command}, f"d{number}"), command)
         for number, command in enumerate(allowed, start=200):

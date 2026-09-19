@@ -26,7 +26,7 @@ def main():
     skills = sorted(path.name for path in (source / "skills").iterdir() if path.is_dir())
     # Older installations may still expose skills this checkout no longer ships; a trial must not
     # load those either, so keep their names here after removing them from skills/.
-    legacy_skills = ["using-devflow"]
+    legacy_skills = ["using-devflow", "devflow-delivering"]
     normal_roots = {Path.home() / ".agents/skills", Path.home() / ".codex/skills",
                     Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "skills"}
     config = ["[features]\nhooks = true\nmulti_agent = true\n"]

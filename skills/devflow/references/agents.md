@@ -1,24 +1,26 @@
-# Devflow agents
+# Agent roles and handoffs
 
-Every delegated action runs as a Devflow agent type, spawned by name. The definitions live in `agents/` in the Devflow checkout and are linked by `install.sh` into `$CODEX_HOME/agents/`. Each definition pins the workflow's default model and effort: `gpt-6-astra` where judgment matters and Sol / high where it does not. The coordinator is the user's session, has no agent type, and runs on the thread's own model; start feature threads on `gpt-5.6-sol` at high or xhigh.
+The installer links five agent definitions from `agents/` into `$CODEX_HOME/agents/`. Each selects its default model and effort. The coordinator uses the user's session, delegates scoped work, records results and performs the final authorized merge.
 
-| Action | Skill | Agent type | Sandbox | Model |
+| Task | Skill | Agent type | Configured sandbox | Default model |
 | --- | --- | --- | --- | --- |
-| Define the work | [defining work](../../devflow-defining-work/SKILL.md) | `devflow-definer` | read-only | `gpt-6-astra` / high |
-| Plan the change | [planning](../../devflow-planning/SKILL.md) | `devflow-planner` | read-only | `gpt-6-astra` / xhigh |
-| Implement the change | [implementing](../../devflow-implementing/SKILL.md) | `devflow-implementer` | workspace-write | `gpt-5.6-sol` / high |
-| Review the candidate | [reviewing](../../devflow-reviewing/SKILL.md) | `devflow-reviewer` | read-only | `gpt-6-astra` / xhigh |
-| Verify the outcome | [verifying](../../devflow-verifying/SKILL.md) | `devflow-verifier` | workspace-write, evidence only | `gpt-6-astra` / xhigh |
-| Deliver the outcome | [delivering](../../devflow-delivering/SKILL.md) | `devflow-deliverer` | workspace-write | `gpt-5.6-sol` / high |
+| Investigate an unclear request | [defining work](../../devflow-defining-work/SKILL.md) | `devflow-definer` | read-only | `gpt-6-astra` / high |
+| Design and slice a change | [planning](../../devflow-planning/SKILL.md) | `devflow-planner` | read-only | `gpt-6-astra` / xhigh |
+| Implement, open PRs and push fixes | [implementing](../../devflow-implementing/SKILL.md) | `devflow-implementer` | workspace-write | `gpt-5.6-sol` / high |
+| Review code and workflow contracts | [reviewing](../../devflow-reviewing/SKILL.md) | `devflow-reviewer` | read-only | `gpt-6-astra` / xhigh |
+| Exercise candidate behavior | [verifying](../../devflow-verifying/SKILL.md) | `devflow-verifier` | workspace-write, evidence only by instruction | `gpt-6-astra` / xhigh |
+| Merge a PR or stack | [merging](../../devflow-merging/SKILL.md) | coordinator directly | current session | current session |
 
-## Spawning
+## Dispatch and reuse
 
-Spawn by type and nothing else, for example `{"agent_type": "devflow-reviewer", "fork_turns": "none"}` plus `task_name` and `message`. Never pass `model` or `reasoning_effort`: Codex applies an agent file's model ahead of any spawn value, and every Devflow definition pins one. The implementation worker's dispatch precondition, brief, reuse and failure handling are in the [implementation worker reference](implementation-worker.md). The same reuse rule applies to every type: continue an agent when the next task is the same or closely related work in the same role, work ID and worktree, and spawn a new one otherwise. Every brief states the work ID, the agent's limits and the model and effort the coordinator expects. Agents never write Devflow records: their read-only and workspace-write sandboxes cannot reach the state database, so each returns a report and the coordinator records the run, results and findings with the [state helper](state.md).
+Spawn by type, for example `{"agent_type": "devflow-reviewer", "fork_turns": "none"}`, plus `task_name` and a self-contained `message`. Do not pass model or effort; the definition selects them. [Coordination](../../devflow-coordinating/SKILL.md) lists each role's required brief fields. The [worker reference](implementation-worker.md) covers implementation scope, publication, reuse and spawn failures.
 
-## Override
+Continue the original agent for related work in the same role, work ID and worktree. Repairs go to the original implementer and rechecks to the original reviewer/verifier, preserving required independence. Use a new agent for unrelated work. Avoid overlapping ownership and agents created merely to fill stages.
 
-A repository changes a Devflow agent only by shipping its own project-scoped `.codex/agents/<name>.toml` with the same `name`, which Codex loads for a trusted project in place of the installed definition. Conversation requests, prose in agent instruction files and user-level settings are not overrides.
+A trusted repository can supply `.codex/agents/<name>.toml` to override a role's defaults. Record the actual model and effort from the host when available; mark them unknown if unavailable rather than claiming the requested settings were observed.
 
-## Boundaries
+## Responsibilities
 
-The coordinator reads, runs the Devflow helpers, spawns and steers agents, and talks to the user; it never edits files, commits, pushes or runs product checks as evidence, and the installed hook denies repository mutations from a claim-holding coordinator session. The definer, planner and reviewer read only. The verifier runs commands and writes evidence but never edits application code or tests. The deliverer uses Git and `gh` within the authorized endpoint and never edits product code. Every repair returns to the coordinator for the implementation worker, no Devflow agent spawns another agent, and no agent writes Devflow records or updates issue tracking; the coordinator does both from the agents' reports.
+Agents return reports; the coordinator writes work records, updates the issue, publishes authorized review comments and resolves verified findings. The implementer changes code and owns commits, PR creation and pushes. The definer, planner and reviewer inspect. The verifier runs checks and writes evidence without changing product code or tests. None delegates further. Merge is a bounded coordinator action, with no separate delivery agent.
+
+These role boundaries are instructions and configuration defaults, not guaranteed isolation or enforced I/O contracts. The host controls effective permissions. The existing hook catches common coordinator writes; it does not enforce workflow sequencing.

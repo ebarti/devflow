@@ -1,33 +1,22 @@
 ---
 name: devflow-implementing
-description: Implement a defined feature or repair a defect in the requested repository scope.
+description: Implement a scoped feature or repair, open its PR early and push subsequent fixes to that PR.
 ---
 
 # Implement the change
 
-Implementation runs in the `devflow-implementer` agent, the delegated [implementation worker](../devflow/references/implementation-worker.md). Your brief names you as that worker for a work ID and states the model and effort of the installed definition; rely on the brief rather than guessing your own configuration, and do the assigned work yourself without spawning another agent. If your brief and your assignment disagree, report the mismatch to the coordinator before editing. Without such a brief you are not the worker: a direct implementation request follows [coordinating](../devflow-coordinating/SKILL.md), which claims the issue and reuses or spawns the worker.
+Use the assigned outcome, worktree, file scope, branch/base and checks. Direct implementation requests enter through [coordinating](../devflow-coordinating/SKILL.md), which supplies the [worker brief](../devflow/references/implementation-worker.md). Do the work yourself without spawning agents.
 
-## Steps
+1. **Inspect before editing.** Read the owning code, project instructions and relevant contracts. Confirm branch and dirty state. Preserve collaborators' edits and unrelated files. For a defect, reproduce or trace the failing invariant and fix the owning layer.
 
-1. **Read first.** Read the owning code, documentation and project rules. Confirm the working branch and dirty state; preserve unrelated work and collaborators' edits.
+2. **Make a coherent change.** Satisfy the assigned behavior without unrelated refactors, upgrades or formatting. Update affected tests, contracts and documentation within the assigned scope. Return a concrete scope gap if the correct repair exceeds it.
 
-2. **Stay in scope.** Use the coordinator's work ID and assigned file scope. Never compete with another task's active claim; report results to the owning coordinator.
+3. **Open the PR early.** For GitHub work, commit and publish the first meaningful change immediately. Use a non-draft PR with a description of implemented behavior, remaining work and checks actually performed. Reuse an existing PR instead of opening another for repairs. Follow [PR workflow](../devflow/references/pr-workflow.md); explicit local-only/no-commit/no-push limits take precedence.
 
-3. **Find the invariant.** For defects, reproduce or trace the failing invariant before editing. Follow the data through its source, transformations and consumers; fix the owning layer. A cosmetic change cannot establish a missing persistence or integrity guarantee.
+4. **Build the stack as work progresses.** Split a feature into reviewable slices. Start each sequential feature or slice from the previous unmerged branch and publish it in the same gh stack, even when features are logically independent. Each PR targets its predecessor. Repair a lower layer on its own branch, then rebase and resubmit affected upper layers; coordinate any shared branches before rewriting them.
 
-4. **Change the minimum.** Make the smallest coherent change that satisfies the requested behavior. Update affected contracts and documentation.
+5. **Check within scope.** Run the agreed checks and appropriate project checks permitted by the user's limits. Do not run tests for a no-tests request. Record commands, expected/observed behavior, failed checks and unperformed checks honestly. Keep evidence at durable paths.
 
-5. **Check proportionally.** Run the target project's applicable checks in proportion to the change, respecting explicit user limits. Use [verification](../devflow-verifying/SKILL.md) when product behavior needs direct evidence; distinguish a blocked check from a proven defect.
+6. **Push repairs and identify the candidate.** Commit further fixes to the same branch, push them to the same PR, update its description and read back base/head SHAs. Verify the remote head contains the reported changes. Separate dirty/untracked work from the committed candidate. With no-commit scope, return the base SHA, worktree, full changed/untracked file list and a durable patch/snapshot with a content hash covering the assigned changes.
 
-6. **Hand over the record.** Return the commit, evidence references, unresolved findings and useful continuation context; the coordinator records the run, with the model and effort from your brief, and its results and findings with the [shared helper](../devflow/references/state.md). A delegated worker writes no Devflow records. Preserve failed evidence at durable paths.
-
-7. **Report.** Return the candidate, changed scope, checks performed with observed results, and unresolved limits. Keep failed or unperformed checks explicit; do not invent a mandatory extra stage.
-
-## Example report
-
-```text
-Candidate: 3f2a1c9 on retry-fix. Changed: src/client/retry.py (backoff and attempt cap), tests/test_retry.py (new).
-Checks: `pytest tests/test_retry.py -q` passed (3 tests); the new test fails on 9b7d0e2 as expected.
-Not done: the integration suite needs the staging token and was not run.
-For the coordinator to record: run retry-fix-impl-1, role implementer, gpt-5.6-sol / high, completed at 3f2a1c9.
-```
+7. **Hand off.** Return candidate identity, PR/stack references, changed scope, check outcomes and remaining work. The coordinator records results and updates the issue. Do not merge, release or deploy as part of implementation unless separately assigned.

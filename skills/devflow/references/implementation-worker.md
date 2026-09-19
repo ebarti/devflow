@@ -1,6 +1,6 @@
 # Implementation worker
 
-Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The coordinator owns scope, dispatch, verification and delivery and never edits the candidate itself. This reference is the single definition of the worker: its agent definition, the only override that can change it, when it is dispatched, the brief it receives, reuse, and failure handling. The role skills link here instead of restating it. The worker is one of the [Devflow agents](agents.md), each of which pins its own default model and effort.
+Every implementation change runs in a dedicated implementation worker: features, fixes, review and QA repairs, and regression-test changes. The worker owns implementation, commits, early PR creation and subsequent pushes. The coordinator owns scope, dispatch, verification and the final authorized merge, and never edits the candidate itself. This reference is the single definition of the worker: its agent definition, the only override that can change it, when it is dispatched, the brief it receives, reuse, and failure handling. The role skills link here instead of restating it. The worker is one of the [Devflow agents](agents.md), each of which pins its own default model and effort.
 
 ## The agent definition
 
@@ -35,14 +35,15 @@ Reuse is decided by the implementation, not by availability. When the next task 
 
 Each worker receives a concise brief containing:
 
-- the statement that it is the implementation worker for a named work ID, the model and effort of the installed definition, and that it must not delegate implementation;
+- the work ID, repository/worktree and implementation assignment;
 - one observable outcome;
 - owned files or modules, and the note that other agents share the checkout and their edits must be preserved;
-- required context and dependencies;
-- exact checks or manual steps with expected results;
+- required context, dependencies, existing PR/stack, branch and base;
+- publication scope, including any explicit local-only, no-commit or no-push limit;
+- exact checks or manual steps with expected results and explicit limits such as no tests;
 - the relevant [implementation instructions](../../devflow-implementing/SKILL.md).
 
-The worker relies on this brief rather than introspecting its own configuration. A worker without such a brief is not the implementation worker and follows [coordinating](../../devflow-coordinating/SKILL.md) instead.
+Missing or contradictory task inputs are returned to the coordinator before editing. The worker never spawns a coordinator or another worker. Report the exact candidate, PR/base/head and stack order, check results and remaining work. For no-commit scope, identify the complete dirty snapshot and its content hash instead of presenting HEAD as the candidate. See [PR workflow](pr-workflow.md).
 
 ## When spawning fails
 

@@ -60,8 +60,10 @@ python3.12 ~/.agents/skills/devflow/scripts/github.py set --work-id WORK_ID --ow
 | `paused` | Work is paused; the helper releases ownership |
 | `done` | Required outcome is verified and the issue is already closed; ownership is released |
 
-Close the issue through `gh` only within the authorized delivery scope. A published
-PR leaves the issue in review. The helper does not close or reopen issues.
+Close the issue through `gh` only within the authorized completion scope. Opening
+a PR early leaves the issue in progress while implementation continues. Move it
+to in review when the candidate is ready for review; publication alone does not
+change its status or establish completion. The helper does not close or reopen issues.
 On `--release`, active local work becomes waiting; completion of a narrower requested
 endpoint can still be recorded separately. A failed GitHub update stays visible in
 the local record and retains the claim for reconciliation and retry by its owner.

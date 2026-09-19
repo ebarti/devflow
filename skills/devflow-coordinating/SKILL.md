@@ -1,42 +1,52 @@
 ---
 name: devflow-coordinating
-description: Run the Devflow workflow for a defined development request or bounded batch: own the outcome, dispatch the Devflow agents, gate on evidence, and recover interrupted work.
+description: Carry a defined request through implementation, early PR publication, review, verification and the authorized merge.
 ---
 
 # Coordinate the outcome
 
-The coordinator is the user's own session. It runs the workflow and owns the outcome; it does not do the workflow's work. Its whole tool surface is: read files, run read-only inspection commands, run the Devflow helpers (`state.py`, `github.py`, `telemetry.py`), spawn and steer the [Devflow agents](../devflow/references/agents.md), and talk to the user. It never edits files, never commits, pushes or merges, never runs product checks as evidence, and never chooses a model for an agent. For a session that holds a claim, the installed hook enforces the repository part of that boundary: edit tools, mutating Git commands, in-place edits and redirects outside temporary paths are denied and recorded as `boundary` events.
-
-Coordination is bookkeeping and judgment about evidence, so run feature threads on `gpt-5.6-sol` at high or xhigh; the planner, reviewer and verifier bring `gpt-6-astra` where judgment matters, and the implementer runs Sol / high.
+Use the user's session to define scope, dispatch work, assess evidence and maintain records. Delegate product edits and checks to the appropriate [agent](../devflow/references/agents.md). Read files and inspect Git/GitHub directly. Run the record and issue helpers, publish authorized review comments, and perform the final authorized PR or stack merge. Do not edit product files, commit, push or run product checks yourself. The installed hook catches common repository writes; it is a backstop, not workflow enforcement.
 
 ## Steps
 
-1. **Establish the outcome with the user.** Use the request and the target project's instructions to state the outcome, acceptance conditions, scope and constraints in observable terms; ask only what materially changes the work. Reuse the [work record](../devflow/references/state.md) for the same outcome; record scope, progress, evidence and the concrete next step. Do not scan or resume a backlog merely because the skill loaded.
+1. **State the outcome.** Record observable acceptance conditions, scope and explicit limits. Ask only for information that changes the work; reuse the existing work record for continuation. A question or plan-only request creates no implementation work.
 
-2. **Claim before dispatching.** Follow [issue ownership](../devflow/references/ownership.md): claim the issue, maintain its assignee and existing Project Status, and release ownership when the task stops. For a requested batch, a coordinator may own several issues and keep independent ready work moving concurrently with separate work IDs and worktrees, respecting dependencies and host capacity. One issue keeps one coordinating owner across its delegated roles.
+2. **Claim the issue.** Follow [ownership](../devflow/references/ownership.md). Maintain the assignee and existing Project Status. Keep the issue in progress while implementation continues, even after its PR opens. Release the claim when the task stops.
 
-3. **Get a sharp plan.** Delegate planning to `devflow-planner` with the outcome, acceptance conditions, constraints and evidence; for an ambiguous bug or request, delegate the investigation to `devflow-definer` first. A trivial change whose slice and checks you can state in a few sentences needs no planner. Ratify the returned plan against the acceptance conditions and the user's constraints, put consequential open choices to the user, and never dispatch a slice whose checks and expected results are not written down.
+3. **Choose the next useful action.** Investigate ambiguity with the definer; use the planner for consequential choices or slicing. A small, clear change needs only a concise implementation brief. Do not dispatch agents to fill mandatory stages. Split features into coherent reviewable PRs. Sequential features or slices started before earlier work merges join the same gh stack, including logically independent features; see [PR workflow](../devflow/references/pr-workflow.md).
 
-4. **Choose the agent.** Every delegated action runs as its [Devflow agent type](../devflow/references/agents.md): `devflow-definer`, `devflow-planner`, `devflow-implementer`, `devflow-reviewer`, `devflow-verifier` and `devflow-deliverer`. Reuse an existing agent when the next task is the same or closely related work in the same role, work ID and worktree, as the [worker reference](../devflow/references/implementation-worker.md#reuse) describes; otherwise spawn by type with `fork_turns: "none"`. Never pass a model or effort, use a generic role, or let an agent inherit the coordinator's model. On a transient spawn failure, wait or reuse a suitable agent; on a configuration failure, stop and ask the user. Never do the delegated work yourself.
+4. **Select and reuse an agent.** Use the named role in the [agents reference](../devflow/references/agents.md). Reuse the original implementer for repairs and the original reviewer/verifier for rechecks when work ID, worktree and role remain compatible. Spawn a new agent by type with `fork_turns: "none"` when needed; the installed definition selects model and effort. Brief it with context it cannot otherwise inherit. Follow the [worker reference](../devflow/references/implementation-worker.md) for reuse and spawn failures.
 
-5. **Brief the worker** as the reference specifies: the statement that it is the implementation worker for this work ID and must not delegate, one observable outcome, owned files or modules, required context and dependencies, and exact checks or manual steps with expected results. Include the relevant [implementation instructions](../devflow-implementing/SKILL.md). Tell workers they share the codebase and must preserve others' edits. Delegate only independent work concurrently; do not create agents just to satisfy stages.
+5. **Supply role-specific inputs.** Every brief includes work ID, repository/worktree, outcome, relevant context, project instructions and explicit limits. Add the inputs below; state unknowns instead of making them up.
 
-6. **Own the records.** Agents never write Devflow records and never update the tracker: their sandboxes cannot reach the state database, and ownership is yours. Record each delegated run with its model and effort, its results, findings and delivery references with the [state helper](../devflow/references/state.md) from the agent's report, and maintain issue ownership and status through `github.py` yourself. Hooks attach to the claiming coordinator and inherit its issue for child tasks when there is exactly one issue. For a multi-issue coordinator, bind each child explicitly with `telemetry.py bind --session-id CHILD_ID --work-id WORK_ID --role ROLE`; shared coordinator usage remains unallocated. Keep recording semantic check and review outcomes and findings; tool completion alone cannot establish product acceptance. Use `state.py metrics --work-id WORK_ID` to inspect coverage before the final report.
+   | Role | Additional inputs |
+   | --- | --- |
+   | Definer | Original request, observed behavior, evidence and unresolved questions |
+   | Planner | Accepted conditions, constraints, affected paths and existing unmerged branches/PRs |
+   | Implementer | Owned files/modules, branch/base or existing PR and stack order, dependencies, checks with expected results, publication limits |
+   | Reviewer | Base/head SHAs or complete snapshot, acceptance conditions, review scope and prior findings to recheck |
+   | Verifier | Candidate identity, acceptance scenarios, environment/build setup, check limits and original failure evidence |
 
-7. **Gate on evidence.** Dispatch `devflow-reviewer` and `devflow-verifier` as the request and project policy require, and route every repair back to the implementation worker. Preserve the user's acceptance conditions through delegation. Before reporting completion, match each required behavior and mode to observed evidence; review approval or passing checks cannot replace an unexercised product scenario. Continue authorized verification. Record actual role outcomes before repairs obscure them, linking findings to fixes and follow-up evidence.
+   Include the relevant role skill. Tell agents that the checkout is shared and they must preserve others' edits. Parallel work needs disjoint ownership and separate worktrees; sequential unmerged work keeps its branch chain.
 
-8. **Deliver within authorization.** Dispatch `devflow-deliverer` for the requested endpoint only; preparing is not permission to push, and a published PR is not product success. Report implemented, verified, published and merged status separately.
+6. **Publish during implementation.** The implementer commits the first meaningful change and opens its PR immediately, then pushes repairs to that same PR. Do not defer publication until review or QA. Preserve explicit local-only/no-commit/no-push instructions. Record the returned PR, base/head SHAs and stack order. A published head must contain the changes being reviewed; dirty work needs an explicit complete snapshot.
 
-9. **Continue interrupted work on request.** Read the existing record and inspect the actual checkout, artifacts and external state. Reconcile uncertain actions before retrying them; a saved intention is not proof of completion. Resume the same outcome and preserve previous results. Report what is implemented, checked, published or blocked with the evidence and the next action needed.
+7. **Review and verify the current candidate.** Dispatch only the roles and checks required by the request, risk and project policy. Keep findings tied to the checked revision. Route repairs to the implementer; rebase/resubmit affected upper stack layers and reassess evidence when the code or bases change. Match required behavior to observed evidence, including the identity of the build exercised. Do not replace a missing product scenario with green unrelated tests.
 
-## Example brief
+8. **Record results and handle comments.** Agents return reports; you record runs, model/effort, checks, findings and publication references with the [state helper](../devflow/references/state.md). Maintain the tracker yourself. For several owned issues, bind each child to its work ID with `telemetry.py bind`; shared coordinator usage stays unallocated. Publish comments only when authorized, using inline locations when requested. Resolve a finding only after checking its original trigger and repair evidence, then read back its thread state.
+
+9. **Merge when requested.** Follow [merging](../devflow-merging/SKILL.md) directly; there is no delivery agent or separate publication stage. Inspect the current PR or stack and its evidence before mutation. Report queued separately from merged. Release the claim and reconcile the issue at the requested endpoint.
+
+10. **Recover from actual state.** After interruption, read the existing record and inspect the checkout, PR heads, stack bases, checks and artifacts. Reconcile an uncertain push, create or merge before retrying. Resume the same work and retain earlier findings and evidence.
+
+## Implementation brief
 
 ```text
-You are the implementation worker for work ID retry-fix (gpt-5.6-sol, effort high). Do not delegate implementation.
-Issue: https://github.com/OWNER/REPO/issues/12. Worktree: /path/to/worktrees/retry-fix, shared with other agents; preserve their edits.
-Outcome: client.fetch() retries a timed-out request at most twice with backoff, then raises RetryExhausted.
-Owned files: src/client/retry.py, tests/test_retry.py. Do not edit other modules.
-Context: retries currently repeat forever; the reproduction in the issue times out after 60 s.
-Checks: `pytest tests/test_retry.py -q` passes, and the new test fails on the previous commit.
-Report: changed files, each check with its observed output, and anything left unverified.
+Work: retry-fix. Worktree: /worktrees/retry-fix; preserve collaborators' changes.
+Outcome: client.fetch() retries a timeout twice, then raises RetryExhausted.
+Owns: src/client/retry.py, tests/test_retry.py. Context: issue #12 reproduces an infinite retry.
+Branch: fix/retry. Base: feat/client (unmerged PR #41); append this feature to that gh stack.
+Publish: open the PR after the first meaningful commit; push subsequent repairs to it. No merge requested.
+Checks: pytest tests/test_retry.py -q passes; the regression fails on the previous candidate. No full suite.
+Return: PR/stack, base/head SHAs, changed scope, check results and remaining gaps.
 ```

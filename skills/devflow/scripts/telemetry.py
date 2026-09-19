@@ -26,16 +26,20 @@ TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_tokens",
 EDIT_TOOL_WORDS = ("patch", "write", "edit", "create_file")
 MUTATING_GIT = {"commit", "push", "merge", "rebase", "cherry-pick", "revert", "apply", "am",
                 "reset", "restore", "stash", "clean", "rm", "mv", "add", "tag"}
-COMMAND_STARTS = {"&&", "||", "|", ";", "(", "{", "then", "do"}
+COMMAND_STARTS = {"&&", "||", "|", ";", "&", "\n", "(", ")", "{", "}", "then", "do"}
 SAFE_REDIRECT_PREFIXES = ("/dev/", "/tmp/", "$TMPDIR", "${TMPDIR")
 
 
 def read_only_git(arguments):
     """True for the inspection forms of otherwise mutating Git subcommands."""
     subcommand, options = arguments[0], arguments[1:]
+    operands = []
+    if "--" in options:
+        end = options.index("--")
+        options, operands = options[:end], options[end + 1:]
     if subcommand == "tag":
         listing = ("-l", "--list", "-n", "--contains", "--no-contains", "--points-at", "--merged", "--no-merged")
-        return not any(not option.startswith("-") for option in options) or any(
+        return (not operands and not any(not option.startswith("-") for option in options)) or any(
             option == flag or option.startswith(flag + "=") or (flag == "-n" and re.match(r"^-n\d*$", option))
             for option in options for flag in listing)
     if subcommand == "stash":
@@ -43,8 +47,13 @@ def read_only_git(arguments):
     if subcommand in ("clean", "add", "rm", "mv"):
         return any(option == "--dry-run" or re.match(r"^-[a-zA-Z]*n", option) for option in options)
     if subcommand == "apply":
-        return any(option in ("--check", "--stat", "--numstat", "--summary") for option in options)
+        return "--apply" not in options and any(
+            option in ("--check", "--stat", "--numstat", "--summary") for option in options)
     return False
+
+
+def command_boundary(token):
+    return token in COMMAND_STARTS or bool(token) and all(char in ";&|()\n" for char in token)
 
 
 def command_text(tool_input):
@@ -67,22 +76,29 @@ def boundary_violation(tool_name, tool_input):
     if not command:
         return None
     try:
-        tokens = shlex.split(command, posix=True)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        tokens = list(lexer)
     except ValueError:
         tokens = command.split()
     for index, token in enumerate(tokens):
-        leading = index == 0 or tokens[index - 1] in COMMAND_STARTS
+        leading = index == 0 or command_boundary(tokens[index - 1])
         if token == "git":
-            rest = tokens[index + 1:]
+            rest = []
+            for argument in tokens[index + 1:]:
+                if command_boundary(argument):
+                    break
+                rest.append(argument)
             while rest and rest[0].startswith("-"):
                 rest = rest[2:] if rest[0] in ("-C", "-c", "--git-dir", "--work-tree") else rest[1:]
             if rest and rest[0] in MUTATING_GIT and not read_only_git(rest):
-                return f"git {rest[0]} changes the repository; only the implementation worker or the deliverer may"
+                return f"git {rest[0]} changes the repository; dispatch the devflow-implementer worker"
         if leading and token in ("patch", "tee"):
             return f"{token} writes files; dispatch the devflow-implementer worker"
         if leading and token in ("sed", "perl"):
             for argument in tokens[index + 1:]:
-                if argument in COMMAND_STARTS:
+                if command_boundary(argument):
                     break
                 if re.match(r"^-[a-zA-Z]*i", argument) or argument.startswith("--in-place"):
                     return f"{token} in-place edits belong to the devflow-implementer worker"

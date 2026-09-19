@@ -14,7 +14,7 @@ devflow_python=${DEVFLOW_PYTHON:-python3.12}
 sh "$source_root/scripts/install.sh" "$destination" "$install_fixture/codex"
 for name in devflow devflow-defining-work devflow-planning \
     devflow-coordinating devflow-implementing devflow-reviewing devflow-verifying \
-    devflow-delivering; do
+    devflow-merging; do
     test -f "$destination/$name/SKILL.md"
 done
 for name in state.py github.py legacy.py telemetry.py measurements.py schema.sql; do
@@ -36,11 +36,11 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("devflow-*.toml")):
     assert agent["name"] == path.stem, path
     assert agent["description"] and agent["developer_instructions"].strip(), path
     assert agent["sandbox_mode"] in {"read-only", "workspace-write"}, path
-    # Agents never write Devflow records; their sandboxes cannot reach the state database.
+    # Agents return reports; the coordinator records them.
     assert not re.search(r"state helper|state\.py|github\.py", agent["developer_instructions"]), path
     agents[agent["name"]] = agent
 assert set(agents) == {"devflow-definer", "devflow-planner", "devflow-implementer",
-                       "devflow-reviewer", "devflow-verifier", "devflow-deliverer"}, sorted(agents)
+                       "devflow-reviewer", "devflow-verifier"}, sorted(agents)
 # The workflow defines every agent's default model and effort; a project overrides with its own file.
 assert all(agent.get("model") and agent.get("model_reasoning_effort") for agent in agents.values()), sorted(agents)
 assert (agents["devflow-implementer"]["model"], agents["devflow-implementer"]["model_reasoning_effort"]) == ("gpt-5.6-sol", "high")
@@ -83,8 +83,10 @@ fi
 test "$(readlink "$destination/devflow")" = "$install_fixture/previous"
 cp "$install_fixture/codex/hooks.json" "$install_fixture/hooks-before.json"
 ln -s "$source_root/skills/devflow-obsolete-install-smoke" "$destination/devflow-obsolete-install-smoke"
+ln -s "$source_root/skills/devflow-delivering" "$destination/devflow-delivering"
 ln -s "$install_fixture/unrelated" "$destination/unrelated"
 ln -s "$source_root/agents/devflow-obsolete-install-smoke.toml" "$install_fixture/codex/agents/devflow-obsolete-install-smoke.toml"
+ln -s "$source_root/agents/devflow-deliverer.toml" "$install_fixture/codex/agents/devflow-deliverer.toml"
 ln -s "$install_fixture/unrelated" "$install_fixture/codex/agents/unrelated.toml"
 ln -s "$("$devflow_python" -c 'import sys; print(sys.executable)')" "$install_fixture/python override"
 DEVFLOW_PYTHON="$install_fixture/python override" sh "$source_root/scripts/install.sh" --force "$destination" "$install_fixture/codex"
@@ -94,18 +96,20 @@ done
 test ! -e "$install_fixture/previous/devflow"
 cmp "$install_fixture/hooks-before.json" "$install_fixture/codex/hooks.json"
 test ! -L "$destination/devflow-obsolete-install-smoke"
+test ! -L "$destination/devflow-delivering"
 test -L "$destination/unrelated"
 for agent in "$source_root"/agents/*; do
     test "$(readlink "$install_fixture/codex/agents/${agent##*/}")" = "$agent"
 done
 test ! -L "$install_fixture/codex/agents/devflow-obsolete-install-smoke.toml"
+test ! -L "$install_fixture/codex/agents/devflow-deliverer.toml"
 test -L "$install_fixture/codex/agents/unrelated.toml"
 
 # A file or directory blocks the whole reinstall before any link is changed.
 mkdir "$install_fixture/conflicts"
 ln -s "$install_fixture/previous" "$install_fixture/conflicts/devflow"
 for kind in file directory; do
-    conflict="$install_fixture/conflicts/devflow-delivering"
+    conflict="$install_fixture/conflicts/devflow-merging"
     if [ "$kind" = file ]; then
         printf 'keep\n' > "$conflict"
     else
