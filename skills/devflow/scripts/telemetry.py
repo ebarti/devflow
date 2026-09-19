@@ -7,53 +7,136 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import sqlite3
 import sys
 import time
 
 import state
+from state import bind, scope
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
           "PermissionRequest", "PreCompact", "PostCompact", "SubagentStart",
           "SubagentStop", "Stop", "Interrupt", "SessionEnd")
 TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_tokens",
                 "output_tokens", "reasoning_output_tokens")
+# The coordinator holds the claim but never changes the repository itself; these are the
+# common ways a session would, short of a sandbox.
+EDIT_TOOL_WORDS = ("patch", "write", "edit", "create_file")
+MUTATING_GIT = {"commit", "push", "merge", "rebase", "cherry-pick", "revert", "apply", "am",
+                "reset", "restore", "stash", "clean", "rm", "mv", "add", "tag"}
+COMMAND_STARTS = {"&&", "||", "|", ";", "&", "\n", "(", ")", "{", "}", "then", "do"}
+SAFE_REDIRECT_PREFIXES = ("/dev/", "/tmp/", "$TMPDIR", "${TMPDIR")
+
+
+def read_only_git(arguments):
+    """True for the inspection forms of otherwise mutating Git subcommands."""
+    subcommand, options = arguments[0], arguments[1:]
+    operands = []
+    if "--" in options:
+        end = options.index("--")
+        options, operands = options[:end], options[end + 1:]
+    if subcommand == "tag":
+        listing = ("-l", "--list", "-n", "--contains", "--no-contains", "--points-at", "--merged", "--no-merged")
+        return (not operands and not any(not option.startswith("-") for option in options)) or any(
+            option == flag or option.startswith(flag + "=") or (flag == "-n" and re.match(r"^-n\d*$", option))
+            for option in options for flag in listing)
+    if subcommand == "stash":
+        return bool(options) and options[0] in ("list", "show")
+    if subcommand in ("clean", "add", "rm", "mv"):
+        return any(option == "--dry-run" or re.match(r"^-[a-zA-Z]*n", option) for option in options)
+    if subcommand == "apply":
+        return "--apply" not in options and any(
+            option in ("--check", "--stat", "--numstat", "--summary") for option in options)
+    return False
+
+
+def command_boundary(token):
+    return token in COMMAND_STARTS or bool(token) and all(char in ";&|()\n" for char in token)
+
+
+def command_text(tool_input):
+    if isinstance(tool_input, dict):
+        for key in ("command", "cmd", "script"):
+            value = tool_input.get(key)
+            if isinstance(value, list):
+                return " ".join(str(item) for item in value)
+            if isinstance(value, str):
+                return value
+    return None
+
+
+def boundary_violation(tool_name, tool_input):
+    """Return why a coordinator may not make this tool call, or None when it is allowed."""
+    lowered = (tool_name or "").lower()
+    if any(word in lowered for word in EDIT_TOOL_WORDS):
+        return f"{tool_name} edits files; dispatch the devflow-implementer worker"
+    command = command_text(tool_input)
+    if not command:
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        tokens = command.split()
+    for index, token in enumerate(tokens):
+        leading = index == 0 or command_boundary(tokens[index - 1])
+        if token == "git":
+            rest = []
+            for argument in tokens[index + 1:]:
+                if command_boundary(argument):
+                    break
+                rest.append(argument)
+            while rest and rest[0].startswith("-"):
+                rest = rest[2:] if rest[0] in ("-C", "-c", "--git-dir", "--work-tree") else rest[1:]
+            if rest and rest[0] in MUTATING_GIT and not read_only_git(rest):
+                return f"git {rest[0]} changes the repository; dispatch the devflow-implementer worker"
+        if leading and token in ("patch", "tee"):
+            return f"{token} writes files; dispatch the devflow-implementer worker"
+        if leading and token in ("sed", "perl"):
+            for argument in tokens[index + 1:]:
+                if command_boundary(argument):
+                    break
+                if re.match(r"^-[a-zA-Z]*i", argument) or argument.startswith("--in-place"):
+                    return f"{token} in-place edits belong to the devflow-implementer worker"
+        redirect = re.match(r"^(\d*)(>{1,2})(.*)$", token)
+        if redirect:
+            target = redirect.group(3) or (tokens[index + 1] if index + 1 < len(tokens) else "")
+            if not target.startswith("&") and not target.startswith(SAFE_REDIRECT_PREFIXES):
+                return f"shell redirection writes {target or 'a file'}; coordinators only write under temporary paths"
+    return None
+
+
+def boundary_decision(db, payload):
+    """Why a PreToolUse from a claim-holding coordinator is denied, or None. Read-only."""
+    if payload.get("hook_event_name") != "PreToolUse":
+        return None
+    saved = db.execute("SELECT role, closed_at FROM runtime_sessions WHERE id=?",
+                       (payload.get("session_id"),)).fetchone()
+    if not saved or saved[1] or saved[0] != "coordinator":
+        return None
+    return boundary_violation(payload.get("tool_name"), payload.get("tool_input"))
+
+
+def record_boundary(db, session_id, payload, stamp):
+    use_id = payload.get("tool_use_id") or stamp
+    event(db, session_id, "boundary:" + session_id + ":" + str(use_id), "boundary", stamp, payload.get("turn_id"),
+          name=payload.get("tool_name"), fingerprint=identity(payload.get("tool_name"), payload.get("tool_input")),
+          status="denied", ended_at=stamp)
+
+
+def deny(reason):
+    message = "Devflow boundary: " + reason
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": message},
+            "systemMessage": message}
 
 
 def identity(*parts):
     return hashlib.sha256(state.encode(parts).encode()).hexdigest()
-
-
-def scope(db, session_id):
-    return [r[0] for r in db.execute(
-        "SELECT work_id FROM runtime_scopes WHERE session_id=? ORDER BY work_id", (session_id,))]
-
-
-def bind(db, session_id, work_ids, role=None, parent_id=None, extend=False):
-    if not session_id or not work_ids:
-        raise ValueError("binding needs a session ID and existing work IDs")
-    for work_id in work_ids:
-        if not state.row(db, "works", work_id):
-            raise ValueError("unknown work: " + work_id)
-    saved = db.execute("SELECT * FROM runtime_sessions WHERE id=?", (session_id,)).fetchone()
-    if saved and not extend and set(scope(db, session_id)) != set(work_ids):
-        # Never reassign observations already attributed to another issue.
-        raise ValueError("session already bound; use a separate session for another issue")
-    db.execute("""INSERT INTO runtime_sessions(id,parent_id,role,bound_at)
-        VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET role=COALESCE(excluded.role,role),
-        parent_id=COALESCE(excluded.parent_id,parent_id),
-        bound_at=CASE WHEN closed_at IS NOT NULL THEN excluded.bound_at ELSE bound_at END,
-        closed_at=NULL""",
-        (session_id, parent_id, role, state.now()))
-    if saved and extend and set(work_ids) - set(scope(db, session_id)):
-        for run in db.execute("SELECT * FROM runs WHERE agent=? AND id LIKE 'runtime:%' AND ended_at IS NULL", (session_id,)).fetchall():
-            end = state.now()
-            db.execute("UPDATE runs SET ended_at=?,duration_seconds=?,status='scope-changed' WHERE id=?",
-                       (end, (state.instant(end)-state.instant(run["started_at"])).total_seconds(), run["id"]))
-    for work_id in work_ids:
-        db.execute("INSERT OR IGNORE INTO runtime_scopes VALUES (?,?)", (session_id, work_id))
-    return {"session_id": session_id, "work_ids": scope(db, session_id)}
 
 
 def event(db, session, key, kind, timestamp, turn_id=None, **values):
@@ -63,12 +146,12 @@ def event(db, session, key, kind, timestamp, turn_id=None, **values):
     existing = state.row(db, "runtime_events", key)
     if existing:
         starts = [x for x in (existing["started_at"], timestamp) if x]
-        item["started_at"] = min(starts) if starts else None
+        item["started_at"] = min(starts, key=state.instant) if starts else None
         for name in ("ended_at", "status", "name", "fingerprint", "source_ref"):
             if item.get(name) is None:
                 item[name] = existing[name]
         if existing["ended_at"] and item.get("ended_at"):
-            item["ended_at"] = max(existing["ended_at"], item["ended_at"])
+            item["ended_at"] = max(existing["ended_at"], item["ended_at"], key=state.instant)
     if item.get("ended_at") and item.get("started_at"):
         item["duration_seconds"] = max(0, (state.instant(item["ended_at"]) -
                                           state.instant(item["started_at"])).total_seconds())
@@ -87,7 +170,7 @@ def turn(db, session, turn_id, timestamp, status=None):
     key = "turn:" + session["id"] + ":" + turn_id
     existing = state.row(db, "runtime_events", key)
     if status is None and existing and existing["ended_at"]:
-        if timestamp <= existing["ended_at"]:
+        if state.instant(timestamp) <= state.instant(existing["ended_at"]):
             status = existing["status"]
             timestamp = existing["ended_at"]
         else:
@@ -127,6 +210,17 @@ def tokens(db, session, payload, timestamp, position, turn_id):
         return
     prior = {k: session[k] for k in TOKEN_FIELDS}
     after_binding = state.instant(timestamp) >= state.instant(session["bound_at"])
+    if prior["input_tokens"] is None and db.execute(
+            "SELECT 1 FROM runtime_events WHERE session_id=? AND kind='transcript_gap' LIMIT 1",
+            (session["id"],)).fetchone():
+        # A skipped line broke counter continuity: this counter is the new baseline and allocates
+        # nothing, so usage hidden by the skipped line stays unknown instead of charging the work.
+        if after_binding:
+            event(db, session["id"], identity(session["id"], position, "baseline"), "counter_baseline",
+                  timestamp, turn_id, status="gap",
+                  source_ref=session["transcript_path"] + "#byte=" + str(position))
+        session.update(values)
+        return
     reset = any(prior[k] is not None and values[k] is not None and values[k] < prior[k]
                 for k in TOKEN_FIELDS)
     if reset and after_binding:
@@ -195,7 +289,21 @@ def collect_transcript(db, session, transcript, collect_tools=False):
             line = stream.readline()
             if not line or not line.endswith(b"\n"):
                 break
-            item = json.loads(line)
+            try:
+                item = json.loads(line)
+                if not isinstance(item, dict):
+                    raise ValueError("transcript line is not an object")
+            except ValueError:
+                # One malformed line must not stall collection: record the gap and move on. The
+                # skipped line may have carried a counter, so the checkpoint is uncertain until
+                # the next counter re-establishes it without allocating usage.
+                event(db, session["id"], identity(session["id"], position, "malformed"), "transcript_gap",
+                      state.now(), active_turn, status="skipped",
+                      source_ref=session["transcript_path"] + "#byte=" + str(position))
+                for key in TOKEN_FIELDS:
+                    session[key] = None
+                cursor = stream.tell()
+                continue
             payload = item.get("payload") or {}
             timestamp = item.get("timestamp")
             if item.get("type") == "turn_context":
@@ -235,12 +343,13 @@ def tool_status(response):
     return "returned"
 
 
-def handle(db, payload):
+def handle(db, payload, reason=None):
     started = time.monotonic()
+    response = None
     parent = payload.get("session_id")
     saved = db.execute("SELECT * FROM runtime_sessions WHERE id=?", (parent,)).fetchone()
     if not saved or saved["closed_at"]:
-        return
+        return None
     session = dict(saved)
     name = payload.get("hook_event_name")
     stamp = state.now()
@@ -252,7 +361,7 @@ def handle(db, payload):
             if not child_saved and len(scope(db, parent)) != 1:
                 event(db, parent, identity(child, name, turn_id), name, stamp, turn_id,
                       name=payload.get("agent_type"), status="unallocated")
-                return
+                return None
             if not child_saved:
                 bind(db, child, scope(db, parent), payload.get("agent_type"), parent)
             session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (child,)).fetchone())
@@ -267,23 +376,32 @@ def handle(db, payload):
             if name == "SubagentStop":
                 close_if_released(db, child, stamp)
     else:
+        if name in ("PreToolUse", "PostToolUse") and not payload.get("tool_use_id"):
+            raise ValueError("tool hook lacks tool_use_id")
+        if name == "PreToolUse":
+            # The boundary is decided and recorded before any collection, so a collector
+            # failure cannot let a coordinator edit through.
+            if reason is None:
+                reason = boundary_decision(db, payload)
+            if reason:
+                record_boundary(db, parent, payload, stamp)
+                response = deny(reason)
         session["model"] = payload.get("model") or session["model"]
         db.execute("UPDATE runtime_sessions SET model=? WHERE id=?", (session["model"], parent))
         collect_transcript(db, session, payload.get("transcript_path"))
         session = dict(db.execute("SELECT * FROM runtime_sessions WHERE id=?", (parent,)).fetchone())
         if name in ("PreToolUse", "PostToolUse"):
-            use_id = payload.get("tool_use_id")
-            if not use_id:
-                raise ValueError("tool hook lacks tool_use_id")
-            signature = identity(payload.get("tool_name"), payload.get("tool_input"))
-            tool_key = "tool:" + parent + ":" + use_id
-            tool_started = stamp if name == "PreToolUse" else None
-            previous = state.row(db, "runtime_events", tool_key)
-            if not previous or previous["ended_at"] is None:
-                event(db, parent, tool_key, "tool", tool_started, turn_id,
-                      name=payload.get("tool_name"), fingerprint=signature,
-                      ended_at=stamp if name == "PostToolUse" else None,
-                      status=tool_status(payload.get("tool_response")) if name == "PostToolUse" else "started")
+            if not response:
+                use_id = payload.get("tool_use_id")
+                signature = identity(payload.get("tool_name"), payload.get("tool_input"))
+                tool_key = "tool:" + parent + ":" + use_id
+                tool_started = stamp if name == "PreToolUse" else None
+                previous = state.row(db, "runtime_events", tool_key)
+                if not previous or previous["ended_at"] is None:
+                    event(db, parent, tool_key, "tool", tool_started, turn_id,
+                          name=payload.get("tool_name"), fingerprint=signature,
+                          ended_at=stamp if name == "PostToolUse" else None,
+                          status=tool_status(payload.get("tool_response")) if name == "PostToolUse" else "started")
         else:
             event(db, parent, identity(parent, name, turn_id, payload.get("source"), session["cursor"]), name, stamp,
                   turn_id, name=payload.get("source") or payload.get("trigger"))
@@ -298,7 +416,7 @@ def handle(db, payload):
     # Runtime collector overhead is measured directly, not inferred from coordinator usage.
     event(db, parent, identity(parent, name, turn_id, payload.get("tool_use_id"), stamp),
           "collector", stamp, turn_id, duration_seconds=time.monotonic() - started, status="completed")
-
+    return response
 
 def close_if_released(db, session_id, timestamp):
     active = db.execute("""SELECT 1 FROM claims c JOIN runtime_scopes s ON s.work_id=c.work_id
@@ -358,13 +476,26 @@ def main():
             with closing(sqlite3.connect(Path(args.db).expanduser().resolve().as_uri() + "?mode=ro", uri=True)) as check:
                 present = check.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_sessions'").fetchone()
                 bound = present and check.execute("SELECT 1 FROM runtime_sessions WHERE id=? AND closed_at IS NULL", (payload.get("session_id"),)).fetchone()
+                reason = boundary_decision(check, payload) if bound else None
             if not bound:
                 print("{}")
                 return 0
-            with closing(state.connect(args.db)) as db, db:
-                db.execute("BEGIN IMMEDIATE")
-                handle(db, payload)
-            result = {}
+            # The boundary is decided before collection and its denial survives any collector failure.
+            result = deny(reason) if reason else {}
+            try:
+                with closing(state.connect(args.db)) as db, db:
+                    db.execute("BEGIN IMMEDIATE")
+                    handle(db, payload, reason)
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                failure = "Devflow metrics collection failed: " + str(exc)
+                result["systemMessage"] = (result["systemMessage"] + " " + failure) if result.get("systemMessage") else failure
+                if reason:
+                    try:
+                        with closing(state.connect(args.db)) as db, db:
+                            db.execute("BEGIN IMMEDIATE")
+                            record_boundary(db, payload.get("session_id"), payload, state.now())
+                    except (ValueError, OSError, sqlite3.Error):
+                        pass  # The denial stands even when it cannot be recorded.
         else:
             with closing(state.connect(args.db)) as db, db:
                 db.execute("BEGIN IMMEDIATE")

@@ -1,16 +1,22 @@
 ---
 name: devflow-implementing
-description: Implement a defined feature or repair a defect in the requested repository scope.
+description: Implement a scoped feature or repair, open its PR early and push subsequent fixes to that PR.
 ---
 
 # Implement the change
 
-Read the owning code, documentation and project rules. Confirm the working branch and dirty state; preserve unrelated work and collaborators' edits. Make the smallest coherent change that satisfies the requested behavior.
+Use the assigned outcome, worktree, file scope, branch/base and checks. Direct implementation requests enter through [coordinating](../devflow-coordinating/SKILL.md), which supplies the [worker brief](../devflow/references/implementation-worker.md). Do the work yourself without spawning agents.
 
-Use the coordinator's work ID and assigned file scope. For a direct implementation request without a coordinator, first [claim the issue and update its tracker](../devflow/references/ownership.md). Never compete with another task's active claim; report results to the owning coordinator when delegated.
+1. **Inspect before editing.** Read the owning code, project instructions and relevant contracts. Confirm branch and dirty state. Preserve collaborators' edits and unrelated files. For a defect, reproduce or trace the failing invariant and fix the owning layer.
 
-For defects, reproduce or trace the failing invariant before editing. Follow the data through its source, transformations and consumers; fix the owning layer. A cosmetic change cannot establish a missing persistence or integrity guarantee.
+2. **Make a coherent change.** Satisfy the assigned behavior without unrelated refactors, upgrades or formatting. Update affected tests, contracts and documentation within the assigned scope. Return a concrete scope gap if the correct repair exceeds it.
 
-Update affected contracts and documentation. Run the target project's applicable checks in proportion to the change, respecting explicit user limits. Use [verification](../devflow-verifying/SKILL.md) when product behavior needs direct evidence; distinguish a blocked check from a proven defect.
+3. **Open the PR early.** For GitHub work, commit and publish the first meaningful change immediately. Use a non-draft PR with a description of implemented behavior, remaining work and checks actually performed. Reuse an existing PR instead of opening another for repairs. Follow [PR workflow](../devflow/references/pr-workflow.md); explicit local-only/no-commit/no-push limits take precedence.
 
-Use the [shared helper](../devflow/references/state.md) to record the actual run, commit/evidence references, unresolved findings and useful continuation context. Preserve failed evidence. Return the candidate, changed scope, checks performed with observed results, and unresolved limits. Keep failed or unperformed checks explicit; do not invent a mandatory extra stage.
+4. **Build the stack as work progresses.** Split a feature into reviewable slices. Start each sequential feature or slice from the previous unmerged branch and publish it in the same gh stack, even when features are logically independent. Each PR targets its predecessor. Repair a lower layer on its own branch, then rebase and resubmit affected upper layers; coordinate any shared branches before rewriting them.
+
+5. **Check within scope.** Run the agreed checks and appropriate project checks permitted by the user's limits. Do not run tests for a no-tests request. Record commands, expected/observed behavior, failed checks and unperformed checks honestly. Keep evidence at durable paths.
+
+6. **Push repairs and identify the candidate.** Commit further fixes to the same branch, push them to the same PR, update its description and read back base/head SHAs. Verify the remote head contains the reported changes. Separate dirty/untracked work from the committed candidate. With no-commit scope, return the base SHA, worktree, full changed/untracked file list and a durable patch/snapshot with a content hash covering the assigned changes.
+
+7. **Hand off.** Return candidate identity, PR/stack references, changed scope, check outcomes and remaining work. The coordinator records results and updates the issue. Do not merge, release or deploy as part of implementation unless separately assigned.
