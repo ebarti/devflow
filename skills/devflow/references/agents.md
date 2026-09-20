@@ -2,7 +2,7 @@
 
 Run the main task on **Astra/xhigh** for inspection, user questions, design and planning. A skill cannot change an existing task's model; select it in the host. Candidate trials configure that default. The installer leaves normal host model settings alone.
 
-The installer links four definitions from `agents/` into `$CODEX_HOME/agents/`:
+The installer copies four definitions from `agents/` into `$CODEX_HOME/agents/` as ordinary files. `$CODEX_HOME/agents/.devflow-agent-manifest.json` records their source and last-installed SHA-256 so unchanged owned copies can be upgraded or pruned without replacing unmanaged files or local edits. This installation mechanism does not change the model, effort or permission policy below:
 
 | Responsibility | Agent type | Default model | Permission configuration |
 | --- | --- | --- | --- |

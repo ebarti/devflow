@@ -16,23 +16,38 @@ for name in devflow devflow-defining-work devflow-planning \
     devflow-coordinating devflow-implementing devflow-reviewing devflow-verifying \
     devflow-merging; do
     test -f "$destination/$name/SKILL.md"
+    test -L "$destination/$name"
 done
 for name in state.py github.py legacy.py telemetry.py measurements.py schema.sql; do
     test -r "$destination/devflow/scripts/$name"
 done
 for agent in "$source_root"/agents/*.toml; do
-    test "$(readlink "$install_fixture/codex/agents/${agent##*/}")" = "$agent"
+    installed="$install_fixture/codex/agents/${agent##*/}"
+    test -f "$installed"
+    test ! -L "$installed"
+    cmp "$agent" "$installed"
 done
-"$devflow_python" -B - "$install_fixture/codex/agents" <<'PY'
+"$devflow_python" -B - "$install_fixture/codex/agents" "$source_root" <<'PY'
+import hashlib
+import json
 import pathlib
 import re
 import sys
 import tomllib
 
+agent_directory = pathlib.Path(sys.argv[1])
+source_root = pathlib.Path(sys.argv[2])
+manifest = json.loads((agent_directory / ".devflow-agent-manifest.json").read_text())
+assert manifest["schema_version"] == 1
+assert manifest["source_root"] == str(source_root)
+assert set(manifest["agents"]) == {path.name for path in (source_root / "agents").glob("*.toml")}
 agents = {}
-for path in sorted(pathlib.Path(sys.argv[1]).glob("devflow-*.toml")):
+for path in sorted(agent_directory.glob("devflow-*.toml")):
     with path.open("rb") as handle:
         agent = tomllib.load(handle)
+    entry = manifest["agents"][path.name]
+    assert entry["source"] == str(source_root / "agents" / path.name)
+    assert entry["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert agent["name"] == path.stem, path
     assert agent["description"] and agent["developer_instructions"].strip(), path
     if agent["name"] == "devflow-coordinator":
@@ -56,6 +71,16 @@ PY
 "$devflow_python" -B "$destination/devflow/scripts/telemetry.py" --help > /dev/null
 test -s "$install_fixture/codex/hooks.json"
 
+# Reinstalling an unchanged installation does not alter owned copies or their manifest.
+mkdir "$install_fixture/idempotent-snapshot"
+cp "$install_fixture/codex/agents"/devflow-*.toml "$install_fixture/idempotent-snapshot/"
+cp "$install_fixture/codex/agents/.devflow-agent-manifest.json" "$install_fixture/idempotent-snapshot/manifest.json"
+sh "$source_root/scripts/install.sh" "$destination" "$install_fixture/codex" > /dev/null
+for agent in "$source_root"/agents/*.toml; do
+    cmp "$install_fixture/idempotent-snapshot/${agent##*/}" "$install_fixture/codex/agents/${agent##*/}"
+done
+cmp "$install_fixture/idempotent-snapshot/manifest.json" "$install_fixture/codex/agents/.devflow-agent-manifest.json"
+
 # Installed hooks keep the installing interpreter even with an empty PATH.
 "$devflow_python" -B - "$install_fixture/codex/hooks.json" <<'PY'
 import json
@@ -76,7 +101,40 @@ result = subprocess.run(["/bin/sh", "-c", command], input="{}", text=True,
 assert json.loads(result.stdout) == {}
 PY
 
-# Switching checkouts requires force, including when the old link is broken.
+# Agent links from this checkout migrate without force.
+rm "$install_fixture/codex/agents/.devflow-agent-manifest.json"
+for agent in "$source_root"/agents/*.toml; do
+    installed="$install_fixture/codex/agents/${agent##*/}"
+    rm "$installed"
+    ln -s "$agent" "$installed"
+done
+sh "$source_root/scripts/install.sh" "$destination" "$install_fixture/codex" > /dev/null
+for agent in "$source_root"/agents/*.toml; do
+    installed="$install_fixture/codex/agents/${agent##*/}"
+    test -f "$installed"
+    test ! -L "$installed"
+    cmp "$agent" "$installed"
+done
+
+# Agent links from another checkout require force, then migrate to owned copies.
+mkdir "$install_fixture/other-checkout-agents"
+cp "$source_root/agents/devflow-implementer.toml" "$install_fixture/other-checkout-agents/"
+rm "$install_fixture/codex/agents/devflow-implementer.toml"
+ln -s "$install_fixture/other-checkout-agents/devflow-implementer.toml" \
+    "$install_fixture/codex/agents/devflow-implementer.toml"
+if sh "$source_root/scripts/install.sh" "$destination" "$install_fixture/codex" > /dev/null 2>&1; then
+    printf 'Agent symlink from another checkout was accepted without --force.\n' >&2
+    exit 1
+fi
+test "$(readlink "$install_fixture/codex/agents/devflow-implementer.toml")" = \
+    "$install_fixture/other-checkout-agents/devflow-implementer.toml"
+sh "$source_root/scripts/install.sh" --force "$destination" "$install_fixture/codex" > /dev/null
+test -f "$install_fixture/codex/agents/devflow-implementer.toml"
+test ! -L "$install_fixture/codex/agents/devflow-implementer.toml"
+cmp "$source_root/agents/devflow-implementer.toml" \
+    "$install_fixture/codex/agents/devflow-implementer.toml"
+
+# Switching skill checkouts requires force, including when the old link is broken.
 mkdir "$install_fixture/previous"
 rm "$destination/devflow" "$destination/devflow-planning"
 ln -s "$install_fixture/previous" "$destination/devflow"
@@ -106,7 +164,10 @@ test ! -L "$destination/devflow-obsolete-install-smoke"
 test ! -L "$destination/devflow-delivering"
 test -L "$destination/unrelated"
 for agent in "$source_root"/agents/*; do
-    test "$(readlink "$install_fixture/codex/agents/${agent##*/}")" = "$agent"
+    installed="$install_fixture/codex/agents/${agent##*/}"
+    test -f "$installed"
+    test ! -L "$installed"
+    cmp "$agent" "$installed"
 done
 test ! -L "$install_fixture/codex/agents/devflow-obsolete-install-smoke.toml"
 test ! -L "$install_fixture/codex/agents/devflow-deliverer.toml"
@@ -133,6 +194,45 @@ for kind in file directory; do
     if [ "$kind" = file ]; then test "$(cat "$conflict")" = keep; else test -d "$conflict"; fi
 done
 
+# An unmanaged regular agent file aborts before an earlier skill link can change,
+# even when its bytes match the bundled definition and --force is supplied.
+mkdir "$install_fixture/preflight-skills" "$install_fixture/preflight-codex"
+mkdir "$install_fixture/preflight-codex/agents"
+ln -s "$install_fixture/previous" "$install_fixture/preflight-skills/devflow"
+cp "$source_root/agents/devflow-verifier.toml" \
+    "$install_fixture/preflight-codex/agents/devflow-verifier.toml"
+if sh "$source_root/scripts/install.sh" --force "$install_fixture/preflight-skills" \
+    "$install_fixture/preflight-codex" > /dev/null 2>&1; then
+    printf 'Unmanaged regular agent file was accepted with --force.\n' >&2
+    exit 1
+fi
+test "$(readlink "$install_fixture/preflight-skills/devflow")" = "$install_fixture/previous"
+cmp "$source_root/agents/devflow-verifier.toml" \
+    "$install_fixture/preflight-codex/agents/devflow-verifier.toml"
+test ! -e "$install_fixture/preflight-codex/agents/.devflow-agent-manifest.json"
+
+# A locally modified managed copy is also preserved, and preflight prevents a
+# preceding skill-link migration before the conflict is reported.
+sh "$source_root/scripts/install.sh" "$install_fixture/modified-skills" \
+    "$install_fixture/modified-codex" > /dev/null
+rm "$install_fixture/modified-skills/devflow"
+ln -s "$install_fixture/previous" "$install_fixture/modified-skills/devflow"
+printf '\n# Local agent edit\n' >> "$install_fixture/modified-codex/agents/devflow-reviewer.toml"
+cp "$install_fixture/modified-codex/agents/devflow-reviewer.toml" \
+    "$install_fixture/modified-reviewer-before.toml"
+cp "$install_fixture/modified-codex/agents/.devflow-agent-manifest.json" \
+    "$install_fixture/modified-manifest-before.json"
+if sh "$source_root/scripts/install.sh" --force "$install_fixture/modified-skills" \
+    "$install_fixture/modified-codex" > /dev/null 2>&1; then
+    printf 'Modified managed agent file was accepted with --force.\n' >&2
+    exit 1
+fi
+test "$(readlink "$install_fixture/modified-skills/devflow")" = "$install_fixture/previous"
+cmp "$install_fixture/modified-reviewer-before.toml" \
+    "$install_fixture/modified-codex/agents/devflow-reviewer.toml"
+cmp "$install_fixture/modified-manifest-before.json" \
+    "$install_fixture/modified-codex/agents/.devflow-agent-manifest.json"
+
 # Upgrade a local installation between two release tags; no remote service is used.
 release_source="$install_fixture/releases"
 mkdir "$release_source"
@@ -140,26 +240,66 @@ cp -R "$source_root/scripts" "$source_root/skills" "$source_root/agents" "$relea
 mkdir "$release_source/skills/devflow-retired"
 printf '%s\n' 'Temporary installation smoke skill.' > "$release_source/skills/devflow-retired/SKILL.md"
 printf '%s\n' 'name = "devflow-retired"' > "$release_source/agents/devflow-retired.toml"
+printf '%s\n' 'name = "devflow-edited-retired"' > \
+    "$release_source/agents/devflow-edited-retired.toml"
 git -C "$release_source" init -q
 git -C "$release_source" config user.name 'Installation smoke'
 git -C "$release_source" config user.email 'install@example.invalid'
 git -C "$release_source" add .
 git -C "$release_source" commit -qm 'Initial installation'
 git -C "$release_source" tag v0.0.1
-git -C "$release_source" rm -qr skills/devflow-retired agents/devflow-retired.toml
-git -C "$release_source" commit -qm 'Remove retired skill'
+printf '\n# Updated source\n' >> "$release_source/agents/devflow-implementer.toml"
+git -C "$release_source" rm -qr skills/devflow-retired agents/devflow-retired.toml \
+    agents/devflow-edited-retired.toml
+git -C "$release_source" commit -qam 'Update agent and remove retired definitions'
 git -C "$release_source" tag v0.0.2
 git clone -q "$release_source" "$install_fixture/checkout"
 git -C "$install_fixture/checkout" checkout -q --detach v0.0.1
 sh "$install_fixture/checkout/scripts/install.sh" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > /dev/null
 test -L "$install_fixture/upgraded-skills/devflow-retired"
-test -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+test -f "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+test ! -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+cp "$install_fixture/upgraded-codex/agents/devflow-implementer.toml" \
+    "$install_fixture/implementer-v1.toml"
+printf '\n# Preserved local edit\n' >> \
+    "$install_fixture/upgraded-codex/agents/devflow-edited-retired.toml"
+cp "$install_fixture/upgraded-codex/agents/devflow-edited-retired.toml" \
+    "$install_fixture/edited-retired-before.toml"
+printf '%s\n' 'unrelated' > "$install_fixture/upgraded-codex/agents/unrelated-role.toml"
 sh "$install_fixture/checkout/scripts/update.sh" v0.0.2 "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > /dev/null
 test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$release_source" rev-parse v0.0.2)"
 test ! -L "$install_fixture/upgraded-skills/devflow-retired"
-test ! -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
-test "$(readlink "$install_fixture/upgraded-codex/agents/devflow-implementer.toml")" = "$install_fixture/checkout/agents/devflow-implementer.toml"
+test ! -e "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+cmp "$install_fixture/edited-retired-before.toml" \
+    "$install_fixture/upgraded-codex/agents/devflow-edited-retired.toml"
+test "$(cat "$install_fixture/upgraded-codex/agents/unrelated-role.toml")" = unrelated
+test -f "$install_fixture/upgraded-codex/agents/devflow-implementer.toml"
+test ! -L "$install_fixture/upgraded-codex/agents/devflow-implementer.toml"
+cmp "$install_fixture/checkout/agents/devflow-implementer.toml" \
+    "$install_fixture/upgraded-codex/agents/devflow-implementer.toml"
+if cmp -s "$install_fixture/implementer-v1.toml" \
+    "$install_fixture/upgraded-codex/agents/devflow-implementer.toml"; then
+    printf 'Changed source agent did not upgrade its owned copy.\n' >&2
+    exit 1
+fi
 test "$(readlink "$install_fixture/upgraded-skills/devflow")" = "$install_fixture/checkout/skills/devflow"
+"$devflow_python" -B - "$install_fixture/upgraded-codex/agents" \
+    "$install_fixture/checkout" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+agents = Path(sys.argv[1])
+source = Path(sys.argv[2])
+manifest = json.loads((agents / ".devflow-agent-manifest.json").read_text())
+assert "devflow-retired.toml" not in manifest["agents"]
+assert "devflow-edited-retired.toml" in manifest["agents"]
+implementer = agents / "devflow-implementer.toml"
+entry = manifest["agents"][implementer.name]
+assert entry["source"] == str(source / "agents" / implementer.name)
+assert entry["sha256"] == hashlib.sha256(implementer.read_bytes()).hexdigest()
+PY
 printf '\n# Local edit\n' >> "$install_fixture/checkout/scripts/install.sh"
 if sh "$install_fixture/checkout/scripts/update.sh" v0.0.1 > /dev/null 2>&1; then
     printf 'Upgrade accepted tracked edits.\n' >&2
@@ -169,8 +309,11 @@ test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$releas
 
 "$devflow_python" -B "$source_root/scripts/candidate.py" --prepare-only "$install_fixture/trial" > /dev/null
 test -f "$install_fixture/trial/codex/skills/devflow/SKILL.md"
-test -L "$install_fixture/trial/codex/agents/devflow-implementer.toml"
-test -L "$install_fixture/trial/codex/agents/devflow-coordinator.toml"
+test -f "$install_fixture/trial/codex/agents/devflow-implementer.toml"
+test ! -L "$install_fixture/trial/codex/agents/devflow-implementer.toml"
+test -f "$install_fixture/trial/codex/agents/devflow-coordinator.toml"
+test ! -L "$install_fixture/trial/codex/agents/devflow-coordinator.toml"
+test -s "$install_fixture/trial/codex/agents/.devflow-agent-manifest.json"
 "$devflow_python" -B - "$install_fixture/trial/codex/config.toml" <<'PY'
 import sys
 import tomllib

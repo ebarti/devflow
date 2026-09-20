@@ -8,7 +8,7 @@ Devflow targets Codex CLI: skills load from its skills directory, metrics hooks 
 
 ## Install
 
-Keep a release checkout at a stable location; installed skills and agent definitions are symlinks into it.
+Keep a release checkout at a stable location; installed skills are symlinks into it. Agent definitions are ordinary files copied into the Codex home so role loading does not depend on following symlinks.
 
 ```sh
 git clone --branch v0.1.0 https://github.com/ebarti/devflow.git
@@ -30,7 +30,9 @@ To switch an existing installation to another checkout, run this from that check
 bash scripts/install.sh --force
 ```
 
-`--force` replaces only bundled skill and agent-definition symlinks, including broken links. Regular files, directories, other agent definitions and other hooks are preserved. Without it, conflicting paths stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
+The installer records each copied agent definition's source and last-installed SHA-256 in `$CODEX_HOME/agents/.devflow-agent-manifest.json`. Unchanged owned copies can be upgraded or pruned safely. Unmanaged regular files and locally modified owned copies are preserved and stop a conflicting install, even with `--force`; edited obsolete copies and unrelated agent files also survive. All skill and agent conflicts are checked before either set is changed.
+
+`--force` replaces bundled skill symlinks and migrates agent-definition symlinks from another checkout, including broken links. Without it, those conflicting links stop installation. Installing or upgrading does not change the model, reasoning-effort, permission or concurrency policy stored in the agent definitions. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
 
 ## Upgrade
 
@@ -40,7 +42,7 @@ Choose a [release tag](https://github.com/ebarti/devflow/releases) and upgrade t
 bash scripts/update.sh v0.1.0
 ```
 
-The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill and agent-definition links owned by this checkout are removed; other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
+The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill links and unchanged agent copies recorded in the manifest are removed; locally edited or unrelated files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
 
 ## Candidate trials
 
