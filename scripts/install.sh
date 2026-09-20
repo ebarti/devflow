@@ -52,6 +52,7 @@ mode, source_root_arg, agent_directory_arg, force_arg = sys.argv[1:]
 source_root = Path(source_root_arg)
 source_directory = source_root / "agents"
 agent_directory = Path(agent_directory_arg)
+codex_directory = agent_directory.parent
 manifest_path = agent_directory / ".devflow-agent-manifest.json"
 force = force_arg == "true"
 
@@ -73,9 +74,13 @@ def path_exists(path):
     return os.path.lexists(path)
 
 
+def validate_destination_shape():
+    for label, path in (("Codex home", codex_directory), ("Agent directory", agent_directory)):
+        if path_exists(path) and not path.is_dir():
+            fail(f"{label} path is not a directory: {path}")
+
+
 def load_manifest():
-    if path_exists(agent_directory) and not agent_directory.is_dir():
-        fail(f"Agent directory path is not a directory: {agent_directory}")
     if not path_exists(manifest_path):
         return {"schema_version": 1, "source_root": str(source_root), "agents": {}}
     if manifest_path.is_symlink() or not manifest_path.is_file():
@@ -101,6 +106,25 @@ def load_manifest():
                 or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None):
             fail(f"Invalid agent entry {name!r} in ownership manifest: {manifest_path}")
     return manifest
+
+
+def prepare_destination():
+    temporary_paths = []
+    try:
+        agent_directory.mkdir(parents=True, exist_ok=True)
+        for _ in range(2):
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".devflow-agent-preflight.", dir=agent_directory
+            )
+            os.close(descriptor)
+            temporary_paths.append(Path(temporary_name))
+        os.replace(temporary_paths[0], temporary_paths[1])
+    except OSError as error:
+        fail(f"Cannot prepare agent directory {agent_directory}: {error}")
+    finally:
+        for path in temporary_paths:
+            if path_exists(path):
+                path.unlink()
 
 
 def source_files():
@@ -171,10 +195,12 @@ def write_manifest(manifest):
             temporary.unlink()
 
 
+validate_destination_shape()
 manifest = load_manifest()
 sources = source_files()
 preflight(manifest, sources)
 if mode == "check":
+    prepare_destination()
     raise SystemExit(0)
 if mode != "apply":
     fail(f"Unknown agent installation mode: {mode}")

@@ -27,6 +27,7 @@ for agent in "$source_root"/agents/*.toml; do
     test ! -L "$installed"
     cmp "$agent" "$installed"
 done
+test -z "$(find "$install_fixture/codex/agents" -maxdepth 1 -name '.devflow-agent-preflight.*' -print)"
 "$devflow_python" -B - "$install_fixture/codex/agents" "$source_root" <<'PY'
 import hashlib
 import json
@@ -193,6 +194,30 @@ for kind in file directory; do
     test "$(readlink "$install_fixture/conflicts/devflow")" = "$install_fixture/previous"
     if [ "$kind" = file ]; then test "$(cat "$conflict")" = keep; else test -d "$conflict"; fi
 done
+
+# Invalid Codex-home shapes fail before an existing skill link is changed.
+mkdir "$install_fixture/invalid-home-skills"
+ln -s "$install_fixture/previous" "$install_fixture/invalid-home-skills/devflow"
+printf '%s\n' keep > "$install_fixture/invalid-codex-home"
+if sh "$source_root/scripts/install.sh" --force "$install_fixture/invalid-home-skills" \
+    "$install_fixture/invalid-codex-home" > /dev/null 2>&1; then
+    printf 'A regular file was accepted as the Codex home.\n' >&2
+    exit 1
+fi
+test "$(readlink "$install_fixture/invalid-home-skills/devflow")" = "$install_fixture/previous"
+test "$(cat "$install_fixture/invalid-codex-home")" = keep
+
+# An unusable agent-directory path has the same preflight guarantee.
+mkdir "$install_fixture/invalid-agents-skills" "$install_fixture/invalid-agents-codex"
+ln -s "$install_fixture/previous" "$install_fixture/invalid-agents-skills/devflow"
+printf '%s\n' keep > "$install_fixture/invalid-agents-codex/agents"
+if sh "$source_root/scripts/install.sh" --force "$install_fixture/invalid-agents-skills" \
+    "$install_fixture/invalid-agents-codex" > /dev/null 2>&1; then
+    printf 'A regular file was accepted as the agent directory.\n' >&2
+    exit 1
+fi
+test "$(readlink "$install_fixture/invalid-agents-skills/devflow")" = "$install_fixture/previous"
+test "$(cat "$install_fixture/invalid-agents-codex/agents")" = keep
 
 # An unmanaged regular agent file aborts before an earlier skill link can change,
 # even when its bytes match the bundled definition and --force is supplied.
