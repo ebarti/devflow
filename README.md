@@ -1,14 +1,14 @@
 # Devflow
 
-Small development skills for an agent, with Python helpers for work ownership, GitHub issue status and metrics. The agent follows the relevant skill and uses its host tools, Git, GitHub CLI and project commands directly.
+Small development skills for OpenAI Codex CLI agents, with Python helpers for work ownership, GitHub issue status and metrics. The agent follows the relevant skill and uses its host tools, Git, GitHub CLI and project commands directly.
 
 ## Prerequisites
 
-Supply Python 3.12+, a POSIX shell, Git, a host that discovers `SKILL.md` directories, and the tools required by your projects. Candidate trials use Codex CLI. GitHub work requires authenticated `gh`; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not check or install prerequisites or manage authentication; behavior with missing prerequisites is undefined.
+Devflow targets Codex CLI: skills load from its skills directory, metrics hooks use its `hooks.json` and transcript format, and delegation uses its agent tools. Other hosts that discover `SKILL.md` directories can load the role skills, but hooks, metrics, candidate trials and worker spawning are Codex-specific. Supply Python 3.12+, a POSIX shell, Git and the tools required by your projects. Execution needs native nested-agent tools, capacity for the main task plus a coordinator and at least one leaf, and access to Astra and Sol. The installer supplies four agent definitions. See the [agents reference](skills/devflow/references/agents.md) and the [implementation worker reference](skills/devflow/references/implementation-worker.md). GitHub work requires authenticated `gh` and sequential stacks use the `gh stack` extension and skill; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not install prerequisites or manage authentication. Check the tools needed for the requested action and report a missing prerequisite as a blocker rather than silently changing the workflow.
 
 ## Install
 
-Keep a release checkout at a stable location; installed skills are symlinks into it.
+Keep a release checkout at a stable location; installed skills and agent definitions are symlinks into it.
 
 ```sh
 git clone --branch v0.1.0 https://github.com/ebarti/devflow.git
@@ -18,7 +18,7 @@ bash scripts/install.sh
 
 The installer uses `python3.12`; set `DEVFLOW_PYTHON` to select another supported interpreter. Hooks record its resolved absolute executable path at installation, so later `PATH` changes do not switch Python. Reinstall to change the interpreter. The helpers use only the standard library; no pip dependencies are required.
 
-The defaults are `~/.agents/skills` and `$CODEX_HOME/hooks.json` (`~/.codex/hooks.json` when unset). Supply custom locations when needed:
+The defaults are `~/.agents/skills` for skills and `$CODEX_HOME` (`~/.codex` when unset) for the agent definitions in `agents/` and the metrics hooks in `hooks.json`. Supply custom locations when needed:
 
 ```sh
 bash scripts/install.sh /path/to/host/skills /path/to/codex-home
@@ -30,7 +30,7 @@ To switch an existing installation to another checkout, run this from that check
 bash scripts/install.sh --force
 ```
 
-`--force` replaces only bundled skill symlinks, including broken links. Regular files, directories and other hooks are preserved. Without it, conflicting paths stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
+`--force` replaces only bundled skill and agent-definition symlinks, including broken links. Regular files, directories, other agent definitions and other hooks are preserved. Without it, conflicting paths stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
 
 ## Upgrade
 
@@ -40,7 +40,7 @@ Choose a [release tag](https://github.com/ebarti/devflow/releases) and upgrade t
 bash scripts/update.sh v0.1.0
 ```
 
-The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill links owned by this checkout are removed; other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
+The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill and agent-definition links owned by this checkout are removed; other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
 
 ## Candidate trials
 
@@ -50,7 +50,7 @@ From a development worktree, use a new trial directory for each candidate and a 
 python3.12 scripts/candidate.py /path/to/trial -C /path/to/project-worktree
 ```
 
-The launcher isolates skills, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit.
+The launcher isolates skills, agent definitions, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration selects Astra/xhigh for the main task and belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit.
 
 Publish a new release tag after the installation smoke check and the selected product trial pass. Release tags remain fixed; normal installations advance only through an explicit upgrade.
 
@@ -58,7 +58,21 @@ Publish a new release tag after the installation smoke check and the selected pr
 
 Ask for the outcome you want, for example: “Use devflow to fix the retry bug in this repository.” Or invoke a role such as `$devflow-reviewing` for a specific review. Skills are independently discoverable; loading one does not create work, issues or agents, or resume a backlog.
 
-Delegated implementation defaults to **Sol / high** (`gpt-5.6-sol`). Explicit user or project choices override it. Other roles keep their selected models.
+Use **Astra/xhigh** for the main task. It inspects the repository, asks user questions and produces the plan itself. Select that model in the host; skills cannot change an existing task's model and normal installation does not alter global model settings. From the CLI:
+
+```sh
+codex --model gpt-6-astra -c 'model_reasoning_effort="xhigh"'
+```
+
+For implementation, the main task hands the inspected plan to one `devflow-coordinator` on **Sol/high**. That agent dispatches implementation on **Sol/xhigh** and review/verification on **Sol/xhigh**, owns the repair loop, maintains records and tracker state, and returns the consolidated outcome. Only material design decisions or unresolved blockers return to the main task. The coordinator inherits the main task's permissions for the shared database; leaf workers return reports.
+
+The implementer commits the first meaningful change, opens a non-draft PR immediately, and pushes subsequent fixes to that PR. Explicit local-only, no-commit and no-push instructions take precedence.
+
+Split features into coherent reviewable PRs. Features and slices developed sequentially while earlier work remains unmerged form one **gh stack**, even when they are logically independent. Each new branch and PR builds on its unmerged predecessor. See [PR workflow](skills/devflow/references/pr-workflow.md).
+
+Reuse the original coordinator for continuation, implementer for repairs and reviewer/verifier for rechecks when the scope is still related. Dispatch only the roles the work needs. The execution coordinator performs the final authorized merge directly. Standalone review/verification uses the corresponding leaf directly; merge-only requests run in the main task. There are no definer, planner or delivery agents.
+
+The [agents reference](skills/devflow/references/agents.md) lists the four delegated roles, default models and override mechanism. Briefs carry the inspected plan, acceptance conditions, candidate identity and verification limits. Reviewers and verifiers must still challenge demonstrated flaws in the plan. These are workflow instructions; this iteration does not add enforced input/output contracts or sequencing. The installed hook remains a backstop for common repository writes from the main claim holder and execution coordinator. Moving routine coordination to Sol aims to reduce expensive main-task turns; no cost saving is guaranteed or inferred from the topology alone.
 
 | Skill | Use |
 | --- | --- |
@@ -66,10 +80,10 @@ Delegated implementation defaults to **Sol / high** (`gpt-5.6-sol`). Explicit us
 | [devflow-defining-work](skills/devflow-defining-work/SKILL.md) | Clarify outcomes and investigate unclear requests |
 | [devflow-planning](skills/devflow-planning/SKILL.md) | Plan consequential changes and coverage |
 | [devflow-coordinating](skills/devflow-coordinating/SKILL.md) | Carry out a defined request and recover ongoing work |
-| [devflow-implementing](skills/devflow-implementing/SKILL.md) | Implement or repair code |
+| [devflow-implementing](skills/devflow-implementing/SKILL.md) | Implement, open PRs early and push repairs |
 | [devflow-reviewing](skills/devflow-reviewing/SKILL.md) | Review a candidate and verify findings |
 | [devflow-verifying](skills/devflow-verifying/SKILL.md) | Reproduce behavior and run project checks |
-| [devflow-delivering](skills/devflow-delivering/SKILL.md) | Publish, merge or reconcile requested delivery |
+| [devflow-merging](skills/devflow-merging/SKILL.md) | Merge an authorized PR or gh stack |
 
 ## How it works
 
@@ -89,27 +103,37 @@ Enter at the role that fits the request. A small fix needs no separate planning 
 ```mermaid
 flowchart LR
     Request[Implementation request] --> Claim[Claim issue and set in progress]
-    Claim --> Work[Define or implement]
-    Work --> Check[Check as project requires]
-    Check -->|Repair needed| Work
-    Check --> Deliver[Deliver within requested scope]
-    Deliver --> Record[Update issue and release claim]
+    Claim --> Work[Implement a coherent change]
+    Work --> PR[Commit and open PR early]
+    PR --> Check[Review and verify as required]
+    Check -->|Repair needed| Fix[Fix and push to same PR]
+    Fix --> Check
+    PR -->|Next sequential feature| Stack[Add branch and PR to gh stack]
+    Stack --> Check
+    Check --> Merge[Coordinator merges when authorized]
+    Merge --> Record[Update issue and release claim]
 ```
 
-Independent issues follow this flow concurrently in separate worktrees. A coordinator may own several issues and dispatch their workers; each issue keeps one owner and work ID. One GitHub helper creates or reuses the issue, assigns the accountable user, adds it to the existing Project and updates its Status using the board's existing options. Use `state.py work list --claimed` to see task owners and their last observations. See [ownership and interruption handling](skills/devflow/references/ownership.md).
+Independent parallel issues use separate worktrees, each with one owner and work ID. Sequential unmerged issues retain that ownership while sharing a PR stack. The GitHub helper creates or reuses the issue, assigns the accountable user and updates its existing Project Status. Ownership rules, concurrency and interruption handling are defined once in [issue ownership](skills/devflow/references/ownership.md).
 
-The state helper stores work, claims, runs, results and findings. Runtime hooks collect bound tasks' turns, tool timings, interruptions, compactions and token-counter deltas without storing prompt or command text. Claims attach coordinators automatically; children inherit a single issue. Multi-issue coordinator usage stays unallocated. There is no scheduler.
+The state helper stores work, claims, runs, results, findings and usage. The main task creates or reuses the record and claim; its execution coordinator then writes the results returned by its leaf workers. Installed hooks attribute runtime observations through both delegation levels. What is collected, how usage is attributed and what is deliberately not inferred are defined once in [work records and metrics](skills/devflow/references/state.md).
 
-`state.py metrics` reports outcomes, roles/models, delivery, ownership, recovery, timing, usage and coverage; add `--work-id ID` for one issue. Missing observations stay unknown. Check acceptance and finding decisions remain explicit records. Costs require supplied estimates; complete workflow overhead and savings are not inferred. See [metrics and collection](skills/devflow/references/state.md).
+`state.py metrics` reports outcomes, roles and models, delivery, ownership, recovery, timing, usage and coverage; add `--work-id ID` for one issue.
 
-The default database is `$XDG_STATE_HOME/devflow/workflow.sqlite3`, or `~/.local/state/devflow/workflow.sqlite3` when that variable is unset. See [helper commands](skills/devflow/references/state.md) and [storage contracts](docs/implementation-contracts.md).
+The database location and helper commands are documented in [work records and metrics](skills/devflow/references/state.md); storage semantics are in the [storage contract](docs/implementation-contracts.md).
 
-## Installation smoke check
+## Checks
 
 ```sh
 bash scripts/check-install.sh
 ```
 
-Devflow CI runs only this installation smoke check. It does not run package test suites, review/QA gates or delivery automation. Target projects retain their own check policies.
+Devflow CI runs this installation smoke check and the helper unit tests in `tests/`:
+
+```sh
+python3.12 -m unittest discover -s tests
+```
+
+It does not run live model-driven workflow trials or target projects' suites, review/QA checks or merges; target projects retain their own check policies.
 
 [Architecture](docs/architecture.md)
