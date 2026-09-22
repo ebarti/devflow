@@ -22,9 +22,15 @@ Spawn one `devflow-coordinator` with `fork_turns: "none"` for the bounded reques
 
 The coordinator inherits the main task's permissions for records and tracker operations; it does not receive broader permissions. Verify required record access as part of starting the work. Leaf workers have their own roles and return reports. During execution, the coordinator is the sole writer of that work's records and tracker updates. The main task retains the user conversation and material design decisions.
 
-Wait for completion or a material escalation instead of supervising each worker turn. Forward new user constraints to the same coordinator. Answer escalations from the existing context or ask the user directly, then send the decision to the running coordinator or resume it with `agents.followup_task`. When it has released a claim, reacquire the same work for the main task before resuming. Do not spawn a replacement for an ordinary clarification or repair.
+Wait for completion or a material escalation instead of supervising each worker turn. Follow the [coordination cadence](#coordination-cadence) while the coordinator runs. Forward new user constraints to the same coordinator. Answer escalations from the existing context or ask the user directly, then send the decision to the running coordinator or resume it with `agents.followup_task`. When it has released a claim, reacquire the same work for the main task before resuming. Do not spawn a replacement for an ordinary clarification or repair.
 
 On return, check the consolidated report against the requested endpoint and inspect the deciding remote state or artifact. Do not repeat current review and verification. Reconcile records/claims yourself if interruption prevented the coordinator from doing so. Standalone review, verification and merge requests use the direct routes in [Devflow](../devflow/SKILL.md); they need no execution coordinator unless implementation is requested.
+
+## Coordination cadence
+
+Main task to coordinator and coordinator to worker communication follows one cadence. Work autonomously. Send no routine inter-agent progress during the first 30 minutes of ongoing work. After that, send at most one useful routine update in each subsequent 30-minute interval; an interval ending does not require an update. Do not narrate each step or PR-publication milestone, use repeated short status polls or pokes, or treat silence or a wait-tool timeout as failure or permission to request status.
+
+Send completion, actionable blockers or material decisions, required candidate/results/repair handoffs, and responses to explicit user steering or status requests immediately. The interval must not delay functional collaboration, user-facing commentary, work-record updates or GitHub state transitions.
 
 ## Execution coordinator: finish the assignment
 
@@ -32,7 +38,7 @@ On return, check the consolidated report against the requested endpoint and insp
 
 2. **Dispatch the next useful worker.** Spawn only the implementer, reviewer or verifier by [agent type](../devflow/references/agents.md), with `fork_turns: "none"` and a self-contained brief. Reuse compatible original workers for repairs and rechecks. Never spawn another coordinator or delegate inspection/planning. Work within host capacity; run roles sequentially when slots are limited.
 
-   Every brief includes work ID, worktree, outcome, acceptance conditions, relevant plan/evidence, project instructions, explicit limits and your reply target. Add the role-specific inputs:
+   Every brief includes work ID, worktree, outcome, acceptance conditions, relevant plan/evidence, project instructions, explicit limits, your reply target and the [coordination cadence](#coordination-cadence). Add the role-specific inputs:
 
    | Role | Additional inputs |
    | --- | --- |

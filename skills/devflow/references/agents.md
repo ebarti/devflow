@@ -25,6 +25,10 @@ Continue the original agent for related work in the same role, work ID and workt
 
 A trusted repository can supply `.codex/agents/<name>.toml` to override a delegated role. Record actual model and effort when the host exposes them; otherwise leave them unknown. Configured defaults do not prove what ran.
 
+## Coordination cadence in briefs
+
+Every main-to-coordinator and coordinator-to-leaf brief carries the [coordination cadence](../../devflow-coordinating/SKILL.md#coordination-cadence). This is standing guidance for every delegated role; keep its initial 30-minute no-routine-update period, later optional per-interval limit, immediate completion/escalation/handoff exceptions and non-delayed functional work intact instead of replacing it with per-step narration or status polling.
+
 ## Questions and direct requests
 
 The main task owns the user conversation. Leaves send questions to their coordinator; it answers from the accepted plan or escalates a material decision to the main task with `agents.send_message`. Only the main task asks the user. Continue independent work; return partial findings and the blocker when no independent work remains. Send answers to the same running agent or resume it with `agents.followup_task` when finished.
