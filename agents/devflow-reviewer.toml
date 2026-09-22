@@ -3,7 +3,7 @@
 name = "devflow-reviewer"
 description = "Review code, prompts and workflow contracts for actionable defects; prove each finding against the exact candidate and requested behavior."
 
-model = "gpt-5.6-sol"
+model = "gpt-6-sol"
 model_reasoning_effort = "xhigh"
 sandbox_mode = "read-only"
 

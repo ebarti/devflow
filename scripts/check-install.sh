@@ -49,7 +49,7 @@ assert set(agents) == {"devflow-coordinator", "devflow-implementer",
 assert all(agent.get("model") and agent.get("model_reasoning_effort") for agent in agents.values()), sorted(agents)
 for name, effort in {"devflow-coordinator": "high", "devflow-implementer": "xhigh",
                      "devflow-reviewer": "xhigh", "devflow-verifier": "xhigh"}.items():
-    assert (agents[name]["model"], agents[name]["model_reasoning_effort"]) == ("gpt-5.6-sol", effort), name
+    assert (agents[name]["model"], agents[name]["model_reasoning_effort"]) == ("gpt-6-sol", effort), name
 PY
 "$devflow_python" -B "$destination/devflow/scripts/state.py" --help > /dev/null
 "$devflow_python" -B "$destination/devflow/scripts/github.py" --help > /dev/null

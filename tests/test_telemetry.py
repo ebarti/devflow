@@ -53,7 +53,7 @@ class TranscriptTests(TelemetryCase):
 
         lines = [
             json.dumps({"type": "turn_context", "timestamp": stamp(-10),
-                        "payload": {"model": "gpt-5.6-sol", "effort": "high", "turn_id": "t0"}}),
+                        "payload": {"model": "gpt-6-sol", "effort": "high", "turn_id": "t0"}}),
             usage(-9, "t0", input_tokens=100, cached_input_tokens=20, output_tokens=10, reasoning_output_tokens=4),
             "{not JSON: this line may have carried the last counter before binding",
             usage(1, "t1", input_tokens=1100, cached_input_tokens=220, output_tokens=110, reasoning_output_tokens=44),
@@ -84,7 +84,7 @@ class TranscriptTests(TelemetryCase):
         offset = len(lines[0]) + 1 + len(lines[1]) + 1
         self.assertTrue(gaps["transcript_gap"]["source_ref"].endswith("#byte=" + str(offset)))
         session = self.session()
-        self.assertEqual((session["model"], session["effort"]), ("gpt-5.6-sol", "high"))
+        self.assertEqual((session["model"], session["effort"]), ("gpt-6-sol", "high"))
         self.assertEqual(session["cursor"], len(complete.encode()))  # the partial line waits
         self.assertEqual(session["input_tokens"], 5)  # counters follow the reset
 

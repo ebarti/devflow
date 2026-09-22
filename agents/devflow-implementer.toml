@@ -3,7 +3,7 @@
 name = "devflow-implementer"
 description = "Implement one scoped change, open its PR early, push repairs to the same PR, and report the exact candidate and check results."
 
-model = "gpt-5.6-sol"
+model = "gpt-6-sol"
 model_reasoning_effort = "xhigh"
 model_verbosity = "low"
 model_reasoning_summary = "concise"
