@@ -3,7 +3,7 @@
 name = "devflow-verifier"
 description = "Exercise the identified candidate through real entry points and report observed behavior, failures and verification gaps."
 
-model = "gpt-5.6-sol"
+model = "gpt-6-sol"
 model_reasoning_effort = "xhigh"
 sandbox_mode = "workspace-write"
 

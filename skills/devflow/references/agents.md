@@ -6,10 +6,10 @@ The installer links four definitions from `agents/` into `$CODEX_HOME/agents/`:
 
 | Responsibility | Agent type | Default model | Permission configuration |
 | --- | --- | --- | --- |
-| Execute the plan, maintain records and tracker, manage workers and authorized merges | `devflow-coordinator` | `gpt-5.6-sol` / high | Inherit the main task's permissions |
-| Implement, open PRs and push fixes | `devflow-implementer` | `gpt-5.6-sol` / xhigh | workspace-write |
-| Review code and workflow contracts | `devflow-reviewer` | `gpt-5.6-sol` / xhigh | read-only |
-| Exercise candidate behavior | `devflow-verifier` | `gpt-5.6-sol` / xhigh | workspace-write; evidence only by instruction |
+| Execute the plan, maintain records and tracker, manage workers and authorized merges | `devflow-coordinator` | `gpt-6-sol` / high | Inherit the main task's permissions |
+| Implement, open PRs and push fixes | `devflow-implementer` | `gpt-6-sol` / xhigh | workspace-write |
+| Review code and workflow contracts | `devflow-reviewer` | `gpt-6-sol` / xhigh | read-only |
+| Exercise candidate behavior | `devflow-verifier` | `gpt-6-sol` / xhigh | workspace-write; evidence only by instruction |
 
 ## One execution handoff
 

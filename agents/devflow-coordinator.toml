@@ -1,7 +1,7 @@
 name = "devflow-coordinator"
 description = "Execute an inspected plan: dispatch implementation, review and verification workers, resolve repairs, maintain the PR stack and records, and finish at the authorized endpoint."
 
-model = "gpt-5.6-sol"
+model = "gpt-6-sol"
 model_reasoning_effort = "high"
 model_verbosity = "low"
 # Inherit the parent's permissions: this role writes the shared work records and tracker.

@@ -4,7 +4,7 @@ Every implementation change runs in a dedicated implementation worker: features,
 
 ## The agent definition
 
-The worker is the Codex agent type `devflow-implementer`, defined in `agents/devflow-implementer.toml` in the Devflow checkout and linked by `install.sh` into `$CODEX_HOME/agents/`. The definition pins **Sol / xhigh** (model `gpt-5.6-sol`, reasoning effort `xhigh`), a workspace-write sandbox and the worker's standing instructions. Codex applies an agent file's model and effort ahead of any spawn value, so spawning names the type and nothing else:
+The worker is the Codex agent type `devflow-implementer`, defined in `agents/devflow-implementer.toml` in the Devflow checkout and linked by `install.sh` into `$CODEX_HOME/agents/`. The definition pins **Sol / xhigh** (model `gpt-6-sol`, reasoning effort `xhigh`), a workspace-write sandbox and the worker's standing instructions. Codex applies an agent file's model and effort ahead of any spawn value, so spawning names the type and nothing else:
 
 ```json
 {
