@@ -27,7 +27,7 @@ A trusted repository can supply `.codex/agents/<name>.toml` to override a delega
 
 ## Coordination cadence in briefs
 
-Every main-to-coordinator and coordinator-to-leaf brief carries the [coordination cadence](../../devflow-coordinating/SKILL.md#coordination-cadence). This is standing guidance for every delegated role; keep its 30-minute routine-update limit, immediate completion/escalation/handoff exceptions and non-delayed functional work intact instead of replacing it with per-step narration or status polling.
+Every main-to-coordinator and coordinator-to-leaf brief carries the [coordination cadence](../../devflow-coordinating/SKILL.md#coordination-cadence). This is standing guidance for every delegated role; keep its initial 30-minute no-routine-update period, later optional per-interval limit, immediate completion/escalation/handoff exceptions and non-delayed functional work intact instead of replacing it with per-step narration or status polling.
 
 ## Questions and direct requests
 

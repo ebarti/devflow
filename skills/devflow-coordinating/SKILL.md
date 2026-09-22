@@ -28,7 +28,7 @@ On return, check the consolidated report against the requested endpoint and insp
 
 ## Coordination cadence
 
-Main task to coordinator and coordinator to worker communication follows one cadence. Work autonomously and send routine inter-agent progress at most once per 30 minutes. Do not narrate each step or PR-publication milestone, use repeated short status polls or pokes, or treat silence or a wait-tool timeout as failure or permission to request status.
+Main task to coordinator and coordinator to worker communication follows one cadence. Work autonomously. Send no routine inter-agent progress during the first 30 minutes of ongoing work. After that, send at most one useful routine update in each subsequent 30-minute interval; an interval ending does not require an update. Do not narrate each step or PR-publication milestone, use repeated short status polls or pokes, or treat silence or a wait-tool timeout as failure or permission to request status.
 
 Send completion, actionable blockers or material decisions, required candidate/results/repair handoffs, and responses to explicit user steering or status requests immediately. The interval must not delay functional collaboration, user-facing commentary, work-record updates or GitHub state transitions.
 
