@@ -11,6 +11,35 @@ trap 'rm -rf "$install_fixture"' EXIT HUP INT TERM
 destination="$install_fixture/skills"
 devflow_python=${DEVFLOW_PYTHON:-python3.12}
 
+# Compare complete installed trees, including regular-file bytes and symlink targets.
+# Git's internal checkout metadata changes during a rejected update, so omit .git.
+snapshot_install() {
+    "$devflow_python" -B - "$@" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+def snapshot(path):
+    if not os.path.lexists(path):
+        return ["missing"]
+    mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode):
+        return ["link", os.readlink(path)]
+    if stat.S_ISDIR(mode):
+        return ["directory", stat.S_IMODE(mode),
+                {child.name: snapshot(child) for child in sorted(path.iterdir())
+                              if child.name != ".git"}]
+    if stat.S_ISREG(mode):
+        return ["file", stat.S_IMODE(mode), hashlib.sha256(path.read_bytes()).hexdigest()]
+    return ["other", mode]
+
+print(json.dumps({str(path): snapshot(path) for path in map(Path, sys.argv[1:])}, sort_keys=True))
+PY
+}
+
 sh "$source_root/scripts/install.sh" "$destination" "$install_fixture/codex"
 for name in devflow devflow-defining-work devflow-planning \
     devflow-coordinating devflow-implementing devflow-reviewing devflow-verifying \
@@ -136,10 +165,13 @@ test "$(cat "$fresh_conflict/codex/agents/devflow-implementer.toml")" = 'custom 
 
 # A skills path below a regular file is rejected before copying any agents.
 printf 'keep\n' > "$install_fixture/blocked-skills-parent"
+snapshot_install "$install_fixture/blocked-skills-parent" "$install_fixture/blocked-codex" > "$install_fixture/blocked-install-before.json"
 if sh "$source_root/scripts/install.sh" "$install_fixture/blocked-skills-parent/skills" "$install_fixture/blocked-codex" > /dev/null 2>&1; then
     printf 'Non-directory skills ancestor was accepted.\n' >&2
     exit 1
 fi
+snapshot_install "$install_fixture/blocked-skills-parent" "$install_fixture/blocked-codex" > "$install_fixture/blocked-install-after.json"
+cmp "$install_fixture/blocked-install-before.json" "$install_fixture/blocked-install-after.json"
 test "$(cat "$install_fixture/blocked-skills-parent")" = keep
 test ! -e "$install_fixture/blocked-codex/agents"
 test ! -e "$install_fixture/blocked-codex/.devflow-install.json"
@@ -319,18 +351,39 @@ test -L "$install_fixture/upgraded-skills/devflow-retired"
 test -f "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
 test ! -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
 "$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
-cp "$install_fixture/upgraded-codex/agents/devflow-implementer.toml" "$install_fixture/blocked-upgrade-agent-before.toml"
-cp "$install_fixture/upgraded-codex/agents/.devflow-agent-manifest.json" "$install_fixture/blocked-upgrade-manifest-before.json"
-cp "$install_fixture/upgraded-codex/hooks.json" "$install_fixture/blocked-upgrade-hooks-before.json"
+
+# A symlink followed by .. reaches nested/blocked, not the lexical parent/blocked.
+mkdir -p "$install_fixture/nested/dir"
+printf 'keep\n' > "$install_fixture/nested/blocked"
+ln -s "$install_fixture/nested/dir" "$install_fixture/alias"
+aliased_blocked="$install_fixture/alias/../blocked/skills"
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > "$install_fixture/aliased-install-before.json"
+if sh "$source_root/scripts/install.sh" --force "$aliased_blocked" "$install_fixture/upgraded-codex" > /dev/null 2>&1; then
+    printf 'Install accepted a symlink-plus-parent skills path.\n' >&2
+    exit 1
+fi
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > "$install_fixture/aliased-install-after.json"
+cmp "$install_fixture/aliased-install-before.json" "$install_fixture/aliased-install-after.json"
+"$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
+
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > "$install_fixture/blocked-upgrade-before.json"
 if sh "$install_fixture/checkout/scripts/update.sh" v0.0.2 "$install_fixture/blocked-skills-parent/skills" "$install_fixture/upgraded-codex" > /dev/null 2>&1; then
     printf 'Upgrade accepted a non-directory skills ancestor.\n' >&2
     exit 1
 fi
 test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$release_source" rev-parse v0.0.1)"
 test "$(readlink "$install_fixture/upgraded-skills/devflow")" = "$install_fixture/checkout/skills/devflow"
-cmp "$install_fixture/blocked-upgrade-agent-before.toml" "$install_fixture/upgraded-codex/agents/devflow-implementer.toml"
-cmp "$install_fixture/blocked-upgrade-manifest-before.json" "$install_fixture/upgraded-codex/agents/.devflow-agent-manifest.json"
-cmp "$install_fixture/blocked-upgrade-hooks-before.json" "$install_fixture/upgraded-codex/hooks.json"
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > "$install_fixture/blocked-upgrade-after.json"
+cmp "$install_fixture/blocked-upgrade-before.json" "$install_fixture/blocked-upgrade-after.json"
+"$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > "$install_fixture/aliased-upgrade-before.json"
+if sh "$install_fixture/checkout/scripts/update.sh" v0.0.2 "$aliased_blocked" "$install_fixture/upgraded-codex" > /dev/null 2>&1; then
+    printf 'Upgrade accepted a symlink-plus-parent skills path.\n' >&2
+    exit 1
+fi
+test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$release_source" rev-parse v0.0.1)"
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > "$install_fixture/aliased-upgrade-after.json"
+cmp "$install_fixture/aliased-upgrade-before.json" "$install_fixture/aliased-upgrade-after.json"
 "$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
 printf '\n# User edit\n' >> "$install_fixture/upgraded-codex/agents/devflow-modified-retired.toml"
 git -C "$install_fixture/checkout" checkout -q --detach v0.0.2

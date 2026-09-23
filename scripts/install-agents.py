@@ -36,10 +36,18 @@ def link_target(path):
 
 
 def check_skills_destination(raw_path):
-    target = Path(os.path.abspath(os.path.expanduser(raw_path)))
-    for path in reversed((target, *target.parents)):
-        if exists(path) and not path.is_dir():
-            fail(f"Skills destination has a non-directory component: {path}")
+    raw = Path(raw_path).expanduser()
+    parts = (raw if raw.is_absolute() else Path.cwd() / raw).parts
+    target = Path(parts[0])
+    for part in parts[1:]:
+        if part == "..":
+            target = target.parent
+            continue
+        target /= part
+        if exists(target):
+            target = target.resolve(strict=True)
+            if not target.is_dir():
+                fail(f"Skills destination has a non-directory component: {target}")
     ancestor = target
     while not exists(ancestor):
         ancestor = ancestor.parent
