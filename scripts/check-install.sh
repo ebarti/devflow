@@ -134,6 +134,16 @@ test ! -e "$fresh_conflict/skills"
 test ! -e "$fresh_conflict/codex/hooks.json"
 test "$(cat "$fresh_conflict/codex/agents/devflow-implementer.toml")" = 'custom definition'
 
+# A skills path below a regular file is rejected before copying any agents.
+printf 'keep\n' > "$install_fixture/blocked-skills-parent"
+if sh "$source_root/scripts/install.sh" "$install_fixture/blocked-skills-parent/skills" "$install_fixture/blocked-codex" > /dev/null 2>&1; then
+    printf 'Non-directory skills ancestor was accepted.\n' >&2
+    exit 1
+fi
+test "$(cat "$install_fixture/blocked-skills-parent")" = keep
+test ! -e "$install_fixture/blocked-codex/agents"
+test ! -e "$install_fixture/blocked-codex/.devflow-install.json"
+
 # An unrelated hook with the Devflow marker is a conflict, before any destination mutation.
 hook_conflict="$install_fixture/hook-conflict"
 mkdir -p "$hook_conflict/codex"
@@ -308,6 +318,19 @@ sh "$install_fixture/checkout/scripts/install.sh" "$install_fixture/upgraded-ski
 test -L "$install_fixture/upgraded-skills/devflow-retired"
 test -f "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
 test ! -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+"$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
+cp "$install_fixture/upgraded-codex/agents/devflow-implementer.toml" "$install_fixture/blocked-upgrade-agent-before.toml"
+cp "$install_fixture/upgraded-codex/agents/.devflow-agent-manifest.json" "$install_fixture/blocked-upgrade-manifest-before.json"
+cp "$install_fixture/upgraded-codex/hooks.json" "$install_fixture/blocked-upgrade-hooks-before.json"
+if sh "$install_fixture/checkout/scripts/update.sh" v0.0.2 "$install_fixture/blocked-skills-parent/skills" "$install_fixture/upgraded-codex" > /dev/null 2>&1; then
+    printf 'Upgrade accepted a non-directory skills ancestor.\n' >&2
+    exit 1
+fi
+test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$release_source" rev-parse v0.0.1)"
+test "$(readlink "$install_fixture/upgraded-skills/devflow")" = "$install_fixture/checkout/skills/devflow"
+cmp "$install_fixture/blocked-upgrade-agent-before.toml" "$install_fixture/upgraded-codex/agents/devflow-implementer.toml"
+cmp "$install_fixture/blocked-upgrade-manifest-before.json" "$install_fixture/upgraded-codex/agents/.devflow-agent-manifest.json"
+cmp "$install_fixture/blocked-upgrade-hooks-before.json" "$install_fixture/upgraded-codex/hooks.json"
 "$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
 printf '\n# User edit\n' >> "$install_fixture/upgraded-codex/agents/devflow-modified-retired.toml"
 git -C "$install_fixture/checkout" checkout -q --detach v0.0.2

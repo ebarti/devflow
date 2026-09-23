@@ -35,6 +35,18 @@ def link_target(path):
     return Path(os.path.abspath(path.parent / os.readlink(path)))
 
 
+def check_skills_destination(raw_path):
+    target = Path(os.path.abspath(os.path.expanduser(raw_path)))
+    for path in reversed((target, *target.parents)):
+        if exists(path) and not path.is_dir():
+            fail(f"Skills destination has a non-directory component: {path}")
+    ancestor = target
+    while not exists(ancestor):
+        ancestor = ancestor.parent
+    if not os.access(ancestor, os.W_OK | os.X_OK):
+        fail(f"Skills destination cannot be created or changed: {ancestor}")
+
+
 def manifest_for(path, source_root):
     if not exists(path):
         return {"schema_version": 1, "source_root": str(source_root), "agents": {}}
@@ -187,6 +199,7 @@ def main():
     if len(sys.argv) != 6 or sys.argv[1] not in {"preflight", "apply"}:
         fail("usage: install-agents.py preflight|apply SOURCE_ROOT SKILLS CODEX_HOME FORCE")
     mode, source_root, skills, codex_home, force = sys.argv[1:]
+    check_skills_destination(skills)
     source_root, skills, codex_home = (Path(path).expanduser().resolve() for path in (source_root, skills, codex_home))
     sources, hashes, actions, obsolete, manifest_path = plan(source_root, skills, codex_home, force == "true")
     if mode == "preflight":
