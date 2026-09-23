@@ -18,6 +18,12 @@ bash scripts/install.sh
 
 The installer uses `python3.12`; set `DEVFLOW_PYTHON` to select another supported interpreter. Hooks record its resolved absolute executable path at installation, so later `PATH` changes do not switch Python. Reinstall to change the interpreter. The helpers use only the standard library; no pip dependencies are required.
 
+The installed hook keeps a checkout snapshot in Codex home. If that checkout
+changes or a linked skill disappears, the hook reports installation drift before
+loading source code. Check it directly with
+`python3.12 "$CODEX_HOME/.devflow-hook.py" --check` (use `~/.codex` when
+`CODEX_HOME` is unset), then restore the checkout or rerun installation.
+
 The defaults are `~/.agents/skills` for skills and `$CODEX_HOME` (`~/.codex` when unset) for the agent definitions in `agents/` and the metrics hooks in `hooks.json`. Supply custom locations when needed:
 
 ```sh

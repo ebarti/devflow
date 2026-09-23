@@ -70,6 +70,24 @@ On `--release`, active local work becomes waiting; completion of a narrower requ
 endpoint can still be recorded separately. A failed GitHub update stays visible in
 the local record and retains the claim for reconciliation and retry by its owner.
 
+Run `github.py audit --work-id WORK_ID` before resuming or ending an owned issue.
+It reads the local work, claim and owner runtime plus the live issue, assignee and
+selected Project item. A successful sync stores its expected issue state, assignee,
+Project/item/Status IDs and readback time in `details.github.sync`. Older records
+without that metadata report `unknown` while observing any discoverable selected
+Project item; an audit never treats missing history as
+a pass. The command changes neither GitHub nor SQLite and exits nonzero for an
+unknown or reconciliation-required result. Resolve differences with an explicit
+`github.py set` and read back again. A failed API read also exits nonzero.
+
+For an external Actions handoff, set `--status blocked --reason REASON` with
+`--await-url ACTIONS_RUN_URL --follow-up 'OWNER checks when TRIGGER occurs'`.
+The run URL and concrete follow-up survive in the work record. Audit checks the
+actual run state: pending remains a wait; a terminal run requires reconciliation
+of the requested outcome, authorization and issue state. A successful run alone
+does not approve, close or release anything. Existing `details.release_run` URLs
+are read for compatibility, but their missing follow-up remains unknown.
+
 ## Concurrency and interruption
 
 Independent issues use separate work IDs and worktrees. A main task may own
@@ -83,7 +101,13 @@ python3.12 ~/.agents/skills/devflow/scripts/state.py work list --claimed
 ```
 
 This lists owners and last observations, not live process health. Claims have no
-automatic expiry. On interruption, inspect the host task and current GitHub state.
+automatic expiry. A normal root Stop blocks while that root still holds issue
+claims; it directs the owner to audit, set and release. Leaf and execution
+coordinator returns do not block on the root's claim. An observed root Interrupt
+or SessionEnd marks its owned work blocked for reconciliation and retains the
+claim; hooks make no network call or tracker change. A hard crash or missing hook
+can leave no local observation, so inspect the host task and run the audit on
+recovery. The audit reports a confirmed closed owner that still holds a claim.
 After confirming the old main task and its delegated execution have stopped, release its claim with
 `state.py work release --id WORK_ID --owner PREVIOUS_HOST_TASK_ID`, then resume with
 the same work ID and the new owner. An active owner must release before handoff.

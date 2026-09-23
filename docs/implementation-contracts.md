@@ -23,6 +23,17 @@ Schema 4 upgrades schemas 2 and 3 transactionally, adding claims and runtime tab
 
 `works.details.github` retains the selected Project, Status mappings and any unresolved creation attempt. Creation records its attempt before calling GitHub and saves the issue URL before further updates. A missing result requires reconciliation, never an automatic second create. Project Status and assignment are read back before success; labels and other Project fields are untouched.
 
+Successful synchronization also stores `details.github.sync`: expected issue
+state, assignee, Project/item/field/option IDs, selected Status and readback time.
+`github.py audit --work-id` opens SQLite read-only, compares that expectation
+and local claim/runtime with the live issue and selected Project item, and
+returns `consistent`, `unknown` or `reconciliation_required`. Legacy records
+without the successful-sync metadata remain unknown. An observed root owner
+SessionEnd with a retained claim requires reconciliation; no claim expires on
+elapsed time. A tracked `details.github.await` Actions URL and follow-up are
+read during audit, as is a legacy `details.release_run` URL. Terminal run state
+signals review, not acceptance, closure or approval. API failure cannot pass.
+
 Record timestamps are supplied automatically when omitted. Active and terminal work/run updates stamp missing start/end observations; explicit nulls remain unknown. Legacy imports retain unknown endpoints. Observation times accept timezone-aware ISO 8601 values. A run's duration derives from its start/end timestamps; unfinished runs have no inferred duration. Evidence references are locators, not copied or validated artifacts.
 
 Metrics query stored rows directly. Global usage counts each unique observation once, including unallocated usage; a work report sums its weighted allocations. Hooks observe cumulative token deltas from the local transcript adapter. A cursor and counters commit with observations, making replay safe; partial lines wait for completion, counter resets record a gap, and a malformed line is recorded as a `transcript_gap` event and skipped rather than stalling the cursor; the next counter after it becomes a new baseline recorded as a `counter_baseline` gap, so a skipped line can hide usage from a work but never charge earlier usage to it. Hosted tools and absent hooks are outside runtime coverage. Prompts, arguments and outputs are never copied into telemetry.

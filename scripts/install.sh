@@ -62,7 +62,9 @@ check_links "$source_root/skills" "$destination"
 check_links "$source_root/agents" "$codex_directory/agents"
 make_links "$source_root/skills" "$destination"
 make_links "$source_root/agents" "$codex_directory/agents"
-"$devflow_python" -B "$destination/devflow/scripts/telemetry.py" install --codex-home "$codex_directory"
+"$devflow_python" -B "$source_root/scripts/install-guard.py" snapshot "$source_root" "$destination" "$codex_directory"
+"$devflow_python" -B "$destination/devflow/scripts/telemetry.py" install --codex-home "$codex_directory" \
+    --guard-path "$codex_directory/.devflow-hook.py"
 prune_links "$source_root/skills" "$destination"
 prune_links "$source_root/agents" "$codex_directory/agents"
 printf 'Skills installed in %s\nAgent definitions installed in %s\nKeep this checkout at %s.\n' \

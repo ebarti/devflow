@@ -67,7 +67,29 @@ def action_url(url, host):
 def project_item(host, item_id):
     return graphql(host, """query($item:ID!){node(id:$item){
         ... on ProjectV2Item{project{id} fieldValueByName(name:"Status"){
-            ... on ProjectV2ItemFieldSingleSelectValue{optionId}}}}}""", item=item_id)["node"]
+        ... on ProjectV2ItemFieldSingleSelectValue{optionId}}}}}""", item=item_id)["node"]
+
+
+def legacy_project_item(project_url, issue_id):
+    """Observe a bounded legacy Project membership without inventing its expected Status."""
+    parsed = urlsplit(project_url)
+    parts = parsed.path.strip("/").split("/")
+    if (parsed.scheme != "https" or len(parts) != 4 or parts[0] not in {"users", "orgs"}
+            or parts[2] != "projects" or not parts[3].isdigit()):
+        raise ValueError("legacy Project URL is invalid")
+    owner_type = "user" if parts[0] == "users" else "organization"
+    selected = graphql(parsed.netloc, """query($owner:String!,$number:Int!){OWNER(login:$owner){
+        projectV2(number:$number){id}}}""".replace("OWNER", owner_type),
+        owner=parts[1], number=int(parts[3]))
+    project_id = ((selected.get(owner_type) or {}).get("projectV2") or {}).get("id")
+    if not project_id:
+        return None
+    observed = graphql(parsed.netloc, """query($issue:ID!){node(id:$issue){
+        ... on Issue{projectItems(first:100){nodes{id project{id}
+        fieldValueByName(name:"Status"){
+        ... on ProjectV2ItemFieldSingleSelectValue{optionId name}}}}}}}""", issue=issue_id)
+    items = (((observed.get("node") or {}).get("projectItems") or {}).get("nodes") or [])
+    return next((item for item in items if (item.get("project") or {}).get("id") == project_id), None)
 
 
 def project(url, status_name):
@@ -151,6 +173,8 @@ def synchronize(db, args):
         saved = details(work).get("github", {})
     status_name = args.project_status or saved.get("statuses", {}).get(args.status) or STATUSES[args.status][2]
     selected = project(args.project or saved.get("project"), status_name)
+    if args.await_url:
+        action_url(args.await_url, selected["host"])
     if args.action == "create":
         issue_url = create_issue(db, args, selected["url"])
     else:
@@ -242,7 +266,7 @@ def audit(db, work_id):
     tracking = details(work).get("github", {})
     claim = state.claim_for(db, work_id)
     result = dict(work_id=work_id, issue=work["issue"], local_status=work["status"],
-                  claim=claim, checks=[], reconciliation_required=[], unknown=[])
+                  claim=claim, reconciliation_required=[], unknown=[])
     if not work["issue"]:
         result["unknown"].append("issue_not_linked")
     else:
@@ -253,6 +277,10 @@ def audit(db, work_id):
         if not isinstance(sync, dict) or not all(sync.get(k) for k in (
                 "issue_state", "assignee", "project", "project_id", "item_id", "option_id", "readback_at")):
             result["unknown"].append("legacy_sync_expectation")
+            if tracking.get("project"):
+                result["project_observed"] = legacy_project_item(tracking["project"], observed["id"])
+                if not result["project_observed"]:
+                    result["unknown"].append("legacy_project_item_not_found_in_first_100")
         else:
             result["expected"] = sync
             if observed["state"] != sync["issue_state"]:
@@ -269,6 +297,8 @@ def audit(db, work_id):
                 result["reconciliation_required"].append("local_status_mismatch")
         if work["status"] == "done" and observed["state"] != "CLOSED":
             result["reconciliation_required"].append("done_issue_open")
+        if work["status"] in {"active", "blocked", "paused", "waiting"} and observed["state"] != "OPEN":
+            result["reconciliation_required"].append("unfinished_issue_closed")
     if claim:
         owner = db.execute("SELECT role,closed_at FROM runtime_sessions WHERE id=?", (claim["owner"],)).fetchone()
         if owner and owner["role"] == "coordinator" and owner["closed_at"]:
@@ -279,16 +309,24 @@ def audit(db, work_id):
     awaited = tracking.get("await")
     if not awaited and isinstance(details(work).get("release_run"), str):
         awaited = dict(url=details(work)["release_run"], follow_up=None, legacy=True)
-    if awaited:
+    if awaited and not work["issue"]:
+        result["unknown"].append("awaited_run_issue_unknown")
+    elif awaited:
         url = action_url(awaited["url"], urlsplit(work["issue"]).netloc)
-        run = gh("run", "view", url, "--json", "status,conclusion,url", as_json=True)
+        parsed = urlsplit(url)
+        owner, repository, _, _, run_id = parsed.path.strip("/").split("/")
+        run = gh("run", "view", run_id, "--repo", f"{parsed.netloc}/{owner}/{repository}",
+                 "--json", "status,conclusion,url", as_json=True)
         result["awaited_run"] = dict(url=url, status=run["status"], conclusion=run.get("conclusion"),
                                       follow_up=awaited.get("follow_up"))
         if run["status"] == "completed":
-            if work["status"] in {"blocked", "waiting", "active"}:
+            if run.get("conclusion") != "success" or work["status"] in {"blocked", "waiting", "active"}:
                 result["reconciliation_required"].append("awaited_run_completed")
-        elif not awaited.get("follow_up"):
-            result["unknown"].append("awaited_run_follow_up_unknown")
+        else:
+            if run["status"] not in {"queued", "in_progress", "requested", "waiting", "pending"}:
+                result["unknown"].append("awaited_run_status_unknown")
+            if not awaited.get("follow_up"):
+                result["unknown"].append("awaited_run_follow_up_unknown")
     result["state"] = ("reconciliation_required" if result["reconciliation_required"] else
                        "unknown" if result["unknown"] else "consistent")
     return result
@@ -337,6 +375,8 @@ def main():
             raise ValueError("blocked requires --reason")
         if bool(args.await_url) != bool(args.follow_up) or (args.await_url and args.status != "blocked"):
             raise ValueError("--await-url and --follow-up are required together with --status blocked")
+        if args.await_url and args.action == "create":
+            raise ValueError("create cannot hand off an Actions run; use set after the issue exists")
         if args.action == "create" and args.status == "done":
             raise ValueError("create starts an open issue; use start to reconcile a closed issue")
         if args.release and args.status == "in-progress":

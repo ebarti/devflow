@@ -20,6 +20,9 @@ done
 for name in state.py github.py legacy.py telemetry.py measurements.py schema.sql; do
     test -r "$destination/devflow/scripts/$name"
 done
+test -r "$source_root/scripts/install-guard.py"
+test -r "$install_fixture/codex/.devflow-install.json"
+test -r "$install_fixture/codex/.devflow-hook.py"
 for agent in "$source_root"/agents/*.toml; do
     test "$(readlink "$install_fixture/codex/agents/${agent##*/}")" = "$agent"
 done
@@ -154,7 +157,24 @@ git -C "$install_fixture/checkout" checkout -q --detach v0.0.1
 sh "$install_fixture/checkout/scripts/install.sh" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > /dev/null
 test -L "$install_fixture/upgraded-skills/devflow-retired"
 test -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+"$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
+git -C "$install_fixture/checkout" checkout -q --detach v0.0.2
+if "$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null; then
+    printf 'Mutable checkout drift went undetected.\n' >&2
+    exit 1
+fi
+"$devflow_python" -B - "$install_fixture/upgraded-codex/.devflow-hook.py" <<'PY'
+import json
+import subprocess
+import sys
+
+result = subprocess.run([sys.executable, "-B", sys.argv[1]], input="{}", text=True,
+                        capture_output=True, check=True)
+assert "installation drift" in json.loads(result.stdout)["systemMessage"]
+PY
+git -C "$install_fixture/checkout" checkout -q --detach v0.0.1
 sh "$install_fixture/checkout/scripts/update.sh" v0.0.2 "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > /dev/null
+"$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
 test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$release_source" rev-parse v0.0.2)"
 test ! -L "$install_fixture/upgraded-skills/devflow-retired"
 test ! -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"

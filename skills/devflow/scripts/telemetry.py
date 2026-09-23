@@ -122,6 +122,35 @@ def boundary_decision(db, payload):
     return boundary_violation(payload.get("tool_name"), payload.get("tool_input"))
 
 
+def root_claims(db, session_id):
+    """Only the actual main task can settle its claims; delegated returns are not owner stops."""
+    saved = db.execute("SELECT role,closed_at FROM runtime_sessions WHERE id=?", (session_id,)).fetchone()
+    if not saved or saved[0] != "coordinator" or saved[1]:
+        return []
+    return [r[0] for r in db.execute("""SELECT c.work_id FROM claims c
+        JOIN works w ON w.id=c.work_id JOIN runtime_scopes s ON s.work_id=c.work_id
+        WHERE c.owner=? AND s.session_id=? AND w.issue IS NOT NULL ORDER BY c.work_id""",
+        (session_id, session_id))]
+
+
+def stop_response(work_ids, stop_hook_active):
+    if not work_ids:
+        return None
+    message = ("Devflow issue claims still belong to this task: " + ", ".join(work_ids) +
+               ". Reconcile each issue with github.py audit, then github.py set --release.")
+    if stop_hook_active:
+        return {"systemMessage": message}
+    return {"decision": "block", "reason": message}
+
+
+def mark_interrupted_owner(db, session_id, stamp, event_name):
+    for work_id in root_claims(db, session_id):
+        work = state.row(db, "works", work_id)
+        blocker = "Owner " + event_name + " observed at " + stamp + "; issue and claim require reconciliation"
+        if work["status"] != "blocked" or work["blocker"] != blocker:
+            state.update(db, "work", dict(id=work_id, status="blocked", blocker=blocker), None)
+
+
 def child_binding(db, payload):
     """Resolve an unbound/resumed child from native hook and rollout identities. Read-only."""
     child = payload.get("agent_id")
@@ -387,7 +416,7 @@ def tool_status(response):
     return "returned"
 
 
-def handle(db, payload, reason=None):
+def handle(db, payload, reason=None, stop=None):
     started = time.monotonic()
     response = None
     inherited = child_binding(db, payload)
@@ -403,6 +432,11 @@ def handle(db, payload, reason=None):
     name = payload.get("hook_event_name")
     stamp = state.now()
     turn_id = payload.get("turn_id")
+    if name == "Stop":
+        response = stop if stop is not None else stop_response(root_claims(db, session_id),
+                                                                payload.get("stop_hook_active"))
+    elif name in ("Interrupt", "SessionEnd"):
+        mark_interrupted_owner(db, session_id, stamp, name)
     if name in ("SubagentStart", "SubagentStop"):
         child = payload.get("agent_id")
         if child:
@@ -448,7 +482,8 @@ def handle(db, payload, reason=None):
             event(db, session_id, identity(session_id, name, turn_id, payload.get("source"), session["cursor"]), name, stamp,
                   turn_id, name=payload.get("source") or payload.get("trigger"))
         if name in ("Stop", "Interrupt"):
-            turn(db, session, turn_id, stamp, "completed" if name == "Stop" else "interrupted")
+            turn(db, session, turn_id, stamp, "blocked" if name == "Stop" and response and response.get("decision") == "block"
+                 else "completed" if name == "Stop" else "interrupted")
             close_if_released(db, session_id, stamp)
         elif name == "SessionEnd":
             db.execute("UPDATE runtime_sessions SET closed_at=? WHERE id=?", (stamp, session_id))
@@ -467,11 +502,13 @@ def close_if_released(db, session_id, timestamp):
         db.execute("UPDATE runtime_sessions SET closed_at=? WHERE id=?", (timestamp, session_id))
 
 
-def install(codex_home):
+def install(codex_home, guard_path=None):
     path = Path(codex_home).expanduser() / "hooks.json"
     original = json.loads(path.read_text()) if path.exists() else {}
     hooks = original.setdefault("hooks", {})
     command = shlex.join([str(Path(sys.executable).resolve()), "-B",
+                          str(Path(guard_path).absolute())] if guard_path else
+                         [str(Path(sys.executable).resolve()), "-B",
                           str(Path(__file__).absolute()), "hook"])
     for name in EVENTS:
         groups = hooks.setdefault(name, [])
@@ -502,11 +539,12 @@ def main():
     binding.add_argument("--role")
     installing = commands.add_parser("install")
     installing.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    installing.add_argument("--guard-path")
     commands.add_parser("hook")
     args = parser.parse_args()
     try:
         if args.command == "install":
-            result = install(args.codex_home)
+            result = install(args.codex_home, args.guard_path)
         elif args.command == "hook":
             payload = json.load(sys.stdin)
             if not isinstance(payload, dict):
@@ -522,6 +560,8 @@ def main():
                 actor_payload = dict(payload, session_id=actor)
                 bound = present and check.execute("SELECT 1 FROM runtime_sessions WHERE id=? AND closed_at IS NULL", (actor,)).fetchone()
                 reason = boundary_decision(check, actor_payload) if bound else None
+                stop = (stop_response(root_claims(check, actor), payload.get("stop_hook_active"))
+                        if bound and payload.get("hook_event_name") == "Stop" else None)
                 if inherited:
                     bound = True
                     if payload.get("hook_event_name") == "PreToolUse" and inherited["role"] in COORDINATOR_ROLES:
@@ -530,13 +570,13 @@ def main():
                 print("{}")
                 return 0
             # The boundary is decided before collection and its denial survives any collector failure.
-            result = deny(reason) if reason else {}
+            result = deny(reason) if reason else stop or {}
             try:
                 with closing(state.connect(args.db)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     if inherited:
                         bind(db, **inherited)
-                    handle(db, payload, reason)
+                    handle(db, payload, reason, stop)
             except (ValueError, OSError, sqlite3.Error) as exc:
                 failure = "Devflow metrics collection failed: " + str(exc)
                 result["systemMessage"] = (result["systemMessage"] + " " + failure) if result.get("systemMessage") else failure
