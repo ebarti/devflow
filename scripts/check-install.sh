@@ -366,6 +366,20 @@ snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" 
 cmp "$install_fixture/aliased-install-before.json" "$install_fixture/aliased-install-after.json"
 "$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
 
+# A quoted ~ stays literal in the shell; the preflight must inspect that path.
+quoted_cwd="$install_fixture/quoted-cwd"
+quoted_home="$install_fixture/quoted-home"
+mkdir -p "$quoted_cwd" "$quoted_home/skills"
+printf 'keep\n' > "$quoted_cwd/~"
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" "$quoted_cwd" "$quoted_home" > "$install_fixture/quoted-install-before.json"
+if (cd "$quoted_cwd" && HOME="$quoted_home" sh "$source_root/scripts/install.sh" --force '~/skills' "$install_fixture/upgraded-codex" > /dev/null 2>&1); then
+    printf 'Install accepted a quoted skills path below a regular file.\n' >&2
+    exit 1
+fi
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" "$quoted_cwd" "$quoted_home" > "$install_fixture/quoted-install-after.json"
+cmp "$install_fixture/quoted-install-before.json" "$install_fixture/quoted-install-after.json"
+"$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
+
 snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > "$install_fixture/blocked-upgrade-before.json"
 if sh "$install_fixture/checkout/scripts/update.sh" v0.0.2 "$install_fixture/blocked-skills-parent/skills" "$install_fixture/upgraded-codex" > /dev/null 2>&1; then
     printf 'Upgrade accepted a non-directory skills ancestor.\n' >&2
@@ -385,6 +399,21 @@ test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$releas
 snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > "$install_fixture/aliased-upgrade-after.json"
 cmp "$install_fixture/aliased-upgrade-before.json" "$install_fixture/aliased-upgrade-after.json"
 "$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" "$quoted_cwd" "$quoted_home" > "$install_fixture/quoted-upgrade-before.json"
+if (cd "$quoted_cwd" && HOME="$quoted_home" sh "$install_fixture/checkout/scripts/update.sh" v0.0.2 '~/skills' "$install_fixture/upgraded-codex" > /dev/null 2>&1); then
+    printf 'Upgrade accepted a quoted skills path below a regular file.\n' >&2
+    exit 1
+fi
+test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$release_source" rev-parse v0.0.1)"
+snapshot_install "$install_fixture/checkout" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" "$quoted_cwd" "$quoted_home" > "$install_fixture/quoted-upgrade-after.json"
+cmp "$install_fixture/quoted-upgrade-before.json" "$install_fixture/quoted-upgrade-after.json"
+"$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
+rm "$quoted_cwd/~"
+mkdir "$quoted_cwd/~"
+(cd "$quoted_cwd" && HOME="$quoted_home" sh "$source_root/scripts/install.sh" '~/skills' "$quoted_cwd/codex" > /dev/null)
+test "$(readlink "$quoted_cwd/~/skills/devflow")" = "$source_root/skills/devflow"
+test ! -e "$quoted_home/skills/devflow"
+"$devflow_python" -B "$quoted_cwd/codex/.devflow-hook.py" --check > /dev/null
 printf '\n# User edit\n' >> "$install_fixture/upgraded-codex/agents/devflow-modified-retired.toml"
 git -C "$install_fixture/checkout" checkout -q --detach v0.0.2
 if "$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null; then

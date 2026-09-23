@@ -36,7 +36,8 @@ def link_target(path):
 
 
 def check_skills_destination(raw_path):
-    raw = Path(raw_path).expanduser()
+    # install.sh passes quoted paths to mkdir unchanged, including a literal ~.
+    raw = Path(raw_path)
     parts = (raw if raw.is_absolute() else Path.cwd() / raw).parts
     target = Path(parts[0])
     for part in parts[1:]:
@@ -208,7 +209,9 @@ def main():
         fail("usage: install-agents.py preflight|apply SOURCE_ROOT SKILLS CODEX_HOME FORCE")
     mode, source_root, skills, codex_home, force = sys.argv[1:]
     check_skills_destination(skills)
-    source_root, skills, codex_home = (Path(path).expanduser().resolve() for path in (source_root, skills, codex_home))
+    source_root = Path(source_root).expanduser().resolve()
+    skills = Path(skills).resolve()
+    codex_home = Path(codex_home).expanduser().resolve()
     sources, hashes, actions, obsolete, manifest_path = plan(source_root, skills, codex_home, force == "true")
     if mode == "preflight":
         return 0
