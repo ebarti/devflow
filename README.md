@@ -8,10 +8,15 @@ Devflow targets Codex CLI: skills load from its skills directory, metrics hooks 
 
 ## Install
 
-Keep a release checkout at a stable location; installed skills and agent definitions are symlinks into it.
+Keep a published release checkout at a stable location; installed skills are
+symlinks into it, and agent definitions are symlinks or preserved matching
+regular files. Set `RELEASE_TAG` to an approved,
+published tag that contains the installer and agent definitions you intend to
+use. To get the regular-agent compatibility in this PR, that tag must be
+created after the change is approved and released; an open PR is not a release.
 
 ```sh
-git clone --branch v0.1.0 https://github.com/ebarti/devflow.git
+git clone --branch "$RELEASE_TAG" https://github.com/ebarti/devflow.git
 cd devflow
 bash scripts/install.sh
 ```
@@ -40,10 +45,11 @@ bash scripts/install.sh --force
 
 ## Upgrade
 
-Choose a [release tag](https://github.com/ebarti/devflow/releases) and upgrade the existing checkout between tasks:
+Set `RELEASE_TAG` to the chosen [approved release tag](https://github.com/ebarti/devflow/releases)
+and upgrade the existing checkout between tasks:
 
 ```sh
-bash scripts/update.sh v0.1.0
+bash scripts/update.sh "$RELEASE_TAG"
 ```
 
 The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill and agent-definition links owned by this checkout are removed; other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
@@ -56,7 +62,7 @@ From a development worktree, use a new trial directory for each candidate and a 
 python3.12 scripts/candidate.py /path/to/trial -C /path/to/project-worktree
 ```
 
-The launcher isolates skills, agent definitions, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration selects Astra/xhigh for the main task and belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit.
+The launcher isolates skills, agent definitions, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration selects Astra/xhigh for the main task and belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit. A change still in an open PR belongs only in such a frozen review/trial checkout until it has an approved release tag.
 
 Publish a new release tag after the installation smoke check and the selected product trial pass. Release tags remain fixed; normal installations advance only through an explicit upgrade.
 
