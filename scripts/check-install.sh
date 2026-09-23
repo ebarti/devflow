@@ -24,8 +24,11 @@ test -r "$source_root/scripts/install-guard.py"
 test -r "$install_fixture/codex/.devflow-install.json"
 test -r "$install_fixture/codex/.devflow-hook.py"
 for agent in "$source_root"/agents/*.toml; do
-    test "$(readlink "$install_fixture/codex/agents/${agent##*/}")" = "$agent"
+    installed="$install_fixture/codex/agents/${agent##*/}"
+    test -f "$installed" && test ! -L "$installed"
+    cmp "$agent" "$installed"
 done
+test -f "$install_fixture/codex/agents/.devflow-agent-manifest.json"
 "$devflow_python" -B - "$install_fixture/codex/agents" <<'PY'
 import pathlib
 import re
@@ -67,7 +70,9 @@ for agent in "$source_root"/agents/*.toml; do
 done
 printf 'unrelated\n' > "$copy_home/codex/agents/custom-agent.toml"
 sh "$source_root/scripts/install.sh" "$copy_home/skills" "$copy_home/codex" > /dev/null
+cp "$copy_home/codex/agents/.devflow-agent-manifest.json" "$install_fixture/copy-manifest-before.json"
 sh "$source_root/scripts/install.sh" --force "$copy_home/skills" "$copy_home/codex" > /dev/null
+cmp "$install_fixture/copy-manifest-before.json" "$copy_home/codex/agents/.devflow-agent-manifest.json"
 for agent in "$source_root"/agents/*.toml; do
     target="$copy_home/codex/agents/${agent##*/}"
     test -f "$target" && test ! -L "$target"
@@ -75,6 +80,34 @@ for agent in "$source_root"/agents/*.toml; do
 done
 test "$(cat "$copy_home/codex/agents/custom-agent.toml")" = unrelated
 "$devflow_python" -B "$copy_home/codex/.devflow-hook.py" --check > /dev/null
+# A stale recorded hash cannot authorize replacing a current matching copy.
+"$devflow_python" -B - "$copy_home/codex/agents/.devflow-agent-manifest.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text())
+manifest["agents"]["devflow-implementer.toml"]["sha256"] = "0" * 64
+path.write_text(json.dumps(manifest))
+PY
+sh "$source_root/scripts/install.sh" "$copy_home/skills" "$copy_home/codex" > /dev/null
+cmp "$source_root/agents/devflow-implementer.toml" "$copy_home/codex/agents/devflow-implementer.toml"
+"$devflow_python" -B - "$copy_home/codex/agents/.devflow-agent-manifest.json" "$source_root/agents/devflow-implementer.toml" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+assert manifest["agents"]["devflow-implementer.toml"]["sha256"] == hashlib.sha256(Path(sys.argv[2]).read_bytes()).hexdigest()
+PY
+# Prior owned agent symlinks migrate to readable regular copies.
+rm "$copy_home/codex/agents/devflow-coordinator.toml"
+ln -s "$source_root/agents/devflow-coordinator.toml" "$copy_home/codex/agents/devflow-coordinator.toml"
+sh "$source_root/scripts/install.sh" "$copy_home/skills" "$copy_home/codex" > /dev/null
+test -f "$copy_home/codex/agents/devflow-coordinator.toml"
+test ! -L "$copy_home/codex/agents/devflow-coordinator.toml"
 cp "$copy_home/codex/hooks.json" "$install_fixture/copy-hooks-before.json"
 printf '\n# Drifted copy\n' >> "$copy_home/codex/agents/devflow-implementer.toml"
 if "$devflow_python" -B "$copy_home/codex/.devflow-hook.py" --check > /dev/null; then
@@ -100,6 +133,20 @@ fi
 test ! -e "$fresh_conflict/skills"
 test ! -e "$fresh_conflict/codex/hooks.json"
 test "$(cat "$fresh_conflict/codex/agents/devflow-implementer.toml")" = 'custom definition'
+
+# An unrelated hook with the Devflow marker is a conflict, before any destination mutation.
+hook_conflict="$install_fixture/hook-conflict"
+mkdir -p "$hook_conflict/codex"
+printf '%s\n' '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"custom hook","statusMessage":"Record Devflow metrics"}]}]}}' > "$hook_conflict/codex/hooks.json"
+cp "$hook_conflict/codex/hooks.json" "$install_fixture/hook-conflict-before.json"
+if sh "$source_root/scripts/install.sh" --force "$hook_conflict/skills" "$hook_conflict/codex" > /dev/null 2>&1; then
+    printf 'Unowned metric hook was replaced.\n' >&2
+    exit 1
+fi
+test ! -e "$hook_conflict/skills"
+test ! -e "$hook_conflict/codex/agents"
+test ! -e "$hook_conflict/codex/.devflow-install.json"
+cmp "$install_fixture/hook-conflict-before.json" "$hook_conflict/codex/hooks.json"
 
 # Installed hooks keep the installing interpreter even with an empty PATH.
 "$devflow_python" -B - "$install_fixture/codex/hooks.json" <<'PY'
@@ -151,7 +198,9 @@ test ! -L "$destination/devflow-obsolete-install-smoke"
 test ! -L "$destination/devflow-delivering"
 test -L "$destination/unrelated"
 for agent in "$source_root"/agents/*; do
-    test "$(readlink "$install_fixture/codex/agents/${agent##*/}")" = "$agent"
+    installed="$install_fixture/codex/agents/${agent##*/}"
+    test -f "$installed" && test ! -L "$installed"
+    cmp "$agent" "$installed"
 done
 test ! -L "$install_fixture/codex/agents/devflow-obsolete-install-smoke.toml"
 test ! -L "$install_fixture/codex/agents/devflow-deliverer.toml"
@@ -185,21 +234,26 @@ cp -R "$source_root/scripts" "$source_root/skills" "$source_root/agents" "$relea
 mkdir "$release_source/skills/devflow-retired"
 printf '%s\n' 'Temporary installation smoke skill.' > "$release_source/skills/devflow-retired/SKILL.md"
 printf '%s\n' 'name = "devflow-retired"' > "$release_source/agents/devflow-retired.toml"
+printf '%s\n' 'name = "devflow-modified-retired"' > "$release_source/agents/devflow-modified-retired.toml"
 git -C "$release_source" init -q
 git -C "$release_source" config user.name 'Installation smoke'
 git -C "$release_source" config user.email 'install@example.invalid'
 git -C "$release_source" add .
 git -C "$release_source" commit -qm 'Initial installation'
 git -C "$release_source" tag v0.0.1
-git -C "$release_source" rm -qr skills/devflow-retired agents/devflow-retired.toml
+git -C "$release_source" rm -qr skills/devflow-retired agents/devflow-retired.toml agents/devflow-modified-retired.toml
+printf '\n# Version 2\n' >> "$release_source/agents/devflow-implementer.toml"
+git -C "$release_source" add agents/devflow-implementer.toml
 git -C "$release_source" commit -qm 'Remove retired skill'
 git -C "$release_source" tag v0.0.2
 git clone -q "$release_source" "$install_fixture/checkout"
 git -C "$install_fixture/checkout" checkout -q --detach v0.0.1
 sh "$install_fixture/checkout/scripts/install.sh" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > /dev/null
 test -L "$install_fixture/upgraded-skills/devflow-retired"
-test -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+test -f "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+test ! -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
 "$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null
+printf '\n# User edit\n' >> "$install_fixture/upgraded-codex/agents/devflow-modified-retired.toml"
 git -C "$install_fixture/checkout" checkout -q --detach v0.0.2
 if "$devflow_python" -B "$install_fixture/upgraded-codex/.devflow-hook.py" --check > /dev/null; then
     printf 'Mutable checkout drift went undetected.\n' >&2
@@ -220,7 +274,12 @@ sh "$install_fixture/checkout/scripts/update.sh" v0.0.2 "$install_fixture/upgrad
 test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$release_source" rev-parse v0.0.2)"
 test ! -L "$install_fixture/upgraded-skills/devflow-retired"
 test ! -L "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
-test "$(readlink "$install_fixture/upgraded-codex/agents/devflow-implementer.toml")" = "$install_fixture/checkout/agents/devflow-implementer.toml"
+test ! -e "$install_fixture/upgraded-codex/agents/devflow-retired.toml"
+test -f "$install_fixture/upgraded-codex/agents/devflow-modified-retired.toml"
+test "$(tail -1 "$install_fixture/upgraded-codex/agents/devflow-modified-retired.toml")" = '# User edit'
+test -f "$install_fixture/upgraded-codex/agents/devflow-implementer.toml"
+test ! -L "$install_fixture/upgraded-codex/agents/devflow-implementer.toml"
+cmp "$install_fixture/checkout/agents/devflow-implementer.toml" "$install_fixture/upgraded-codex/agents/devflow-implementer.toml"
 test "$(readlink "$install_fixture/upgraded-skills/devflow")" = "$install_fixture/checkout/skills/devflow"
 printf '\n# Local edit\n' >> "$install_fixture/checkout/scripts/install.sh"
 if sh "$install_fixture/checkout/scripts/update.sh" v0.0.1 > /dev/null 2>&1; then
@@ -231,8 +290,10 @@ test "$(git -C "$install_fixture/checkout" rev-parse HEAD)" = "$(git -C "$releas
 
 "$devflow_python" -B "$source_root/scripts/candidate.py" --prepare-only "$install_fixture/trial" > /dev/null
 test -f "$install_fixture/trial/codex/skills/devflow/SKILL.md"
-test -L "$install_fixture/trial/codex/agents/devflow-implementer.toml"
-test -L "$install_fixture/trial/codex/agents/devflow-coordinator.toml"
+test -f "$install_fixture/trial/codex/agents/devflow-implementer.toml"
+test ! -L "$install_fixture/trial/codex/agents/devflow-implementer.toml"
+test -f "$install_fixture/trial/codex/agents/devflow-coordinator.toml"
+test ! -L "$install_fixture/trial/codex/agents/devflow-coordinator.toml"
 "$devflow_python" -B - "$install_fixture/trial/codex/config.toml" <<'PY'
 import sys
 import tomllib

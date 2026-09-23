@@ -30,7 +30,7 @@ Select only the role needed:
 
 3. **Retain work and ownership.** Use [the state helper](references/state.md) for substantive work and [issue ownership](references/ownership.md) for implementation or merging. The main task creates or reuses the record and claim; the execution coordinator maintains records, assignee and existing Project Status for that owner while executing. Audit linked issues before resume and closeout, including stopped owners and tracked external runs. Leaves report results without claiming again or writing records. Reuse work IDs for continuation. Record usage with provenance and leave unavailable values unknown. Ordinary questions need no bookkeeping.
 
-4. **Install only on request.** Run `bash scripts/install.sh [SKILLS_DIRECTORY] [CODEX_HOME]` from a release checkout, and upgrade with `bash scripts/update.sh TAG [SKILLS_DIRECTORY] [CODEX_HOME]`; keep development trials separate. Installation links sibling skills and agent definitions, removes obsolete links owned by that checkout and refreshes metrics hooks. Review changed hooks through the host's hook controls. Agent instructions and project tools remain with their existing owners.
+4. **Install only on request.** Run `bash scripts/install.sh [SKILLS_DIRECTORY] [CODEX_HOME]` from a release checkout, and upgrade with `bash scripts/update.sh TAG [SKILLS_DIRECTORY] [CODEX_HOME]`; keep development trials separate. Installation links sibling skills, copies regular agent definitions, removes obsolete owned links and unchanged agent copies, and refreshes metrics hooks. Review changed hooks through the host's hook controls. Agent instructions and project tools remain with their existing owners.
 
 ## Example
 

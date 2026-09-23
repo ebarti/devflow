@@ -1,5 +1,5 @@
 #!/bin/sh
-# Link the bundled skills and agent definitions into the host's directories.
+# Link bundled skills and copy loadable agent definitions into the host directories.
 set -eu
 
 force=false
@@ -19,7 +19,6 @@ devflow_python=${DEVFLOW_PYTHON:-python3.12}
 
 # Stop on any conflict before changing a link; force replaces only symlinks.
 check_links() {
-    allow_identical_files=${3:-false}
     for source in "$1"/*; do
         [ -e "$source" ] || continue
         target="$2/${source##*/}"
@@ -28,8 +27,6 @@ check_links() {
                 if [ "$force" = true ] || [ "$(readlink "$target")" = "$source" ]; then
                     continue
                 fi
-            elif [ "$allow_identical_files" = true ] && [ -f "$target" ] && cmp -s "$source" "$target"; then
-                continue
             fi
             printf 'Existing path preserved: %s\nUse --force for symlinks; relocate other conflicting paths.\n' "$target" >&2
             exit 1
@@ -38,15 +35,12 @@ check_links() {
 }
 
 make_links() {
-    allow_identical_files=${3:-false}
     mkdir -p "$2"
     for source in "$1"/*; do
         [ -e "$source" ] || continue
         target="$2/${source##*/}"
         if [ "$force" = true ] && [ -L "$target" ]; then
             ln -sfn "$source" "$target"
-        elif [ "$allow_identical_files" = true ] && [ -f "$target" ] && [ ! -L "$target" ]; then
-            :  # Preflight already verified the regular agent copy is byte-identical.
         elif [ ! -L "$target" ]; then
             ln -s "$source" "$target"
         fi
@@ -65,13 +59,14 @@ prune_links() {
 }
 
 check_links "$source_root/skills" "$destination"
-check_links "$source_root/agents" "$codex_directory/agents" true
+"$devflow_python" -B "$source_root/scripts/install-agents.py" preflight \
+    "$source_root" "$destination" "$codex_directory" "$force"
 make_links "$source_root/skills" "$destination"
-make_links "$source_root/agents" "$codex_directory/agents" true
+"$devflow_python" -B "$source_root/scripts/install-agents.py" apply \
+    "$source_root" "$destination" "$codex_directory" "$force"
 "$devflow_python" -B "$source_root/scripts/install-guard.py" snapshot "$source_root" "$destination" "$codex_directory"
 "$devflow_python" -B "$destination/devflow/scripts/telemetry.py" install --codex-home "$codex_directory" \
     --guard-path "$codex_directory/.devflow-hook.py"
 prune_links "$source_root/skills" "$destination"
-prune_links "$source_root/agents" "$codex_directory/agents"
-printf 'Skills installed in %s\nAgent definitions installed in %s\nKeep this checkout at %s.\n' \
+printf 'Skills linked in %s\nAgent definitions copied into %s\nKeep this checkout at %s.\n' \
     "$destination" "$codex_directory/agents" "$source_root"

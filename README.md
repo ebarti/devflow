@@ -9,8 +9,8 @@ Devflow targets Codex CLI: skills load from its skills directory, metrics hooks 
 ## Install
 
 Keep a published release checkout at a stable location; installed skills are
-symlinks into it, and agent definitions are symlinks or preserved matching
-regular files. Set `RELEASE_TAG` to an approved,
+symlinks into it, while agent definitions are regular file copies that Codex
+can load. Set `RELEASE_TAG` to an approved,
 published tag that contains the installer and agent definitions you intend to
 use. To get the regular-agent compatibility in this PR, that tag must be
 created after the change is approved and released; an open PR is not a release.
@@ -41,7 +41,7 @@ To switch an existing installation to another checkout, run this from that check
 bash scripts/install.sh --force
 ```
 
-`--force` replaces only bundled skill and agent-definition symlinks, including broken links. Existing regular agent-definition files are preserved when byte-identical to this checkout's definitions; differing copies stop installation before any links change, even with `--force`. Skill paths still require symlinks. Other files, directories, agent definitions and hooks are preserved. Without `--force`, conflicting symlinks stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
+`--force` repoints bundled skill symlinks and migrates owned agent-definition symlinks to regular copies. Existing regular agent-definition files are preserved when byte-identical to this checkout's definitions. The installer records copied definitions in `$CODEX_HOME/agents/.devflow-agent-manifest.json`; on upgrade it refreshes unchanged owned copies and removes obsolete unchanged owned copies. Modified or custom copies stop installation before any destination changes, even with `--force`; modified obsolete copies are preserved. Skill paths still require symlinks. Other files, agent definitions and hooks are preserved. Without `--force`, conflicting symlinks stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
 
 ## Upgrade
 
@@ -52,7 +52,7 @@ and upgrade the existing checkout between tasks:
 bash scripts/update.sh "$RELEASE_TAG"
 ```
 
-The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill and agent-definition links owned by this checkout are removed; other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
+The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill links and unchanged owned agent copies are removed; modified copies, other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
 
 ## Candidate trials
 
