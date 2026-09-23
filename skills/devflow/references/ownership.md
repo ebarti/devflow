@@ -73,7 +73,9 @@ the local record and retains the claim for reconciliation and retry by its owner
 Run `github.py audit --work-id WORK_ID` before resuming or ending an owned issue.
 It reads the local work, claim and owner runtime plus the live issue, assignee and
 selected Project item. A successful sync stores its expected issue state, assignee,
-Project/item/Status IDs and readback time in `details.github.sync`. Older records
+Project/item/Status IDs, Status name and readback time in `details.github.sync`.
+Audit compares both the Status ID and current name, and flags active linked work
+whose claim has been released. Older records
 without that metadata report `unknown` while observing any discoverable selected
 Project item; an audit never treats missing history as
 a pass. The command changes neither GitHub nor SQLite and exits nonzero for an
@@ -101,10 +103,12 @@ python3.12 ~/.agents/skills/devflow/scripts/state.py work list --claimed
 ```
 
 This lists owners and last observations, not live process health. Claims have no
-automatic expiry. A normal root Stop blocks while that root still holds issue
-claims; it directs the owner to audit, set and release. Leaf and execution
+automatic expiry. A normal root Stop blocks while that root still holds linked
+issue claims or a `create_pending` claim; it directs the owner to audit, set and
+release or to resolve the issue-creation attempt. Leaf and execution
 coordinator returns do not block on the root's claim. An observed root Interrupt
-or SessionEnd marks its owned work blocked for reconciliation and retains the
+or SessionEnd marks all its claimed work, including local-only work, blocked for
+reconciliation and retains the
 claim; hooks make no network call or tracker change. A hard crash or missing hook
 can leave no local observation, so inspect the host task and run the audit on
 recovery. The audit reports a confirmed closed owner that still holds a claim.

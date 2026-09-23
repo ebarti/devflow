@@ -127,26 +127,45 @@ def root_claims(db, session_id):
     saved = db.execute("SELECT role,closed_at FROM runtime_sessions WHERE id=?", (session_id,)).fetchone()
     if not saved or saved[0] != "coordinator" or saved[1]:
         return []
-    return [r[0] for r in db.execute("""SELECT c.work_id FROM claims c
+    return [dict(work_id=r[0], issue=r[1], details=r[2]) for r in db.execute("""SELECT c.work_id,w.issue,w.details FROM claims c
         JOIN works w ON w.id=c.work_id JOIN runtime_scopes s ON s.work_id=c.work_id
-        WHERE c.owner=? AND s.session_id=? AND w.issue IS NOT NULL ORDER BY c.work_id""",
+        WHERE c.owner=? AND s.session_id=? ORDER BY c.work_id""",
         (session_id, session_id))]
 
 
-def stop_response(work_ids, stop_hook_active):
-    if not work_ids:
+def pending_issue_creation(raw_details):
+    try:
+        saved = json.loads(raw_details) if raw_details else {}
+        github = saved.get("github", {}) if isinstance(saved, dict) else {}
+        return isinstance(github, dict) and github.get("create_pending") is True
+    except ValueError:
+        return False
+
+
+def stop_response(claims, stop_hook_active):
+    issues = [item["work_id"] for item in claims if item["issue"]]
+    pending = [item["work_id"] for item in claims
+               if not item["issue"] and pending_issue_creation(item["details"])]
+    if not issues and not pending:
         return None
-    message = ("Devflow issue claims still belong to this task: " + ", ".join(work_ids) +
-               ". Reconcile each issue with github.py audit, then github.py set --release.")
+    parts = []
+    if issues:
+        parts.append("Issue claims still belong to this task: " + ", ".join(issues) +
+                     ". Audit each issue, then use github.py set --release")
+    if pending:
+        parts.append("Issue creation is unresolved for: " + ", ".join(pending) +
+                     ". Inspect GitHub for the creation outcome and bind an existing issue with github.py start")
+    message = "Devflow: " + "; ".join(parts) + "."
     if stop_hook_active:
         return {"systemMessage": message}
     return {"decision": "block", "reason": message}
 
 
 def mark_interrupted_owner(db, session_id, stamp, event_name):
-    for work_id in root_claims(db, session_id):
+    for claim in root_claims(db, session_id):
+        work_id = claim["work_id"]
         work = state.row(db, "works", work_id)
-        blocker = "Owner " + event_name + " observed at " + stamp + "; issue and claim require reconciliation"
+        blocker = "Owner " + event_name + " observed at " + stamp + "; work and claim require reconciliation"
         if work["status"] != "blocked" or work["blocker"] != blocker:
             state.update(db, "work", dict(id=work_id, status="blocked", blocker=blocker), None)
 

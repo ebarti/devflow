@@ -44,9 +44,9 @@ elif a[:2] == ["api", "graphql"]:
         out = {"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "ITEM"}}}}
     elif "projectItems(first:100)" in query:
         out = {"data": {"node": {"projectItems": {"nodes": [
-            {"id": "ITEM", "project": {"id": "P"}, "fieldValueByName": {"optionId": s["option"], "name": "Blocked"}}]}}}}
+            {"id": "ITEM", "project": {"id": "P"}, "fieldValueByName": {"optionId": s["option"], "name": s["option_name"]}}]}}}}
     else:
-        out = {"data": {"node": {"project": {"id": "P"}, "fieldValueByName": {"optionId": s["option"]}}}}
+        out = {"data": {"node": {"project": {"id": "P"}, "fieldValueByName": {"optionId": s["option"], "name": s["option_name"]}}}}
 else:
     raise SystemExit("unknown fake gh call: " + str(a))
 p.write_text(json.dumps(s))
@@ -64,7 +64,8 @@ class LifecycleCLI(unittest.TestCase):
         self.gh_state.write_text(json.dumps({
             "issue": {"id": "ISSUE", "url": ISSUE, "title": "Work", "state": "OPEN",
                       "assignees": [{"login": "owner"}]},
-            "option": "B", "run": {"status": "in_progress", "conclusion": None, "url": RUN}}))
+            "option": "B", "option_name": "Blocked",
+            "run": {"status": "in_progress", "conclusion": None, "url": RUN}}))
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         gh = bin_dir / "gh"
@@ -134,6 +135,23 @@ class LifecycleCLI(unittest.TestCase):
         self.assertEqual(failed.returncode, 1)
         self.assertIn("fake API failure", failed.stderr)
 
+    def test_renamed_project_option_with_same_id_requires_reconciliation(self):
+        self.set_blocked(release=True)
+        remote = json.loads(self.gh_state.read_text())
+        remote["option_name"] = "Done"
+        self.gh_state.write_text(json.dumps(remote))
+        result, report = self.audit()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("project_status_mismatch", report["reconciliation_required"])
+
+    def test_active_issue_without_claim_requires_reconciliation(self):
+        with state.connect(self.db_path) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            state.release_work(db, "w1", "root-1")
+        result, report = self.audit()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("active_work_unclaimed", report["reconciliation_required"])
+
     def test_legacy_sync_unknown_and_done_closed_state_mismatch(self):
         result, report = self.audit()
         self.assertEqual(result.returncode, 1)
@@ -195,6 +213,38 @@ class LifecycleCLI(unittest.TestCase):
         result, report = self.audit()
         self.assertEqual(result.returncode, 1)
         self.assertIn("stopped_owner_retains_claim", report["reconciliation_required"])
+
+    def test_unresolved_issue_creation_blocks_root_stop_without_blocking_local_work(self):
+        with state.connect(self.db_path) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            state.record(db, "work", dict(id="pending", title="Pending issue", status="starting",
+                                           details={"github": {"create_pending": True, "project": PROJECT}}))
+            state.claim_work(db, "pending", "root-pending")
+            state.record(db, "work", dict(id="local", title="Local work", status="active"))
+            state.claim_work(db, "local", "root-local")
+        pending = self.cli("telemetry.py", "hook", payload={"session_id": "root-pending",
+                           "hook_event_name": "Stop", "turn_id": "t1"})
+        self.assertEqual(json.loads(pending.stdout)["decision"], "block")
+        self.assertIn("creation", json.loads(pending.stdout)["reason"])
+        local = self.cli("telemetry.py", "hook", payload={"session_id": "root-local",
+                         "hook_event_name": "Stop", "turn_id": "t1"})
+        self.assertNotIn("decision", json.loads(local.stdout))
+
+    def test_local_only_owner_interrupt_and_end_preserve_claim_and_mark_blocked(self):
+        for event in ("Interrupt", "SessionEnd"):
+            work_id, owner = "local-" + event, "root-" + event
+            with state.connect(self.db_path) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                state.record(db, "work", dict(id=work_id, title="Local work", status="active"))
+                state.claim_work(db, work_id, owner)
+            response = self.cli("telemetry.py", "hook", payload={"session_id": owner,
+                                "hook_event_name": event, "turn_id": "t1"})
+            self.assertEqual(response.returncode, 0)
+            with state.connect(self.db_path) as db:
+                work = state.row(db, "works", work_id)
+                self.assertEqual(work["status"], "blocked")
+                self.assertIn("reconciliation", work["blocker"])
+                self.assertEqual(state.claim_for(db, work_id)["owner"], owner)
 
 
 if __name__ == "__main__":

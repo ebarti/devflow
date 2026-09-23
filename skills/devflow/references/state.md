@@ -77,8 +77,9 @@ Transcript parsing is an adapter for the current local format; missing counters 
 Collection starts at binding and closes when a released task's turn ends. Reclaiming or explicitly binding resumes collection; unrelated later conversations are ignored. Runtime runs represent observed turns, including tool waits. Shared coordinator usage is reported globally without an invented issue split.
 
 On a normal Stop, the hook blocks only the root claim holder while linked issues
-remain claimed. `stop_hook_active` produces a message instead of another block.
-An observed root Interrupt or SessionEnd marks its owned work blocked for
+or unresolved issue-creation attempts remain claimed. Local-only claims do not
+block Stop. `stop_hook_active` produces a message instead of another block.
+An observed root Interrupt or SessionEnd marks all its claimed work blocked for
 reconciliation while preserving its claim. Child returns and unrelated owners
 are untouched. Hooks do not contact GitHub; a hard crash without a hook still
 requires the [read-only issue audit](ownership.md) and host inspection on resume.

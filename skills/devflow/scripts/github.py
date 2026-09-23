@@ -67,7 +67,7 @@ def action_url(url, host):
 def project_item(host, item_id):
     return graphql(host, """query($item:ID!){node(id:$item){
         ... on ProjectV2Item{project{id} fieldValueByName(name:"Status"){
-        ... on ProjectV2ItemFieldSingleSelectValue{optionId}}}}}""", item=item_id)["node"]
+        ... on ProjectV2ItemFieldSingleSelectValue{optionId name}}}}}""", item=item_id)["node"]
 
 
 def legacy_project_item(project_url, issue_id):
@@ -221,6 +221,7 @@ def synchronize(db, args):
     verified = view(issue_url)
     if (not readback or readback["project"]["id"] != selected["id"]
             or (readback.get("fieldValueByName") or {}).get("optionId") != selected["option"]
+            or (readback.get("fieldValueByName") or {}).get("name") != selected["status"]
             or login.casefold() not in {item["login"].casefold() for item in verified["assignees"]}
             or verified["state"] != observed["state"]):
         raise RuntimeError("GitHub readback disagrees with assignment or Project Status; reconcile before retrying")
@@ -292,7 +293,8 @@ def audit(db, work_id):
             selected = project_item(urlsplit(sync["project"]).netloc, sync["item_id"])
             result["project_observed"] = selected
             if (not selected or (selected.get("project") or {}).get("id") != sync["project_id"]
-                    or (selected.get("fieldValueByName") or {}).get("optionId") != sync["option_id"]):
+                    or (selected.get("fieldValueByName") or {}).get("optionId") != sync["option_id"]
+                    or (selected.get("fieldValueByName") or {}).get("name") != sync["project_status"]):
                 result["reconciliation_required"].append("project_status_mismatch")
             desired = ("in-review" if work["stage"] == "review" else "in-progress") if work["status"] == "active" else work["status"]
             if desired in STATUSES and sync["status"] != desired:
@@ -301,6 +303,8 @@ def audit(db, work_id):
             result["reconciliation_required"].append("done_issue_open")
         if work["status"] in {"active", "blocked", "paused", "waiting"} and observed["state"] != "OPEN":
             result["reconciliation_required"].append("unfinished_issue_closed")
+        if work["status"] == "active" and not claim:
+            result["reconciliation_required"].append("active_work_unclaimed")
     if claim:
         owner = db.execute("SELECT role,closed_at FROM runtime_sessions WHERE id=?", (claim["owner"],)).fetchone()
         if owner and owner["role"] == "coordinator" and owner["closed_at"]:

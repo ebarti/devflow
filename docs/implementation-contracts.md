@@ -24,9 +24,13 @@ Schema 4 upgrades schemas 2 and 3 transactionally, adding claims and runtime tab
 `works.details.github` retains the selected Project, Status mappings and any unresolved creation attempt. Creation records its attempt before calling GitHub and saves the issue URL before further updates. A missing result requires reconciliation, never an automatic second create. Project Status and assignment are read back before success; labels and other Project fields are untouched.
 
 Successful synchronization also stores `details.github.sync`: expected issue
-state, assignee, Project/item/field/option IDs, selected Status and readback time.
+state, assignee, Project/item/field/option IDs, selected Status name and readback time.
 `github.py audit --work-id` opens SQLite read-only, compares that expectation
-and local claim/runtime with the live issue and selected Project item, and
+and local claim/runtime with the live issue and selected Project item, including
+both the Status option ID and its current name. Active linked work with no claim
+requires reconciliation. A root Stop blocks linked issues and unresolved
+`create_pending` claims; observed Interrupt/SessionEnd blocks all of the root's
+claimed work locally, including local-only work, while retaining claims. Audit
 returns `consistent`, `unknown` or `reconciliation_required`. Legacy records
 without the successful-sync metadata remain unknown. An observed root owner
 SessionEnd with a retained claim requires reconciliation; no claim expires on
