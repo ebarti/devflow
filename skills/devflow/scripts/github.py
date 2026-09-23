@@ -265,8 +265,10 @@ def audit(db, work_id):
         raise ValueError("unknown work: " + work_id)
     tracking = details(work).get("github", {})
     claim = state.claim_for(db, work_id)
+    claim_summary = ({key: claim[key] for key in ("resource", "owner", "claimed_at", "updated_at")}
+                     if claim else None)
     result = dict(work_id=work_id, issue=work["issue"], local_status=work["status"],
-                  claim=claim, reconciliation_required=[], unknown=[])
+                  claim=claim_summary, reconciliation_required=[], unknown=[])
     if not work["issue"]:
         result["unknown"].append("issue_not_linked")
     else:
