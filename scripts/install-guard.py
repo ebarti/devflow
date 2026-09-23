@@ -43,8 +43,12 @@ def check(codex):
             if (skills / name).resolve() != (source / "skills" / name).resolve() or not (skills / name / "SKILL.md").is_file():
                 return "installed Devflow skill link is missing or changed; rerun scripts/install.sh"
         for path in (source / "agents").glob("*.toml"):
-            if (codex / "agents" / path.name).resolve() != path.resolve():
-                return "installed Devflow agent link is missing or changed; rerun scripts/install.sh"
+            target = codex / "agents" / path.name
+            if target.is_symlink():
+                if target.resolve() != path.resolve():
+                    return "installed Devflow agent link is missing or changed; rerun scripts/install.sh"
+            elif not target.is_file() or target.read_bytes() != path.read_bytes():
+                return "installed Devflow agent copy is missing or changed; restore a matching copy before reinstalling"
     except (OSError, KeyError, ValueError, subprocess.CalledProcessError):
         return "installed Devflow source cannot be verified; restore it or rerun scripts/install.sh"
     return None

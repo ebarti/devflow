@@ -59,6 +59,48 @@ PY
 "$devflow_python" -B "$destination/devflow/scripts/telemetry.py" --help > /dev/null
 test -s "$install_fixture/codex/hooks.json"
 
+# Existing native-role workaround: exact regular agent copies are preserved.
+copy_home="$install_fixture/regular-copies"
+mkdir -p "$copy_home/codex/agents"
+for agent in "$source_root"/agents/*.toml; do
+    cp "$agent" "$copy_home/codex/agents/${agent##*/}"
+done
+printf 'unrelated\n' > "$copy_home/codex/agents/custom-agent.toml"
+sh "$source_root/scripts/install.sh" "$copy_home/skills" "$copy_home/codex" > /dev/null
+sh "$source_root/scripts/install.sh" --force "$copy_home/skills" "$copy_home/codex" > /dev/null
+for agent in "$source_root"/agents/*.toml; do
+    target="$copy_home/codex/agents/${agent##*/}"
+    test -f "$target" && test ! -L "$target"
+    cmp "$agent" "$target"
+done
+test "$(cat "$copy_home/codex/agents/custom-agent.toml")" = unrelated
+"$devflow_python" -B "$copy_home/codex/.devflow-hook.py" --check > /dev/null
+cp "$copy_home/codex/hooks.json" "$install_fixture/copy-hooks-before.json"
+printf '\n# Drifted copy\n' >> "$copy_home/codex/agents/devflow-implementer.toml"
+if "$devflow_python" -B "$copy_home/codex/.devflow-hook.py" --check > /dev/null; then
+    printf 'Drifted regular agent copy went undetected.\n' >&2
+    exit 1
+fi
+if sh "$source_root/scripts/install.sh" --force "$copy_home/skills" "$copy_home/codex" > /dev/null 2>&1; then
+    printf 'Differing regular agent copy was overwritten with --force.\n' >&2
+    exit 1
+fi
+cmp "$install_fixture/copy-hooks-before.json" "$copy_home/codex/hooks.json"
+test ! -L "$copy_home/codex/agents/devflow-implementer.toml"
+test "$(cat "$copy_home/codex/agents/custom-agent.toml")" = unrelated
+
+# A differing copy in a fresh install fails before creating any skill links or hooks.
+fresh_conflict="$install_fixture/regular-conflict"
+mkdir -p "$fresh_conflict/codex/agents"
+printf 'custom definition\n' > "$fresh_conflict/codex/agents/devflow-implementer.toml"
+if sh "$source_root/scripts/install.sh" "$fresh_conflict/skills" "$fresh_conflict/codex" > /dev/null 2>&1; then
+    printf 'Fresh differing regular agent copy was accepted.\n' >&2
+    exit 1
+fi
+test ! -e "$fresh_conflict/skills"
+test ! -e "$fresh_conflict/codex/hooks.json"
+test "$(cat "$fresh_conflict/codex/agents/devflow-implementer.toml")" = 'custom definition'
+
 # Installed hooks keep the installing interpreter even with an empty PATH.
 "$devflow_python" -B - "$install_fixture/codex/hooks.json" <<'PY'
 import json
