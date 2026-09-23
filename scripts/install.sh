@@ -61,9 +61,9 @@ prune_links() {
 check_links "$source_root/skills" "$destination"
 "$devflow_python" -B "$source_root/scripts/install-agents.py" preflight \
     "$source_root" "$destination" "$codex_directory" "$force"
-make_links "$source_root/skills" "$destination"
 "$devflow_python" -B "$source_root/scripts/install-agents.py" apply \
     "$source_root" "$destination" "$codex_directory" "$force"
+make_links "$source_root/skills" "$destination"
 "$devflow_python" -B "$source_root/scripts/install-guard.py" snapshot "$source_root" "$destination" "$codex_directory"
 "$devflow_python" -B "$destination/devflow/scripts/telemetry.py" install --codex-home "$codex_directory" \
     --guard-path "$codex_directory/.devflow-hook.py"

@@ -148,6 +148,43 @@ test ! -e "$hook_conflict/codex/agents"
 test ! -e "$hook_conflict/codex/.devflow-install.json"
 cmp "$install_fixture/hook-conflict-before.json" "$hook_conflict/codex/hooks.json"
 
+# A CODEX_HOME symlink alias must not make the installed hook look unowned on replay.
+mkdir -p "$install_fixture/aliased-codex"
+ln -s "$install_fixture/aliased-codex" "$install_fixture/codex-alias"
+sh "$source_root/scripts/install.sh" "$install_fixture/alias-skills" "$install_fixture/codex-alias" > /dev/null
+sh "$source_root/scripts/install.sh" "$install_fixture/alias-skills" "$install_fixture/codex-alias" > /dev/null
+"$devflow_python" -B "$install_fixture/aliased-codex/.devflow-hook.py" --check > /dev/null
+
+# A pre-manifest install derives ownership from the old skill link. Switching it
+# must migrate current agent links and prune obsolete owned links before repointing.
+legacy_root="$install_fixture/legacy-source"
+legacy_skills="$install_fixture/legacy-skills"
+legacy_codex="$install_fixture/legacy-codex"
+mkdir -p "$legacy_root/skills/devflow" "$legacy_root/agents" "$legacy_skills" "$legacy_codex/agents"
+cp "$source_root/agents/devflow-coordinator.toml" "$legacy_root/agents/devflow-coordinator.toml"
+printf 'retired\n' > "$legacy_root/agents/devflow-retired.toml"
+ln -s "$legacy_root/skills/devflow" "$legacy_skills/devflow"
+ln -s "$legacy_root/agents/devflow-coordinator.toml" "$legacy_codex/agents/devflow-coordinator.toml"
+ln -s "$legacy_root/agents/devflow-retired.toml" "$legacy_codex/agents/devflow-retired.toml"
+ln -s "$install_fixture/unowned.toml" "$legacy_codex/agents/devflow-reviewer.toml"
+if sh "$source_root/scripts/install.sh" --force "$legacy_skills" "$legacy_codex" > /dev/null 2>&1; then
+    printf 'Unowned legacy agent symlink was replaced.\n' >&2
+    exit 1
+fi
+test "$(readlink "$legacy_skills/devflow")" = "$legacy_root/skills/devflow"
+test "$(readlink "$legacy_codex/agents/devflow-coordinator.toml")" = "$legacy_root/agents/devflow-coordinator.toml"
+test "$(readlink "$legacy_codex/agents/devflow-retired.toml")" = "$legacy_root/agents/devflow-retired.toml"
+test ! -e "$legacy_codex/agents/.devflow-agent-manifest.json"
+test ! -e "$legacy_codex/hooks.json"
+rm "$legacy_codex/agents/devflow-reviewer.toml"
+sh "$source_root/scripts/install.sh" --force "$legacy_skills" "$legacy_codex" > /dev/null
+test "$(readlink "$legacy_skills/devflow")" = "$source_root/skills/devflow"
+test -f "$legacy_codex/agents/devflow-coordinator.toml"
+test ! -L "$legacy_codex/agents/devflow-coordinator.toml"
+cmp "$source_root/agents/devflow-coordinator.toml" "$legacy_codex/agents/devflow-coordinator.toml"
+test ! -e "$legacy_codex/agents/devflow-retired.toml"
+"$devflow_python" -B "$legacy_codex/.devflow-hook.py" --check > /dev/null
+
 # Installed hooks keep the installing interpreter even with an empty PATH.
 "$devflow_python" -B - "$install_fixture/codex/hooks.json" <<'PY'
 import json
@@ -248,6 +285,25 @@ git -C "$release_source" commit -qm 'Remove retired skill'
 git -C "$release_source" tag v0.0.2
 git clone -q "$release_source" "$install_fixture/checkout"
 git -C "$install_fixture/checkout" checkout -q --detach v0.0.1
+
+# A rejected upgrade restores the old checkout, links and pin without touching
+# the modified copy that caused the rejection.
+git clone -q "$release_source" "$install_fixture/rejected-checkout"
+git -C "$install_fixture/rejected-checkout" checkout -q --detach v0.0.1
+sh "$install_fixture/rejected-checkout/scripts/install.sh" "$install_fixture/rejected-skills" "$install_fixture/rejected-codex" > /dev/null
+cp "$install_fixture/rejected-codex/hooks.json" "$install_fixture/rejected-hooks-before.json"
+printf '\n# User edit\n' >> "$install_fixture/rejected-codex/agents/devflow-implementer.toml"
+if sh "$install_fixture/rejected-checkout/scripts/update.sh" v0.0.2 "$install_fixture/rejected-skills" "$install_fixture/rejected-codex" > /dev/null 2>&1; then
+    printf 'Upgrade overwrote a modified agent copy.\n' >&2
+    exit 1
+fi
+test "$(git -C "$install_fixture/rejected-checkout" rev-parse HEAD)" = "$(git -C "$release_source" rev-parse v0.0.1)"
+test "$(readlink "$install_fixture/rejected-skills/devflow")" = "$install_fixture/rejected-checkout/skills/devflow"
+test "$(tail -1 "$install_fixture/rejected-codex/agents/devflow-implementer.toml")" = '# User edit'
+cmp "$install_fixture/rejected-hooks-before.json" "$install_fixture/rejected-codex/hooks.json"
+cp "$install_fixture/rejected-checkout/agents/devflow-implementer.toml" "$install_fixture/rejected-codex/agents/devflow-implementer.toml"
+"$devflow_python" -B "$install_fixture/rejected-codex/.devflow-hook.py" --check > /dev/null
+
 sh "$install_fixture/checkout/scripts/install.sh" "$install_fixture/upgraded-skills" "$install_fixture/upgraded-codex" > /dev/null
 test -L "$install_fixture/upgraded-skills/devflow-retired"
 test -f "$install_fixture/upgraded-codex/agents/devflow-retired.toml"

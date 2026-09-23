@@ -97,7 +97,7 @@ def hook_pin(codex_home, source_root, force):
                         fail(f"Unrecognized Devflow hook command in {hooks_path}")
                     if (item.get("type") == "command" and len(command) == 3
                             and Path(command[0]).is_absolute() and command[1] == "-B"
-                            and command[2] == str(guard_path) and pin):
+                            and Path(command[2]).resolve() == guard_path.resolve() and pin):
                         continue
                     if (item.get("type") == "command" and len(command) == 4
                             and Path(command[0]).is_absolute() and command[1] == "-B"

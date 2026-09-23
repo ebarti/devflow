@@ -52,7 +52,7 @@ and upgrade the existing checkout between tasks:
 bash scripts/update.sh "$RELEASE_TAG"
 ```
 
-The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill links and unchanged owned agent copies are removed; modified copies, other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
+The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade; if installation rejects a destination conflict, the updater restores the previous checkout. Obsolete skill links and unchanged owned agent copies are removed; modified copies, other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
 
 ## Candidate trials
 
