@@ -366,6 +366,10 @@ class ReconcileCLI(unittest.TestCase):
         self.assertEqual(result["coverage"]["returned"], 20)
         self.assertTrue(result["coverage"]["truncated"])
         self.assertEqual(len(json.loads(self.cli("reconcile.py", "once", "--dry-run", "--limit", "100").stdout)["records"]), 26)
+        legacy = next(row for row in result["records"] if row["work_id"] == "legacy-01")
+        self.assertEqual(legacy["audit_state"], "unknown")
+        self.assertIsNone(legacy["local_claim_owner"])
+        self.assertEqual(legacy["remote_observed"]["project_status"], "In progress")
 
     def test_fair_cursor_and_legacy_migration(self):
         self.set()

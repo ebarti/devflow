@@ -501,6 +501,7 @@ def once(db, limit=20, dry_run=False):
         rows = []
         total = 0
         has_queue = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reconcile_intents'").fetchone())
+        has_claims = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims'").fetchone())
         for raw in db.execute("SELECT * FROM works WHERE issue IS NOT NULL ORDER BY id"):
             work = dict(raw)
             tracking = github.details(work).get("github", {})
@@ -516,6 +517,7 @@ def once(db, limit=20, dry_run=False):
                        "project": tracking["project"],
                        "eligibility": "managed" if eligible else "legacy_needs_explicit_mapping",
                        "missing_mappings": [name for name in ("blocked", "paused", "done") if name not in mappings],
+                       "local_claim_owner": (state.claim_for(db, work["id"]) or {}).get("owner") if has_claims else None,
                        "intent": (intent(db, work["id"]) or {}).get("state") if has_queue else None,
                        "possible_remote_writes": []}
             queued = intent(db, work["id"]) if has_queue else None
@@ -541,7 +543,18 @@ def once(db, limit=20, dry_run=False):
                     preview["audit_state"] = "unknown"
                     preview["error"] = str(exc)
             else:
+                preview["audit_state"] = "unknown"
                 preview["next_action"] = "supply and verify explicit mapping before opt-in"
+                try:
+                    observed = github.view(work["issue"])
+                    item = github.legacy_project_item(tracking["project"], observed["id"])
+                    preview["remote_observed"] = {
+                        "issue_state": observed["state"],
+                        "assignees": [person["login"] for person in observed["assignees"]],
+                        "project_status": ((item or {}).get("fieldValueByName") or {}).get("name"),
+                        "project_item_found": bool(item)}
+                except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                    preview["remote_observed"] = {"state": "unknown", "error": str(exc)}
             rows.append(preview)
         return {"records": rows, "coverage": {"total_project_records": total,
                 "returned": len(rows), "truncated": total > len(rows),
