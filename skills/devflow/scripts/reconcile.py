@@ -5,10 +5,12 @@ import argparse
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import time
 from urllib.parse import urlsplit
@@ -17,13 +19,29 @@ sys.dont_write_bytecode = True
 import github
 import state
 
+SYNC_KEYS = ("status", "issue_state", "assignee", "project", "project_id",
+             "item_id", "field_id", "option_id", "project_status", "readback_at")
+
+
+def managed(tracking):
+    sync = tracking.get("sync")
+    return (bool(tracking.get("project")) and isinstance(sync, dict)
+            and all(sync.get(key) for key in SYNC_KEYS) and sync["status"] in github.STATUSES)
+
 
 def intent(db, work_id):
     found = db.execute("SELECT * FROM reconcile_intents WHERE work_id=?", (work_id,)).fetchone()
     return dict(found) if found else None
 
 
-def queue(db, work_id, kind, payload, owner=None, next_action=None):
+def owner_token(db, claim):
+    if not claim:
+        return None
+    session = db.execute("SELECT generation FROM runtime_sessions WHERE id=?", (claim["owner"],)).fetchone()
+    return state.encode([claim["claimed_at"], session["generation"] if session else None])
+
+
+def queue(db, work_id, kind, payload, owner=None, next_action=None, force=False):
     """Call within a short write transaction, before any requested remote mutation."""
     work = state.row(db, "works", work_id)
     if not work or not work["issue"]:
@@ -34,11 +52,14 @@ def queue(db, work_id, kind, payload, owner=None, next_action=None):
     claim = state.claim_for(db, work_id)
     if owner and (not claim or claim["owner"] != owner):
         raise ValueError("work ownership mismatch")
-    token = claim["claimed_at"] if claim else None
+    token = owner_token(db, claim)
     prior = intent(db, work_id)
     encoded = state.encode(payload)
-    if prior and (prior["kind"], prior["owner"], prior["claim_token"], prior["payload"]) == (
-            kind, owner, token, encoded) and prior["state"] in {"pending", "acknowledged", "needs_decision"}:
+    reusable = {"pending", "needs_decision"}
+    if kind != "probe":
+        reusable.add("acknowledged")
+    if not force and prior and (prior["kind"], prior["owner"], prior["claim_token"], prior["payload"]) == (
+            kind, owner, token, encoded) and prior["state"] in reusable:
         return prior
     stamp = state.now()
     revision = (prior["revision"] + 1) if prior else 1
@@ -60,7 +81,7 @@ def current(db, saved):
         return False
     claim = state.claim_for(db, saved["work_id"])
     if saved["owner"]:
-        return bool(claim and claim["owner"] == saved["owner"] and claim["claimed_at"] == saved["claim_token"])
+        return bool(claim and claim["owner"] == saved["owner"] and owner_token(db, claim) == saved["claim_token"])
     return claim is None
 
 
@@ -105,12 +126,14 @@ def apply_sync(db, saved):
     work = state.row(db, "works", saved["work_id"])
     if not work or work["issue"] != payload["issue"]:
         raise ValueError("linked issue changed; choose a new intent")
-    if saved["kind"] == "owner_stop" and not descendants_terminal(db, saved["owner"]):
+    if saved["kind"] in {"owner_stop", "closed_convergence", "external_transition"} and saved["owner"] and not descendants_terminal(db, saved["owner"]):
         finish(db, saved, "pending", "owner or descendant has no terminal observation",
                "wait for authoritative terminal owner and descendants",
                (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat())
         return {"work_id": saved["work_id"], "state": "pending", "reason": "owner_or_descendant_active_or_unknown"}
     selected = github.project(payload["project"], payload["project_status"])
+    if urlsplit(payload["issue"]).netloc.casefold() != selected["host"].casefold():
+        raise ValueError("issue and Project must belong to the same GitHub host")
     observed = github.view(payload["issue"])
     if observed["state"] == "CLOSED" and payload["status"] != "done":
         finish(db, saved, "needs_decision", "issue closed during nonterminal transition",
@@ -127,6 +150,9 @@ def apply_sync(db, saved):
     sync = tracking.get("sync") or {}
     item_id = sync.get("item_id") if sync.get("project_id") == selected["id"] else None
     item = github.project_item(selected["host"], item_id) if item_id else None
+    if item and (item.get("project") or {}).get("id") != selected["id"]:
+        item = None
+        item_id = None
     if not item:
         item = github.legacy_project_item(selected["url"], observed["id"])
         item_id = item["id"] if item else None
@@ -169,6 +195,8 @@ def apply_sync(db, saved):
             tracking["await"] = dict(url=payload["await_url"], follow_up=payload["follow_up"])
         elif payload["status"] != "blocked":
             tracking.pop("await", None)
+        if saved["kind"] == "sync" and isinstance(tracking.get("external_outcome"), dict):
+            tracking["external_outcome"]["resolved_at"] = state.now()
         state.update(db, "work", dict(id=saved["work_id"], details=details), None)
         local_status, stage, _ = github.STATUSES[payload["status"]]
         if payload.get("release") and local_status == "active":
@@ -183,27 +211,53 @@ def apply_sync(db, saved):
         state.record(db, "result", dict(id="reconcile:" + saved["work_id"] + ":" + str(saved["revision"]),
                      work_id=saved["work_id"], kind="github", status="synchronized",
                      evidence_ref=payload["issue"], summary=selected["url"] + ": " + selected["status"] + "; assigned to " + login))
-        db.execute("""UPDATE reconcile_intents SET state='acknowledged',attempts=attempts+1,
-            last_error=NULL,next_attempt_at=NULL,next_action=NULL,updated_at=?,acknowledged_at=?
-            WHERE work_id=? AND revision=?""", (state.now(), state.now(), saved["work_id"], saved["revision"]))
+        decision = saved["kind"] == "external_transition"
+        stamp = state.now()
+        db.execute("""UPDATE reconcile_intents SET state=?,attempts=attempts+1,
+            last_error=NULL,next_attempt_at=NULL,next_action=?,updated_at=?,acknowledged_at=?
+            WHERE work_id=? AND revision=?""",
+            ("needs_decision" if decision else "acknowledged",
+             payload.get("next_action") if decision else None, stamp, stamp,
+             saved["work_id"], saved["revision"]))
         if payload.get("release") or payload["status"] in {"paused", "done"} or saved["kind"] == "owner_stop":
             if saved["owner"]:
                 state.release_work(db, saved["work_id"], saved["owner"])
-    return {"work_id": saved["work_id"], "state": "acknowledged", "issue": payload["issue"],
+    return {"work_id": saved["work_id"], "state": "needs_decision" if decision else "acknowledged", "issue": payload["issue"],
             "status": payload["status"], "project_status": selected["status"], "assignee": login}
 
 
 def apply_one(db, saved):
+    lock_name = hashlib.sha256(saved["work_id"].encode()).hexdigest()[:24]
+    filename = db.execute("PRAGMA database_list").fetchone()[2]
+    lock = Path(filename).with_name(".reconcile-" + lock_name + ".lock")
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        return _apply_one(db, saved)
+
+
+def _apply_one(db, saved):
     if not current(db, saved):
         return {"work_id": saved["work_id"], "state": "superseded"}
     try:
+        if saved["kind"] == "probe":
+            payload = json.loads(saved["payload"])
+            github.view(payload["issue"])
+            github.project(payload["project"], payload["project_status"])
+            if payload.get("await_url"):
+                url = urlsplit(payload["await_url"])
+                parts = url.path.strip("/").split("/")
+                github.gh("run", "view", parts[-1], "--repo", f"{url.netloc}/{parts[0]}/{parts[1]}",
+                          "--json", "status,conclusion,url", as_json=True)
+            finish(db, saved, "acknowledged")
+            return {"work_id": saved["work_id"], "state": "acknowledged", "kind": "probe"}
         return apply_sync(db, saved)
     except ValueError as exc:
         if "superseded" in str(exc):
             return {"work_id": saved["work_id"], "state": "superseded"}
         finish(db, saved, "needs_decision", str(exc), "resolve mapping or semantic decision")
         return {"work_id": saved["work_id"], "state": "needs_decision", "error": str(exc)}
-    except (OSError, RuntimeError, sqlite3.Error) as exc:
+    except (OSError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
         return retry(db, saved, exc)
 
 
@@ -219,6 +273,16 @@ def external_outcome(db, work, tracking):
         return None
     outcome = {"url": url, "status": run["status"], "conclusion": run.get("conclusion"),
                "follow_up": awaited.get("follow_up")}
+    succeeded = run.get("conclusion") == "success"
+    next_action = ("review completed external run and record semantic acceptance or repair" if succeeded
+                   else "inspect failed external run and record repair decision")
+    outcome["next_action"] = next_action
+    issue_state = github.view(work["issue"])["state"]
+    if issue_state not in {"OPEN", "CLOSED"}:
+        raise ValueError("unknown issue state for external outcome")
+    target = "done" if issue_state == "CLOSED" else "in-review" if succeeded else "blocked"
+    chosen = tracking.get("statuses", {}).get(target) or github.STATUSES[target][2]
+    reason = None if succeeded else "External Actions run completed with " + str(run.get("conclusion") or "unknown conclusion")
     with db:
         db.execute("BEGIN IMMEDIATE")
         fresh = state.row(db, "works", work["id"])
@@ -230,35 +294,93 @@ def external_outcome(db, work, tracking):
             return None
         details["github"].pop("await", None)
         details["github"]["external_outcome"] = outcome
-        state.update(db, "work", dict(id=work["id"], details=details, status="waiting", blocker=None), None)
-        next_action = ("review completed external run and record semantic acceptance or repair" if
-                       run.get("conclusion") == "success" else "inspect failed external run and record repair decision")
-        queue(db, work["id"], "external_outcome", {"issue": work["issue"], "outcome": outcome},
-              next_action=next_action)
-        db.execute("UPDATE reconcile_intents SET state='needs_decision' WHERE work_id=?", (work["id"],))
-    return {"work_id": work["id"], "state": "needs_decision", "external_outcome": outcome,
+        # Replace the stale waiting reason immediately. Project movement is a
+        # separate queued, verified operation and cannot imply acceptance.
+        state.update(db, "work", dict(id=work["id"], details=details, status="blocked",
+                                      blocker="External run completed; tracker transition pending"), None)
+        queue(db, work["id"], "external_transition", dict(
+            issue=work["issue"], status=target, project=tracking["project"],
+            project_status=chosen, assignee=tracking["sync"]["assignee"],
+            reason=reason, release=True, await_url=None, follow_up=None,
+            next_action=next_action), owner=(state.claim_for(db, work["id"]) or {}).get("owner"),
+            next_action=next_action)
+    return {"work_id": work["id"], "state": "pending", "external_outcome": outcome,
             "next_action": next_action}
 
 
 def discover(db, limit):
     """Read only opted-in managed work; never infer acceptance from CI or a PR."""
     results = []
-    rows = db.execute("SELECT * FROM works WHERE issue IS NOT NULL ORDER BY id LIMIT ?", (limit,)).fetchall()
-    for item in rows:
+    rows = []
+    for item in db.execute("SELECT * FROM works WHERE issue IS NOT NULL ORDER BY id"):
         work = dict(item)
         tracking = github.details(work).get("github", {})
+        if managed(tracking):
+            rows.append(work)
+    cursor = db.execute("SELECT last_work_id FROM reconcile_cursor WHERE id=1").fetchone()[0]
+    start = next((index for index, work in enumerate(rows) if work["id"] > (cursor or "")), 0)
+    selected_rows = (rows[start:] + rows[:start])[:limit]
+    if len(rows) > limit and selected_rows:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE reconcile_cursor SET last_work_id=? WHERE id=1", (selected_rows[-1]["id"],))
+    for work in selected_rows:
+        tracking = github.details(work).get("github", {})
         sync = tracking.get("sync")
-        if not tracking.get("project") or not isinstance(sync, dict) or not sync.get("project_status"):
+        pending = intent(db, work["id"])
+        if pending and pending["state"] == "pending" and pending["next_attempt_at"] and pending["next_attempt_at"] > state.now() and pending["last_error"]:
             continue
-        if intent(db, work["id"]) and intent(db, work["id"])["state"] in {"pending", "needs_decision"}:
+        # An external run can finish while an earlier sync is pending or
+        # awaiting a decision. Observe that terminal fact before gating drift.
+        if tracking.get("await"):
+            try:
+                outcome = external_outcome(db, work, tracking)
+                if outcome:
+                    results.append(outcome)
+                    continue
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                with db:
+                    db.execute("BEGIN IMMEDIATE")
+                    if pending and pending["state"] == "pending":
+                        seconds = min(3600, 15 * (2 ** min(pending["attempts"], 8)))
+                        at = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+                        db.execute("""UPDATE reconcile_intents SET attempts=attempts+1,last_error=?,
+                            next_attempt_at=?,next_action='retry external run read',updated_at=?
+                            WHERE work_id=? AND revision=?""",
+                            (str(exc), at, state.now(), work["id"], pending["revision"]))
+                    elif not pending or pending["state"] == "acknowledged":
+                        chosen = tracking.get("statuses", {}).get(sync.get("status")) or sync["project_status"]
+                        queue(db, work["id"], "probe", dict(issue=work["issue"],
+                              project=tracking["project"], project_status=chosen,
+                              await_url=tracking["await"]["url"]),
+                              owner=(state.claim_for(db, work["id"]) or {}).get("owner"),
+                              next_action="retry external run read")
+                results.append({"work_id": work["id"], "state": "unknown", "error": str(exc)})
+                continue
+        if pending and pending["state"] == "pending" and not current(db, pending):
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("""UPDATE reconcile_intents SET state='needs_decision',
+                    last_error='owner or lifecycle generation changed',
+                    next_action='record current owner decision before synchronizing',updated_at=?
+                    WHERE work_id=? AND revision=? AND state='pending'""",
+                    (state.now(), work["id"], pending["revision"]))
+            results.append({"work_id": work["id"], "state": "needs_decision", "reason": "stale_owner_generation"})
+            continue
+        if pending and pending["state"] in {"pending", "needs_decision"}:
             continue
         try:
-            outcome = external_outcome(db, work, tracking)
-            if outcome:
-                results.append(outcome)
-                continue
             observed = github.view(work["issue"])
             if observed["state"] == "CLOSED" and work["status"] != "done":
+                claim = state.claim_for(db, work["id"])
+                if claim and not descendants_terminal(db, claim["owner"]):
+                    with db:
+                        db.execute("BEGIN IMMEDIATE")
+                        queue(db, work["id"], "unknown", {"issue": work["issue"]},
+                              owner=claim["owner"], next_action="live owner must confirm closed issue")
+                        db.execute("UPDATE reconcile_intents SET state='needs_decision' WHERE work_id=?", (work["id"],))
+                    results.append({"work_id": work["id"], "state": "needs_decision", "reason": "live_claim_on_closed_issue"})
+                    continue
                 status = "done"
             elif observed["state"] == "OPEN" and work["status"] == "done":
                 with db:
@@ -287,20 +409,64 @@ def discover(db, limit):
                                release=status == "done", await_url=None, follow_up=None)
                 with db:
                     db.execute("BEGIN IMMEDIATE")
-                    queue(db, work["id"], "sync", payload, owner=(state.claim_for(db, work["id"]) or {}).get("owner"))
+                    queue(db, work["id"], "closed_convergence" if status == "done" else "sync",
+                          payload, owner=(state.claim_for(db, work["id"]) or {}).get("owner"), force=True)
                 results.append({"work_id": work["id"], "state": "pending", "reason": "remote_drift"})
-        except (OSError, RuntimeError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            chosen = tracking.get("statuses", {}).get(sync.get("status")) or github.STATUSES.get(sync.get("status"), (None, None, None))[2]
+            if chosen:
+                with db:
+                    db.execute("BEGIN IMMEDIATE")
+                    queue(db, work["id"], "probe", dict(issue=work["issue"],
+                          project=tracking["project"], project_status=chosen),
+                          owner=(state.claim_for(db, work["id"]) or {}).get("owner"),
+                          next_action="retry remote read or resolve mapping")
+                    if isinstance(exc, ValueError):
+                        db.execute("UPDATE reconcile_intents SET state='needs_decision',last_error=? WHERE work_id=?",
+                                   (str(exc), work["id"]))
             results.append({"work_id": work["id"], "state": "unknown", "error": str(exc)})
     return results
 
 
 def once(db, limit=20, dry_run=False):
     if dry_run:
-        return [{"work_id": r["id"], "issue": r["issue"], "status": r["status"],
-                 "project": github.details(dict(r)).get("github", {}).get("project"),
-                 "intent": (intent(db, r["id"]) or {}).get("state")}
-                for r in db.execute("SELECT * FROM works WHERE issue IS NOT NULL ORDER BY id LIMIT ?", (limit,))
-                if github.details(dict(r)).get("github", {}).get("project")]
+        rows = []
+        has_queue = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reconcile_intents'").fetchone())
+        for raw in db.execute("SELECT * FROM works WHERE issue IS NOT NULL ORDER BY id"):
+            work = dict(raw)
+            tracking = github.details(work).get("github", {})
+            if not tracking.get("project"):
+                continue
+            sync = tracking.get("sync")
+            mappings = tracking.get("statuses", {})
+            eligible = managed(tracking)
+            preview = {"work_id": work["id"], "issue": work["issue"], "local_status": work["status"],
+                       "project": tracking["project"],
+                       "eligibility": "managed" if eligible else "legacy_needs_explicit_mapping",
+                       "missing_mappings": [name for name in ("blocked", "paused", "done") if name not in mappings],
+                       "intent": (intent(db, work["id"]) or {}).get("state") if has_queue else None,
+                       "possible_remote_writes": []}
+            if eligible:
+                try:
+                    audit = github.audit(db, work["id"])
+                    preview["audit_state"] = audit["state"]
+                    reasons = audit["reconciliation_required"]
+                    preview["possible_remote_writes"] = [
+                        name for name, cause in (("assignee", "assignee_mismatch"),
+                                                 ("Project Status", "project_status_mismatch")) if cause in reasons]
+                    if "unfinished_issue_closed" in reasons:
+                        preview["possible_remote_writes"].append("Project Done if configured; local completion")
+                    if audit.get("awaited_run", {}).get("status") == "completed":
+                        preview["next_action"] = "record external outcome; review semantic acceptance"
+                except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                    preview["audit_state"] = "unknown"
+                    preview["error"] = str(exc)
+            else:
+                preview["next_action"] = "supply and verify explicit mapping before opt-in"
+            rows.append(preview)
+            if len(rows) >= limit:
+                break
+        return rows
     results = discover(db, limit)
     due = db.execute("""SELECT * FROM reconcile_intents WHERE state='pending'
         AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY updated_at,work_id LIMIT ?""",
@@ -328,6 +494,12 @@ def main():
     if not path.exists():
         print(state.encode({"state": "no_database", "db": str(path)}))
         return 0
+    if args.dry_run:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+            db.row_factory = sqlite3.Row
+            result = once(db, args.limit, True)
+        print(state.encode({"state": "preview", "records": result}), flush=True)
+        return 0
     lock = path.with_suffix(path.suffix + ".reconcile.lock")
     fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(fd, "w") as handle:
@@ -337,7 +509,8 @@ def main():
             print(state.encode({"state": "already_running", "db": str(path)}))
             return 0
         while True:
-            with closing(state.connect(path)) as db:
+            db = state.connect(path)
+            with closing(db):
                 result = once(db, args.limit, args.dry_run)
             print(state.encode({"state": "completed", "actions": result}), flush=True)
             if args.command == "once":

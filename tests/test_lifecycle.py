@@ -181,7 +181,7 @@ class LifecycleCLI(unittest.TestCase):
         stop = {"session_id": "root-1", "hook_event_name": "Stop", "turn_id": "t1"}
         result = self.cli("telemetry.py", "hook", payload=stop)
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(json.loads(result.stdout)["decision"], "block")
+        self.assertNotIn("decision", json.loads(result.stdout))
         active = self.cli("telemetry.py", "hook", payload=dict(stop, stop_hook_active=True))
         self.assertNotIn("decision", json.loads(active.stdout))
         with state.connect(self.db_path) as db, db:
@@ -214,7 +214,7 @@ class LifecycleCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("stopped_owner_retains_claim", report["reconciliation_required"])
 
-    def test_unresolved_issue_creation_blocks_root_stop_without_blocking_local_work(self):
+    def test_unresolved_issue_creation_stays_durable_without_stop_loop(self):
         with state.connect(self.db_path) as db, db:
             db.execute("BEGIN IMMEDIATE")
             state.record(db, "work", dict(id="pending", title="Pending issue", status="starting",
@@ -224,8 +224,9 @@ class LifecycleCLI(unittest.TestCase):
             state.claim_work(db, "local", "root-local")
         pending = self.cli("telemetry.py", "hook", payload={"session_id": "root-pending",
                            "hook_event_name": "Stop", "turn_id": "t1"})
-        self.assertEqual(json.loads(pending.stdout)["decision"], "block")
-        self.assertIn("creation", json.loads(pending.stdout)["reason"])
+        self.assertNotIn("decision", json.loads(pending.stdout))
+        with state.connect(self.db_path) as db:
+            self.assertTrue(json.loads(state.row(db, "works", "pending")["details"])["github"]["create_pending"])
         local = self.cli("telemetry.py", "hook", payload={"session_id": "root-local",
                          "hook_event_name": "Stop", "turn_id": "t1"})
         self.assertNotIn("decision", json.loads(local.stdout))

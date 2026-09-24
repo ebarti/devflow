@@ -83,8 +83,8 @@ def connect(path):
                     db.execute(statement)
                     statement = ""
             db.execute(f"PRAGMA application_id={APP_ID}")
-            db.execute("PRAGMA user_version=5")
-        elif version not in {2, 3, 4, 5} or db.execute("PRAGMA application_id").fetchone()[0] != APP_ID:
+            db.execute("PRAGMA user_version=7")
+        elif version not in {2, 3, 4, 5, 6, 7} or db.execute("PRAGMA application_id").fetchone()[0] != APP_ID:
             raise ValueError("not a supported workflow.sqlite3 database; use import-legacy for version-1 state.sqlite3")
         elif version == 2:
             db.execute("""CREATE TABLE claims (
@@ -96,7 +96,9 @@ def connect(path):
         if version in {2, 3}:
             schema = Path(__file__).with_name("schema.sql").read_text()
             statement = ""
-            for line in schema[schema.index("CREATE TABLE runtime_sessions"):].splitlines(True):
+            runtime_schema = schema[schema.index("CREATE TABLE runtime_sessions"):
+                                    schema.index("CREATE TABLE reconcile_intents")]
+            for line in runtime_schema.splitlines(True):
                 statement += line
                 if sqlite3.complete_statement(statement):
                     db.execute(statement)
@@ -113,6 +115,14 @@ def connect(path):
             )""")
             db.execute("CREATE INDEX reconcile_due ON reconcile_intents(state,next_attempt_at)")
             db.execute("PRAGMA user_version=5")
+        if version in {2, 3, 4, 5}:
+            db.execute("CREATE TABLE reconcile_cursor (id INTEGER PRIMARY KEY CHECK(id=1), last_work_id TEXT)")
+            db.execute("INSERT INTO reconcile_cursor(id,last_work_id) VALUES (1,NULL)")
+            db.execute("PRAGMA user_version=6")
+        if version in {4, 5, 6}:
+            db.execute("ALTER TABLE runtime_sessions ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+        if version in {2, 3, 4, 5, 6}:
+            db.execute("PRAGMA user_version=7")
         db.commit()
         return db
     except BaseException:
@@ -209,6 +219,7 @@ def bind(db, session_id, work_ids, role=None, parent_id=None, extend=False):
         VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET role=COALESCE(excluded.role,role),
         parent_id=COALESCE(excluded.parent_id,parent_id),
         bound_at=CASE WHEN closed_at IS NOT NULL THEN excluded.bound_at ELSE bound_at END,
+        generation=CASE WHEN closed_at IS NOT NULL THEN generation+1 ELSE generation END,
         closed_at=NULL""",
         (session_id, parent_id, role, now()))
     if saved and extend and set(work_ids) - set(scope(db, session_id)):

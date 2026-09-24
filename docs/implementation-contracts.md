@@ -16,27 +16,30 @@ The standard-library helper stores records in one SQLite database; its default l
 | `runtime_sessions` | Bound task identity, role/model, transcript cursor and cumulative token checkpoint |
 | `runtime_scopes` | Explicit task-to-work associations; several scopes leave usage unallocated |
 | `runtime_events` | Deduplicated turns/tools, observed lifecycle events, counter resets, skipped transcript lines and re-baselines after them, denied coordinator boundary calls, timing and command fingerprints |
+| `reconcile_intents` | Revisioned desired transition, owner/lifecycle fence, attempts, retry/error and next action |
+| `reconcile_cursor` | Durable position for bounded fair sweeps of managed records |
 
 Fields are ordinary queryable columns; optional `details` holds extra JSON context. Missing facts remain SQL `NULL`. Creation records use caller-supplied stable IDs: replay matching stored facts is a no-op, conflicting reuse fails. Work/run/finding updates retain change history and support optional stable event IDs. A started run can be completed under the same ID. Related rows and history commit in one transaction. The helper records facts without enforcing stage order, authorization or a passing gate.
 
-Schema 4 upgrades schemas 2 and 3 transactionally, adding claims and runtime tables as needed. Claims are unique by canonical issue URL and work ID. A different owner cannot claim or release the same reservation; retries by its owner retain it. Changing a claimed work's issue/repository requires release first. Claim/release history is preserved. Claims coordinate one shared database and do not expire automatically or establish live host activity.
+Schema 7 upgrades schemas 2 through 6 transactionally, adding claims, runtime and reconciliation tables and a monotonic runtime generation as needed. Claims are unique by canonical issue URL and work ID. A different owner cannot claim or release the same reservation; retries by its owner retain it. Changing a claimed work's issue/repository requires release first. Claim/release history is preserved. Claims coordinate one shared database and do not expire automatically or establish live host activity.
 
 `works.details.github` retains the selected Project, Status mappings and any unresolved creation attempt. Creation records its attempt before calling GitHub and saves the issue URL before further updates. A missing result requires reconciliation, never an automatic second create. Project Status and assignment are read back before success; labels and other Project fields are untouched.
+
+Before assignee or Project mutation, synchronization commits a desired intent. Replay reads GitHub first and writes only mismatched fields. Acknowledgment requires issue, assignee and Project option ID/name readback. Revisions and the claim/runtime generation fence stale owners. Network requests run outside SQLite transactions; failures retain a bounded retry or one explicit `needs_decision` state. The periodic service calls no model or agent.
 
 Successful synchronization also stores `details.github.sync`: expected issue
 state, assignee, Project/item/field/option IDs, selected Status name and readback time.
 `github.py audit --work-id` opens SQLite read-only, compares that expectation
 and local claim/runtime with the live issue and selected Project item, including
 both the Status option ID and its current name. Active linked work with no claim
-requires reconciliation. A root Stop blocks linked issues and unresolved
-`create_pending` claims; observed Interrupt/SessionEnd blocks all of the root's
-claimed work locally, including local-only work, while retaining claims. Audit
+requires reconciliation. Stop does not start a repeated model reconciliation conversation; unresolved `create_pending` remains durable. Observed Interrupt/SessionEnd blocks the root's
+claimed work locally, including local-only work, while retaining claims, and queues linked managed work. The service releases a claim only after terminal root and descendant evidence. A resumed same-ID owner starts a new runtime generation that fences old recovery. Hard crashes and missing hooks remain unknown. Audit
 returns `consistent`, `unknown` or `reconciliation_required`. Legacy records
 without the successful-sync metadata remain unknown. An observed root owner
 SessionEnd with a retained claim requires reconciliation; no claim expires on
 elapsed time. A tracked `details.github.await` Actions URL and follow-up are
 read during audit, as is a legacy `details.release_run` URL. Terminal run state
-signals review, not acceptance, closure or approval. API failure cannot pass.
+signals review, not acceptance, closure or approval. The service records terminal Actions outcomes once and, after readback, moves success to configured In review or failure to configured Blocked with a concrete reason. An already-closed issue can converge to configured Done without a live owner claim. API failure cannot pass.
 
 Record timestamps are supplied automatically when omitted. Active and terminal work/run updates stamp missing start/end observations; explicit nulls remain unknown. Legacy imports retain unknown endpoints. Observation times accept timezone-aware ISO 8601 values. A run's duration derives from its start/end timestamps; unfinished runs have no inferred duration. Evidence references are locators, not copied or validated artifacts.
 

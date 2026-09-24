@@ -71,7 +71,7 @@ CREATE INDEX allocations_work ON usage_allocations(work_id);
 CREATE INDEX history_work ON history(work_id);
 CREATE TABLE runtime_sessions (
  id TEXT PRIMARY KEY NOT NULL, parent_id TEXT, role TEXT, model TEXT, effort TEXT, turn_id TEXT,
- bound_at TEXT NOT NULL, closed_at TEXT, last_seen_at TEXT, transcript_path TEXT, cursor INTEGER NOT NULL DEFAULT 0,
+ bound_at TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1, closed_at TEXT, last_seen_at TEXT, transcript_path TEXT, cursor INTEGER NOT NULL DEFAULT 0,
  input_tokens INTEGER, cached_input_tokens INTEGER, cache_write_tokens INTEGER,
  output_tokens INTEGER, reasoning_output_tokens INTEGER
 );
@@ -95,3 +95,7 @@ CREATE TABLE reconcile_intents (
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, acknowledged_at TEXT
 );
 CREATE INDEX reconcile_due ON reconcile_intents(state,next_attempt_at);
+CREATE TABLE reconcile_cursor (
+ id INTEGER PRIMARY KEY CHECK(id=1), last_work_id TEXT
+);
+INSERT INTO reconcile_cursor(id,last_work_id) VALUES (1,NULL);

@@ -26,7 +26,7 @@ STATUSES = {
 
 
 def gh(*args, as_json=False):
-    result = subprocess.run(["gh", *args], text=True, capture_output=True, timeout=60)
+    result = subprocess.run([os.environ.get("DEVFLOW_GH", "gh"), *args], text=True, capture_output=True, timeout=60)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gh failed")
     return json.loads(result.stdout) if as_json else result.stdout.strip()
@@ -172,6 +172,23 @@ def synchronize(db, args):
             state.require_owner(db, args.work_id, args.owner)
         saved = details(work).get("github", {})
     status_name = args.project_status or saved.get("statuses", {}).get(args.status) or STATUSES[args.status][2]
+    # For an already linked issue, preserve the requested transition even if
+    # the mapping/API read fails before the normal sync path reaches GitHub.
+    if args.action == "set" and work and work["issue"] and (args.project or saved.get("project")):
+        import reconcile
+        raw_project = args.project or saved["project"]
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            current_details = details(state.row(db, "works", args.work_id))
+            current_details.setdefault("github", {})["project"] = raw_project
+            state.update(db, "work", dict(id=args.work_id, details=current_details), None)
+            reconcile.queue(db, args.work_id, "sync", dict(
+                issue=work["issue"], status=args.status, project=raw_project,
+                project_status=status_name, assignee=args.assignee, reason=args.reason,
+                release=args.release,
+                await_url=action_url(args.await_url, urlsplit(work["issue"]).netloc) if args.await_url else None,
+                follow_up=args.follow_up),
+                args.owner)
     selected = project(args.project or saved.get("project"), status_name)
     if args.await_url:
         action_url(args.await_url, selected["host"])
@@ -213,12 +230,25 @@ def synchronize(db, args):
     with db:
         db.execute("BEGIN IMMEDIATE")
         queued = reconcile.queue(db, args.work_id, "sync", payload, args.owner)
+    if queued["state"] == "acknowledged":
+        report = audit(db, args.work_id)
+        if report["state"] == "consistent":
+            return dict(issue=issue_url, assignee=tracking_assignee(db, args.work_id),
+                        status=args.status, project=selected["url"],
+                        project_status=selected["status"], claim=state.claim_for(db, args.work_id))
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            queued = reconcile.queue(db, args.work_id, "sync", payload, args.owner, force=True)
     result = reconcile.apply_one(db, queued)
     if result["state"] != "acknowledged":
         raise RuntimeError("GitHub reconciliation pending: " + state.encode(result))
     return dict(issue=issue_url, assignee=result["assignee"], status=args.status,
                 project=selected["url"], project_status=result["project_status"],
                 claim=state.claim_for(db, args.work_id))
+
+
+def tracking_assignee(db, work_id):
+    return details(state.row(db, "works", work_id))["github"]["sync"]["assignee"]
 
 
 def audit(db, work_id):
@@ -274,6 +304,10 @@ def audit(db, work_id):
         elif not owner:
             result["unknown"].append("owner_runtime_unknown")
         result["owner_runtime"] = dict(owner) if owner else None
+    external = tracking.get("external_outcome")
+    if isinstance(external, dict) and not external.get("resolved_at"):
+        result["external_outcome"] = external
+        result["unknown"].append("external_outcome_needs_semantic_decision")
     awaited = tracking.get("await")
     if not awaited and isinstance(details(work).get("release_run"), str):
         awaited = dict(url=details(work)["release_run"], follow_up=None, legacy=True)

@@ -49,6 +49,10 @@ done
 for name in state.py github.py legacy.py telemetry.py measurements.py schema.sql; do
     test -r "$destination/devflow/scripts/$name"
 done
+test -r "$destination/devflow/scripts/reconcile.py"
+test -r "$install_fixture/codex/LaunchAgents/com.ebarti.devflow.reconcile.plist"
+"$devflow_python" -B "$source_root/scripts/reconcile-service.py" \
+    --launch-agents "$install_fixture/codex/LaunchAgents" inspect > /dev/null
 test -r "$source_root/scripts/install-guard.py"
 test -r "$install_fixture/codex/.devflow-install.json"
 test -r "$install_fixture/codex/.devflow-hook.py"

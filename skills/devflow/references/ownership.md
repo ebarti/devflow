@@ -67,8 +67,9 @@ a PR early leaves the issue in progress while implementation continues. Move it
 to in review when the candidate is ready for review; publication alone does not
 change its status or establish completion. The helper does not close or reopen issues.
 On `--release`, active local work becomes waiting; completion of a narrower requested
-endpoint can still be recorded separately. A failed GitHub update stays visible in
-the local record and retains the claim for reconciliation and retry by its owner.
+endpoint can still be recorded separately. A failed GitHub update retains a durable
+intent with its error and bounded retry. The service reads back before retrying;
+unknown mapping or semantics remain one explicit decision.
 
 Run `github.py audit --work-id WORK_ID` before resuming or ending an owned issue.
 It reads the local work, claim and owner runtime plus the live issue, assignee and
@@ -79,16 +80,18 @@ whose claim has been released. Older records
 without that metadata report `unknown` while observing any discoverable selected
 Project item; an audit never treats missing history as
 a pass. The command changes neither GitHub nor SQLite and exits nonzero for an
-unknown or reconciliation-required result. Resolve differences with an explicit
-`github.py set` and read back again. A failed API read also exits nonzero.
+unknown or reconciliation-required result. The service retries mechanical
+differences from recorded intent. Use `github.py set` once for a new semantic
+status or mapping, then audit its readback. A failed API read also exits nonzero.
 
 For an external Actions handoff, set `--status blocked --reason REASON` with
 `--await-url ACTIONS_RUN_URL --follow-up 'OWNER checks when TRIGGER occurs'`.
-The run URL and concrete follow-up survive in the work record. Audit checks the
-actual run state: pending remains a wait; a terminal run requires reconciliation
-of the requested outcome, authorization and issue state. A successful run alone
-does not approve, close or release anything. Existing `details.release_run` URLs
-are read for compatibility, but their missing follow-up remains unknown.
+The run URL and concrete follow-up survive in the work record. The service checks
+the run without model polling. Terminal success moves to configured In review;
+failure moves to configured Blocked with the observed conclusion. Both require
+issue, assignee and Project readback and retain an `external_outcome` next action
+until the owner records a semantic decision. Success does not approve or close the
+issue. Legacy `details.release_run` URLs remain read-only compatibility evidence.
 
 ## Concurrency and interruption
 
@@ -103,18 +106,14 @@ python3.12 ~/.agents/skills/devflow/scripts/state.py work list --claimed
 ```
 
 This lists owners and last observations, not live process health. Claims have no
-automatic expiry. A normal root Stop blocks while that root still holds linked
-issue claims or a `create_pending` claim; it directs the owner to audit, set and
-release or to resolve the issue-creation attempt. Leaf and execution
-coordinator returns do not block on the root's claim. An observed root Interrupt
-or SessionEnd marks all its claimed work, including local-only work, blocked for
-reconciliation and retains the
-claim; hooks make no network call or tracker change. A hard crash or missing hook
-can leave no local observation, so inspect the host task and run the audit on
-recovery. The audit reports a confirmed closed owner that still holds a claim.
-After confirming the old main task and its delegated execution have stopped, release its claim with
-`state.py work release --id WORK_ID --owner PREVIOUS_HOST_TASK_ID`, then resume with
-the same work ID and the new owner. An active owner must release before handoff.
+automatic expiry. A normal root Stop does not start a repeated reconciliation
+conversation. Observed root Interrupt or SessionEnd blocks claimed work locally
+and queues linked managed issues; hooks make no network call. The service waits
+for terminal root and descendant evidence before releasing a claim. A new prompt
+from the same root session reopens its runtime generation and fences old recovery.
+A hard crash or missing hook remains unknown. Unresolved issue creation stays
+`create_pending` until its actual outcome is bound. An active owner must release
+before handoff.
 
 If an execution coordinator returned blocked and released its claim, the main task
 reclaims the same work before resuming that coordinator. A reply target such as
@@ -124,4 +123,6 @@ Local-only work uses `state.py work claim --id WORK_ID --owner HOST_TASK_ID` and
 `work release` directly. Atomic exclusion covers tasks sharing one SQLite database.
 Separate hosts/databases require coordination through GitHub; Project Status and assignees
 are not a distributed lock. Status remains the last reported observation after an
-abrupt interruption; no heartbeat or background scheduler is installed.
+abrupt interruption without terminal evidence. The launchd service drains managed
+issue intents on macOS; `reconcile.py once` is available elsewhere. It never
+calls a model or infers acceptance from PR or CI state.

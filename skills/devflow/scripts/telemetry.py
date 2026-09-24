@@ -143,31 +143,40 @@ def pending_issue_creation(raw_details):
 
 
 def stop_response(claims, stop_hook_active):
-    issues = [item["work_id"] for item in claims if item["issue"]]
-    pending = [item["work_id"] for item in claims
-               if not item["issue"] and pending_issue_creation(item["details"])]
-    if not issues and not pending:
-        return None
-    parts = []
-    if issues:
-        parts.append("Issue claims still belong to this task: " + ", ".join(issues) +
-                     ". Audit each issue, then use github.py set --release")
-    if pending:
-        parts.append("Issue creation is unresolved for: " + ", ".join(pending) +
-                     ". Inspect GitHub for the creation outcome and bind an existing issue with github.py start")
-    message = "Devflow: " + "; ".join(parts) + "."
-    if stop_hook_active:
-        return {"systemMessage": message}
-    return {"decision": "block", "reason": message}
+    # Stop is not an authoritative terminal owner observation. SessionEnd and
+    # Interrupt persist recovery, while unresolved creation remains explicit
+    # in details.github.create_pending for a human decision. Do not elicit a
+    # repeated model status conversation at each Stop attempt.
+    return None
 
 
 def mark_interrupted_owner(db, session_id, stamp, event_name):
     for claim in root_claims(db, session_id):
         work_id = claim["work_id"]
         work = state.row(db, "works", work_id)
-        blocker = "Owner " + event_name + " observed at " + stamp + "; work and claim require reconciliation"
+        blocker = "Owner " + event_name + " observed; work and claim require reconciliation"
         if work["status"] != "blocked" or work["blocker"] != blocker:
             state.update(db, "work", dict(id=work_id, status="blocked", blocker=blocker), None)
+        if not work["issue"]:
+            continue
+        # The hook never calls GitHub. It records only managed work with an
+        # explicit verified mapping; legacy and ambiguous records remain visible.
+        import reconcile
+        tracking = github_details(work)
+        if not reconcile.managed(tracking):
+            continue
+        sync = tracking["sync"]
+        selected = tracking.get("statuses", {}).get("blocked") or "Blocked"
+        reconcile.queue(db, work_id, "owner_stop", dict(
+            issue=work["issue"], status="blocked", project=tracking["project"],
+            project_status=selected, assignee=sync["assignee"], reason=blocker,
+            release=True, await_url=None, follow_up=None), owner=session_id)
+
+
+def github_details(work):
+    saved = json.loads(work["details"]) if work["details"] else {}
+    github = saved.get("github", {}) if isinstance(saved, dict) else {}
+    return github if isinstance(github, dict) else {}
 
 
 def child_binding(db, payload):
@@ -469,7 +478,9 @@ def handle(db, payload, reason=None, stop=None):
                   name=payload.get("agent_type"), status="stopped" if name == "SubagentStop" else "started")
             db.execute("UPDATE runtime_sessions SET last_seen_at=? WHERE id=?", (stamp, child))
             if name == "SubagentStop":
-                close_if_released(db, child, stamp)
+                # A descendant never owns the root claim. Native SubagentStop
+                # is its terminal observation even while that claim remains.
+                db.execute("UPDATE runtime_sessions SET closed_at=? WHERE id=?", (stamp, child))
     else:
         if name in ("PreToolUse", "PostToolUse") and not payload.get("tool_use_id"):
             raise ValueError("tool hook lacks tool_use_id")
@@ -578,6 +589,15 @@ def main():
                 actor = payload.get("agent_id") or payload.get("session_id")
                 actor_payload = dict(payload, session_id=actor)
                 bound = present and check.execute("SELECT 1 FROM runtime_sessions WHERE id=? AND closed_at IS NULL", (actor,)).fetchone()
+                # A native prompt after SessionEnd is live evidence that the
+                # same task resumed. Rebind it before any queued recovery drains.
+                resumed = (present and not bound and payload.get("hook_event_name") == "UserPromptSubmit"
+                           and check.execute("""SELECT 1 FROM runtime_sessions s JOIN claims c ON c.owner=s.id
+                               JOIN runtime_scopes rs ON rs.session_id=s.id AND rs.work_id=c.work_id
+                               WHERE s.id=? AND s.role='coordinator' AND s.closed_at IS NOT NULL LIMIT 1""",
+                               (actor,)).fetchone())
+                if resumed:
+                    bound = True
                 reason = boundary_decision(check, actor_payload) if bound else None
                 stop = (stop_response(root_claims(check, actor), payload.get("stop_hook_active"))
                         if bound and payload.get("hook_event_name") == "Stop" else None)
@@ -595,6 +615,8 @@ def main():
                     db.execute("BEGIN IMMEDIATE")
                     if inherited:
                         bind(db, **inherited)
+                    if resumed:
+                        state.bind(db, actor, state.scope(db, actor), "coordinator", extend=True)
                     handle(db, payload, reason, stop)
             except (ValueError, OSError, sqlite3.Error) as exc:
                 failure = "Devflow metrics collection failed: " + str(exc)

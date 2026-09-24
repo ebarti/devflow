@@ -43,6 +43,14 @@ bash scripts/install.sh --force
 
 `--force` repoints bundled skill symlinks and migrates owned agent-definition symlinks to regular copies. Existing regular agent-definition files are preserved when byte-identical to this checkout's definitions. The installer records copied definitions in `$CODEX_HOME/agents/.devflow-agent-manifest.json`; on upgrade it refreshes unchanged owned copies and removes obsolete unchanged owned copies. Modified or custom copies and invalid skill destinations stop installation before any destination changes, even with `--force`; modified obsolete copies are preserved. Skill paths still require symlinks. Other files, agent definitions and hooks are preserved. Without `--force`, conflicting symlinks stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
 
+On macOS, a default-home install also starts the managed launchd issue reconciler. Its plist pins the installed Python, script, `gh` and SQLite paths; logs are private under Codex home. Custom or candidate homes receive a staged plist without launchd activation. Read the managed-record and potential-write preview before installation or upgrade:
+
+```sh
+python3.12 skills/devflow/scripts/reconcile.py --db "$HOME/.local/state/devflow/workflow.sqlite3" once --dry-run --limit 100
+```
+
+The preview opens SQLite read-only, creates no lock file and makes no GitHub writes. It reports legacy records needing explicit mapping; the service sweeps only records with verified sync metadata. Use `python3.12 skills/devflow/scripts/reconcile.py --db PATH once` for a bounded manual pass on hosts without launchd. Use `python3.12 scripts/reconcile-service.py inspect` or `python3.12 scripts/reconcile-service.py uninstall` to inspect or remove the owned launch agent. No background path calls a model or agent. A stopped owner's claim is released only after terminal root and descendant evidence; a missing hook or hard crash stays unknown. A completed Actions run becomes an In review or concrete Blocked outcome, never an automatic issue closure or acceptance.
+
 ## Upgrade
 
 Set `RELEASE_TAG` to the chosen [approved release tag](https://github.com/ebarti/devflow/releases)
