@@ -86,3 +86,12 @@ CREATE TABLE runtime_events (
  fingerprint TEXT, source_ref TEXT
 );
 CREATE INDEX runtime_events_work ON runtime_events(work_id,kind);
+CREATE TABLE reconcile_intents (
+ work_id TEXT PRIMARY KEY NOT NULL REFERENCES works(id),
+ revision INTEGER NOT NULL CHECK(revision > 0), kind TEXT NOT NULL,
+ owner TEXT, claim_token TEXT, payload TEXT NOT NULL,
+ state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+ last_error TEXT, next_attempt_at TEXT, next_action TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, acknowledged_at TEXT
+);
+CREATE INDEX reconcile_due ON reconcile_intents(state,next_attempt_at);

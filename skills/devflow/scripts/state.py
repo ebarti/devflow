@@ -83,8 +83,8 @@ def connect(path):
                     db.execute(statement)
                     statement = ""
             db.execute(f"PRAGMA application_id={APP_ID}")
-            db.execute("PRAGMA user_version=4")
-        elif version not in {2, 3, 4} or db.execute("PRAGMA application_id").fetchone()[0] != APP_ID:
+            db.execute("PRAGMA user_version=5")
+        elif version not in {2, 3, 4, 5} or db.execute("PRAGMA application_id").fetchone()[0] != APP_ID:
             raise ValueError("not a supported workflow.sqlite3 database; use import-legacy for version-1 state.sqlite3")
         elif version == 2:
             db.execute("""CREATE TABLE claims (
@@ -102,6 +102,17 @@ def connect(path):
                     db.execute(statement)
                     statement = ""
             db.execute("PRAGMA user_version=4")
+        if version in {2, 3, 4}:
+            db.execute("""CREATE TABLE reconcile_intents (
+                work_id TEXT PRIMARY KEY NOT NULL REFERENCES works(id),
+                revision INTEGER NOT NULL CHECK(revision > 0), kind TEXT NOT NULL,
+                owner TEXT, claim_token TEXT, payload TEXT NOT NULL,
+                state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT, next_attempt_at TEXT, next_action TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, acknowledged_at TEXT
+            )""")
+            db.execute("CREATE INDEX reconcile_due ON reconcile_intents(state,next_attempt_at)")
+            db.execute("PRAGMA user_version=5")
         db.commit()
         return db
     except BaseException:

@@ -202,61 +202,23 @@ def synchronize(db, args):
         tracking.setdefault("statuses", {})[args.status] = selected["status"]
         state.update(db, "work", dict(id=args.work_id, details=saved), None)
 
-    # No database transaction spans network requests or the agent's actual work.
-    login = args.assignee
-    if login == "@me":
-        login = gh("api", "--hostname", parsed.netloc, "user", "--jq", ".login")
-    assigned = {item["login"].casefold() for item in observed["assignees"]}
-    if login.casefold() not in assigned:
-        gh("issue", "edit", issue_url, "--add-assignee", login)
-    added = graphql(selected["host"], """mutation($project:ID!,$issue:ID!){
-        addProjectV2ItemById(input:{projectId:$project,contentId:$issue}){item{id}}}""",
-        project=selected["id"], issue=observed["id"])
-    item_id = added["addProjectV2ItemById"]["item"]["id"]
-    graphql(selected["host"], """mutation($project:ID!,$item:ID!,$field:ID!,$option:String!){
-        updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,
-        value:{singleSelectOptionId:$option}}){projectV2Item{id}}}""",
-        project=selected["id"], item=item_id, field=selected["field"], option=selected["option"])
-    readback = project_item(selected["host"], item_id)
-    verified = view(issue_url)
-    if (not readback or readback["project"]["id"] != selected["id"]
-            or (readback.get("fieldValueByName") or {}).get("optionId") != selected["option"]
-            or (readback.get("fieldValueByName") or {}).get("name") != selected["status"]
-            or login.casefold() not in {item["login"].casefold() for item in verified["assignees"]}
-            or verified["state"] != observed["state"]):
-        raise RuntimeError("GitHub readback disagrees with assignment or Project Status; reconcile before retrying")
-
+    # Queue the complete desired operation before changing GitHub. The bounded worker
+    # observes remote state first, so a crashed or uncertain write can be replayed.
+    import reconcile
+    payload = dict(issue=issue_url, status=args.status, project=selected["url"],
+                   project_status=selected["status"], assignee=args.assignee,
+                   reason=args.reason, release=args.release,
+                   await_url=action_url(args.await_url, parsed.netloc) if args.await_url else None,
+                   follow_up=args.follow_up)
     with db:
         db.execute("BEGIN IMMEDIATE")
-        state.require_owner(db, args.work_id, args.owner)
-        saved = details(state.row(db, "works", args.work_id))
-        tracking = saved.setdefault("github", {})
-        tracking["sync"] = dict(status=args.status, issue_state=verified["state"], assignee=login,
-                                project=selected["url"], project_id=selected["id"],
-                                item_id=item_id, field_id=selected["field"], option_id=selected["option"],
-                                project_status=selected["status"], readback_at=state.now())
-        if args.await_url:
-            tracking["await"] = dict(url=action_url(args.await_url, parsed.netloc),
-                                     follow_up=args.follow_up)
-        elif args.status != "blocked":
-            tracking.pop("await", None)
-        state.update(db, "work", dict(id=args.work_id, details=saved), None)
-        status, stage, _ = STATUSES[args.status]
-        if args.release and status == "active":
-            status = "waiting"
-        values = dict(id=args.work_id, status=status, blocker=args.reason if status == "blocked" else None)
-        if stage:
-            values["stage"] = stage
-        state.update(db, "work", values, None)
-        state.claim_work(db, args.work_id, args.owner)
-        state.record(db, "result", dict(id=uuid.uuid4().hex, work_id=args.work_id,
-                     kind="github", status="synchronized", evidence_ref=issue_url,
-                     summary=selected["url"] + ": " + selected["status"] + "; assigned to " + login))
-        if args.release or args.status in {"paused", "done"}:
-            state.release_work(db, args.work_id, args.owner)
-        return dict(issue=issue_url, assignee=login, status=args.status, project=selected["url"],
-                    project_status=selected["status"],
-                    claim=state.claim_for(db, args.work_id))
+        queued = reconcile.queue(db, args.work_id, "sync", payload, args.owner)
+    result = reconcile.apply_one(db, queued)
+    if result["state"] != "acknowledged":
+        raise RuntimeError("GitHub reconciliation pending: " + state.encode(result))
+    return dict(issue=issue_url, assignee=result["assignee"], status=args.status,
+                project=selected["url"], project_status=result["project_status"],
+                claim=state.claim_for(db, args.work_id))
 
 
 def audit(db, work_id):
