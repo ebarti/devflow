@@ -39,7 +39,7 @@ without the successful-sync metadata remain unknown. An observed root owner
 SessionEnd with a retained claim requires reconciliation; no claim expires on
 elapsed time. A tracked `details.github.await` Actions URL and follow-up are
 read during audit, as is a legacy `details.release_run` URL. Terminal run state
-signals review, not acceptance, closure or approval. The service records terminal Actions outcomes once and, after readback, moves success to configured In review or failure to configured Blocked with a concrete reason. An already-closed issue can converge to configured Done without a live owner claim. API failure cannot pass.
+signals review, not acceptance, closure or approval. The service records terminal Actions outcomes once and, after readback, moves success to configured In review or failure to configured Blocked with a concrete reason. An already-closed issue can converge to configured Done when no live owner remains, including a terminal interrupted owner whose retained claim is released after verified readback. API failure cannot pass. A repaired mapping can be retried by repeating the explicit transition; this creates a fresh revision rather than replaying a `needs_decision` intent.
 
 Record timestamps are supplied automatically when omitted. Active and terminal work/run updates stamp missing start/end observations; explicit nulls remain unknown. Legacy imports retain unknown endpoints. Observation times accept timezone-aware ISO 8601 values. A run's duration derives from its start/end timestamps; unfinished runs have no inferred duration. Evidence references are locators, not copied or validated artifacts.
 

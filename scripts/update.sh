@@ -30,6 +30,13 @@ upgrade() {
     else
         git -C "$source_root" checkout --detach "$previous_commit"
     fi
+    # The service activation marker is written only after successful bootstrap.
+    # On a rejected upgrade, restore owned hooks/agents/pin from the old tag;
+    # never roll back SQLite bytes or newer runtime observations.
+    if ! sh "$source_root/scripts/install.sh" --force "$@"; then
+        printf 'Previous checkout restored, but installation repair failed; inspect owned files before using Devflow.\n' >&2
+        return 1
+    fi
     return "$result"
 }
 

@@ -49,7 +49,7 @@ On macOS, a default-home install also starts the managed launchd issue reconcile
 python3.12 skills/devflow/scripts/reconcile.py --db "$HOME/.local/state/devflow/workflow.sqlite3" once --dry-run --limit 100
 ```
 
-The preview opens SQLite read-only, creates no lock file and makes no GitHub writes. It reports legacy records needing explicit mapping; the service sweeps only records with verified sync metadata. Use `python3.12 skills/devflow/scripts/reconcile.py --db PATH once` for a bounded manual pass on hosts without launchd. Use `python3.12 scripts/reconcile-service.py inspect` or `python3.12 scripts/reconcile-service.py uninstall` to inspect or remove the owned launch agent. No background path calls a model or agent. A stopped owner's claim is released only after terminal root and descendant evidence; a missing hook or hard crash stays unknown. A completed Actions run becomes an In review or concrete Blocked outcome, never an automatic issue closure or acceptance.
+The preview opens SQLite read-only, creates no lock file and makes no GitHub writes. Its `coverage` field reports the total Project-bound records and whether the selected limit truncated the result. Pending intents report their intended remote writes and local claim action. Legacy records remain visible as needing explicit mapping; the service sweeps only records with verified sync metadata. Use `python3.12 skills/devflow/scripts/reconcile.py --db PATH once` for a bounded manual pass on hosts without launchd. Use `python3.12 scripts/reconcile-service.py inspect` or `python3.12 scripts/reconcile-service.py uninstall` to inspect or remove the owned launch agent. No background path calls a model or agent. A stopped owner's claim is released only after terminal root and descendant evidence; a missing hook or hard crash stays unknown. A completed Actions run becomes an In review or concrete Blocked outcome, never an automatic issue closure or acceptance.
 
 ## Upgrade
 
@@ -60,7 +60,7 @@ and upgrade the existing checkout between tasks:
 bash scripts/update.sh "$RELEASE_TAG"
 ```
 
-The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade; if installation rejects a destination conflict, the updater restores the previous checkout. Obsolete skill links and unchanged owned agent copies are removed; modified copies, other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
+The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. If installation fails before service activation, the installer restores owned hooks, agent copies and the previous detached checkout, including upgrades begun with the older updater. The service waits for a matching activation marker written only after bootstrap succeeds; it does not open or migrate SQLite before that point. Obsolete skill links and unchanged owned agent copies are removed on success; modified copies, other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
 
 ## Candidate trials
 

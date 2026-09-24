@@ -124,7 +124,9 @@ def hook_pin(codex_home, source_root, force):
                             and Path(command[0]).is_absolute() and command[1] == "-B"
                             and command[-1] == "hook"
                             and command[-2].endswith("/skills/devflow/scripts/telemetry.py")):
-                        previous = str(Path(command[-2]).parents[3])
+                        # Legacy installs invoked telemetry through the skill
+                        # symlink, which may live outside the checkout.
+                        previous = str(Path(command[-2]).resolve(strict=True).parents[3])
                         if previous == str(source_root) or force:
                             continue
                     fail(f"Unrecognized or differently pinned Devflow hook in {hooks_path}")

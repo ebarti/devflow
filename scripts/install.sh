@@ -69,6 +69,21 @@ prune_links() {
     done
 }
 
+rollback_backup=$("$devflow_python" -B "$source_root/scripts/install-rollback.py" capture \
+    "$source_root" "$destination" "$codex_directory")
+restore_on_failure() {
+    install_status=$?
+    trap - 0
+    if [ "$install_status" -ne 0 ]; then
+        if "$devflow_python" -B "$source_root/scripts/install-rollback.py" restore "$rollback_backup"; then
+            "$devflow_python" -B "$source_root/scripts/install-rollback.py" discard "$rollback_backup" || true
+        else
+            printf 'Install rollback failed; preserved snapshot at %s\n' "$rollback_backup" >&2
+        fi
+    fi
+    exit "$install_status"
+}
+trap restore_on_failure 0
 check_links "$source_root/skills" "$destination"
 "$devflow_python" -B "$source_root/scripts/reconcile-service.py" \
     --launch-agents "$reconcile_agents" inspect > /dev/null
@@ -78,9 +93,10 @@ command -v gh > /dev/null || { printf 'gh is required for issue reconciliation.\
 "$devflow_python" -B "$source_root/scripts/install-agents.py" apply \
     "$source_root" "$destination" "$codex_directory" "$force"
 make_links "$source_root/skills" "$destination"
-"$devflow_python" -B "$source_root/scripts/install-guard.py" snapshot "$source_root" "$destination" "$codex_directory"
 "$devflow_python" -B "$destination/devflow/scripts/telemetry.py" install --codex-home "$codex_directory" \
     --guard-path "$codex_directory/.devflow-hook.py"
+prune_links "$source_root/skills" "$destination"
+"$devflow_python" -B "$source_root/scripts/install-guard.py" snapshot "$source_root" "$destination" "$codex_directory"
 if [ "$reconcile_mode" = active ]; then
     "$devflow_python" -B "$source_root/scripts/reconcile-service.py" \
         --launch-agents "$reconcile_agents" install --codex-home "$codex_directory"
@@ -88,6 +104,9 @@ else
     "$devflow_python" -B "$source_root/scripts/reconcile-service.py" \
         --launch-agents "$reconcile_agents" install --codex-home "$codex_directory" --no-start
 fi
-prune_links "$source_root/skills" "$destination"
+trap - 0
+"$devflow_python" -B "$source_root/scripts/install-rollback.py" discard "$rollback_backup" || true
+# Service activation is the final fallible step. A broken informational stdout
+# pipe must not make update.sh roll back after the daemon may have migrated DB.
 printf 'Skills linked in %s\nAgent definitions copied into %s\nKeep this checkout at %s.\n' \
-    "$destination" "$codex_directory/agents" "$source_root"
+    "$destination" "$codex_directory/agents" "$source_root" || true

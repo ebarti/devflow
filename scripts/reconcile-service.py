@@ -2,6 +2,8 @@
 """Install or remove the deterministic macOS launchd issue reconciler."""
 
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -55,6 +57,8 @@ def install(args, path):
     if not db.is_absolute():
         raise ValueError("state database must be absolute")
     logs = Path(args.codex_home).expanduser().resolve() / "logs"
+    manifest = Path(args.codex_home).expanduser().resolve() / ".devflow-install.json"
+    marker = Path(args.codex_home).expanduser().resolve() / ".devflow-reconcile-active.json"
     if logs.is_symlink():
         raise ValueError("refusing symlinked service log directory: " + str(logs))
     logs.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -67,8 +71,14 @@ def install(args, path):
         fd = os.open(target, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         os.close(fd)
         target.chmod(0o600)
-    data = {"Label": LABEL, "DevflowManaged": True,
+    revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    token = hashlib.sha256(json.dumps([str(script), revision,
+        hashlib.sha256(script.read_bytes()).hexdigest(), str(interpreter), str(gh),
+        str(db), args.interval, args.limit], sort_keys=True).encode()).hexdigest()
+    data = {"Label": LABEL, "DevflowManaged": True, "DevflowToken": token,
             "ProgramArguments": [str(interpreter), "-B", str(script), "--db", str(db),
+                                 "--manifest", str(manifest), "--activation-marker", str(marker),
+                                 "--activation-token", token,
                                  "daemon", "--interval", str(args.interval), "--limit", str(args.limit)],
             "EnvironmentVariables": {"PATH": str(gh.parent) + ":/usr/bin:/bin",
                                      "DEVFLOW_GH": str(gh)},
@@ -76,6 +86,7 @@ def install(args, path):
             "StandardErrorPath": str(err), "ProcessType": "Background"}
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     prior = path.read_bytes() if existing else None
+    prior_marker = marker.read_bytes() if marker.exists() else None
     with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".devflow-reconcile-", delete=False) as temp:
         temp.write(plistlib.dumps(data, sort_keys=True))
         staged = Path(temp.name)
@@ -89,17 +100,34 @@ def install(args, path):
                 launchctl(binary, "bootout", target, str(path))
                 stopped_previous = True
             launchctl(binary, "bootstrap", target, str(path))
+            # This is the activation commit point. A newly bootstrapped daemon
+            # waits for its exact token, so an uncertain bootstrap cannot
+            # migrate SQLite before launchctl reports success.
+            temporary = marker.with_name(marker.name + ".tmp-" + str(os.getpid()))
+            temporary.write_text(json.dumps({"token": token}, sort_keys=True) + "\n")
+            temporary.chmod(0o600)
+            temporary.replace(marker)
         except BaseException as exc:
+            try:
+                if service_loaded(binary):
+                    launchctl(binary, "bootout", target, str(path))
+            except BaseException:
+                pass
             if prior is None:
                 path.unlink(missing_ok=True)
             else:
                 path.write_bytes(prior)
                 path.chmod(0o600)
-                if stopped_previous:
-                    try:
-                        launchctl(binary, "bootstrap", target, str(path))
-                    except BaseException as rollback:
-                        raise RuntimeError(f"service upgrade failed: {exc}; prior service restart failed: {rollback}") from exc
+            if prior_marker is None:
+                marker.unlink(missing_ok=True)
+            else:
+                marker.write_bytes(prior_marker)
+                marker.chmod(0o600)
+            if stopped_previous:
+                try:
+                    launchctl(binary, "bootstrap", target, str(path))
+                except BaseException as rollback:
+                    raise RuntimeError(f"service upgrade failed: {exc}; prior service restart failed: {rollback}") from exc
             raise
     return {"service": str(path), "db": str(db), "script": str(script),
             "gh": str(gh), "active": not args.no_start}
@@ -116,13 +144,19 @@ def uninstall(args, path):
         if service_loaded(binary):
             launchctl(binary, "bootout", f"gui/{os.getuid()}", str(path))
     path.unlink()
+    arguments = existing.get("ProgramArguments", [])
+    if "--activation-marker" in arguments:
+        marker = Path(arguments[arguments.index("--activation-marker") + 1])
+        if marker.exists() and json.loads(marker.read_text()).get("token") == existing.get("DevflowToken"):
+            marker.unlink()
     return {"service": str(path), "removed": True}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launch-agents", default=str(Path.home() / "Library/LaunchAgents"))
-    parser.add_argument("--launchctl", default="/bin/launchctl", help="Absolute launchctl path")
+    parser.add_argument("--launchctl", default=os.environ.get("DEVFLOW_LAUNCHCTL", "/bin/launchctl"),
+                        help="Absolute launchctl path")
     commands = parser.add_subparsers(dest="command", required=True)
     setting = commands.add_parser("install")
     setting.add_argument("--db", default=str(Path(os.environ.get("XDG_STATE_HOME",
@@ -147,7 +181,6 @@ def main():
         else:
             result = {"service": str(path), "installed": bool(owned(path)),
                       "configuration": owned(path)}
-        import json
         print(json.dumps(result, sort_keys=True))
         return 0
     except (OSError, ValueError, RuntimeError, plistlib.InvalidFileException) as exc:

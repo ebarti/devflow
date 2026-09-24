@@ -55,7 +55,9 @@ def queue(db, work_id, kind, payload, owner=None, next_action=None, force=False)
     token = owner_token(db, claim)
     prior = intent(db, work_id)
     encoded = state.encode(payload)
-    reusable = {"pending", "needs_decision"}
+    # A human repeating the same explicit request after fixing a missing
+    # mapping must create a fresh revision; needs_decision is not executable.
+    reusable = {"pending"}
     if kind != "probe":
         reusable.add("acknowledged")
     if not force and prior and (prior["kind"], prior["owner"], prior["claim_token"], prior["payload"]) == (
@@ -136,6 +138,18 @@ def apply_sync(db, saved):
         raise ValueError("issue and Project must belong to the same GitHub host")
     observed = github.view(payload["issue"])
     if observed["state"] == "CLOSED" and payload["status"] != "done":
+        if saved["kind"] in {"owner_stop", "external_transition"}:
+            tracking = github.details(work)["github"]
+            replacement = dict(payload, status="done",
+                               project_status=tracking.get("statuses", {}).get("done") or github.STATUSES["done"][2],
+                               reason=None, release=True)
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                fence(db, saved)
+                newer = queue(db, saved["work_id"], "closed_convergence", replacement,
+                              owner=saved["owner"], force=True)
+            return {"work_id": saved["work_id"], "state": "pending",
+                    "reason": "closed_issue_superseded_stop", "revision": newer["revision"]}
         finish(db, saved, "needs_decision", "issue closed during nonterminal transition",
                "inspect the closed issue and record a new semantic event")
         return {"work_id": saved["work_id"], "state": "needs_decision", "reason": "issue_closed"}
@@ -428,14 +442,72 @@ def discover(db, limit):
     return results
 
 
+def preview_pending(db, queued):
+    payload = json.loads(queued["payload"])
+    summary = {"kind": queued["kind"], "revision": queued["revision"],
+               "state": queued["state"], "next_attempt_at": queued["next_attempt_at"],
+               "next_action": queued["next_action"]}
+    if queued["state"] != "pending" or not current(db, queued):
+        return summary, [], []
+    if queued["kind"] in {"probe", "unknown"}:
+        return summary, [], []
+    if queued["kind"] in {"owner_stop", "closed_convergence", "external_transition"} and queued["owner"]:
+        if not descendants_terminal(db, queued["owner"]):
+            summary["next_action"] = "wait for terminal root and descendants"
+            return summary, [], []
+    observed = github.view(payload["issue"])
+    if observed["state"] == "CLOSED" and payload["status"] != "done":
+        if queued["kind"] in {"owner_stop", "external_transition"}:
+            tracking = github.details(state.row(db, "works", queued["work_id"]))["github"]
+            payload = dict(payload, status="done",
+                           project_status=tracking.get("statuses", {}).get("done") or github.STATUSES["done"][2],
+                           release=True)
+            summary["next_action"] = "supersede terminal stop with closed-issue convergence"
+        else:
+            summary["next_action"] = "resolve closed issue before nonterminal transition"
+            return summary, [], []
+    if observed["state"] == "OPEN" and payload["status"] == "done":
+        summary["next_action"] = "resolve open issue before Done transition"
+        return summary, [], []
+    selected = github.project(payload["project"], payload["project_status"])
+    login = payload["assignee"]
+    if login == "@me":
+        login = github.gh("api", "--hostname", selected["host"], "user", "--jq", ".login")
+    work = state.row(db, "works", queued["work_id"])
+    sync = github.details(work).get("github", {}).get("sync") or {}
+    item_id = sync.get("item_id") if sync.get("project_id") == selected["id"] else None
+    item = github.project_item(selected["host"], item_id) if item_id else None
+    if not item or (item.get("project") or {}).get("id") != selected["id"]:
+        item = github.legacy_project_item(selected["url"], observed["id"])
+    writes = []
+    if not item:
+        writes.append("add Project item")
+    if login.casefold() not in {a["login"].casefold() for a in observed["assignees"]}:
+        writes.append("assignee")
+    field = (item or {}).get("fieldValueByName") or {}
+    if field.get("optionId") != selected["option"] or field.get("name") != selected["status"]:
+        writes.append("Project Status")
+    local = ["update local work after readback"]
+    if queued["owner"] and (payload.get("release") or payload["status"] in {"paused", "done"}
+                            or queued["kind"] == "owner_stop"):
+        local.append("release terminal owner claim after readback")
+    summary["desired_status"] = payload["status"]
+    summary["desired_project_status"] = selected["status"]
+    return summary, writes, local
+
+
 def once(db, limit=20, dry_run=False):
     if dry_run:
         rows = []
+        total = 0
         has_queue = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reconcile_intents'").fetchone())
         for raw in db.execute("SELECT * FROM works WHERE issue IS NOT NULL ORDER BY id"):
             work = dict(raw)
             tracking = github.details(work).get("github", {})
             if not tracking.get("project"):
+                continue
+            total += 1
+            if len(rows) >= limit:
                 continue
             sync = tracking.get("sync")
             mappings = tracking.get("statuses", {})
@@ -446,6 +518,7 @@ def once(db, limit=20, dry_run=False):
                        "missing_mappings": [name for name in ("blocked", "paused", "done") if name not in mappings],
                        "intent": (intent(db, work["id"]) or {}).get("state") if has_queue else None,
                        "possible_remote_writes": []}
+            queued = intent(db, work["id"]) if has_queue else None
             if eligible:
                 try:
                     audit = github.audit(db, work["id"])
@@ -458,15 +531,21 @@ def once(db, limit=20, dry_run=False):
                         preview["possible_remote_writes"].append("Project Done if configured; local completion")
                     if audit.get("awaited_run", {}).get("status") == "completed":
                         preview["next_action"] = "record external outcome; review semantic acceptance"
+                    if queued:
+                        summary, writes, local = preview_pending(db, queued)
+                        preview["pending_intent"] = summary
+                        if queued["state"] in {"pending", "needs_decision"}:
+                            preview["possible_remote_writes"] = writes
+                        preview["possible_local_actions"] = local
                 except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
                     preview["audit_state"] = "unknown"
                     preview["error"] = str(exc)
             else:
                 preview["next_action"] = "supply and verify explicit mapping before opt-in"
             rows.append(preview)
-            if len(rows) >= limit:
-                break
-        return rows
+        return {"records": rows, "coverage": {"total_project_records": total,
+                "returned": len(rows), "truncated": total > len(rows),
+                "next_action": "rerun with a larger --limit (maximum 100)" if total > len(rows) else None}}
     results = discover(db, limit)
     due = db.execute("""SELECT * FROM reconcile_intents WHERE state='pending'
         AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY updated_at,work_id LIMIT ?""",
@@ -476,10 +555,43 @@ def once(db, limit=20, dry_run=False):
     return results
 
 
+def installation_ready(args):
+    if not args.activation_token:
+        return True
+    try:
+        marker = json.loads(Path(args.activation_marker).read_text())
+        manifest = json.loads(Path(args.manifest).read_text())
+        source = Path(__file__).resolve().parents[3]
+        if marker.get("token") != args.activation_token or Path(manifest["source"]).resolve() != source:
+            return False
+        head = subprocess.check_output([manifest["git"], "-C", str(source), "rev-parse", "HEAD"],
+                                       text=True, timeout=10).strip()
+        return (manifest.get("head") == head and
+                manifest.get("files", {}).get("skills/devflow/scripts/reconcile.py") ==
+                hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
+def run_once_locked(path, limit):
+    lock = path.with_suffix(path.suffix + ".reconcile.lock")
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"state": "already_running", "db": str(path)}
+        with closing(state.connect(path)) as db:
+            return {"state": "completed", "actions": once(db, limit)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=str(Path(os.environ.get("XDG_STATE_HOME",
                         str(Path.home() / ".local/state"))) / "devflow/workflow.sqlite3"))
+    parser.add_argument("--manifest")
+    parser.add_argument("--activation-marker")
+    parser.add_argument("--activation-token")
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("once", "daemon"):
         command = commands.add_parser(name)
@@ -490,32 +602,35 @@ def main():
     args = parser.parse_args()
     if args.limit < 1 or args.limit > 100 or (args.command == "daemon" and args.interval < 15):
         parser.error("limit must be 1..100 and daemon interval at least 15 seconds")
+    if any((args.manifest, args.activation_marker, args.activation_token)) and not all(
+            (args.manifest, args.activation_marker, args.activation_token)):
+        parser.error("manifest, activation marker and token are required together")
     path = Path(args.db).expanduser().resolve()
-    if not path.exists():
-        print(state.encode({"state": "no_database", "db": str(path)}))
-        return 0
     if args.dry_run:
+        if not path.exists():
+            print(state.encode({"state": "no_database", "db": str(path)}))
+            return 0
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
             result = once(db, args.limit, True)
-        print(state.encode({"state": "preview", "records": result}), flush=True)
+        print(state.encode({"state": "preview", **result}), flush=True)
         return 0
-    lock = path.with_suffix(path.suffix + ".reconcile.lock")
-    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print(state.encode({"state": "already_running", "db": str(path)}))
-            return 0
-        while True:
-            db = state.connect(path)
-            with closing(db):
-                result = once(db, args.limit, args.dry_run)
-            print(state.encode({"state": "completed", "actions": result}), flush=True)
-            if args.command == "once":
-                return 0
-            time.sleep(args.interval)
+    if args.command == "once":
+        result = run_once_locked(path, args.limit) if path.exists() else {"state": "no_database", "db": str(path)}
+        print(state.encode(result), flush=True)
+        return 0
+    last_wait = None
+    while True:
+        reason = ("waiting_for_activation" if not installation_ready(args) else
+                  "no_database" if not path.exists() else None)
+        if reason:
+            if reason != last_wait:
+                print(state.encode({"state": reason, "db": str(path)}), flush=True)
+            last_wait = reason
+        else:
+            last_wait = None
+            print(state.encode(run_once_locked(path, args.limit)), flush=True)
+        time.sleep(args.interval)
 
 
 if __name__ == "__main__":

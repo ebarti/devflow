@@ -1,13 +1,18 @@
 """Controlled CLI, hook, and service replay without real GitHub mutation."""
 import json
+import hashlib
+import io
 import os
 from pathlib import Path
 import plistlib
 import select
+import shlex
+import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -232,6 +237,18 @@ class ReconcileCLI(unittest.TestCase):
         self.assertEqual(self.record()[1]["state"], "needs_decision")
         self.assertEqual(self.remote()["writes"], [])
 
+    def test_explicit_retry_after_mapping_repair_uses_new_revision(self):
+        self.save_remote(lambda s: s["options"].pop("B"))
+        self.assertEqual(self.set("blocked", check=False).returncode, 1)
+        self.cli("reconcile.py", "once")
+        old = self.record()[1]
+        self.assertEqual(old["state"], "needs_decision")
+        self.save_remote(lambda s: s["options"].update(B="Blocked"))
+        self.set("blocked")
+        self.assertGreater(self.record()[1]["revision"], old["revision"])
+        self.assertEqual(self.record()[1]["state"], "acknowledged")
+        self.assertEqual(self.remote()["option"], "B")
+
     def test_external_terminal_success_and_failure_remain_open_and_actionable(self):
         for conclusion, expected in (("success", "R"), ("failure", "B")):
             with self.subTest(conclusion=conclusion):
@@ -282,6 +299,18 @@ class ReconcileCLI(unittest.TestCase):
         self.assertEqual(self.record()[2]["owner"], "root-1")
         self.assertEqual(self.remote()["option"], "I")
 
+    def test_interrupted_claimed_owner_converges_already_closed_issue(self):
+        self.set()
+        self.cli("telemetry.py", "hook", payload={"session_id": "root-1", "hook_event_name": "SessionEnd"})
+        self.save_remote(lambda s: s["issue"].update(state="CLOSED"))
+        self.cli("reconcile.py", "once")
+        self.assertEqual(self.record()[1]["kind"], "closed_convergence")
+        self.assertEqual(self.record()[1]["state"], "pending")
+        self.cli("reconcile.py", "once")
+        self.assertEqual(self.record()[0]["status"], "done")
+        self.assertIsNone(self.record()[2])
+        self.assertEqual(self.remote()["option"], "D")
+
     def test_missing_mapping_api_failure_and_read_only_preview(self):
         self.set()
         self.save_remote(lambda s: s["options"].pop("B"))
@@ -310,6 +339,33 @@ class ReconcileCLI(unittest.TestCase):
         self.assertEqual(json.loads(preview.stdout)["records"][0]["eligibility"], "managed")
         self.assertEqual(self.db.read_bytes(), before)
         self.assertFalse(lock.exists())
+
+    def test_preview_reports_queued_owner_stop_remote_and_claim_impact(self):
+        self.set()
+        self.cli("telemetry.py", "hook", payload={"session_id": "root-1", "hook_event_name": "SessionEnd"})
+        before = self.db.read_bytes()
+        preview = json.loads(self.cli("reconcile.py", "once", "--dry-run").stdout)["records"][0]
+        self.assertEqual(preview["pending_intent"]["kind"], "owner_stop")
+        self.assertEqual(preview["pending_intent"]["desired_project_status"], "Blocked")
+        self.assertIn("Project Status", preview["possible_remote_writes"])
+        self.assertIn("release terminal owner claim after readback", preview["possible_local_actions"])
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertEqual(self.remote()["writes"], [])
+
+    def test_default_preview_reports_truncated_coverage(self):
+        self.set()
+        with state.connect(self.db) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            for index in range(1, 26):
+                state.record(db, "work", {"id": f"legacy-{index:02d}", "title": "Legacy",
+                                           "issue": f"https://github.com/owner/repo/issues/{index + 100}",
+                                           "repository": "github.com/owner/repo", "status": "active",
+                                           "details": {"github": {"project": PROJECT}}})
+        result = json.loads(self.cli("reconcile.py", "once", "--dry-run").stdout)
+        self.assertEqual(result["coverage"]["total_project_records"], 26)
+        self.assertEqual(result["coverage"]["returned"], 20)
+        self.assertTrue(result["coverage"]["truncated"])
+        self.assertEqual(len(json.loads(self.cli("reconcile.py", "once", "--dry-run", "--limit", "100").stdout)["records"]), 26)
 
     def test_fair_cursor_and_legacy_migration(self):
         self.set()
@@ -367,6 +423,58 @@ class ReconcileCLI(unittest.TestCase):
             process.terminate()
             process.communicate(timeout=5)
 
+    def test_daemon_waits_for_activation_without_migrating_and_missing_db_without_exit(self):
+        manifest = self.root / "manifest.json"
+        marker = self.root / "active.json"
+        manifest.write_text("{}")
+        before = self.db.read_bytes()
+        command = [sys.executable, "-B", str(SCRIPTS / "reconcile.py"), "--db", str(self.db),
+                   "--manifest", str(manifest), "--activation-marker", str(marker),
+                   "--activation-token", "next-release", "daemon", "--interval", "15"]
+        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 5)
+            self.assertTrue(ready)
+            self.assertEqual(json.loads(process.stdout.readline())["state"], "waiting_for_activation")
+            self.assertIsNone(process.poll())
+            self.assertEqual(self.db.read_bytes(), before)
+        finally:
+            process.terminate()
+            process.communicate(timeout=5)
+        missing = self.root / "missing.sqlite3"
+        process = subprocess.Popen([sys.executable, "-B", str(SCRIPTS / "reconcile.py"), "--db", str(missing),
+                                    "daemon", "--interval", "15"], text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, env=self.env)
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 5)
+            self.assertTrue(ready)
+            self.assertEqual(json.loads(process.stdout.readline())["state"], "no_database")
+            self.assertIsNone(process.poll())
+            self.assertFalse(missing.exists())
+        finally:
+            process.terminate()
+            process.communicate(timeout=5)
+
+    def test_daemon_runs_after_matching_installation_activation(self):
+        manifest = self.root / "manifest.json"
+        marker = self.root / "active.json"
+        manifest.write_text(json.dumps({"source": str(ROOT), "git": shutil.which("git"),
+                                        "head": subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip(),
+                                        "files": {"skills/devflow/scripts/reconcile.py":
+                                                  hashlib.sha256((SCRIPTS / "reconcile.py").read_bytes()).hexdigest()}}))
+        marker.write_text(json.dumps({"token": "activated"}))
+        process = subprocess.Popen([sys.executable, "-B", str(SCRIPTS / "reconcile.py"), "--db", str(self.db),
+                                    "--manifest", str(manifest), "--activation-marker", str(marker),
+                                    "--activation-token", "activated", "daemon", "--interval", "15"],
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 5)
+            self.assertTrue(ready)
+            self.assertEqual(json.loads(process.stdout.readline())["state"], "completed")
+        finally:
+            process.terminate()
+            process.communicate(timeout=5)
+
     def test_service_activation_and_failed_upgrade_restore_prior_service(self):
         agents = self.root / "Library/LaunchAgents"
         home = self.root / "codex"
@@ -406,12 +514,15 @@ p.write_text(json.dumps(s))
         self.assertTrue(json.loads(launch_state.read_text())["loaded"])
         path = agents / "com.ebarti.devflow.reconcile.plist"
         prior = path.read_bytes()
+        marker = home / ".devflow-reconcile-active.json"
+        prior_marker = marker.read_bytes()
         config = json.loads(launch_state.read_text())
         config["fail_next_bootstrap"] = True
         launch_state.write_text(json.dumps(config))
         failed = subprocess.run(base + install + ["--interval", "120"], env=env, text=True, capture_output=True)
         self.assertEqual(failed.returncode, 1)
         self.assertEqual(path.read_bytes(), prior)
+        self.assertEqual(marker.read_bytes(), prior_marker)
         recovered = json.loads(launch_state.read_text())
         self.assertTrue(recovered["loaded"])
         self.assertEqual(recovered["program"], plistlib.loads(prior)["ProgramArguments"])
@@ -419,6 +530,145 @@ p.write_text(json.dumps(s))
             removed = subprocess.run(base + ["uninstall"], env=env, text=True, capture_output=True)
             self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse(path.exists())
+        self.assertFalse(marker.exists())
+
+    def exercise_full_upgrade(self, baseline):
+        origin, checkout = self.root / "origin", self.root / "checkout"
+        origin.mkdir()
+        archive = subprocess.check_output(["git", "-C", str(ROOT), "archive", "--format=tar", baseline])
+        with tarfile.open(fileobj=io.BytesIO(archive)) as packed:
+            packed.extractall(origin, filter="data")
+        subprocess.run(["git", "init", "-q", str(origin)], check=True)
+        for key, value in (("user.name", "Test"), ("user.email", "test@example.invalid")):
+            subprocess.run(["git", "-C", str(origin), "config", key, value], check=True)
+        subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(origin), "commit", "-qm", "old release"], check=True)
+        subprocess.run(["git", "-C", str(origin), "tag", "v1"], check=True)
+        tracked = subprocess.check_output(["git", "-C", str(ROOT), "ls-files", "-z"]).decode().split("\0")
+        for name in set(filter(None, tracked)) | {"scripts/install-rollback.py"}:
+            target = origin / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, target)
+        subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(origin), "commit", "-qm", "new release"], check=True)
+        subprocess.run(["git", "-C", str(origin), "tag", "v2"], check=True)
+        subprocess.run(["git", "clone", "-q", str(origin), str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "checkout", "-q", "--detach", "v1"], check=True)
+        home = self.root / "home"
+        codex = home / ".codex"
+        launch_state = self.root / "launch.json"
+        launch_state.write_text(json.dumps({"calls": [], "observed": None}))
+        launchctl = self.root / "launchctl"
+        launchctl.write_text('''#!/usr/bin/env python3
+import json, os, plistlib, subprocess, sys
+from pathlib import Path
+p = Path(os.environ["FAKE_LAUNCH_STATE"])
+s = json.loads(p.read_text())
+a = sys.argv[1:]
+s["calls"].append(a[0])
+if a[0] == "print":
+    p.write_text(json.dumps(s)); print("Could not find service", file=sys.stderr); sys.exit(1)
+if a[0] == "bootstrap":
+    arguments = plistlib.loads(Path(a[-1]).read_bytes())["ProgramArguments"]
+    if os.environ.get("FAKE_BOOTSTRAP_OK") == "1":
+        s["program"] = arguments
+        s["loaded"] = True
+        p.write_text(json.dumps(s)); sys.exit(0)
+    child = subprocess.Popen(arguments, env=os.environ, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        s["observed"] = json.loads(child.stdout.readline())["state"]
+    finally:
+        child.terminate(); child.communicate(timeout=5)
+    p.write_text(json.dumps(s)); print("uncertain bootstrap failure", file=sys.stderr); sys.exit(1)
+p.write_text(json.dumps(s))
+''')
+        launchctl.chmod(0o755)
+        env = dict(self.env, HOME=str(home), CODEX_HOME=str(codex),
+                   XDG_STATE_HOME=str(self.root / "state"), DEVFLOW_PYTHON=sys.executable,
+                   DEVFLOW_LAUNCHCTL=str(launchctl), FAKE_LAUNCH_STATE=str(launch_state))
+        old_install = subprocess.run(["sh", str(checkout / "scripts/install.sh")], env=env,
+                                     text=True, capture_output=True, timeout=30)
+        self.assertEqual(old_install.returncode, 0, old_install.stderr)
+        database = self.root / "state/devflow/workflow.sqlite3"
+        seed = subprocess.run([sys.executable, "-B", "-c", "import state; state.connect(__import__('sys').argv[1]).close()",
+                               str(database)], env=dict(env, PYTHONPATH=str(checkout / "skills/devflow/scripts")),
+                              text=True, capture_output=True, timeout=15)
+        self.assertEqual(seed.returncode, 0, seed.stderr)
+        with sqlite3.connect(database) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+        prior_head = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "v1"], text=True).strip()
+        logs_target = self.root / "logs-target"
+        logs_target.mkdir()
+        (codex / "logs").symlink_to(logs_target)
+        late = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"], env=env,
+                              text=True, capture_output=True, timeout=90)
+        self.assertNotEqual(late.returncode, 0, late.stdout + late.stderr)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(),
+                         prior_head)
+        self.assertTrue((codex / "logs").is_symlink())
+        with sqlite3.connect(database) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+        (codex / "logs").unlink()
+        before = {str(path.relative_to(codex)): path.read_bytes() for path in codex.rglob("*") if path.is_file()}
+        failed = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"], env=env,
+                                text=True, capture_output=True, timeout=90)
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(),
+                         prior_head)
+        self.assertEqual(json.loads(launch_state.read_text())["observed"], "waiting_for_activation",
+                         failed.stdout + failed.stderr)
+        for name, expected in before.items():
+            actual = (codex / name).read_bytes()
+            if name == ".devflow-install.json" and actual != expected:
+                original, restored = json.loads(expected), json.loads(actual)
+                changed = {key for key in original["files"] | restored["files"]
+                           if original["files"].get(key) != restored["files"].get(key)}
+                self.fail(f"manifest changed files: {changed}; checkout status: " +
+                          subprocess.check_output(["git", "-C", str(checkout), "status", "--short"], text=True) +
+                          "\nupdate output:\n" + failed.stdout + failed.stderr)
+            self.assertEqual(actual, expected, name)
+        self.assertFalse((codex / ".devflow-reconcile-active.json").exists())
+        with sqlite3.connect(database) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+        installed_guard = codex / ".devflow-hook.py"
+        if installed_guard.exists():
+            guard = subprocess.run([sys.executable, "-B", str(installed_guard), "--check"],
+                                   env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(guard.returncode, 0, guard.stdout + guard.stderr)
+        else:
+            hooks = json.loads((codex / "hooks.json").read_text())
+            command = hooks["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+            self.assertEqual(Path(shlex.split(command)[-2]).resolve(),
+                             (checkout / "skills/devflow/scripts/telemetry.py").resolve())
+        activated = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"],
+                                   env=dict(env, FAKE_BOOTSTRAP_OK="1"), text=True, capture_output=True, timeout=90)
+        self.assertEqual(activated.returncode, 0, activated.stdout + activated.stderr)
+        installed_guard = codex / ".devflow-hook.py"
+        guard = subprocess.run([sys.executable, "-B", str(installed_guard), "--check"],
+                               env=env, text=True, capture_output=True, timeout=15)
+        self.assertEqual(guard.returncode, 0, guard.stdout + guard.stderr)
+        service = plistlib.loads((home / "Library/LaunchAgents/com.ebarti.devflow.reconcile.plist").read_bytes())
+        marker = json.loads((codex / ".devflow-reconcile-active.json").read_text())
+        self.assertEqual(marker["token"], service["DevflowToken"])
+        with sqlite3.connect(database) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+        child = subprocess.Popen(service["ProgramArguments"], env=env, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            ready, _, _ = select.select([child.stdout], [], [], 5)
+            self.assertTrue(ready)
+            self.assertEqual(json.loads(child.stdout.readline())["state"], "completed")
+        finally:
+            child.terminate()
+            child.communicate(timeout=5)
+        with sqlite3.connect(database) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
+
+    def test_first_upgrade_from_legacy_updater_rollback_then_activation(self):
+        self.exercise_full_upgrade("e966cf89e057abc9a2629faf957a2ec175599b53")
+
+    def test_upgrade_from_installed_lifecycle_checkout_rollback_then_activation(self):
+        self.exercise_full_upgrade("60de52a37c9774f188376904517fb6318246adf9")
 
 
 if __name__ == "__main__":
