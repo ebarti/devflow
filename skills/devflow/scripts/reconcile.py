@@ -519,9 +519,11 @@ def once(db, limit=20, dry_run=False):
             queued = intent(db, work["id"]) if has_queue else None
             first_sync = bool(not eligible and queued and queued["kind"] == "sync"
                               and queued["state"] in {"pending", "needs_decision"})
+            first_sync_decision = bool(first_sync and queued["state"] == "needs_decision")
             preview = {"work_id": work["id"], "issue": work["issue"], "local_status": work["status"],
                        "project": tracking["project"],
                        "eligibility": "managed" if eligible else
+                                      "first_sync_needs_decision" if first_sync_decision else
                                       "pending_first_sync" if first_sync else "legacy_needs_explicit_mapping",
                        "missing_mappings": [name for name in ("blocked", "paused", "done") if name not in mappings],
                        "local_claim_owner": (state.claim_for(db, work["id"]) or {}).get("owner") if has_claims else None,
@@ -544,8 +546,12 @@ def once(db, limit=20, dry_run=False):
                     preview["error"] = str(exc)
             else:
                 preview["audit_state"] = "unknown"
-                preview["next_action"] = ("drain explicit first synchronization after readback" if first_sync
-                                          else "supply and verify explicit mapping before opt-in")
+                preview["next_action"] = (queued["next_action"] or "resolve mapping or semantic decision"
+                                          if first_sync_decision else
+                                          "drain explicit first synchronization after readback" if first_sync else
+                                          "supply and verify explicit mapping before opt-in")
+                if first_sync_decision:
+                    preview["last_error"] = queued["last_error"]
                 try:
                     observed = github.view(work["issue"])
                     item = github.legacy_project_item(tracking["project"], observed["id"])

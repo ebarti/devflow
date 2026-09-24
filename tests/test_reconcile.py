@@ -335,6 +335,27 @@ class ReconcileCLI(unittest.TestCase):
         self.cli("reconcile.py", "once")
         self.assertEqual(self.remote()["option"], "B")
 
+    def test_first_sync_mapping_decision_preview_is_not_executable(self):
+        self.save_remote(lambda s: s["options"].pop("B"))
+        self.assertEqual(self.set("blocked", check=False).returncode, 1)
+        self.cli("reconcile.py", "once")
+        self.assertEqual(self.record()[1]["state"], "needs_decision")
+        before = self.db.read_bytes()
+        lock = self.db.with_suffix(self.db.suffix + ".reconcile.lock")
+        lock.unlink(missing_ok=True)
+        preview = json.loads(self.cli("reconcile.py", "once", "--dry-run").stdout)["records"][0]
+        self.assertEqual(preview["eligibility"], "first_sync_needs_decision")
+        self.assertEqual(preview["intent"], "needs_decision")
+        self.assertEqual(preview["next_action"], "resolve mapping or semantic decision")
+        self.assertIn("choose --project-status", preview["last_error"])
+        self.assertEqual(preview["pending_intent"]["next_action"], preview["next_action"])
+        self.assertEqual(preview["possible_remote_writes"], [])
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertFalse(lock.exists())
+        self.assertEqual(self.remote()["writes"], [])
+        self.cli("reconcile.py", "once")
+        self.assertEqual(self.record()[1]["state"], "needs_decision")
+
     def test_missing_mapping_api_failure_and_read_only_preview(self):
         self.set()
         self.save_remote(lambda s: s["options"].pop("B"))
