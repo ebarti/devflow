@@ -480,6 +480,8 @@ class ReconcileCLI(unittest.TestCase):
             process.communicate(timeout=5)
 
     def test_service_activation_and_failed_upgrade_restore_prior_service(self):
+        if sys.platform != "darwin":
+            self.skipTest("launchd activation is a macOS entry point")
         agents = self.root / "Library/LaunchAgents"
         home = self.root / "codex"
         launch_state = self.root / "launch.json"
@@ -537,6 +539,11 @@ p.write_text(json.dumps(s))
         self.assertFalse(marker.exists())
 
     def exercise_full_upgrade(self, baseline):
+        if sys.platform != "darwin":
+            self.skipTest("launchd upgrade activation is a macOS entry point")
+        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", baseline + "^{commit}"],
+                          capture_output=True).returncode:
+            self.skipTest("historical installed checkout is absent from this shallow clone")
         origin, checkout = self.root / "origin", self.root / "checkout"
         origin.mkdir()
         archive = subprocess.check_output(["git", "-C", str(ROOT), "archive", "--format=tar", baseline])
