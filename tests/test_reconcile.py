@@ -560,6 +560,8 @@ p.write_text(json.dumps(s))
         subprocess.run(["git", "-C", str(checkout), "checkout", "-q", "--detach", "v1"], check=True)
         home = self.root / "home"
         codex = home / ".codex"
+        temporary = self.root / "temporary"
+        temporary.mkdir()
         launch_state = self.root / "launch.json"
         launch_state.write_text(json.dumps({"calls": [], "observed": None}))
         launchctl = self.root / "launchctl"
@@ -589,7 +591,8 @@ p.write_text(json.dumps(s))
         launchctl.chmod(0o755)
         env = dict(self.env, HOME=str(home), CODEX_HOME=str(codex),
                    XDG_STATE_HOME=str(self.root / "state"), DEVFLOW_PYTHON=sys.executable,
-                   DEVFLOW_LAUNCHCTL=str(launchctl), FAKE_LAUNCH_STATE=str(launch_state))
+                   DEVFLOW_LAUNCHCTL=str(launchctl), FAKE_LAUNCH_STATE=str(launch_state),
+                   TMPDIR=str(temporary))
         old_install = subprocess.run(["sh", str(checkout / "scripts/install.sh")], env=env,
                                      text=True, capture_output=True, timeout=30)
         self.assertEqual(old_install.returncode, 0, old_install.stderr)
@@ -610,6 +613,7 @@ p.write_text(json.dumps(s))
         self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(),
                          prior_head)
         self.assertTrue((codex / "logs").is_symlink())
+        self.assertEqual(list(temporary.glob("devflow-install-rollback-*")), [])
         with sqlite3.connect(database) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
         (codex / "logs").unlink()
@@ -621,6 +625,7 @@ p.write_text(json.dumps(s))
                          prior_head)
         self.assertEqual(json.loads(launch_state.read_text())["observed"], "waiting_for_activation",
                          failed.stdout + failed.stderr)
+        self.assertEqual(list(temporary.glob("devflow-install-rollback-*")), [])
         for name, expected in before.items():
             actual = (codex / name).read_bytes()
             if name == ".devflow-install.json" and actual != expected:
@@ -647,6 +652,7 @@ p.write_text(json.dumps(s))
         activated = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"],
                                    env=dict(env, FAKE_BOOTSTRAP_OK="1"), text=True, capture_output=True, timeout=90)
         self.assertEqual(activated.returncode, 0, activated.stdout + activated.stderr)
+        self.assertEqual(list(temporary.glob("devflow-install-rollback-*")), [])
         installed_guard = codex / ".devflow-hook.py"
         guard = subprocess.run([sys.executable, "-B", str(installed_guard), "--check"],
                                env=env, text=True, capture_output=True, timeout=15)

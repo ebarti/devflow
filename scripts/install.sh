@@ -75,9 +75,7 @@ restore_on_failure() {
     install_status=$?
     trap - 0
     if [ "$install_status" -ne 0 ]; then
-        if "$devflow_python" -B "$source_root/scripts/install-rollback.py" restore "$rollback_backup"; then
-            "$devflow_python" -B "$source_root/scripts/install-rollback.py" discard "$rollback_backup" || true
-        else
+        if ! "$devflow_python" -B "$source_root/scripts/install-rollback.py" restore "$rollback_backup"; then
             printf 'Install rollback failed; preserved snapshot at %s\n' "$rollback_backup" >&2
         fi
     fi

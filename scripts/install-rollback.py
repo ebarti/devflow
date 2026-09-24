@@ -103,6 +103,9 @@ def restore(directory):
         if subprocess.run(["git", "-C", str(source), "diff", "--quiet", "HEAD", "--"]).returncode:
             raise ValueError("checkout changed during failed install; restore previous commit manually")
         subprocess.run(["git", "-C", str(source), "checkout", "--detach", previous["head"]], check=True)
+    # Run cleanup in this process: checkout may have replaced this helper on
+    # disk, so the invoking shell cannot safely launch it again.
+    discard(directory)
 
 
 def discard(directory):
