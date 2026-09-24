@@ -15,6 +15,6 @@ The execution coordinator performs an authorized merge directly. For a standalon
 
 4. **Read back the result.** Verify the remote state for every requested PR. A merge-queue submission is queued, not merged. Record merge commits when present; do not report completion from a successful command alone. Inspect an uncertain result before retrying.
 
-5. **Reconcile ownership.** Update the [issue and claim](../devflow/references/ownership.md) and retain references in the [work record](../devflow/references/state.md). Close an issue only when its requested outcome and closure are satisfied. A subset merged from a larger stack does not complete the remaining work.
+5. **Reconcile ownership.** Audit and update the [issue and claim](../devflow/references/ownership.md) and retain references in the [work record](../devflow/references/state.md). For a signed release, inspect the terminal Actions run, published tag/assets and requested acceptance before closing the issue or setting Done; run success alone is not approval. A pending signing run needs its URL and a concrete follow-up owner/trigger. Close an issue only when its requested outcome and closure are satisfied. A subset merged from a larger stack does not complete the remaining work.
 
 Report the target, observed heads, merged/queued/blocked state, merge commits and any remaining action. Release, deployment and installation are separate explicit requests, not automatic follow-up stages.

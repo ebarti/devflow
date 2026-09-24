@@ -122,6 +122,63 @@ def boundary_decision(db, payload):
     return boundary_violation(payload.get("tool_name"), payload.get("tool_input"))
 
 
+def root_claims(db, session_id):
+    """Only the actual main task can settle its claims; delegated returns are not owner stops."""
+    saved = db.execute("SELECT role,closed_at FROM runtime_sessions WHERE id=?", (session_id,)).fetchone()
+    if not saved or saved[0] != "coordinator" or saved[1]:
+        return []
+    return [dict(work_id=r[0], issue=r[1], details=r[2]) for r in db.execute("""SELECT c.work_id,w.issue,w.details FROM claims c
+        JOIN works w ON w.id=c.work_id JOIN runtime_scopes s ON s.work_id=c.work_id
+        WHERE c.owner=? AND s.session_id=? ORDER BY c.work_id""",
+        (session_id, session_id))]
+
+
+def pending_issue_creation(raw_details):
+    try:
+        saved = json.loads(raw_details) if raw_details else {}
+        github = saved.get("github", {}) if isinstance(saved, dict) else {}
+        return isinstance(github, dict) and github.get("create_pending") is True
+    except ValueError:
+        return False
+
+
+def stop_response(claims, stop_hook_active):
+    # Stop is not an authoritative terminal owner observation. SessionEnd and
+    # Interrupt persist recovery, while unresolved creation remains explicit
+    # in details.github.create_pending for a human decision. Do not elicit a
+    # repeated model status conversation at each Stop attempt.
+    return None
+
+
+def mark_interrupted_owner(db, session_id, stamp, event_name):
+    for claim in root_claims(db, session_id):
+        work_id = claim["work_id"]
+        work = state.row(db, "works", work_id)
+        blocker = "Owner " + event_name + " observed; work and claim require reconciliation"
+        if work["status"] != "blocked" or work["blocker"] != blocker:
+            state.update(db, "work", dict(id=work_id, status="blocked", blocker=blocker), None)
+        if not work["issue"]:
+            continue
+        # The hook never calls GitHub. It records only managed work with an
+        # explicit verified mapping; legacy and ambiguous records remain visible.
+        import reconcile
+        tracking = github_details(work)
+        if not reconcile.managed(tracking):
+            continue
+        sync = tracking["sync"]
+        selected = tracking.get("statuses", {}).get("blocked") or "Blocked"
+        reconcile.queue(db, work_id, "owner_stop", dict(
+            issue=work["issue"], status="blocked", project=tracking["project"],
+            project_status=selected, assignee=sync["assignee"], reason=blocker,
+            release=True, await_url=None, follow_up=None), owner=session_id)
+
+
+def github_details(work):
+    saved = json.loads(work["details"]) if work["details"] else {}
+    github = saved.get("github", {}) if isinstance(saved, dict) else {}
+    return github if isinstance(github, dict) else {}
+
+
 def child_binding(db, payload):
     """Resolve an unbound/resumed child from native hook and rollout identities. Read-only."""
     child = payload.get("agent_id")
@@ -387,7 +444,7 @@ def tool_status(response):
     return "returned"
 
 
-def handle(db, payload, reason=None):
+def handle(db, payload, reason=None, stop=None):
     started = time.monotonic()
     response = None
     inherited = child_binding(db, payload)
@@ -403,6 +460,11 @@ def handle(db, payload, reason=None):
     name = payload.get("hook_event_name")
     stamp = state.now()
     turn_id = payload.get("turn_id")
+    if name == "Stop":
+        response = stop if stop is not None else stop_response(root_claims(db, session_id),
+                                                                payload.get("stop_hook_active"))
+    elif name in ("Interrupt", "SessionEnd"):
+        mark_interrupted_owner(db, session_id, stamp, name)
     if name in ("SubagentStart", "SubagentStop"):
         child = payload.get("agent_id")
         if child:
@@ -416,7 +478,9 @@ def handle(db, payload, reason=None):
                   name=payload.get("agent_type"), status="stopped" if name == "SubagentStop" else "started")
             db.execute("UPDATE runtime_sessions SET last_seen_at=? WHERE id=?", (stamp, child))
             if name == "SubagentStop":
-                close_if_released(db, child, stamp)
+                # A descendant never owns the root claim. Native SubagentStop
+                # is its terminal observation even while that claim remains.
+                db.execute("UPDATE runtime_sessions SET closed_at=? WHERE id=?", (stamp, child))
     else:
         if name in ("PreToolUse", "PostToolUse") and not payload.get("tool_use_id"):
             raise ValueError("tool hook lacks tool_use_id")
@@ -448,7 +512,8 @@ def handle(db, payload, reason=None):
             event(db, session_id, identity(session_id, name, turn_id, payload.get("source"), session["cursor"]), name, stamp,
                   turn_id, name=payload.get("source") or payload.get("trigger"))
         if name in ("Stop", "Interrupt"):
-            turn(db, session, turn_id, stamp, "completed" if name == "Stop" else "interrupted")
+            turn(db, session, turn_id, stamp, "blocked" if name == "Stop" and response and response.get("decision") == "block"
+                 else "completed" if name == "Stop" else "interrupted")
             close_if_released(db, session_id, stamp)
         elif name == "SessionEnd":
             db.execute("UPDATE runtime_sessions SET closed_at=? WHERE id=?", (stamp, session_id))
@@ -467,11 +532,13 @@ def close_if_released(db, session_id, timestamp):
         db.execute("UPDATE runtime_sessions SET closed_at=? WHERE id=?", (timestamp, session_id))
 
 
-def install(codex_home):
+def install(codex_home, guard_path=None):
     path = Path(codex_home).expanduser() / "hooks.json"
     original = json.loads(path.read_text()) if path.exists() else {}
     hooks = original.setdefault("hooks", {})
     command = shlex.join([str(Path(sys.executable).resolve()), "-B",
+                          str(Path(guard_path).absolute())] if guard_path else
+                         [str(Path(sys.executable).resolve()), "-B",
                           str(Path(__file__).absolute()), "hook"])
     for name in EVENTS:
         groups = hooks.setdefault(name, [])
@@ -502,11 +569,12 @@ def main():
     binding.add_argument("--role")
     installing = commands.add_parser("install")
     installing.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    installing.add_argument("--guard-path")
     commands.add_parser("hook")
     args = parser.parse_args()
     try:
         if args.command == "install":
-            result = install(args.codex_home)
+            result = install(args.codex_home, args.guard_path)
         elif args.command == "hook":
             payload = json.load(sys.stdin)
             if not isinstance(payload, dict):
@@ -521,7 +589,18 @@ def main():
                 actor = payload.get("agent_id") or payload.get("session_id")
                 actor_payload = dict(payload, session_id=actor)
                 bound = present and check.execute("SELECT 1 FROM runtime_sessions WHERE id=? AND closed_at IS NULL", (actor,)).fetchone()
+                # A native prompt after SessionEnd is live evidence that the
+                # same task resumed. Rebind it before any queued recovery drains.
+                resumed = (present and not bound and payload.get("hook_event_name") == "UserPromptSubmit"
+                           and check.execute("""SELECT 1 FROM runtime_sessions s JOIN claims c ON c.owner=s.id
+                               JOIN runtime_scopes rs ON rs.session_id=s.id AND rs.work_id=c.work_id
+                               WHERE s.id=? AND s.role='coordinator' AND s.closed_at IS NOT NULL LIMIT 1""",
+                               (actor,)).fetchone())
+                if resumed:
+                    bound = True
                 reason = boundary_decision(check, actor_payload) if bound else None
+                stop = (stop_response(root_claims(check, actor), payload.get("stop_hook_active"))
+                        if bound and payload.get("hook_event_name") == "Stop" else None)
                 if inherited:
                     bound = True
                     if payload.get("hook_event_name") == "PreToolUse" and inherited["role"] in COORDINATOR_ROLES:
@@ -530,13 +609,15 @@ def main():
                 print("{}")
                 return 0
             # The boundary is decided before collection and its denial survives any collector failure.
-            result = deny(reason) if reason else {}
+            result = deny(reason) if reason else stop or {}
             try:
                 with closing(state.connect(args.db)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     if inherited:
                         bind(db, **inherited)
-                    handle(db, payload, reason)
+                    if resumed:
+                        state.bind(db, actor, state.scope(db, actor), "coordinator", extend=True)
+                    handle(db, payload, reason, stop)
             except (ValueError, OSError, sqlite3.Error) as exc:
                 failure = "Devflow metrics collection failed: " + str(exc)
                 result["systemMessage"] = (result["systemMessage"] + " " + failure) if result.get("systemMessage") else failure

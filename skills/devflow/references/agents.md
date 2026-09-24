@@ -2,7 +2,7 @@
 
 Run the main task on **Astra/xhigh** for inspection, user questions, design and planning. A skill cannot change an existing task's model; select it in the host. Candidate trials configure that default. The installer leaves normal host model settings alone.
 
-The installer links four definitions from `agents/` into `$CODEX_HOME/agents/`:
+The installer copies four regular definitions from `agents/` into `$CODEX_HOME/agents/`; Codex loads those copies as native agent types:
 
 | Responsibility | Agent type | Default model | Permission configuration |
 | --- | --- | --- | --- |
