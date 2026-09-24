@@ -302,7 +302,15 @@ class ReconcileCLI(unittest.TestCase):
     def test_interrupted_claimed_owner_converges_already_closed_issue(self):
         self.set()
         self.cli("telemetry.py", "hook", payload={"session_id": "root-1", "hook_event_name": "SessionEnd"})
-        self.save_remote(lambda s: s["issue"].update(state="CLOSED"))
+        def close_without_blocked(s):
+            s["issue"]["state"] = "CLOSED"
+            s["options"].pop("B")
+        self.save_remote(close_without_blocked)
+        preview = json.loads(self.cli("reconcile.py", "once", "--dry-run").stdout)["records"][0]
+        self.assertEqual(preview["pending_intent"]["desired_project_status"], "Done")
+        self.assertIn("Project Status", preview["possible_remote_writes"])
+        self.assertIn("release terminal owner claim after readback", preview["possible_local_actions"])
+        self.assertEqual(self.remote()["writes"], [])
         self.cli("reconcile.py", "once")
         self.assertEqual(self.record()[1]["kind"], "closed_convergence")
         self.assertEqual(self.record()[1]["state"], "pending")
@@ -310,6 +318,22 @@ class ReconcileCLI(unittest.TestCase):
         self.assertEqual(self.record()[0]["status"], "done")
         self.assertIsNone(self.record()[2])
         self.assertEqual(self.remote()["option"], "D")
+
+    def test_preview_shows_explicit_first_sync_intent_before_baseline(self):
+        self.save_remote(lambda s: s.update(fail_read=True))
+        self.assertEqual(self.set("blocked", check=False).returncode, 1)
+        self.assertEqual(self.record()[1]["state"], "pending")
+        self.save_remote(lambda s: s.update(fail_read=False))
+        before = self.db.read_bytes()
+        preview = json.loads(self.cli("reconcile.py", "once", "--dry-run").stdout)["records"][0]
+        self.assertEqual(preview["eligibility"], "pending_first_sync")
+        self.assertEqual(preview["pending_intent"]["desired_project_status"], "Blocked")
+        self.assertIn("Project Status", preview["possible_remote_writes"])
+        self.assertIn("update local work after readback", preview["possible_local_actions"])
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertEqual(self.remote()["writes"], [])
+        self.cli("reconcile.py", "once")
+        self.assertEqual(self.remote()["option"], "B")
 
     def test_missing_mapping_api_failure_and_read_only_preview(self):
         self.set()
@@ -426,6 +450,26 @@ class ReconcileCLI(unittest.TestCase):
         finally:
             process.terminate()
             process.communicate(timeout=5)
+
+    def test_daemon_holds_single_instance_lock_through_sleep(self):
+        self.set()
+        command = [sys.executable, "-B", str(SCRIPTS / "reconcile.py"), "--db", str(self.db),
+                   "daemon", "--interval", "15", "--limit", "1"]
+        first = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+        try:
+            ready, _, _ = select.select([first.stdout], [], [], 5)
+            self.assertTrue(ready)
+            self.assertEqual(json.loads(first.stdout.readline())["state"], "completed")
+            second = subprocess.run(command, text=True, capture_output=True, env=self.env, timeout=5)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(json.loads(second.stdout)["state"], "already_running")
+            bounded = json.loads(self.cli("reconcile.py", "once").stdout)
+            self.assertEqual(bounded["state"], "already_running")
+            self.assertEqual(self.remote()["writes"], [])
+        finally:
+            first.terminate()
+            first.communicate(timeout=5)
+        self.assertEqual(json.loads(self.cli("reconcile.py", "once").stdout)["state"], "completed")
 
     def test_daemon_waits_for_activation_without_migrating_and_missing_db_without_exit(self):
         manifest = self.root / "manifest.json"

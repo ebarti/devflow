@@ -25,7 +25,7 @@ Schema 7 upgrades schemas 2 through 6 transactionally, adding claims, runtime an
 
 `works.details.github` retains the selected Project, Status mappings and any unresolved creation attempt. Creation records its attempt before calling GitHub and saves the issue URL before further updates. A missing result requires reconciliation, never an automatic second create. Project Status and assignment are read back before success; labels and other Project fields are untouched.
 
-Before assignee or Project mutation, synchronization commits a desired intent. Replay reads GitHub first and writes only mismatched fields. Acknowledgment requires issue, assignee and Project option ID/name readback. Revisions and the claim/runtime generation fence stale owners. Network requests run outside SQLite transactions; failures retain a bounded retry or one explicit `needs_decision` state. The periodic service calls no model or agent.
+Before assignee or Project mutation, synchronization commits a desired intent. Replay reads GitHub first and writes only mismatched fields. Acknowledgment requires issue, assignee and Project option ID/name readback. Revisions and the claim/runtime generation fence stale owners. Network requests run outside SQLite transactions; failures retain a bounded retry or one explicit `needs_decision` state. The periodic service calls no model or agent and holds its instance lock across passes and sleep; a manual `once` takes that lock only for its bounded pass. A first-sync intent is visible in dry-run and can be drained even before a verified sync baseline exists.
 
 Successful synchronization also stores `details.github.sync`: expected issue
 state, assignee, Project/item/field/option IDs, selected Status name and readback time.

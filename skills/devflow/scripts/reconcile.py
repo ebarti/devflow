@@ -133,9 +133,6 @@ def apply_sync(db, saved):
                "wait for authoritative terminal owner and descendants",
                (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat())
         return {"work_id": saved["work_id"], "state": "pending", "reason": "owner_or_descendant_active_or_unknown"}
-    selected = github.project(payload["project"], payload["project_status"])
-    if urlsplit(payload["issue"]).netloc.casefold() != selected["host"].casefold():
-        raise ValueError("issue and Project must belong to the same GitHub host")
     observed = github.view(payload["issue"])
     if observed["state"] == "CLOSED" and payload["status"] != "done":
         if saved["kind"] in {"owner_stop", "external_transition"}:
@@ -157,6 +154,12 @@ def apply_sync(db, saved):
         finish(db, saved, "needs_decision", "done requires an already closed issue",
                "close the issue within authorized acceptance scope or record a new status")
         return {"work_id": saved["work_id"], "state": "needs_decision", "reason": "issue_open"}
+    # Resolve only the final desired option. A terminal owner stop may have
+    # queued Blocked before an external actor closed the issue; Blocked can be
+    # absent even though configured Done is valid for that closed issue.
+    selected = github.project(payload["project"], payload["project_status"])
+    if urlsplit(payload["issue"]).netloc.casefold() != selected["host"].casefold():
+        raise ValueError("issue and Project must belong to the same GitHub host")
     login = payload["assignee"]
     if login == "@me":
         login = github.gh("api", "--hostname", selected["host"], "user", "--jq", ".login")
@@ -513,14 +516,17 @@ def once(db, limit=20, dry_run=False):
             sync = tracking.get("sync")
             mappings = tracking.get("statuses", {})
             eligible = managed(tracking)
+            queued = intent(db, work["id"]) if has_queue else None
+            first_sync = bool(not eligible and queued and queued["kind"] == "sync"
+                              and queued["state"] in {"pending", "needs_decision"})
             preview = {"work_id": work["id"], "issue": work["issue"], "local_status": work["status"],
                        "project": tracking["project"],
-                       "eligibility": "managed" if eligible else "legacy_needs_explicit_mapping",
+                       "eligibility": "managed" if eligible else
+                                      "pending_first_sync" if first_sync else "legacy_needs_explicit_mapping",
                        "missing_mappings": [name for name in ("blocked", "paused", "done") if name not in mappings],
                        "local_claim_owner": (state.claim_for(db, work["id"]) or {}).get("owner") if has_claims else None,
-                       "intent": (intent(db, work["id"]) or {}).get("state") if has_queue else None,
+                       "intent": (queued or {}).get("state"),
                        "possible_remote_writes": []}
-            queued = intent(db, work["id"]) if has_queue else None
             if eligible:
                 try:
                     audit = github.audit(db, work["id"])
@@ -533,18 +539,13 @@ def once(db, limit=20, dry_run=False):
                         preview["possible_remote_writes"].append("Project Done if configured; local completion")
                     if audit.get("awaited_run", {}).get("status") == "completed":
                         preview["next_action"] = "record external outcome; review semantic acceptance"
-                    if queued:
-                        summary, writes, local = preview_pending(db, queued)
-                        preview["pending_intent"] = summary
-                        if queued["state"] in {"pending", "needs_decision"}:
-                            preview["possible_remote_writes"] = writes
-                        preview["possible_local_actions"] = local
                 except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
                     preview["audit_state"] = "unknown"
                     preview["error"] = str(exc)
             else:
                 preview["audit_state"] = "unknown"
-                preview["next_action"] = "supply and verify explicit mapping before opt-in"
+                preview["next_action"] = ("drain explicit first synchronization after readback" if first_sync
+                                          else "supply and verify explicit mapping before opt-in")
                 try:
                     observed = github.view(work["issue"])
                     item = github.legacy_project_item(tracking["project"], observed["id"])
@@ -555,6 +556,16 @@ def once(db, limit=20, dry_run=False):
                         "project_item_found": bool(item)}
                 except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
                     preview["remote_observed"] = {"state": "unknown", "error": str(exc)}
+            if queued:
+                try:
+                    summary, writes, local = preview_pending(db, queued)
+                    preview["pending_intent"] = summary
+                    if queued["state"] in {"pending", "needs_decision"}:
+                        preview["possible_remote_writes"] = writes
+                    preview["possible_local_actions"] = local
+                except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                    preview["pending_intent"] = {"kind": queued["kind"], "state": queued["state"],
+                                                 "error": str(exc), "next_action": "retry remote readback"}
             rows.append(preview)
         return {"records": rows, "coverage": {"total_project_records": total,
                 "returned": len(rows), "truncated": total > len(rows),
@@ -586,16 +597,31 @@ def installation_ready(args):
         return False
 
 
-def run_once_locked(path, limit):
+def acquire_lock(path, create_parent=False):
+    if create_parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.with_suffix(path.suffix + ".reconcile.lock")
     fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return {"state": "already_running", "db": str(path)}
-        with closing(state.connect(path)) as db:
-            return {"state": "completed", "actions": once(db, limit)}
+    handle = os.fdopen(fd, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def perform_once(path, limit):
+    with closing(state.connect(path)) as db:
+        return {"state": "completed", "actions": once(db, limit)}
+
+
+def run_once_locked(path, limit):
+    handle = acquire_lock(path)
+    if handle is None:
+        return {"state": "already_running", "db": str(path)}
+    with handle:
+        return perform_once(path, limit)
 
 
 def main():
@@ -633,17 +659,31 @@ def main():
         print(state.encode(result), flush=True)
         return 0
     last_wait = None
-    while True:
-        reason = ("waiting_for_activation" if not installation_ready(args) else
-                  "no_database" if not path.exists() else None)
-        if reason:
-            if reason != last_wait:
-                print(state.encode({"state": reason, "db": str(path)}), flush=True)
-            last_wait = reason
-        else:
-            last_wait = None
-            print(state.encode(run_once_locked(path, args.limit)), flush=True)
-        time.sleep(args.interval)
+    handle = None
+    try:
+        while True:
+            if not installation_ready(args):
+                reason = "waiting_for_activation"
+            else:
+                if handle is None:
+                    # Hold the same flock for the entire daemon lifetime,
+                    # including sleep, so two processes cannot alternate passes.
+                    handle = acquire_lock(path, create_parent=True)
+                    if handle is None:
+                        print(state.encode({"state": "already_running", "db": str(path)}), flush=True)
+                        return 0
+                reason = "no_database" if not path.exists() else None
+            if reason:
+                if reason != last_wait:
+                    print(state.encode({"state": reason, "db": str(path)}), flush=True)
+                last_wait = reason
+            else:
+                last_wait = None
+                print(state.encode(perform_once(path, args.limit)), flush=True)
+            time.sleep(args.interval)
+    finally:
+        if handle is not None:
+            handle.close()
 
 
 if __name__ == "__main__":
