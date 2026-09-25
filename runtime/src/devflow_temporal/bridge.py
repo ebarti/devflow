@@ -103,7 +103,6 @@ async def run_codex(
             "finish_reason": "unsupported",
         }
     result: AgentResult = await runtime.run(task)
-    metadata = result.metadata
     assessment = result.parsed_output if result.parsed_output_available else None
     if not result.is_success or not isinstance(assessment, dict):
         status = "blocked"
@@ -117,12 +116,10 @@ async def run_codex(
         "status": status,
         "summary": summary,
         "findings": findings,
-        "reported_model": metadata.get("model") if isinstance(metadata.get("model"), str) else None,
-        "reported_effort": (
-            metadata.get("reasoning_effort")
-            if isinstance(metadata.get("reasoning_effort"), str)
-            else None
-        ),
+        # The kit's Codex metadata.model is the selected task input, not an
+        # observation from the provider. This adapter exposes neither field.
+        "reported_model": None,
+        "reported_effort": None,
         "session_id": result.session_id,
         "usage": asdict(result.usage),
         "finish_reason": result.finish_reason,

@@ -15,8 +15,8 @@ The package uses Python 3.12+, locked `uv` dependencies, `temporalio`, typed ser
 - Implementation, review, and verification are distinct tasks and sessions. Typed role assessments must establish a pass. Findings and missing evidence block; a completed provider turn alone is insufficient.
 - Candidate identity covers Git HEAD and actual working-tree content. The implementer produces a snapshot. Review and verification bind to that immutable candidate; a changed copy invalidates the gate.
 - The kit bridge requests explicit provider, model, effort, working directory, output schema, and permission profile. It preflights supported task capabilities. Reviewer read-only behavior uses provider permissions. Unsupported controls are rejected rather than silently ignored.
-- A separate single-host SQLite receipt store claims each activity before a model invocation. Finished results are reused on duplicate delivery. Ambiguous interrupted calls become recovery-unknown instead of launching a second model.
-- Local role evidence retains run/candidate identity, requested and reported model/effort, session and usage when available. Unknown fields remain unknown. The fake demo is always labeled as fake.
+- A separate single-host SQLite receipt store binds each run ID to its inputs and claims each activity before a model invocation. Finished results are reused on duplicate delivery only for matching inputs. Ambiguous interrupted calls become recovery-unknown instead of launching a second model.
+- Local role evidence retains run/candidate identity, requested model/effort, session and usage when available. The current Codex adapter does not expose an observed model or effort, so those reported fields remain unknown. The fake demo is always labeled as fake.
 
 ## Verification
 

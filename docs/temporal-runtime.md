@@ -19,7 +19,7 @@ In another terminal, start the worker:
 uv run --frozen devflow-temporal worker --address 127.0.0.1:17333
 ```
 
-Prepare a **clean disposable Git copy** of the task repository. `start` requires `--disposable` because the implementer edits that copy. Keep the runtime state directory outside it. The deterministic fake provider gives a repeatable workflow demonstration and makes no model calls:
+Prepare a **clean disposable Git copy** of the task repository. `start` requires `--disposable` because the implementer edits that copy. Keep the runtime state directory outside it. The state directory must be newly created by the runtime or an owned private directory with mode `0700`; an existing directory with broader permissions is rejected without changing its mode. The deterministic fake provider gives a repeatable workflow demonstration and makes no model calls:
 
 ```sh
 uv run --frozen devflow-temporal start --address 127.0.0.1:17333 \
@@ -46,11 +46,11 @@ This is an example model choice, not a guarantee that every account supports it.
 
 ## State and recovery
 
-Temporal stores workflow transitions, decisions, and terminal outcomes in its configured persistence file. The separate private state directory holds candidate snapshots, role evidence, and a SQLite activity receipt store. The active Devflow tracking database is untouched. Status reports phase, outcome, candidate identity, findings, per-role usage, and the requested and provider-reported model, effort, and session. Unknown provider fields remain `null`. Fake evidence is labeled explicitly.
+Temporal stores workflow transitions, decisions, and terminal outcomes in its configured persistence file. The separate private state directory holds candidate snapshots, role evidence, and a SQLite activity receipt store. The active Devflow tracking database is untouched. Status reports phase, outcome, candidate identity, findings, per-role usage, requested model and effort, and the role session. The kit's Codex `metadata.model` is copied from task selection, so it is not proof of the model that executed. This adapter does not expose observed model or effort; `reported_model` and `reported_effort` remain `null`. Fake evidence is labeled explicitly.
 
 The candidate ID combines Git HEAD with the content and executable mode of Git-visible regular files: tracked files plus nonignored untracked files. The snapshot omits ignored files and `.git`, as well as `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, and `.ruff_cache`; symlinks and special files are rejected. Review and verification bind to the same snapshot. If their working copy changes during a gate, that gate blocks. This is a small-repository local snapshot design, not a general artifact service.
 
-An activity receipt is keyed by run, role, iteration, and candidate. A finished receipt is reused if Temporal redelivers the activity. A still-running receipt after an interruption is treated as recovery-unknown and blocks, because the provider may already have acted. Activity and workflow retries are disabled for this path. It cannot resume a model mid-turn. Restarting a worker during the optional decision wait preserves the pending decision; answer with the exact ID and revision shown by `status`.
+An activity receipt is keyed by run, role, iteration, and candidate. Before any receipt or snapshot can be reused, the private store binds the run ID to its input digest, repository, state directory, and initial candidate. A conflicting new Temporal history is blocked even if it uses the same run ID and candidate. A finished receipt is reused only for matching inputs if Temporal redelivers the activity. Unbound receipts created by an older version require a new state directory. A still-running receipt after an interruption is treated as recovery-unknown and blocks, because the provider may already have acted. Activity and workflow retries are disabled for this path. It cannot resume a model mid-turn. Restarting a worker during the optional decision wait preserves the pending decision; answer with the exact ID and revision shown by `status`.
 
 `cancel --id RUN --reason TEXT` requests a stop at the next role boundary. It does not roll back file or tool effects of an active role; status reports cleanup as unknown after activity work. This version has no production broker, multi-host receipt coordination, hosted UI, GitHub mutation, release, or global installation. The Codex adapter's output events are not a durable event journal and its SDK result arrives after the turn; use Temporal history and the local evidence files for the first version of observability.
 
@@ -61,4 +61,4 @@ uv run --frozen ruff check src tests
 uv run --frozen pytest -q
 ```
 
-The integration tests start a real local Temporal dev server, exercise a worker restart, duplicate starts, decision revisions, candidate gates, findings, cancellation, and receipt reuse. The fake provider is deterministic; these tests do not prove live model quality. Real provider smoke evidence must be labeled separately.
+The integration tests start a real local Temporal dev server, exercise a worker restart, duplicate starts, a conflicting history on a fresh server, decision revisions, candidate gates, findings, cancellation, and receipt reuse. The fake provider is deterministic; these tests do not prove live model quality. Real provider smoke evidence must be labeled separately.

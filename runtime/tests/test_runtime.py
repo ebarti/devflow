@@ -2,23 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import sqlite3
+import stat
 import subprocess
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from agent_runtime_kit import AgentResult
 from temporalio import activity
 from temporalio.client import WorkflowUpdateFailedError
 from temporalio.common import RetryPolicy, WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from devflow_temporal import cli
+from devflow_temporal import bridge, cli
 from devflow_temporal.activities import run_role
 from devflow_temporal.candidate import candidate_for, snapshot
 from devflow_temporal.contracts import digest, public_inputs
-from devflow_temporal.receipts import ReceiptStore
+from devflow_temporal.receipts import ReceiptStore, RunBindingError
 from devflow_temporal.workflow import IssueWorkflow
 
 
@@ -214,13 +220,109 @@ async def test_receipts_reuse_finished_and_block_ambiguous_invocation(tmp_path):
 
     ambiguous = spec_for(tmp_path, "ambiguous-run")
     store = ReceiptStore(Path(ambiguous["state_dir"]))
-    claim = store.claim("ambiguous-run", "implement", 0, ambiguous["initial_candidate"]["id"])
+    claim = store.claim(ambiguous, "implement", 0, ambiguous["initial_candidate"]["id"])
     assert claim.state == "new"
     blocked = await run_role(
         {"spec": ambiguous, "role": "implement", "candidate": ambiguous["initial_candidate"]}
     )
     assert blocked["status"] == "recovery_unknown"
     assert not (Path(ambiguous["state_dir"]) / "fake-invocations.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_new_temporal_history_cannot_reuse_receipts_for_different_inputs(tmp_path):
+    first = spec_for(tmp_path, "reused-run")
+    other_repo = tmp_path / "other-repo"
+    shutil.copytree(first["repo"], other_repo)
+    second = {**first, "repo": str(other_repo), "goal": "Make a different change"}
+    second["input_digest"] = digest(public_inputs(second))
+    assert candidate_for(other_repo) == first["initial_candidate"]
+
+    async with await WorkflowEnvironment.start_local() as first_env:
+        queue = f"devflow-test-{uuid4().hex}"
+        async with Worker(
+            first_env.client, task_queue=queue, workflows=[IssueWorkflow], activities=[run_role]
+        ):
+            first_run = await start_run(first_env.client, first, queue)
+            assert (await asyncio.wait_for(first_run.result(), 20))["outcome"] == "completed"
+
+    invocation_file = Path(first["state_dir"]) / "fake-invocations.jsonl"
+    assert len(invocation_file.read_text().splitlines()) == 3
+    async with await WorkflowEnvironment.start_local() as second_env:
+        queue = f"devflow-test-{uuid4().hex}"
+        async with Worker(
+            second_env.client, task_queue=queue, workflows=[IssueWorkflow], activities=[run_role]
+        ):
+            second_run = await start_run(second_env.client, second, queue)
+            final = await asyncio.wait_for(second_run.result(), 20)
+
+    assert final["outcome"] == "blocked"
+    assert "bound to different inputs" in final["roles"][0]["findings"][0]
+    assert not (other_repo / "devflow-temporal-demo.txt").exists()
+    assert len(invocation_file.read_text().splitlines()) == 3
+
+
+def test_receipt_store_rejects_unbound_legacy_receipt(tmp_path):
+    spec = spec_for(tmp_path, "legacy-run")
+    store = ReceiptStore(Path(spec["state_dir"]))
+    with sqlite3.connect(store.path) as db:
+        db.execute(
+            """INSERT INTO receipts
+               (run_id, role, iteration, candidate_id, generation, state, result_json)
+               VALUES (?, 'implement', 0, ?, 'old', 'finished', '{}')""",
+            (spec["run_id"], spec["initial_candidate"]["id"]),
+        )
+    with pytest.raises(RunBindingError, match="unbound legacy receipts"):
+        store.claim(spec, "implement", 0, spec["initial_candidate"]["id"])
+
+
+def test_receipt_store_rejects_public_existing_directory_without_chmod(tmp_path):
+    state_dir = tmp_path / "public-state"
+    state_dir.mkdir()
+    os.chmod(state_dir, 0o755)
+    with pytest.raises(ValueError, match="private directory"):
+        ReceiptStore(state_dir)
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o755
+    assert not (state_dir / "receipts.sqlite3").exists()
+
+    private_dir = tmp_path / "private-state"
+    store = ReceiptStore(private_dir)
+    assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    ReceiptStore(private_dir)
+
+
+@pytest.mark.asyncio
+async def test_codex_task_selected_metadata_is_not_reported_as_provider_observation(
+    tmp_path, monkeypatch
+):
+    spec = spec_for(tmp_path, "metadata-run")
+    spec.update(model="gpt-5.5", effort="low")
+    seen = []
+
+    class StubRuntime:
+        async def run(self, task):
+            seen.append(task)
+            return AgentResult(
+                output="{}",
+                parsed_output={"status": "pass", "summary": "reviewed", "findings": []},
+                metadata={"model": task.model, "reasoning_effort": task.reasoning_effort},
+                session_id="kit-session",
+            )
+
+    monkeypatch.setattr(bridge, "CodexAgentRuntime", StubRuntime)
+    monkeypatch.setattr(
+        bridge, "validate_task", lambda _runtime, _task: SimpleNamespace(supported=True)
+    )
+    result = await bridge.run_codex(
+        spec, "review", Path(spec["repo"]), spec["initial_candidate"]["id"]
+    )
+    assert seen[0].model == "gpt-5.5"
+    assert seen[0].reasoning_effort == "low"
+    assert result["status"] == "pass"
+    assert result["session_id"] == "kit-session"
+    assert result["reported_model"] is None
+    assert result["reported_effort"] is None
 
 
 def test_candidate_snapshot_excludes_ignored_credentials_and_rejects_symlinks(tmp_path):

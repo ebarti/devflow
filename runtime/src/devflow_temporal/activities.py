@@ -14,7 +14,7 @@ from temporalio import activity
 from .bridge import run_codex
 from .candidate import assert_candidate, candidate_for, snapshot, validate_paths
 from .contracts import ROLE_NAMES, RUN_ID_RE
-from .receipts import ReceiptStore
+from .receipts import ReceiptStore, RunBindingError
 
 
 def _blocked(request: dict[str, Any], finding: str) -> dict[str, Any]:
@@ -83,7 +83,10 @@ async def run_role(request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid role request")
     state_dir = Path(spec["state_dir"])
     receipts = ReceiptStore(state_dir)
-    claim = receipts.claim(spec["run_id"], role, 0, candidate["id"])
+    try:
+        claim = receipts.claim(spec, role, 0, candidate["id"])
+    except RunBindingError as exc:
+        return _blocked(request, str(exc))
     if claim.state == "finished":
         assert claim.result is not None
         return claim.result
