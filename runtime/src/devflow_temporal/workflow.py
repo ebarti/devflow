@@ -7,6 +7,7 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
 
 
 @workflow.defn(name="DevflowIssueWorkflow")
@@ -28,6 +29,8 @@ class IssueWorkflow:
             "candidate": spec["initial_candidate"],
             "roles": [],
             "findings": [],
+            "usage": {},
+            "active_role": None,
             "cleanup": "none",
         }
         if spec["require_decision"]:
@@ -44,6 +47,7 @@ class IssueWorkflow:
             if self.cancel_requested:
                 return self._cancelled()
             self.state["phase"] = role
+            self.state["active_role"] = role
             requested_candidate = self.state["candidate"]
             try:
                 result = await workflow.execute_activity(
@@ -57,18 +61,42 @@ class IssueWorkflow:
                     return self._cancelled()
                 return self._blocked(f"{role} activity failed: {type(exc).__name__}")
             self.state["roles"].append(result)
+            self.state["usage"][role] = result.get("usage")
+            self.state["active_role"] = None
             if self.cancel_requested:
                 return self._cancelled()
+            if result.get("role") != role or result.get("provider") != spec["provider"]:
+                return self._blocked(f"{role} returned the wrong role or provider identity")
+            identity = result.get("identity")
+            if not isinstance(identity, str) or any(
+                prior.get("identity") == identity for prior in self.state["roles"][:-1]
+            ):
+                return self._blocked(f"{role} did not have an independent role identity")
+            session = result.get("session_id")
+            if session is not None and any(
+                prior.get("session_id") == session for prior in self.state["roles"][:-1]
+            ):
+                return self._blocked(f"{role} reused another role's session")
             if result.get("input_candidate_id") != requested_candidate["id"]:
                 return self._blocked(f"{role} result is bound to another candidate")
+            if not isinstance(result.get("findings"), list) or not isinstance(
+                result.get("summary"), str
+            ):
+                return self._blocked(f"{role} returned an invalid role assessment")
+            if result.get("status") == "pass" and (
+                not result["summary"].strip() or result["findings"]
+            ):
+                return self._blocked(f"{role} passed without a clean assessment")
+            if role == "implement":
+                produced = result.get("candidate")
+                if isinstance(produced, dict) and produced.get("id"):
+                    self.state["candidate"] = produced
             if result.get("status") != "pass":
                 self.state["findings"].extend(result.get("findings") or [])
                 return self._blocked(f"{role} did not pass")
             if role == "implement":
-                produced = result.get("candidate")
                 if not isinstance(produced, dict) or not produced.get("id"):
                     return self._blocked("implementer did not produce a candidate")
-                self.state["candidate"] = produced
             elif result.get("candidate", {}).get("id") != requested_candidate["id"]:
                 return self._blocked(f"{role} observed changed candidate content")
         self.state["phase"] = "completed"
@@ -79,12 +107,15 @@ class IssueWorkflow:
         self.state["phase"] = "blocked"
         self.state["outcome"] = "blocked"
         self.state["findings"].append(reason)
+        self.state["active_role"] = None
         return self.state
 
     def _cancelled(self) -> dict[str, Any]:
         self.state["phase"] = "cancelled"
         self.state["outcome"] = "cancelled"
-        self.state["cleanup"] = "unknown_after_activity" if self.state["roles"] else "none"
+        self.state["cleanup"] = (
+            "unknown_after_activity" if self.state["active_role"] or self.state["roles"] else "none"
+        )
         return self.state
 
     @workflow.query(name="status")
@@ -92,27 +123,29 @@ class IssueWorkflow:
         return self.state
 
     @workflow.update(name="decision")
-    def decision(self, request: dict[str, Any]) -> dict[str, Any]:
+    async def decision(self, request: dict[str, Any]) -> dict[str, Any]:
+        await workflow.wait_condition(lambda: bool(self.state))
         if self.state.get("phase") != "waiting_decision":
-            raise ValueError("no decision is pending")
+            raise ApplicationError("no decision is pending", non_retryable=True)
         if request.get("decision_id") != self.state["decision_id"]:
-            raise ValueError("decision ID does not match")
+            raise ApplicationError("decision ID does not match", non_retryable=True)
         if request.get("revision") != self.state["revision"]:
-            raise ValueError("decision revision does not match")
+            raise ApplicationError("decision revision does not match", non_retryable=True)
         answer = request.get("answer")
         if answer not in ("proceed", "decline"):
-            raise ValueError("answer must be proceed or decline")
+            raise ApplicationError("answer must be proceed or decline", non_retryable=True)
         self.decision_answer = answer
         self.state["decision_id"] = None
         self.state["revision"] += 1
         return self.state
 
     @workflow.update(name="cancel")
-    def cancel(self, reason: str) -> dict[str, Any]:
+    async def cancel(self, reason: str) -> dict[str, Any]:
+        await workflow.wait_condition(lambda: bool(self.state))
         if self.state.get("outcome") is not None:
-            raise ValueError("run is already terminal")
+            raise ApplicationError("run is already terminal", non_retryable=True)
         if not reason.strip():
-            raise ValueError("cancellation reason is required")
+            raise ApplicationError("cancellation reason is required", non_retryable=True)
         self.cancel_requested = True
         self.state["phase"] = "cancelling"
         self.state["revision"] += 1

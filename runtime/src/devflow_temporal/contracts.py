@@ -21,7 +21,11 @@ def digest(value: Any) -> str:
 
 def public_inputs(spec: dict[str, Any]) -> dict[str, Any]:
     """Inputs whose equality decides whether a repeated start is identical."""
-    return {key: value for key, value in spec.items() if key != "initial_candidate"}
+    return {
+        key: value
+        for key, value in spec.items()
+        if key not in {"initial_candidate", "input_digest", "preflight"}
+    }
 
 
 def validate_spec(spec: dict[str, Any]) -> None:
@@ -46,6 +50,12 @@ def validate_spec(spec: dict[str, Any]) -> None:
         raise ValueError("real provider requires explicit model and effort")
     if spec.get("fake_finding") not in (None, "review", "verify"):
         raise ValueError("fake_finding must be review or verify")
+    if spec.get("fake_change") not in (None, "review", "verify"):
+        raise ValueError("fake_change must be review or verify")
+    if spec["provider"] != "fake" and (
+        spec.get("fake_finding") is not None or spec.get("fake_change") is not None
+    ):
+        raise ValueError("fake scenarios are only supported with the fake provider")
     if not isinstance(spec.get("require_decision"), bool):
         raise ValueError("require_decision must be boolean")
     if not isinstance(spec.get("initial_candidate"), dict):

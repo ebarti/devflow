@@ -36,8 +36,44 @@ def validate_paths(repo: Path, state_dir: Path, *, require_clean: bool) -> None:
 
 
 def _files(root: Path) -> list[Path]:
+    # The source repository may contain ignored credentials or dependency trees.
+    # Only Git-visible files form the review candidate. Snapshots have no .git,
+    # so walking them also detects new files created during a gate.
+    if (root / ".git").exists():
+        listing = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+            capture_output=True,
+            check=True,
+        ).stdout
+        paths = []
+        for raw in listing.split(b"\0"):
+            if not raw:
+                continue
+            relative = Path(os.fsdecode(raw))
+            if any(part in SKIP_NAMES for part in relative.parts):
+                continue
+            path = root / relative
+            if not path.exists() and not path.is_symlink():
+                continue  # a deleted tracked file is absent from the candidate
+            if not stat.S_ISREG(path.lstat().st_mode):
+                raise ValueError(f"candidate contains a symlink or special file: {path}")
+            paths.append(path)
+        return sorted(set(paths))
     paths: list[Path] = []
     for base, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs:
+            directory = Path(base, name)
+            if directory.is_symlink():
+                raise ValueError(f"candidate contains a symlinked directory: {directory}")
         dirs[:] = sorted(name for name in dirs if name not in SKIP_NAMES)
         for name in sorted(files):
             if name in SKIP_NAMES:
@@ -86,6 +122,10 @@ def snapshot(repo: Path, state_dir: Path, run_id: str, candidate: dict[str, Any]
     if destination.exists():
         raise ValueError("candidate snapshot already exists; recovery requires inspection")
     destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    shutil.copytree(repo, destination, ignore=shutil.ignore_patterns(*SKIP_NAMES))
+    destination.mkdir(mode=0o700)
+    for path in _files(repo):
+        copied = destination / path.relative_to(repo)
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, copied, follow_symlinks=False)
     assert_candidate(destination, candidate, git_head=False)
     return destination

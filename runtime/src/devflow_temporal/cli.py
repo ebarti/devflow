@@ -8,13 +8,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from temporalio.client import Client
-from temporalio.common import WorkflowIDReusePolicy
+from temporalio.client import Client, WorkflowUpdateFailedError
+from temporalio.common import RetryPolicy, WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 
 from .activities import run_role
+from .bridge import preflight
 from .candidate import candidate_for, validate_paths
 from .contracts import digest, public_inputs, validate_spec
 from .workflow import IssueWorkflow
@@ -44,6 +45,16 @@ async def _existing_status(client: Client, run_id: str) -> dict[str, Any] | None
         raise
 
 
+async def _existing_digest(client: Client, run_id: str) -> str | None:
+    try:
+        description = await _handle(client, run_id).describe()
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            return None
+        raise
+    return await description.memo_value("input_digest", "unknown")
+
+
 async def _start(args: argparse.Namespace) -> None:
     if not args.disposable:
         raise ValueError("pass --disposable to confirm this local Git copy may be edited")
@@ -60,18 +71,21 @@ async def _start(args: argparse.Namespace) -> None:
         "effort": args.effort,
         "require_decision": args.decision,
         "fake_finding": args.fake_finding,
+        "fake_change": args.fake_change,
     }
     spec["input_digest"] = digest(public_inputs(spec))
     client = await _client(args)
-    existing = await _existing_status(client, args.id)
-    if existing is not None:
-        if existing.get("input_digest") != spec["input_digest"]:
+    existing_digest = await _existing_digest(client, args.id)
+    if existing_digest is not None:
+        if existing_digest != spec["input_digest"]:
             raise ValueError("run ID already exists with different inputs")
-        _print(existing)
+        _print({"run_id": args.id, "input_digest": existing_digest, "existing": True})
         return
     validate_paths(repo, state_dir, require_clean=True)
     spec["initial_candidate"] = candidate_for(repo)
     validate_spec(spec)
+    if spec["provider"] == "codex":
+        spec["preflight"] = await preflight(spec)
     try:
         await client.start_workflow(
             IssueWorkflow.run,
@@ -79,14 +93,24 @@ async def _start(args: argparse.Namespace) -> None:
             id=args.id,
             task_queue=args.queue,
             id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+            id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+            memo={"input_digest": spec["input_digest"]},
         )
     except WorkflowAlreadyStartedError:
-        existing = await _existing_status(client, args.id)
-        if existing is None or existing.get("input_digest") != spec["input_digest"]:
+        existing_digest = await _existing_digest(client, args.id)
+        if existing_digest != spec["input_digest"]:
             raise ValueError("run ID was taken by another input") from None
-        _print(existing)
+        _print({"run_id": args.id, "input_digest": existing_digest, "existing": True})
         return
-    _print({"run_id": args.id, "input_digest": spec["input_digest"], "phase": "started"})
+    _print(
+        {
+            "run_id": args.id,
+            "input_digest": spec["input_digest"],
+            "phase": "started",
+            "preflight": spec.get("preflight"),
+        }
+    )
 
 
 async def _status(args: argparse.Namespace) -> None:
@@ -144,6 +168,7 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--effort")
     start.add_argument("--decision", action="store_true")
     start.add_argument("--fake-finding", choices=("review", "verify"))
+    start.add_argument("--fake-change", choices=("review", "verify"))
     start.add_argument("--disposable", action="store_true")
     start.set_defaults(func=_start)
 
@@ -172,5 +197,10 @@ def main() -> None:
     args = parser().parse_args()
     try:
         asyncio.run(args.func(args))
+    except WorkflowUpdateFailedError as exc:
+        cause = exc.__cause__ or exc
+        parser().exit(2, f"error: {cause}\n")
     except (ValueError, RPCError) as exc:
         parser().exit(2, f"error: {exc}\n")
+    except KeyboardInterrupt:
+        return
