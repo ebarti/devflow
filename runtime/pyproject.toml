@@ -17,6 +17,8 @@ dependencies = [
 
 [project.scripts]
 devflow-temporal = "devflow_temporal.cli:main"
+devflow-delivery = "devflow_temporal.delivery_control:main"
+devflow-delivery-mcp = "devflow_temporal.delivery_mcp:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1"]

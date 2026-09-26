@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -62,6 +63,7 @@ class DeliveryStore:
                     phase TEXT NOT NULL,
                     execution_state TEXT NOT NULL,
                     revision INTEGER NOT NULL,
+                    protocol_revision INTEGER,
                     candidate_revision INTEGER NOT NULL DEFAULT 0,
                     candidate_json TEXT,
                     pr_json TEXT,
@@ -133,6 +135,16 @@ class DeliveryStore:
                     state TEXT NOT NULL,
                     observed_json TEXT,
                     updated_at TEXT NOT NULL
+                )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_mutations (
+                    command_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
+                    kind TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    response_json TEXT
                 )"""
             )
 
@@ -304,6 +316,14 @@ class DeliveryStore:
             if row is None:
                 raise ValueError("run ID not found")
             if row[1] != "accepted":
+                if accepted:
+                    # The worker may project a phase before the dispatcher has
+                    # recorded start_workflow's acknowledgement.
+                    db.execute(
+                        """UPDATE delivery_outbox SET state='sent',last_error=NULL,
+                           updated_at=? WHERE run_id=?""",
+                        (_now(), run_id),
+                    )
                 return
             new_phase = "preparing" if accepted else "accepted"
             new_state = "running" if accepted else "pending_temporal"
@@ -340,6 +360,7 @@ class DeliveryStore:
         checks: dict[str, Any] | None = None,
         tracker: dict[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
+        protocol_revision: int | None = None,
         outcome: str | None = None,
         error: str | None = None,
         key: str | None = None,
@@ -366,6 +387,9 @@ class DeliveryStore:
                 "phase": phase,
                 "execution_state": execution_state,
                 "revision": revision,
+                "protocol_revision": (
+                    protocol_revision if protocol_revision is not None else row["protocol_revision"]
+                ),
                 "candidate_revision": candidate_revision,
                 "candidate_json": canonical_json(candidate)
                 if candidate is not None
@@ -405,6 +429,40 @@ class DeliveryStore:
                 for row in rows
             ]
 
+    def begin_mutation(
+        self, run_id: str, command_id: str, kind: str, payload: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        request_digest = digest(payload)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone():
+                raise ValueError("run ID not found")
+            prior = db.execute(
+                """SELECT run_id,kind,request_digest,state,response_json
+                   FROM delivery_mutations WHERE command_id=?""",
+                (command_id,),
+            ).fetchone()
+            if prior:
+                if (prior[0], prior[1], prior[2]) != (run_id, kind, request_digest):
+                    raise ValueError("command ID already belongs to another mutation")
+                return json.loads(prior[4]) if prior[3] == "complete" else None
+            db.execute(
+                """INSERT INTO delivery_mutations
+                   (command_id,run_id,kind,request_digest,state)
+                   VALUES (?,?,?,?,'pending')""",
+                (command_id, run_id, kind, request_digest),
+            )
+            return None
+
+    def finish_mutation(self, command_id: str, response: dict[str, Any]) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE delivery_mutations SET state='complete',response_json=?
+                   WHERE command_id=?""",
+                (canonical_json(response), command_id),
+            )
+
     def list_runs(self) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute(
@@ -426,6 +484,7 @@ class DeliveryStore:
             "execution_state": row["execution_state"],
             "updated_at": row["updated_at"],
             "revision": row["revision"],
+            "protocol_revision": row["protocol_revision"],
             "authorized_endpoint": spec["authorized_endpoint"],
             "outcome": row["outcome"],
         }
@@ -439,7 +498,7 @@ class DeliveryStore:
             attempts = [
                 dict(item)
                 for item in db.execute(
-                    """SELECT role,iteration,state,session_id,result_json,cleanup
+                    """SELECT job_key,role,iteration,state,session_id,result_json,cleanup
                        FROM delivery_attempts WHERE run_id=? ORDER BY iteration,role""",
                     (run_id,),
                 )
@@ -461,12 +520,29 @@ class DeliveryStore:
                     "cleanup": attempt["cleanup"],
                 }
             )
+        with self._connect() as db:
+            active = db.execute(
+                """SELECT COUNT(*) FROM delivery_attempts
+                   WHERE state IN ('starting','running','unknown')"""
+            ).fetchone()[0]
+        event_types = {event["type"] for event in self.events(run_id)}
+        gates = [
+            {"id": name, "label": label, "state": "completed" if name in event_types else "pending"}
+            for name, label in (
+                ("preparing", "Prepare"),
+                ("published", "Publish"),
+                ("checks_started", "Local checks"),
+                ("ci_wait", "Required CI"),
+                ("tracker_started", "Tracker"),
+                ("delivered", "Delivered"),
+            )
+        ]
         return {
             **compact,
             "run": compact,
-            "phase_gates": [],
+            "phase_gates": gates,
             "roles": roles,
-            "capacity": {"limit": self.config.raw.get("capacity", 2), "active": None},
+            "capacity": {"limit": self.config.raw.get("capacity", 2), "active": active},
             "queued": row["execution_state"] == "queued",
             "cleanup": "unknown" if any(a["cleanup"] == "unknown" for a in attempts) else "none",
             "candidate": {**candidate, "revision": row["candidate_revision"]}
@@ -479,4 +555,82 @@ class DeliveryStore:
             "decisions": [],
             "events": self.events(run_id),
             "error": row["error"],
+        }
+
+    def evidence_index(self, run_id: str) -> list[dict[str, Any]]:
+        spec = self.spec(run_id)
+        root = Path(spec["state_dir"])
+        indexed: list[dict[str, Any]] = []
+        with self._connect() as db:
+            attempts = db.execute(
+                "SELECT job_key,role,iteration FROM delivery_attempts WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+        for attempt in attempts:
+            path = root / "attempts" / attempt["job_key"] / "process.log"
+            if path.is_file():
+                indexed.append(
+                    {
+                        "id": f"role-{attempt['role']}-{attempt['iteration']}",
+                        "label": f"{attempt['role']} process log, attempt {attempt['iteration']}",
+                        "path": path,
+                    }
+                )
+        details = self.detail(run_id)
+        for result in details.get("checks", {}).get("local", {}).get("results", []):
+            path = Path(result["log"])
+            indexed.append({"id": f"check-{result['id']}", "label": result["id"], "path": path})
+        recovery = root / "recovery" / "provenance.json"
+        if recovery.is_file():
+            indexed.append(
+                {"id": "recovery-provenance", "label": "Recovery provenance", "path": recovery}
+            )
+        safe = []
+        for item in indexed:
+            path = item["path"]
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or root.resolve() not in path.resolve().parents
+            ):
+                continue
+            safe.append({"id": item["id"], "label": item["label"], "bytes": path.stat().st_size})
+        return safe
+
+    def evidence(self, run_id: str, evidence_id: str) -> dict[str, Any]:
+        spec = self.spec(run_id)
+        root = Path(spec["state_dir"])
+        known = {item["id"] for item in self.evidence_index(run_id)}
+        if evidence_id not in known:
+            raise ValueError("evidence ID is not indexed for this run")
+        if evidence_id == "recovery-provenance":
+            path = root / "recovery" / "provenance.json"
+        elif evidence_id.startswith("role-"):
+            with self._connect() as db:
+                attempts = db.execute(
+                    "SELECT job_key,role,iteration FROM delivery_attempts WHERE run_id=?",
+                    (run_id,),
+                ).fetchall()
+            matched = [
+                row for row in attempts if evidence_id == f"role-{row['role']}-{row['iteration']}"
+            ]
+            if len(matched) != 1:
+                raise ValueError("evidence identity is ambiguous")
+            path = root / "attempts" / matched[0]["job_key"] / "process.log"
+        else:
+            results = self.detail(run_id).get("checks", {}).get("local", {}).get("results", [])
+            matched = [item for item in results if evidence_id == f"check-{item['id']}"]
+            if len(matched) != 1:
+                raise ValueError("evidence identity is ambiguous")
+            path = Path(matched[0]["log"])
+        if path.is_symlink() or root.resolve() not in path.resolve().parents:
+            raise ValueError("evidence path escaped its run state")
+        data = path.read_bytes()
+        if len(data) > 1024 * 1024:
+            raise ValueError("evidence exceeds the local read limit")
+        return {
+            "id": evidence_id,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
+            "text": data.decode("utf-8", errors="replace"),
         }

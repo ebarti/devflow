@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -149,18 +150,31 @@ class DeliveryConfig:
         policy = {
             "roles": self.raw["roles"],
             "checks": repository.get("checks", []),
+            "required_ci": repository.get("required_ci", []),
             "allowed_paths": repository.get("allowed_paths", []),
             "recovery": repository.get("recovery", {}).get(recovery_key),
             "codex_bin": self.raw["codex_bin"],
+            "codex_auth_path": self.raw.get("codex_auth_path"),
+            "tracking_db": str(self.tracking_db),
             "config_overrides": self.raw.get("config_overrides", ["features.plugins=false"]),
             "max_repairs": int(self.raw.get("max_repairs", 2)),
             "capacity": int(self.raw.get("capacity", 2)),
+            "fake_findings": self.raw.get("fake_findings", {})
+            if self.raw.get("provider") == "fake"
+            else {},
         }
         if policy["max_repairs"] < 0 or policy["max_repairs"] > 3:
             raise ValueError("max_repairs must be between 0 and 3")
+        if self.raw.get("provider", "codex") == "codex":
+            if os.uname().sysname != "Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+                raise ValueError("this host lacks the required outer macOS role sandbox")
+            if not Path(policy["codex_bin"]).is_file():
+                raise ValueError("configured Codex executable is unavailable")
+            policy["host_sandbox"] = "seatbelt"
         return {
             **supplied,
             "version": 1,
+            "provider": self.raw.get("provider", "codex"),
             "source_path": str(source),
             "origin_url": actual_remote,
             "github_repo": owner_repo,
@@ -169,5 +183,6 @@ class DeliveryConfig:
             "checkout": str(checkout),
             "policy": policy,
             "policy_digest": digest(policy),
+            "config_digest": digest(self.raw),
             "config_path": str(self.path),
         }
