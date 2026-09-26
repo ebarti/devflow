@@ -1,4 +1,4 @@
-import type { NewRunRequest, RunDetail, RunSummary, ServiceInfo } from './model'
+import type { NewRunRequest, RunDetail, RunSummary, ServiceInfo, Usage } from './model'
 
 /** The only HTTP path/contract adapter. No credentials are persisted or put in URLs. */
 export class ApiError extends Error {
@@ -10,14 +10,42 @@ export class ApiError extends Error {
 
 let csrfToken: string | undefined
 
-function observedCount(value: unknown): number | null {
-  return typeof value === 'number' ? value : Array.isArray(value) ? value.length : null
+type BackendTracker = Omit<NonNullable<RunDetail['tracker']>, 'observed'> & { observed?: unknown }
+type BackendRunDetail = Omit<RunDetail, 'tracker' | 'usage'> & {
+  tracker?: BackendTracker | null
+  usage?: Usage | Record<string, Usage | null> | null
 }
 
-function observedState(value: unknown): string | null {
+const tokenFields = ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens', 'total_tokens', 'reasoning_tokens', 'cached_input_tokens'] as const
+
+function numericTokens(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+function observedUsage(value: unknown): Usage | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  if (tokenFields.some(field => field in raw) || 'status' in raw || 'gaps' in raw) return value as Usage
+  const entries = Object.entries(raw)
+  const usage: Usage = { source: 'role_attempts' }
+  const partialFields: string[] = []
+  for (const field of tokenFields) {
+    const observed = entries.map(([, entry]) => entry && typeof entry === 'object' ? (entry as Record<string, unknown>)[field] : null).filter(numericTokens)
+    if (observed.length) {
+      usage[field] = observed.reduce((sum, count) => sum + count, 0)
+    }
+    if (observed.length > 0 && observed.length !== entries.length) partialFields.push(field)
+  }
+  const missing = entries.filter(([, entry]) => !entry || typeof entry !== 'object' || !tokenFields.some(field => numericTokens((entry as Record<string, unknown>)[field])))
+  const gaps = [...missing.map(([role]) => `${role} usage`), ...partialFields.map(field => `${field} for some role attempts`)]
+  if (gaps.length) usage.gaps = gaps
+  return usage
+}
+
+function observedText(value: unknown): string | null {
   if (typeof value === 'string') return value
-  if (value && typeof value === 'object' && 'state' in value && typeof value.state === 'string') return value.state
-  return null
+  if (value == null) return null
+  return JSON.stringify(value) ?? null
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -71,16 +99,12 @@ export const api = {
   login,
   listRuns: async (): Promise<RunSummary[]> => (await request<{ runs: RunSummary[] }>('/api/runs')).runs,
   getRun: async (id: string): Promise<RunDetail> => {
-    const result = await request<{ run: RunDetail; events?: RunDetail['events']; evidence?: RunDetail['evidence'] }>(`/api/runs/${encodeURIComponent(id)}`)
+    const result = await request<{ run: BackendRunDetail; events?: RunDetail['events']; evidence?: RunDetail['evidence'] }>(`/api/runs/${encodeURIComponent(id)}`)
     const run = result.run
     const observed = run.tracker?.observed
     return {
       ...run,
-      capacity: {
-        ...run.capacity,
-        queued: observedCount(run.capacity?.queued ?? run.queued),
-        cleanup: observedState(run.capacity?.cleanup ?? run.cleanup),
-      },
+      usage: observedUsage(run.usage),
       candidate: run.candidate ? {
         ...run.candidate,
         base: run.candidate.base ?? run.candidate.base_sha,
@@ -90,7 +114,7 @@ export const api = {
         ...run.tracker,
         pending: run.tracker.pending ?? run.tracker.state === 'pending',
         conflict: run.tracker.conflict ?? (run.tracker.state === 'conflict' ? 'Tracker synchronization conflict' : null),
-        observed: typeof observed === 'string' ? observed : observed == null ? null : JSON.stringify(observed),
+        observed: observedText(observed),
       } : null,
       events: result.events ?? run.events,
       evidence: result.evidence ?? run.evidence,
@@ -102,7 +126,7 @@ export const api = {
   },
   newRun: async (body: NewRunRequest): Promise<{ run_id: string; dashboard_url: string; existing: boolean; phase: string }> =>
     command('/api/runs', body),
-  answer: async (runId: string, body: { command_id: string; expected_revision: number; decision_id: string; decision_revision: number; candidate_revision?: number | null; answer: string }): Promise<void> => {
+  answer: async (runId: string, body: { command_id: string; expected_revision: number; decision_id: string; decision_revision: number; candidate_revision: number; answer: string }): Promise<void> => {
     await command(`/api/runs/${encodeURIComponent(runId)}/decision`, body)
   },
   cancel: async (runId: string, body: { command_id: string; expected_revision: number; reason: string }): Promise<void> => {

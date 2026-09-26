@@ -3,12 +3,15 @@ export type GateState = string | null
 export interface Usage {
   input_tokens?: number | null
   cached_input_tokens?: number | null
+  cache_read_tokens?: number | null
+  cache_creation_tokens?: number | null
   output_tokens?: number | null
   reasoning_tokens?: number | null
   total_tokens?: number | null
   status?: string | null
   observed_at?: string | null
   gaps?: string[] | null
+  source?: 'role_attempts'
 }
 
 export interface RunSummary {
@@ -39,6 +42,7 @@ export interface PhaseGate {
 
 export interface RoleState {
   role: string
+  iteration?: number | null
   state?: string | null
   session_id?: string | null
   attempt_id?: string | null
@@ -63,7 +67,7 @@ export interface Decision {
   revision: number
   candidate_revision?: number | null
   prompt: string
-  options: Array<{ value: string; label: string; consequence?: string | null }>
+  options: Array<string | { value: string; label: string; consequence?: string | null }>
   state?: string | null
 }
 
@@ -87,6 +91,8 @@ export interface Evidence {
 export interface RunDetail extends RunSummary {
   outcome?: string | null
   protocol_revision?: number | null
+  projection_revision?: number | null
+  iteration?: number | null
   error?: string | null
   sequence?: number | null
   observed_at?: string | null
@@ -94,11 +100,9 @@ export interface RunDetail extends RunSummary {
   roles?: RoleState[] | null
   capacity?: {
     active?: number | null
-    queued?: number | null
     limit?: number | null
-    cleanup?: string | null
   } | null
-  queued?: number | null
+  queued?: boolean | null
   cleanup?: string | null
   candidate?: {
     base?: string | null

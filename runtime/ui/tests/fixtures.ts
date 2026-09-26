@@ -5,7 +5,7 @@ export const mockRun: RunDetail = {
   id: 'fixture-run', run_id: 'fixture-run', work_id: 'fixture-work',
   title: 'Fixture workflow', repository: 'fixture/repository', issue: '#1',
   issue_url: 'https://github.com/example/repository/issues/1',
-  phase: 'verify', execution_state: 'running', revision: 7,
+  phase: 'verify', execution_state: 'running', revision: 7, protocol_revision: 5,
   authorized_endpoint: 'published_unmerged', observed_at: '2026-01-01T12:00:00Z',
   sequence: 4,
   phase_gates: [

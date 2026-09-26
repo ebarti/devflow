@@ -7,10 +7,40 @@ import { RunDetails } from '../src/RunDetails'
 import type { RunDetail } from '../src/model'
 import { mockRun, mockService } from './fixtures'
 import realBackendProjection from './real-backend-projection.json'
+import waitingDecisionProjection from './waiting-decision-projection.json'
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('dashboard commands', () => {
+  it('submits a string option from the managed waiting-decision projection', async () => {
+    // Mirrors DeliveryWorkflow's projected options and DeliveryStore.detail's public run shape.
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => waitingDecisionProjection })))
+    const run = await api.getRun('fixture-run')
+    const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    const user = userEvent.setup()
+    render(<RunDetails run={run} onRefresh={refresh} />)
+
+    const proceed = screen.getByRole('radio', { name: 'Proceed' }) as HTMLInputElement
+    expect(proceed.value).toBe('proceed')
+    expect(screen.getByRole('radio', { name: 'Cancel' })).toBeTruthy()
+    const submit = screen.getByRole('button', { name: 'Submit decision' }) as HTMLButtonElement
+    expect(submit.disabled).toBe(true)
+    await user.click(proceed)
+    expect(submit.disabled).toBe(false)
+    await user.click(submit)
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
+    expect(answer.mock.calls[0][1]).toMatchObject({
+      expected_revision: 3, decision_id: 'fixture-run:initial', decision_revision: 1,
+      candidate_revision: 1, answer: 'proceed',
+    })
+    expect(screen.getByText('Run queued').closest('div')?.querySelector('dd')?.textContent).toBe('No')
+    expect(screen.getByText('Cleanup').closest('div')?.querySelector('dd')?.textContent).toBe('None')
+    expect(screen.getByText('Tracker observed').closest('div')?.querySelector('dd')?.textContent).toBe('{"state":"consistent","claim":true}')
+    expect(screen.queryByText('[object Object]')).toBeNull()
+    expect(screen.getByText('Total').closest('div')?.querySelector('dd')?.textContent).toBe('Unknown')
+  })
+
   it('renders the observed backend gate order and hides cancellation for a blocked outcome', () => {
     // Sanitized projection captured from the real service/Temporal verifier run at PR #44 head 7eb6fb7.
     render(<RunDetails run={realBackendProjection as RunDetail} onRefresh={vi.fn()} />)
@@ -56,7 +86,24 @@ describe('dashboard commands', () => {
     expect(screen.getByRole('alert').textContent).toMatch(/decision changed/i)
     expect((screen.getByRole('button', { name: 'Submit decision' }) as HTMLButtonElement).disabled).toBe(true)
     expect(answer).toHaveBeenCalledTimes(1)
-    expect(answer.mock.calls[0][1]).toMatchObject({ expected_revision: 7, decision_id: 'fixture-decision', decision_revision: 3, candidate_revision: 2, answer: 'yes' })
+    expect(answer.mock.calls[0][1]).toMatchObject({ expected_revision: 5, decision_id: 'fixture-decision', decision_revision: 3, candidate_revision: 2, answer: 'yes' })
+  })
+
+  it('uses the workflow revision for cancellation and disables commands until it is observed', async () => {
+    const user = userEvent.setup()
+    const cancel = vi.spyOn(api, 'cancel').mockResolvedValue(undefined)
+    render(<RunDetails run={{ ...mockRun, decisions: [] }} onRefresh={vi.fn().mockResolvedValue(undefined)} />)
+    await user.click(screen.getByRole('button', { name: 'Cancel run' }))
+    await user.type(screen.getByLabelText('Reason for cancellation'), 'Stop this run')
+    await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(1))
+    expect(cancel.mock.calls[0][1]).toMatchObject({ expected_revision: 5, reason: 'Stop this run' })
+  })
+
+  it('does not enable decisions or cancellation without a workflow revision', () => {
+    render(<RunDetails run={{ ...mockRun, protocol_revision: null }} onRefresh={vi.fn()} />)
+    expect((screen.getByRole('button', { name: 'Submit decision' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Cancel run' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it('submits only allowlisted repository, endpoint and accepted plan fields', async () => {

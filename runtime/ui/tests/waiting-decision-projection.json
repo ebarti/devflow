@@ -1,0 +1,53 @@
+{
+  "run": {
+    "id": "fixture-run",
+    "run_id": "fixture-run",
+    "work_id": "fixture-work",
+    "title": "Fixture workflow",
+    "issue": "https://github.com/example/fixture/issues/1",
+    "issue_url": "https://github.com/example/fixture/issues/1",
+    "repository": "fixture",
+    "phase": "waiting_decision",
+    "execution_state": "waiting",
+    "updated_at": "2026-01-01T12:04:00Z",
+    "revision": 3,
+    "protocol_revision": 3,
+    "projection_revision": 6,
+    "iteration": 0,
+    "sequence": 4,
+    "authorized_endpoint": "published_unmerged",
+    "outcome": null,
+    "phase_gates": [
+      { "id": "prepare", "label": "Prepare", "state": "completed" },
+      { "id": "prepublish", "label": "Before PR checks", "state": "pending" },
+      { "id": "publish", "label": "Publish", "state": "pending" },
+      { "id": "local_checks", "label": "Local checks", "state": "pending" },
+      { "id": "required_ci", "label": "Required CI", "state": "pending" },
+      { "id": "tracker", "label": "Tracker", "state": "pending" }
+    ],
+    "roles": [],
+    "capacity": { "limit": 2, "active": 0 },
+    "queued": false,
+    "cleanup": "none",
+    "candidate": { "head": "fixture-head", "base_sha": "fixture-base", "content_sha256": "fixture-content", "revision": 1 },
+    "pull_request": null,
+    "checks": {},
+    "tracker": { "state": "consistent", "observed": { "state": "consistent", "claim": true } },
+    "usage": {},
+    "decisions": [
+      {
+        "id": "fixture-run:initial",
+        "revision": 1,
+        "candidate_revision": 1,
+        "prompt": "Proceed with this run?",
+        "options": ["proceed", "cancel"],
+        "state": "pending"
+      }
+    ],
+    "error": null
+  },
+  "events": [
+    { "sequence": 4, "timestamp": "2026-01-01T12:04:00Z", "type": "decision_pending", "message": "Waiting for an explicit run decision", "run_revision": 6, "payload": { "iteration": 0 } }
+  ],
+  "evidence": []
+}

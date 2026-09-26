@@ -47,7 +47,7 @@ function RoleTable({ roles }: { roles: RoleState[] | null | undefined }) {
     <h2 id="roles-heading">Roles</h2>
     <div className="table-scroll"><table>
       <thead><tr><th>Role</th><th>State</th><th>Session</th><th>Tokens</th></tr></thead>
-      <tbody>{roles?.length ? roles.map((role, index) => <tr key={`${role.role}-${role.attempt_id ?? index}`}>
+      <tbody>{roles?.length ? roles.map((role, index) => <tr key={`${role.role}-${role.iteration ?? role.attempt_id ?? index}`}>
         <td>{titleCase(role.role)}</td>
         <td><State value={role.state} /></td>
         <td className="mono">{display(role.session_id, 'Unknown')}</td>
@@ -103,10 +103,10 @@ function Operations({ run }: { run: RunDetail }) {
   return <section className="section lower-section" aria-labelledby="operations-heading">
     <h2 id="operations-heading">Operations</h2>
     <dl className="operations-grid">
-      <div><dt>Active roles</dt><dd>{display(run.capacity?.active)}</dd></div>
-      <div><dt>Queued roles</dt><dd>{display(run.capacity?.queued)}</dd></div>
-      <div><dt>Capacity</dt><dd>{display(run.capacity?.limit)}</dd></div>
-      <div><dt>Cleanup</dt><dd><State value={run.capacity?.cleanup} /></dd></div>
+      <div><dt>Service active roles</dt><dd>{display(run.capacity?.active)}</dd></div>
+      <div><dt>Run queued</dt><dd>{run.queued == null ? 'Unknown' : run.queued ? 'Yes' : 'No'}</dd></div>
+      <div><dt>Service capacity</dt><dd>{display(run.capacity?.limit)}</dd></div>
+      <div><dt>Cleanup</dt><dd>{titleCase(run.cleanup)}</dd></div>
       <div><dt>Tracker desired</dt><dd>{display(run.tracker?.desired)}</dd></div>
       <div><dt>Tracker observed</dt><dd>{display(run.tracker?.observed)}</dd></div>
       <div><dt>Tracker sync</dt><dd>{titleCase(run.tracker?.state)}</dd></div>
@@ -118,7 +118,7 @@ function Operations({ run }: { run: RunDetail }) {
       <div><dt>Environment digest</dt><dd className="mono">{display(run.candidate?.environment_digest)}</dd></div>
       <div><dt>Protocol revision</dt><dd>{display(run.protocol_revision)}</dd></div>
     </dl>
-    {run.roles?.length ? <div className="role-provenance"><h3>Role provenance</h3><ul>{run.roles.map((role, index) => <li key={`${role.role}-${role.attempt_id ?? index}`}><strong>{titleCase(role.role)}</strong><span>Model {display(role.model, 'unobserved')} · Effort {display(role.effort, 'unobserved')} · Attempt {display(role.attempt_id, 'unknown')} · Last activity {time(role.last_activity_at)}{role.summary ? ` · ${role.summary}` : ''}{role.findings?.length ? ` · Findings: ${role.findings.join('; ')}` : ''}</span></li>)}</ul></div> : null}
+    {run.roles?.length ? <div className="role-provenance"><h3>Role provenance</h3><ul>{run.roles.map((role, index) => <li key={`${role.role}-${role.iteration ?? role.attempt_id ?? index}`}><strong>{titleCase(role.role)}</strong><span>Model {display(role.model, 'unobserved')} · Effort {display(role.effort, 'unobserved')} · Iteration {display(role.iteration, 'unknown')} · Cleanup {display(role.cleanup)} · Last activity {time(role.last_activity_at)}{role.summary ? ` · ${role.summary}` : ''}{role.findings?.length ? ` · Findings: ${role.findings.join('; ')}` : ''}</span></li>)}</ul></div> : null}
     {run.tracker?.conflict ? <p className="inline-alert">Tracker conflict: {run.tracker.conflict}</p> : null}
   </section>
 }
@@ -129,12 +129,13 @@ function UsageSection({ run }: { run: RunDetail }) {
     <h2 id="usage-heading">Usage</h2>
     <dl className="usage-grid">
       <div><dt>Input</dt><dd>{tokens(usage?.input_tokens)}</dd></div>
-      <div><dt>Cached input</dt><dd>{tokens(usage?.cached_input_tokens)}</dd></div>
+      <div><dt>Cache read</dt><dd>{tokens(usage?.cache_read_tokens ?? usage?.cached_input_tokens)}</dd></div>
+      <div><dt>Cache creation</dt><dd>{tokens(usage?.cache_creation_tokens)}</dd></div>
       <div><dt>Output</dt><dd>{tokens(usage?.output_tokens)}</dd></div>
       <div><dt>Reasoning</dt><dd>{tokens(usage?.reasoning_tokens)}</dd></div>
       <div><dt>Total</dt><dd>{tokens(usage?.total_tokens)}</dd></div>
     </dl>
-    <p className="subtle">Telemetry: {display(usage?.status)} · Observed {time(usage?.observed_at)}</p>
+    <p className="subtle">{usage?.source === 'role_attempts' ? 'Totals sum available role-attempt readings; missing values remain unknown.' : `Telemetry: ${display(usage?.status)} · Observed ${time(usage?.observed_at)}`}</p>
     {usage?.gaps?.length ? <p className="inline-alert">Unknown: {usage.gaps.join(', ')}</p> : null}
   </section>
 }
@@ -147,11 +148,11 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
   const [stale, setStale] = useState(false)
 
   async function answer() {
-    if (!choice || run.revision == null || busy || stale) return
+    if (!choice || run.protocol_revision == null || decision.candidate_revision == null || busy || stale) return
     setBusy(true); setError('')
     try {
       await api.answer(run.id, {
-        command_id: commandId, expected_revision: run.revision,
+        command_id: commandId, expected_revision: run.protocol_revision,
         decision_id: decision.id, decision_revision: decision.revision,
         candidate_revision: decision.candidate_revision, answer: choice,
       })
@@ -171,13 +172,18 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
     {decision.candidate_revision != null ? <p className="subtle">Candidate revision {decision.candidate_revision}</p> : null}
     <fieldset disabled={busy || stale}>
       <legend className="sr-only">Choose a response</legend>
-      {decision.options.map(option => <label className="choice" key={option.value}>
-        <input type="radio" name={`decision-${decision.id}`} value={option.value} checked={choice === option.value} onChange={() => { setChoice(option.value); setCommandId(crypto.randomUUID()) }} />
-        <span>{option.label}{option.consequence ? <small>{option.consequence}</small> : null}</span>
-      </label>)}
+      {decision.options.map(option => {
+        const value = typeof option === 'string' ? option : option.value
+        const label = typeof option === 'string' ? titleCase(option) : option.label
+        const consequence = typeof option === 'string' ? null : option.consequence
+        return <label className="choice" key={value}>
+          <input type="radio" name={`decision-${decision.id}`} value={value} checked={choice === value} onChange={() => { setChoice(value); setCommandId(crypto.randomUUID()) }} />
+          <span>{label}{consequence ? <small>{consequence}</small> : null}</span>
+        </label>
+      })}
     </fieldset>
     {error ? <p className="form-error" role="alert">{error}</p> : null}
-    <button className="primary-button" type="button" disabled={!choice || busy || stale || run.revision == null} onClick={() => void answer()}>{busy ? 'Submitting…' : 'Submit decision'}</button>
+    <button className="primary-button" type="button" disabled={!choice || busy || stale || run.protocol_revision == null || decision.candidate_revision == null} onClick={() => void answer()}>{busy ? 'Submitting…' : 'Submit decision'}</button>
   </section>
 }
 
@@ -189,10 +195,10 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
   const [error, setError] = useState('')
   if (run.outcome != null || ['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')) return null
   async function cancel() {
-    if (!reason.trim() || run.revision == null) return
+    if (!reason.trim() || run.protocol_revision == null) return
     setBusy(true); setError('')
     try {
-      await api.cancel(run.id, { command_id: commandId, expected_revision: run.revision, reason: reason.trim() })
+      await api.cancel(run.id, { command_id: commandId, expected_revision: run.protocol_revision, reason: reason.trim() })
       setOpen(false)
       await onRefresh()
     } catch (cause) {
@@ -202,8 +208,8 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
   }
   return <div className="cancel-control">
     {open ? <div className="cancel-form"><label htmlFor="cancel-reason">Reason for cancellation</label><input id="cancel-reason" value={reason} onChange={event => { setReason(event.target.value); setCommandId(crypto.randomUUID()) }} required />
-      <div className="button-row"><button type="button" className="danger-button" onClick={() => void cancel()} disabled={!reason.trim() || busy || run.revision == null}>{busy ? 'Requesting…' : 'Request cancellation'}</button><button type="button" className="text-button" onClick={() => setOpen(false)}>Keep run</button></div>
-    </div> : <button type="button" className="text-button" onClick={() => setOpen(true)}>Cancel run</button>}
+      <div className="button-row"><button type="button" className="danger-button" onClick={() => void cancel()} disabled={!reason.trim() || busy || run.protocol_revision == null}>{busy ? 'Requesting…' : 'Request cancellation'}</button><button type="button" className="text-button" onClick={() => setOpen(false)}>Keep run</button></div>
+    </div> : <button type="button" className="text-button" onClick={() => setOpen(true)} disabled={run.protocol_revision == null}>Cancel run</button>}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
   </div>
 }

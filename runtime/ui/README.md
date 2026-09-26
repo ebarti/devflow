@@ -22,14 +22,14 @@ The browser starts with `GET /api/session`. If it returns `{authenticated:false}
 | Request | Response used by UI |
 | --- | --- |
 | `GET /api/runs` | `{runs:[{id, title?, goal?, repository?, issue?, phase?, execution_state?, updated_at?, revision?}]}` |
-| `GET /api/runs/{id}` | `{run, events, evidence}`; `run` has `id`, `revision`, `sequence`, `phase_gates`, `roles`, `capacity`, `queued`, `cleanup`, `candidate`, `pull_request`, `checks`, `tracker`, `usage`, `decisions` |
+| `GET /api/runs/{id}` | `{run, events, evidence}`; `run` has `id`, nullable Temporal `revision`/`protocol_revision`, `projection_revision`, `iteration`, `sequence`, ordered `phase_gates`, `roles`, `capacity:{limit,active}`, boolean `queued`, top-level `cleanup`, `candidate`, `pull_request`, `checks`, `tracker`, role-keyed `usage`, and `decisions` with string `options` |
 | `GET /api/runs/{id}/events?after=N` | SSE `event: update`, numeric `id`, optional JSON `sequence`; snapshot refetched on new event and reconnect |
 | `GET /api/service` | Service health, version, Temporal, capacity, and `policy` containing allowlisted `repositories` and role settings |
 | `POST /api/runs` | Revisioned command with `command_id`, `run_id`, `work_id`, `issue_url`, `repository_key`, `goal`, `accepted_plan`, `base_ref`, `branch`, `authorized_endpoint: published_unmerged`, optional `recovery_key`; returns `{run_id,dashboard_url,existing,phase}` |
-| `POST /api/runs/{id}/decision` | `{command_id,expected_revision,decision_id,decision_revision,candidate_revision?,answer}` |
+| `POST /api/runs/{id}/decision` | `{command_id,expected_revision,decision_id,decision_revision,candidate_revision,answer}` |
 | `POST /api/runs/{id}/cancel` | `{command_id,expected_revision,reason}` |
 
-The service owns repository paths, role models, checks, authorization scope, and state transitions. The New run form only selects an allowlisted repository and recovery key from `/api/service`. The UI adapts `base_sha` and `content_sha256` for candidate display and separates local checks from independent review and QA. It displays missing telemetry as unknown, pending tracker readback as pending, and a lost SSE or fetch connection as disconnected with the last observation retained.
+The service owns repository paths, role models, checks, authorization scope, and state transitions. The New run form only selects an allowlisted repository and recovery key from `/api/service`. Decision and cancellation commands use the observed `protocol_revision` and remain disabled before it exists. The UI adapts `base_sha` and `content_sha256` for candidate display, sums only numeric role usage readings, and separates local checks from independent review and QA. It displays missing telemetry as unknown, pending tracker readback as pending, and a lost SSE or fetch connection as disconnected with the last observation retained.
 
 ## Visual and browser QA
 
