@@ -253,7 +253,7 @@ def create_app(config_path: Path) -> FastAPI:
     async def submit(request: Request) -> dict[str, Any]:
         _mutation(request)
         try:
-            return service.store.submit(await request.json())
+            return await asyncio.to_thread(service.store.submit, await request.json())
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 

@@ -8,12 +8,12 @@ import os
 import shutil
 import socket
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from temporalio import activity
-from temporalio.client import Client, WorkflowUpdateFailedError
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -333,7 +333,8 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     store.mark_start("run-1", accepted=True)
     store.project(
         "run-1", phase="blocked", execution_state="blocked", event_type="blocked",
-        message="role could not run broker checks", outcome="blocked", checks={},
+        message="implementer did not establish a pass", outcome="blocked", checks={},
+        error="implementer did not establish a pass",
     )
     assert store.detail("run-1")["candidate"]["id"] == initial["id"]
     configuration = json.loads(store.config.path.read_text())
@@ -356,6 +357,18 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     store.config.path.write_text(json.dumps(configuration))
     successor = DeliveryStore(DeliveryConfig.load(store.config.path))
     monkeypatch.setattr(successor, "_ensure_no_remote_pr", lambda *_args: None)
+    live = {
+        "workflow_id": "delivery-run-1",
+        "execution_run_id": "closed-temporal-execution",
+        "closed_at": (datetime.now(UTC) + timedelta(seconds=1)).isoformat(),
+        "request_digest": old_spec["request_digest"],
+        "result": {
+            "run_id": "run-1", "phase": "blocked", "outcome": "blocked",
+            "cleanup": "none", "error": "implementer did not establish a pass",
+            "roles": [role],
+        },
+    }
+    monkeypatch.setattr(successor, "_completed_temporal_result", lambda _id: live)
     request2 = {
         **request, "command_id": "command-2", "run_id": "run-2",
         "branch": "feat/fixture-2", "supersedes_run_id": "run-1",
@@ -380,9 +393,37 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     store.config.path.write_text(json.dumps(changed_configuration))
     changed_store = DeliveryStore(DeliveryConfig.load(store.config.path))
     monkeypatch.setattr(changed_store, "_ensure_no_remote_pr", lambda *_args: None)
+    monkeypatch.setattr(changed_store, "_completed_temporal_result", lambda _id: live)
     with pytest.raises(ValueError, match="changed authority"):
         changed_store.submit(request2)
     store.config.path.write_text(json.dumps(configuration))
+    with pytest.raises(ValueError, match="changed authority"):
+        successor.submit({**request2, "accepted_plan": "A different feature"})
+    with successor._connect() as db:
+        db.execute(
+            "UPDATE delivery_runs SET cleanup='unknown' WHERE run_id='run-1'"
+        )
+    with pytest.raises(ValueError, match="changed authority"):
+        successor.submit(request2)
+    with successor._connect() as db:
+        db.execute("UPDATE delivery_runs SET cleanup='none' WHERE run_id='run-1'")
+    prechecks = Path(old_spec["state_dir"]) / "prechecks"
+    prechecks.mkdir()
+    with pytest.raises(ValueError, match="crossed a broker check gate"):
+        successor.submit(request2)
+    prechecks.rmdir()
+    stale_live = copy.deepcopy(live)
+    stale_live["result"]["roles"][0]["candidate"]["id"] = "wrong-history"
+    monkeypatch.setattr(successor, "_completed_temporal_result", lambda _id: stale_live)
+    with pytest.raises(ValueError, match="closed Temporal result"):
+        successor.submit(request2)
+    monkeypatch.setattr(
+        successor, "_completed_temporal_result",
+        lambda _id: (_ for _ in ()).throw(ValueError("workflow is still running")),
+    )
+    with pytest.raises(ValueError, match="still running"):
+        successor.submit(request2)
+    monkeypatch.setattr(successor, "_completed_temporal_result", lambda _id: live)
     monkeypatch.setattr(
         successor, "_ensure_no_remote_pr",
         lambda *_args: (_ for _ in ()).throw(ValueError("remote PR exists")),
@@ -457,6 +498,29 @@ def test_failed_broker_gate_returns_bounded_candidate_diagnostics_for_repair():
         "test_count": 1, "diagnostic": "1 passed; minimum 2", "log_sha256": "b" * 64,
     }, iteration=2)[0]
     assert json.loads(browser.split(": ", 1)[1])["test_count"] == 1
+
+
+def test_continuation_rejects_temporal_projection_before_workflow_close(service, monkeypatch):
+    store, _request = service
+
+    class RunningDescription:
+        status = WorkflowExecutionStatus.RUNNING
+        close_time = None
+
+    class RunningHandle:
+        async def describe(self):
+            return RunningDescription()
+
+    class RunningClient:
+        def get_workflow_handle(self, _workflow_id):
+            return RunningHandle()
+
+    async def connect(*_args, **_kwargs):
+        return RunningClient()
+
+    monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", connect)
+    with pytest.raises(ValueError, match="Temporal closure is unproven"):
+        store._completed_temporal_result("run-1")
 
 
 def test_check_network_domains_reject_local_destinations():
@@ -582,6 +646,28 @@ def test_verify_task_requires_hash_of_broker_executed_qa_receipt():
     assert "broker, not you, executed" in task.goal
     assert task.output_schema["properties"]["qa_receipt_sha256"]["type"] == "string"
     assert "qa_receipt_sha256" in task.output_schema["required"]
+
+
+def test_implement_continuation_prompt_keeps_broker_checks_mandatory():
+    spec = {
+        "run_id": "continuation", "provider": "codex", "goal": "Finish the feature",
+        "accepted_plan": "Publish after independent gates",
+        "policy": {
+            "roles": {"implement": {"model": "gpt-6-sol", "effort": "max"}},
+            "allowed_paths": ["README.md"], "host_sandbox": "native-profile",
+        },
+    }
+    task = _task({
+        "spec": spec, "role": "implement", "iteration": 0,
+        "candidate": {"id": "bound-candidate", "head": "base"},
+        "workspace": "/owned/checkout", "findings": ["Old check was unavailable"],
+        "resume_session": "original-session", "continuation": True,
+    })
+    assert task.resume_from.session_id == "original-session"
+    assert "Status pass means substantive code is ready" in task.goal
+    assert "mandatory broker" in task.goal
+    assert "cosmetic new edit is not" in task.goal
+    assert "historical, not evidence" in task.goal
 
 
 def test_boundary_attestation_requires_both_tmp_aliases_in_parent_and_child():

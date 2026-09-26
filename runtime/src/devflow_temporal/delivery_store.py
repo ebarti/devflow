@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import json
@@ -11,10 +12,13 @@ import sqlite3
 import stat
 import subprocess
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from temporalio.client import Client, WorkflowExecutionStatus
 
 from .candidate import candidate_for
 from .contracts import canonical_json, digest
@@ -231,6 +235,18 @@ class DeliveryStore:
                 }
         spec = self.config.admit(supplied)
         spec["request_digest"] = request_digest
+        temporal_result = None
+        superseded = spec.get("supersedes_run_id")
+        if superseded:
+            # A blocked projection can precede Temporal's terminal close. Read
+            # the completed execution before BEGIN IMMEDIATE; recheck DB state,
+            # frozen bytes and claim under that transaction below.
+            with self._connect() as db:
+                has_attempt = db.execute(
+                    "SELECT 1 FROM delivery_attempts WHERE run_id=? LIMIT 1", (superseded,)
+                ).fetchone()
+            if has_attempt:
+                temporal_result = self._completed_temporal_result(superseded)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             command = db.execute(
@@ -276,11 +292,10 @@ class DeliveryStore:
                 != self.state.issue_resource(spec["issue_url"])
             ):
                 raise ValueError("work ID is bound to another issue")
-            superseded = spec.get("supersedes_run_id")
             if superseded:
                 previous = db.execute(
-                    """SELECT work_id,issue_url,repository_key,outcome,execution_state,
-                              pr_json,checks_json,request_json
+                    """SELECT work_id,issue_url,repository_key,phase,outcome,execution_state,
+                              cleanup,error,pr_json,checks_json,request_digest,request_json
                        FROM delivery_runs WHERE run_id=?""",
                     (superseded,),
                 ).fetchone()
@@ -301,7 +316,7 @@ class DeliveryStore:
                     raise ValueError("superseded run retains the owned branch; choose a new branch")
                 if attempts:
                     spec["continuation"] = self._post_role_continuation(
-                        db, spec, prior_spec, previous, attempts
+                        db, spec, prior_spec, previous, attempts, temporal_result
                     )
                 elif (spec["policy"].get("recovery") or {}).get("continuation"):
                     raise ValueError("pre-role supersede cannot import a role session")
@@ -349,6 +364,40 @@ class DeliveryStore:
             )
             return response
 
+    def _completed_temporal_result(self, run_id: str) -> dict[str, Any]:
+        """Read a closed workflow from Temporal, never from caller-authored JSON."""
+
+        async def read() -> dict[str, Any]:
+            client = await Client.connect(
+                self.config.temporal_address,
+                namespace=self.config.raw.get("temporal_namespace", "default"),
+            )
+            handle = client.get_workflow_handle("delivery-" + run_id)
+            description = await handle.describe()
+            if (
+                description.status != WorkflowExecutionStatus.COMPLETED
+                or not description.close_time
+            ):
+                raise ValueError("continuation predecessor Temporal workflow is not closed")
+            return {
+                "workflow_id": description.id,
+                "execution_run_id": description.run_id,
+                "closed_at": description.close_time.isoformat(),
+                "request_digest": await description.memo_value("request_digest", "unknown"),
+                "result": await client.get_workflow_handle(
+                    description.id, run_id=description.run_id
+                ).result(),
+            }
+
+        try:
+            # submit() is shared by synchronous CLI and the async API route.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(
+                    lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))
+                ).result(timeout=35)
+        except Exception as exc:
+            raise ValueError("continuation predecessor Temporal closure is unproven") from exc
+
     def _post_role_continuation(
         self,
         db: sqlite3.Connection,
@@ -356,6 +405,7 @@ class DeliveryStore:
         prior_spec: dict[str, Any],
         previous: sqlite3.Row,
         attempts: list[sqlite3.Row],
+        temporal_result: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Freeze one finished post-role result before transferring its claim."""
 
@@ -372,16 +422,27 @@ class DeliveryStore:
         if (
             control["from_run_id"] != old_id
             or spec.get("supersedes_run_id") != old_id
+            or spec["goal"] != prior_spec["goal"]
+            or spec["accepted_plan"] != prior_spec["accepted_plan"]
+            or spec["authorized_endpoint"] != prior_spec["authorized_endpoint"]
             or spec["base_sha"] != prior_spec["base_sha"]
             or spec["source_path"] != prior_spec["source_path"]
             or Path(recovery["source_path"]).resolve(strict=True)
             != Path(prior_spec["checkout"]).resolve(strict=True)
             or continuation_authority(spec["policy"])
             != continuation_authority(prior_spec["policy"])
+            or previous["phase"] != "blocked"
+            or previous["cleanup"] != "none"
+            or previous["error"] != "implementer did not establish a pass"
             or previous["checks_json"] not in (None, "{}")
             or len(attempts) != 1
         ):
             raise ValueError("continuation changed authority or predecessor identity")
+        old_state = Path(prior_spec["state_dir"])
+        if any((old_state / name).exists() or (old_state / name).is_symlink() for name in (
+            "prechecks", "checks", "browser-qa", "gate-evidence",
+        )):
+            raise ValueError("continuation predecessor crossed a broker check gate")
         attempt = attempts[0]
         if (
             attempt["role"] != "implement"
@@ -404,18 +465,21 @@ class DeliveryStore:
             raise ValueError("continuation predecessor has an unresolved external effect")
         history_path = Path(control["history_result_path"])
         info = history_path.lstat()
+        history_bytes = history_path.read_bytes()
         if (
             not history_path.is_absolute()
             or not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o600
-            or hashlib.sha256(history_path.read_bytes()).hexdigest()
+            or hashlib.sha256(history_bytes).hexdigest()
             != control["history_result_sha256"]
         ):
             raise ValueError("continuation Temporal result evidence changed")
-        history = json.loads(history_path.read_text(encoding="utf-8"))
+        history = json.loads(history_bytes)
         role = history.get("role_result")
         raw = json.loads(attempt["result_json"])
+        live = temporal_result or {}
+        live_result = live.get("result")
         if (
             history.get("workflow_id") != f"delivery-{old_id}"
             or history.get("run_id") != old_id
@@ -427,8 +491,22 @@ class DeliveryStore:
             or role.get("cleanup") != "confirmed"
             or role.get("session_id") != control["session_id"]
             or any(role.get(key) != value for key, value in raw.items())
+            or live.get("workflow_id") != f"delivery-{old_id}"
+            or not isinstance(live.get("execution_run_id"), str)
+            or not live["execution_run_id"]
+            or live.get("request_digest") != previous["request_digest"]
+            or not isinstance(live_result, dict)
+            or live_result.get("run_id") != old_id
+            or live_result.get("phase") != "blocked"
+            or live_result.get("outcome") != "blocked"
+            or live_result.get("cleanup") != previous["cleanup"]
+            or live_result.get("error") != previous["error"]
+            or live_result.get("roles") != [role]
+            or not isinstance(live.get("closed_at"), str)
+            or datetime.fromisoformat(live["closed_at"])
+            <= datetime.fromisoformat(attempt["finished_at"])
         ):
-            raise ValueError("continuation history differs from the finished role receipt")
+            raise ValueError("continuation history differs from closed Temporal result")
         candidate = role.get("candidate")
         source = Path(prior_spec["checkout"])
         if (
@@ -459,6 +537,8 @@ class DeliveryStore:
             "source_manifest_sha256": control["source_manifest_sha256"],
             "session_state_sha256": control["session_state_sha256"],
             "history_result_sha256": control["history_result_sha256"],
+            "workflow_execution_run_id": live["execution_run_id"],
+            "workflow_closed_at": live["closed_at"],
             "findings": role.get("findings", []),
         }
 
