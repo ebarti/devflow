@@ -286,6 +286,9 @@ async def test_public_evidence_reads_contained_role_and_browser_logs(api_fixture
         browser_log.write_text("changed after receipt\n")
         assert (await browser.get("/api/runs/run-1/evidence/role-implement-0")).status_code == 404
         assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
+        role_log.unlink()
+        (role_log.parent.parent / "process.log").write_text("unbound native fallback\n")
+        assert (await browser.get("/api/runs/run-1/evidence/role-implement-0")).status_code == 404
         receipt.write_text(
             json.dumps(
                 {
@@ -295,6 +298,10 @@ async def test_public_evidence_reads_contained_role_and_browser_logs(api_fixture
             )
         )
         assert (await browser.get(qa_receipt_url)).status_code == 404
+        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
+        receipt.write_text(json.dumps(saved_receipt))
+        browser_log.unlink()
+        (browser_folder / "browser-qa.log").write_text("unbound browser fallback\n")
         assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
 
 

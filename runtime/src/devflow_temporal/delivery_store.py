@@ -727,10 +727,13 @@ class DeliveryStore:
             }
         for attempt in attempts:
             folder = root / "attempts" / attempt["job_key"]
+            result = json.loads(attempt["result_json"]) if attempt["result_json"] else {}
             contained_log = folder / "container" / "container.log"
-            path = contained_log if contained_log.is_file() else folder / "process.log"
+            contained = spec["provider"] == "codex" or bool(
+                result.get("container_id") or result.get("container_log_sha256")
+            )
+            path = contained_log if contained else folder / "process.log"
             if path.is_file():
-                result = json.loads(attempt["result_json"]) if attempt["result_json"] else {}
                 indexed.append(
                     {
                         "id": f"role-{attempt['role']}-{attempt['iteration']}",
@@ -758,8 +761,6 @@ class DeliveryStore:
             if not folder.name.isdecimal():
                 continue
             receipt = folder / "receipt.json"
-            contained_log = folder / "container" / "container.log"
-            path = contained_log if contained_log.is_file() else folder / "browser-qa.log"
             effect = browser_effects.get(f"browser_qa:{run_id}:{folder.name}")
             projected = (
                 details.get("checks", {}).get("browser_qa")
@@ -780,6 +781,13 @@ class DeliveryStore:
             ):
                 continue
             binding = effect if effect is not None else projected
+            contained_log = folder / "container" / "container.log"
+            contained = spec["provider"] == "codex" or (
+                binding is not None and binding.get("log") == str(contained_log)
+            )
+            if binding is None and contained_log.is_file():
+                contained = True
+            path = contained_log if contained else folder / "browser-qa.log"
             if binding is not None:
                 expected_receipt = binding.get("receipt_sha256")
                 if (
