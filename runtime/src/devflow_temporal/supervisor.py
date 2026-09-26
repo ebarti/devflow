@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json
-from .delivery_sandbox import prepare_native_role, prepare_sandbox
+from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
 
 
@@ -151,7 +151,7 @@ class DeliverySupervisor:
                         "devflow_temporal.role_runner",
                         str(request_path),
                     ]
-                else:
+                elif Path("/usr/bin/sandbox-exec").is_file():
                     profile, role_env = prepare_sandbox(request, folder)
                     child_argv = [
                         "/usr/bin/sandbox-exec",
@@ -163,6 +163,20 @@ class DeliverySupervisor:
                         "devflow_temporal.role_runner",
                         str(request_path),
                     ]
+                elif spec.get("provider") == "fake":
+                    # The fake role runs only fixed fixture code and never a
+                    # candidate-controlled command. Keep its protocol tests
+                    # executable on Linux CI, where Seatbelt is unavailable.
+                    role_env = _native_env(folder, folder / "unused-codex", folder)
+                    child_argv = [
+                        sys.executable,
+                        "-I",
+                        "-m",
+                        "devflow_temporal.role_runner",
+                        str(request_path),
+                    ]
+                else:
+                    raise ValueError("real role has no supported OS sandbox")
                 log_descriptor = os.open(
                     folder / "process.log", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
                 )

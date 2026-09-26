@@ -122,6 +122,12 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
     return broker.run_checks(request["iteration"], request["candidate"])
 
 
+@activity.defn(name="delivery_browser_qa")
+async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
+    _, broker = _context(request["spec"])
+    return broker.run_browser_qa(request["iteration"], request["candidate"])
+
+
 @activity.defn(name="delivery_precheck")
 async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
     _, broker = _context(request["spec"])
@@ -207,6 +213,7 @@ DELIVERY_ACTIVITIES = [
     delivery_role,
     delivery_publish,
     delivery_checks,
+    delivery_browser_qa,
     delivery_precheck,
     delivery_ci,
     delivery_tracker_start,

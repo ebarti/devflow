@@ -8,6 +8,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -282,11 +283,43 @@ def prepare_native_role(request: dict[str, Any], attempt_dir: Path) -> tuple[str
             raise ValueError("controller-bound diff is unavailable or changed")
     elif review_diff is not None:
         raise ValueError("implementer may not receive an independent gate diff")
+    qa_evidence = request.get("qa_evidence")
+    if qa_evidence is not None:
+        if request["role"] != "verify" or not isinstance(qa_evidence, dict):
+            raise ValueError("browser QA evidence belongs only to independent verification")
+        qa_parent = (Path(spec["state_dir"]) / "browser-qa" / str(request["iteration"])).resolve(
+            strict=True
+        )
+        for field, hash_field in (("path", "sha256"), ("log", "log_sha256")):
+            file = Path(qa_evidence[field])
+            info = file.lstat()
+            if (
+                file.parent.resolve(strict=True) != qa_parent
+                or file.is_symlink()
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or hashlib.sha256(file.read_bytes()).hexdigest() != qa_evidence[hash_field]
+            ):
+                raise ValueError("browser QA evidence is unavailable or changed")
+        receipt = json.loads(Path(qa_evidence["path"]).read_text(encoding="utf-8"))
+        if (
+            qa_evidence.get("candidate_id") != request["candidate"]["id"]
+            or qa_evidence.get("iteration") != request["iteration"]
+            or receipt.get("candidate_id") != request["candidate"]["id"]
+            or receipt.get("iteration") != request["iteration"]
+            or receipt.get("state") != "passed"
+            or receipt.get("log_sha256") != qa_evidence["log_sha256"]
+        ):
+            raise ValueError("browser QA evidence assessed a different candidate")
+    elif request["role"] == "verify" and spec["policy"].get("browser_qa"):
+        raise ValueError("configured browser QA receipt is required for verification")
     extra_read = (
         toolchain_roots
         + ((Path(cache),) if cache else ())
         + ((recovery,) if request["role"] == "implement" and recovery.is_dir() else ())
         + ((diff_path,) if review_diff else ())
+        + ((Path(qa_evidence["path"]), Path(qa_evidence["log"])) if qa_evidence else ())
     )
     profile_name = "devflow-role"
     lines = _profile_lines(
@@ -349,3 +382,107 @@ def prepare_native_check(
     if cache:
         env["COREPACK_HOME"] = cache
     return profile_name, env
+
+
+def prepare_browser_qa(
+    spec: dict[str, Any],
+    checkout: Path,
+    evidence_dir: Path,
+    scratch: Path,
+    qa: dict[str, Any],
+) -> tuple[Path, dict[str, str]]:
+    """An OS boundary for fixture, API and browser children on exact owned ports.
+
+    The Codex command sandbox cannot be nested inside this Seatbelt profile.
+    This separate, credential-free profile is applied before launching the
+    deterministic QA command and is inherited by its services and browser.
+    """
+
+    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
+        raise ValueError("real browser QA requires the admitted macOS boundary")
+    if not Path("/usr/bin/sandbox-exec").is_file():
+        raise ValueError("required macOS sandbox-exec is unavailable")
+    checkout = checkout.resolve(strict=True)
+    state_root = Path(spec["state_dir"]).parent.parent.resolve(strict=True)
+    scratch = scratch.resolve(strict=True)
+    if scratch.parent != Path("/private/tmp") or not scratch.name.startswith("dfqa-"):
+        raise ValueError("browser QA scratch is outside the owned short temp root")
+    home = evidence_dir / "home"
+    _private(home)
+    _private(scratch)
+    ports = tuple(qa["ports"].values())
+    if len(ports) != 2 or len(set(ports)) != 2:
+        raise ValueError("browser QA requires two distinct owned ports")
+    tcp_local = " ".join(f'(local tcp "localhost:{port}")' for port in ports)
+    tcp_remote = " ".join(f'(remote tcp "localhost:{port}")' for port in ports)
+    protected_home = Path.home().resolve(strict=True)
+    readable_roots = (
+        *(Path(root) for root in spec["policy"].get("toolchain_roots", [])),
+        *(Path(root) for root in qa.get("read_roots", [])),
+        *(
+            (Path(spec["policy"]["package_manager_cache"]),)
+            if spec["policy"].get("package_manager_cache")
+            else ()
+        ),
+    )
+    if any(not root.is_dir() or root.resolve(strict=True) != root for root in readable_roots):
+        raise ValueError("browser QA read root changed after admission")
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        "(deny file-write*)",
+        f"(deny file-read* (subpath {_path(protected_home)}))",
+        f"(allow file-read-metadata (subpath {_path(protected_home)}))",
+        f"(deny file-read* (subpath {_path(state_root)}))",
+        f"(allow file-read-metadata (subpath {_path(state_root)}))",
+        f"(deny file-read* (subpath {_path(Path('/private/tmp'))}))",
+        f"(allow file-read-metadata (subpath {_path(Path('/private/tmp'))}))",
+    ]
+    host_tmp = Path(tempfile.gettempdir()).resolve(strict=True)
+    if host_tmp != Path("/private/tmp"):
+        lines.extend(
+            (
+                f"(deny file-read* (subpath {_path(host_tmp)}))",
+                f"(allow file-read-metadata (subpath {_path(host_tmp)}))",
+            )
+        )
+    for path in (
+        checkout,
+        home,
+        scratch,
+        *readable_roots,
+    ):
+        lines.append(f"(allow file-read* (subpath {_path(path)}))")
+    for path in (checkout, home, scratch):
+        lines.append(f"(allow file-write* (subpath {_path(path)}))")
+    for path in (checkout / ".git", checkout / ".codex"):
+        lines.append(f"(deny file-read* (subpath {_path(path)}))")
+        lines.append(f"(deny file-write* (subpath {_path(path)}))")
+    lines.extend(
+        (
+            '(allow file-write* (literal "/dev/null"))',
+            "(deny network-bind)",
+            "(deny network-inbound)",
+            "(deny network-outbound)",
+            f"(allow network-bind {tcp_local} (subpath {_path(scratch)}))",
+            f"(allow network-inbound {tcp_local} (subpath {_path(scratch)}))",
+            f"(allow network-outbound {tcp_remote} (subpath {_path(scratch)}))",
+        )
+    )
+    profile = evidence_dir / "browser-qa.sb"
+    _write_once(profile, ("\n".join(lines) + "\n").encode())
+    env = _native_env(
+        home,
+        home / "unused-codex-home",
+        scratch,
+        tuple(Path(root) for root in spec["policy"].get("toolchain_roots", [])),
+    )
+    env.pop("CODEX_HOME")
+    env.update(qa.get("env", {}))
+    env.update({name: str(port) for name, port in qa["ports"].items()})
+    env["CI"] = ""
+    env["NO_COLOR"] = "1"
+    env["npm_config_cache"] = str(home / ".npm")
+    if spec["policy"].get("package_manager_cache"):
+        env["COREPACK_HOME"] = spec["policy"]["package_manager_cache"]
+    return profile, env

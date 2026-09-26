@@ -34,6 +34,8 @@ BOUNDARY_DENIAL_FIELDS = (
     "private_tmp_write",
     "loopback",
 )
+QA_PORT_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*_PORT$")
+QA_ENV_KEYS = {"JOBCTRL_E2E_ISOLATED", "PLAYWRIGHT_BROWSERS_PATH"}
 
 
 def _boundary_probe_passed(observed: Any) -> bool:
@@ -48,6 +50,35 @@ def _boundary_probe_passed(observed: Any) -> bool:
             for result in (observed, observed["child"])
             for field in BOUNDARY_DENIAL_FIELDS
         )
+    )
+
+
+def _browser_qa_probe_passed(observed: Any) -> bool:
+    if not isinstance(observed, dict):
+        return False
+    denied = (
+        "host_credential_read",
+        "state_read",
+        "outside_write",
+        "slash_tmp_read",
+        "slash_tmp_write",
+        "private_tmp_read",
+        "private_tmp_write",
+        "unrelated_port_connect",
+        "unrelated_port_bind",
+        "unrelated_host_connect",
+    )
+    return (
+        observed.get("browser_api_sqlite") is True
+        and observed.get("owned_listeners") is True
+        and observed.get("cleanup") == "confirmed"
+        and observed.get("allowed_scratch_write") == "ALLOWED"
+        and type(observed.get("test_count")) is int
+        and observed["test_count"] >= 2
+        and all(observed.get(field) == "PermissionError:1" for field in denied)
+        and isinstance(observed.get("child"), dict)
+        and observed["child"].get("allowed_scratch_write") == "ALLOWED"
+        and all(observed["child"].get(field) == "PermissionError:1" for field in denied)
     )
 
 
@@ -240,6 +271,7 @@ class DeliveryConfig:
             "roles": self.raw["roles"],
             "checks": repository.get("checks", []),
             "prepublish_checks": repository.get("prepublish_checks", []),
+            "browser_qa": repository.get("browser_qa"),
             "required_ci": repository.get("required_ci", []),
             "allowed_paths": repository.get("allowed_paths", []),
             "pr_body": repository.get("pr_body"),
@@ -348,6 +380,88 @@ class DeliveryConfig:
                         not check.get("test_count_regex") or int(check.get("min_tests", 0)) < 1
                     ):
                         raise ValueError("test checks require an observed positive count")
+            qa = policy["browser_qa"]
+            if qa is not None:
+                if not isinstance(qa, dict) or not CHECK_ID_RE.fullmatch(qa.get("id", "")):
+                    raise ValueError("browser QA needs a stable check ID")
+                argv = qa.get("argv")
+                if (
+                    not isinstance(argv, list)
+                    or not argv
+                    or any(not isinstance(arg, str) or not arg for arg in argv)
+                ):
+                    raise ValueError("browser QA needs a fixed nonempty argv")
+                cwd = qa.get("cwd", ".")
+                if not isinstance(cwd, str) or Path(cwd).is_absolute() or ".." in Path(cwd).parts:
+                    raise ValueError("browser QA cwd must remain in the checkout")
+                ports = qa.get("ports")
+                if (
+                    not isinstance(ports, dict)
+                    or len(ports) != 2
+                    or any(not QA_PORT_ENV_RE.fullmatch(key) for key in ports)
+                    or any(
+                        type(port) is not int or not 1024 <= port <= 65535
+                        for port in ports.values()
+                    )
+                    or len(set(ports.values())) != 2
+                ):
+                    raise ValueError("browser QA requires two distinct exact TCP port leases")
+                env = qa.get("env", {})
+                if (
+                    not isinstance(env, dict)
+                    or set(env) - QA_ENV_KEYS
+                    or any(not isinstance(value, str) for value in env.values())
+                ):
+                    raise ValueError("browser QA environment exceeds the fixed fixture controls")
+                if env.get("JOBCTRL_E2E_ISOLATED") != "1":
+                    raise ValueError("browser QA fixture isolation must be enabled")
+                read_roots = qa.get("read_roots", [])
+                if not isinstance(read_roots, list) or len(read_roots) > 3:
+                    raise ValueError("browser QA read roots exceed the bounded policy")
+                for raw_root in read_roots:
+                    if not isinstance(raw_root, str) or not Path(raw_root).is_absolute():
+                        raise ValueError("browser QA read root must be absolute")
+                    root = Path(raw_root)
+                    if not root.is_dir() or root.resolve(strict=True) != root:
+                        raise ValueError("browser QA read root must be a canonical directory")
+                    protected_roots = (
+                        self.state_root,
+                        Path.home() / ".codex",
+                        Path.home() / ".ssh",
+                        Path.home() / ".aws",
+                        Path.home() / ".config" / "gh",
+                    )
+                    if any(
+                        root == protected
+                        or root in protected.parents
+                        or protected in root.parents
+                        for protected in protected_roots
+                    ):
+                        raise ValueError("browser QA read root is too broad")
+                browser_path = env.get("PLAYWRIGHT_BROWSERS_PATH")
+                if browser_path and browser_path not in read_roots:
+                    raise ValueError("browser executable path must be an admitted read root")
+                artifact_paths = qa.get("artifact_paths", [])
+                if (
+                    not isinstance(artifact_paths, list)
+                    or len(artifact_paths) > 3
+                    or any(
+                        not isinstance(path, str)
+                        or Path(path).is_absolute()
+                        or ".." in Path(path).parts
+                        for path in artifact_paths
+                    )
+                ):
+                    raise ValueError("browser artifacts must be bounded checkout-relative paths")
+                if (
+                    not isinstance(qa.get("test_count_regex"), str)
+                    or not qa["test_count_regex"]
+                    or type(qa.get("min_tests")) is not int
+                    or qa["min_tests"] < 1
+                    or type(qa.get("timeout_seconds")) is not int
+                    or not 30 <= qa["timeout_seconds"] <= 1800
+                ):
+                    raise ValueError("browser QA requires positive count and bounded timeout")
             security_digest = security_binding(
                 supplied=supplied,
                 repository=repository,
@@ -394,7 +508,7 @@ class DeliveryConfig:
             role_denied = _boundary_probe_passed(role)
             check_denied = _boundary_probe_passed(check)
             if (
-                attestation.get("schema") != "devflow-native-profile-v2"
+                attestation.get("schema") != "devflow-native-profile-v3"
                 or attestation.get("effective_mode") != "Codex native named profile"
                 or attestation.get("codex_bin_sha256") != binary_digest
                 or attestation.get("kit_revision") != kit_revision
@@ -412,6 +526,10 @@ class DeliveryConfig:
                 or attestation.get("network_enabled_check_credential") != "PermissionError:1"
                 or attestation.get("install_exit_code") != 0
                 or attestation.get("api_check_exit_code") != 0
+                or (
+                    qa is not None
+                    and not _browser_qa_probe_passed(attestation.get("browser_qa_observed"))
+                )
             ):
                 raise ValueError("sandbox attestation does not match this executable and boundary")
             policy["codex_bin_sha256"] = binary_digest

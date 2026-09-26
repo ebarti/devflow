@@ -227,9 +227,76 @@ class DeliveryWorkflow:
                 spec, "published", "Regular pull request read back at candidate head"
             )
             repair_findings = []
+            qa_evidence = None
             for role in ("review", "verify"):
                 if self.cancel_requested:
                     return await self._cancelled(spec)
+                if role == "verify":
+                    # The broker installs/builds the disposable gate checkout
+                    # before browser QA and before the independent verifier
+                    # inspects either source or receipts.
+                    self.state["phase"] = "checks"
+                    self.state["revision"] += 1
+                    await self._project(spec, "checks_started", "Executing required local checks")
+                    try:
+                        checked = await self._activity(
+                            "delivery_checks",
+                            {
+                                "spec": spec,
+                                "iteration": iteration,
+                                "candidate": self.state["candidate"],
+                            },
+                        )
+                    except Exception as exc:
+                        return await self._stop(
+                            spec, f"checks activity failed: {type(exc).__name__}"
+                        )
+                    self.state["checks"]["local"] = checked
+                    if self.cancel_requested:
+                        return await self._cancelled(spec)
+                    if checked.get("state") != "passed":
+                        repair_findings.append("required local checks did not pass")
+                        break
+                if role == "verify" and spec["policy"].get("browser_qa"):
+                    self.state["phase"] = "browser_qa"
+                    self.state["revision"] += 1
+                    await self._project(
+                        spec, "browser_qa_started", "Running owned browser and API fixture"
+                    )
+                    try:
+                        browser_qa = await self._activity(
+                            "delivery_browser_qa",
+                            {
+                                "spec": spec,
+                                "iteration": iteration,
+                                "candidate": self.state["candidate"],
+                            },
+                        )
+                    except Exception as exc:
+                        return await self._stop(
+                            spec, f"browser QA activity failed: {type(exc).__name__}"
+                        )
+                    self.state["checks"]["browser_qa"] = browser_qa
+                    if self.cancel_requested:
+                        return await self._cancelled(spec)
+                    if browser_qa.get("cleanup") == "unknown":
+                        self.state["cleanup"] = "unknown"
+                        return await self._stop(spec, "browser QA child cleanup is unknown")
+                    if browser_qa.get("state") != "passed":
+                        repair_findings.append("owned browser/API QA did not pass")
+                        break
+                    qa_evidence = {
+                        "path": browser_qa["receipt"],
+                        "sha256": browser_qa["receipt_sha256"],
+                        "log": browser_qa["log"],
+                        "log_sha256": browser_qa["log_sha256"],
+                        "candidate_id": self.state["candidate"]["id"],
+                        "iteration": iteration,
+                    }
+                    self.state["revision"] += 1
+                    await self._project(
+                        spec, "browser_qa_passed", "Owned browser/API QA receipt is ready"
+                    )
                 self.state["phase"] = role
                 self.state["revision"] += 1
                 await self._project(spec, "role_started", role + " role started")
@@ -243,6 +310,7 @@ class DeliveryWorkflow:
                             "candidate": self.state["candidate"],
                             "findings": [],
                             "resume_session": None,
+                            "qa_evidence": qa_evidence if role == "verify" else None,
                         },
                     )
                 except Exception as exc:
@@ -266,26 +334,6 @@ class DeliveryWorkflow:
                 if result.get("status") != "pass":
                     repair_findings.extend(result.get("findings") or [f"{role} did not pass"])
                     break
-            if not repair_findings:
-                self.state["phase"] = "checks"
-                self.state["revision"] += 1
-                await self._project(spec, "checks_started", "Executing required local checks")
-                try:
-                    checked = await self._activity(
-                        "delivery_checks",
-                        {
-                            "spec": spec,
-                            "iteration": iteration,
-                            "candidate": self.state["candidate"],
-                        },
-                    )
-                except Exception as exc:
-                    return await self._stop(spec, f"checks activity failed: {type(exc).__name__}")
-                self.state["checks"]["local"] = checked
-                if self.cancel_requested:
-                    return await self._cancelled(spec)
-                if checked.get("state") != "passed":
-                    repair_findings.append("required local checks did not pass")
             if repair_findings:
                 self.state["findings"].extend(repair_findings)
                 self.state["revision"] += 1

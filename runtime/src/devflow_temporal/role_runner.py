@@ -78,6 +78,17 @@ def _task(request: dict[str, Any]) -> AgentTask:
         if review_diff
         else ""
     )
+    qa_evidence = request.get("qa_evidence")
+    qa_note = (
+        "The broker, not you, executed the owned browser/API/SQLite QA. Inspect "
+        f"its immutable receipt at {qa_evidence['path']} and log at {qa_evidence['log']}; "
+        "compare the source and report gaps truthfully. Return the SHA-256 of the "
+        "receipt bytes in qa_receipt_sha256. Your independent role assesses this "
+        "evidence and may run additional permitted local checks, but must not claim "
+        "you executed the broker's browser test.\n"
+        if qa_evidence and role == "verify"
+        else ""
+    )
     prompt = (
         f"{instructions}\n\n"
         f"Goal: {spec['goal']}\n\nAccepted plan:\n{spec['accepted_plan']}\n\n"
@@ -86,6 +97,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"Previous findings to repair: {json.dumps(findings)}\n"
         f"{recovery_note}\n"
         f"{diff_note}\n"
+        f"{qa_note}\n"
         "Return a structured assessment with status, summary, and findings. "
         "A completed turn alone is not a pass."
     )
@@ -93,6 +105,16 @@ def _task(request: dict[str, Any]) -> AgentTask:
         raise ValueError("Codex role requires a native named permission profile")
     mode = FilesystemAccess.READ_ONLY if role == "review" else FilesystemAccess.WORKSPACE_WRITE
     prior = request.get("resume_session")
+    schema = ASSESSMENT_SCHEMA
+    if qa_evidence and role == "verify":
+        schema = {
+            **ASSESSMENT_SCHEMA,
+            "properties": {
+                **ASSESSMENT_SCHEMA["properties"],
+                "qa_receipt_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            },
+            "required": [*ASSESSMENT_SCHEMA["required"], "qa_receipt_sha256"],
+        }
     return AgentTask(
         goal=prompt,
         task_id=f"delivery:{spec['run_id']}:{role}:{request['iteration']}:{candidate['id'][:12]}",
@@ -107,7 +129,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         ),
         resume_from=SessionResumeState(session_id=prior) if prior else None,
         deadline=datetime.now(UTC) + timedelta(seconds=int(policy.get("timeout_seconds", 7200))),
-        output_schema=ASSESSMENT_SCHEMA,
+        output_schema=schema,
         metadata={"run_id": spec["run_id"], "role": role, "iteration": request["iteration"]},
     )
 
@@ -160,6 +182,16 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(findings, list) or any(not isinstance(item, str) for item in findings):
         status = "blocked"
         findings = ["assessment findings were invalid"]
+    qa_evidence = request.get("qa_evidence")
+    if (
+        qa_evidence
+        and request["role"] == "verify"
+        and (
+            not isinstance(parsed, dict) or parsed.get("qa_receipt_sha256") != qa_evidence["sha256"]
+        )
+    ):
+        status = "blocked"
+        findings = ["independent verifier did not bind its assessment to the QA receipt"]
     return {
         "status": status,
         "summary": summary,

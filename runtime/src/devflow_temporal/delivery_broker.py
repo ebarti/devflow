@@ -14,6 +14,7 @@ from typing import Any
 
 from .candidate import candidate_for
 from .contracts import canonical_json
+from .delivery_browser_qa import run_browser_qa as execute_browser_qa
 from .delivery_sandbox import prepare_native_check
 from .delivery_store import DeliveryStore, _now
 
@@ -433,6 +434,9 @@ class DeliveryBroker:
             self.state_dir / "checks" / str(iteration),
             candidate,
         )
+
+    def run_browser_qa(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
+        return execute_browser_qa(self, iteration, candidate)
 
     def _existing_pr(self) -> dict[str, Any] | None:
         output = _run(

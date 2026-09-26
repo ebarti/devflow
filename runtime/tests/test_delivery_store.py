@@ -24,12 +24,14 @@ from devflow_temporal.delivery_config import (
     BOUNDARY_DENIAL_FIELDS,
     DeliveryConfig,
     _boundary_probe_passed,
+    _browser_qa_probe_passed,
     _installed_codex_binary,
     security_binding,
 )
 from devflow_temporal.delivery_sandbox import validate_network_domain
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+from devflow_temporal.role_runner import _task
 from devflow_temporal.supervisor import DeliverySupervisor
 
 
@@ -188,6 +190,40 @@ def test_phase_gates_do_not_reuse_previous_repair_iteration(service):
     assert all(terminal[name] == "pending" for name in ("publish", "local_checks"))
 
 
+def test_browser_gate_projects_current_candidate_failure_and_resets_on_repair(service):
+    original, request = service
+    config = json.loads(original.config.path.read_text())
+    config["repositories"]["fixture"]["browser_qa"] = {"id": "fixture-browser"}
+    original.config.path.write_text(json.dumps(config))
+    store = DeliveryStore(DeliveryConfig.load(original.config.path))
+    store.submit(request)
+    store.project(
+        "run-1",
+        phase="browser_qa",
+        execution_state="running",
+        event_type="findings",
+        message="Browser fixture failed",
+        checks={"local": {"state": "passed"}, "browser_qa": {"state": "failed"}},
+        iteration=0,
+        key="browser-failed:0",
+    )
+    first = {gate["id"]: gate["state"] for gate in store.detail("run-1")["phase_gates"]}
+    assert first["local_checks"] == "completed"
+    assert first["browser_qa"] == "failed"
+    store.project(
+        "run-1",
+        phase="repair",
+        execution_state="running",
+        event_type="role_started",
+        message="Repair started",
+        checks={},
+        iteration=1,
+        key="repair:1",
+    )
+    repaired = {gate["id"]: gate["state"] for gate in store.detail("run-1")["phase_gates"]}
+    assert repaired["local_checks"] == repaired["browser_qa"] == "pending"
+
+
 def test_blocked_pre_role_run_can_transfer_claim_to_explicit_successor(service):
     store, request = service
     store.submit(request)
@@ -267,10 +303,82 @@ def test_security_attestation_binding_rejects_changed_workspace_and_check_author
     changed_policy = copy.deepcopy(base)
     changed_policy["policy"]["toolchain_roots"] = ["/opt/other"]
     variants.append(changed_policy)
+    changed_browser = copy.deepcopy(base)
+    changed_browser["policy"]["browser_qa"] = {
+        "ports": {"JOBCTRL_E2E_API_PORT": 18871, "JOBCTRL_E2E_WEB_PORT": 18872}
+    }
+    variants.append(changed_browser)
     changed_model = copy.deepcopy(base)
     changed_model["policy"]["roles"]["implement"]["effort"] = "high"
     variants.append(changed_model)
     assert all(security_binding(**variant) != expected for variant in variants)
+
+
+def test_browser_attestation_requires_positive_fixture_and_child_denials():
+    denied = {
+        key: "PermissionError:1"
+        for key in (
+            "host_credential_read",
+            "state_read",
+            "outside_write",
+            "slash_tmp_read",
+            "slash_tmp_write",
+            "private_tmp_read",
+            "private_tmp_write",
+            "unrelated_port_connect",
+            "unrelated_port_bind",
+            "unrelated_host_connect",
+        )
+    }
+    observed = {
+        **denied,
+        "browser_api_sqlite": True,
+        "owned_listeners": True,
+        "cleanup": "confirmed",
+        "test_count": 2,
+        "allowed_scratch_write": "ALLOWED",
+        "child": {**denied, "allowed_scratch_write": "ALLOWED"},
+    }
+    assert _browser_qa_probe_passed(observed)
+    for change in (
+        {"owned_listeners": False},
+        {"cleanup": "unknown"},
+        {"test_count": 0},
+        {"unrelated_port_connect": "ALLOWED"},
+        {"child": {**observed["child"], "host_credential_read": "ALLOWED"}},
+    ):
+        assert not _browser_qa_probe_passed({**observed, **change})
+
+
+def test_verify_task_requires_hash_of_broker_executed_qa_receipt():
+    digest = "a" * 64
+    spec = {
+        "run_id": "qa-run",
+        "provider": "codex",
+        "goal": "Verify feature",
+        "accepted_plan": "Inspect browser and API results",
+        "policy": {
+            "roles": {"verify": {"model": "gpt-6-sol", "effort": "max"}},
+            "allowed_paths": ["README.md"],
+            "host_sandbox": "native-profile",
+        },
+    }
+    request = {
+        "spec": spec,
+        "role": "verify",
+        "iteration": 0,
+        "candidate": {"id": "candidate", "head": "head"},
+        "workspace": "/owned/checkout",
+        "qa_evidence": {
+            "path": "/owned/receipt.json",
+            "log": "/owned/browser-qa.log",
+            "sha256": digest,
+        },
+    }
+    task = _task(request)
+    assert "broker, not you, executed" in task.goal
+    assert task.output_schema["properties"]["qa_receipt_sha256"]["type"] == "string"
+    assert "qa_receipt_sha256" in task.output_schema["required"]
 
 
 def test_boundary_attestation_requires_both_tmp_aliases_in_parent_and_child():
@@ -691,6 +799,109 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
     finally:
         server.terminate()
         await server.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("qa_state", ["passed", "failed", "unknown"])
+async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure(qa_state):
+    calls = []
+    candidate = {"id": "candidate-1", "head": "head-1"}
+    spec = {
+        "run_id": f"browser-qa-{qa_state}",
+        "provider": "fake",
+        "policy": {"max_repairs": 0, "browser_qa": {"id": "owned-browser"}},
+    }
+
+    @activity.defn(name="delivery_project")
+    async def project_stub(_payload):
+        return {"revision": 1}
+
+    @activity.defn(name="delivery_prepare")
+    async def prepare_stub(_payload):
+        return {"candidate": candidate}
+
+    @activity.defn(name="delivery_tracker_start")
+    async def start_stub(_payload):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_role")
+    async def role_stub(payload):
+        role = payload["role"]
+        calls.append(role)
+        if role == "verify":
+            assert payload["qa_evidence"] == {
+                "path": "/owned/receipt.json",
+                "sha256": "a" * 64,
+                "log": "/owned/browser-qa.log",
+                "log_sha256": "b" * 64,
+                "candidate_id": candidate["id"],
+                "iteration": 0,
+            }
+        return {"status": "pass", "session_id": f"fake:{role}", "candidate": candidate}
+
+    @activity.defn(name="delivery_precheck")
+    async def precheck_stub(_payload):
+        return {"state": "passed"}
+
+    @activity.defn(name="delivery_publish")
+    async def publish_stub(_payload):
+        return {"candidate": candidate, "head": candidate["head"]}
+
+    @activity.defn(name="delivery_browser_qa")
+    async def browser_stub(_payload):
+        calls.append("browser_qa")
+        return {
+            "state": qa_state,
+            "cleanup": "unknown" if qa_state == "unknown" else "confirmed",
+            "receipt": "/owned/receipt.json",
+            "receipt_sha256": "a" * 64,
+            "log": "/owned/browser-qa.log",
+            "log_sha256": "b" * 64,
+        }
+
+    @activity.defn(name="delivery_checks")
+    async def checks_stub(_payload):
+        calls.append("local_checks")
+        return {"state": "passed"}
+
+    @activity.defn(name="delivery_ci")
+    async def ci_stub(_payload):
+        return {"state": "passed"}
+
+    @activity.defn(name="delivery_tracker")
+    async def tracker_stub(_payload):
+        return {"state": "consistent"}
+
+    async with await WorkflowEnvironment.start_local() as environment:
+        async with Worker(
+            environment.client,
+            task_queue=f"browser-qa-{qa_state}",
+            workflows=[DeliveryWorkflow],
+            activities=[
+                project_stub,
+                prepare_stub,
+                start_stub,
+                role_stub,
+                precheck_stub,
+                publish_stub,
+                browser_stub,
+                checks_stub,
+                ci_stub,
+                tracker_stub,
+            ],
+        ):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run,
+                spec,
+                id=spec["run_id"],
+                task_queue=spec["run_id"],
+            )
+            result = await handle.result()
+    assert calls[:4] == ["implement", "review", "local_checks", "browser_qa"]
+    assert ("verify" in calls) is (qa_state == "passed")
+    assert result["outcome"] == ("delivered" if qa_state == "passed" else "blocked")
+    if qa_state == "unknown":
+        assert result["cleanup"] == "unknown"
 
 
 @pytest.mark.asyncio

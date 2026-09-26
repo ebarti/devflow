@@ -633,6 +633,7 @@ class DeliveryStore:
         tracker = json.loads(row["tracker_json"]) if row["tracker_json"] else {}
         observed_gate_states = {
             "prepublish": checks.get("prepublish", {}).get("state"),
+            "browser_qa": checks.get("browser_qa", {}).get("state"),
             "local_checks": checks.get("local", {}).get("state"),
             "required_ci": checks.get("ci", {}).get("state"),
             "tracker": tracker.get("state"),
@@ -649,20 +650,31 @@ class DeliveryStore:
                 return "failed"
             return "pending"
 
+        gate_specs = [
+            ("prepare", "Prepare", "tracker_start"),
+            ("prepublish", "Before PR checks", "candidate_ready"),
+            ("publish", "Publish", "published"),
+            (
+                "local_checks",
+                "Local checks",
+                "browser_qa_started" if spec["policy"].get("browser_qa") else "ci_wait",
+            ),
+        ]
+        if spec["policy"].get("browser_qa"):
+            gate_specs.append(("browser_qa", "Browser / API QA", "browser_qa_passed"))
+        gate_specs.extend(
+            (
+                ("required_ci", "Required CI", "tracker_started"),
+                ("tracker", "Tracker", "delivered"),
+            )
+        )
         gates = [
             {
                 "id": name,
                 "label": label,
                 "state": gate_state(name, completion),
             }
-            for name, label, completion in (
-                ("prepare", "Prepare", "tracker_start"),
-                ("prepublish", "Before PR checks", "candidate_ready"),
-                ("publish", "Publish", "published"),
-                ("local_checks", "Local checks", "ci_wait"),
-                ("required_ci", "Required CI", "tracker_started"),
-                ("tracker", "Tracker", "delivered"),
-            )
+            for name, label, completion in gate_specs
         ]
         return {
             **compact,
@@ -716,6 +728,17 @@ class DeliveryStore:
         for result in details.get("checks", {}).get("local", {}).get("results", []):
             path = Path(result["log"])
             indexed.append({"id": f"check-{result['id']}", "label": result["id"], "path": path})
+        for folder in sorted((root / "browser-qa").glob("[0-9]*")):
+            for name, suffix in (("receipt.json", "receipt"), ("browser-qa.log", "log")):
+                path = folder / name
+                if path.is_file():
+                    indexed.append(
+                        {
+                            "id": f"browser-qa-{folder.name}-{suffix}",
+                            "label": f"browser QA {suffix}, iteration {folder.name}",
+                            "path": path,
+                        }
+                    )
         recovery = root / "recovery" / "provenance.json"
         if recovery.is_file():
             indexed.append(
@@ -748,6 +771,13 @@ class DeliveryStore:
             raise ValueError("evidence ID is not indexed for this run")
         if evidence_id == "recovery-provenance":
             path = root / "recovery" / "provenance.json"
+        elif evidence_id.startswith("browser-qa-"):
+            indexed = {
+                f"browser-qa-{folder.name}-{suffix}": folder / name
+                for folder in (root / "browser-qa").glob("[0-9]*")
+                for name, suffix in (("receipt.json", "receipt"), ("browser-qa.log", "log"))
+            }
+            path = indexed[evidence_id]
         elif evidence_id.startswith("role-"):
             with self._connect() as db:
                 attempts = db.execute(
