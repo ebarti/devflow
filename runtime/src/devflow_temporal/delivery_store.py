@@ -716,6 +716,15 @@ class DeliveryStore:
                 "SELECT job_key,role,iteration,result_json FROM delivery_attempts WHERE run_id=?",
                 (run_id,),
             ).fetchall()
+            browser_effects = {
+                row["effect_key"]: json.loads(row["observed_json"])
+                for row in db.execute(
+                    """SELECT effect_key,observed_json FROM delivery_effects
+                       WHERE run_id=? AND kind='browser_qa' AND state='complete'
+                       AND observed_json IS NOT NULL""",
+                    (run_id,),
+                )
+            }
         for attempt in attempts:
             folder = root / "attempts" / attempt["job_key"]
             contained_log = folder / "container" / "container.log"
@@ -749,44 +758,58 @@ class DeliveryStore:
             if not folder.name.isdecimal():
                 continue
             receipt = folder / "receipt.json"
-            if receipt.is_file():
+            contained_log = folder / "container" / "container.log"
+            path = contained_log if contained_log.is_file() else folder / "browser-qa.log"
+            effect = browser_effects.get(f"browser_qa:{run_id}:{folder.name}")
+            projected = (
+                details.get("checks", {}).get("browser_qa")
+                if int(folder.name) == details["iteration"]
+                else None
+            )
+            if not isinstance(projected, dict) or not projected.get("receipt_sha256"):
+                projected = None
+            if effect is not None and not isinstance(effect, dict):
+                continue
+            if (
+                effect is not None
+                and projected is not None
+                and any(
+                    effect.get(field) != projected.get(field)
+                    for field in ("receipt", "receipt_sha256", "log", "log_sha256")
+                )
+            ):
+                continue
+            binding = effect if effect is not None else projected
+            if binding is not None:
+                expected_receipt = binding.get("receipt_sha256")
+                if (
+                    not isinstance(expected_receipt, str)
+                    or binding.get("receipt") != str(receipt)
+                    or binding.get("log") != str(path)
+                    or binding.get("iteration", int(folder.name)) != int(folder.name)
+                    or receipt.is_symlink()
+                    or not receipt.is_file()
+                    or root.resolve() not in receipt.resolve().parents
+                    or receipt.stat().st_size > 1024 * 1024
+                    or hashlib.sha256(receipt.read_bytes()).hexdigest() != expected_receipt
+                ):
+                    continue
                 indexed.append(
                     {
                         "id": f"browser-qa-{folder.name}-receipt",
                         "label": f"browser QA receipt, iteration {folder.name}",
                         "path": receipt,
+                        "expected_sha256": expected_receipt,
                         "limit": 1024 * 1024,
                     }
                 )
-            contained_log = folder / "container" / "container.log"
-            path = contained_log if contained_log.is_file() else folder / "browser-qa.log"
             if path.is_file():
-                expected_hash = None
-                if receipt.is_file():
-                    if (
-                        receipt.is_symlink()
-                        or root.resolve() not in receipt.resolve().parents
-                        or receipt.stat().st_size > 1024 * 1024
-                    ):
-                        continue
-                    try:
-                        saved = json.loads(receipt.read_text(encoding="utf-8"))
-                        if not isinstance(saved, dict):
-                            continue
-                        if saved.get("log") == str(path) and saved.get("iteration") == int(
-                            folder.name
-                        ):
-                            expected_hash = saved.get("log_sha256")
-                        else:
-                            continue
-                    except (OSError, UnicodeError, ValueError, TypeError):
-                        continue
                 indexed.append(
                     {
                         "id": f"browser-qa-{folder.name}-log",
                         "label": f"browser QA log, iteration {folder.name}",
                         "path": path,
-                        "expected_sha256": expected_hash,
+                        "expected_sha256": binding.get("log_sha256") if binding else None,
                         "limit": 20 * 1024 * 1024 if path == contained_log else 1024 * 1024,
                     }
                 )

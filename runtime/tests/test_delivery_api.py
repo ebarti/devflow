@@ -186,7 +186,8 @@ async def test_local_api_auth_csrf_submit_replay_and_conflict(api_fixture):
 
 
 @pytest.mark.asyncio
-async def test_public_evidence_reads_contained_role_and_browser_logs(api_fixture):
+@pytest.mark.parametrize("binding_source", ["effect", "projection"])
+async def test_public_evidence_reads_contained_role_and_browser_logs(api_fixture, binding_source):
     path, request = api_fixture
     app = create_app(path)
     store = app.state.delivery.store
@@ -217,9 +218,43 @@ async def test_public_evidence_reads_contained_role_and_browser_logs(api_fixture
     browser_log.parent.mkdir(parents=True)
     browser_log.write_text("4 passed\n")
     browser_sha = hashlib.sha256(browser_log.read_bytes()).hexdigest()
-    (browser_folder / "receipt.json").write_text(
-        json.dumps({"iteration": 0, "log": str(browser_log), "log_sha256": browser_sha})
-    )
+    receipt = browser_folder / "receipt.json"
+    saved_receipt = {
+        "iteration": 0,
+        "log": str(browser_log),
+        "log_sha256": browser_sha,
+        "state": "passed",
+        "test_count": 4,
+    }
+    receipt.write_text(json.dumps(saved_receipt))
+    receipt_sha = hashlib.sha256(receipt.read_bytes()).hexdigest()
+    bound_result = {**saved_receipt, "receipt": str(receipt), "receipt_sha256": receipt_sha}
+    if binding_source == "effect":
+        with store._connect() as db:
+            db.execute(
+                """INSERT INTO delivery_effects
+                   (effect_key,run_id,kind,request_json,state,observed_json,updated_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    "browser_qa:run-1:0",
+                    "run-1",
+                    "browser_qa",
+                    "{}",
+                    "complete",
+                    json.dumps(bound_result),
+                    "2026-09-26T00:00:00Z",
+                ),
+            )
+    else:
+        store.project(
+            "run-1",
+            phase="accepted",
+            execution_state="queued",
+            event_type="browser_receipt_bound",
+            message="Owned browser receipt projected",
+            checks={"browser_qa": bound_result},
+            key="browser_receipt_bound:0",
+        )
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
         token = (Path(json.loads(path.read_text())["state_root"]) / "service-token").read_text()
@@ -242,9 +277,24 @@ async def test_public_evidence_reads_contained_role_and_browser_logs(api_fixture
         assert role["sha256"] == role_sha
         assert qa["text"] == "4 passed\n"
         assert qa["sha256"] == browser_sha
+        qa_receipt_url = "/api/runs/run-1/evidence/browser-qa-0-receipt"
+        receipt.write_text(json.dumps({**saved_receipt, "state": "failed", "test_count": 0}))
+        assert (await browser.get(qa_receipt_url)).status_code == 404
+        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
+        receipt.write_text(json.dumps(saved_receipt))
         role_log.write_text("changed after result\n")
         browser_log.write_text("changed after receipt\n")
         assert (await browser.get("/api/runs/run-1/evidence/role-implement-0")).status_code == 404
+        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
+        receipt.write_text(
+            json.dumps(
+                {
+                    **saved_receipt,
+                    "log_sha256": hashlib.sha256(browser_log.read_bytes()).hexdigest(),
+                }
+            )
+        )
+        assert (await browser.get(qa_receipt_url)).status_code == 404
         assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
 
 
