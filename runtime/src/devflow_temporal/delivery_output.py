@@ -16,3 +16,13 @@ _DOCKER_TIMESTAMP = re.compile(
 
 def visible_output(output: str) -> str:
     return _DOCKER_TIMESTAMP.sub("", _TERMINAL_ESCAPE.sub("", output))
+
+
+def observed_test_count(output: str, pattern: str) -> int:
+    """Read one runner's largest summary, excluding duplicated CI annotations."""
+
+    summaries = "\n".join(
+        line for line in visible_output(output).splitlines() if not line.lstrip().startswith("::")
+    )
+    numbers = re.findall(pattern, summaries)
+    return max(int(number) for number in numbers) if numbers else 0

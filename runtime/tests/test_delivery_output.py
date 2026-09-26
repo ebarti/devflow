@@ -2,7 +2,7 @@
 
 import re
 
-from devflow_temporal.delivery_output import visible_output
+from devflow_temporal.delivery_output import observed_test_count, visible_output
 
 
 def test_colored_vitest_summary_retains_test_count_and_failure_words():
@@ -28,3 +28,19 @@ def test_timestamped_colored_browser_failure_cannot_hide_from_anchored_reject_pa
     assert re.findall(r"(?m)(\d+) passed", parsed) == ["2"]
     assert re.search(failure, parsed)
     assert raw.startswith("2026-09-26T")
+
+
+def test_playwright_notice_does_not_inflate_the_single_runner_test_count():
+    actual_two = (
+        "2026-09-26T20:38:53.395069592Z   2 passed (11.6s)\n"
+        "2026-09-26T20:38:53.395541092Z ::notice title=🎭 Playwright "
+        "Run Summary::  2 passed (11.6s)\n"
+    )
+    assert observed_test_count(actual_two, r"(?m)(\d+) passed") == 2
+    actual_one_with_misleading_notice = (
+        "2026-09-26T20:38:53.395069592Z   1 passed (11.6s)\n"
+        "2026-09-26T20:38:53.395541092Z ::notice title=🎭 Playwright "
+        "Run Summary::  2 passed (11.6s)\n"
+    )
+    assert observed_test_count(actual_one_with_misleading_notice, r"(?m)(\d+) passed") == 1
+    assert observed_test_count(actual_one_with_misleading_notice, r"(?m)(\d+) passed") < 2
