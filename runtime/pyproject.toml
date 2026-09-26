@@ -9,7 +9,10 @@ description = "Experimental local Temporal runtime for Devflow"
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "agent-runtime-kit[codex]==0.5.2",
+  "fastapi==0.141.1",
+  "mcp==1.30.0",
   "temporalio>=1.20,<2",
+  "uvicorn==0.54.0",
 ]
 
 [project.scripts]
