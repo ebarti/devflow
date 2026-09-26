@@ -21,7 +21,7 @@ from devflow_temporal.delivery_activities import (
     delivery_prepare,
     delivery_project,
 )
-from devflow_temporal.delivery_api import create_app
+from devflow_temporal.delivery_api import DeliveryService, create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_container import ContainerUnknown
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -31,6 +31,49 @@ def _git(path: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(path), *args], check=True, capture_output=True, text=True
     ).stdout.strip()
+
+
+@pytest.mark.asyncio
+async def test_idle_dispatch_reports_actual_temporal_health(monkeypatch):
+    class Temporal:
+        service_client = None
+        healthy = True
+        probes = 0
+
+        async def check_health(self):
+            self.probes += 1
+            return self.healthy
+
+    class Store:
+        calls = 0
+
+        def pending_starts(self):
+            self.calls += 1
+            return []
+
+    temporal = Temporal()
+    temporal.service_client = temporal
+    store = Store()
+    service = object.__new__(DeliveryService)
+    service.store = store
+    service.temporal_status = "disconnected"
+    service._health_client = None
+
+    async def connect():
+        return temporal
+
+    monkeypatch.setattr(service, "client", connect)
+    await service.dispatch_once()
+    assert service.temporal_status == "connected"
+    assert temporal.probes == 1
+    assert store.calls == 1
+
+    temporal.healthy = False
+    with pytest.raises(RuntimeError, match="Temporal health check failed"):
+        await service.dispatch_once()
+    assert service.temporal_status == "disconnected"
+    assert service._health_client is None
+    assert store.calls == 1
 
 
 @pytest.mark.asyncio

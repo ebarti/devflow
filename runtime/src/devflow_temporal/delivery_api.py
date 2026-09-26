@@ -78,6 +78,7 @@ class DeliveryService:
         self.store = DeliveryStore(self.config)
         self.auth = LocalAuth(self.config.state_root)
         self.temporal_status = "disconnected"
+        self._health_client: Client | None = None
         self.dispatch_task: asyncio.Task | None = None
 
     async def client(self) -> Client:
@@ -86,12 +87,27 @@ class DeliveryService:
             namespace=self.config.raw.get("temporal_namespace", "default"),
         )
 
+    async def healthy_client(self) -> Client:
+        try:
+            if self._health_client is None:
+                self._health_client = await self.client()
+            healthy = await self._health_client.service_client.check_health()
+        except Exception:
+            self._health_client = None
+            self.temporal_status = "disconnected"
+            raise
+        if not healthy:
+            self._health_client = None
+            self.temporal_status = "disconnected"
+            raise RuntimeError("Temporal health check failed")
+        self.temporal_status = "connected"
+        return self._health_client
+
     async def dispatch_once(self) -> None:
+        client = await self.healthy_client()
         pending = self.store.pending_starts()
         if not pending:
             return
-        client = await self.client()
-        self.temporal_status = "connected"
         for item in pending:
             spec = json.loads(item["request_json"])
             workflow_id = "delivery-" + spec["run_id"]
