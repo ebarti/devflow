@@ -6,19 +6,12 @@ required-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 
-[options]
-exclude-newer = "2026-09-25T23:59:59Z"
-
 [[package]]
 name = "agent-runtime-kit"
 version = "0.5.2"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/ebarti/agent-runtime-kit.git?rev=facc9034a7c26efa412ce69bac4b8689257c0d61#facc9034a7c26efa412ce69bac4b8689257c0d61" }
 dependencies = [
     { name = "jsonschema" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/38/37/202539458e03e04e3bdf5bae5f0048086e31acc3887024de12ef9a62bf65/agent_runtime_kit-0.5.2.tar.gz", hash = "sha256:e2cc352b7d27dc393b9c1e76b379ded830cfef073238fe0e3cebdab77898d6a2", size = 226914, upload-time = "2026-09-19T15:51:12.312Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/2b/10/01c91d09d14be830516469c0e6653e593919210a122702c24b3bfdf2badf/agent_runtime_kit-0.5.2-py3-none-any.whl", hash = "sha256:a189cef8540fc5a04af55e887c4c71701a380128681dbef5b3b43cdfa8be4a3f", size = 78165, upload-time = "2026-09-19T15:51:11.106Z" },
 ]
 
 [package.optional-dependencies]
@@ -188,7 +181,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agent-runtime-kit", extras = ["codex"], specifier = "==0.5.2" },
+    { name = "agent-runtime-kit", extras = ["codex"], git = "https://github.com/ebarti/agent-runtime-kit.git?rev=facc9034a7c26efa412ce69bac4b8689257c0d61" },
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "mcp", specifier = "==1.30.0" },
     { name = "temporalio", specifier = ">=1.20,<2" },

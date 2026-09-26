@@ -39,6 +39,7 @@ class DeliveryWorkflow:
                 "checks": self.state.get("checks"),
                 "tracker": self.state.get("tracker"),
                 "usage": self.state.get("usage"),
+                "decision": self.state.get("decision"),
                 "protocol_revision": self.state["revision"],
                 "outcome": self.state.get("outcome"),
                 "error": self.state.get("error"),
@@ -47,6 +48,8 @@ class DeliveryWorkflow:
         )
 
     async def _stop(self, spec: dict[str, Any], reason: str) -> dict[str, Any]:
+        if self.cancel_requested:
+            return await self._cancelled(spec)
         self.state["phase"] = "blocked"
         self.state["execution_state"] = "blocked"
         self.state["outcome"] = "blocked"
@@ -81,6 +84,7 @@ class DeliveryWorkflow:
             "usage": {},
             "findings": [],
             "decision": None,
+            "candidate_revision": 0,
             "cleanup": "none",
             "error": None,
         }
@@ -90,6 +94,7 @@ class DeliveryWorkflow:
         except Exception as exc:
             return await self._stop(spec, f"preparation failed: {type(exc).__name__}")
         self.state["candidate"] = prepared["candidate"]
+        self.state["candidate_revision"] += 1
         self.state["phase"] = "tracker_start"
         self.state["revision"] += 1
         await self._project(spec, "tracker_start", "Claimed issue entering In progress")
@@ -102,6 +107,28 @@ class DeliveryWorkflow:
         self.state["tracker"] = started_tracker
         if started_tracker.get("state") != "consistent":
             return await self._stop(spec, "initial tracker readback remains pending")
+        prompt = spec["policy"].get("initial_decision_prompt")
+        if prompt:
+            self.state["phase"] = "waiting_decision"
+            self.state["execution_state"] = "waiting"
+            self.state["revision"] += 1
+            self.state["decision"] = {
+                "id": f"{spec['run_id']}:initial",
+                "revision": 1,
+                "candidate_revision": self.state["candidate_revision"],
+                "prompt": prompt,
+                "options": ["proceed", "cancel"],
+                "state": "pending",
+            }
+            await self._project(spec, "decision_pending", "Waiting for an explicit run decision")
+            await workflow.wait_condition(
+                lambda: self.decision_answer is not None or self.cancel_requested
+            )
+            if self.cancel_requested or self.decision_answer == "cancel":
+                return await self._cancelled(spec)
+            self.state["execution_state"] = "running"
+            self.state["revision"] += 1
+            await self._project(spec, "decision_accepted", "Run decision accepted")
         prior_implementer_session = None
         max_repairs = spec["policy"]["max_repairs"]
         repair_findings: list[str] = []
@@ -138,6 +165,7 @@ class DeliveryWorkflow:
             if not prior_implementer_session and spec["provider"] == "codex":
                 return await self._stop(spec, "implementer session identity is missing")
             self.state["candidate"] = implementation["candidate"]
+            self.state["candidate_revision"] += 1
             self.state["phase"] = "prepublish_checks"
             self.state["revision"] += 1
             await self._project(spec, "prepublish_checks", "Checking candidate before the first PR")
@@ -149,6 +177,8 @@ class DeliveryWorkflow:
             except Exception as exc:
                 return await self._stop(spec, f"prepublication checks failed: {type(exc).__name__}")
             self.state["checks"]["prepublish"] = prechecked
+            if self.cancel_requested:
+                return await self._cancelled(spec)
             if prechecked.get("state") != "passed":
                 repair_findings = ["required prepublication checks did not pass"]
                 self.state["findings"].extend(repair_findings)
@@ -169,6 +199,8 @@ class DeliveryWorkflow:
                 return await self._stop(spec, f"publication unresolved: {type(exc).__name__}")
             self.state["candidate"] = published["candidate"]
             self.state["pull_request"] = published
+            if self.cancel_requested:
+                return await self._cancelled(spec)
             self.state["revision"] += 1
             await self._project(
                 spec, "published", "Regular pull request read back at candidate head"
@@ -224,6 +256,8 @@ class DeliveryWorkflow:
                 except Exception as exc:
                     return await self._stop(spec, f"checks activity failed: {type(exc).__name__}")
                 self.state["checks"]["local"] = checked
+                if self.cancel_requested:
+                    return await self._cancelled(spec)
                 if checked.get("state") != "passed":
                     repair_findings.append("required local checks did not pass")
             if repair_findings:
@@ -243,6 +277,8 @@ class DeliveryWorkflow:
             except Exception as exc:
                 return await self._stop(spec, f"CI observation failed: {type(exc).__name__}")
             self.state["checks"]["ci"] = ci
+            if self.cancel_requested:
+                return await self._cancelled(spec)
             if ci.get("state") != "passed":
                 return await self._stop(spec, "required CI did not confirm this PR head")
             self.state["phase"] = "tracker"
@@ -255,6 +291,8 @@ class DeliveryWorkflow:
                     spec, f"tracker synchronization pending: {type(exc).__name__}"
                 )
             self.state["tracker"] = tracker
+            if self.cancel_requested:
+                return await self._cancelled(spec)
             if tracker.get("state") != "consistent":
                 return await self._stop(spec, "tracker readback remains pending or conflicting")
             self.state["phase"] = "delivered"

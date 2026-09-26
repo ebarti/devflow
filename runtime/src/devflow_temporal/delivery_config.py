@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
 import stat
 import subprocess
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from .contracts import RUN_ID_RE, digest
+from .delivery_sandbox import validate_network_domain
 
 BRANCH_RE = re.compile(r"^(?:feat|fix|docs|chore)/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+CHECK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -104,7 +108,7 @@ class DeliveryConfig:
             "branch",
             "authorized_endpoint",
         }
-        optional = {"recovery_key"}
+        optional = {"recovery_key", "supersedes_run_id"}
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
@@ -141,6 +145,13 @@ class DeliveryConfig:
         recovery_key = supplied.get("recovery_key")
         if recovery_key is not None and recovery_key not in repository.get("recovery", {}):
             raise ValueError("recovery key is not configured")
+        supersedes = supplied.get("supersedes_run_id")
+        if supersedes is not None and (
+            not isinstance(supersedes, str)
+            or not RUN_ID_RE.fullmatch(supersedes)
+            or supersedes == supplied["run_id"]
+        ):
+            raise ValueError("superseded run ID is invalid")
         source = Path(repository["source_path"]).resolve(strict=True)
         if not source.is_dir() or _git(source, "rev-parse", "--show-toplevel") != str(source):
             raise ValueError("configured source is not a Git working-copy root")
@@ -148,6 +159,9 @@ class DeliveryConfig:
         if actual_remote != repository["origin_url"]:
             raise ValueError("configured Git origin changed")
         base_sha = _git(source, "rev-parse", supplied["base_ref"])
+        base_paths = _git(source, "ls-tree", "-r", "--name-only", base_sha).splitlines()
+        if any(path == ".codex" or path.startswith(".codex/") for path in base_paths):
+            raise ValueError("project Codex configuration is not admitted")
         expected = repository.get("expected_base_sha")
         if expected and base_sha != expected:
             raise ValueError("base ref moved from the accepted plan")
@@ -160,11 +174,14 @@ class DeliveryConfig:
             "required_ci": repository.get("required_ci", []),
             "allowed_paths": repository.get("allowed_paths", []),
             "pr_body": repository.get("pr_body"),
+            "initial_decision_prompt": repository.get("initial_decision_prompt"),
             "recovery": repository.get("recovery", {}).get(recovery_key),
             "codex_bin": self.raw["codex_bin"],
             "codex_auth_path": self.raw.get("codex_auth_path"),
             "tracking_db": str(self.tracking_db),
             "config_overrides": self.raw.get("config_overrides", ["features.plugins=false"]),
+            "toolchain_roots": self.raw.get("toolchain_roots", []),
+            "package_manager_cache": self.raw.get("package_manager_cache"),
             "max_repairs": int(self.raw.get("max_repairs", 2)),
             "capacity": int(self.raw.get("capacity", 2)),
             "fake_findings": self.raw.get("fake_findings", {})
@@ -173,17 +190,58 @@ class DeliveryConfig:
         }
         if policy["max_repairs"] < 0 or policy["max_repairs"] > 3:
             raise ValueError("max_repairs must be between 0 and 3")
+        prompt = policy["initial_decision_prompt"]
+        if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
+            raise ValueError("initial decision prompt must be a non-empty string")
         if self.raw.get("provider", "codex") == "codex":
             if os.uname().sysname != "Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-                raise ValueError("this host lacks the required outer macOS role sandbox")
-            if not Path(policy["codex_bin"]).is_file():
+                raise ValueError("this host lacks the required macOS profile sandbox")
+            binary = Path(policy["codex_bin"])
+            if not binary.is_file() or not os.access(binary, os.X_OK):
                 raise ValueError("configured Codex executable is unavailable")
+            if binary.is_symlink():
+                raise ValueError("configured Codex executable must not be a symlink")
+            with binary.open("rb") as stream:
+                if stream.read(2) == b"#!":
+                    raise ValueError("configured Codex executable must be a pinned binary")
+            if policy["config_overrides"] != ["features.plugins=false"]:
+                raise ValueError("real role configuration overrides must disable plugins")
             if (
                 not policy["allowed_paths"]
                 or not policy["prepublish_checks"]
                 or not policy["checks"]
             ):
                 raise ValueError("real delivery requires source scope and both check stages")
+            for raw_path in policy["allowed_paths"]:
+                if not isinstance(raw_path, str):
+                    raise ValueError("allowed feature path must be a relative file")
+                path = Path(raw_path)
+                if (
+                    path.is_absolute()
+                    or not path.parts
+                    or any(part in {".", "..", ".git", ".codex"} for part in path.parts)
+                    or path.name in {".gitattributes", ".gitmodules"}
+                    or raw_path != path.as_posix()
+                ):
+                    raise ValueError("allowed feature path controls Git or Codex configuration")
+            if (
+                not isinstance(policy["toolchain_roots"], list)
+                or len(policy["toolchain_roots"]) > 3
+            ):
+                raise ValueError("toolchain roots must be a bounded service list")
+            for raw_root in policy["toolchain_roots"]:
+                if not isinstance(raw_root, str) or not Path(raw_root).is_absolute():
+                    raise ValueError("toolchain root must be an absolute directory")
+                root = Path(raw_root)
+                if root.is_symlink() or not root.is_dir() or not (root / "bin").is_dir():
+                    raise ValueError("toolchain root is unavailable")
+            cache = policy["package_manager_cache"]
+            if cache is not None:
+                if not isinstance(cache, str) or not Path(cache).is_absolute():
+                    raise ValueError("package manager cache must be an absolute directory")
+                cache_path = Path(cache)
+                if cache_path.is_symlink() or not cache_path.is_dir():
+                    raise ValueError("package manager cache is unavailable")
             if not policy["required_ci"]:
                 raise ValueError("real delivery requires named CI checks")
             if not repository.get("project_url") or not repository.get("assignee"):
@@ -195,11 +253,26 @@ class DeliveryConfig:
             for stage in ("prepublish_checks", "checks"):
                 ids = set()
                 for check in policy[stage]:
-                    if not isinstance(check, dict) or not check.get("id") or not check.get("argv"):
+                    if (
+                        not isinstance(check, dict)
+                        or not isinstance(check.get("id"), str)
+                        or not CHECK_ID_RE.fullmatch(check["id"])
+                        or not isinstance(check.get("argv"), list)
+                        or not check["argv"]
+                        or any(not isinstance(item, str) or not item for item in check["argv"])
+                    ):
                         raise ValueError(f"{stage} has an incomplete check command")
                     if check["id"] in ids:
                         raise ValueError(f"{stage} contains a duplicate check ID")
                     ids.add(check["id"])
+                    if check.get("env"):
+                        raise ValueError("real check environment cannot carry arbitrary variables")
+                    if not isinstance(check.get("network_domains", []), list) or any(
+                        not isinstance(domain, str) for domain in check.get("network_domains", [])
+                    ):
+                        raise ValueError("check network domains must be exact hosts")
+                    for domain in check.get("network_domains", []):
+                        validate_network_domain(domain)
                     if check.get("kind") == "test" and (
                         not check.get("test_count_regex") or int(check.get("min_tests", 0)) < 1
                     ):
@@ -218,25 +291,86 @@ class DeliveryConfig:
             attestation = json.loads(attestation_bytes)
             with Path(policy["codex_bin"]).open("rb") as stream:
                 binary_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            project_root = Path(__file__).resolve().parents[2]
+            with (project_root / "pyproject.toml").open("rb") as stream:
+                project = tomllib.load(stream)
+            kit_revision = project["tool"]["uv"]["sources"]["agent-runtime-kit"]["rev"]
+            installed_url = importlib.metadata.distribution("agent-runtime-kit").read_text(
+                "direct_url.json"
+            )
             if (
-                attestation.get("effective_mode")
-                != "Codex CLI full-access inside outer Seatbelt; kit approval STRICT"
-                or attestation.get("outer_sentinel") != "SAFE"
-                or attestation.get("direct_kit_sentinel") != "BREACH"
-                or attestation.get("allowed_workspace_marker") is not True
-                or attestation.get("controller_state_read") != "denied"
-                or attestation.get("controller_state_write") != "denied"
-                or attestation.get("credential_read") != "denied"
-                or attestation.get("subprocess_external_write") != "denied"
-                or attestation.get("gh_authenticated_in_role") != "false"
+                not installed_url
+                or json.loads(installed_url).get("vcs_info", {}).get("commit_id") != kit_revision
+            ):
+                raise ValueError("installed kit does not match the pinned source revision")
+            package = Path(__file__).resolve().parent
+            source_hashes = {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in sorted(package.glob("*.py"))
+            }
+            expected_denial = "PermissionError:1"
+            role = attestation.get("role_observed", {})
+            check = attestation.get("check_observed", {})
+            role_denied = (
+                isinstance(role, dict)
+                and role.get("allowed_write") is True
+                and role.get("child_returncode") == 0
+                and isinstance(role.get("child"), dict)
+                and all(
+                    result.get(field) == expected_denial
+                    for result in (role, role["child"])
+                    for field in (
+                        "copied_auth_read",
+                        "host_credential_read",
+                        "state_read",
+                        "state_write",
+                        "outside_write",
+                        "loopback",
+                    )
+                )
+                and role["child"].get("allowed_write") is True
+            )
+            check_denied = (
+                isinstance(check, dict)
+                and check.get("allowed_write") is True
+                and check.get("child_returncode") == 0
+                and isinstance(check.get("child"), dict)
+                and all(
+                    result.get(field) == expected_denial
+                    for result in (check, check["child"])
+                    for field in (
+                        "copied_auth_read",
+                        "host_credential_read",
+                        "state_read",
+                        "state_write",
+                        "outside_write",
+                        "loopback",
+                    )
+                )
+                and check["child"].get("allowed_write") is True
+            )
+            if (
+                attestation.get("schema") != "devflow-native-profile-v1"
+                or attestation.get("effective_mode") != "Codex native named profile"
                 or attestation.get("codex_bin_sha256") != binary_digest
+                or attestation.get("kit_revision") != kit_revision
+                or attestation.get("source_hashes") != source_hashes
                 or attestation.get("requested_model") != policy["roles"]["implement"]["model"]
                 or attestation.get("requested_effort") != policy["roles"]["implement"]["effort"]
+                or not isinstance(attestation.get("role_session_id"), str)
+                or not attestation["role_session_id"]
+                or not role_denied
+                or not check_denied
+                or attestation.get("network_enabled_check_loopback") != "PermissionError:1"
+                or attestation.get("network_enabled_check_credential") != "PermissionError:1"
+                or attestation.get("install_exit_code") != 0
+                or attestation.get("api_check_exit_code") != 0
             ):
                 raise ValueError("sandbox attestation does not match this executable and boundary")
             policy["codex_bin_sha256"] = binary_digest
             policy["sandbox_attestation_sha256"] = hashlib.sha256(attestation_bytes).hexdigest()
-            policy["host_sandbox"] = "seatbelt"
+            policy["kit_revision"] = kit_revision
+            policy["host_sandbox"] = "native-profile"
         return {
             **supplied,
             "version": 1,

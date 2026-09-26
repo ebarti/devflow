@@ -78,11 +78,9 @@ def _task(request: dict[str, Any]) -> AgentTask:
         "Return a structured assessment with status, summary, and findings. "
         "A completed turn alone is not a pass."
     )
-    if spec["provider"] == "codex" and spec["policy"].get("host_sandbox") != "seatbelt":
-        raise ValueError("Codex role requires an outer Seatbelt boundary")
-    # Codex's nested macOS sandbox cannot initialize under Seatbelt. The
-    # supervisor's OS profile is authoritative; CLI escalation remains denied.
-    mode = FilesystemAccess.FULL_ACCESS
+    if spec["provider"] == "codex" and spec["policy"].get("host_sandbox") != "native-profile":
+        raise ValueError("Codex role requires a native named permission profile")
+    mode = FilesystemAccess.READ_ONLY if role == "review" else FilesystemAccess.WORKSPACE_WRITE
     prior = request.get("resume_session")
     return AgentTask(
         goal=prompt,
@@ -91,7 +89,11 @@ def _task(request: dict[str, Any]) -> AgentTask:
         model=policy["model"],
         reasoning_effort=policy["effort"],
         working_directory=workspace,
-        permissions=PermissionProfile(mode=PermissionMode.STRICT, filesystem=mode),
+        permissions=PermissionProfile(
+            mode=PermissionMode.STRICT,
+            filesystem=mode,
+            native_profile="devflow-role" if spec["provider"] == "codex" else None,
+        ),
         resume_from=SessionResumeState(session_id=prior) if prior else None,
         deadline=datetime.now(UTC) + timedelta(seconds=int(policy.get("timeout_seconds", 7200))),
         output_schema=ASSESSMENT_SCHEMA,
@@ -160,7 +162,7 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
         # are not exposed and must remain unknown.
         "reported_model": None,
         "reported_effort": None,
-        "host_sandbox": "seatbelt",
+        "host_sandbox": "native-profile",
         "tool_calls": [asdict(item) for item in result.tool_calls],
     }
 

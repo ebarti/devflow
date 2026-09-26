@@ -111,3 +111,39 @@ async def test_local_api_auth_csrf_submit_replay_and_conflict(api_fixture):
         assert detail["events"][0]["type"] == "accepted"
         assert detail["evidence"] == []
         assert (await browser.get("/api/runs/run-1/evidence/not-indexed")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_terminal_cancel_is_conflict_without_pending_mutation(api_fixture):
+    path, request = api_fixture
+    app = create_app(path)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
+        token = (
+            (Path(json.loads(path.read_text())["state_root"]) / "service-token").read_text().strip()
+        )
+        login = await browser.post(
+            "/api/session", json={"token": token}, headers={"Origin": "http://127.0.0.1:18770"}
+        )
+        headers = {
+            "Origin": "http://127.0.0.1:18770",
+            "X-Devflow-CSRF": login.json()["csrf_token"],
+        }
+        assert (await browser.post("/api/runs", json=request, headers=headers)).status_code == 200
+        app.state.delivery.store.project(
+            "run-1",
+            phase="blocked",
+            execution_state="blocked",
+            event_type="blocked",
+            message="preparation failed",
+            outcome="blocked",
+        )
+        response = await browser.post(
+            "/api/runs/run-1/cancel",
+            json={"command_id": "cancel-blocked", "expected_revision": 1, "reason": "stop"},
+            headers=headers,
+        )
+        assert response.status_code == 409
+        assert "already terminal" in response.json()["detail"]
+        with app.state.delivery.store._connect() as db:
+            assert db.execute("SELECT COUNT(*) FROM delivery_mutations").fetchone()[0] == 0

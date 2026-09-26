@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shutil
 import socket
@@ -9,12 +10,14 @@ from pathlib import Path
 
 import pytest
 from temporalio import activity
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowUpdateFailedError
+from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from devflow_temporal.delivery_activities import delivery_prepare, delivery_project, delivery_role
 from devflow_temporal.delivery_api import DeliveryService
 from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_broker import _git as broker_git
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -129,6 +132,211 @@ def test_projection_event_is_idempotent_and_detail_is_factual(service):
     assert after["roles"] == []
     assert after["pull_request"] is None
     assert after["usage"] == {}
+
+
+def test_blocked_pre_role_run_can_transfer_claim_to_explicit_successor(service):
+    store, request = service
+    store.submit(request)
+    successor = {
+        **request,
+        "command_id": "submit-successor",
+        "run_id": "run-2",
+        "branch": "feat/fixture-2",
+        "supersedes_run_id": "run-1",
+    }
+    with pytest.raises(ValueError, match="only a blocked pre-role"):
+        store.submit(successor)
+    store.mark_start("run-1", accepted=True)
+    store.project(
+        "run-1",
+        phase="blocked",
+        execution_state="blocked",
+        event_type="blocked",
+        message="fixture preparation failed",
+        outcome="blocked",
+    )
+    assert store.submit(successor)["run_id"] == "run-2"
+    with store._connect() as db:
+        claim = store.state.claim_for(db, request["work_id"])
+        old_session = db.execute(
+            "SELECT closed_at FROM runtime_sessions WHERE id=?", ("external:devflow:run-1",)
+        ).fetchone()
+    assert claim["owner"] == "external:devflow:run-2"
+    assert old_session["closed_at"]
+    assert store.detail("run-1")["outcome"] == "blocked"
+
+
+def test_real_admission_rejects_project_config_and_unsafe_check_domains(service, tmp_path):
+    original, request = service
+    configuration = json.loads(original.config.path.read_text())
+    configuration["provider"] = "codex"
+    repository = configuration["repositories"]["fixture"]
+    repository.update(
+        {
+            "prepublish_checks": [
+                {"id": "install", "argv": ["/usr/bin/true"], "network_domains": ["127.0.0.1"]}
+            ],
+            "checks": [{"id": "test", "argv": ["/usr/bin/true"]}],
+            "required_ci": ["test"],
+            "project_url": "https://github.com/orgs/example/projects/1",
+            "assignee": "example",
+        }
+    )
+    original.config.path.write_text(json.dumps(configuration))
+    with pytest.raises(ValueError, match="network domain must not be an IP"):
+        DeliveryConfig.load(original.config.path).admit(request)
+
+    repository["prepublish_checks"][0]["network_domains"] = ["registry.npmjs.org"]
+    source = Path(repository["source_path"])
+    (source / ".codex").mkdir()
+    (source / ".codex" / "config.toml").write_text('sandbox_mode = "danger-full-access"\n')
+    _git(source, "add", ".codex/config.toml")
+    _git(source, "commit", "-qm", "Project permissions fixture")
+    repository["expected_base_sha"] = _git(source, "rev-parse", "HEAD")
+    original.config.path.write_text(json.dumps(configuration))
+    with pytest.raises(ValueError, match="project Codex configuration"):
+        DeliveryConfig.load(original.config.path).admit(request)
+
+    _git(source, "rm", "-rq", ".codex")
+    _git(source, "commit", "-qm", "Remove project permissions fixture")
+    repository["expected_base_sha"] = _git(source, "rev-parse", "HEAD")
+    wrapper = tmp_path / "codex-wrapper"
+    wrapper.write_text("#!/bin/sh\nexec /usr/bin/true\n")
+    wrapper.chmod(0o700)
+    configuration["codex_bin"] = str(wrapper)
+    original.config.path.write_text(json.dumps(configuration))
+    with pytest.raises(ValueError, match="pinned binary"):
+        DeliveryConfig.load(original.config.path).admit(request)
+
+
+def test_check_cwd_accepts_canonical_path_behind_checkout_alias(service, tmp_path):
+    store, request = service
+    store.submit(request)
+    broker = DeliveryBroker(store, store.spec("run-1"))
+    broker.prepare()
+    alias = tmp_path / "checkout-alias"
+    alias.symlink_to(broker.checkout, target_is_directory=True)
+    result = broker._run_check_list(
+        alias,
+        [{"id": "cwd", "argv": ["/usr/bin/python3", "-c", "print('ok')"], "cwd": "."}],
+        broker.state_dir / "alias-check",
+        broker.candidate(),
+    )
+    assert result["state"] == "passed"
+    assert result["results"][0]["cwd"] == str(broker.checkout.resolve())
+
+
+def test_broker_git_push_does_not_invoke_repository_hook(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    _git(source, "init", "-q")
+    _git(source, "config", "user.name", "Fixture")
+    _git(source, "config", "user.email", "fixture@example.invalid")
+    _git(source, "remote", "add", "origin", str(remote))
+    (source / "README.md").write_text("Fixture\n")
+    _git(source, "add", "README.md")
+    _git(source, "commit", "-qm", "Fixture")
+    sentinel = tmp_path / "outside.txt"
+    sentinel.write_text("SAFE\n")
+    hook = source / ".git" / "hooks" / "pre-push"
+    hook.write_text(f'#!/bin/sh\nprintf BREACH > "{sentinel}"\n')
+    hook.chmod(0o700)
+
+    broker_git(source, "push", "origin", "HEAD:refs/heads/fixture")
+
+    assert sentinel.read_text() == "SAFE\n"
+
+
+@pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS required")
+def test_real_check_command_cannot_escape_native_profile(service, tmp_path):
+    binary = Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
+    if not binary.is_file():
+        pytest.skip("Codex CLI with native permission profiles is unavailable")
+    store, request = service
+    store.submit(request)
+    spec = store.spec("run-1")
+    spec["provider"] = "codex"
+    spec["policy"].update(
+        {
+            "host_sandbox": "native-profile",
+            "codex_bin": str(binary),
+            "codex_bin_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        }
+    )
+    broker = DeliveryBroker(store, spec)
+    broker.prepare()
+    Path(_git(broker.checkout, "rev-parse", "--git-path", "info/exclude")).write_text(
+        "allowed.txt\n"
+    )
+    outside = tmp_path / "outside.txt"
+    outside.write_text("SAFE\n")
+    credential = tmp_path / "credential.txt"
+    credential.write_text("CANARY\n")
+    state_secret = broker.state_dir / "controller.txt"
+    state_secret.parent.mkdir(parents=True, exist_ok=True)
+    state_secret.write_text("STATE\n")
+    probe = (
+        "import json,pathlib,sys,subprocess,socket\n"
+        "paths=list(map(pathlib.Path,sys.argv[1:5]));port=int(sys.argv[5])\n"
+        "out={}\n"
+        "for name,path,write in zip(('owned','outside','credential','controller'),paths,"
+        "(True,True,False,False)):\n"
+        " try:\n"
+        "  path.write_text('BREACH\\n') if write else path.read_text()\n"
+        "  out[name]=True\n"
+        " except Exception as exc: out[name]=type(exc).__name__\n"
+        "try:\n"
+        " s=socket.create_connection(('127.0.0.1',port),timeout=1);s.sendall(b'BREACH');s.close()\n"
+        " out['loopback']=True\n"
+        "except Exception as exc: out['loopback']=type(exc).__name__\n"
+        "if len(sys.argv)<8:\n"
+        " child=subprocess.run([sys.executable,'-c',sys.argv[6],*sys.argv[1:7],'child'],"
+        "capture_output=True,text=True,timeout=10)\n"
+        " out['child']=json.loads(child.stdout)\n"
+        "print(json.dumps(out,sort_keys=True))\n"
+    )
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(1)
+    try:
+        check = {
+            "id": "security",
+            "argv": [
+                "/usr/bin/python3",
+                "-c",
+                probe,
+                str(broker.checkout / "allowed.txt"),
+                str(outside),
+                str(credential),
+                str(state_secret),
+                str(listener.getsockname()[1]),
+                probe,
+            ],
+            "cwd": ".",
+        }
+        result = broker._run_check_list(
+            broker.checkout, [check], broker.state_dir / "security-check", broker.candidate()
+        )
+        try:
+            received = listener.accept()[0].recv(100)
+        except TimeoutError:
+            received = None
+    finally:
+        listener.close()
+    assert result["state"] == "passed"
+    lines = Path(result["results"][0]["log"]).read_text().splitlines()
+    observed = json.loads(next(line for line in lines if line.startswith('{"child":')))
+    for item in (observed, observed["child"]):
+        assert item["owned"] is True
+        assert item["outside"] is not True
+        assert item["credential"] is not True
+        assert item["controller"] is not True
+        assert item["loopback"] is not True
+    assert outside.read_text() == "SAFE\n"
+    assert received is None
 
 
 @pytest.mark.asyncio
@@ -279,3 +487,142 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
     finally:
         server.terminate()
         await server.wait()
+
+
+@pytest.mark.asyncio
+async def test_managed_decision_wait_survives_worker_restart(service, tmp_path):
+    original, request = service
+    config = json.loads(original.config.path.read_text())
+    config["repositories"]["fixture"]["initial_decision_prompt"] = "Proceed with this run?"
+    original.config.path.write_text(json.dumps(config))
+    store = DeliveryStore(DeliveryConfig.load(original.config.path))
+    store.submit(request)
+    admitted = store.spec(request["run_id"])
+    calls = []
+
+    @activity.defn(name="delivery_tracker_start")
+    async def tracker_start_stub(_payload):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_role")
+    async def role_stub(payload):
+        calls.append(payload["role"])
+        return {"status": "blocked", "candidate": payload["candidate"]}
+
+    activities = [delivery_project, delivery_prepare, tracker_start_stub, role_stub]
+    async with await WorkflowEnvironment.start_local(
+        dev_server_database_filename=str(tmp_path / "decision-temporal.sqlite3")
+    ) as environment:
+        queue = "managed-decision-restart"
+        async with Worker(
+            environment.client,
+            task_queue=queue,
+            workflows=[DeliveryWorkflow],
+            activities=activities,
+        ):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run, admitted, id="delivery-run-1", task_queue=queue
+            )
+            store.mark_start(request["run_id"], accepted=True)
+            for _ in range(50):
+                if store.detail(request["run_id"])["decisions"]:
+                    break
+                await asyncio.sleep(0.05)
+            waiting = store.detail(request["run_id"])
+            assert waiting["decisions"][0]["id"] == "run-1:initial"
+            assert waiting["decisions"][0]["candidate_revision"] == 1
+            assert calls == []
+        async with Worker(
+            environment.client,
+            task_queue=queue,
+            workflows=[DeliveryWorkflow],
+            activities=activities,
+        ):
+            current = await handle.query("status")
+            assert current["phase"] == "waiting_decision"
+            with pytest.raises(WorkflowUpdateFailedError):
+                await handle.execute_update(
+                    "decision",
+                    {
+                        "expected_revision": current["revision"],
+                        "decision_id": "wrong",
+                        "decision_revision": 1,
+                        "candidate_revision": 1,
+                        "answer": "proceed",
+                    },
+                )
+            accepted = await handle.execute_update(
+                "decision",
+                {
+                    "expected_revision": current["revision"],
+                    "decision_id": "run-1:initial",
+                    "decision_revision": 1,
+                    "candidate_revision": 1,
+                    "answer": "proceed",
+                },
+            )
+            assert accepted["decision"] is None
+            final = await asyncio.wait_for(handle.result(), 15)
+        assert final["outcome"] == "blocked"
+        assert calls == ["implement"]
+        assert store.detail(request["run_id"])["decisions"] == []
+
+
+@pytest.mark.asyncio
+async def test_managed_cancel_wins_over_overlapping_failed_precheck(service, tmp_path):
+    original, request = service
+    config = json.loads(original.config.path.read_text())
+    config["repositories"]["fixture"]["allowed_paths"].append("devflow-fake-change.txt")
+    original.config.path.write_text(json.dumps(config))
+    store = DeliveryStore(DeliveryConfig.load(original.config.path))
+    store.submit(request)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    @activity.defn(name="delivery_tracker_start")
+    async def tracker_start_stub(_payload):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_precheck")
+    async def failing_precheck(_payload):
+        entered.set()
+        await release.wait()
+        return {"state": "failed", "results": []}
+
+    activities = [
+        delivery_project,
+        delivery_prepare,
+        delivery_role,
+        tracker_start_stub,
+        failing_precheck,
+    ]
+    async with await WorkflowEnvironment.start_local(
+        dev_server_database_filename=str(tmp_path / "cancel-temporal.sqlite3")
+    ) as environment:
+        async with Worker(
+            environment.client,
+            task_queue="managed-cancel-race",
+            workflows=[DeliveryWorkflow],
+            activities=activities,
+        ):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run,
+                store.spec(request["run_id"]),
+                id="delivery-run-1",
+                task_queue="managed-cancel-race",
+            )
+            store.mark_start(request["run_id"], accepted=True)
+            await asyncio.wait_for(entered.wait(), 15)
+            current = await handle.query("status")
+            assert current["phase"] == "prepublish_checks"
+            accepted = await handle.execute_update(
+                "cancel", {"expected_revision": current["revision"], "reason": "stop now"}
+            )
+            assert accepted["execution_state"] == "cancelling"
+            release.set()
+            final = await asyncio.wait_for(handle.result(), 15)
+        assert final["outcome"] == "cancelled"
+        assert final["cleanup"] == "confirmed_after_role_boundary"
+        detail = store.detail(request["run_id"])
+        assert detail["outcome"] == "cancelled"
+        assert detail["phase"] == "cancelled"

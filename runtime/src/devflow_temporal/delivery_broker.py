@@ -13,6 +13,7 @@ from typing import Any
 
 from .candidate import candidate_for
 from .contracts import canonical_json
+from .delivery_sandbox import prepare_native_check
 from .delivery_store import DeliveryStore, _now
 
 
@@ -29,7 +30,18 @@ def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 120) -> str
 
 
 def _git(path: Path, *args: str) -> str:
-    return _run(["git", "-C", str(path), *args])
+    return _run(
+        [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(path),
+            *args,
+        ]
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -256,30 +268,12 @@ class DeliveryBroker:
         candidate: dict[str, Any],
     ) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
+        checkout = checkout.resolve(strict=True)
         evidence_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-        check_home = self.state_dir / "check-home"
-        check_temp = self.state_dir / "check-tmp"
-        check_home.mkdir(mode=0o700, exist_ok=True)
-        check_temp.mkdir(mode=0o700, exist_ok=True)
-        check_env = {
-            key: value
-            for key, value in os.environ.items()
-            if key in {"PATH", "LANG", "LC_ALL", "USER", "LOGNAME"}
-        }
-        check_env.update(
-            {
-                "HOME": str(check_home),
-                "TMPDIR": str(check_temp),
-                "XDG_CACHE_HOME": str(check_home / ".cache"),
-                "COREPACK_HOME": str(check_home / ".corepack"),
-                "CI": "1",
-                "NO_COLOR": "1",
-            }
-        )
         for check in checks:
             argv = check.get("argv")
             relative = check.get("cwd", ".")
-            cwd = (checkout / relative).resolve()
+            cwd = (checkout / relative).resolve(strict=True)
             if (
                 not isinstance(argv, list)
                 or not argv
@@ -287,10 +281,28 @@ class DeliveryBroker:
                 or checkout not in (cwd, *cwd.parents)
             ):
                 raise ValueError("configured check command or cwd is invalid")
+            if self.spec["provider"] == "codex":
+                binary = Path(self.spec["policy"]["codex_bin"])
+                if not binary.is_file() or _sha256(binary) != self.spec["policy"].get(
+                    "codex_bin_sha256"
+                ):
+                    raise ValueError("Codex executable changed after check sandbox attestation")
+                profile, check_env = prepare_native_check(self.spec, checkout, evidence_dir, check)
+                # The CLI applies the selected OS sandbox before execing the
+                # candidate-controlled command and its descendants. Its home
+                # contains no provider or GitHub credentials.
+                command = [str(binary), "sandbox", "-P", profile, "-C", str(cwd), *argv]
+            elif self.spec["provider"] == "fake":
+                # Explicit fixture provider only; real deliveries never take
+                # this unsandboxed path.
+                check_env = {"PATH": os.environ.get("PATH", ""), "CI": "1"}
+                command = argv
+            else:
+                raise ValueError("unknown delivery provider")
             checked = subprocess.run(
-                argv,
+                command,
                 cwd=cwd,
-                env={**check_env, **check.get("env", {})},
+                env=check_env,
                 text=True,
                 capture_output=True,
                 check=False,
@@ -413,6 +425,12 @@ class DeliveryBroker:
             )
         existing = self._existing_pr()
         if changed:
+            for relative in sorted(changed):
+                attribute = _git(self.checkout, "check-attr", "filter", "--", relative)
+                if not attribute.endswith(": filter: unspecified") and not attribute.endswith(
+                    ": filter: unset"
+                ):
+                    raise ValueError("candidate path would invoke a Git clean filter")
             _git(self.checkout, "add", "--", *sorted(changed))
             if _git(self.checkout, "diff", "--cached", "--name-only"):
                 _git(
@@ -427,6 +445,8 @@ class DeliveryBroker:
         if head == self.spec["base_sha"]:
             raise ValueError("no meaningful commit is available for publication")
         remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
+            raise RuntimeError("Git push destination changed from the admitted origin")
         remote_head = remote.split()[0] if remote else None
         if remote_head != head:
             if remote_head:

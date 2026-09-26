@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json
-from .delivery_sandbox import prepare_sandbox
+from .delivery_sandbox import prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
 
 
@@ -139,21 +139,38 @@ class DeliverySupervisor:
                 # An ambiguous attempt retains its slot. An operator must
                 # resolve it before queued work can acquire authority.
                 await asyncio.sleep(5)
-            _private_json(request_path, request)
-            profile, role_env = prepare_sandbox(request, folder)
-            log_descriptor = os.open(
-                folder / "process.log", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
+            try:
+                _private_json(request_path, request)
+                if spec.get("provider") == "codex":
+                    _, role_env = prepare_native_role(request, folder)
+                    child_argv = [
+                        sys.executable,
+                        "-I",
+                        "-m",
+                        "devflow_temporal.role_runner",
+                        str(request_path),
+                    ]
+                else:
+                    profile, role_env = prepare_sandbox(request, folder)
+                    child_argv = [
+                        "/usr/bin/sandbox-exec",
+                        "-f",
+                        str(profile),
+                        sys.executable,
+                        "-I",
+                        "-m",
+                        "devflow_temporal.role_runner",
+                        str(request_path),
+                    ]
+                log_descriptor = os.open(
+                    folder / "process.log", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                )
+            except Exception as exc:
+                return self._mark_prelaunch_blocked(job_key, type(exc).__name__)
             log = os.fdopen(log_descriptor, "wb")
             try:
                 child = await asyncio.create_subprocess_exec(
-                    "/usr/bin/sandbox-exec",
-                    "-f",
-                    str(profile),
-                    sys.executable,
-                    "-m",
-                    "devflow_temporal.role_runner",
-                    str(request_path),
+                    *child_argv,
                     cwd=request["workspace"],
                     stdin=asyncio.subprocess.PIPE,
                     stdout=log,
@@ -207,8 +224,41 @@ class DeliverySupervisor:
                         await child.wait()
                 self._mark_unknown(job_key, "role cancelled during provider work")
                 raise
+            except Exception as exc:
+                if "child" not in locals():
+                    return self._mark_prelaunch_blocked(job_key, type(exc).__name__)
+                if child.returncode is None:
+                    try:
+                        os.killpg(child.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(child.wait(), timeout=5)
+                    except TimeoutError:
+                        os.killpg(child.pid, signal.SIGKILL)
+                        await child.wait()
+                self._mark_unknown(job_key, "role child failed without a final receipt")
+                raise
             finally:
                 log.close()
+
+    def _mark_prelaunch_blocked(self, job_key: str, reason: str) -> dict[str, Any]:
+        result = {
+            "status": "blocked",
+            "summary": "role launch failed before any provider process started",
+            "findings": [reason],
+            "session_id": None,
+            "usage": None,
+            "finish_reason": "prelaunch",
+        }
+        with self.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE delivery_attempts SET state='finished',result_json=?,
+                   finished_at=?,cleanup='confirmed' WHERE job_key=? AND state='starting'""",
+                (canonical_json(result), _now(), job_key),
+            )
+        return result
 
     def _mark_unknown(self, job_key: str, reason: str) -> dict[str, Any]:
         with self.store._connect() as db:

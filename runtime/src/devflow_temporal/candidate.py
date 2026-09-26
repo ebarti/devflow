@@ -64,8 +64,7 @@ def _files(root: Path) -> list[Path]:
             path = root / relative
             if not path.exists() and not path.is_symlink():
                 continue  # a deleted tracked file is absent from the candidate
-            if not stat.S_ISREG(path.lstat().st_mode):
-                raise ValueError(f"candidate contains a symlink or special file: {path}")
+            _validate_candidate_file(root, path)
             paths.append(path)
         return sorted(set(paths))
     paths: list[Path] = []
@@ -79,11 +78,24 @@ def _files(root: Path) -> list[Path]:
             if name in SKIP_NAMES:
                 continue
             path = Path(base, name)
-            mode = path.lstat().st_mode
-            if not stat.S_ISREG(mode):
-                raise ValueError(f"candidate contains a symlink or special file: {path}")
+            _validate_candidate_file(root, path)
             paths.append(path)
     return sorted(paths)
+
+
+def _validate_candidate_file(root: Path, path: Path) -> None:
+    mode = path.lstat().st_mode
+    if stat.S_ISREG(mode):
+        return
+    if stat.S_ISLNK(mode):
+        target_name = os.readlink(path)
+        if os.path.isabs(target_name):
+            raise ValueError(f"candidate symlink points outside its checkout: {path}")
+        target = path.resolve(strict=True)
+        if root.resolve() not in target.parents or not target.is_file():
+            raise ValueError(f"candidate symlink points outside a regular checkout file: {path}")
+        return
+    raise ValueError(f"candidate contains a special file: {path}")
 
 
 def content_hash(root: Path) -> str:
@@ -91,6 +103,9 @@ def content_hash(root: Path) -> str:
     for path in _files(root):
         relative = path.relative_to(root).as_posix()
         hasher.update(relative.encode("utf-8") + b"\0")
+        if path.is_symlink():
+            hasher.update(b"l" + os.readlink(path).encode("utf-8") + b"\0")
+            continue
         hasher.update(b"x" if path.stat().st_mode & stat.S_IXUSR else b"-")
         with path.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):

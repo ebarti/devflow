@@ -70,12 +70,16 @@ class DeliveryStore:
                     checks_json TEXT,
                     tracker_json TEXT,
                     usage_json TEXT,
+                    decision_json TEXT,
                     outcome TEXT,
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )"""
             )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(delivery_runs)")}
+            if "decision_json" not in columns:
+                db.execute("ALTER TABLE delivery_runs ADD COLUMN decision_json TEXT")
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_commands (
                     command_id TEXT PRIMARY KEY,
@@ -254,6 +258,34 @@ class DeliveryStore:
                 != self.state.issue_resource(spec["issue_url"])
             ):
                 raise ValueError("work ID is bound to another issue")
+            superseded = spec.get("supersedes_run_id")
+            if superseded:
+                previous = db.execute(
+                    """SELECT work_id,issue_url,repository_key,outcome,pr_json
+                       FROM delivery_runs WHERE run_id=?""",
+                    (superseded,),
+                ).fetchone()
+                attempts = db.execute(
+                    "SELECT COUNT(*) FROM delivery_attempts WHERE run_id=?", (superseded,)
+                ).fetchone()[0]
+                if (
+                    previous is None
+                    or (previous["work_id"], previous["issue_url"], previous["repository_key"])
+                    != (spec["work_id"], spec["issue_url"], spec["repository_key"])
+                    or previous["outcome"] != "blocked"
+                    or previous["pr_json"] is not None
+                    or attempts
+                ):
+                    raise ValueError("only a blocked pre-role run without a PR may be superseded")
+                old_owner = f"external:devflow:{superseded}"
+                claim = self.state.claim_for(db, spec["work_id"])
+                if claim is None or claim["owner"] != old_owner:
+                    raise ValueError("superseded run no longer owns this work")
+                self.state.release_work(db, spec["work_id"], old_owner)
+                db.execute(
+                    "UPDATE runtime_sessions SET closed_at=? WHERE id=? AND closed_at IS NULL",
+                    (self.state.now(), old_owner),
+                )
             self.state.claim_work(db, spec["work_id"], f"external:devflow:{run_id}", dashboard_url)
             timestamp = _now()
             db.execute(
@@ -360,6 +392,7 @@ class DeliveryStore:
         checks: dict[str, Any] | None = None,
         tracker: dict[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
+        decision: dict[str, Any] | None = None,
         protocol_revision: int | None = None,
         outcome: str | None = None,
         error: str | None = None,
@@ -370,6 +403,10 @@ class DeliveryStore:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
+            if row["outcome"] is not None and outcome != row["outcome"]:
+                # A late cancel-request projection cannot overwrite the final
+                # workflow result after its update was accepted.
+                return dict(row)
             if (
                 key is not None
                 and db.execute(
@@ -402,6 +439,7 @@ class DeliveryStore:
                 if tracker is not None
                 else row["tracker_json"],
                 "usage_json": canonical_json(usage) if usage is not None else row["usage_json"],
+                "decision_json": canonical_json(decision),
                 "outcome": outcome if outcome is not None else row["outcome"],
                 "error": error if error is not None else row["error"],
                 "updated_at": _now(),
@@ -435,7 +473,10 @@ class DeliveryStore:
         request_digest = digest(payload)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not db.execute("SELECT 1 FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone():
+            run = db.execute(
+                "SELECT outcome FROM delivery_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if run is None:
                 raise ValueError("run ID not found")
             prior = db.execute(
                 """SELECT run_id,kind,request_digest,state,response_json
@@ -445,7 +486,11 @@ class DeliveryStore:
             if prior:
                 if (prior[0], prior[1], prior[2]) != (run_id, kind, request_digest):
                     raise ValueError("command ID already belongs to another mutation")
+                if prior[3] == "rejected":
+                    raise ValueError(json.loads(prior[4])["error"])
                 return json.loads(prior[4]) if prior[3] == "complete" else None
+            if run["outcome"] is not None:
+                raise ValueError("run is already terminal")
             db.execute(
                 """INSERT INTO delivery_mutations
                    (command_id,run_id,kind,request_digest,state)
@@ -461,6 +506,23 @@ class DeliveryStore:
                 """UPDATE delivery_mutations SET state='complete',response_json=?
                    WHERE command_id=?""",
                 (canonical_json(response), command_id),
+            )
+
+    def reject_mutation(self, command_id: str, reason: str) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE delivery_mutations SET state='rejected',response_json=? WHERE command_id=?",
+                (canonical_json({"error": reason}), command_id),
+            )
+
+    def mark_mutation_unknown(self, command_id: str) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE delivery_mutations SET state='unknown'
+                   WHERE command_id=? AND state='pending'""",
+                (command_id,),
             )
 
     def list_runs(self) -> list[dict[str, Any]]:
@@ -534,7 +596,7 @@ class DeliveryStore:
             }
             for name, label, completion in (
                 ("prepare", "Prepare", "role_started"),
-                ("prepublish", "Before PR checks", "published"),
+                ("prepublish", "Before PR checks", "candidate_ready"),
                 ("publish", "Publish", "published"),
                 ("local_checks", "Local checks", "ci_wait"),
                 ("required_ci", "Required CI", "tracker_started"),
@@ -556,7 +618,9 @@ class DeliveryStore:
             "checks": json.loads(row["checks_json"]) if row["checks_json"] else {},
             "tracker": json.loads(row["tracker_json"]) if row["tracker_json"] else {},
             "usage": json.loads(row["usage_json"]) if row["usage_json"] else {},
-            "decisions": [],
+            "decisions": [json.loads(row["decision_json"])]
+            if row["decision_json"] and json.loads(row["decision_json"]) is not None
+            else [],
             "events": self.events(run_id),
             "error": row["error"],
         }

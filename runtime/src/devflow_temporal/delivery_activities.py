@@ -43,6 +43,7 @@ async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
         checks=request.get("checks"),
         tracker=request.get("tracker"),
         usage=request.get("usage"),
+        decision=request.get("decision"),
         protocol_revision=request.get("protocol_revision"),
         outcome=request.get("outcome"),
         error=request.get("error"),

@@ -33,6 +33,9 @@ required-environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
+[tool.uv.sources]
+agent-runtime-kit = { git = "https://github.com/ebarti/agent-runtime-kit.git", rev = "facc9034a7c26efa412ce69bac4b8689257c0d61" }
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

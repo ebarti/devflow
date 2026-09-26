@@ -341,3 +341,28 @@ def test_candidate_snapshot_excludes_ignored_credentials_and_rejects_symlinks(tm
     (repo / "linked.txt").symlink_to(secret)
     with pytest.raises(ValueError, match="symlink"):
         candidate_for(repo)
+
+
+def test_candidate_supports_tracked_internal_file_symlink_and_rejects_escape(tmp_path):
+    repo = repo_at(tmp_path / "linked-repo")
+    link = repo / "CLAUDE.md"
+    link.symlink_to("README.md")
+    subprocess.run(["git", "-C", str(repo), "add", "CLAUDE.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "Tracked relative link"], check=True)
+    first = candidate_for(repo)
+    gate = tmp_path / "linked-gate"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "--detach", str(gate), "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert candidate_for(gate) == first
+    copied = snapshot(repo, tmp_path / "state", "linked-run", first)
+    assert copied.joinpath("CLAUDE.md").is_symlink()
+    assert candidate_for(copied, head=first["head"]) == first
+    link.unlink()
+    link.symlink_to("../outside.txt")
+    (tmp_path / "outside.txt").write_text("outside")
+    with pytest.raises(ValueError, match="outside"):
+        candidate_for(repo)

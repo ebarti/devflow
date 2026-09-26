@@ -316,8 +316,11 @@ def create_app(config_path: Path) -> FastAPI:
                 name, payload, id=command_id
             )
         except WorkflowUpdateFailedError as exc:
-            raise HTTPException(409, str(exc.__cause__ or exc)) from exc
+            reason = str(exc.__cause__ or exc)
+            service.store.reject_mutation(command_id, reason)
+            raise HTTPException(409, reason) from exc
         except RPCError as exc:
+            service.store.mark_mutation_unknown(command_id)
             raise HTTPException(503, type(exc).__name__) from exc
         response = {"run_id": run_id, "phase": result["phase"], "revision": result["revision"]}
         service.store.finish_mutation(command_id, response)
