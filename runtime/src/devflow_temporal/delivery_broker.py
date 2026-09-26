@@ -18,6 +18,7 @@ from .candidate import candidate_for
 from .contracts import canonical_json
 from .delivery_browser_qa import run_browser_qa as execute_browser_qa
 from .delivery_container import Bind, OwnedContainer, dependency_volume
+from .delivery_output import visible_output
 from .delivery_store import DeliveryStore, _now
 
 
@@ -542,17 +543,18 @@ class DeliveryBroker:
                 os.chmod(artifact, 0o600)
             else:
                 raise ValueError("unknown delivery provider")
+            parsed_output = visible_output(output)
             count = None
             if check.get("test_count_regex"):
                 import re
 
-                numbers = re.findall(check["test_count_regex"], output)
+                numbers = re.findall(check["test_count_regex"], parsed_output)
                 count = sum(int(number) for number in numbers) if numbers else 0
             rejected_output = False
             if check.get("reject_regex"):
                 import re
 
-                rejected_output = re.search(check["reject_regex"], output) is not None
+                rejected_output = re.search(check["reject_regex"], parsed_output) is not None
             passed = (
                 exit_code == 0
                 and (count is None or count >= int(check.get("min_tests", 1)))

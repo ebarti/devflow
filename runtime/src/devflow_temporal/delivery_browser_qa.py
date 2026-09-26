@@ -18,6 +18,7 @@ from typing import Any
 
 from .candidate import candidate_for
 from .contracts import canonical_json, digest
+from .delivery_output import visible_output
 from .delivery_sandbox import prepare_browser_qa
 from .delivery_store import _now
 
@@ -408,7 +409,7 @@ def run_browser_qa_native_fixture(
         raise
     if any(_listeners(port) for port in ports):
         cleanup = "unknown"
-    output = log.read_text(encoding="utf-8", errors="replace")
+    output = visible_output(log.read_text(encoding="utf-8", errors="replace"))
     numbers = re.findall(qa["test_count_regex"], output)
     count = sum(int(number) for number in numbers) if numbers else 0
     rejected = bool(qa.get("reject_regex") and re.search(qa["reject_regex"], output))

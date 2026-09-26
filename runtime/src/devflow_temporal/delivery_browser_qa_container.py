@@ -13,6 +13,7 @@ from .candidate import candidate_for
 from .contracts import canonical_json, digest
 from .delivery_browser_qa import _artifacts
 from .delivery_container import Bind, OwnedContainer
+from .delivery_output import visible_output
 
 
 def _hash(path: Path) -> str:
@@ -113,7 +114,7 @@ def run_browser_qa_container(
         volume_mounts=((volume, "/store", True),),
     ).run()
     log = contained.log
-    output = log.read_text(encoding="utf-8", errors="replace")
+    output = visible_output(log.read_text(encoding="utf-8", errors="replace"))
     numbers = re.findall(qa["test_count_regex"], output)
     count = sum(int(number) for number in numbers) if numbers else 0
     rejected = bool(qa.get("reject_regex") and re.search(qa["reject_regex"], output))
