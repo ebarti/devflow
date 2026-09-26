@@ -83,9 +83,25 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
     )
     if role == "implement":
         after = broker.candidate()
-        if result.get("status") == "pass" and after["id"] == candidate["id"]:
-            result["status"] = "blocked"
-            result.setdefault("findings", []).append("implementer produced no candidate change")
+        if result.get("status") == "pass":
+            changed = subprocess.run(
+                ["git", "-C", str(broker.checkout), "status", "--porcelain=v1",
+                 "--untracked-files=all"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            ).stdout.strip()
+            if not changed:
+                result["status"] = "blocked"
+                result.setdefault("findings", []).append(
+                    "implementer candidate has no feature diff"
+                )
+            elif after["id"] == candidate["id"] and not (
+                request.get("continuation") and iteration == 0
+            ):
+                result["status"] = "blocked"
+                result.setdefault("findings", []).append("implementer produced no candidate change")
     else:
         observed = candidate_for(workspace)
         source = broker.candidate()

@@ -18,6 +18,7 @@ from .candidate import candidate_for
 from .contracts import canonical_json
 from .delivery_browser_qa import run_browser_qa as execute_browser_qa
 from .delivery_container import Bind, OwnedContainer, dependency_volume
+from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
 from .delivery_output import observed_test_count, visible_output
 from .delivery_store import DeliveryStore, _now
 
@@ -141,10 +142,34 @@ class DeliveryBroker:
         recovery = self.spec["policy"].get("recovery")
         provenance = self._recover(recovery) if recovery else None
         candidate = self.candidate()
+        continuation = self.spec.get("continuation")
+        if continuation:
+            source = Path(recovery["source_path"])
+            if (
+                selected_digest(source, recovery["paths"])
+                != continuation["source_manifest_sha256"]
+                or candidate["id"] != continuation["candidate_id"]
+            ):
+                raise ValueError("continuation import differs from the finished role candidate")
+            source_home = (
+                self.state_dir.parent / continuation["from_run_id"] / "role-homes" / "implement"
+            )
+            destination_home = self.state_dir / "role-homes" / "implement"
+            copy_session_state(
+                source_home,
+                destination_home,
+                continuation["session_id"],
+                continuation["session_state_sha256"],
+            )
+            if session_state_digest(
+                destination_home, continuation["session_id"]
+            ) != continuation["session_state_sha256"]:
+                raise ValueError("continuation session state changed after import")
         result = {
             "checkout": str(self.checkout),
             "candidate": candidate,
             "provenance": provenance,
+            "continuation": continuation,
         }
         self._finish_effect(key, result)
         return result
@@ -564,6 +589,7 @@ class DeliveryBroker:
                     "test_count": count,
                     "rejected_output": rejected_output,
                     "passed": passed,
+                    "diagnostic": parsed_output[-2000:] if not passed else None,
                     "log": str(artifact),
                     "log_sha256": _sha256(artifact),
                     "container_id": outcome.container_id

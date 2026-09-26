@@ -348,6 +348,7 @@ class DeliverySupervisor:
                 "container_authorized": True,
                 "findings": request.get("findings"),
                 "resume_session": request.get("resume_session"),
+                "continuation": request.get("continuation"),
                 "recovery_path": "/recovery" if recovery.is_dir() else None,
                 "review_diff": {**review_diff, "path": "/evidence/diff.patch"}
                 if review_diff

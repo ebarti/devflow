@@ -144,6 +144,9 @@ def run_browser_qa_container(
         "exit_code": contained.exit_code,
         "test_count": count,
         "rejected_output": rejected,
+        "diagnostic": output[-2000:]
+        if contained.exit_code or count < qa["min_tests"] or rejected or not unchanged
+        else None,
         "log": str(log),
         "log_sha256": contained.log_sha256,
         "artifacts": artifacts,

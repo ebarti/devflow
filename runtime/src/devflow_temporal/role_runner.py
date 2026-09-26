@@ -45,19 +45,30 @@ def _task(request: dict[str, Any]) -> AgentTask:
     instructions = {
         "implement": (
             "Implement the accepted plan in this owned checkout. Preserve unrelated work. "
-            "Run relevant checks and report concrete evidence. Do not push, open a PR, "
-            "merge, or change GitHub tracking; the controller owns those effects. "
-            "Status pass requires a substantive candidate change."
+            "Run checks available within your role and report concrete evidence. The "
+            "controller, not this role, runs frozen dependency preparation, mandatory "
+            "prepublication and final checks, browser/API QA, CI and publication after "
+            "your implementation checkpoint. Shell network and Git metadata are "
+            "intentionally unavailable here; their absence alone is not an implementation "
+            "defect. Status pass means substantive code is ready for those mandatory broker "
+            "gates, not that the feature is verified. Report checks you could not run as "
+            "pending in your summary; report actual implementation defects as findings. "
+            "Do not push, open a PR, merge, or change GitHub tracking."
         ),
         "review": (
             "Independently review the exact candidate against the accepted plan. "
-            "Inspect source and meaningful tests. Report actionable defects and missing "
-            "evidence as findings. Do not edit files."
+            "Inspect source, controller-bound diff and meaningful tests. Report actionable "
+            "defects and missing evidence available at this review gate as findings. "
+            "Final broker checks and browser QA are later gates; do not call them passed "
+            "or block solely because they have not run yet. Do not edit files."
         ),
         "verify": (
-            "Independently exercise the exact candidate through the real local entry "
-            "points and report observed commands, outcomes, and gaps. This checkout "
-            "is disposable. Do not push, open a PR, or change GitHub tracking."
+            "Independently assess the exact candidate, controller-bound diff and broker "
+            "check/browser receipts. Run additional entry-point checks available within "
+            "this disposable role when useful. Broker-executed tests are evidence to "
+            "inspect, not tests you performed; unavailable network or GitHub authority "
+            "is not by itself a verification defect. Report real gaps and failures. "
+            "Do not push, open a PR, or change GitHub tracking."
         ),
     }[role]
     recovery = spec["policy"].get("recovery")
@@ -82,6 +93,15 @@ def _task(request: dict[str, Any]) -> AgentTask:
         else ""
     )
     qa_evidence = request.get("qa_evidence")
+    continuation_note = (
+        "This is a guarded continuation in the original implementer session. The "
+        "recovered candidate already contains substantive feature changes; assess their "
+        "readiness honestly and edit only where needed. A cosmetic new edit is not a "
+        "condition for the implementation checkpoint. Prior findings about unavailable "
+        "broker-owned checks are historical, not evidence that those checks passed.\n"
+        if role == "implement" and request.get("continuation")
+        else ""
+    )
     qa_note = (
         "The broker, not you, executed the owned browser/API/SQLite QA. Inspect "
         f"its immutable receipt at {qa_evidence['path']} and log at {qa_evidence['log']}; "
@@ -98,6 +118,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"Candidate: {candidate['id']} at {candidate['head']}\n"
         f"Allowed feature paths: {json.dumps(spec['policy']['allowed_paths'])}\n"
         f"Previous findings to repair: {json.dumps(findings)}\n"
+        f"{continuation_note}\n"
         f"{recovery_note}\n"
         f"{diff_note}\n"
         f"{qa_note}\n"

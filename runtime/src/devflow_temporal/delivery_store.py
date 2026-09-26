@@ -9,14 +9,21 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .candidate import candidate_for
 from .contracts import canonical_json, digest
 from .delivery_config import DeliveryConfig
+from .delivery_continuation import (
+    continuation_authority,
+    selected_manifest,
+    session_state_digest,
+)
 
 
 def _now() -> str:
@@ -272,25 +279,32 @@ class DeliveryStore:
             superseded = spec.get("supersedes_run_id")
             if superseded:
                 previous = db.execute(
-                    """SELECT work_id,issue_url,repository_key,outcome,pr_json,request_json
+                    """SELECT work_id,issue_url,repository_key,outcome,execution_state,
+                              pr_json,checks_json,request_json
                        FROM delivery_runs WHERE run_id=?""",
                     (superseded,),
                 ).fetchone()
                 attempts = db.execute(
-                    "SELECT COUNT(*) FROM delivery_attempts WHERE run_id=?", (superseded,)
-                ).fetchone()[0]
+                    "SELECT * FROM delivery_attempts WHERE run_id=?", (superseded,)
+                ).fetchall()
                 if (
                     previous is None
                     or (previous["work_id"], previous["issue_url"], previous["repository_key"])
                     != (spec["work_id"], spec["issue_url"], spec["repository_key"])
                     or previous["outcome"] != "blocked"
+                    or previous["execution_state"] != "blocked"
                     or previous["pr_json"] is not None
-                    or attempts
                 ):
-                    raise ValueError("only a blocked pre-role run without a PR may be superseded")
+                    raise ValueError("only a blocked unpublished run may be superseded")
                 prior_spec = json.loads(previous["request_json"])
                 if prior_spec["branch"] == spec["branch"]:
                     raise ValueError("superseded run retains the owned branch; choose a new branch")
+                if attempts:
+                    spec["continuation"] = self._post_role_continuation(
+                        db, spec, prior_spec, previous, attempts
+                    )
+                elif (spec["policy"].get("recovery") or {}).get("continuation"):
+                    raise ValueError("pre-role supersede cannot import a role session")
                 old_owner = f"external:devflow:{superseded}"
                 claim = self.state.claim_for(db, spec["work_id"])
                 if claim is None or claim["owner"] != old_owner:
@@ -334,6 +348,134 @@ class DeliveryStore:
                 (command_id, run_id, request_digest, canonical_json(response)),
             )
             return response
+
+    def _post_role_continuation(
+        self,
+        db: sqlite3.Connection,
+        spec: dict[str, Any],
+        prior_spec: dict[str, Any],
+        previous: sqlite3.Row,
+        attempts: list[sqlite3.Row],
+    ) -> dict[str, Any]:
+        """Freeze one finished post-role result before transferring its claim."""
+
+        recovery = spec["policy"].get("recovery") or {}
+        control = recovery.get("continuation")
+        required = {
+            "from_run_id", "attempt_job_key", "session_id", "candidate_id",
+            "history_result_path", "history_result_sha256",
+            "source_manifest_sha256", "session_state_sha256",
+        }
+        if not isinstance(control, dict) or set(control) != required:
+            raise ValueError("post-role continuation requires exact private evidence")
+        old_id = prior_spec["run_id"]
+        if (
+            control["from_run_id"] != old_id
+            or spec.get("supersedes_run_id") != old_id
+            or spec["base_sha"] != prior_spec["base_sha"]
+            or spec["source_path"] != prior_spec["source_path"]
+            or Path(recovery["source_path"]).resolve(strict=True)
+            != Path(prior_spec["checkout"]).resolve(strict=True)
+            or continuation_authority(spec["policy"])
+            != continuation_authority(prior_spec["policy"])
+            or previous["checks_json"] not in (None, "{}")
+            or len(attempts) != 1
+        ):
+            raise ValueError("continuation changed authority or predecessor identity")
+        attempt = attempts[0]
+        if (
+            attempt["role"] != "implement"
+            or attempt["iteration"] != 0
+            or attempt["job_key"] != control["attempt_job_key"]
+            or attempt["state"] != "finished"
+            or attempt["cleanup"] != "confirmed"
+            or not attempt["finished_at"]
+            or attempt["session_id"] != control["session_id"]
+            or not attempt["result_json"]
+        ):
+            raise ValueError("continuation predecessor role is not finished and contained")
+        effects = db.execute(
+            "SELECT kind,state FROM delivery_effects WHERE run_id=?", (old_id,)
+        ).fetchall()
+        if not effects or any(
+            row["kind"] not in {"prepare", "dependency-preparation"}
+            or row["state"] != "complete" for row in effects
+        ):
+            raise ValueError("continuation predecessor has an unresolved external effect")
+        history_path = Path(control["history_result_path"])
+        info = history_path.lstat()
+        if (
+            not history_path.is_absolute()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or hashlib.sha256(history_path.read_bytes()).hexdigest()
+            != control["history_result_sha256"]
+        ):
+            raise ValueError("continuation Temporal result evidence changed")
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+        role = history.get("role_result")
+        raw = json.loads(attempt["result_json"])
+        if (
+            history.get("workflow_id") != f"delivery-{old_id}"
+            or history.get("run_id") != old_id
+            or history.get("outcome") != "blocked"
+            or not isinstance(role, dict)
+            or role.get("role") != "implement"
+            or role.get("iteration") != 0
+            or role.get("status") != "blocked"
+            or role.get("cleanup") != "confirmed"
+            or role.get("session_id") != control["session_id"]
+            or any(role.get(key) != value for key, value in raw.items())
+        ):
+            raise ValueError("continuation history differs from the finished role receipt")
+        candidate = role.get("candidate")
+        source = Path(prior_spec["checkout"])
+        if (
+            not isinstance(candidate, dict)
+            or candidate.get("id") != control["candidate_id"]
+            or candidate.get("base_sha") != spec["base_sha"]
+            or any(candidate.get(key) != value for key, value in candidate_for(source).items())
+        ):
+            raise ValueError("continuation source differs from the completed activity candidate")
+        manifest = selected_manifest(source, recovery["paths"])
+        if digest(manifest) != control["source_manifest_sha256"]:
+            raise ValueError("continuation recovered file manifest changed")
+        finished_ns = int(datetime.fromisoformat(attempt["finished_at"]).timestamp() * 1e9)
+        if any(
+            item.get("type") == "file" and int(item["mtime_ns"]) > finished_ns
+            for item in manifest.values()
+        ):
+            raise ValueError("continuation source was edited after the role finished")
+        home = Path(prior_spec["state_dir"]) / "role-homes" / "implement"
+        if session_state_digest(home, control["session_id"]) != control["session_state_sha256"]:
+            raise ValueError("continuation provider session state changed")
+        self._ensure_no_remote_pr(spec["github_repo"], prior_spec["branch"])
+        return {
+            "from_run_id": old_id,
+            "attempt_job_key": attempt["job_key"],
+            "session_id": control["session_id"],
+            "candidate_id": candidate["id"],
+            "source_manifest_sha256": control["source_manifest_sha256"],
+            "session_state_sha256": control["session_state_sha256"],
+            "history_result_sha256": control["history_result_sha256"],
+            "findings": role.get("findings", []),
+        }
+
+    @staticmethod
+    def _ensure_no_remote_pr(repository: str, branch: str) -> None:
+        remote = subprocess.run(
+            [
+                "gh", "pr", "list", "--repo", repository, "--head", branch,
+                "--state", "all", "--json", "number",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if remote.returncode or json.loads(remote.stdout) != []:
+            raise ValueError("continuation predecessor has a remote pull request")
 
     def spec(self, run_id: str) -> dict[str, Any]:
         with self._connect() as db:
