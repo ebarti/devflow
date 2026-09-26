@@ -15,6 +15,7 @@ from temporalio.client import Client, WorkflowUpdateFailedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
+from devflow_temporal import delivery_broker
 from devflow_temporal.delivery_activities import delivery_prepare, delivery_project, delivery_role
 from devflow_temporal.delivery_api import DeliveryService
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -30,6 +31,7 @@ from devflow_temporal.delivery_config import (
 from devflow_temporal.delivery_sandbox import validate_network_domain
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+from devflow_temporal.payload import payload_digest
 from devflow_temporal.role_runner import _task
 from devflow_temporal.supervisor import DeliverySupervisor
 
@@ -221,6 +223,26 @@ def test_browser_gate_projects_current_candidate_failure_and_resets_on_repair(se
     )
     repaired = {gate["id"]: gate["state"] for gate in store.detail("run-1")["phase_gates"]}
     assert repaired["local_checks"] == repaired["browser_qa"] == "pending"
+
+
+def test_unknown_check_projects_quarantined_cleanup_and_gate(service):
+    store, request = service
+    store.submit(request)
+    store.project(
+        "run-1",
+        phase="blocked",
+        execution_state="blocked",
+        event_type="blocked",
+        message="Docker inspection unavailable",
+        checks={"prepublish": {"state": "unknown", "cleanup": "unknown"}},
+        cleanup="unknown",
+        outcome="blocked",
+        key="unknown-check",
+    )
+    detail = store.detail("run-1")
+    assert detail["cleanup"] == "unknown"
+    assert detail["checks"]["prepublish"]["state"] == "unknown"
+    assert next(g for g in detail["phase_gates"] if g["id"] == "prepublish")["state"] == "unknown"
 
 
 def test_blocked_pre_role_run_can_transfer_claim_to_explicit_successor(service):
@@ -426,6 +448,22 @@ def test_contained_attestation_requires_child_credential_and_network_denials():
         assert not _contained_probe_passed({**observed, **changed}, role=True)
 
 
+def test_runner_payload_identity_includes_imported_modules_and_launcher(tmp_path):
+    package = tmp_path / "devflow_temporal"
+    package.mkdir()
+    (package / "role_runner.py").write_text("from .bridge import ASSESSMENT_SCHEMA\n")
+    bridge = package / "bridge.py"
+    bridge.write_text("ASSESSMENT_SCHEMA = {'required': ['summary']}\n")
+    launcher = tmp_path / "landlock_exec.py"
+    launcher.write_text("print('bounded')\n")
+    original = payload_digest(package, launcher)
+    bridge.write_text("ASSESSMENT_SCHEMA = {'required': ['summary', 'status']}\n")
+    assert payload_digest(package, launcher) != original
+    bridge.write_text("ASSESSMENT_SCHEMA = {'required': ['summary']}\n")
+    launcher.write_text("print('changed')\n")
+    assert payload_digest(package, launcher) != original
+
+
 def test_admission_rejects_tracked_project_codex_config(service):
     original, request = service
     configuration = json.loads(original.config.path.read_text())
@@ -491,6 +529,33 @@ def test_check_cwd_accepts_canonical_path_behind_checkout_alias(service, tmp_pat
     )
     assert result["state"] == "passed"
     assert result["results"][0]["cwd"] == str(broker.checkout.resolve())
+
+
+def test_git_metadata_prelaunch_clone_interruption_rebuilds_without_a_check(service, monkeypatch):
+    store, request = service
+    store.submit(request)
+    broker = DeliveryBroker(store, store.spec(request["run_id"]))
+    broker.prepare()
+    candidate = broker.candidate()
+    original_run = delivery_broker._run
+
+    def fail_after_clone(argv, **kwargs):
+        if "fetch" in argv and ".staging" in " ".join(argv):
+            raise RuntimeError("injected crash before Git snapshot publication")
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(delivery_broker, "_run", fail_after_clone)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        broker.git_metadata(candidate)
+    root = broker.state_dir / "git-metadata"
+    assert (root / f".{candidate['id']}.staging").is_dir()
+    assert not (root / f"{candidate['id']}.git").exists()
+
+    monkeypatch.setattr(delivery_broker, "_run", original_run)
+    metadata = broker.git_metadata(candidate)
+    assert (metadata / "devflow-manifest.json").is_file()
+    assert not (root / f".{candidate['id']}.staging").exists()
+    assert broker.git_metadata(candidate) == metadata
 
 
 def test_gate_diff_is_bound_to_base_head_and_rejects_tampering(service):
@@ -851,6 +916,79 @@ async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure
     assert result["outcome"] == ("delivered" if qa_state == "passed" else "blocked")
     if qa_state == "unknown":
         assert result["cleanup"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unknown_stage", ["prepublish", "local"])
+async def test_managed_check_unknown_keeps_terminal_cleanup_quarantined(unknown_stage):
+    candidate = {"id": "candidate-1", "head": "head-1"}
+    spec = {
+        "run_id": f"unknown-{unknown_stage}",
+        "provider": "fake",
+        "policy": {"max_repairs": 0, "browser_qa": None},
+    }
+
+    @activity.defn(name="delivery_project")
+    async def project_stub(_payload):
+        return {"revision": 1}
+
+    @activity.defn(name="delivery_prepare")
+    async def prepare_stub(_payload):
+        return {"candidate": candidate}
+
+    @activity.defn(name="delivery_tracker_start")
+    async def start_stub(_payload):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_role")
+    async def role_stub(payload):
+        return {
+            "status": "pass",
+            "session_id": f"fake:{payload['role']}",
+            "candidate": candidate,
+        }
+
+    @activity.defn(name="delivery_precheck")
+    async def precheck_stub(_payload):
+        return (
+            {"state": "unknown", "cleanup": "unknown"}
+            if unknown_stage == "prepublish"
+            else {"state": "passed"}
+        )
+
+    @activity.defn(name="delivery_publish")
+    async def publish_stub(_payload):
+        return {"candidate": candidate, "head": candidate["head"]}
+
+    @activity.defn(name="delivery_checks")
+    async def checks_stub(_payload):
+        return {"state": "unknown", "cleanup": "unknown"}
+
+    async with await WorkflowEnvironment.start_local() as environment:
+        async with Worker(
+            environment.client,
+            task_queue=spec["run_id"],
+            workflows=[DeliveryWorkflow],
+            activities=[
+                project_stub,
+                prepare_stub,
+                start_stub,
+                role_stub,
+                precheck_stub,
+                publish_stub,
+                checks_stub,
+            ],
+        ):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run,
+                spec,
+                id=spec["run_id"],
+                task_queue=spec["run_id"],
+            )
+            result = await handle.result()
+    assert result["outcome"] == "blocked"
+    assert result["cleanup"] == "unknown"
+    assert result["checks"][unknown_stage]["state"] == "unknown"
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -14,11 +15,14 @@ from temporalio.worker import Worker
 
 from devflow_temporal.delivery_activities import (
     delivery_browser_qa,
+    delivery_checks,
+    delivery_precheck,
     delivery_prepare,
     delivery_project,
 )
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_container import ContainerUnknown
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -26,6 +30,61 @@ def _git(path: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(path), *args], check=True, capture_output=True, text=True
     ).stdout.strip()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks])
+async def test_contained_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class Broker:
+        def run_prechecks(self, _iteration, _candidate):
+            started.set()
+            assert release.wait(2)
+            return {"state": "passed"}
+
+        run_checks = run_prechecks
+
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_activities._context", lambda _spec: (None, Broker())
+    )
+    task = asyncio.create_task(activity_fn({"spec": {}, "iteration": 0, "candidate": {}}))
+    try:
+        beginning = time.monotonic()
+        assert await asyncio.to_thread(started.wait, 1)
+        await asyncio.sleep(0.02)
+        assert time.monotonic() - beginning < 0.5
+        assert not task.done()
+    finally:
+        release.set()
+    assert await task == {"state": "passed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks, delivery_browser_qa])
+async def test_contained_effect_uncertainty_is_returned_for_durable_projection(
+    activity_fn, monkeypatch
+):
+    class Broker:
+        def run_prechecks(self, _iteration, _candidate):
+            raise ContainerUnknown("Docker inspection became unavailable")
+
+        run_checks = run_prechecks
+        run_browser_qa = run_prechecks
+
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_activities._context", lambda _spec: (None, Broker())
+    )
+    result = await activity_fn(
+        {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {"id": "candidate"}}
+    )
+    assert result == {
+        "state": "unknown",
+        "cleanup": "unknown",
+        "candidate_id": "candidate",
+        "reason": "ContainerUnknown",
+    }
 
 
 @pytest.fixture

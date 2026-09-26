@@ -119,15 +119,38 @@ async def delivery_publish(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_checks")
 async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
-    _, broker = _context(request["spec"])
-    return broker.run_checks(request["iteration"], request["candidate"])
+    def execute() -> dict[str, Any]:
+        _, broker = _context(request["spec"])
+        try:
+            return broker.run_checks(request["iteration"], request["candidate"])
+        except Exception as exc:
+            if request["spec"]["provider"] != "codex":
+                raise
+            return {
+                "state": "unknown",
+                "cleanup": "unknown",
+                "candidate_id": request["candidate"]["id"],
+                "reason": type(exc).__name__,
+            }
+
+    return await asyncio.to_thread(execute)
 
 
 @activity.defn(name="delivery_browser_qa")
 async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
         _, broker = _context(request["spec"])
-        return broker.run_browser_qa(request["iteration"], request["candidate"])
+        try:
+            return broker.run_browser_qa(request["iteration"], request["candidate"])
+        except Exception as exc:
+            if request["spec"]["provider"] != "codex":
+                raise
+            return {
+                "state": "unknown",
+                "cleanup": "unknown",
+                "candidate_id": request["candidate"]["id"],
+                "reason": type(exc).__name__,
+            }
 
     # Browser/API fixtures may run for minutes. Keep the Temporal worker loop
     # available for cancellation updates and unrelated workflows while this
@@ -137,8 +160,21 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_precheck")
 async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
-    _, broker = _context(request["spec"])
-    return broker.run_prechecks(request["iteration"], request["candidate"])
+    def execute() -> dict[str, Any]:
+        _, broker = _context(request["spec"])
+        try:
+            return broker.run_prechecks(request["iteration"], request["candidate"])
+        except Exception as exc:
+            if request["spec"]["provider"] != "codex":
+                raise
+            return {
+                "state": "unknown",
+                "cleanup": "unknown",
+                "candidate_id": request["candidate"]["id"],
+                "reason": type(exc).__name__,
+            }
+
+    return await asyncio.to_thread(execute)
 
 
 @activity.defn(name="delivery_ci")

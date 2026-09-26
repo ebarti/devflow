@@ -648,6 +648,8 @@ class DeliveryStore:
                 return "completed"
             if observed_gate_states.get(name) in {"failed", "blocked", "conflict"}:
                 return "failed"
+            if observed_gate_states.get(name) == "unknown":
+                return "unknown"
             return "pending"
 
         gate_specs = [

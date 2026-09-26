@@ -53,6 +53,10 @@ class DeliveryWorkflow:
         if any(
             role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
             for role in self.state["roles"]
+        ) or any(
+            isinstance(check, dict)
+            and (check.get("cleanup") == "unknown" or check.get("state") == "unknown")
+            for check in self.state["checks"].values()
         ):
             self.state["cleanup"] = "unknown"
         if self.cancel_requested:
@@ -67,9 +71,17 @@ class DeliveryWorkflow:
         return self.state
 
     async def _cancelled(self, spec: dict[str, Any]) -> dict[str, Any]:
-        uncertain = self.state.get("cleanup") == "unknown" or any(
-            role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
-            for role in self.state["roles"]
+        uncertain = (
+            self.state.get("cleanup") == "unknown"
+            or any(
+                role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
+                for role in self.state["roles"]
+            )
+            or any(
+                isinstance(check, dict)
+                and (check.get("cleanup") == "unknown" or check.get("state") == "unknown")
+                for check in self.state["checks"].values()
+            )
         )
         self.state["phase"] = "cancelled"
         self.state["execution_state"] = "terminal"
@@ -194,8 +206,11 @@ class DeliveryWorkflow:
                     {"spec": spec, "iteration": iteration, "candidate": self.state["candidate"]},
                 )
             except Exception as exc:
+                self.state["cleanup"] = "unknown"
                 return await self._stop(spec, f"prepublication checks failed: {type(exc).__name__}")
             self.state["checks"]["prepublish"] = prechecked
+            if prechecked.get("state") == "unknown" or prechecked.get("cleanup") == "unknown":
+                return await self._stop(spec, "prepublication container cleanup is unknown")
             if self.cancel_requested:
                 return await self._cancelled(spec)
             if prechecked.get("state") != "passed":
@@ -248,10 +263,13 @@ class DeliveryWorkflow:
                             },
                         )
                     except Exception as exc:
+                        self.state["cleanup"] = "unknown"
                         return await self._stop(
                             spec, f"checks activity failed: {type(exc).__name__}"
                         )
                     self.state["checks"]["local"] = checked
+                    if checked.get("state") == "unknown" or checked.get("cleanup") == "unknown":
+                        return await self._stop(spec, "local check container cleanup is unknown")
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                     if checked.get("state") != "passed":
@@ -273,6 +291,7 @@ class DeliveryWorkflow:
                             },
                         )
                     except Exception as exc:
+                        self.state["cleanup"] = "unknown"
                         return await self._stop(
                             spec, f"browser QA activity failed: {type(exc).__name__}"
                         )

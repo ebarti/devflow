@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from .contracts import RUN_ID_RE, digest
 from .delivery_sandbox import validate_network_domain
+from .payload import payload_digest
 
 BRANCH_RE = re.compile(r"^(?:feat|fix|docs|chore)/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -130,6 +131,7 @@ def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str,
         "codex_bin",
         "codex_bin_sha256",
         "role_runner_sha256",
+        "runtime_payload_sha256",
         "pnpm_lock_sha256",
     }
     if not isinstance(container, dict) or required - set(container):
@@ -154,6 +156,10 @@ def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str,
     runner = Path(__file__).with_name("role_runner.py")
     if hashlib.sha256(runner.read_bytes()).hexdigest() != container["role_runner_sha256"]:
         raise ValueError("role runner source changed after image build")
+    package = Path(__file__).resolve().parent
+    launcher = package.parents[1] / "docker" / "landlock_exec.py"
+    if payload_digest(package, launcher) != container["runtime_payload_sha256"]:
+        raise ValueError("trusted runner payload changed after image build")
     lock = source / "pnpm-lock.yaml"
     if (
         lock.is_symlink()
@@ -181,6 +187,7 @@ def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str,
         or image.get("Id") != container["image_id"]
         or f"{image.get('Os')}/{image.get('Architecture')}" != container["platform"]
         or labels.get("devflow.role_runner_sha256") != container["role_runner_sha256"]
+        or labels.get("devflow.runtime_payload_sha256") != container["runtime_payload_sha256"]
         or labels.get("devflow.codex_bin_sha256") != container["codex_bin_sha256"]
         or labels.get("devflow.kit_revision") != "d9ed6e186ce028d0db3b044ce959a94f409510c5"
         or labels.get("devflow.codex_cli_version") != REQUIRED_CODEX_VERSION
@@ -194,6 +201,7 @@ def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str,
         "docker_bin_sha256": container["docker_bin_sha256"],
         "seccomp_sha256": container["seccomp_sha256"],
         "role_runner_sha256": container["role_runner_sha256"],
+        "runtime_payload_sha256": container["runtime_payload_sha256"],
         "codex_bin_sha256": container["codex_bin_sha256"],
         "pnpm_lock_sha256": container["pnpm_lock_sha256"],
     }

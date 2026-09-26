@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -339,91 +340,111 @@ class DeliveryBroker:
         ):
             raise ValueError("candidate Git metadata root is not private")
         metadata = root / f"{candidate_id}.git"
-        receipt = root / f"{candidate_id}.json"
-        if not metadata.exists():
-            if receipt.exists():
-                raise RuntimeError("candidate Git metadata vanished after its receipt")
-            command = [
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "clone",
-                "--bare",
-                "--no-local",
-                "--quiet",
-                str(self.source),
-                str(metadata),
-            ]
-            _run(command, timeout=180)
-            _run(
-                [
-                    "git",
-                    f"--git-dir={metadata}",
-                    "fetch",
-                    "--no-tags",
-                    "--quiet",
-                    str(self.checkout),
-                    candidate["head"],
-                ],
-                timeout=180,
-            )
-            for key, value in (
-                ("core.bare", "false"),
-                ("core.worktree", "/work"),
-                ("core.hooksPath", "/dev/null"),
-                ("core.fsmonitor", "false"),
+        staging = root / f".{candidate_id}.staging"
+        lock = root / f"{candidate_id}.lock"
+        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "rb") as stream:
+            lock_info = lock.lstat()
+            if (
+                not stat.S_ISREG(lock_info.st_mode)
+                or stat.S_IMODE(lock_info.st_mode) != 0o600
+                or lock_info.st_uid != os.getuid()
             ):
-                _run(["git", f"--git-dir={metadata}", "config", key, value])
-            subprocess.run(
-                ["git", f"--git-dir={metadata}", "config", "--remove-section", "remote.origin"],
-                capture_output=True,
-                check=False,
-                timeout=30,
-            )
-            _run(
-                [
+                raise RuntimeError("candidate Git metadata lock is not private")
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            if not metadata.exists() and not metadata.is_symlink():
+                # Staging is never mounted. An interruption here occurred
+                # before any check or browser command could start.
+                if staging.exists() or staging.is_symlink():
+                    stage_info = staging.lstat()
+                    if not stat.S_ISDIR(stage_info.st_mode) or stage_info.st_uid != os.getuid():
+                        raise RuntimeError("candidate Git metadata staging is not owned")
+                    shutil.rmtree(staging)
+                command = [
                     "git",
-                    f"--git-dir={metadata}",
-                    "update-ref",
-                    "refs/heads/devflow-candidate",
-                    candidate["head"],
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "clone",
+                    "--bare",
+                    "--no-local",
+                    "--quiet",
+                    str(self.source),
+                    str(staging),
                 ]
-            )
-            _run(
-                [
-                    "git",
-                    f"--git-dir={metadata}",
-                    "symbolic-ref",
-                    "HEAD",
-                    "refs/heads/devflow-candidate",
-                ]
-            )
-            _run(["git", f"--git-dir={metadata}", "read-tree", candidate["head"]])
-            manifest = {
-                "candidate_id": candidate_id,
-                "head": candidate["head"],
-                "config_sha256": _sha256(metadata / "config"),
-                "index_sha256": _sha256(metadata / "index"),
-                "head_sha256": _sha256(metadata / "HEAD"),
-            }
-            descriptor = os.open(receipt, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(canonical_json(manifest) + "\n")
-        if not receipt.is_file() or metadata.is_symlink() or not metadata.is_dir():
-            raise RuntimeError("candidate Git metadata preparation is incomplete")
-        recorded = json.loads(receipt.read_text(encoding="utf-8"))
-        if (
-            recorded.get("candidate_id") != candidate_id
-            or recorded.get("head") != candidate["head"]
-            or recorded.get("config_sha256") != _sha256(metadata / "config")
-            or recorded.get("index_sha256") != _sha256(metadata / "index")
-            or recorded.get("head_sha256") != _sha256(metadata / "HEAD")
-            or _run(["git", f"--git-dir={metadata}", "rev-parse", "HEAD"]) != candidate["head"]
-        ):
-            raise RuntimeError("candidate Git metadata changed after it was frozen")
-        return metadata
+                _run(command, timeout=180)
+                _run(
+                    [
+                        "git",
+                        f"--git-dir={staging}",
+                        "fetch",
+                        "--no-tags",
+                        "--quiet",
+                        str(self.checkout),
+                        candidate["head"],
+                    ],
+                    timeout=180,
+                )
+                for key, value in (
+                    ("core.bare", "false"),
+                    ("core.worktree", "/work"),
+                    ("core.hooksPath", "/dev/null"),
+                    ("core.fsmonitor", "false"),
+                ):
+                    _run(["git", f"--git-dir={staging}", "config", key, value])
+                subprocess.run(
+                    ["git", f"--git-dir={staging}", "config", "--remove-section", "remote.origin"],
+                    capture_output=True,
+                    check=False,
+                    timeout=30,
+                )
+                _run(
+                    [
+                        "git",
+                        f"--git-dir={staging}",
+                        "update-ref",
+                        "refs/heads/devflow-candidate",
+                        candidate["head"],
+                    ]
+                )
+                _run(
+                    [
+                        "git",
+                        f"--git-dir={staging}",
+                        "symbolic-ref",
+                        "HEAD",
+                        "refs/heads/devflow-candidate",
+                    ]
+                )
+                _run(["git", f"--git-dir={staging}", "read-tree", candidate["head"]])
+                manifest = {
+                    "candidate_id": candidate_id,
+                    "head": candidate["head"],
+                    "config_sha256": _sha256(staging / "config"),
+                    "index_sha256": _sha256(staging / "index"),
+                    "head_sha256": _sha256(staging / "HEAD"),
+                }
+                receipt = staging / "devflow-manifest.json"
+                receipt_descriptor = os.open(receipt, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(receipt_descriptor, "w", encoding="utf-8") as saved:
+                    saved.write(canonical_json(manifest) + "\n")
+                os.chmod(staging, 0o700)
+                staging.rename(metadata)
+            receipt = metadata / "devflow-manifest.json"
+            if metadata.is_symlink() or not metadata.is_dir() or not receipt.is_file():
+                raise RuntimeError("candidate Git metadata preparation is incomplete")
+            recorded = json.loads(receipt.read_text(encoding="utf-8"))
+            if (
+                recorded.get("candidate_id") != candidate_id
+                or recorded.get("head") != candidate["head"]
+                or recorded.get("config_sha256") != _sha256(metadata / "config")
+                or recorded.get("index_sha256") != _sha256(metadata / "index")
+                or recorded.get("head_sha256") != _sha256(metadata / "HEAD")
+                or _run(["git", f"--git-dir={metadata}", "rev-parse", "HEAD"]) != candidate["head"]
+            ):
+                raise RuntimeError("candidate Git metadata changed after it was frozen")
+            return metadata
 
     def _run_check_list(
         self,
