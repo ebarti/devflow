@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
 import threading
@@ -182,6 +183,69 @@ async def test_local_api_auth_csrf_submit_replay_and_conflict(api_fixture):
         assert detail["events"][0]["type"] == "accepted"
         assert detail["evidence"] == []
         assert (await browser.get("/api/runs/run-1/evidence/not-indexed")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_public_evidence_reads_contained_role_and_browser_logs(api_fixture):
+    path, request = api_fixture
+    app = create_app(path)
+    store = app.state.delivery.store
+    store.submit(request)
+    root = Path(store.spec("run-1")["state_dir"])
+    role_log = root / "attempts" / "implement-0" / "container" / "container.log"
+    role_log.parent.mkdir(parents=True)
+    role_log.write_text("contained role output\n")
+    role_sha = hashlib.sha256(role_log.read_bytes()).hexdigest()
+    with store._connect() as db:
+        db.execute(
+            """INSERT INTO delivery_attempts
+               (job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                "implement-0",
+                "run-1",
+                "implement",
+                0,
+                "candidate-1",
+                "finished",
+                json.dumps({"container_log_sha256": role_sha}),
+                "confirmed",
+            ),
+        )
+    browser_folder = root / "browser-qa" / "0"
+    browser_log = browser_folder / "container" / "container.log"
+    browser_log.parent.mkdir(parents=True)
+    browser_log.write_text("4 passed\n")
+    browser_sha = hashlib.sha256(browser_log.read_bytes()).hexdigest()
+    (browser_folder / "receipt.json").write_text(
+        json.dumps({"iteration": 0, "log": str(browser_log), "log_sha256": browser_sha})
+    )
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
+        token = (Path(json.loads(path.read_text())["state_root"]) / "service-token").read_text()
+        assert (
+            await browser.post(
+                "/api/session",
+                json={"token": token.strip()},
+                headers={"Origin": "http://127.0.0.1:18770"},
+            )
+        ).status_code == 200
+        listed = (await browser.get("/api/runs/run-1")).json()["evidence"]
+        assert {item["id"] for item in listed} == {
+            "role-implement-0",
+            "browser-qa-0-log",
+            "browser-qa-0-receipt",
+        }
+        role = (await browser.get("/api/runs/run-1/evidence/role-implement-0")).json()
+        qa = (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).json()
+        assert role["text"] == "contained role output\n"
+        assert role["sha256"] == role_sha
+        assert qa["text"] == "4 passed\n"
+        assert qa["sha256"] == browser_sha
+        role_log.write_text("changed after result\n")
+        browser_log.write_text("changed after receipt\n")
+        assert (await browser.get("/api/runs/run-1/evidence/role-implement-0")).status_code == 404
+        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
 
 
 @pytest.mark.asyncio

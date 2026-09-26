@@ -707,54 +707,116 @@ class DeliveryStore:
             "error": row["error"],
         }
 
-    def evidence_index(self, run_id: str) -> list[dict[str, Any]]:
+    def _evidence_items(self, run_id: str) -> list[dict[str, Any]]:
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
         with self._connect() as db:
             attempts = db.execute(
-                "SELECT job_key,role,iteration FROM delivery_attempts WHERE run_id=?",
+                "SELECT job_key,role,iteration,result_json FROM delivery_attempts WHERE run_id=?",
                 (run_id,),
             ).fetchall()
         for attempt in attempts:
-            path = root / "attempts" / attempt["job_key"] / "process.log"
+            folder = root / "attempts" / attempt["job_key"]
+            contained_log = folder / "container" / "container.log"
+            path = contained_log if contained_log.is_file() else folder / "process.log"
             if path.is_file():
+                result = json.loads(attempt["result_json"]) if attempt["result_json"] else {}
                 indexed.append(
                     {
                         "id": f"role-{attempt['role']}-{attempt['iteration']}",
-                        "label": f"{attempt['role']} process log, attempt {attempt['iteration']}",
+                        "label": f"{attempt['role']} log, attempt {attempt['iteration']}",
                         "path": path,
+                        "expected_sha256": result.get("container_log_sha256")
+                        if path == contained_log
+                        else None,
+                        "limit": 20 * 1024 * 1024 if path == contained_log else 1024 * 1024,
                     }
                 )
         details = self.detail(run_id)
         for result in details.get("checks", {}).get("local", {}).get("results", []):
             path = Path(result["log"])
-            indexed.append({"id": f"check-{result['id']}", "label": result["id"], "path": path})
+            indexed.append(
+                {
+                    "id": f"check-{result['id']}",
+                    "label": result["id"],
+                    "path": path,
+                    "expected_sha256": result.get("log_sha256"),
+                    "limit": 20 * 1024 * 1024 if path.name == "container.log" else 1024 * 1024,
+                }
+            )
         for folder in sorted((root / "browser-qa").glob("[0-9]*")):
-            for name, suffix in (("receipt.json", "receipt"), ("browser-qa.log", "log")):
-                path = folder / name
-                if path.is_file():
-                    indexed.append(
-                        {
-                            "id": f"browser-qa-{folder.name}-{suffix}",
-                            "label": f"browser QA {suffix}, iteration {folder.name}",
-                            "path": path,
-                        }
-                    )
+            if not folder.name.isdecimal():
+                continue
+            receipt = folder / "receipt.json"
+            if receipt.is_file():
+                indexed.append(
+                    {
+                        "id": f"browser-qa-{folder.name}-receipt",
+                        "label": f"browser QA receipt, iteration {folder.name}",
+                        "path": receipt,
+                        "limit": 1024 * 1024,
+                    }
+                )
+            contained_log = folder / "container" / "container.log"
+            path = contained_log if contained_log.is_file() else folder / "browser-qa.log"
+            if path.is_file():
+                expected_hash = None
+                if receipt.is_file():
+                    if (
+                        receipt.is_symlink()
+                        or root.resolve() not in receipt.resolve().parents
+                        or receipt.stat().st_size > 1024 * 1024
+                    ):
+                        continue
+                    try:
+                        saved = json.loads(receipt.read_text(encoding="utf-8"))
+                        if not isinstance(saved, dict):
+                            continue
+                        if saved.get("log") == str(path) and saved.get("iteration") == int(
+                            folder.name
+                        ):
+                            expected_hash = saved.get("log_sha256")
+                        else:
+                            continue
+                    except (OSError, UnicodeError, ValueError, TypeError):
+                        continue
+                indexed.append(
+                    {
+                        "id": f"browser-qa-{folder.name}-log",
+                        "label": f"browser QA log, iteration {folder.name}",
+                        "path": path,
+                        "expected_sha256": expected_hash,
+                        "limit": 20 * 1024 * 1024 if path == contained_log else 1024 * 1024,
+                    }
+                )
         recovery = root / "recovery" / "provenance.json"
         if recovery.is_file():
             indexed.append(
-                {"id": "recovery-provenance", "label": "Recovery provenance", "path": recovery}
+                {
+                    "id": "recovery-provenance",
+                    "label": "Recovery provenance",
+                    "path": recovery,
+                    "limit": 1024 * 1024,
+                }
             )
-        safe = []
+        safe: list[dict[str, Any]] = []
         for item in indexed:
             path = item["path"]
             if (
                 path.is_symlink()
                 or not path.is_file()
                 or root.resolve() not in path.resolve().parents
+                or path.stat().st_size > item["limit"]
             ):
                 continue
+            safe.append(item)
+        return safe
+
+    def evidence_index(self, run_id: str) -> list[dict[str, Any]]:
+        safe = []
+        for item in self._evidence_items(run_id):
+            path = item["path"]
             safe.append(
                 {
                     "id": item["id"],
@@ -766,46 +828,23 @@ class DeliveryStore:
         return safe
 
     def evidence(self, run_id: str, evidence_id: str) -> dict[str, Any]:
-        spec = self.spec(run_id)
-        root = Path(spec["state_dir"])
-        known = {item["id"] for item in self.evidence_index(run_id)}
-        if evidence_id not in known:
+        matched = [item for item in self._evidence_items(run_id) if item["id"] == evidence_id]
+        if len(matched) != 1:
             raise ValueError("evidence ID is not indexed for this run")
-        if evidence_id == "recovery-provenance":
-            path = root / "recovery" / "provenance.json"
-        elif evidence_id.startswith("browser-qa-"):
-            indexed = {
-                f"browser-qa-{folder.name}-{suffix}": folder / name
-                for folder in (root / "browser-qa").glob("[0-9]*")
-                for name, suffix in (("receipt.json", "receipt"), ("browser-qa.log", "log"))
-            }
-            path = indexed[evidence_id]
-        elif evidence_id.startswith("role-"):
-            with self._connect() as db:
-                attempts = db.execute(
-                    "SELECT job_key,role,iteration FROM delivery_attempts WHERE run_id=?",
-                    (run_id,),
-                ).fetchall()
-            matched = [
-                row for row in attempts if evidence_id == f"role-{row['role']}-{row['iteration']}"
-            ]
-            if len(matched) != 1:
-                raise ValueError("evidence identity is ambiguous")
-            path = root / "attempts" / matched[0]["job_key"] / "process.log"
-        else:
-            results = self.detail(run_id).get("checks", {}).get("local", {}).get("results", [])
-            matched = [item for item in results if evidence_id == f"check-{item['id']}"]
-            if len(matched) != 1:
-                raise ValueError("evidence identity is ambiguous")
-            path = Path(matched[0]["log"])
+        item = matched[0]
+        path = item["path"]
+        root = Path(self.spec(run_id)["state_dir"])
         if path.is_symlink() or root.resolve() not in path.resolve().parents:
             raise ValueError("evidence path escaped its run state")
         data = path.read_bytes()
-        if len(data) > 1024 * 1024:
+        if len(data) > item["limit"]:
             raise ValueError("evidence exceeds the local read limit")
+        observed_sha256 = hashlib.sha256(data).hexdigest()
+        if item.get("expected_sha256") and item["expected_sha256"] != observed_sha256:
+            raise ValueError("evidence differs from its immutable result")
         return {
             "id": evidence_id,
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "sha256": observed_sha256,
             "bytes": len(data),
             "text": data.decode("utf-8", errors="replace"),
         }
