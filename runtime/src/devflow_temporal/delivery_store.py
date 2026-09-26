@@ -87,6 +87,8 @@ class DeliveryStore:
                     outcome TEXT,
                     cleanup TEXT NOT NULL DEFAULT 'none',
                     error TEXT,
+                    workflow_id TEXT,
+                    recovery_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )"""
@@ -102,6 +104,10 @@ class DeliveryStore:
                 db.execute(
                     "ALTER TABLE delivery_runs ADD COLUMN cleanup TEXT NOT NULL DEFAULT 'none'"
                 )
+            if "workflow_id" not in columns:
+                db.execute("ALTER TABLE delivery_runs ADD COLUMN workflow_id TEXT")
+            if "recovery_json" not in columns:
+                db.execute("ALTER TABLE delivery_runs ADD COLUMN recovery_json TEXT")
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_commands (
                     command_id TEXT PRIMARY KEY,
@@ -398,6 +404,218 @@ class DeliveryStore:
         except Exception as exc:
             raise ValueError("continuation predecessor Temporal closure is unproven") from exc
 
+    def recover_publication(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+        """Queue one same-run continuation after a pushed PR outlived readback.
+
+        The completed Temporal result is the authority for the checkpoint.
+        Git and GitHub are checked twice: before this transaction and by the
+        read-only recovery activity before any downstream gate can start.
+        """
+        from .delivery_broker import DeliveryBroker
+
+        required = {
+            "command_id",
+            "expected_revision",
+            "expected_candidate_id",
+            "expected_head",
+            "expected_pr_number",
+        }
+        if not isinstance(supplied, dict) or set(supplied) != required:
+            raise ValueError("publication recovery fields do not match the contract")
+        command_id = supplied["command_id"]
+        head = supplied["expected_head"]
+        pr_number = supplied["expected_pr_number"]
+        if (
+            not isinstance(command_id, str)
+            or not command_id
+            or type(supplied["expected_revision"]) is not int
+            or not isinstance(supplied["expected_candidate_id"], str)
+            or not isinstance(head, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", head)
+            or type(pr_number) is not int
+            or pr_number < 1
+        ):
+            raise ValueError("invalid publication recovery identity")
+        request_digest = digest({"run_id": run_id, **supplied})
+        with self._connect() as db:
+            prior = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            if prior:
+                if prior["request_digest"] != request_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(prior["response_json"])
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            raise ValueError("run ID not found")
+        spec = json.loads(row["request_json"])
+        closed = self._completed_temporal_result(run_id)
+        state = closed["result"]
+        candidate = state.get("candidate") if isinstance(state, dict) else None
+        precheck = state.get("checks", {}).get("prepublish", {}) if isinstance(state, dict) else {}
+        roles = state.get("roles", []) if isinstance(state, dict) else []
+        iteration = state.get("iteration") if isinstance(state, dict) else None
+        previous_pr = state.get("pull_request") if isinstance(state, dict) else None
+        if (
+            closed["workflow_id"] != f"delivery-{run_id}"
+            or closed["request_digest"] != row["request_digest"]
+            or not isinstance(state, dict)
+            or state.get("run_id") != run_id
+            or state.get("phase") != "blocked"
+            or state.get("outcome") != "blocked"
+            or state.get("execution_state") != "blocked"
+            or state.get("error") != "publication unresolved: ActivityError"
+            or state.get("cleanup") != "none"
+            or state.get("revision") != supplied["expected_revision"]
+            or type(iteration) is not int
+            or iteration < 0
+            or not isinstance(candidate, dict)
+            or candidate.get("id") != supplied["expected_candidate_id"]
+            or candidate.get("head") == head
+            or not isinstance(precheck, dict)
+            or precheck.get("state") != "passed"
+            or precheck.get("candidate_id") != candidate["id"]
+            or precheck.get("source_unchanged") is not True
+            or not isinstance(precheck.get("results"), list)
+            or not precheck["results"]
+            or any(
+                not isinstance(item, dict)
+                or item.get("passed") is not True
+                or item.get("cleanup") != "confirmed"
+                for item in precheck["results"]
+            )
+            or not isinstance(roles, list)
+            or not roles
+            or roles[-1].get("role") != "implement"
+            or roles[-1].get("iteration") != iteration
+            or roles[-1].get("status") != "pass"
+            or roles[-1].get("cleanup") != "confirmed"
+            or roles[-1].get("candidate", {}).get("id") != candidate["id"]
+            or not roles[-1].get("session_id")
+            or (
+                previous_pr is not None
+                and (
+                    not isinstance(previous_pr, dict)
+                    or previous_pr.get("number") != pr_number
+                    or previous_pr.get("head") != candidate["head"]
+                )
+            )
+        ):
+            raise ValueError("closed Temporal result is not a recoverable publication")
+        broker = DeliveryBroker(self, spec)
+        observed = broker.reconcile_publish(
+            iteration,
+            candidate,
+            expected_head=head,
+            expected_pr_number=pr_number,
+            complete=False,
+        )
+        if observed.get("state") == "pending":
+            raise ValueError("published head has not read back at the expected PR")
+        workflow_id = f"delivery-{run_id}-publish-recovery-1"
+        recovery = {
+            "predecessor_execution_run_id": closed["execution_run_id"],
+            "predecessor_closed_at": closed["closed_at"],
+            "state": state,
+            "expected_head": head,
+            "expected_pr_number": pr_number,
+            "observed_publication": observed,
+        }
+        response = {
+            "run_id": run_id,
+            "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
+            "phase": "publication_recovery_queued",
+            "workflow_id": workflow_id,
+            "existing": False,
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            if prior:
+                if prior["request_digest"] != request_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(prior["response_json"])
+            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            effects = db.execute(
+                "SELECT effect_key,kind,request_json,state FROM delivery_effects WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+            attempts = db.execute(
+                "SELECT state,cleanup FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            key = f"publish:{run_id}:{iteration}"
+            pending = [item for item in effects if item["state"] == "pending"]
+            if (
+                current is None
+                or current["request_json"] != row["request_json"]
+                or current["outcome"] != "blocked"
+                or current["phase"] != "blocked"
+                or current["error"] != state["error"]
+                or current["cleanup"] != "none"
+                or current["protocol_revision"] != state["revision"]
+                or current["recovery_json"] is not None
+                or current["workflow_id"] is not None
+                or json.loads(current["candidate_json"] or "null") != candidate
+                or json.loads(current["checks_json"] or "{}").get("prepublish") != precheck
+                or json.loads(current["pr_json"] or "null") != previous_pr
+                or claim is None
+                or claim["owner"] != f"external:devflow:{run_id}"
+                or len(pending) != 1
+                or pending[0]["effect_key"] != key
+                or pending[0]["kind"] != "publish"
+                or pending[0]["request_json"]
+                != canonical_json(
+                    {
+                        "iteration": iteration,
+                        "input_candidate_id": candidate["id"],
+                    }
+                )
+                or any(item["state"] not in {"complete", "pending"} for item in effects)
+                or len(attempts) != len(roles)
+                or any(
+                    item["state"] in {"starting", "running", "unknown"}
+                    or item["cleanup"] != "confirmed"
+                    for item in attempts
+                )
+            ):
+                raise ValueError("publication recovery lost its frozen run or effect")
+            revision = current["revision"] + 1
+            db.execute(
+                """UPDATE delivery_runs SET phase='publication_recovery_queued',
+                   execution_state='queued',outcome=NULL,error=NULL,revision=?,
+                   workflow_id=?,recovery_json=?,updated_at=? WHERE run_id=?""",
+                (revision, workflow_id, canonical_json(recovery), _now(), run_id),
+            )
+            db.execute(
+                """UPDATE delivery_outbox SET state='pending',last_error=NULL,updated_at=?
+                   WHERE run_id=?""",
+                (_now(), run_id),
+            )
+            self._event(
+                db,
+                run_id,
+                revision,
+                "publication_recovery_queued",
+                "Existing PR head verified; resuming remaining gates",
+                {
+                    "iteration": iteration,
+                    "candidate_id": candidate["id"],
+                    "expected_head": head,
+                    "pr_number": pr_number,
+                    "predecessor_execution_run_id": closed["execution_run_id"],
+                },
+            )
+            db.execute(
+                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                (command_id, run_id, request_digest, canonical_json(response)),
+            )
+        return response
+
     def _post_role_continuation(
         self,
         db: sqlite3.Connection,
@@ -412,9 +630,14 @@ class DeliveryStore:
         recovery = spec["policy"].get("recovery") or {}
         control = recovery.get("continuation")
         required = {
-            "from_run_id", "attempt_job_key", "session_id", "candidate_id",
-            "history_result_path", "history_result_sha256",
-            "source_manifest_sha256", "session_state_sha256",
+            "from_run_id",
+            "attempt_job_key",
+            "session_id",
+            "candidate_id",
+            "history_result_path",
+            "history_result_sha256",
+            "source_manifest_sha256",
+            "session_state_sha256",
         }
         if not isinstance(control, dict) or set(control) != required:
             raise ValueError("post-role continuation requires exact private evidence")
@@ -439,9 +662,15 @@ class DeliveryStore:
         ):
             raise ValueError("continuation changed authority or predecessor identity")
         old_state = Path(prior_spec["state_dir"])
-        if any((old_state / name).exists() or (old_state / name).is_symlink() for name in (
-            "prechecks", "checks", "browser-qa", "gate-evidence",
-        )):
+        if any(
+            (old_state / name).exists() or (old_state / name).is_symlink()
+            for name in (
+                "prechecks",
+                "checks",
+                "browser-qa",
+                "gate-evidence",
+            )
+        ):
             raise ValueError("continuation predecessor crossed a broker check gate")
         attempt = attempts[0]
         if (
@@ -459,8 +688,8 @@ class DeliveryStore:
             "SELECT kind,state FROM delivery_effects WHERE run_id=?", (old_id,)
         ).fetchall()
         if not effects or any(
-            row["kind"] not in {"prepare", "dependency-preparation"}
-            or row["state"] != "complete" for row in effects
+            row["kind"] not in {"prepare", "dependency-preparation"} or row["state"] != "complete"
+            for row in effects
         ):
             raise ValueError("continuation predecessor has an unresolved external effect")
         history_path = Path(control["history_result_path"])
@@ -471,8 +700,7 @@ class DeliveryStore:
             or not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o600
-            or hashlib.sha256(history_bytes).hexdigest()
-            != control["history_result_sha256"]
+            or hashlib.sha256(history_bytes).hexdigest() != control["history_result_sha256"]
         ):
             raise ValueError("continuation Temporal result evidence changed")
         history = json.loads(history_bytes)
@@ -546,8 +774,17 @@ class DeliveryStore:
     def _ensure_no_remote_pr(repository: str, branch: str) -> None:
         remote = subprocess.run(
             [
-                "gh", "pr", "list", "--repo", repository, "--head", branch,
-                "--state", "all", "--json", "number",
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repository,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--json",
+                "number",
             ],
             check=False,
             capture_output=True,
@@ -566,10 +803,20 @@ class DeliveryStore:
                 raise ValueError("run ID not found")
             return json.loads(row[0])
 
+    def active_workflow_id(self, run_id: str) -> str:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT workflow_id FROM delivery_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("run ID not found")
+            return row[0] or f"delivery-{run_id}"
+
     def pending_starts(self) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute(
-                """SELECT r.run_id,r.request_digest,r.request_json FROM delivery_runs r
+                """SELECT r.run_id,r.request_digest,r.request_json,r.workflow_id,
+                          r.recovery_json FROM delivery_runs r
                    JOIN delivery_outbox o ON o.run_id=r.run_id
                    WHERE o.state IN ('pending','unknown') ORDER BY r.created_at"""
             ).fetchall()
@@ -583,7 +830,7 @@ class DeliveryStore:
             ).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
-            if row[1] != "accepted":
+            if row[1] not in {"accepted", "publication_recovery_queued"}:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
                     # recorded start_workflow's acknowledgement.
@@ -593,7 +840,13 @@ class DeliveryStore:
                         (_now(), run_id),
                     )
                 return
-            new_phase = "preparing" if accepted else "accepted"
+            new_phase = (
+                "publishing"
+                if row[1] == "publication_recovery_queued" and accepted
+                else "preparing"
+                if accepted
+                else row[1]
+            )
             new_state = "running" if accepted else "pending_temporal"
             revision = row[0] + 1
             db.execute(

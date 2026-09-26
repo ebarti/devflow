@@ -11,6 +11,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -146,8 +147,7 @@ class DeliveryBroker:
         if continuation:
             source = Path(recovery["source_path"])
             if (
-                selected_digest(source, recovery["paths"])
-                != continuation["source_manifest_sha256"]
+                selected_digest(source, recovery["paths"]) != continuation["source_manifest_sha256"]
                 or candidate["id"] != continuation["candidate_id"]
             ):
                 raise ValueError("continuation import differs from the finished role candidate")
@@ -161,9 +161,10 @@ class DeliveryBroker:
                 continuation["session_id"],
                 continuation["session_state_sha256"],
             )
-            if session_state_digest(
-                destination_home, continuation["session_id"]
-            ) != continuation["session_state_sha256"]:
+            if (
+                session_state_digest(destination_home, continuation["session_id"])
+                != continuation["session_state_sha256"]
+            ):
                 raise ValueError("continuation session state changed after import")
         result = {
             "checkout": str(self.checkout),
@@ -745,7 +746,7 @@ class DeliveryBroker:
         if done:
             found = self._existing_pr()
             if found is None or found["headRefOid"] != done["head"]:
-                raise RuntimeError("published PR changed after its durable effect receipt")
+                return {"state": "pending", "reason": "pr_head_readback", "head": done["head"]}
             return done
         if before["id"] != input_candidate["id"] and self._changed_paths():
             raise RuntimeError("candidate changed during publication recovery")
@@ -829,9 +830,17 @@ class DeliveryBroker:
                 cwd=self.checkout,
                 timeout=90,
             )
-        found = self._existing_pr()
-        if found is None or found["headRefOid"] != head:
-            raise RuntimeError("published PR head did not read back at the expected commit")
+        # A successful push can precede GitHub's PR-head projection. The
+        # durable effect remains pending until a separate read-only
+        # reconciliation proves all three heads equal.
+        for delay in (0, 1, 2, 4, 8):
+            if delay:
+                time.sleep(delay)
+            found = self._existing_pr()
+            if found is not None and found["headRefOid"] == head:
+                break
+        else:
+            return {"state": "pending", "reason": "pr_head_readback", "head": head}
         result = {
             "number": found["number"],
             "url": found["url"],
@@ -841,6 +850,79 @@ class DeliveryBroker:
             "candidate": self.candidate(),
         }
         self._finish_effect(key, result)
+        return result
+
+    def reconcile_publish(
+        self,
+        iteration: int,
+        input_candidate: dict[str, Any],
+        *,
+        expected_head: str | None = None,
+        expected_pr_number: int | None = None,
+        complete: bool = True,
+    ) -> dict[str, Any]:
+        """Complete only an existing publish effect after external readback.
+
+        This path cannot commit, push, or create a PR. It is safe after a
+        successful push followed by a stale GitHub PR projection.
+        """
+        key = f"publish:{self.spec['run_id']}:{iteration}"
+        request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
+        with self.store._connect() as db:
+            saved = db.execute(
+                "SELECT kind,request_json,state,observed_json "
+                "FROM delivery_effects WHERE effect_key=?",
+                (key,),
+            ).fetchone()
+        if (
+            saved is None
+            or saved["kind"] != "publish"
+            or saved["request_json"] != canonical_json(request)
+        ):
+            raise ValueError("publication effect does not match this candidate")
+        current = self.candidate()
+        head = current["head"]
+        if expected_head is not None and head != expected_head:
+            raise ValueError("published checkout head changed")
+        if any(
+            current.get(field) != input_candidate.get(field)
+            for field in ("content_sha256", "base_sha", "policy_digest", "environment_digest")
+        ):
+            raise ValueError("published candidate content or authority changed")
+        if self._changed_paths():
+            raise ValueError("published checkout has uncommitted changes")
+        if (
+            head != input_candidate["head"]
+            and _git(self.checkout, "rev-parse", "HEAD^") != input_candidate["head"]
+        ):
+            raise ValueError("published commit does not descend directly from checked candidate")
+        if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
+            raise ValueError("published Git destination changed")
+        remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        if not remote or remote.split()[0] != head:
+            raise ValueError("remote feature branch differs from the published checkout")
+        found = self._existing_pr()
+        if found is None or found["headRefOid"] != head:
+            return {"state": "pending", "reason": "pr_head_readback", "head": head}
+        if expected_pr_number is not None and found["number"] != expected_pr_number:
+            raise ValueError("publication resolved to a different PR")
+        if saved["state"] == "complete":
+            done = json.loads(saved["observed_json"])
+            if done["head"] != head or done["number"] != found["number"]:
+                raise ValueError("durable publication receipt disagrees with current PR")
+            return done
+        if saved["state"] != "pending":
+            raise ValueError("publication effect is not recoverable")
+        result = {
+            "number": found["number"],
+            "url": found["url"],
+            "state": found["state"],
+            "head": head,
+            "base": self.spec["base_sha"],
+            "candidate": current,
+        }
+        if complete:
+            self._finish_effect(key, result)
         return result
 
     async def checks(self, pr: dict[str, Any], *, timeout_seconds: int = 1200) -> dict[str, Any]:

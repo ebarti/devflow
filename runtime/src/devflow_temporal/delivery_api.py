@@ -24,6 +24,7 @@ from temporalio.common import RetryPolicy, WorkflowIDConflictPolicy, WorkflowIDR
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
+from .contracts import digest
 from .delivery_config import DeliveryConfig
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
@@ -110,7 +111,8 @@ class DeliveryService:
             return
         for item in pending:
             spec = json.loads(item["request_json"])
-            workflow_id = "delivery-" + spec["run_id"]
+            workflow_id = item["workflow_id"] or "delivery-" + spec["run_id"]
+            recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
             handle = client.get_workflow_handle(workflow_id)
             try:
                 description = await handle.describe()
@@ -120,7 +122,10 @@ class DeliveryService:
                 description = None
             if description is not None:
                 remote_digest = await description.memo_value("request_digest", "unknown")
-                if remote_digest != item["request_digest"]:
+                remote_recovery = await description.memo_value("recovery_digest", None)
+                if remote_digest != item["request_digest"] or remote_recovery != (
+                    digest(recovery) if recovery else None
+                ):
                     self.store.mark_start(
                         spec["run_id"], accepted=False, error="Temporal ID conflict"
                     )
@@ -130,13 +135,16 @@ class DeliveryService:
             try:
                 await client.start_workflow(
                     DeliveryWorkflow.run,
-                    spec,
+                    args=[spec, recovery],
                     id=workflow_id,
                     task_queue=self.config.queue,
                     id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
                     id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
                     retry_policy=RetryPolicy(maximum_attempts=1),
-                    memo={"request_digest": item["request_digest"]},
+                    memo={
+                        "request_digest": item["request_digest"],
+                        **({"recovery_digest": digest(recovery)} if recovery else {}),
+                    },
                 )
             except WorkflowAlreadyStartedError:
                 # The next dispatch inspects the durable remote memo before acking.
@@ -257,6 +265,16 @@ def create_app(config_path: Path) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.post("/api/runs/{run_id}/recover-publication")
+    async def recover_publication(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        try:
+            return await asyncio.to_thread(
+                service.store.recover_publication, run_id, await request.json()
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.get("/api/runs/{run_id}")
     async def detail(request: Request, run_id: str) -> dict[str, Any]:
         _session(request)
@@ -326,9 +344,9 @@ def create_app(config_path: Path) -> FastAPI:
             return prior
         try:
             client = await service.client()
-            result = await client.get_workflow_handle("delivery-" + run_id).execute_update(
-                name, payload, id=command_id
-            )
+            result = await client.get_workflow_handle(
+                service.store.active_workflow_id(run_id)
+            ).execute_update(name, payload, id=command_id)
         except WorkflowUpdateFailedError as exc:
             reason = str(exc.__cause__ or exc)
             service.store.reject_mutation(command_id, reason)

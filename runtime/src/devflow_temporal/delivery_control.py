@@ -229,6 +229,7 @@ def main() -> None:
             "evidence",
             "decision",
             "cancel",
+            "recover-publication",
         ),
     )
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
@@ -246,12 +247,28 @@ def main() -> None:
     if args.command == "token":
         print((config.state_root / "service-token").read_text(encoding="utf-8").strip())
         return
-    if args.command in {"submit", "runs", "run", "evidence", "decision", "cancel"}:
+    if args.command in {
+        "submit",
+        "runs",
+        "run",
+        "evidence",
+        "decision",
+        "cancel",
+        "recover-publication",
+    }:
         caller = api_client(config.path)
         request = json.loads(args.request.read_text(encoding="utf-8")) if args.request else None
-        if args.command in {"submit", "decision", "cancel"} and not isinstance(request, dict):
+        if args.command in {
+            "submit",
+            "decision",
+            "cancel",
+            "recover-publication",
+        } and not isinstance(request, dict):
             parser.error("--request must name a JSON object file for this command")
-        if args.command in {"run", "evidence", "decision", "cancel"} and not args.id:
+        if (
+            args.command in {"run", "evidence", "decision", "cancel", "recover-publication"}
+            and not args.id
+        ):
             parser.error("--id is required for this command")
         if args.command == "evidence" and not args.evidence_id:
             parser.error("--evidence-id is required")
@@ -262,6 +279,7 @@ def main() -> None:
             "evidence": lambda: caller.evidence(args.id, args.evidence_id),
             "decision": lambda: caller.decision(args.id, request),
             "cancel": lambda: caller.cancel(args.id, request),
+            "recover-publication": lambda: caller.recover_publication(args.id, request),
         }[args.command]()
         print(json.dumps(result, sort_keys=True, indent=2))
         return

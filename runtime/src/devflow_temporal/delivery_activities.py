@@ -85,8 +85,14 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
         after = broker.candidate()
         if result.get("status") == "pass":
             changed = subprocess.run(
-                ["git", "-C", str(broker.checkout), "status", "--porcelain=v1",
-                 "--untracked-files=all"],
+                [
+                    "git",
+                    "-C",
+                    str(broker.checkout),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -129,8 +135,25 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_publish")
 async def delivery_publish(request: dict[str, Any]) -> dict[str, Any]:
-    _, broker = _context(request["spec"])
-    return broker.publish(request["iteration"], request["candidate"])
+    def execute() -> dict[str, Any]:
+        _, broker = _context(request["spec"])
+        return broker.publish(request["iteration"], request["candidate"])
+
+    return await asyncio.to_thread(execute)
+
+
+@activity.defn(name="delivery_reconcile_publish")
+async def delivery_reconcile_publish(request: dict[str, Any]) -> dict[str, Any]:
+    def execute() -> dict[str, Any]:
+        _, broker = _context(request["spec"])
+        return broker.reconcile_publish(
+            request["iteration"],
+            request["candidate"],
+            expected_head=request.get("expected_head"),
+            expected_pr_number=request.get("expected_pr_number"),
+        )
+
+    return await asyncio.to_thread(execute)
 
 
 @activity.defn(name="delivery_checks")
@@ -304,6 +327,7 @@ DELIVERY_ACTIVITIES = [
     delivery_prepare,
     delivery_role,
     delivery_publish,
+    delivery_reconcile_publish,
     delivery_checks,
     delivery_browser_qa,
     delivery_precheck,
