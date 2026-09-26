@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
+import importlib.metadata
 import json
 import shutil
 import socket
@@ -18,7 +20,14 @@ from devflow_temporal.delivery_activities import delivery_prepare, delivery_proj
 from devflow_temporal.delivery_api import DeliveryService
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_broker import _git as broker_git
-from devflow_temporal.delivery_config import DeliveryConfig
+from devflow_temporal.delivery_config import (
+    BOUNDARY_DENIAL_FIELDS,
+    DeliveryConfig,
+    _boundary_probe_passed,
+    _installed_codex_binary,
+    security_binding,
+)
+from devflow_temporal.delivery_sandbox import validate_network_domain
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 from devflow_temporal.supervisor import DeliverySupervisor
@@ -134,6 +143,51 @@ def test_projection_event_is_idempotent_and_detail_is_factual(service):
     assert after["usage"] == {}
 
 
+def test_phase_gates_do_not_reuse_previous_repair_iteration(service):
+    store, request = service
+    store.submit(request)
+    for event in ("tracker_start", "candidate_ready", "published", "ci_wait"):
+        store.project(
+            "run-1",
+            phase=event,
+            execution_state="running",
+            event_type=event,
+            message=event,
+            iteration=0,
+            key=f"{event}:0",
+        )
+    first = {gate["id"]: gate["state"] for gate in store.detail("run-1")["phase_gates"]}
+    assert all(
+        first[name] == "completed" for name in ("prepare", "prepublish", "publish", "local_checks")
+    )
+    store.project(
+        "run-1",
+        phase="repair",
+        execution_state="running",
+        event_type="role_started",
+        message="Repair started",
+        iteration=1,
+        key="role_started:1",
+    )
+    repaired = {gate["id"]: gate["state"] for gate in store.detail("run-1")["phase_gates"]}
+    assert repaired["prepare"] == "completed"
+    assert all(repaired[name] == "pending" for name in ("prepublish", "publish", "local_checks"))
+    store.project(
+        "run-1",
+        phase="blocked",
+        execution_state="blocked",
+        event_type="blocked",
+        message="prepublication repair limit exhausted",
+        checks={"prepublish": {"state": "failed", "results": []}},
+        iteration=1,
+        outcome="blocked",
+        key="blocked:1",
+    )
+    terminal = {gate["id"]: gate["state"] for gate in store.detail("run-1")["phase_gates"]}
+    assert terminal["prepublish"] == "failed"
+    assert all(terminal[name] == "pending" for name in ("publish", "local_checks"))
+
+
 def test_blocked_pre_role_run_can_transfer_claim_to_explicit_successor(service):
     store, request = service
     store.submit(request)
@@ -166,10 +220,112 @@ def test_blocked_pre_role_run_can_transfer_claim_to_explicit_successor(service):
     assert store.detail("run-1")["outcome"] == "blocked"
 
 
-def test_real_admission_rejects_project_config_and_unsafe_check_domains(service, tmp_path):
+def test_check_network_domains_reject_local_destinations():
+    for domain in ("127.0.0.1", "::1", "localhost", "metadata.localhost", "*.example.com"):
+        with pytest.raises(ValueError):
+            validate_network_domain(domain)
+    assert validate_network_domain("REGISTRY.NPMJS.ORG") == "registry.npmjs.org"
+
+
+def test_security_attestation_binding_rejects_changed_workspace_and_check_authority(service):
+    store, request = service
+    repository = copy.deepcopy(store.config.raw["repositories"]["fixture"])
+    repository["prepublish_checks"] = [
+        {"id": "install", "argv": ["corepack", "pnpm", "install"], "network_domains": []}
+    ]
+    policy = {
+        "roles": {"implement": {"model": "gpt-6-sol", "effort": "max"}},
+        "toolchain_roots": ["/opt/toolchain"],
+        "package_manager_cache": "/opt/cache",
+        "codex_auth_path": "/private/auth.json",
+        "checks": [{"id": "test", "argv": ["corepack", "pnpm", "test"]}],
+    }
+    base = {
+        "supplied": request,
+        "repository": repository,
+        "source": Path(repository["source_path"]),
+        "origin": repository["origin_url"],
+        "base_sha": repository["expected_base_sha"],
+        "state_dir": store.config.state_root / "runs" / request["run_id"],
+        "checkout": store.config.state_root / "checkouts" / request["run_id"],
+        "policy": policy,
+    }
+    expected = security_binding(**base)
+    variants = []
+    for field, value in (
+        ("source", Path(repository["source_path"]).parent / "other"),
+        ("checkout", store.config.state_root / "elsewhere"),
+        ("state_dir", store.config.state_root / "other-state"),
+        ("origin", "https://example.invalid/other.git"),
+    ):
+        changed = copy.deepcopy(base)
+        changed[field] = value
+        variants.append(changed)
+    changed_repo = copy.deepcopy(base)
+    changed_repo["repository"]["prepublish_checks"][0]["network_domains"] = ["registry.npmjs.org"]
+    variants.append(changed_repo)
+    changed_policy = copy.deepcopy(base)
+    changed_policy["policy"]["toolchain_roots"] = ["/opt/other"]
+    variants.append(changed_policy)
+    changed_model = copy.deepcopy(base)
+    changed_model["policy"]["roles"]["implement"]["effort"] = "high"
+    variants.append(changed_model)
+    assert all(security_binding(**variant) != expected for variant in variants)
+
+
+def test_boundary_attestation_requires_both_tmp_aliases_in_parent_and_child():
+    observed = {
+        "allowed_write": True,
+        "child_returncode": 0,
+        "child": {"allowed_write": True},
+    }
+    for result in (observed, observed["child"]):
+        result.update({field: "PermissionError:1" for field in BOUNDARY_DENIAL_FIELDS})
+    assert _boundary_probe_passed(observed)
+    for scope in (observed, observed["child"]):
+        for field in ("slash_tmp_read", "slash_tmp_write", "private_tmp_read", "private_tmp_write"):
+            changed = copy.deepcopy(observed)
+            target = changed["child"] if scope is observed["child"] else changed
+            target.pop(field)
+            assert not _boundary_probe_passed(changed)
+
+
+def test_real_provider_requires_the_installed_tested_sdk_and_binary(monkeypatch):
+    binary = _installed_codex_binary()
+    assert binary.is_file()
+    assert binary.name == "codex"
+    assert not binary.is_symlink()
+    original = importlib.metadata.version
+
+    def changed_version(name):
+        return "0.154.0" if name == "openai-codex" else original(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", changed_version)
+    with pytest.raises(ValueError, match="SDK is not the tested version"):
+        _installed_codex_binary()
+
+
+def test_admission_rejects_tracked_project_codex_config(service):
+    original, request = service
+    configuration = json.loads(original.config.path.read_text())
+    repository = configuration["repositories"]["fixture"]
+    source = Path(repository["source_path"])
+    (source / ".codex").mkdir()
+    (source / ".codex" / "config.toml").write_text('sandbox_mode = "danger-full-access"\n')
+    _git(source, "add", ".codex/config.toml")
+    _git(source, "commit", "-qm", "Project permissions fixture")
+    repository["expected_base_sha"] = _git(source, "rev-parse", "HEAD")
+    original.config.path.write_text(json.dumps(configuration))
+    with pytest.raises(ValueError, match="project Codex configuration"):
+        DeliveryConfig.load(original.config.path).admit(request)
+
+
+@pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS required")
+def test_real_admission_rejects_unsafe_check_domains_and_script_wrapper(service, tmp_path):
     original, request = service
     configuration = json.loads(original.config.path.read_text())
     configuration["provider"] = "codex"
+    configuration["codex_bin"] = str(_installed_codex_binary())
     repository = configuration["repositories"]["fixture"]
     repository.update(
         {
@@ -187,25 +343,12 @@ def test_real_admission_rejects_project_config_and_unsafe_check_domains(service,
         DeliveryConfig.load(original.config.path).admit(request)
 
     repository["prepublish_checks"][0]["network_domains"] = ["registry.npmjs.org"]
-    source = Path(repository["source_path"])
-    (source / ".codex").mkdir()
-    (source / ".codex" / "config.toml").write_text('sandbox_mode = "danger-full-access"\n')
-    _git(source, "add", ".codex/config.toml")
-    _git(source, "commit", "-qm", "Project permissions fixture")
-    repository["expected_base_sha"] = _git(source, "rev-parse", "HEAD")
-    original.config.path.write_text(json.dumps(configuration))
-    with pytest.raises(ValueError, match="project Codex configuration"):
-        DeliveryConfig.load(original.config.path).admit(request)
-
-    _git(source, "rm", "-rq", ".codex")
-    _git(source, "commit", "-qm", "Remove project permissions fixture")
-    repository["expected_base_sha"] = _git(source, "rev-parse", "HEAD")
     wrapper = tmp_path / "codex-wrapper"
     wrapper.write_text("#!/bin/sh\nexec /usr/bin/true\n")
     wrapper.chmod(0o700)
     configuration["codex_bin"] = str(wrapper)
     original.config.path.write_text(json.dumps(configuration))
-    with pytest.raises(ValueError, match="pinned binary"):
+    with pytest.raises(ValueError, match="tested installed Codex CLI binary"):
         DeliveryConfig.load(original.config.path).admit(request)
 
 
@@ -224,6 +367,67 @@ def test_check_cwd_accepts_canonical_path_behind_checkout_alias(service, tmp_pat
     )
     assert result["state"] == "passed"
     assert result["results"][0]["cwd"] == str(broker.checkout.resolve())
+
+
+def test_gate_diff_is_bound_to_base_head_and_rejects_tampering(service):
+    store, request = service
+    store.submit(request)
+    broker = DeliveryBroker(store, store.spec("run-1"))
+    broker.prepare()
+    (broker.checkout / "README.md").write_text("Reviewed feature\n")
+    _git(broker.checkout, "add", "README.md")
+    _git(
+        broker.checkout,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "Feature",
+    )
+    candidate = broker.candidate()
+    broker.gate_checkout("review", 0, candidate)
+    evidence = broker.gate_diff("review", 0, candidate)
+    patch = Path(evidence["path"])
+    assert evidence["base_sha"] == store.spec("run-1")["base_sha"]
+    assert evidence["head"] == candidate["head"]
+    assert b"+Reviewed feature" in patch.read_bytes()
+    assert hashlib.sha256(patch.read_bytes()).hexdigest() == evidence["sha256"]
+    assert broker.gate_diff("review", 0, candidate) == evidence
+    patch.write_text("tampered\n")
+    with pytest.raises(RuntimeError, match="changed across attempts"):
+        broker.gate_diff("review", 0, candidate)
+
+
+@pytest.mark.asyncio
+async def test_delivery_review_role_receives_a_bound_diff_in_its_gate_checkout(service):
+    store, request = service
+    store.submit(request)
+    spec = store.spec("run-1")
+    broker = DeliveryBroker(store, spec)
+    broker.prepare()
+    (broker.checkout / "README.md").write_text("Reviewed feature\n")
+    _git(broker.checkout, "add", "README.md")
+    _git(
+        broker.checkout,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "Feature",
+    )
+    candidate = broker.candidate()
+    assessed = await delivery_role(
+        {"spec": spec, "role": "review", "iteration": 0, "candidate": candidate}
+    )
+    assert assessed["status"] == "pass"
+    assert assessed["candidate"] == candidate
+    artifact = broker.gate_diff("review", 0, candidate)
+    assert Path(artifact["path"]).is_file()
+    assert artifact["candidate_id"] == candidate["id"]
 
 
 def test_broker_git_push_does_not_invoke_repository_hook(tmp_path):
@@ -251,9 +455,7 @@ def test_broker_git_push_does_not_invoke_repository_hook(tmp_path):
 
 @pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS required")
 def test_real_check_command_cannot_escape_native_profile(service, tmp_path):
-    binary = Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
-    if not binary.is_file():
-        pytest.skip("Codex CLI with native permission profiles is unavailable")
+    binary = _installed_codex_binary()
     store, request = service
     store.submit(request)
     spec = store.spec("run-1")
@@ -483,6 +685,8 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
         assert detail["roles"][0]["session_id"] == detail["roles"][2]["session_id"]
         assert detail["pull_request"]["number"] == 1
         assert detail["pull_request"]["head"] == detail["candidate"]["head"]
+        assert detail["checks"]["review"]["state"] == "passed"
+        assert detail["checks"]["qa"]["state"] == "passed"
         assert detail["checks"]["ci"]["state"] == "passed"
     finally:
         server.terminate()
@@ -589,10 +793,21 @@ async def test_managed_cancel_wins_over_overlapping_failed_precheck(service, tmp
         await release.wait()
         return {"state": "failed", "results": []}
 
+    @activity.defn(name="delivery_role")
+    async def role_stub(payload):
+        return {
+            "status": "pass",
+            "summary": "Fixture role completed",
+            "findings": [],
+            "candidate": payload["candidate"],
+            "session_id": "fake:implement",
+            "usage": None,
+        }
+
     activities = [
         delivery_project,
         delivery_prepare,
-        delivery_role,
+        role_stub,
         tracker_start_stub,
         failing_precheck,
     ]
@@ -626,3 +841,72 @@ async def test_managed_cancel_wins_over_overlapping_failed_precheck(service, tmp
         detail = store.detail(request["run_id"])
         assert detail["outcome"] == "cancelled"
         assert detail["phase"] == "cancelled"
+        assert detail["checks"]["prepublish"]["state"] == "failed"
+        assert (
+            next(gate for gate in detail["phase_gates"] if gate["id"] == "prepublish")["state"]
+            == "failed"
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_role_with_unknown_teardown_retains_unknown_cleanup(service, tmp_path):
+    original, request = service
+    store = original
+    store.submit(request)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    @activity.defn(name="delivery_tracker_start")
+    async def tracker_start_stub(_payload):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_role")
+    async def ambiguous_role(payload):
+        entered.set()
+        await release.wait()
+        with store._connect() as db:
+            db.execute(
+                """INSERT INTO delivery_attempts
+                   (job_key,run_id,role,iteration,candidate_id,state,cleanup)
+                   VALUES (?,?,?,0,?,'unknown','unknown')""",
+                ("unknown-attempt", request["run_id"], "implement", payload["candidate"]["id"]),
+            )
+        return {
+            "status": "recovery_unknown",
+            "summary": "Child exited without a final receipt",
+            "findings": ["outcome ambiguous"],
+            "candidate": payload["candidate"],
+            "session_id": None,
+            "cleanup": "unknown",
+            "finish_reason": "recovery_unknown",
+        }
+
+    async with await WorkflowEnvironment.start_local(
+        dev_server_database_filename=str(tmp_path / "unknown-cancel.sqlite3")
+    ) as environment:
+        async with Worker(
+            environment.client,
+            task_queue="unknown-cancel",
+            workflows=[DeliveryWorkflow],
+            activities=[delivery_project, delivery_prepare, tracker_start_stub, ambiguous_role],
+        ):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run,
+                store.spec(request["run_id"]),
+                id="delivery-run-1",
+                task_queue="unknown-cancel",
+            )
+            store.mark_start(request["run_id"], accepted=True)
+            await asyncio.wait_for(entered.wait(), 15)
+            status = await handle.query("status")
+            accepted = await handle.execute_update(
+                "cancel", {"expected_revision": status["revision"], "reason": "stop"}
+            )
+            assert accepted["execution_state"] == "cancelling"
+            release.set()
+            final = await asyncio.wait_for(handle.result(), 15)
+    assert final["outcome"] == "cancelled"
+    assert final["cleanup"] == "unknown"
+    detail = store.detail(request["run_id"])
+    assert detail["cleanup"] == "unknown"
+    assert detail["capacity"]["active"] == 1

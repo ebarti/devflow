@@ -40,15 +40,23 @@ class DeliveryWorkflow:
                 "tracker": self.state.get("tracker"),
                 "usage": self.state.get("usage"),
                 "decision": self.state.get("decision"),
+                "iteration": self.state["iteration"],
                 "protocol_revision": self.state["revision"],
                 "outcome": self.state.get("outcome"),
+                "cleanup": self.state.get("cleanup"),
                 "error": self.state.get("error"),
                 "key": f"{event}:{self.state['iteration']}:{self.state['revision']}",
             },
         )
 
     async def _stop(self, spec: dict[str, Any], reason: str) -> dict[str, Any]:
+        if any(
+            role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
+            for role in self.state["roles"]
+        ):
+            self.state["cleanup"] = "unknown"
         if self.cancel_requested:
+            self.state["cleanup"] = "unknown"
             return await self._cancelled(spec)
         self.state["phase"] = "blocked"
         self.state["execution_state"] = "blocked"
@@ -59,12 +67,22 @@ class DeliveryWorkflow:
         return self.state
 
     async def _cancelled(self, spec: dict[str, Any]) -> dict[str, Any]:
+        uncertain = self.state.get("cleanup") == "unknown" or any(
+            role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
+            for role in self.state["roles"]
+        )
         self.state["phase"] = "cancelled"
         self.state["execution_state"] = "terminal"
         self.state["outcome"] = "cancelled"
-        self.state["cleanup"] = "confirmed_after_role_boundary"
+        self.state["cleanup"] = "unknown" if uncertain else "confirmed_after_role_boundary"
         self.state["revision"] += 1
-        await self._project(spec, "cancelled", "Cancellation reached a role boundary")
+        await self._project(
+            spec,
+            "cancelled",
+            "Cancellation ended with unknown cleanup"
+            if uncertain
+            else "Cancellation reached a role boundary",
+        )
         return self.state
 
     @workflow.run
@@ -134,6 +152,7 @@ class DeliveryWorkflow:
         repair_findings: list[str] = []
         for iteration in range(max_repairs + 1):
             self.state["iteration"] = iteration
+            self.state["checks"] = {}
             if self.cancel_requested:
                 return await self._cancelled(spec)
             self.state["phase"] = "implement" if iteration == 0 else "repair"
@@ -197,6 +216,8 @@ class DeliveryWorkflow:
                 )
             except Exception as exc:
                 return await self._stop(spec, f"publication unresolved: {type(exc).__name__}")
+            if published["candidate"]["id"] != self.state["candidate"]["id"]:
+                self.state["candidate_revision"] += 1
             self.state["candidate"] = published["candidate"]
             self.state["pull_request"] = published
             if self.cancel_requested:
@@ -237,6 +258,11 @@ class DeliveryWorkflow:
                     and spec["provider"] == "codex"
                 ):
                     return await self._stop(spec, f"{role} reused the implementer session")
+                self.state["checks"]["review" if role == "review" else "qa"] = {
+                    "state": "passed" if result.get("status") == "pass" else "failed",
+                    "detail": result.get("summary"),
+                    "candidate_id": self.state["candidate"]["id"],
+                }
                 if result.get("status") != "pass":
                     repair_findings.extend(result.get("findings") or [f"{role} did not pass"])
                     break

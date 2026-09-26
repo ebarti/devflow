@@ -11,6 +11,7 @@ dependencies = [
   "agent-runtime-kit[codex]==0.5.2",
   "fastapi==0.141.1",
   "mcp==1.30.0",
+  "openai-codex==0.157.1",
   "temporalio>=1.20,<2",
   "uvicorn==0.54.0",
 ]
@@ -27,14 +28,13 @@ dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1"]
 packages = ["src/devflow_temporal"]
 
 [tool.uv]
-exclude-newer = "2026-09-25T23:59:59Z"
 required-environments = [
   "sys_platform == 'darwin' and platform_machine == 'arm64'",
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [tool.uv.sources]
-agent-runtime-kit = { git = "https://github.com/ebarti/agent-runtime-kit.git", rev = "facc9034a7c26efa412ce69bac4b8689257c0d61" }
+agent-runtime-kit = { git = "https://github.com/ebarti/agent-runtime-kit.git", rev = "d9ed6e186ce028d0db3b044ce959a94f409510c5" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

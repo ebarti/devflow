@@ -21,6 +21,75 @@ from .delivery_sandbox import validate_network_domain
 BRANCH_RE = re.compile(r"^(?:feat|fix|docs|chore)/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CHECK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+REQUIRED_CODEX_VERSION = "0.157.1"
+BOUNDARY_DENIAL_FIELDS = (
+    "copied_auth_read",
+    "host_credential_read",
+    "state_read",
+    "state_write",
+    "outside_write",
+    "slash_tmp_read",
+    "slash_tmp_write",
+    "private_tmp_read",
+    "private_tmp_write",
+    "loopback",
+)
+
+
+def _boundary_probe_passed(observed: Any) -> bool:
+    if not isinstance(observed, dict) or not isinstance(observed.get("child"), dict):
+        return False
+    return (
+        observed.get("allowed_write") is True
+        and observed.get("child_returncode") == 0
+        and observed["child"].get("allowed_write") is True
+        and all(
+            result.get(field) == "PermissionError:1"
+            for result in (observed, observed["child"])
+            for field in BOUNDARY_DENIAL_FIELDS
+        )
+    )
+
+
+def _installed_codex_binary() -> Path:
+    if importlib.metadata.version("openai-codex") != REQUIRED_CODEX_VERSION:
+        raise ValueError("installed Codex SDK is not the tested version")
+    distribution = importlib.metadata.distribution("openai-codex-cli-bin")
+    if distribution.version != REQUIRED_CODEX_VERSION:
+        raise ValueError("installed Codex CLI is not the tested version")
+    binary = Path(distribution.locate_file("codex_cli_bin/bin/codex"))
+    if not binary.is_file() or binary.is_symlink():
+        raise ValueError("tested Codex CLI binary is unavailable")
+    return binary.resolve(strict=True)
+
+
+def security_binding(
+    *,
+    supplied: dict[str, Any],
+    repository: dict[str, Any],
+    source: Path,
+    origin: str,
+    base_sha: str,
+    state_dir: Path,
+    checkout: Path,
+    policy: dict[str, Any],
+) -> str:
+    """Bind a real boundary probe to one admitted repository and workspace layout."""
+
+    return digest(
+        {
+            "repository_key": supplied["repository_key"],
+            "run_id": supplied["run_id"],
+            "branch": supplied["branch"],
+            "source": str(source),
+            "origin": origin,
+            "base_sha": base_sha,
+            "state_dir": str(state_dir),
+            "checkout": str(checkout),
+            "repository_policy": repository,
+            "role_and_check_policy": policy,
+        }
+    )
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -197,6 +266,8 @@ class DeliveryConfig:
             if os.uname().sysname != "Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
                 raise ValueError("this host lacks the required macOS profile sandbox")
             binary = Path(policy["codex_bin"])
+            if binary != _installed_codex_binary():
+                raise ValueError("real provider requires the tested installed Codex CLI binary")
             if not binary.is_file() or not os.access(binary, os.X_OK):
                 raise ValueError("configured Codex executable is unavailable")
             if binary.is_symlink():
@@ -277,6 +348,16 @@ class DeliveryConfig:
                         not check.get("test_count_regex") or int(check.get("min_tests", 0)) < 1
                     ):
                         raise ValueError("test checks require an observed positive count")
+            security_digest = security_binding(
+                supplied=supplied,
+                repository=repository,
+                source=source,
+                origin=actual_remote,
+                base_sha=base_sha,
+                state_dir=state_dir,
+                checkout=checkout,
+                policy=policy,
+            )
             attestation_path = Path(self.raw.get("sandbox_attestation_path", ""))
             if not attestation_path.is_absolute():
                 raise ValueError("real role policy requires an absolute sandbox attestation path")
@@ -308,53 +389,19 @@ class DeliveryConfig:
                 path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in sorted(package.glob("*.py"))
             }
-            expected_denial = "PermissionError:1"
             role = attestation.get("role_observed", {})
             check = attestation.get("check_observed", {})
-            role_denied = (
-                isinstance(role, dict)
-                and role.get("allowed_write") is True
-                and role.get("child_returncode") == 0
-                and isinstance(role.get("child"), dict)
-                and all(
-                    result.get(field) == expected_denial
-                    for result in (role, role["child"])
-                    for field in (
-                        "copied_auth_read",
-                        "host_credential_read",
-                        "state_read",
-                        "state_write",
-                        "outside_write",
-                        "loopback",
-                    )
-                )
-                and role["child"].get("allowed_write") is True
-            )
-            check_denied = (
-                isinstance(check, dict)
-                and check.get("allowed_write") is True
-                and check.get("child_returncode") == 0
-                and isinstance(check.get("child"), dict)
-                and all(
-                    result.get(field) == expected_denial
-                    for result in (check, check["child"])
-                    for field in (
-                        "copied_auth_read",
-                        "host_credential_read",
-                        "state_read",
-                        "state_write",
-                        "outside_write",
-                        "loopback",
-                    )
-                )
-                and check["child"].get("allowed_write") is True
-            )
+            role_denied = _boundary_probe_passed(role)
+            check_denied = _boundary_probe_passed(check)
             if (
-                attestation.get("schema") != "devflow-native-profile-v1"
+                attestation.get("schema") != "devflow-native-profile-v2"
                 or attestation.get("effective_mode") != "Codex native named profile"
                 or attestation.get("codex_bin_sha256") != binary_digest
                 or attestation.get("kit_revision") != kit_revision
+                or attestation.get("codex_sdk_version") != REQUIRED_CODEX_VERSION
+                or attestation.get("codex_cli_version") != REQUIRED_CODEX_VERSION
                 or attestation.get("source_hashes") != source_hashes
+                or attestation.get("security_binding_sha256") != security_digest
                 or attestation.get("requested_model") != policy["roles"]["implement"]["model"]
                 or attestation.get("requested_effort") != policy["roles"]["implement"]["effort"]
                 or not isinstance(attestation.get("role_session_id"), str)
@@ -369,6 +416,7 @@ class DeliveryConfig:
                 raise ValueError("sandbox attestation does not match this executable and boundary")
             policy["codex_bin_sha256"] = binary_digest
             policy["sandbox_attestation_sha256"] = hashlib.sha256(attestation_bytes).hexdigest()
+            policy["security_binding_sha256"] = security_digest
             policy["kit_revision"] = kit_revision
             policy["host_sandbox"] = "native-profile"
         return {

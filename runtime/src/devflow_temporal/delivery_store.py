@@ -63,6 +63,7 @@ class DeliveryStore:
                     phase TEXT NOT NULL,
                     execution_state TEXT NOT NULL,
                     revision INTEGER NOT NULL,
+                    iteration INTEGER NOT NULL DEFAULT 0,
                     protocol_revision INTEGER,
                     candidate_revision INTEGER NOT NULL DEFAULT 0,
                     candidate_json TEXT,
@@ -72,14 +73,23 @@ class DeliveryStore:
                     usage_json TEXT,
                     decision_json TEXT,
                     outcome TEXT,
+                    cleanup TEXT NOT NULL DEFAULT 'none',
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )"""
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(delivery_runs)")}
+            if "iteration" not in columns:
+                db.execute(
+                    "ALTER TABLE delivery_runs ADD COLUMN iteration INTEGER NOT NULL DEFAULT 0"
+                )
             if "decision_json" not in columns:
                 db.execute("ALTER TABLE delivery_runs ADD COLUMN decision_json TEXT")
+            if "cleanup" not in columns:
+                db.execute(
+                    "ALTER TABLE delivery_runs ADD COLUMN cleanup TEXT NOT NULL DEFAULT 'none'"
+                )
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_commands (
                     command_id TEXT PRIMARY KEY,
@@ -261,7 +271,7 @@ class DeliveryStore:
             superseded = spec.get("supersedes_run_id")
             if superseded:
                 previous = db.execute(
-                    """SELECT work_id,issue_url,repository_key,outcome,pr_json
+                    """SELECT work_id,issue_url,repository_key,outcome,pr_json,request_json
                        FROM delivery_runs WHERE run_id=?""",
                     (superseded,),
                 ).fetchone()
@@ -277,6 +287,9 @@ class DeliveryStore:
                     or attempts
                 ):
                     raise ValueError("only a blocked pre-role run without a PR may be superseded")
+                prior_spec = json.loads(previous["request_json"])
+                if prior_spec["branch"] == spec["branch"]:
+                    raise ValueError("superseded run retains the owned branch; choose a new branch")
                 old_owner = f"external:devflow:{superseded}"
                 claim = self.state.claim_for(db, spec["work_id"])
                 if claim is None or claim["owner"] != old_owner:
@@ -393,8 +406,10 @@ class DeliveryStore:
         tracker: dict[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
         decision: dict[str, Any] | None = None,
+        iteration: int | None = None,
         protocol_revision: int | None = None,
         outcome: str | None = None,
+        cleanup: str | None = None,
         error: str | None = None,
         key: str | None = None,
     ) -> dict[str, Any]:
@@ -407,12 +422,12 @@ class DeliveryStore:
                 # A late cancel-request projection cannot overwrite the final
                 # workflow result after its update was accepted.
                 return dict(row)
-            if (
-                key is not None
-                and db.execute(
-                    "SELECT 1 FROM delivery_events WHERE run_id=? AND type=? AND payload_json=?",
-                    (run_id, event_type, canonical_json({"key": key})),
-                ).fetchone()
+            if key is not None and any(
+                json.loads(item[0]).get("key") == key
+                for item in db.execute(
+                    "SELECT payload_json FROM delivery_events WHERE run_id=? AND type=?",
+                    (run_id, event_type),
+                )
             ):
                 return dict(row)
             revision = row["revision"] + 1
@@ -424,6 +439,7 @@ class DeliveryStore:
                 "phase": phase,
                 "execution_state": execution_state,
                 "revision": revision,
+                "iteration": iteration if iteration is not None else row["iteration"],
                 "protocol_revision": (
                     protocol_revision if protocol_revision is not None else row["protocol_revision"]
                 ),
@@ -441,6 +457,7 @@ class DeliveryStore:
                 "usage_json": canonical_json(usage) if usage is not None else row["usage_json"],
                 "decision_json": canonical_json(decision),
                 "outcome": outcome if outcome is not None else row["outcome"],
+                "cleanup": cleanup if cleanup is not None else row["cleanup"],
                 "error": error if error is not None else row["error"],
                 "updated_at": _now(),
             }
@@ -449,7 +466,18 @@ class DeliveryStore:
                 f"UPDATE delivery_runs SET {assignments} WHERE run_id=?",
                 (*values.values(), run_id),
             )
-            self._event(db, run_id, revision, event_type, message, {"key": key} if key else {})
+            self._event(
+                db,
+                run_id,
+                revision,
+                event_type,
+                message,
+                {
+                    "key": key,
+                    "iteration": values["iteration"],
+                    "candidate_id": candidate["id"] if candidate else None,
+                },
+            )
             return dict(
                 db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             )
@@ -541,14 +569,20 @@ class DeliveryStore:
             "work_id": row["work_id"],
             "title": spec["goal"].splitlines()[0][:120],
             "issue": row["issue_url"],
+            "issue_url": row["issue_url"],
             "repository": row["repository_key"],
             "phase": row["phase"],
             "execution_state": row["execution_state"],
             "updated_at": row["updated_at"],
-            "revision": row["revision"],
+            # Public command revisions follow Temporal's deterministic
+            # protocol. The SQLite projection has an independent sequence.
+            "revision": row["protocol_revision"],
+            "projection_revision": row["revision"],
             "protocol_revision": row["protocol_revision"],
+            "iteration": row["iteration"],
             "authorized_endpoint": spec["authorized_endpoint"],
             "outcome": row["outcome"],
+            "cleanup": row["cleanup"],
         }
 
     def detail(self, run_id: str) -> dict[str, Any]:
@@ -566,6 +600,7 @@ class DeliveryStore:
                 )
             ]
         compact = self._compact(row)
+        spec = json.loads(row["request_json"])
         candidate = json.loads(row["candidate_json"]) if row["candidate_json"] else None
         roles = []
         for attempt in attempts:
@@ -587,15 +622,41 @@ class DeliveryStore:
                 """SELECT COUNT(*) FROM delivery_attempts
                    WHERE state IN ('starting','running','unknown')"""
             ).fetchone()[0]
-        event_types = {event["type"] for event in self.events(run_id)}
+        events = self.events(run_id)
+        event_types = {event["type"] for event in events}
+        current_event_types = {
+            event["type"]
+            for event in events
+            if event["payload"].get("iteration") == row["iteration"]
+        }
+        checks = json.loads(row["checks_json"]) if row["checks_json"] else {}
+        tracker = json.loads(row["tracker_json"]) if row["tracker_json"] else {}
+        observed_gate_states = {
+            "prepublish": checks.get("prepublish", {}).get("state"),
+            "local_checks": checks.get("local", {}).get("state"),
+            "required_ci": checks.get("ci", {}).get("state"),
+            "tracker": tracker.get("state"),
+        }
+
+        def gate_state(name: str, completion: str) -> str:
+            relevant_events = event_types if name == "prepare" else current_event_types
+            if completion in relevant_events or observed_gate_states.get(name) in {
+                "passed",
+                "consistent",
+            }:
+                return "completed"
+            if observed_gate_states.get(name) in {"failed", "blocked", "conflict"}:
+                return "failed"
+            return "pending"
+
         gates = [
             {
                 "id": name,
                 "label": label,
-                "state": "completed" if completion in event_types else "pending",
+                "state": gate_state(name, completion),
             }
             for name, label, completion in (
-                ("prepare", "Prepare", "role_started"),
+                ("prepare", "Prepare", "tracker_start"),
                 ("prepublish", "Before PR checks", "candidate_ready"),
                 ("publish", "Publish", "published"),
                 ("local_checks", "Local checks", "ci_wait"),
@@ -610,18 +671,25 @@ class DeliveryStore:
             "roles": roles,
             "capacity": {"limit": self.config.raw.get("capacity", 2), "active": active},
             "queued": row["execution_state"] == "queued",
-            "cleanup": "unknown" if any(a["cleanup"] == "unknown" for a in attempts) else "none",
-            "candidate": {**candidate, "revision": row["candidate_revision"]}
+            "cleanup": "unknown"
+            if row["cleanup"] == "unknown" or any(a["cleanup"] == "unknown" for a in attempts)
+            else row["cleanup"],
+            "candidate": {
+                **candidate,
+                "revision": row["candidate_revision"],
+                "base_sha": spec["base_sha"],
+                "policy_digest": spec["policy_digest"],
+            }
             if candidate
             else None,
             "pull_request": json.loads(row["pr_json"]) if row["pr_json"] else None,
-            "checks": json.loads(row["checks_json"]) if row["checks_json"] else {},
-            "tracker": json.loads(row["tracker_json"]) if row["tracker_json"] else {},
+            "checks": checks,
+            "tracker": tracker,
             "usage": json.loads(row["usage_json"]) if row["usage_json"] else {},
             "decisions": [json.loads(row["decision_json"])]
             if row["decision_json"] and json.loads(row["decision_json"]) is not None
             else [],
-            "events": self.events(run_id),
+            "events": events,
             "error": row["error"],
         }
 

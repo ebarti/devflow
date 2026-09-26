@@ -88,6 +88,7 @@ class DeliverySupervisor:
                             "no duplicate invocation was launched"
                         ],
                         "session_id": row["session_id"],
+                        "cleanup": "unknown",
                         "usage": None,
                         "finish_reason": "recovery_unknown",
                     }
@@ -248,6 +249,7 @@ class DeliverySupervisor:
             "summary": "role launch failed before any provider process started",
             "findings": [reason],
             "session_id": None,
+            "cleanup": "confirmed",
             "usage": None,
             "finish_reason": "prelaunch",
         }
@@ -273,6 +275,7 @@ class DeliverySupervisor:
             "summary": reason,
             "findings": [reason],
             "session_id": None,
+            "cleanup": "unknown",
             "usage": None,
             "finish_reason": "recovery_unknown",
         }

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -259,6 +260,66 @@ class DeliveryBroker:
         if observed["id"] != candidate["id"]:
             raise RuntimeError("gate checkout does not match the published candidate")
         return path
+
+    def gate_diff(self, role: str, iteration: int, candidate: dict[str, Any]) -> dict[str, str]:
+        """Freeze the controller's base-to-head diff for a role without Git access."""
+
+        if role not in {"review", "verify"}:
+            raise ValueError("only independent gates receive a controller diff")
+        checkout = self.state_dir / "gates" / str(iteration) / role
+        if candidate_for(checkout)["id"] != candidate["id"]:
+            raise ValueError("gate checkout changed before diff production")
+        base = self.spec["base_sha"]
+        head = candidate["head"]
+        command = [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(checkout),
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            base,
+            head,
+            "--",
+        ]
+        result = subprocess.run(command, capture_output=True, check=False, timeout=120)
+        if result.returncode or not result.stdout:
+            raise RuntimeError("controller could not produce a nonempty bound candidate diff")
+        folder = self.state_dir / "gate-evidence" / str(iteration) / role
+        folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+        folder_info = folder.lstat()
+        if (
+            not stat.S_ISDIR(folder_info.st_mode)
+            or stat.S_IMODE(folder_info.st_mode) != 0o700
+            or folder_info.st_uid != os.getuid()
+        ):
+            raise RuntimeError("controller diff directory is not private and owned")
+        path = folder / f"{candidate['id']}.patch"
+        if path.exists() or path.is_symlink():
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.getuid()
+                or path.read_bytes() != result.stdout
+            ):
+                raise RuntimeError("controller candidate diff changed across attempts")
+        else:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(result.stdout)
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(result.stdout).hexdigest(),
+            "base_sha": base,
+            "head": head,
+            "candidate_id": candidate["id"],
+        }
 
     def _run_check_list(
         self,

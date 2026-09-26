@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -187,6 +188,11 @@ def _profile_lines(
         f"[permissions.{name}.filesystem]",
         '":root" = "deny"',
         '":minimal" = "read"',
+        # Codex can otherwise grant /tmp to sandboxed commands even when this
+        # profile names only an owned workspace. Deny both temp aliases, then
+        # reopen only the more specific owned scratch and checkout paths below.
+        '":tmpdir" = "deny"',
+        '":slash_tmp" = "deny"',
         f'{_path(Path("/opt/homebrew"))} = "read"',
         f'{_path(Path("/usr/local"))} = "read"',
         f'{_path(Path("/System/Library/OpenSSL"))} = "read"',
@@ -253,10 +259,34 @@ def prepare_native_role(request: dict[str, Any], attempt_dir: Path) -> tuple[str
     recovery = Path(spec["state_dir"]) / "recovery"
     toolchain_roots = tuple(Path(root) for root in spec["policy"].get("toolchain_roots", []))
     cache = spec["policy"].get("package_manager_cache")
+    review_diff = request.get("review_diff")
+    if request["role"] in {"review", "verify"}:
+        if not isinstance(review_diff, dict):
+            raise ValueError("independent role requires the controller-bound diff")
+        diff_path = Path(review_diff["path"])
+        expected_parent = (
+            Path(spec["state_dir"]) / "gate-evidence" / str(request["iteration"]) / request["role"]
+        ).resolve(strict=True)
+        info = diff_path.lstat()
+        if (
+            diff_path.parent.resolve(strict=True) != expected_parent
+            or diff_path.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or review_diff.get("candidate_id") != request["candidate"]["id"]
+            or review_diff.get("head") != request["candidate"]["head"]
+            or review_diff.get("base_sha") != spec["base_sha"]
+            or hashlib.sha256(diff_path.read_bytes()).hexdigest() != review_diff.get("sha256")
+        ):
+            raise ValueError("controller-bound diff is unavailable or changed")
+    elif review_diff is not None:
+        raise ValueError("implementer may not receive an independent gate diff")
     extra_read = (
         toolchain_roots
         + ((Path(cache),) if cache else ())
         + ((recovery,) if request["role"] == "implement" and recovery.is_dir() else ())
+        + ((diff_path,) if review_diff else ())
     )
     profile_name = "devflow-role"
     lines = _profile_lines(

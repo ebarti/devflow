@@ -66,7 +66,7 @@ def _files(root: Path) -> list[Path]:
                 continue  # a deleted tracked file is absent from the candidate
             _validate_candidate_file(root, path)
             paths.append(path)
-        return sorted(set(paths))
+        return _check_symlink_targets(root, paths)
     paths: list[Path] = []
     for base, dirs, files in os.walk(root, followlinks=False):
         for name in dirs:
@@ -80,7 +80,21 @@ def _files(root: Path) -> list[Path]:
             path = Path(base, name)
             _validate_candidate_file(root, path)
             paths.append(path)
-    return sorted(paths)
+    return _check_symlink_targets(root, paths)
+
+
+def _check_symlink_targets(root: Path, paths: list[Path]) -> list[Path]:
+    selected = sorted(set(paths))
+    # Every file reachable through a selected link must itself participate in
+    # the candidate hash. An ignored target could otherwise change between
+    # review and verification without changing the candidate ID.
+    visible_regular = {
+        path.resolve(strict=True) for path in selected if path.is_file() and not path.is_symlink()
+    }
+    for path in selected:
+        if path.is_symlink() and path.resolve(strict=True) not in visible_regular:
+            raise ValueError(f"candidate symlink target is not Git-visible: {path}")
+    return selected
 
 
 def _validate_candidate_file(root: Path, path: Path) -> None:
@@ -94,6 +108,9 @@ def _validate_candidate_file(root: Path, path: Path) -> None:
         target = path.resolve(strict=True)
         if root.resolve() not in target.parents or not target.is_file():
             raise ValueError(f"candidate symlink points outside a regular checkout file: {path}")
+        lexical = Path(os.path.normpath(str(path.parent / target_name)))
+        if not lexical.is_relative_to(root) or target != root.resolve() / lexical.relative_to(root):
+            raise ValueError(f"candidate symlink traverses another link: {path}")
         return
     raise ValueError(f"candidate contains a special file: {path}")
 

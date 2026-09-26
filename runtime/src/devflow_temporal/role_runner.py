@@ -68,6 +68,16 @@ def _task(request: dict[str, Any]) -> AgentTask:
         if recovery and role == "implement"
         else ""
     )
+    review_diff = request.get("review_diff")
+    diff_note = (
+        "Controller-bound base-to-head diff (Git metadata is inaccessible in this role): "
+        f"{review_diff['path']}\n"
+        f"Diff SHA-256: {review_diff['sha256']}\n"
+        f"Base: {review_diff['base_sha']}\nHead: {review_diff['head']}\n"
+        "Inspect this immutable diff and the checkout source before assessing the candidate.\n"
+        if review_diff
+        else ""
+    )
     prompt = (
         f"{instructions}\n\n"
         f"Goal: {spec['goal']}\n\nAccepted plan:\n{spec['accepted_plan']}\n\n"
@@ -75,6 +85,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"Allowed feature paths: {json.dumps(spec['policy']['allowed_paths'])}\n"
         f"Previous findings to repair: {json.dumps(findings)}\n"
         f"{recovery_note}\n"
+        f"{diff_note}\n"
         "Return a structured assessment with status, summary, and findings. "
         "A completed turn alone is not a pass."
     )

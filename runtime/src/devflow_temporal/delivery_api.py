@@ -251,8 +251,6 @@ def create_app(config_path: Path) -> FastAPI:
         events = value.pop("events")
         run = {key: item for key, item in value.items() if key != "run"}
         run["sequence"] = events[-1]["sequence"] if events else 0
-        if run.get("protocol_revision") is not None:
-            run["revision"] = run["protocol_revision"]
         return {"run": run, "events": events, "evidence": service.store.evidence_index(run_id)}
 
     @app.get("/api/runs/{run_id}/evidence/{evidence_id}")

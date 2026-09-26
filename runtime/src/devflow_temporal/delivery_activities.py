@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -44,8 +45,10 @@ async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
         tracker=request.get("tracker"),
         usage=request.get("usage"),
         decision=request.get("decision"),
+        iteration=request.get("iteration"),
         protocol_revision=request.get("protocol_revision"),
         outcome=request.get("outcome"),
+        cleanup=request.get("cleanup"),
         error=request.get("error"),
         key=request.get("key"),
     )
@@ -66,13 +69,17 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
     candidate = request["candidate"]
     if role == "implement":
         workspace = broker.checkout
+        review_diff = None
         if broker.candidate() != candidate:
             raise ValueError("implementer checkout changed before its role")
     elif role in {"review", "verify"}:
         workspace = broker.gate_checkout(role, iteration, candidate)
+        review_diff = broker.gate_diff(role, iteration, candidate)
     else:
         raise ValueError("unknown delivery role")
-    result = await get_supervisor(store).run({**request, "workspace": str(workspace)})
+    result = await get_supervisor(store).run(
+        {**request, "workspace": str(workspace), "review_diff": review_diff}
+    )
     if role == "implement":
         after = broker.candidate()
         if result.get("status") == "pass" and after["id"] == candidate["id"]:
@@ -81,9 +88,17 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
     else:
         observed = candidate_for(workspace)
         source = broker.candidate()
-        if observed["id"] != candidate["id"] or source != candidate:
+        with Path(review_diff["path"]).open("rb") as stream:
+            diff_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+        if (
+            observed["id"] != candidate["id"]
+            or source != candidate
+            or diff_sha != review_diff["sha256"]
+        ):
             result["status"] = "blocked"
-            result.setdefault("findings", []).append("candidate changed during independent gate")
+            result.setdefault("findings", []).append(
+                "candidate or controller diff changed during independent gate"
+            )
         after = candidate
     return {
         **result,

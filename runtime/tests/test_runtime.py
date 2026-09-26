@@ -361,8 +361,27 @@ def test_candidate_supports_tracked_internal_file_symlink_and_rejects_escape(tmp
     copied = snapshot(repo, tmp_path / "state", "linked-run", first)
     assert copied.joinpath("CLAUDE.md").is_symlink()
     assert candidate_for(copied, head=first["head"]) == first
+    (repo / "README.md").write_text("Changed visible target\n", encoding="utf-8")
+    assert candidate_for(repo) != first
     link.unlink()
     link.symlink_to("../outside.txt")
     (tmp_path / "outside.txt").write_text("outside")
     with pytest.raises(ValueError, match="outside"):
+        candidate_for(repo)
+
+
+def test_candidate_rejects_tracked_link_to_ignored_target(tmp_path):
+    repo = repo_at(tmp_path / "ignored-link-repo")
+    (repo / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    ignored = repo / "ignored"
+    ignored.mkdir()
+    secret = ignored / "secret"
+    secret.write_text("first\n", encoding="utf-8")
+    (repo / "link").symlink_to("ignored/secret")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitignore", "link"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "Tracked link"], check=True)
+    with pytest.raises(ValueError, match="not Git-visible"):
+        candidate_for(repo)
+    secret.write_text("second\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not Git-visible"):
         candidate_for(repo)
