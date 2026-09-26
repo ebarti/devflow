@@ -4,11 +4,41 @@ import userEvent from '@testing-library/user-event'
 import { api, ApiError } from '../src/api'
 import { NewRun } from '../src/NewRun'
 import { RunDetails } from '../src/RunDetails'
+import type { RunDetail } from '../src/model'
 import { mockRun, mockService } from './fixtures'
+import realBackendProjection from './real-backend-projection.json'
 
 afterEach(() => vi.restoreAllMocks())
 
 describe('dashboard commands', () => {
+  it('renders the observed backend gate order and hides cancellation for a blocked outcome', () => {
+    // Sanitized projection captured from the real service/Temporal verifier run at PR #44 head 7eb6fb7.
+    render(<RunDetails run={realBackendProjection as RunDetail} onRefresh={vi.fn()} />)
+    const strip = screen.getByRole('region', { name: 'Workflow phase gates' })
+    const gates = Array.from(strip.querySelectorAll('.phase'))
+    expect(gates.map(gate => gate.querySelector('.phase__label')?.textContent)).toEqual([
+      'Prepare', 'Before PR checks', 'Publish', 'Local checks', 'Required CI', 'Tracker',
+    ])
+    expect(gates.map(gate => gate.className)).toEqual([
+      'phase phase--good', 'phase phase--waiting', 'phase phase--waiting',
+      'phase phase--waiting', 'phase phase--waiting', 'phase phase--waiting',
+    ])
+    expect(strip.textContent).not.toContain('Implement')
+    expect(strip.querySelector('.phase-strip__progress')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
+  })
+
+  it('keeps future gate IDs neutral and does not repeat a pending cancellation', () => {
+    render(<RunDetails run={{
+      ...mockRun, outcome: null, execution_state: 'cancelling',
+      phase_gates: [{ id: 'future_gate', label: 'Future gate', state: 'unobserved' }],
+    }} onRefresh={vi.fn()} />)
+    const strip = screen.getByRole('region', { name: 'Workflow phase gates' })
+    expect(strip.querySelector('.phase')?.className).toBe('phase phase--unknown')
+    expect(strip.textContent).toContain('Future gate')
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
+  })
+
   it('does not present an unconfigured tracker readback as synchronized', () => {
     render(<RunDetails run={{ ...mockRun, tracker: { state: 'unconfigured', observed: 'issue open' } }} onRefresh={vi.fn()} />)
     expect(screen.getAllByText('Unconfigured').length).toBeGreaterThan(0)

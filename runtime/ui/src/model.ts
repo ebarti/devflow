@@ -85,6 +85,7 @@ export interface Evidence {
 }
 
 export interface RunDetail extends RunSummary {
+  outcome?: string | null
   protocol_revision?: number | null
   error?: string | null
   sequence?: number | null

@@ -4,31 +4,26 @@ import { CheckIcon, ExternalIcon } from './icons'
 import { display, time, timelineTime, titleCase, tokens, tone } from './format'
 import type { ActivityEvent, CheckState, Decision, PhaseGate, RoleState, RunDetail } from './model'
 
-const phases = [
-  ['prepare', 'Prepare'], ['implement', 'Implement'], ['review', 'Review'],
-  ['verify', 'Verify'], ['ci', 'CI'], ['deliver', 'Deliver'],
-] as const
-
 function State({ value }: { value: string | null | undefined }) {
   return <span className={`state state--${tone(value)}`}><span className="state__mark" aria-hidden="true">{tone(value) === 'good' ? <CheckIcon /> : null}</span>{titleCase(value)}</span>
 }
 
 function PhaseStrip({ gates }: { gates: PhaseGate[] | null | undefined }) {
-  const byId = new Map((gates ?? []).map(gate => [gate.id.toLowerCase(), gate]))
-  let completeSegments = 0
-  for (const [id] of phases.slice(0, -1)) {
-    if (tone(byId.get(id)?.state) !== 'good') break
-    completeSegments += 1
+  if (!gates?.length) return <section className="phase-strip phase-strip--empty" aria-label="Workflow phase gates"><p className="empty-section">No phase gate observations are available.</p></section>
+  let leadingCompleted = 0
+  for (const gate of gates) {
+    if (tone(gate.state) !== 'good') break
+    leadingCompleted += 1
   }
+  const completeSegments = Math.max(0, leadingCompleted - 1)
   return <section className="phase-strip" aria-label="Workflow phase gates">
-    <span className="phase-strip__progress" style={{ width: `calc((100% - 2 * var(--phase-end)) * ${completeSegments / 5})` }} aria-hidden="true" />
-    {phases.map(([id, label]) => {
-      const gate = byId.get(id)
-      const state = tone(gate?.state)
-      return <div key={id} className={`phase phase--${state}`} title={gate?.detail ?? undefined}>
+    {completeSegments > 0 ? <span className="phase-strip__progress" style={{ width: `calc((100% - 2 * var(--phase-end)) * ${completeSegments / (gates.length - 1)})` }} aria-hidden="true" /> : null}
+    {gates.map((gate, index) => {
+      const state = tone(gate.state)
+      return <div key={`${gate.id}-${index}`} className={`phase phase--${state}`} title={gate.detail ?? undefined}>
         <span className="phase__circle" aria-hidden="true">{state === 'good' ? <CheckIcon /> : null}</span>
-        <span className="phase__label">{label}</span>
-        <span className="sr-only">: {titleCase(gate?.state)}</span>
+        <span className="phase__label">{gate.label || titleCase(gate.id)}</span>
+        <span className="sr-only">: {titleCase(gate.state)}</span>
       </div>
     })}
   </section>
@@ -192,6 +187,7 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  if (run.outcome != null || ['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')) return null
   async function cancel() {
     if (!reason.trim() || run.revision == null) return
     setBusy(true); setError('')

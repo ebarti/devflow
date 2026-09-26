@@ -82,8 +82,10 @@ h1, h2, p { margin-top: 0; }
 .meta-separator { width: 1px; height: 16px; background: #cdd8e6; }
 .phase-strip { --phase-end: 44px; display: flex; justify-content: space-between; padding: 0 4px; margin: 31px 0 36px; position: relative; isolation: isolate; }
 .phase-strip::before { content: ''; position: absolute; left: var(--phase-end); right: var(--phase-end); top: 12px; height: 3px; background: #d4dce6; z-index: -1; }
+.phase-strip--empty::before { display: none; }
 .phase-strip__progress { position: absolute; left: var(--phase-end); top: 12px; height: 3px; background: var(--blue); z-index: -1; }
 .phase { display: flex; flex-direction: column; align-items: center; gap: 10px; min-width: 0; width: 80px; flex: 0 0 80px; color: #5b6c89; font-size: 15px; text-align: center; position: relative; }
+.phase__label { white-space: nowrap; }
 .phase__circle { width: 28px; height: 28px; border-radius: 50%; background: #e8ecf1; border: 2px solid #9daabb; display: grid; place-items: center; color: #fff; }
 .phase__circle svg { width: 18px; height: 18px; stroke-width: 2.5; }
 .phase--good .phase__circle { border-color: var(--blue); background: var(--blue); }
@@ -256,6 +258,7 @@ th:nth-child(3), td:nth-child(3) { width: 24%; }
   .run-heading h1 { font-size: 24px; }
   .run-heading__meta { font-size: 13px; gap: 8px; }
   .phase { font-size: 12px; width: auto; flex: 1 1 0; }
+  .phase__label { white-space: normal; }
   .phase-strip { --phase-end: calc((100% - 8px) / 12 + 4px); margin: 26px 0 24px; }
   .phase__circle { width: 24px; height: 24px; }
   .phase-strip::before { top: 10px; }
