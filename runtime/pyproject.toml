@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "devflow-temporal"
+version = "0.1.0"
+description = "Experimental local Temporal runtime for Devflow"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "agent-runtime-kit[codex]==0.5.2",
+  "fastapi==0.141.1",
+  "mcp==1.30.0",
+  "openai-codex==0.157.1",
+  "temporalio>=1.20,<2",
+  "uvicorn==0.54.0",
+]
+
+[project.scripts]
+devflow-temporal = "devflow_temporal.cli:main"
+devflow-delivery = "devflow_temporal.delivery_control:main"
+devflow-delivery-mcp = "devflow_temporal.delivery_mcp:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/devflow_temporal"]
+
+[tool.uv]
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+agent-runtime-kit = { git = "https://github.com/ebarti/agent-runtime-kit.git", rev = "d9ed6e186ce028d0db3b044ce959a94f409510c5" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
