@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import importlib.metadata
 import json
 import shutil
 import socket
@@ -25,7 +24,7 @@ from devflow_temporal.delivery_config import (
     DeliveryConfig,
     _boundary_probe_passed,
     _browser_qa_probe_passed,
-    _installed_codex_binary,
+    _contained_probe_passed,
     security_binding,
 )
 from devflow_temporal.delivery_sandbox import validate_network_domain
@@ -398,19 +397,33 @@ def test_boundary_attestation_requires_both_tmp_aliases_in_parent_and_child():
             assert not _boundary_probe_passed(changed)
 
 
-def test_real_provider_requires_the_installed_tested_sdk_and_binary(monkeypatch):
-    binary = _installed_codex_binary()
-    assert binary.is_file()
-    assert binary.name == "codex"
-    assert not binary.is_symlink()
-    original = importlib.metadata.version
-
-    def changed_version(name):
-        return "0.154.0" if name == "openai-codex" else original(name)
-
-    monkeypatch.setattr(importlib.metadata, "version", changed_version)
-    with pytest.raises(ValueError, match="SDK is not the tested version"):
-        _installed_codex_binary()
+def test_contained_attestation_requires_child_credential_and_network_denials():
+    denied = {
+        field: "PermissionError:13"
+        for field in (
+            "host_credential_read",
+            "state_read",
+            "state_write",
+            "outside_write",
+            "docker_socket_read",
+            "unrelated_host_connect",
+            "copied_auth_read",
+            "loopback",
+        )
+    }
+    observed = {
+        **denied,
+        "allowed_write": True,
+        "child_returncode": 0,
+        "child": {**denied, "allowed_write": True},
+    }
+    assert _contained_probe_passed(observed, role=True)
+    for changed in (
+        {"docker_socket_read": "ALLOWED"},
+        {"child": {**observed["child"], "copied_auth_read": "ALLOWED"}},
+        {"child_returncode": 1},
+    ):
+        assert not _contained_probe_passed({**observed, **changed}, role=True)
 
 
 def test_admission_rejects_tracked_project_codex_config(service):
@@ -428,12 +441,10 @@ def test_admission_rejects_tracked_project_codex_config(service):
         DeliveryConfig.load(original.config.path).admit(request)
 
 
-@pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS required")
-def test_real_admission_rejects_unsafe_check_domains_and_script_wrapper(service, tmp_path):
+def test_real_admission_rejects_unattested_container_and_check_network(service, monkeypatch):
     original, request = service
     configuration = json.loads(original.config.path.read_text())
     configuration["provider"] = "codex"
-    configuration["codex_bin"] = str(_installed_codex_binary())
     repository = configuration["repositories"]["fixture"]
     repository.update(
         {
@@ -447,16 +458,21 @@ def test_real_admission_rejects_unsafe_check_domains_and_script_wrapper(service,
         }
     )
     original.config.path.write_text(json.dumps(configuration))
+    with pytest.raises(ValueError, match="complete container policy"):
+        DeliveryConfig.load(original.config.path).admit(request)
+
+    configuration["container"] = {"image_id": "fixture"}
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_config._container_identity",
+        lambda _container, *, source: {"image_id": "fixture"},
+    )
+    original.config.path.write_text(json.dumps(configuration))
     with pytest.raises(ValueError, match="network domain must not be an IP"):
         DeliveryConfig.load(original.config.path).admit(request)
 
     repository["prepublish_checks"][0]["network_domains"] = ["registry.npmjs.org"]
-    wrapper = tmp_path / "codex-wrapper"
-    wrapper.write_text("#!/bin/sh\nexec /usr/bin/true\n")
-    wrapper.chmod(0o700)
-    configuration["codex_bin"] = str(wrapper)
     original.config.path.write_text(json.dumps(configuration))
-    with pytest.raises(ValueError, match="tested installed Codex CLI binary"):
+    with pytest.raises(ValueError, match="networking disabled"):
         DeliveryConfig.load(original.config.path).admit(request)
 
 
@@ -561,92 +577,25 @@ def test_broker_git_push_does_not_invoke_repository_hook(tmp_path):
     assert sentinel.read_text() == "SAFE\n"
 
 
-@pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS required")
-def test_real_check_command_cannot_escape_native_profile(service, tmp_path):
-    binary = _installed_codex_binary()
+def test_real_check_fails_closed_without_admitted_container(service, tmp_path):
     store, request = service
     store.submit(request)
     spec = store.spec("run-1")
     spec["provider"] = "codex"
-    spec["policy"].update(
-        {
-            "host_sandbox": "native-profile",
-            "codex_bin": str(binary),
-            "codex_bin_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        }
-    )
     broker = DeliveryBroker(store, spec)
     broker.prepare()
-    Path(_git(broker.checkout, "rev-parse", "--git-path", "info/exclude")).write_text(
-        "allowed.txt\n"
-    )
-    outside = tmp_path / "outside.txt"
-    outside.write_text("SAFE\n")
-    credential = tmp_path / "credential.txt"
-    credential.write_text("CANARY\n")
-    state_secret = broker.state_dir / "controller.txt"
-    state_secret.parent.mkdir(parents=True, exist_ok=True)
-    state_secret.write_text("STATE\n")
-    probe = (
-        "import json,pathlib,sys,subprocess,socket\n"
-        "paths=list(map(pathlib.Path,sys.argv[1:5]));port=int(sys.argv[5])\n"
-        "out={}\n"
-        "for name,path,write in zip(('owned','outside','credential','controller'),paths,"
-        "(True,True,False,False)):\n"
-        " try:\n"
-        "  path.write_text('BREACH\\n') if write else path.read_text()\n"
-        "  out[name]=True\n"
-        " except Exception as exc: out[name]=type(exc).__name__\n"
-        "try:\n"
-        " s=socket.create_connection(('127.0.0.1',port),timeout=1);s.sendall(b'BREACH');s.close()\n"
-        " out['loopback']=True\n"
-        "except Exception as exc: out['loopback']=type(exc).__name__\n"
-        "if len(sys.argv)<8:\n"
-        " child=subprocess.run([sys.executable,'-c',sys.argv[6],*sys.argv[1:7],'child'],"
-        "capture_output=True,text=True,timeout=10)\n"
-        " out['child']=json.loads(child.stdout)\n"
-        "print(json.dumps(out,sort_keys=True))\n"
-    )
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    listener.settimeout(1)
-    try:
-        check = {
-            "id": "security",
-            "argv": [
-                "/usr/bin/python3",
-                "-c",
-                probe,
-                str(broker.checkout / "allowed.txt"),
-                str(outside),
-                str(credential),
-                str(state_secret),
-                str(listener.getsockname()[1]),
-                probe,
-            ],
-            "cwd": ".",
-        }
-        result = broker._run_check_list(
+    sentinel = tmp_path / "outside.txt"
+    sentinel.write_text("SAFE\n")
+    check = {
+        "id": "unsafe",
+        "argv": ["/usr/bin/python3", "-c", f"open({str(sentinel)!r}, 'w').write('BREACH')"],
+        "cwd": ".",
+    }
+    with pytest.raises(ValueError, match="admitted container policy"):
+        broker._run_check_list(
             broker.checkout, [check], broker.state_dir / "security-check", broker.candidate()
         )
-        try:
-            received = listener.accept()[0].recv(100)
-        except TimeoutError:
-            received = None
-    finally:
-        listener.close()
-    assert result["state"] == "passed"
-    lines = Path(result["results"][0]["log"]).read_text().splitlines()
-    observed = json.loads(next(line for line in lines if line.startswith('{"child":')))
-    for item in (observed, observed["child"]):
-        assert item["owned"] is True
-        assert item["outside"] is not True
-        assert item["credential"] is not True
-        assert item["controller"] is not True
-        assert item["loopback"] is not True
-    assert outside.read_text() == "SAFE\n"
-    assert received is None
+    assert sentinel.read_text() == "SAFE\n"
 
 
 @pytest.mark.asyncio

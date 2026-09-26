@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -242,18 +241,20 @@ except PermissionError:
 results['inherited_gh_token']='GH_TOKEN' in os.environ
 gh=subprocess.run(['gh','auth','status'],capture_output=True,text=True)
 results['gh_authenticated']=gh.returncode==0
-child=subprocess.run([{sys.executable!r},'-c',{child_code!r}],capture_output=True,text=True)
+child=subprocess.run(['/usr/bin/python3','-c',{child_code!r}],capture_output=True,text=True)
 results['child_write_exit']=child.returncode
 (workspace/'allowed.txt').write_text('OK')
 print(json.dumps(results))
 """
     result = subprocess.run(
-        ["/usr/bin/sandbox-exec", "-f", str(profile), sys.executable, "-c", program],
+        ["/usr/bin/sandbox-exec", "-f", str(profile), "/usr/bin/python3", "-c", program],
+        cwd=workspace,
         env=env,
         text=True,
         capture_output=True,
-        check=True,
+        check=False,
     )
+    assert result.returncode == 0, result.stderr
     observed = json.loads(result.stdout)
     assert observed == {
         "broker_write": "denied",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import subprocess
@@ -15,7 +16,7 @@ from .candidate import candidate_for
 from .contracts import digest
 from .delivery_broker import DeliveryBroker
 from .delivery_config import DeliveryConfig
-from .delivery_store import DeliveryStore
+from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
 
 
@@ -124,8 +125,14 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_browser_qa")
 async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
-    _, broker = _context(request["spec"])
-    return broker.run_browser_qa(request["iteration"], request["candidate"])
+    def execute() -> dict[str, Any]:
+        _, broker = _context(request["spec"])
+        return broker.run_browser_qa(request["iteration"], request["candidate"])
+
+    # Browser/API fixtures may run for minutes. Keep the Temporal worker loop
+    # available for cancellation updates and unrelated workflows while this
+    # bounded child is supervised on its own thread.
+    return await asyncio.to_thread(execute)
 
 
 @activity.defn(name="delivery_precheck")
@@ -145,8 +152,18 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
     repository = store.config.raw["repositories"][spec["repository_key"]]
     project = repository.get("project_url")
     assignee = repository.get("assignee")
+    desired = (
+        f"{status}; assignee @{assignee or 'unconfigured'}; "
+        f"project {project or 'unconfigured'}; "
+        f"claim {'released' if release else 'retained by external:devflow:' + spec['run_id']}"
+    )
     if not project or not assignee:
-        return {"state": "unconfigured", "reason": "tracker project or assignee is missing"}
+        return {
+            "state": "unconfigured",
+            "desired": desired,
+            "pending": True,
+            "reason": "tracker project or assignee is missing",
+        }
     script = store.config.helpers_dir / "github.py"
     owner = f"external:devflow:{spec['run_id']}"
     command = [
@@ -170,7 +187,12 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
         command.append("--release")
     result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=120)
     if result.returncode:
-        return {"state": "pending", "reason": (result.stderr or result.stdout).strip()[:500]}
+        return {
+            "state": "pending",
+            "desired": desired,
+            "pending": True,
+            "reason": (result.stderr or result.stdout).strip()[:500],
+        }
     audit = subprocess.run(
         [
             sys.executable,
@@ -187,12 +209,30 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
         timeout=120,
     )
     if audit.returncode:
-        return {"state": "pending", "reason": (audit.stderr or audit.stdout).strip()[:500]}
+        return {
+            "state": "pending",
+            "desired": desired,
+            "pending": True,
+            "reason": (audit.stderr or audit.stdout).strip()[:500],
+        }
     observed = json.loads(audit.stdout)
     expected_claim = not release
     if observed.get("state") != "consistent" or bool(observed.get("claim")) != expected_claim:
-        return {"state": "pending", "observed": observed}
-    return {"state": "consistent", "observed": observed}
+        return {
+            "state": "pending",
+            "desired": desired,
+            "observed": observed,
+            "pending": True,
+            "conflict": ", ".join(observed.get("reconciliation_required") or []) or None,
+            "readback_at": _now(),
+        }
+    return {
+        "state": "consistent",
+        "desired": desired,
+        "observed": observed,
+        "pending": False,
+        "readback_at": _now(),
+    }
 
 
 @activity.defn(name="delivery_tracker_start")

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_browser_qa import run_browser_qa_native_fixture
 from devflow_temporal.delivery_sandbox import prepare_browser_qa
 
 
@@ -100,7 +101,7 @@ def test_broker_browser_qa_owns_ports_and_binds_receipt_to_candidate(tmp_path: P
     }
     broker = DeliveryBroker(_EffectStore(tmp_path / "effects.sqlite3"), spec)
     candidate = broker.candidate()
-    result = broker.run_browser_qa(0, candidate)
+    result = run_browser_qa_native_fixture(broker, 0, candidate)
     try:
         assert result["state"] == "passed"
         assert result["test_count"] == 2
@@ -109,13 +110,89 @@ def test_broker_browser_qa_owns_ports_and_binds_receipt_to_candidate(tmp_path: P
         assert result["source_unchanged"] is True
         assert all(result["listeners"][str(port)] for port in ports)
         assert json.loads(Path(result["receipt"]).read_text())["candidate_id"] == candidate["id"]
-        assert broker.run_browser_qa(0, candidate) == result
+        assert run_browser_qa_native_fixture(broker, 0, candidate) == result
         with socket.socket() as conflict:
             conflict.bind(("127.0.0.1", ports[0]))
             with pytest.raises(RuntimeError, match="unavailable"):
-                broker.run_browser_qa(1, candidate)
+                run_browser_qa_native_fixture(broker, 1, candidate)
+        # No child was launched. The same effect key can safely start once the
+        # unrelated port owner exits, rather than becoming recovery-unknown.
+        recovered_preflight = run_browser_qa_native_fixture(broker, 1, candidate)
+        assert recovered_preflight["state"] == "passed"
+        assert recovered_preflight["cleanup"] == "confirmed"
     finally:
         shutil.rmtree(result["scratch"])
+        if "recovered_preflight" in locals():
+            shutil.rmtree(recovered_preflight["scratch"])
+
+
+@pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS Seatbelt")
+def test_browser_qa_recovers_completed_receipt_after_db_commit_crash(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    _git(source, "init", "-q")
+    _git(source, "config", "user.name", "Fixture")
+    _git(source, "config", "user.email", "fixture@example.invalid")
+    (source / "README.md").write_text("Owned fixture\n")
+    _git(source, "add", "README.md")
+    _git(source, "commit", "-qm", "fixture")
+    ports = (_free_port(), _free_port())
+    assert ports[0] != ports[1]
+    program = (
+        "import os,socket,time; "
+        "ports=[int(os.environ[x]) for x in ('QA_API_PORT','QA_WEB_PORT')]; "
+        "servers=[socket.socket() for _ in ports]; "
+        "[(s.bind(('127.0.0.1',p)),s.listen()) for s,p in zip(servers,ports)]; "
+        "time.sleep(2); print('2 passed',flush=True)"
+    )
+    qa = {
+        "id": "browser-qa",
+        "argv": ["/usr/bin/python3", "-c", program],
+        "ports": {"QA_API_PORT": ports[0], "QA_WEB_PORT": ports[1]},
+        "env": {"JOBCTRL_E2E_ISOLATED": "1"},
+        "read_roots": [],
+        "test_count_regex": r"(?m)(\d+) passed",
+        "min_tests": 2,
+        "timeout_seconds": 30,
+        "artifact_paths": [],
+    }
+    state_dir = tmp_path / "state" / "runs" / "fixture"
+    state_dir.mkdir(parents=True)
+    spec = {
+        "run_id": "fixture",
+        "provider": "codex",
+        "source_path": str(source),
+        "checkout": str(source),
+        "state_dir": str(state_dir),
+        "base_sha": _git(source, "rev-parse", "HEAD"),
+        "policy_digest": "fixture-policy",
+        "policy": {
+            "host_sandbox": "native-profile",
+            "toolchain_roots": [],
+            "package_manager_cache": None,
+            "browser_qa": qa,
+        },
+    }
+    store = _EffectStore(tmp_path / "effects.sqlite3")
+    broker = DeliveryBroker(store, spec)
+    candidate = broker.candidate()
+
+    def crash_after_receipt(_key, _result):
+        raise RuntimeError("injected DB commit crash")
+
+    monkeypatch.setattr(broker, "_finish_effect", crash_after_receipt)
+    with pytest.raises(RuntimeError, match="injected DB commit crash"):
+        run_browser_qa_native_fixture(broker, 0, candidate)
+    receipt = state_dir / "browser-qa" / "0" / "receipt.json"
+    assert receipt.is_file()
+    original_bytes = receipt.read_bytes()
+    restarted = DeliveryBroker(store, spec)
+    recovered = run_browser_qa_native_fixture(restarted, 0, candidate)
+    assert recovered["state"] == "passed"
+    assert recovered["cleanup"] == "confirmed"
+    assert receipt.read_bytes() == original_bytes
+    assert run_browser_qa_native_fixture(restarted, 0, candidate) == recovered
+    shutil.rmtree(recovered["scratch"])
 
 
 @pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS Seatbelt")

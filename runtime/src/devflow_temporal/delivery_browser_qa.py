@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -166,7 +167,12 @@ def _artifacts(checkout: Path, configured: list[str]) -> list[dict[str, Any]]:
     return found
 
 
-def _begin(broker: Any, key: str, request: dict[str, Any]) -> dict[str, Any] | None:
+def _begin(
+    broker: Any,
+    key: str,
+    request: dict[str, Any],
+    preflight: Callable[[], tuple[Path, Path, dict[str, str]]],
+) -> tuple[dict[str, Any] | None, tuple[Path, Path, dict[str, str]] | None]:
     with broker.store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute(
@@ -177,19 +183,23 @@ def _begin(broker: Any, key: str, request: dict[str, Any]) -> dict[str, Any] | N
             if row[0] != "browser_qa" or row[1] != canonical_json(request):
                 raise ValueError("browser QA effect identity changed")
             if row[2] == "complete" and row[3]:
-                return json.loads(row[3])
+                return json.loads(row[3]), None
             return {
                 "state": "unknown",
                 "cleanup": "unknown",
                 "candidate_id": request["candidate_id"],
-            }
+            }, None
+        # The port/profile preflight performs no child execution. Keep it
+        # before the durable intent so a known-unstarted conflict can be
+        # retried under the same candidate/iteration after it is resolved.
+        launch = preflight()
         db.execute(
             """INSERT INTO delivery_effects
                (effect_key,run_id,kind,request_json,state,updated_at)
                VALUES (?,?,? ,?,'pending',?)""",
             (key, broker.spec["run_id"], "browser_qa", canonical_json(request), _now()),
         )
-    return None
+    return None, launch
 
 
 def _reconcile_pending(
@@ -212,7 +222,72 @@ def _reconcile_pending(
     return result
 
 
+def _recover_completed_receipt(
+    broker: Any,
+    key: str,
+    request: dict[str, Any],
+    evidence_dir: Path,
+    checkout: Path,
+    qa: dict[str, Any],
+    ports: tuple[int, int],
+) -> dict[str, Any] | None:
+    """Close the receipt-written/DB-pending crash window without rerunning QA."""
+
+    receipt = evidence_dir / "receipt.json"
+    if not receipt.exists():
+        return None
+    for path in (receipt, evidence_dir / "browser-qa.log", evidence_dir / "browser-qa.sb"):
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("browser QA recovery evidence is not a private regular file")
+        if info.st_uid != os.getuid():
+            raise ValueError("browser QA recovery evidence has a different owner")
+    saved = json.loads(receipt.read_text(encoding="utf-8"))
+    expected = {
+        "candidate_id": request["candidate_id"],
+        "iteration": request["iteration"],
+        "qa_config_sha256": request["qa_config_sha256"],
+        "argv": request["argv"],
+        "ports": qa["ports"],
+        "log": str(evidence_dir / "browser-qa.log"),
+    }
+    if (
+        not isinstance(saved, dict)
+        or any(saved.get(name) != value for name, value in expected.items())
+        or saved.get("state") not in {"passed", "failed"}
+        or saved.get("cleanup") != "confirmed"
+        or saved.get("log_sha256") != _hash(evidence_dir / "browser-qa.log")
+        or saved.get("profile_sha256") != _hash(evidence_dir / "browser-qa.sb")
+        or saved.get("start") != json.loads((evidence_dir / "start.json").read_text())
+        or saved.get("artifacts") != _artifacts(checkout, qa.get("artifact_paths", []))
+        or candidate_for(checkout)["id"] != request["candidate_id"]
+        or saved.get("source_unchanged") is not True
+    ):
+        raise ValueError("browser QA pending receipt no longer matches its candidate and evidence")
+    reconciled = _reconcile_pending(
+        evidence_dir,
+        {"state": "unknown", "cleanup": "unknown", "candidate_id": request["candidate_id"]},
+        ports,
+    )
+    if reconciled["cleanup"] != "confirmed":
+        return None
+    recovered = {**saved, "receipt": str(receipt), "receipt_sha256": _hash(receipt)}
+    broker._finish_effect(key, recovered)
+    return recovered
+
+
 def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
+    if broker.spec.get("provider") == "codex":
+        from .delivery_browser_qa_container import run_browser_qa_container
+
+        return run_browser_qa_container(broker, iteration, candidate)
+    return run_browser_qa_native_fixture(broker, iteration, candidate)
+
+
+def run_browser_qa_native_fixture(
+    broker: Any, iteration: int, candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """Retain the historical Seatbelt fixture for comparison, never real dispatch."""
     qa = broker.spec["policy"].get("browser_qa")
     if not qa:
         raise ValueError("browser QA is not configured")
@@ -233,9 +308,29 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "argv": qa["argv"],
     }
     evidence_dir = broker.state_dir / "browser-qa" / str(iteration)
-    existing = _begin(broker, key, request)
+
+    def preflight() -> tuple[Path, Path, dict[str, str]]:
+        _ports_free(ports)
+        evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = evidence_dir.lstat()
+        if stat.S_IMODE(metadata.st_mode) != 0o700 or metadata.st_uid != os.getuid():
+            raise ValueError("browser QA evidence directory is not private")
+        scratch = Path(tempfile.mkdtemp(prefix="dfqa-", dir="/private/tmp"))
+        try:
+            profile, env = prepare_browser_qa(broker.spec, checkout, evidence_dir, scratch, qa)
+        except BaseException:
+            scratch.rmdir()
+            raise
+        return scratch, profile, env
+
+    existing, launch = _begin(broker, key, request, preflight)
     if existing:
         if existing["state"] == "unknown":
+            recovered = _recover_completed_receipt(
+                broker, key, request, evidence_dir, checkout, qa, ports
+            )
+            if recovered is not None:
+                return recovered
             return _reconcile_pending(evidence_dir, existing, ports)
         if broker.candidate() != candidate:
             raise ValueError("browser QA candidate changed after its receipt")
@@ -243,13 +338,8 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         if _hash(receipt) != existing["receipt_sha256"]:
             raise ValueError("browser QA receipt changed after completion")
         return existing
-    evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    metadata = evidence_dir.lstat()
-    if stat.S_IMODE(metadata.st_mode) != 0o700 or metadata.st_uid != os.getuid():
-        raise ValueError("browser QA evidence directory is not private")
-    scratch = Path(tempfile.mkdtemp(prefix="dfqa-", dir="/private/tmp"))
-    profile, env = prepare_browser_qa(broker.spec, checkout, evidence_dir, scratch, qa)
-    _ports_free(ports)
+    assert launch is not None
+    scratch, profile, env = launch
     log = evidence_dir / "browser-qa.log"
     started = evidence_dir / "start.json"
     process_file = evidence_dir / "owned-processes.json"

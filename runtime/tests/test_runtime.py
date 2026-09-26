@@ -385,3 +385,23 @@ def test_candidate_rejects_tracked_link_to_ignored_target(tmp_path):
     secret.write_text("second\n", encoding="utf-8")
     with pytest.raises(ValueError, match="not Git-visible"):
         candidate_for(repo)
+
+
+def test_candidate_rejects_tracked_file_under_ignored_symlinked_ancestor(tmp_path):
+    repo = repo_at(tmp_path / "ancestor-link-repo")
+    directory = repo / "dir"
+    directory.mkdir()
+    (directory / "file").write_text("tracked content\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("dir\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-f", "dir/file", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "Tracked nested file"], check=True)
+    assert candidate_for(repo)["id"]
+
+    outside = tmp_path / "ignored-outside"
+    outside.mkdir()
+    (outside / "file").write_text("untracked outside content\n", encoding="utf-8")
+    (directory / "file").unlink()
+    directory.rmdir()
+    directory.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlinked or non-directory ancestor"):
+        candidate_for(repo)

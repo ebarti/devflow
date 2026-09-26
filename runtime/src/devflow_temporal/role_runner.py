@@ -61,8 +61,11 @@ def _task(request: dict[str, Any]) -> AgentTask:
         ),
     }[role]
     recovery = spec["policy"].get("recovery")
+    recovery_path = request.get("recovery_path") or (
+        spec["state_dir"] + "/recovery" if recovery and role == "implement" else ""
+    )
     recovery_note = (
-        f"Recovered stopped-work provenance is at {spec['state_dir']}/recovery/provenance.json. "
+        f"Recovered stopped-work provenance is at {recovery_path}/provenance.json. "
         "If import did not apply cleanly, inspect its feature.patch; resolve only feature "
         "paths in this owned checkout. The old checkout is read-only evidence."
         if recovery and role == "implement"
@@ -241,7 +244,7 @@ def main() -> int:
     start = Path(request["start_path"])
     output = Path(request["result_path"])
     _write_json(start, {"pid": os.getpid(), "started_at": datetime.now(UTC).isoformat()})
-    if sys.stdin.readline().strip() != "GO":
+    if request.get("container_authorized") is not True and sys.stdin.readline().strip() != "GO":
         return 2
     try:
         result = asyncio.run(

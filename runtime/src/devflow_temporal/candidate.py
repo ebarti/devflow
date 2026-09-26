@@ -98,6 +98,15 @@ def _check_symlink_targets(root: Path, paths: list[Path]) -> list[Path]:
 
 
 def _validate_candidate_file(root: Path, path: Path) -> None:
+    # Git can still list a tracked `dir/file` after `dir` is ignored and
+    # replaced by a link. Check every lexical parent before opening the file;
+    # otherwise its bytes may come from outside the candidate checkout.
+    parent = root
+    for component in path.relative_to(root).parts[:-1]:
+        parent /= component
+        parent_mode = parent.lstat().st_mode
+        if not stat.S_ISDIR(parent_mode) or stat.S_ISLNK(parent_mode):
+            raise ValueError(f"candidate contains a symlinked or non-directory ancestor: {parent}")
     mode = path.lstat().st_mode
     if stat.S_ISREG(mode):
         return

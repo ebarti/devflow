@@ -199,7 +199,6 @@ def _profile_lines(
         f'{_path(Path("/System/Library/OpenSSL"))} = "read"',
         f'{_path(workspace)} = "{workspace_access}"',
         f'{_path(workspace / ".git")} = "deny"',
-        f'{_path(workspace / ".codex")} = "deny"',
         f'{_path(home)} = "write"',
         f'{_path(scratch)} = "write"',
         f'{_path(codex_home)} = "deny"',
@@ -238,7 +237,9 @@ def validate_network_domain(domain: str) -> str:
     return normalized
 
 
-def prepare_native_role(request: dict[str, Any], attempt_dir: Path) -> tuple[str, dict[str, str]]:
+def prepare_native_role(
+    request: dict[str, Any], attempt_dir: Path, *, containerized: bool = False
+) -> tuple[str, dict[str, str]]:
     """Keep provider auth in the trusted CLI, while its commands use a native profile."""
 
     spec = request["spec"]
@@ -314,27 +315,64 @@ def prepare_native_role(request: dict[str, Any], attempt_dir: Path) -> tuple[str
             raise ValueError("browser QA evidence assessed a different candidate")
     elif request["role"] == "verify" and spec["policy"].get("browser_qa"):
         raise ValueError("configured browser QA receipt is required for verification")
-    extra_read = (
-        toolchain_roots
-        + ((Path(cache),) if cache else ())
-        + ((recovery,) if request["role"] == "implement" and recovery.is_dir() else ())
-        + ((diff_path,) if review_diff else ())
-        + ((Path(qa_evidence["path"]), Path(qa_evidence["log"])) if qa_evidence else ())
-    )
+    if containerized:
+        extra_read = (
+            Path("/opt/devflow-venv"),
+            Path("/opt/devflow-runtime/src"),
+            Path("/ms-playwright"),
+            *((Path("/recovery"),) if request["role"] == "implement" and recovery.is_dir() else ()),
+            *((Path("/evidence/diff.patch"),) if review_diff else ()),
+            *((Path("/qa/receipt.json"), Path("/qa/browser-qa.log")) if qa_evidence else ()),
+        )
+        profile_workspace = Path("/work")
+        profile_home = Path("/rolehome")
+        profile_codex_home = Path("/rolehome/codex")
+        profile_scratch = Path("/rolehome/tmp")
+    else:
+        extra_read = (
+            toolchain_roots
+            + ((Path(cache),) if cache else ())
+            + ((recovery,) if request["role"] == "implement" and recovery.is_dir() else ())
+            + ((diff_path,) if review_diff else ())
+            + ((Path(qa_evidence["path"]), Path(qa_evidence["log"])) if qa_evidence else ())
+        )
+        profile_workspace = workspace
+        profile_home = role_home
+        profile_codex_home = codex_home
+        profile_scratch = scratch
     profile_name = "devflow-role"
     lines = _profile_lines(
         profile_name,
-        workspace=workspace,
+        workspace=profile_workspace,
         workspace_access="read" if request["role"] == "review" else "write",
-        home=role_home,
-        codex_home=codex_home,
-        scratch=scratch,
+        home=profile_home,
+        codex_home=profile_codex_home,
+        scratch=profile_scratch,
         extra_read=extra_read,
     )
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
-    env = _native_env(role_home, codex_home, scratch, toolchain_roots)
-    if cache:
-        env["COREPACK_HOME"] = cache
+    if containerized:
+        env = {
+            "PATH": "/opt/devflow-venv/bin:/usr/local/bin:/usr/bin:/bin",
+            "HOME": "/rolehome",
+            "CODEX_HOME": "/rolehome/codex",
+            "TMPDIR": "/rolehome/tmp",
+            "XDG_CACHE_HOME": "/rolehome/.cache",
+            "PYTHONPATH": "/opt/devflow-runtime/src",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "/usr/bin/false",
+            "GCM_INTERACTIVE": "never",
+        }
+    else:
+        env = _native_env(role_home, codex_home, scratch, toolchain_roots)
+        if cache:
+            env["COREPACK_HOME"] = cache
     return profile_name, env
 
 

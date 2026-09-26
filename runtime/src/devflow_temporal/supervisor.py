@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json
+from .delivery_container import Bind, ContainerUnknown, OwnedContainer
 from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
 
@@ -26,10 +27,14 @@ def _process_identity(pid: int) -> str | None:
 
 
 def _private_json(path: Path, value: dict[str, Any]) -> None:
+    content = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or path.read_bytes() != content:
+            raise ContainerUnknown("role request changed across a durable attempt")
+        return
     descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write("\n")
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(content)
 
 
 class DeliverySupervisor:
@@ -42,6 +47,7 @@ class DeliverySupervisor:
                    WHERE state IN ('starting','running','unknown')"""
             ).fetchone()[0]
         self.semaphore = asyncio.Semaphore(max(0, capacity - occupied))
+        self.job_locks: dict[str, asyncio.Lock] = {}
 
     def _claim(self, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         spec = request["spec"]
@@ -66,7 +72,7 @@ class DeliverySupervisor:
                     raise ValueError("attempt key collision")
                 if row["state"] == "finished":
                     return job_key, json.loads(row["result_json"])
-                if result_path.is_file():
+                if spec.get("provider") != "codex" and result_path.is_file():
                     result = json.loads(result_path.read_text(encoding="utf-8"))
                     db.execute(
                         """UPDATE delivery_attempts SET state='finished',result_json=?,
@@ -80,6 +86,8 @@ class DeliverySupervisor:
                     )
                     return job_key, result
                 if row["state"] in {"starting", "running", "unknown"}:
+                    if spec.get("provider") == "codex":
+                        return job_key, None
                     return job_key, {
                         "status": "recovery_unknown",
                         "summary": "prior role process has no durable final result",
@@ -114,6 +122,10 @@ class DeliverySupervisor:
         job_key, existing = self._claim(request)
         if existing is not None:
             return existing
+        if request["spec"].get("provider") == "codex":
+            lock = self.job_locks.setdefault(job_key, asyncio.Lock())
+            async with lock:
+                return await self._run_contained(request, job_key)
         spec = request["spec"]
         folder = Path(spec["state_dir"]) / "attempts" / job_key
         result_path = folder / "result.json"
@@ -257,6 +269,180 @@ class DeliverySupervisor:
             finally:
                 log.close()
 
+    async def _run_contained(self, request: dict[str, Any], job_key: str) -> dict[str, Any]:
+        """Run one real role in a durable private PID namespace."""
+
+        spec = request["spec"]
+        folder = Path(spec["state_dir"]) / "attempts" / job_key
+        result_path = folder / "result.json"
+        policy = spec["policy"]["container"]
+        with self.store._connect() as db:
+            row = db.execute(
+                "SELECT state,result_json FROM delivery_attempts WHERE job_key=?", (job_key,)
+            ).fetchone()
+        if row["state"] == "finished":
+            return json.loads(row["result_json"])
+        newly_occupied = row["state"] == "queued"
+        if newly_occupied:
+            await self.semaphore.acquire()
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                updated = db.execute(
+                    """UPDATE delivery_attempts SET state='starting',started_at=?
+                       WHERE job_key=? AND state='queued'""",
+                    (_now(), job_key),
+                ).rowcount
+            if updated != 1:
+                self.semaphore.release()
+                raise ContainerUnknown("role capacity claim changed before launch")
+        cleanup_confirmed = False
+        try:
+            _, role_env = prepare_native_role(request, folder, containerized=True)
+            role_home = Path(spec["state_dir"]) / "role-homes" / request["role"]
+            if request["role"] != "implement":
+                role_home /= str(request["iteration"])
+            binds = [
+                Bind(Path(request["workspace"]), "/work", request["role"] == "review"),
+                Bind(role_home, "/rolehome"),
+                Bind(folder, "/attempt"),
+            ]
+            review_diff = request.get("review_diff")
+            if review_diff:
+                binds.append(Bind(Path(review_diff["path"]), "/evidence/diff.patch", True))
+            qa_evidence = request.get("qa_evidence")
+            if qa_evidence:
+                binds.extend(
+                    (
+                        Bind(Path(qa_evidence["path"]), "/qa/receipt.json", True),
+                        Bind(Path(qa_evidence["log"]), "/qa/browser-qa.log", True),
+                    )
+                )
+            recovery = Path(spec["state_dir"]) / "recovery"
+            if request["role"] == "implement" and recovery.is_dir():
+                binds.append(Bind(recovery, "/recovery", True))
+            role_policy = {
+                "roles": spec["policy"]["roles"],
+                "allowed_paths": spec["policy"]["allowed_paths"],
+                "recovery": spec["policy"].get("recovery"),
+                "browser_qa": spec["policy"].get("browser_qa"),
+                "host_sandbox": "native-profile",
+                "codex_bin": policy["codex_bin"],
+                "codex_bin_sha256": policy["codex_bin_sha256"],
+                "config_overrides": spec["policy"]["config_overrides"],
+            }
+            translated = {
+                "spec": {
+                    "run_id": spec["run_id"],
+                    "goal": spec["goal"],
+                    "accepted_plan": spec["accepted_plan"],
+                    "provider": "codex",
+                    "state_dir": "/attempt",
+                    "policy": role_policy,
+                },
+                "role": request["role"],
+                "iteration": request["iteration"],
+                "candidate": request["candidate"],
+                "workspace": "/work",
+                "result_path": "/attempt/result.json",
+                "start_path": "/attempt/start.json",
+                "container_authorized": True,
+                "findings": request.get("findings"),
+                "resume_session": request.get("resume_session"),
+                "recovery_path": "/recovery" if recovery.is_dir() else None,
+                "review_diff": {**review_diff, "path": "/evidence/diff.patch"}
+                if review_diff
+                else None,
+                "qa_evidence": {
+                    **qa_evidence,
+                    "path": "/qa/receipt.json",
+                    "log": "/qa/browser-qa.log",
+                }
+                if qa_evidence
+                else None,
+            }
+            _private_json(folder / "request.json", translated)
+            container = OwnedContainer(
+                spec,
+                kind="role",
+                identity={
+                    "role": request["role"],
+                    "iteration": request["iteration"],
+                    "candidate_id": request["candidate"]["id"],
+                },
+                evidence_dir=folder / "container",
+                binds=tuple(binds),
+                command=(
+                    "/opt/devflow-venv/bin/python",
+                    "-m",
+                    "devflow_temporal.role_runner",
+                    "/attempt/request.json",
+                ),
+                cwd="/work",
+                environment=role_env,
+                # Trusted provider traffic needs egress; the native profile
+                # denies shell/tool networking inside this private namespace.
+                network="bridge",
+                timeout_seconds=int(
+                    spec["policy"]["roles"][request["role"]].get("timeout_seconds", 7200)
+                ),
+            )
+            outcome = await asyncio.to_thread(container.run)
+            cleanup_confirmed = outcome.cleanup == "confirmed"
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    """UPDATE delivery_attempts SET state='running',process_identity=?,cleanup=?
+                       WHERE job_key=? AND state IN ('starting','running','unknown')""",
+                    (outcome.container_id, outcome.cleanup, job_key),
+                )
+            if not result_path.is_file():
+                return self._mark_unknown(
+                    job_key,
+                    "contained role exited without a final receipt",
+                    cleanup=outcome.cleanup,
+                )
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            if outcome.exit_code != 0 and result.get("status") == "pass":
+                raise ContainerUnknown("role reported pass despite a failed container exit")
+            result["cleanup"] = outcome.cleanup
+            result["container_id"] = outcome.container_id
+            result["container_log_sha256"] = outcome.log_sha256
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    """UPDATE delivery_attempts SET state='finished',result_json=?,
+                       session_id=?,finished_at=?,cleanup=? WHERE job_key=?""",
+                    (
+                        canonical_json(result),
+                        result.get("session_id"),
+                        _now(),
+                        outcome.cleanup,
+                        job_key,
+                    ),
+                )
+            return result
+        except asyncio.CancelledError:
+            self._mark_unknown(job_key, "contained role was interrupted")
+            raise
+        except Exception as exc:
+            if isinstance(exc, ContainerUnknown):
+                return self._mark_unknown(
+                    job_key,
+                    str(exc),
+                    cleanup="confirmed" if cleanup_confirmed else "unknown",
+                )
+            if (folder / "container" / "container-start-authorized.json").exists():
+                return self._mark_unknown(
+                    job_key,
+                    type(exc).__name__,
+                    cleanup="confirmed" if cleanup_confirmed else "unknown",
+                )
+            cleanup_confirmed = True
+            return self._mark_prelaunch_blocked(job_key, type(exc).__name__)
+        finally:
+            if cleanup_confirmed:
+                self.semaphore.release()
+
     def _mark_prelaunch_blocked(self, job_key: str, reason: str) -> dict[str, Any]:
         result = {
             "status": "blocked",
@@ -276,23 +462,32 @@ class DeliverySupervisor:
             )
         return result
 
-    def _mark_unknown(self, job_key: str, reason: str) -> dict[str, Any]:
-        with self.store._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute(
-                """UPDATE delivery_attempts SET state='unknown',cleanup='unknown',finished_at=?
-                   WHERE job_key=?""",
-                (_now(), job_key),
-            )
-        return {
+    def _mark_unknown(
+        self, job_key: str, reason: str, *, cleanup: str = "unknown"
+    ) -> dict[str, Any]:
+        result = {
             "status": "recovery_unknown",
             "summary": reason,
             "findings": [reason],
             "session_id": None,
-            "cleanup": "unknown",
+            "cleanup": cleanup,
             "usage": None,
             "finish_reason": "recovery_unknown",
         }
+        with self.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE delivery_attempts SET state=?,result_json=?,cleanup=?,finished_at=?
+                   WHERE job_key=?""",
+                (
+                    "finished" if cleanup == "confirmed" else "unknown",
+                    canonical_json(result) if cleanup == "confirmed" else None,
+                    cleanup,
+                    _now(),
+                    job_key,
+                ),
+            )
+        return result
 
 
 _SUPERVISORS: dict[str, DeliverySupervisor] = {}

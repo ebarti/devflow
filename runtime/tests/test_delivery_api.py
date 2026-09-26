@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import httpx
@@ -11,7 +12,11 @@ from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from devflow_temporal.delivery_activities import delivery_prepare, delivery_project
+from devflow_temporal.delivery_activities import (
+    delivery_browser_qa,
+    delivery_prepare,
+    delivery_project,
+)
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -332,3 +337,119 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
                     assert update.status_code == 200, update.text
                     final = await asyncio.wait_for(handle.result(), 15)
                     assert final["outcome"] == expected_outcome
+
+
+@pytest.mark.asyncio
+async def test_public_cancel_remains_responsive_during_blocking_browser_activity(
+    api_fixture, tmp_path, monkeypatch
+):
+    path, request = api_fixture
+    config = json.loads(path.read_text())
+    config["repositories"]["fixture"]["browser_qa"] = {"id": "owned-browser"}
+    path.write_text(json.dumps(config))
+    app = create_app(path)
+    store = app.state.delivery.store
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_browser(_broker, _iteration, candidate):
+        entered.set()
+        assert release.wait(timeout=10)
+        return {"state": "passed", "cleanup": "confirmed", "candidate_id": candidate["id"]}
+
+    monkeypatch.setattr(DeliveryBroker, "run_browser_qa", blocking_browser)
+
+    @activity.defn(name="delivery_precheck")
+    async def precheck_stub(_payload):
+        return {"state": "passed"}
+
+    @activity.defn(name="delivery_tracker_start")
+    async def tracker_start_stub(_payload):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_publish")
+    async def publish_stub(payload):
+        return {"candidate": payload["candidate"], "head": payload["candidate"]["head"]}
+
+    @activity.defn(name="delivery_role")
+    async def role_stub(payload):
+        return {
+            "status": "pass",
+            "candidate": payload["candidate"],
+            "session_id": f"fake:{payload['role']}",
+        }
+
+    @activity.defn(name="delivery_checks")
+    async def checks_stub(_payload):
+        return {"state": "passed"}
+
+    async with await WorkflowEnvironment.start_local(
+        dev_server_database_filename=str(tmp_path / "browser-cancel.sqlite3")
+    ) as environment:
+
+        async def temporal_client():
+            return environment.client
+
+        app.state.delivery.client = temporal_client
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://127.0.0.1:18770"
+        ) as browser:
+            token = (Path(config["state_root"]) / "service-token").read_text().strip()
+            login = await browser.post(
+                "/api/session",
+                json={"token": token},
+                headers={"Origin": "http://127.0.0.1:18770"},
+            )
+            headers = {
+                "Origin": "http://127.0.0.1:18770",
+                "X-Devflow-CSRF": login.json()["csrf_token"],
+            }
+            submitted = await browser.post("/api/runs", json=request, headers=headers)
+            assert submitted.status_code == 200
+            async with Worker(
+                environment.client,
+                task_queue="public-browser-cancel",
+                workflows=[DeliveryWorkflow],
+                activities=[
+                    delivery_project,
+                    delivery_prepare,
+                    precheck_stub,
+                    tracker_start_stub,
+                    publish_stub,
+                    role_stub,
+                    checks_stub,
+                    delivery_browser_qa,
+                ],
+            ):
+                handle = await environment.client.start_workflow(
+                    DeliveryWorkflow.run,
+                    store.spec(request["run_id"]),
+                    id="delivery-" + request["run_id"],
+                    task_queue="public-browser-cancel",
+                )
+                store.mark_start(request["run_id"], accepted=True)
+                assert await asyncio.wait_for(asyncio.to_thread(entered.wait), 5)
+                try:
+                    detail = (await browser.get("/api/runs/run-1")).json()["run"]
+                    assert detail["phase"] == "browser_qa"
+                    cancelled = await asyncio.wait_for(
+                        browser.post(
+                            "/api/runs/run-1/cancel",
+                            json={
+                                "command_id": "cancel-during-browser",
+                                "expected_revision": detail["protocol_revision"],
+                                "reason": "stop browser fixture",
+                            },
+                            headers=headers,
+                        ),
+                        3,
+                    )
+                    assert cancelled.status_code == 200, cancelled.text
+                    waiting = (await browser.get("/api/runs/run-1")).json()["run"]
+                    assert waiting["execution_state"] == "cancelling"
+                finally:
+                    release.set()
+                final = await asyncio.wait_for(handle.result(), 15)
+                assert final["outcome"] == "cancelled"
+                assert store.detail(request["run_id"])["outcome"] == "cancelled"

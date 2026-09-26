@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
 import os
 import re
@@ -82,16 +81,122 @@ def _browser_qa_probe_passed(observed: Any) -> bool:
     )
 
 
-def _installed_codex_binary() -> Path:
-    if importlib.metadata.version("openai-codex") != REQUIRED_CODEX_VERSION:
-        raise ValueError("installed Codex SDK is not the tested version")
-    distribution = importlib.metadata.distribution("openai-codex-cli-bin")
-    if distribution.version != REQUIRED_CODEX_VERSION:
-        raise ValueError("installed Codex CLI is not the tested version")
-    binary = Path(distribution.locate_file("codex_cli_bin/bin/codex"))
-    if not binary.is_file() or binary.is_symlink():
-        raise ValueError("tested Codex CLI binary is unavailable")
-    return binary.resolve(strict=True)
+def _contained_denied(value: Any) -> bool:
+    return value in {
+        "PermissionError:1",
+        "PermissionError:13",
+        "FileNotFoundError:2",
+        "OSError:101",
+    }
+
+
+def _contained_probe_passed(observed: Any, *, role: bool) -> bool:
+    if not isinstance(observed, dict) or not isinstance(observed.get("child"), dict):
+        return False
+    fields = (
+        "host_credential_read",
+        "state_read",
+        "state_write",
+        "outside_write",
+        "docker_socket_read",
+        "unrelated_host_connect",
+    )
+    if role:
+        fields += ("copied_auth_read", "loopback")
+    else:
+        fields += ("unrelated_port_bind", "unrelated_port_connect")
+    return (
+        observed.get("allowed_write") is True
+        and observed.get("child_returncode") == 0
+        and observed["child"].get("allowed_write") is True
+        and all(
+            _contained_denied(item.get(field))
+            for item in (observed, observed["child"])
+            for field in fields
+        )
+    )
+
+
+def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str, Any]:
+    """Inspect the exact image, CLI launch chain and security profile."""
+
+    required = {
+        "docker_bin",
+        "docker_bin_sha256",
+        "image_id",
+        "platform",
+        "seccomp_profile",
+        "seccomp_sha256",
+        "codex_bin",
+        "codex_bin_sha256",
+        "role_runner_sha256",
+        "pnpm_lock_sha256",
+    }
+    if not isinstance(container, dict) or required - set(container):
+        raise ValueError("real delivery requires a complete container policy")
+    docker = Path(container["docker_bin"]).resolve(strict=True)
+    if not docker.is_file() or not os.access(docker, os.X_OK):
+        raise ValueError("configured Docker CLI is unavailable")
+    if hashlib.sha256(docker.read_bytes()).hexdigest() != container["docker_bin_sha256"]:
+        raise ValueError("Docker CLI changed after boundary attestation")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", container["image_id"]):
+        raise ValueError("container image must be an immutable content ID")
+    if container["platform"] != "linux/arm64":
+        raise ValueError("container platform was not tested")
+    profile = Path(container["seccomp_profile"]).resolve(strict=True)
+    expected_profile = (
+        Path(__file__).resolve().parents[2] / "docker" / "moby-56be731-codex-bwrap-seccomp.json"
+    )
+    if profile != expected_profile.resolve(strict=True):
+        raise ValueError("container seccomp profile is not the reviewed source")
+    if hashlib.sha256(profile.read_bytes()).hexdigest() != container["seccomp_sha256"]:
+        raise ValueError("container seccomp profile changed")
+    runner = Path(__file__).with_name("role_runner.py")
+    if hashlib.sha256(runner.read_bytes()).hexdigest() != container["role_runner_sha256"]:
+        raise ValueError("role runner source changed after image build")
+    lock = source / "pnpm-lock.yaml"
+    if (
+        lock.is_symlink()
+        or not lock.is_file()
+        or hashlib.sha256(lock.read_bytes()).hexdigest() != container["pnpm_lock_sha256"]
+    ):
+        raise ValueError("admitted package lock is unavailable or changed")
+    inspected = subprocess.run(
+        [str(docker), "image", "inspect", container["image_id"]],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if inspected.returncode:
+        raise ValueError("admitted container image is unavailable")
+    try:
+        values = json.loads(inspected.stdout)
+        image = values[0]
+    except (ValueError, IndexError, KeyError, TypeError) as exc:
+        raise ValueError("container image inspection is malformed") from exc
+    labels = image.get("Config", {}).get("Labels") or {}
+    if (
+        len(values) != 1
+        or image.get("Id") != container["image_id"]
+        or f"{image.get('Os')}/{image.get('Architecture')}" != container["platform"]
+        or labels.get("devflow.role_runner_sha256") != container["role_runner_sha256"]
+        or labels.get("devflow.codex_bin_sha256") != container["codex_bin_sha256"]
+        or labels.get("devflow.kit_revision") != "d9ed6e186ce028d0db3b044ce959a94f409510c5"
+        or labels.get("devflow.codex_cli_version") != REQUIRED_CODEX_VERSION
+        or container["codex_bin"]
+        != "/opt/devflow-venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex"
+    ):
+        raise ValueError("container image or launch chain does not match the tested policy")
+    return {
+        "image_id": image["Id"],
+        "platform": container["platform"],
+        "docker_bin_sha256": container["docker_bin_sha256"],
+        "seccomp_sha256": container["seccomp_sha256"],
+        "role_runner_sha256": container["role_runner_sha256"],
+        "codex_bin_sha256": container["codex_bin_sha256"],
+        "pnpm_lock_sha256": container["pnpm_lock_sha256"],
+    }
 
 
 def security_binding(
@@ -283,6 +388,7 @@ class DeliveryConfig:
             "config_overrides": self.raw.get("config_overrides", ["features.plugins=false"]),
             "toolchain_roots": self.raw.get("toolchain_roots", []),
             "package_manager_cache": self.raw.get("package_manager_cache"),
+            "container": self.raw.get("container"),
             "max_repairs": int(self.raw.get("max_repairs", 2)),
             "capacity": int(self.raw.get("capacity", 2)),
             "fake_findings": self.raw.get("fake_findings", {})
@@ -295,18 +401,7 @@ class DeliveryConfig:
         if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
             raise ValueError("initial decision prompt must be a non-empty string")
         if self.raw.get("provider", "codex") == "codex":
-            if os.uname().sysname != "Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-                raise ValueError("this host lacks the required macOS profile sandbox")
-            binary = Path(policy["codex_bin"])
-            if binary != _installed_codex_binary():
-                raise ValueError("real provider requires the tested installed Codex CLI binary")
-            if not binary.is_file() or not os.access(binary, os.X_OK):
-                raise ValueError("configured Codex executable is unavailable")
-            if binary.is_symlink():
-                raise ValueError("configured Codex executable must not be a symlink")
-            with binary.open("rb") as stream:
-                if stream.read(2) == b"#!":
-                    raise ValueError("configured Codex executable must be a pinned binary")
+            container_identity = _container_identity(policy["container"], source=source)
             if policy["config_overrides"] != ["features.plugins=false"]:
                 raise ValueError("real role configuration overrides must disable plugins")
             if (
@@ -376,6 +471,16 @@ class DeliveryConfig:
                         raise ValueError("check network domains must be exact hosts")
                     for domain in check.get("network_domains", []):
                         validate_network_domain(domain)
+                    if check.get("network_domains"):
+                        raise ValueError("contained checks must run with networking disabled")
+                    if check["id"] == "install" and (
+                        "--offline" not in check["argv"]
+                        or "--frozen-lockfile" not in check["argv"]
+                        or "--store-dir" not in check["argv"]
+                    ):
+                        raise ValueError(
+                            "contained package installation must use the frozen offline store"
+                        )
                     if check.get("kind") == "test" and (
                         not check.get("test_count_regex") or int(check.get("min_tests", 0)) < 1
                     ):
@@ -416,31 +521,11 @@ class DeliveryConfig:
                 if env.get("JOBCTRL_E2E_ISOLATED") != "1":
                     raise ValueError("browser QA fixture isolation must be enabled")
                 read_roots = qa.get("read_roots", [])
-                if not isinstance(read_roots, list) or len(read_roots) > 3:
-                    raise ValueError("browser QA read roots exceed the bounded policy")
-                for raw_root in read_roots:
-                    if not isinstance(raw_root, str) or not Path(raw_root).is_absolute():
-                        raise ValueError("browser QA read root must be absolute")
-                    root = Path(raw_root)
-                    if not root.is_dir() or root.resolve(strict=True) != root:
-                        raise ValueError("browser QA read root must be a canonical directory")
-                    protected_roots = (
-                        self.state_root,
-                        Path.home() / ".codex",
-                        Path.home() / ".ssh",
-                        Path.home() / ".aws",
-                        Path.home() / ".config" / "gh",
-                    )
-                    if any(
-                        root == protected
-                        or root in protected.parents
-                        or protected in root.parents
-                        for protected in protected_roots
-                    ):
-                        raise ValueError("browser QA read root is too broad")
+                if read_roots not in (None, []):
+                    raise ValueError("container browser QA cannot mount host read roots")
                 browser_path = env.get("PLAYWRIGHT_BROWSERS_PATH")
-                if browser_path and browser_path not in read_roots:
-                    raise ValueError("browser executable path must be an admitted read root")
+                if browser_path != "/ms-playwright":
+                    raise ValueError("browser executable must use the pinned image path")
                 artifact_paths = qa.get("artifact_paths", [])
                 if (
                     not isinstance(artifact_paths, list)
@@ -484,20 +569,12 @@ class DeliveryConfig:
                 raise ValueError("sandbox attestation must be an owned private file")
             attestation_bytes = attestation_path.read_bytes()
             attestation = json.loads(attestation_bytes)
-            with Path(policy["codex_bin"]).open("rb") as stream:
-                binary_digest = hashlib.file_digest(stream, "sha256").hexdigest()
             project_root = Path(__file__).resolve().parents[2]
             with (project_root / "pyproject.toml").open("rb") as stream:
                 project = tomllib.load(stream)
             kit_revision = project["tool"]["uv"]["sources"]["agent-runtime-kit"]["rev"]
-            installed_url = importlib.metadata.distribution("agent-runtime-kit").read_text(
-                "direct_url.json"
-            )
-            if (
-                not installed_url
-                or json.loads(installed_url).get("vcs_info", {}).get("commit_id") != kit_revision
-            ):
-                raise ValueError("installed kit does not match the pinned source revision")
+            if kit_revision != "d9ed6e186ce028d0db3b044ce959a94f409510c5":
+                raise ValueError("runtime kit source is not the tested container revision")
             package = Path(__file__).resolve().parent
             source_hashes = {
                 path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -505,12 +582,35 @@ class DeliveryConfig:
             }
             role = attestation.get("role_observed", {})
             check = attestation.get("check_observed", {})
-            role_denied = _boundary_probe_passed(role)
-            check_denied = _boundary_probe_passed(check)
+            browser = attestation.get("browser_qa_observed", {})
+            evidence = attestation.get("evidence", {})
+            if not isinstance(evidence, dict) or set(evidence) != {
+                "role",
+                "check",
+                "browser",
+                "detached",
+                "resume",
+            }:
+                raise ValueError("container boundary evidence is incomplete")
+            for recorded in evidence.values():
+                if not isinstance(recorded, dict):
+                    raise ValueError("container evidence reference is malformed")
+                path = Path(recorded.get("path", ""))
+                if not path.is_absolute():
+                    raise ValueError("container evidence reference is not absolute")
+                info = path.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != recorded.get("sha256")
+                ):
+                    raise ValueError("container evidence changed after the conformance probe")
             if (
-                attestation.get("schema") != "devflow-native-profile-v3"
-                or attestation.get("effective_mode") != "Codex native named profile"
-                or attestation.get("codex_bin_sha256") != binary_digest
+                attestation.get("schema") != "devflow-container-v4"
+                or attestation.get("effective_mode")
+                != "Docker private PID namespace with Codex native role permissions"
+                or attestation.get("container_identity") != container_identity
                 or attestation.get("kit_revision") != kit_revision
                 or attestation.get("codex_sdk_version") != REQUIRED_CODEX_VERSION
                 or attestation.get("codex_cli_version") != REQUIRED_CODEX_VERSION
@@ -520,19 +620,28 @@ class DeliveryConfig:
                 or attestation.get("requested_effort") != policy["roles"]["implement"]["effort"]
                 or not isinstance(attestation.get("role_session_id"), str)
                 or not attestation["role_session_id"]
-                or not role_denied
-                or not check_denied
-                or attestation.get("network_enabled_check_loopback") != "PermissionError:1"
-                or attestation.get("network_enabled_check_credential") != "PermissionError:1"
+                or not _contained_probe_passed(role, role=True)
+                or not _contained_probe_passed(check, role=False)
+                or role.get("cleanup") != "confirmed"
+                or check.get("cleanup") != "confirmed"
+                or attestation.get("same_session_resume") is not True
+                or attestation.get("detached_cleanup")
+                != {"role": True, "check": True, "browser": True}
                 or attestation.get("install_exit_code") != 0
                 or attestation.get("api_check_exit_code") != 0
                 or (
                     qa is not None
-                    and not _browser_qa_probe_passed(attestation.get("browser_qa_observed"))
+                    and not (
+                        _contained_probe_passed(browser, role=False)
+                        and browser.get("browser_api_sqlite") is True
+                        and browser.get("owned_listeners") is True
+                        and browser.get("cleanup") == "confirmed"
+                        and type(browser.get("test_count")) is int
+                        and browser["test_count"] >= 2
+                    )
                 )
             ):
                 raise ValueError("sandbox attestation does not match this executable and boundary")
-            policy["codex_bin_sha256"] = binary_digest
             policy["sandbox_attestation_sha256"] = hashlib.sha256(attestation_bytes).hexdigest()
             policy["security_binding_sha256"] = security_digest
             policy["kit_revision"] = kit_revision
