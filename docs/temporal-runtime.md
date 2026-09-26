@@ -1,64 +1,74 @@
-# Experimental Temporal runtime
+# Local Temporal delivery runtime
 
-This optional Python package runs one local development task as a Temporal workflow. It does not change the existing Devflow skills, installer, tracking database, or GitHub issue state. The workflow starts with an explicit run ID, can wait for a decision, and then runs implement, independent review, and independent verification in order. A role must return a structured pass before the next role begins.
+The runtime under `runtime/` is a single-host, local development service. It accepts an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. The managed path owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. Its endpoint is a **published, unmerged PR**. It does not merge, release, deploy, or update personal production data.
 
-## Local setup
+The older `devflow-temporal` CLI remains a disposable role-ordering demonstration. It does not publish a PR or reconcile an issue. Use the managed `devflow-delivery` service for an end-to-end delivery.
 
-Use Python 3.12 or 3.13, `uv`, Git, and a local Temporal CLI. Run the commands below from `runtime/`. The dev server is for local experiments and is not a production Temporal deployment.
+## Setup and policy
+
+On macOS, install Python 3.12 or 3.13, `uv`, Git, GitHub CLI with access to the selected repository and Project, and a local Temporal CLI. Start from this checkout:
 
 ```sh
+cd runtime
 uv sync --locked --python python3.12
-export DEVFLOW_TEMPORAL_DATA="$(mktemp -d)"
-temporal server start-dev --ip 127.0.0.1 --port 17333 --ui-port 18333 \
-  --db-filename "$DEVFLOW_TEMPORAL_DATA/temporal.db"
+cd ui
+npm ci
+npm run build
+npm test
+cd ..
 ```
 
-In another terminal, start the worker:
+The service configuration is a private JSON file outside the target checkout. It owns absolute paths for `state_root`, `tracking_db`, `helpers_dir`, and `codex_bin`, plus fixed ports and allowlisted repositories. A repository policy fixes its source, origin URL, GitHub repository, base ref and expected SHA, Project and assignee, exact allowed feature paths, recovery paths, prepublication and final check commands, and required CI names. Roles have explicit model and effort selections. Clients cannot submit paths, check commands, model settings, or a broader endpoint. The public submit body is:
 
-```sh
-uv run --frozen devflow-temporal worker --address 127.0.0.1:17333
+```json
+{
+  "command_id": "submit-001",
+  "run_id": "local-001",
+  "work_id": "issue-work-001",
+  "issue_url": "https://github.com/OWNER/REPO/issues/123",
+  "repository_key": "configured-repository",
+  "goal": "Implement the accepted issue scope",
+  "accepted_plan": "The reviewed implementation and verification contract",
+  "base_ref": "main",
+  "branch": "feat/issue-123",
+  "authorized_endpoint": "published_unmerged"
+}
 ```
 
-Prepare a **clean disposable Git copy** of the task repository. `start` requires `--disposable` because the implementer edits that copy. Keep the runtime state directory outside it. The state directory must be newly created by the runtime or an owned private directory with mode `0700`; an existing directory with broader permissions is rejected without changing its mode. The deterministic fake provider gives a repeatable workflow demonstration and makes no model calls:
+`recovery_key` selects a server-configured source import. `supersedes_run_id` is allowed only for an explicitly named, terminal pre-role run whose external claim can be atomically transferred; the previous run remains auditable. An identical submit retry reuses its run, while a changed request with the same run ID is rejected. The service records an outbox intent before Temporal start and compares the remote workflow memo on recovery.
+
+The real provider requires the pinned, executable Codex Mach-O binary and the tested agent-runtime-kit revision in `runtime/pyproject.toml`. The private `sandbox_attestation_path` binds that binary and every runtime Python source hash to local negative and positive boundary probes. A missing, stale, or unsafe attestation blocks admission before claiming work. The attestation records the requested model/effort and real session ID, command-tool and child-process denial of copied/host credentials, controller state, outside writes, and loopback, plus an owned write; it also records separate broker-check and network-enabled install probes. A check's `network_domains` may name exact public hosts only. Check commands receive a credential-free Codex home, an owned workspace, and the explicitly configured toolchain/cache. The model command tool uses a native named permission profile; provider authentication stays in the trusted CLI. This is a macOS local boundary, not a portable or multi-tenant security claim. Account acceptance of a requested model is established by an actual provider call; the current kit does not attest the provider-observed model, so reported model and effort remain unknown.
+
+Only the operator's private policy file can grant check domains or toolchain roots. The check/role profiles reject tracked project `.codex` configuration, deny workspace `.git`, disable plugins and Git hooks, and keep broker GitHub credentials and controller state outside model and check command access. Candidate-controlled installation, build, and tests run through the native check profile, not as unrestricted broker subprocesses. Before running a new real repository, repeat the direct, child, credential, network, outside-write, owned-write, and actual toolchain probes for that configuration and bind the resulting evidence to its admission attestation.
+
+## Lifecycle and public interfaces
+
+Use dedicated loopback ports that do not conflict with the target project. The runtime starts and owns a local Temporal dev server, one worker, and one dashboard/API process. It stores process identity in the private state root; status distinguishes a dead or replaced process. Build the UI before start. The Temporal dev server is for a local experiment and is not a production deployment.
 
 ```sh
-uv run --frozen devflow-temporal start --address 127.0.0.1:17333 \
-  --id demo-1 --goal 'Add a demo marker' --repo /path/to/disposable-repo \
-  --state-dir "$DEVFLOW_TEMPORAL_DATA/state" --provider fake --decision --disposable
-uv run --frozen devflow-temporal status --address 127.0.0.1:17333 --id demo-1
-uv run --frozen devflow-temporal decision --address 127.0.0.1:17333 \
-  --id demo-1 --decision-id demo-1:start --revision 1 --answer proceed
-uv run --frozen devflow-temporal status --address 127.0.0.1:17333 --id demo-1
+uv run --frozen devflow-delivery --config /absolute/private/config.json start
+uv run --frozen devflow-delivery --config /absolute/private/config.json status
+uv run --frozen devflow-delivery --config /absolute/private/config.json token
+uv run --frozen devflow-delivery --config /absolute/private/config.json submit --request /absolute/private/submit.json
+uv run --frozen devflow-delivery --config /absolute/private/config.json run --id local-001
+uv run --frozen devflow-delivery --config /absolute/private/config.json stop
 ```
 
-The fake implementer writes `devflow-temporal-demo.txt`. `--fake-finding review` or `--fake-change review` demonstrates a blocked gate. Repeating `start` with the same ID and identical inputs returns the existing run; changing its inputs is rejected. `status` and waiting for a decision do not invoke a role. The Temporal UI is at `http://127.0.0.1:18333` for this example.
+The token command prints the local service credential for dashboard sign-in; keep it private. The browser uses same-origin loopback requests, an HttpOnly session cookie, Origin/Host checks, and a CSRF header for writes. The dashboard serves `/`, `/new`, `/settings`, and `/runs/{id}` with the built static assets. It renders authoritative phase gates, roles, candidate and PR identity, checks, tracker status, usage unknowns, decisions, and durable events. SSE resumes from its event cursor and shows stale state on disconnect. No display refresh calls a model.
 
-For a real provider, select an account-supported model and effort explicitly:
+The CLI, HTTP API, and official MCP stdio server use the same service. To configure a local MCP client, run `uv run --frozen devflow-delivery-mcp --config /absolute/private/config.json` as its command. It exposes `submit_run`, `list_runs`, `get_run`, `read_evidence`, `answer_decision`, and `cancel_run`. The MCP client authenticates to the loopback API with the private local token. HTTP has `GET /api/service`, `/api/runs`, `/api/runs/{id}`, indexed evidence and cursor-replay events; `POST /api/runs`, `/decision`, and `/cancel` require the session and CSRF value. Indexed evidence reads are contained to the run's owned state. The CLI request file is an alternative to browser writes.
 
-```sh
-uv run --frozen devflow-temporal start --address 127.0.0.1:17333 \
-  --id local-task-1 --goal 'Make a small local change' \
-  --repo /path/to/disposable-repo --state-dir "$DEVFLOW_TEMPORAL_DATA/state" \
-  --provider codex --model gpt-5.5 --effort low --disposable
-```
+An optional managed decision is a Temporal wait with a persisted ID and candidate revision. A wrong/stale answer returns a conflict; a worker restart does not invoke a model while waiting. Cancellation stops at a role/check boundary. An accepted cancellation cannot later become a blocked or successful outcome because a check finishes concurrently. If a child or external effect cannot be proven stopped, cleanup is explicitly unknown. A completed role receipt is reused only for its bound request; an ambiguous in-flight role is quarantined rather than repeated.
 
-This is an example model choice, not a guarantee that every account supports it. The start command checks the kit's declared task capabilities and bounded account readiness before scheduling. Provider-side model acceptance is established only by an actual call. Every real role call uses `agent-runtime-kit` 0.5.2 `AgentTask` and `AgentResult`; each role gets a separate task and session. Review requests the Codex read-only sandbox and strict approval mode. Implementation and verification request a workspace-write sandbox with strict approval mode; verification runs in a copy of the candidate. Network control and a portable tool allow-list are unsupported by this adapter, so this runtime does not claim to prevent arbitrary external side effects. Do not use it on production work or grant it credentials that permit unwanted writes.
-
-## State and recovery
-
-Temporal stores workflow transitions, decisions, and terminal outcomes in its configured persistence file. The separate private state directory holds candidate snapshots, role evidence, and a SQLite activity receipt store. The active Devflow tracking database is untouched. Status reports phase, outcome, candidate identity, findings, per-role usage, requested model and effort, and the role session. The kit's Codex `metadata.model` is copied from task selection, so it is not proof of the model that executed. This adapter does not expose observed model or effort; `reported_model` and `reported_effort` remain `null`. Fake evidence is labeled explicitly.
-
-The candidate ID combines Git HEAD with the content and executable mode of Git-visible regular files: tracked files plus nonignored untracked files. The snapshot omits ignored files and `.git`, as well as `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, and `.ruff_cache`; symlinks and special files are rejected. Review and verification bind to the same snapshot. If their working copy changes during a gate, that gate blocks. This is a small-repository local snapshot design, not a general artifact service.
-
-An activity receipt is keyed by run, role, iteration, and candidate. Before any receipt or snapshot can be reused, the private store binds the run ID to its input digest, repository, state directory, and initial candidate. A conflicting new Temporal history is blocked even if it uses the same run ID and candidate. A finished receipt is reused only for matching inputs if Temporal redelivers the activity. Unbound receipts created by an older version require a new state directory. A still-running receipt after an interruption is treated as recovery-unknown and blocks, because the provider may already have acted. Activity and workflow retries are disabled for this path. It cannot resume a model mid-turn. Restarting a worker during the optional decision wait preserves the pending decision; answer with the exact ID and revision shown by `status`.
-
-`cancel --id RUN --reason TEXT` requests a stop at the next role boundary. It does not roll back file or tool effects of an active role; status reports cleanup as unknown after activity work. This version has no production broker, multi-host receipt coordination, hosted UI, GitHub mutation, release, or global installation. The Codex adapter's output events are not a durable event journal and its SDK result arrives after the turn; use Temporal history and the local evidence files for the first version of observability.
-
-## Checks
+## Verification and limits
 
 ```sh
+cd runtime
 uv run --frozen ruff check src tests
 uv run --frozen pytest -q
+cd ui
+npm run build
+npm test
 ```
 
-The integration tests start a real local Temporal dev server, exercise a worker restart, duplicate starts, a conflicting history on a fresh server, decision revisions, candidate gates, findings, cancellation, and receipt reuse. The fake provider is deterministic; these tests do not prove live model quality. Real provider smoke evidence must be labeled separately.
+Tests cover real Temporal restart/decision and repair gates, submission/claim conflicts, cancellation races, check containment, and the local API. The dashboard suite exercises the real response shape as well as UI state changes. Live model availability, actual repository checks, GitHub effects, browser interaction against the real service, and independent review/verification require separate evidence for the **exact candidate**. A successful unit suite or fake provider run does not establish those effects. The service is local, single-host, and uses Temporal's development server and SQLite; interrupted external effects may need human reconciliation.

@@ -2,7 +2,7 @@
 
 Small development skills for OpenAI Codex CLI agents, with Python helpers for work ownership, GitHub issue status and metrics. The agent follows the relevant skill and uses its host tools, Git, GitHub CLI and project commands directly.
 
-An [experimental local Temporal runtime](docs/temporal-runtime.md) is available as a separate Python package under `runtime/`.
+An [experimental local Temporal delivery service](docs/temporal-runtime.md) is available as a separate Python package under `runtime/`. It serves a dashboard, CLI, and MCP interface for allowlisted, published-unmerged issue delivery on a single host; it does not change the installed skills or release workflow.
 
 ## Prerequisites
 

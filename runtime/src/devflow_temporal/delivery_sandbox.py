@@ -1,4 +1,4 @@
-"""Outer macOS role sandbox; kit permission declarations alone are not a host boundary."""
+"""Native Codex permission profiles for real roles and checks; Seatbelt for fake tests."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import stat
 from pathlib import Path
 from typing import Any
@@ -28,12 +27,12 @@ def _private(path: Path) -> None:
 
 
 def prepare_sandbox(request: dict[str, Any], attempt_dir: Path) -> tuple[Path, dict[str, str]]:
+    if request["spec"].get("provider") != "fake":
+        raise ValueError("legacy Seatbelt launcher is only for the fake provider")
     if not Path("/usr/bin/sandbox-exec").is_file():
         raise ValueError("required macOS sandbox-exec is unavailable")
     spec = request["spec"]
     role = request["role"]
-    if spec.get("provider") == "codex" and spec["policy"].get("host_sandbox") != "seatbelt":
-        raise ValueError("role policy did not require the host sandbox")
     state_root = Path(spec["state_dir"]).parent.parent.resolve()
     workspace = Path(request["workspace"]).resolve(strict=True)
     role_home = Path(spec["state_dir"]) / "role-homes" / role
@@ -44,19 +43,6 @@ def prepare_sandbox(request: dict[str, Any], attempt_dir: Path) -> tuple[Path, d
     auth_source = Path(
         spec["policy"].get("codex_auth_path") or Path.home() / ".codex" / "auth.json"
     )
-    if spec.get("provider") == "codex":
-        source_info = auth_source.lstat()
-        if (
-            not stat.S_ISREG(source_info.st_mode)
-            or source_info.st_uid != os.getuid()
-            or stat.S_IMODE(source_info.st_mode) & 0o077
-        ):
-            raise ValueError("configured provider credential is not an owned private file")
-        target = codex_home / "auth.json"
-        if not target.exists():
-            descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(descriptor, "wb") as stream, auth_source.open("rb") as source:
-                shutil.copyfileobj(source, stream)
     protected = [
         state_root,
         Path(spec["config_path"]),

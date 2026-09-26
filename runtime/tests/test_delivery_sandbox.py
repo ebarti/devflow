@@ -10,6 +10,11 @@ import pytest
 from devflow_temporal.delivery_sandbox import prepare_sandbox
 
 
+def test_legacy_launcher_rejects_real_provider_before_credential_copy(tmp_path):
+    with pytest.raises(ValueError, match="only for the fake provider"):
+        prepare_sandbox({"spec": {"provider": "codex"}}, tmp_path / "attempt")
+
+
 @pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS Seatbelt required")
 def test_outer_role_boundary_blocks_state_and_child_writes(tmp_path: Path, monkeypatch):
     root = tmp_path / "state"

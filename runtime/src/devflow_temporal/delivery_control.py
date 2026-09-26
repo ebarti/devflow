@@ -123,6 +123,9 @@ def _stop(config: DeliveryConfig, manifest: dict) -> dict:
 
 
 def service_start(config: DeliveryConfig) -> dict:
+    bundle = Path(__file__).resolve().parents[2] / "ui" / "dist" / "index.html"
+    if not bundle.is_file():
+        raise ValueError("dashboard bundle is missing; build runtime/ui before service start")
     existing = _read_manifest(config)
     if existing:
         if any(_owned(process) for process in existing.get("processes", {}).values()):
