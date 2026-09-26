@@ -306,6 +306,105 @@ async def test_public_evidence_reads_contained_role_and_browser_logs(api_fixture
 
 
 @pytest.mark.asyncio
+async def test_public_evidence_keeps_historical_codex_logs(api_fixture):
+    path, request = api_fixture
+    app = create_app(path)
+    store = app.state.delivery.store
+    store.submit(request)
+    root = Path(store.spec("run-1")["state_dir"])
+    with store._connect() as db:
+        frozen = json.loads(
+            db.execute("SELECT request_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0]
+        )
+        frozen["provider"] = "codex"  # A run created before contained Codex execution.
+        db.execute(
+            "UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'", (json.dumps(frozen),)
+        )
+        for role in ("implement", "review"):
+            db.execute(
+                """INSERT INTO delivery_attempts
+                   (job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    f"{role}-0",
+                    "run-1",
+                    role,
+                    0,
+                    "candidate-1",
+                    "finished" if role == "implement" else "unknown",
+                    json.dumps({"status": "pass"}) if role == "implement" else None,
+                    "confirmed" if role == "implement" else "unknown",
+                ),
+            )
+    native_role_log = root / "attempts" / "implement-0" / "process.log"
+    native_role_log.parent.mkdir(parents=True)
+    native_role_log.write_text("historical native role\n")
+    marked_role = root / "attempts" / "review-0"
+    (marked_role / "container").mkdir(parents=True)
+    (marked_role / "container" / "container-intent.json").write_text("{}")
+    (marked_role / "process.log").write_text("forged native fallback\n")
+    native_qa = root / "browser-qa" / "0"
+    native_qa.mkdir(parents=True)
+    native_qa_log = native_qa / "browser-qa.log"
+    native_qa_log.write_text("historical browser QA\n")
+    native_log_sha = hashlib.sha256(native_qa_log.read_bytes()).hexdigest()
+    native_receipt = native_qa / "receipt.json"
+    native_receipt.write_text(
+        json.dumps({"iteration": 0, "log": str(native_qa_log), "log_sha256": native_log_sha})
+    )
+    native_receipt_sha = hashlib.sha256(native_receipt.read_bytes()).hexdigest()
+    with store._connect() as db:
+        db.execute(
+            """INSERT INTO delivery_effects
+               (effect_key,run_id,kind,request_json,state,observed_json,updated_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                "browser_qa:run-1:0",
+                "run-1",
+                "browser_qa",
+                "{}",
+                "complete",
+                json.dumps(
+                    {
+                        "iteration": 0,
+                        "log": str(native_qa_log),
+                        "log_sha256": native_log_sha,
+                        "receipt": str(native_receipt),
+                        "receipt_sha256": native_receipt_sha,
+                    }
+                ),
+                "2026-09-26T00:00:00Z",
+            ),
+        )
+    marked_qa = root / "browser-qa" / "1"
+    (marked_qa / "container").mkdir(parents=True)
+    (marked_qa / "container" / "container-intent.json").write_text("{}")
+    (marked_qa / "browser-qa.log").write_text("forged browser fallback\n")
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
+        token = (Path(json.loads(path.read_text())["state_root"]) / "service-token").read_text()
+        assert (
+            await browser.post(
+                "/api/session",
+                json={"token": token.strip()},
+                headers={"Origin": "http://127.0.0.1:18770"},
+            )
+        ).status_code == 200
+        listed = (await browser.get("/api/runs/run-1")).json()["evidence"]
+        assert {item["id"] for item in listed} == {
+            "role-implement-0",
+            "browser-qa-0-log",
+            "browser-qa-0-receipt",
+        }
+        role = (await browser.get("/api/runs/run-1/evidence/role-implement-0")).json()
+        qa = (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).json()
+        assert role["text"] == "historical native role\n"
+        assert qa["text"] == "historical browser QA\n"
+        assert (await browser.get("/api/runs/run-1/evidence/role-review-0")).status_code == 404
+        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-1-log")).status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_terminal_cancel_is_conflict_without_pending_mutation(api_fixture):
     path, request = api_fixture
     app = create_app(path)

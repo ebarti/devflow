@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import stat
 from collections.abc import Iterator
@@ -713,7 +714,8 @@ class DeliveryStore:
         indexed: list[dict[str, Any]] = []
         with self._connect() as db:
             attempts = db.execute(
-                "SELECT job_key,role,iteration,result_json FROM delivery_attempts WHERE run_id=?",
+                """SELECT job_key,role,iteration,process_identity,result_json
+                   FROM delivery_attempts WHERE run_id=?""",
                 (run_id,),
             ).fetchall()
             browser_effects = {
@@ -729,8 +731,13 @@ class DeliveryStore:
             folder = root / "attempts" / attempt["job_key"]
             result = json.loads(attempt["result_json"]) if attempt["result_json"] else {}
             contained_log = folder / "container" / "container.log"
-            contained = spec["provider"] == "codex" or bool(
-                result.get("container_id") or result.get("container_log_sha256")
+            intent = folder / "container" / "container-intent.json"
+            if intent.is_symlink():
+                continue
+            contained = (
+                intent.is_file()
+                or bool(result.get("container_id") or result.get("container_log_sha256"))
+                or bool(re.fullmatch(r"[0-9a-f]{64}", attempt["process_identity"] or ""))
             )
             path = contained_log if contained else folder / "process.log"
             if path.is_file():
@@ -782,11 +789,12 @@ class DeliveryStore:
                 continue
             binding = effect if effect is not None else projected
             contained_log = folder / "container" / "container.log"
-            contained = spec["provider"] == "codex" or (
+            intent = folder / "container" / "container-intent.json"
+            if intent.is_symlink():
+                continue
+            contained = intent.is_file() or (
                 binding is not None and binding.get("log") == str(contained_log)
             )
-            if binding is None and contained_log.is_file():
-                contained = True
             path = contained_log if contained else folder / "browser-qa.log"
             if binding is not None:
                 expected_receipt = binding.get("receipt_sha256")
