@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +45,10 @@ class DeliveryConfig:
                 raise ValueError(f"{key} must be absolute")
         if not value.get("repositories") or not value.get("roles"):
             raise ValueError("service requires repository and role policy")
+        if set(value["roles"]) != {"implement", "review", "verify"}:
+            raise ValueError("service role policy must define implement, review, and verify")
+        if value.get("provider", "codex") not in {"codex", "fake"}:
+            raise ValueError("unsupported configured role provider")
         return cls(path=path.resolve(), raw=value)
 
     @property
@@ -150,8 +156,10 @@ class DeliveryConfig:
         policy = {
             "roles": self.raw["roles"],
             "checks": repository.get("checks", []),
+            "prepublish_checks": repository.get("prepublish_checks", []),
             "required_ci": repository.get("required_ci", []),
             "allowed_paths": repository.get("allowed_paths", []),
+            "pr_body": repository.get("pr_body"),
             "recovery": repository.get("recovery", {}).get(recovery_key),
             "codex_bin": self.raw["codex_bin"],
             "codex_auth_path": self.raw.get("codex_auth_path"),
@@ -170,6 +178,64 @@ class DeliveryConfig:
                 raise ValueError("this host lacks the required outer macOS role sandbox")
             if not Path(policy["codex_bin"]).is_file():
                 raise ValueError("configured Codex executable is unavailable")
+            if (
+                not policy["allowed_paths"]
+                or not policy["prepublish_checks"]
+                or not policy["checks"]
+            ):
+                raise ValueError("real delivery requires source scope and both check stages")
+            if not policy["required_ci"]:
+                raise ValueError("real delivery requires named CI checks")
+            if not repository.get("project_url") or not repository.get("assignee"):
+                raise ValueError("real delivery requires a managed tracker target")
+            for role in ("implement", "review", "verify"):
+                selected = policy["roles"][role]
+                if not selected.get("model") or not selected.get("effort"):
+                    raise ValueError(f"{role} model and effort must be configured")
+            for stage in ("prepublish_checks", "checks"):
+                ids = set()
+                for check in policy[stage]:
+                    if not isinstance(check, dict) or not check.get("id") or not check.get("argv"):
+                        raise ValueError(f"{stage} has an incomplete check command")
+                    if check["id"] in ids:
+                        raise ValueError(f"{stage} contains a duplicate check ID")
+                    ids.add(check["id"])
+                    if check.get("kind") == "test" and (
+                        not check.get("test_count_regex") or int(check.get("min_tests", 0)) < 1
+                    ):
+                        raise ValueError("test checks require an observed positive count")
+            attestation_path = Path(self.raw.get("sandbox_attestation_path", ""))
+            if not attestation_path.is_absolute():
+                raise ValueError("real role policy requires an absolute sandbox attestation path")
+            metadata = attestation_path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ValueError("sandbox attestation must be an owned private file")
+            attestation_bytes = attestation_path.read_bytes()
+            attestation = json.loads(attestation_bytes)
+            with Path(policy["codex_bin"]).open("rb") as stream:
+                binary_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            if (
+                attestation.get("effective_mode")
+                != "Codex CLI full-access inside outer Seatbelt; kit approval STRICT"
+                or attestation.get("outer_sentinel") != "SAFE"
+                or attestation.get("direct_kit_sentinel") != "BREACH"
+                or attestation.get("allowed_workspace_marker") is not True
+                or attestation.get("controller_state_read") != "denied"
+                or attestation.get("controller_state_write") != "denied"
+                or attestation.get("credential_read") != "denied"
+                or attestation.get("subprocess_external_write") != "denied"
+                or attestation.get("gh_authenticated_in_role") != "false"
+                or attestation.get("codex_bin_sha256") != binary_digest
+                or attestation.get("requested_model") != policy["roles"]["implement"]["model"]
+                or attestation.get("requested_effort") != policy["roles"]["implement"]["effort"]
+            ):
+                raise ValueError("sandbox attestation does not match this executable and boundary")
+            policy["codex_bin_sha256"] = binary_digest
+            policy["sandbox_attestation_sha256"] = hashlib.sha256(attestation_bytes).hexdigest()
             policy["host_sandbox"] = "seatbelt"
         return {
             **supplied,

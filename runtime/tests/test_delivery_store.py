@@ -224,12 +224,20 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
         async def checks_stub(payload):
             return {"state": "passed", "candidate_id": payload["candidate"]["id"]}
 
+        @activity.defn(name="delivery_precheck")
+        async def precheck_stub(payload):
+            return {"state": "passed", "candidate_id": payload["candidate"]["id"]}
+
         @activity.defn(name="delivery_ci")
         async def ci_stub(payload):
             return {"state": "passed", "head": payload["pull_request"]["head"]}
 
         @activity.defn(name="delivery_tracker")
         async def tracker_stub(_payload):
+            return {"state": "consistent", "observed": {"fixture": True}}
+
+        @activity.defn(name="delivery_tracker_start")
+        async def tracker_start_stub(_payload):
             return {"state": "consistent", "observed": {"fixture": True}}
 
         async with Worker(
@@ -241,8 +249,10 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
                 delivery_prepare,
                 delivery_role,
                 publish_stub,
+                precheck_stub,
                 checks_stub,
                 ci_stub,
+                tracker_start_stub,
                 tracker_stub,
             ],
         ):

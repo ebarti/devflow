@@ -248,10 +248,14 @@ class DeliveryBroker:
             raise RuntimeError("gate checkout does not match the published candidate")
         return path
 
-    def run_checks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
-        checkout = self.gate_checkout("verify", iteration, candidate)
+    def _run_check_list(
+        self,
+        checkout: Path,
+        checks: list[dict[str, Any]],
+        evidence_dir: Path,
+        candidate: dict[str, Any],
+    ) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
-        evidence_dir = self.state_dir / "checks" / str(iteration)
         evidence_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         check_home = self.state_dir / "check-home"
         check_temp = self.state_dir / "check-tmp"
@@ -268,9 +272,11 @@ class DeliveryBroker:
                 "TMPDIR": str(check_temp),
                 "XDG_CACHE_HOME": str(check_home / ".cache"),
                 "COREPACK_HOME": str(check_home / ".corepack"),
+                "CI": "1",
+                "NO_COLOR": "1",
             }
         )
-        for check in self.spec["policy"].get("checks", []):
+        for check in checks:
             argv = check.get("argv")
             relative = check.get("cwd", ".")
             cwd = (checkout / relative).resolve()
@@ -300,8 +306,15 @@ class DeliveryBroker:
 
                 numbers = re.findall(check["test_count_regex"], output)
                 count = sum(int(number) for number in numbers) if numbers else 0
-            passed = checked.returncode == 0 and (
-                count is None or count >= int(check.get("min_tests", 1))
+            rejected_output = False
+            if check.get("reject_regex"):
+                import re
+
+                rejected_output = re.search(check["reject_regex"], output) is not None
+            passed = (
+                checked.returncode == 0
+                and (count is None or count >= int(check.get("min_tests", 1)))
+                and not rejected_output
             )
             results.append(
                 {
@@ -310,6 +323,7 @@ class DeliveryBroker:
                     "cwd": str(cwd),
                     "exit_code": checked.returncode,
                     "test_count": count,
+                    "rejected_output": rejected_output,
                     "passed": passed,
                     "log": str(artifact),
                     "log_sha256": _sha256(artifact),
@@ -327,6 +341,25 @@ class DeliveryBroker:
             "candidate_id": candidate["id"],
             "source_unchanged": source_unchanged,
         }
+
+    def run_prechecks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
+        if self.candidate() != candidate:
+            raise ValueError("prepublication candidate is stale")
+        return self._run_check_list(
+            self.checkout,
+            self.spec["policy"].get("prepublish_checks", []),
+            self.state_dir / "prechecks" / str(iteration),
+            candidate,
+        )
+
+    def run_checks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
+        checkout = self.gate_checkout("verify", iteration, candidate)
+        return self._run_check_list(
+            checkout,
+            self.spec["policy"].get("checks", []),
+            self.state_dir / "checks" / str(iteration),
+            candidate,
+        )
 
     def _existing_pr(self) -> dict[str, Any] | None:
         output = _run(
@@ -416,9 +449,12 @@ class DeliveryBroker:
             title = self.spec["goal"].splitlines()[0][:100]
             body = self.state_dir / "pull-request.md"
             body.write_text(
-                f"{title}\n\n"
-                f"Implements issue {self.spec['issue_url']} under the accepted local plan. "
-                "This PR is published for review and remains unmerged.\n",
+                self.spec["policy"].get("pr_body")
+                or (
+                    f"{title}\n\n"
+                    f"Implements issue {self.spec['issue_url']} under the accepted local plan. "
+                    "This PR is published for review and remains unmerged.\n"
+                ),
                 encoding="utf-8",
             )
             os.chmod(body, 0o600)

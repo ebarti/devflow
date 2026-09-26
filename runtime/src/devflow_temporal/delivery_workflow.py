@@ -90,6 +90,18 @@ class DeliveryWorkflow:
         except Exception as exc:
             return await self._stop(spec, f"preparation failed: {type(exc).__name__}")
         self.state["candidate"] = prepared["candidate"]
+        self.state["phase"] = "tracker_start"
+        self.state["revision"] += 1
+        await self._project(spec, "tracker_start", "Claimed issue entering In progress")
+        try:
+            started_tracker = await self._activity("delivery_tracker_start", {"spec": spec})
+        except Exception as exc:
+            return await self._stop(
+                spec, f"initial tracker synchronization pending: {type(exc).__name__}"
+            )
+        self.state["tracker"] = started_tracker
+        if started_tracker.get("state") != "consistent":
+            return await self._stop(spec, "initial tracker readback remains pending")
         prior_implementer_session = None
         max_repairs = spec["policy"]["max_repairs"]
         repair_findings: list[str] = []
@@ -126,6 +138,25 @@ class DeliveryWorkflow:
             if not prior_implementer_session and spec["provider"] == "codex":
                 return await self._stop(spec, "implementer session identity is missing")
             self.state["candidate"] = implementation["candidate"]
+            self.state["phase"] = "prepublish_checks"
+            self.state["revision"] += 1
+            await self._project(spec, "prepublish_checks", "Checking candidate before the first PR")
+            try:
+                prechecked = await self._activity(
+                    "delivery_precheck",
+                    {"spec": spec, "iteration": iteration, "candidate": self.state["candidate"]},
+                )
+            except Exception as exc:
+                return await self._stop(spec, f"prepublication checks failed: {type(exc).__name__}")
+            self.state["checks"]["prepublish"] = prechecked
+            if prechecked.get("state") != "passed":
+                repair_findings = ["required prepublication checks did not pass"]
+                self.state["findings"].extend(repair_findings)
+                self.state["revision"] += 1
+                await self._project(spec, "findings", "Prepublication candidate needs repair")
+                if iteration >= max_repairs:
+                    return await self._stop(spec, "prepublication repair limit exhausted")
+                continue
             self.state["phase"] = "publishing"
             self.state["revision"] += 1
             await self._project(spec, "candidate_ready", "Candidate ready for publication")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -102,6 +103,10 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
     binary = request["spec"]["policy"]["codex_bin"]
     if not Path(binary).is_file():
         raise ValueError("configured Codex executable is missing")
+    with Path(binary).open("rb") as stream:
+        actual_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    if actual_digest != request["spec"]["policy"].get("codex_bin_sha256"):
+        raise ValueError("Codex executable changed after sandbox attestation")
 
     class PinnedConfig(CodexConfig):
         def __init__(self, *, cwd=None, config_overrides=(), env=None):

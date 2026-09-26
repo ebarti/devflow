@@ -347,6 +347,8 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.get("/")
     @app.get("/runs/{run_id}")
+    @app.get("/new")
+    @app.get("/settings")
     async def dashboard(_request: Request, run_id: str | None = None):
         if (dist / "index.html").is_file():
             return FileResponse(dist / "index.html")

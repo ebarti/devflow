@@ -106,16 +106,20 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
     return broker.run_checks(request["iteration"], request["candidate"])
 
 
+@activity.defn(name="delivery_precheck")
+async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
+    _, broker = _context(request["spec"])
+    return broker.run_prechecks(request["iteration"], request["candidate"])
+
+
 @activity.defn(name="delivery_ci")
 async def delivery_ci(request: dict[str, Any]) -> dict[str, Any]:
     _, broker = _context(request["spec"])
     return await broker.checks(request["pull_request"])
 
 
-@activity.defn(name="delivery_tracker")
-async def delivery_tracker(request: dict[str, Any]) -> dict[str, Any]:
-    store, _ = _context(request["spec"])
-    spec = request["spec"]
+def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[str, Any]:
+    store, _ = _context(spec)
     repository = store.config.raw["repositories"][spec["repository_key"]]
     project = repository.get("project_url")
     assignee = repository.get("assignee")
@@ -138,9 +142,10 @@ async def delivery_tracker(request: dict[str, Any]) -> dict[str, Any]:
         "--project",
         project,
         "--status",
-        "in-review",
-        "--release",
+        status,
     ]
+    if release:
+        command.append("--release")
     result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=120)
     if result.returncode:
         return {"state": "pending", "reason": (result.stderr or result.stdout).strip()[:500]}
@@ -162,9 +167,22 @@ async def delivery_tracker(request: dict[str, Any]) -> dict[str, Any]:
     if audit.returncode:
         return {"state": "pending", "reason": (audit.stderr or audit.stdout).strip()[:500]}
     observed = json.loads(audit.stdout)
-    if observed.get("state") != "consistent" or observed.get("claim"):
+    expected_claim = not release
+    if observed.get("state") != "consistent" or bool(observed.get("claim")) != expected_claim:
         return {"state": "pending", "observed": observed}
     return {"state": "consistent", "observed": observed}
+
+
+@activity.defn(name="delivery_tracker_start")
+async def delivery_tracker_start(request: dict[str, Any]) -> dict[str, Any]:
+    if request["spec"]["provider"] == "fake":
+        return {"state": "consistent", "observed": {"fixture": True}}
+    return _tracker_sync(request["spec"], "in-progress", release=False)
+
+
+@activity.defn(name="delivery_tracker")
+async def delivery_tracker(request: dict[str, Any]) -> dict[str, Any]:
+    return _tracker_sync(request["spec"], "in-review", release=True)
 
 
 DELIVERY_ACTIVITIES = [
@@ -173,6 +191,8 @@ DELIVERY_ACTIVITIES = [
     delivery_role,
     delivery_publish,
     delivery_checks,
+    delivery_precheck,
     delivery_ci,
+    delivery_tracker_start,
     delivery_tracker,
 ]

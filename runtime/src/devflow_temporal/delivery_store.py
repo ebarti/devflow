@@ -527,14 +527,18 @@ class DeliveryStore:
             ).fetchone()[0]
         event_types = {event["type"] for event in self.events(run_id)}
         gates = [
-            {"id": name, "label": label, "state": "completed" if name in event_types else "pending"}
-            for name, label in (
-                ("preparing", "Prepare"),
-                ("published", "Publish"),
-                ("checks_started", "Local checks"),
-                ("ci_wait", "Required CI"),
-                ("tracker_started", "Tracker"),
-                ("delivered", "Delivered"),
+            {
+                "id": name,
+                "label": label,
+                "state": "completed" if completion in event_types else "pending",
+            }
+            for name, label, completion in (
+                ("prepare", "Prepare", "role_started"),
+                ("prepublish", "Before PR checks", "published"),
+                ("publish", "Publish", "published"),
+                ("local_checks", "Local checks", "ci_wait"),
+                ("required_ci", "Required CI", "tracker_started"),
+                ("tracker", "Tracker", "delivered"),
             )
         ]
         return {
@@ -594,7 +598,14 @@ class DeliveryStore:
                 or root.resolve() not in path.resolve().parents
             ):
                 continue
-            safe.append({"id": item["id"], "label": item["label"], "bytes": path.stat().st_size})
+            safe.append(
+                {
+                    "id": item["id"],
+                    "label": item["label"],
+                    "bytes": path.stat().st_size,
+                    "url": f"/api/runs/{run_id}/evidence/{item['id']}",
+                }
+            )
         return safe
 
     def evidence(self, run_id: str, evidence_id: str) -> dict[str, Any]:
