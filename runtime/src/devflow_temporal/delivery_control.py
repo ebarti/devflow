@@ -22,6 +22,7 @@ from temporalio.worker import Worker
 from .delivery_activities import DELIVERY_ACTIVITIES
 from .delivery_api import create_app
 from .delivery_client import client as api_client
+from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
@@ -201,6 +202,7 @@ async def worker(config: DeliveryConfig) -> None:
     client = await Client.connect(
         config.temporal_address,
         namespace=config.raw.get("temporal_namespace", "default"),
+        data_converter=DELIVERY_DATA_CONVERTER,
     )
     async with Worker(
         client,

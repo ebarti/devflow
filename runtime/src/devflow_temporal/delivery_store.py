@@ -22,6 +22,7 @@ from temporalio.client import Client, WorkflowExecutionStatus
 
 from .candidate import candidate_for
 from .contracts import canonical_json, digest
+from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig, scope_amended_spec, scope_amendment_config
 from .delivery_continuation import (
     continuation_authority,
@@ -495,6 +496,7 @@ class DeliveryStore:
             client = await Client.connect(
                 self.config.temporal_address,
                 namespace=self.config.raw.get("temporal_namespace", "default"),
+                data_converter=DELIVERY_DATA_CONVERTER,
             )
             handle = client.get_workflow_handle(workflow_id or "delivery-" + run_id)
             description = await handle.describe()

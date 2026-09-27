@@ -25,6 +25,7 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from .contracts import digest
+from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
@@ -86,6 +87,7 @@ class DeliveryService:
         return await Client.connect(
             self.config.temporal_address,
             namespace=self.config.raw.get("temporal_namespace", "default"),
+            data_converter=DELIVERY_DATA_CONVERTER,
         )
 
     async def healthy_client(self) -> Client:

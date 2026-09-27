@@ -14,10 +14,11 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
+from temporalio.converter import DataConverter
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 from devflow_temporal import delivery_broker, delivery_repair, delivery_store
 from devflow_temporal.contracts import digest
@@ -32,6 +33,7 @@ from devflow_temporal.delivery_activities import (
 from devflow_temporal.delivery_api import DeliveryService, create_app
 from devflow_temporal.delivery_broker import BrokerReadbackUnavailable, DeliveryBroker
 from devflow_temporal.delivery_broker import _git as broker_git
+from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER, LargePayloadCodec
 from devflow_temporal.delivery_config import (
     BOUNDARY_DENIAL_FIELDS,
     ContainerReadbackPending,
@@ -5924,3 +5926,204 @@ async def test_public_later_grant_pending_preflight_survives_worker_restart_once
             "SELECT COUNT(*) FROM delivery_commands WHERE command_id=?",
             (command["command_id"],),
         ).fetchone()[0] == 1
+
+
+@workflow.defn(name="LegacyUnencodedEcho")
+class LegacyUnencodedEcho:
+    @workflow.run
+    async def run(self, value: dict) -> dict:
+        return value
+
+
+@pytest.mark.asyncio
+async def test_large_delivery_payload_codec_preserves_canonical_and_legacy_payloads():
+    history = {
+        "prior_reviews": [
+            {"iteration": index, "finding": f"Evidence from review {index}: retain context"}
+            for index in range(35_000)
+        ]
+    }
+    legacy = await DataConverter.default.encode([history])
+    assert len(legacy[0].data) > 2_000_000
+    encoded = await DELIVERY_DATA_CONVERTER.encode([history])
+    assert encoded[0].metadata["encoding"] == b"binary/zlib"
+    assert len(encoded[0].data) < 2_000_000
+    assert await DELIVERY_DATA_CONVERTER.decode(encoded) == [history]
+    assert await DELIVERY_DATA_CONVERTER.decode(legacy) == [history]
+    assert (
+        await LargePayloadCodec().decode(encoded)
+    )[0].SerializeToString() == legacy[0].SerializeToString()
+    small = await DataConverter.default.encode([{"legacy": "unencoded"}])
+    assert (await DELIVERY_DATA_CONVERTER.decode(small))[0] == {"legacy": "unencoded"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not shutil.which("temporal"), reason="local Temporal CLI required")
+async def test_large_public_submit_dispatches_through_real_temporal_and_safe_activities(
+    service, tmp_path
+):
+    store, request = service
+    request["accepted_plan"] = "".join(
+        f"Review criterion {index:06d}: preserve sealed evidence.\n"
+        for index in range(53_000)
+    )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    raw = json.loads(store.config.path.read_text())
+    raw.update({
+        "temporal_address": f"127.0.0.1:{port}",
+        "queue": "delivery-large-payload-test",
+    })
+    store.config.path.write_text(json.dumps(raw))
+    app = create_app(store.config.path)
+    service_runtime = app.state.delivery
+    seen: dict[str, int] = {}
+
+    @activity.defn(name="delivery_prepare")
+    async def prepare_stub(payload):
+        seen["prepare_plan_bytes"] = len(payload["spec"]["accepted_plan"].encode())
+        return await delivery_prepare(payload)
+
+    @activity.defn(name="delivery_tracker_start")
+    async def tracker_start_stub(_payload):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_role")
+    async def role_stub(payload):
+        seen[payload["role"]] = len(payload["spec"]["accepted_plan"].encode())
+        return {
+            "role": payload["role"], "iteration": payload["iteration"],
+            "status": "pass", "cleanup": "confirmed", "findings": [],
+            "summary": "Disposable safe activity passed",
+            "session_id": f"fake:{payload['role']}",
+            "candidate": payload["candidate"],
+        }
+
+    @activity.defn(name="delivery_precheck")
+    async def precheck_stub(payload):
+        return {"state": "passed", "candidate_id": payload["candidate"]["id"]}
+
+    @activity.defn(name="delivery_publish")
+    async def publish_stub(payload):
+        return {
+            "number": 1, "url": "https://example.invalid/pull/1",
+            "state": "OPEN", "head": payload["candidate"]["head"],
+            "base": payload["spec"]["base_sha"],
+            "candidate": payload["candidate"],
+        }
+
+    @activity.defn(name="delivery_checks")
+    async def checks_stub(payload):
+        return {"state": "passed", "candidate_id": payload["candidate"]["id"]}
+
+    @activity.defn(name="delivery_ci")
+    async def ci_stub(payload):
+        return {"state": "passed", "head": payload["pull_request"]["head"]}
+
+    @activity.defn(name="delivery_tracker")
+    async def tracker_stub(_payload):
+        return {"state": "consistent", "observed": {"fixture": True}}
+
+    server = await asyncio.create_subprocess_exec(
+        "temporal", "server", "start-dev", "--headless", "--ip", "127.0.0.1",
+        "--port", str(port), "--db-filename", str(tmp_path / "temporal.sqlite3"),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        client = None
+        for _ in range(100):
+            try:
+                client = await Client.connect(
+                    f"127.0.0.1:{port}", data_converter=DELIVERY_DATA_CONVERTER
+                )
+                break
+            except Exception as exc:
+                if server.returncode is not None:
+                    raise RuntimeError("disposable Temporal exited") from exc
+                await asyncio.sleep(0.1)
+        assert client is not None
+        origin = app.state.delivery.config.dashboard_url
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url=origin
+        ) as browser:
+            login = await browser.post(
+                "/api/session", json={"token": app.state.delivery.auth.secret},
+                headers={"Origin": origin},
+            )
+            assert login.status_code == 200
+            headers = {
+                "Origin": origin,
+                "X-Devflow-CSRF": login.json()["csrf_token"],
+            }
+            accepted = await browser.post("/api/runs", json=request, headers=headers)
+            assert accepted.status_code == 200
+            replay = await browser.post("/api/runs", json=request, headers=headers)
+            assert replay.json() == accepted.json()
+            with service_runtime.store._connect() as db:
+                row = db.execute(
+                    "SELECT request_digest FROM delivery_runs WHERE run_id=?",
+                    (request["run_id"],),
+                ).fetchone()
+                receipt = db.execute(
+                    "SELECT request_digest,response_json FROM delivery_commands "
+                    "WHERE command_id=?", (request["command_id"],),
+                ).fetchone()
+                assert len(receipt["request_digest"]) == 64
+                assert json.loads(receipt["response_json"]) == accepted.json()
+                plain = await DataConverter.default.encode([
+                    service_runtime.store.spec(request["run_id"])
+                ])
+                assert len(plain[0].data) > 2_000_000
+            async with Worker(
+                client, task_queue=raw["queue"], workflows=[DeliveryWorkflow],
+                activities=[
+                    delivery_project, prepare_stub, tracker_start_stub, role_stub,
+                    precheck_stub, publish_stub, checks_stub, ci_stub, tracker_stub,
+                ],
+            ):
+                await service_runtime.dispatch_once()
+                result = await asyncio.wait_for(
+                    client.get_workflow_handle("delivery-run-1").result(), timeout=35
+                )
+            assert result["outcome"] == "delivered"
+            assert seen == {
+                key: len(request["accepted_plan"].encode())
+                for key in ("prepare_plan_bytes", "implement", "review", "verify")
+            }
+            detail = await browser.get("/api/runs/run-1")
+            assert detail.json()["run"]["outcome"] == "delivered"
+            description = await client.get_workflow_handle("delivery-run-1").describe()
+            assert await description.memo_value("request_digest", None) == row["request_digest"]
+
+            legacy_client = await Client.connect(f"127.0.0.1:{port}")
+            legacy_value = {"history": "unencoded result"}
+            async with Worker(
+                legacy_client, task_queue=raw["queue"] + "-legacy",
+                workflows=[LegacyUnencodedEcho],
+                workflow_runner=UnsandboxedWorkflowRunner(),
+            ):
+                legacy = await legacy_client.start_workflow(
+                    LegacyUnencodedEcho.run, legacy_value,
+                    id="legacy-unencoded", task_queue=raw["queue"] + "-legacy",
+                    memo={"receipt_digest": digest(legacy_value)},
+                )
+                assert await asyncio.wait_for(legacy.result(), timeout=10) == legacy_value
+            older = client.get_workflow_handle("legacy-unencoded")
+            assert await older.result() == legacy_value
+            assert await (await older.describe()).memo_value(
+                "receipt_digest", None
+            ) == digest(legacy_value)
+            with service_runtime.store._connect() as db:
+                unchanged = db.execute(
+                    "SELECT request_digest,response_json FROM delivery_commands "
+                    "WHERE command_id=?", (request["command_id"],),
+                ).fetchone()
+                assert tuple(unchanged) == tuple(receipt)
+                assert db.execute(
+                    "SELECT state FROM delivery_outbox WHERE run_id=?",
+                    (request["run_id"],),
+                ).fetchone()[0] == "sent"
+    finally:
+        server.terminate()
+        await server.wait()
