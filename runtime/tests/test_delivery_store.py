@@ -26,6 +26,7 @@ from devflow_temporal.delivery_activities import (
     delivery_reconcile_publish,
     delivery_repair_preflight,
     delivery_role,
+    delivery_tracker_start,
 )
 from devflow_temporal.delivery_api import DeliveryService, create_app
 from devflow_temporal.delivery_broker import BrokerReadbackUnavailable, DeliveryBroker
@@ -449,6 +450,49 @@ def test_repair_preflight_distinguishes_docker_outage_from_lost_container(
     daemon_available["value"] = True
     with pytest.raises(ValueError, match="cannot be inspected"):
         confirmed_container_cleanup(spec)
+
+
+@pytest.mark.asyncio
+async def test_repair_preflight_activity_exposes_only_unavailable_readback_as_pending(
+    monkeypatch,
+):
+    class ReadbackStore:
+        def repair_preflight(self, _spec, _recovery):
+            raise RepairReadbackPending("temporary PR readback")
+
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_activities._context", lambda _spec: (ReadbackStore(), None)
+    )
+    request = {"spec": {}, "recovery": {}}
+    assert await delivery_repair_preflight(request) == {
+        "state": "pending",
+        "reason": "RepairReadbackPending",
+    }
+
+    class ChangedStore:
+        def repair_preflight(self, _spec, _recovery):
+            raise ValueError("claim owner changed")
+
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_activities._context", lambda _spec: (ChangedStore(), None)
+    )
+    with pytest.raises(ValueError, match="claim owner changed"):
+        await delivery_repair_preflight(request)
+
+
+@pytest.mark.asyncio
+async def test_repair_tracker_timeout_returns_pending_for_interruptible_wait(monkeypatch):
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(["github.py", "set"], 120)
+
+    monkeypatch.setattr("devflow_temporal.delivery_activities._tracker_sync", timeout)
+    request = {"spec": {"provider": "codex"}, "repair_continuation": True}
+    assert await delivery_tracker_start(request) == {
+        "state": "pending",
+        "reason": "TimeoutExpired",
+    }
+    with pytest.raises(subprocess.TimeoutExpired):
+        await delivery_tracker_start({"spec": request["spec"]})
 
 
 def test_ci_repair_diagnostic_binds_exact_failed_job_log_and_head(monkeypatch):
@@ -1552,8 +1596,9 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
     ("preflight_mode", "tracker_mode"),
     [
         ("transient", "pending"),
-        ("transient", "error"),
         ("transient", "drift"),
+        ("transient", "claim"),
+        ("cancel", "none"),
         ("authority", "none"),
     ],
 )
@@ -1661,11 +1706,15 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
         if calls["tracker_start"] == 2:
             if tracker_mode == "pending":
                 return {"state": "pending", "reason": "temporary tracker readback"}
-            if tracker_mode == "error":
-                raise RuntimeError("temporary tracker timeout")
             if tracker_mode == "drift":
                 checkout = Path(payload["spec"]["checkout"])
                 (checkout / "README.md").write_text("Changed after grant\n")
+            if tracker_mode == "claim":
+                with service_runtime.store._connect() as db:
+                    service_runtime.store.state.release_work(
+                        db, request["work_id"], "external:devflow:run-1"
+                    )
+                return {"state": "pending", "reason": "claim owner changed"}
         return {"state": "consistent"}
 
     @activity.defn(name="delivery_repair_preflight")
@@ -1674,7 +1723,9 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
         if calls["preflight"] == 1:
             if preflight_mode == "authority":
                 raise ValueError("candidate authority changed")
-            raise RepairReadbackPending("temporary Docker readback")
+            return {"state": "pending", "reason": "temporary Docker readback"}
+        if preflight_mode == "cancel":
+            return {"state": "pending", "reason": "persistent Docker outage"}
         return await delivery_repair_preflight(payload)
 
     @activity.defn(name="delivery_tracker")
@@ -1768,22 +1819,41 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
             if preflight_mode == "authority":
                 delivered = await asyncio.wait_for(repair_handle.result(), timeout=35)
             else:
-                # Stop the worker after Temporal has durably recorded the failed
-                # readback attempt. The same granted execution must resume on a
-                # new worker without a second command or role attempt.
+                # The pending projection is durable before the retry timer.
                 for _ in range(100):
-                    pending = (await repair_handle.describe()).raw_description.pending_activities
+                    detail = service_runtime.store.detail("run-1")
                     if any(
-                        item.activity_type.name == "delivery_repair_preflight"
-                        and item.HasField("last_failure")
-                        for item in pending
+                        event["type"] == "repair_preflight_pending" for event in detail["events"]
                     ):
                         break
                     await asyncio.sleep(0.05)
                 else:
-                    raise AssertionError("Temporal did not retain the failed preflight")
+                    raise AssertionError("Temporal did not retain pending repair preflight")
                 assert calls["preflight"] == 1
                 assert calls["publish"] == [0]
+                if preflight_mode == "cancel":
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app), base_url=origin_url
+                    ) as browser:
+                        login = await browser.post(
+                            "/api/session",
+                            json={"token": app.state.delivery.auth.secret},
+                            headers={"Origin": origin_url},
+                        )
+                        cancelled = await browser.post(
+                            "/api/runs/run-1/cancel",
+                            json={
+                                "command_id": "cancel-pending-repair",
+                                "expected_revision": detail["protocol_revision"],
+                                "reason": "operator cancelled unavailable readback",
+                            },
+                            headers={
+                                "Origin": origin_url,
+                                "X-Devflow-CSRF": login.json()["csrf_token"],
+                            },
+                        )
+                        assert cancelled.status_code == 200, cancelled.text
+                    delivered = await asyncio.wait_for(repair_handle.result(), timeout=10)
         if preflight_mode == "transient":
             async with Worker(
                 client,
@@ -1792,12 +1862,19 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
                 activities=activities,
             ):
                 delivered = await asyncio.wait_for(repair_handle.result(), timeout=35)
-        if preflight_mode == "authority" or tracker_mode == "drift":
+        if preflight_mode == "authority" or tracker_mode in {"drift", "claim"}:
             assert delivered["outcome"] == "blocked"
             assert delivered["phase"] == "blocked"
             assert calls["preflight"] == (1 if preflight_mode == "authority" else 3)
             assert calls["publish"] == [0]
             assert calls["tracker_start"] == (1 if preflight_mode == "authority" else 2)
+            assert len([role for role in delivered["roles"] if role["role"] == "implement"]) == 1
+            return
+        if preflight_mode == "cancel":
+            assert delivered["outcome"] == "cancelled"
+            assert calls["preflight"] == 1
+            assert calls["publish"] == [0]
+            assert calls["tracker_start"] == 1
             assert len([role for role in delivered["roles"] if role["role"] == "implement"]) == 1
             return
         assert delivered["outcome"] == "delivered"
@@ -1806,7 +1883,7 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
         assert calls["precheck"] == [0, 1]
         assert calls["checks"] == [1]
         assert calls["ci"] == [delivered["pull_request"]["head"]]
-        assert calls["preflight"] == 3
+        assert calls["preflight"] == 4
         assert calls["tracker_start"] == 3
         implement_sessions = [
             role["session_id"] for role in delivered["roles"] if role["role"] == "implement"

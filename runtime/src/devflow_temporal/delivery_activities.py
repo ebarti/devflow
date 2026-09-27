@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ from .candidate import candidate_for
 from .contracts import digest
 from .delivery_broker import DeliveryBroker
 from .delivery_config import DeliveryConfig
+from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
 
@@ -159,8 +161,15 @@ async def delivery_reconcile_publish(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_repair_preflight")
 async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        store, _ = _context(request["spec"])
-        store.repair_preflight(request["spec"], request["recovery"])
+        try:
+            store, _ = _context(request["spec"])
+            store.repair_preflight(request["spec"], request["recovery"])
+        except (
+            RepairReadbackPending,
+            subprocess.TimeoutExpired,
+            sqlite3.OperationalError,
+        ) as exc:
+            return {"state": "pending", "reason": type(exc).__name__}
         return {"state": "confirmed"}
 
     return await asyncio.to_thread(execute)
@@ -324,7 +333,12 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
 async def delivery_tracker_start(request: dict[str, Any]) -> dict[str, Any]:
     if request["spec"]["provider"] == "fake":
         return {"state": "consistent", "observed": {"fixture": True}}
-    return _tracker_sync(request["spec"], "in-progress", release=False)
+    try:
+        return await asyncio.to_thread(_tracker_sync, request["spec"], "in-progress", release=False)
+    except (subprocess.TimeoutExpired, sqlite3.OperationalError) as exc:
+        if not request.get("repair_continuation"):
+            raise
+        return {"state": "pending", "reason": type(exc).__name__}
 
 
 @activity.defn(name="delivery_tracker")

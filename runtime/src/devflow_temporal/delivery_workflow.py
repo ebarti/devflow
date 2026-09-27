@@ -70,29 +70,58 @@ class DeliveryWorkflow:
         self.cancel_requested = False
         self.decision_answer: str | None = None
 
-    async def _activity(
-        self,
-        name: str,
-        request: dict[str, Any],
-        *,
-        hours: int = 2,
-        durable_readback: bool = False,
-    ) -> Any:
+    async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
         return await workflow.execute_activity(
             name,
             request,
             start_to_close_timeout=timedelta(hours=hours),
-            retry_policy=(
-                RetryPolicy(
-                    initial_interval=timedelta(seconds=2),
-                    maximum_interval=timedelta(seconds=30),
-                    maximum_attempts=0,
-                    non_retryable_error_types=["ValueError"],
-                )
-                if durable_readback
-                else RetryPolicy(maximum_attempts=1)
-            ),
+            retry_policy=RetryPolicy(maximum_attempts=1),
         )
+
+    async def _wait_repair_readback(self, delay: int) -> None:
+        """Let cancellation wake a durable readback wait before its timer expires."""
+
+        try:
+            await workflow.wait_condition(
+                lambda: self.cancel_requested, timeout=timedelta(seconds=delay)
+            )
+        except TimeoutError:
+            pass
+
+    async def _confirm_repair_preflight(
+        self, spec: dict[str, Any], recovery: dict[str, Any]
+    ) -> bool:
+        delay = 2
+        pending_projected = False
+        while True:
+            if self.cancel_requested:
+                await self._cancelled(spec)
+                return False
+            try:
+                result = await self._activity(
+                    "delivery_repair_preflight", {"spec": spec, "recovery": recovery}
+                )
+            except Exception as exc:
+                await self._stop(spec, f"repair authority preflight failed: {type(exc).__name__}")
+                return False
+            if self.cancel_requested:
+                await self._cancelled(spec)
+                return False
+            if result.get("state") == "confirmed":
+                return True
+            if result.get("state") != "pending":
+                await self._stop(spec, "repair authority preflight conflicted")
+                return False
+            if not pending_projected:
+                self.state["revision"] += 1
+                await self._project(
+                    spec,
+                    "repair_preflight_pending",
+                    "Waiting for owned Docker or GitHub readback before repair",
+                )
+                pending_projected = True
+            await self._wait_repair_readback(delay)
+            delay = min(delay * 2, 30)
 
     async def _project(self, spec: dict[str, Any], event: str, message: str) -> None:
         await self._activity(
@@ -362,16 +391,8 @@ class DeliveryWorkflow:
             "repair_preflight_started",
             "Checking the frozen repair grant and owned resource readbacks",
         )
-        try:
-            await self._activity(
-                "delivery_repair_preflight",
-                {"spec": spec, "recovery": recovery},
-                durable_readback=True,
-            )
-        except Exception as exc:
-            return await self._stop(
-                spec, f"repair continuation preflight failed: {type(exc).__name__}"
-            )
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
         self.state["revision"] += 1
         await self._project(
             spec,
@@ -389,18 +410,21 @@ class DeliveryWorkflow:
             try:
                 tracker = await self._activity(
                     "delivery_tracker_start",
-                    {"spec": spec},
-                    durable_readback=True,
+                    {"spec": spec, "repair_continuation": True},
                 )
             except Exception as exc:
                 return await self._stop(
                     spec, f"repair tracker authority failed: {type(exc).__name__}"
                 )
             self.state["tracker"] = tracker
+            if self.cancel_requested:
+                return await self._cancelled(spec)
             if tracker.get("state") == "consistent":
                 break
             if tracker.get("state") != "pending" or tracker.get("conflict"):
                 return await self._stop(spec, "repair tracker readback conflicts with authority")
+            if not await self._confirm_repair_preflight(spec, recovery):
+                return self.state
             if not tracker_pending_projected:
                 self.state["revision"] += 1
                 await self._project(
@@ -409,18 +433,10 @@ class DeliveryWorkflow:
                     "Waiting for issue and claim readback before the repair role",
                 )
                 tracker_pending_projected = True
-            await workflow.sleep(timedelta(seconds=delay))
+            await self._wait_repair_readback(delay)
             delay = min(delay * 2, 30)
-        try:
-            await self._activity(
-                "delivery_repair_preflight",
-                {"spec": spec, "recovery": recovery},
-                durable_readback=True,
-            )
-        except Exception as exc:
-            return await self._stop(
-                spec, f"repair authority changed after tracker readback: {type(exc).__name__}"
-            )
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
         return await self._run_iterations(
             spec,
             start_iteration=start,
