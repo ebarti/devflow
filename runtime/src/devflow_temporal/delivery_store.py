@@ -255,6 +255,31 @@ class DeliveryStore:
                 )"""
             )
             db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_repair_grant_successors (
+                    run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
+                    grant_number INTEGER NOT NULL CHECK (grant_number >= 4),
+                    command_id TEXT NOT NULL UNIQUE,
+                    predecessor_workflow_id TEXT NOT NULL,
+                    predecessor_execution_run_id TEXT NOT NULL,
+                    predecessor_result_digest TEXT NOT NULL,
+                    review_job_key TEXT NOT NULL,
+                    review_receipt_sha256 TEXT NOT NULL,
+                    review_container_log_sha256 TEXT NOT NULL,
+                    effective_policy_digest TEXT NOT NULL,
+                    ancestor_row_digests_json TEXT NOT NULL,
+                    prior_grant_digest TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    pr_head TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    operator_brief_digest TEXT NOT NULL,
+                    granted_iterations INTEGER NOT NULL CHECK (granted_iterations IN (1, 2)),
+                    maximum_iteration INTEGER NOT NULL,
+                    granted_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, grant_number)
+                )"""
+            )
+            db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_scope_amendments (
                     run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
                     command_id TEXT NOT NULL UNIQUE,
@@ -1199,6 +1224,12 @@ class DeliveryStore:
 
     def continue_repair(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
+        if (
+            isinstance(supplied, dict)
+            and type(supplied.get("grant_number")) is int
+            and supplied["grant_number"] >= 4
+        ):
+            return self._continue_later_repair(run_id, supplied)
         if isinstance(supplied, dict) and supplied.get("grant_number") == 3:
             return self._continue_third_repair(run_id, supplied)
         if isinstance(supplied, dict) and supplied.get("grant_number") == 2:
@@ -2035,21 +2066,22 @@ class DeliveryStore:
             observed[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
         return observed
 
-    def _third_repair_intents(
+    def _later_repair_intents(
         self, spec: dict[str, Any], recovery: dict[str, Any]
     ) -> dict[str, str]:
-        """Seal every contained turn after grant two, including prior review failures."""
+        """Seal the completed one- or two-turn interval since the prior grant."""
         prior = recovery["prior_recovery"]
         state = recovery["state"]
         first = prior["state"]["iteration"] + 1
         last = state["iteration"]
         if (
-            first != prior["maximum_iteration"] - 1
-            or last != prior["maximum_iteration"]
+            last != prior["maximum_iteration"]
+            or last - first + 1 != prior["additional_iterations"]
+            or prior["additional_iterations"] not in (1, 2)
             or not isinstance(prior.get("additional_intents"), dict)
             or not isinstance(state.get("roles"), list)
         ):
-            raise ValueError("third grant has no bounded earlier execution inventory")
+            raise ValueError("later grant has no bounded earlier execution inventory")
         root = Path(spec["state_dir"])
         extra = dict(prior["additional_intents"])
         previous = prior["state"]["candidate"]
@@ -2150,10 +2182,72 @@ class DeliveryStore:
             raise ValueError("third grant candidate or intent identity changed")
         return extra
 
-    def _third_repair_readback(
+    @staticmethod
+    def _numbered_recovery_chain(
+        recovery: dict[str, Any]
+    ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+        """Normalize immutable numbered recoveries without projecting old ones anew."""
+        number = recovery.get("grant_number")
+        if type(number) is not int or number < 3:
+            raise ValueError("later grant has no numbered predecessor")
+        chain: dict[int, dict[str, Any]] = {}
+        cursor: Any = recovery
+        for expected in range(number, 1, -1):
+            if (
+                not isinstance(cursor, dict)
+                or cursor.get("kind") != "repair_continuation"
+                or cursor.get("grant_number") != expected
+            ):
+                raise ValueError("numbered repair ancestry skips or repeats a grant")
+            chain[expected] = cursor
+            cursor = cursor.get("prior_recovery")
+        if not isinstance(cursor, dict) or cursor.get("kind") != "precheck_prelaunch_recovery":
+            raise ValueError("numbered repair ancestry has no amended predecessor")
+        return chain, cursor
+
+    @staticmethod
+    def _numbered_authority_rows(
+        db: sqlite3.Connection, run_id: str, through: int
+    ) -> tuple[dict[int, sqlite3.Row], sqlite3.Row, list[dict[str, Any]]]:
+        """Read full legacy ancestry and the consecutive append-only successors."""
+        tables = (
+            (1, "delivery_repair_grants"),
+            (2, "delivery_repair_grant_extensions"),
+            (3, "delivery_repair_grant_thirds"),
+        )
+        rows = {
+            number: db.execute(f"SELECT * FROM {table} WHERE run_id=?", (run_id,)).fetchone()
+            for number, table in tables
+        }
+        amendment = db.execute(
+            "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
+        ).fetchone()
+        successors = db.execute(
+            "SELECT * FROM delivery_repair_grant_successors WHERE run_id=? ORDER BY grant_number",
+            (run_id,),
+        ).fetchall()
+        if (
+            amendment is None
+            or any(rows[number] is None for number in range(1, min(through, 3) + 1))
+            or rows[3] is not None and through < 3
+            or [item["grant_number"] for item in successors]
+            != list(range(4, through + 1))
+        ):
+            raise ValueError("numbered repair authority rows are missing or nonconsecutive")
+        rows.update({item["grant_number"]: item for item in successors})
+        vector = [
+            {"source": "grant1", "sha256": digest(dict(rows[1]))},
+            {"source": "scope_amendment", "sha256": digest(dict(amendment))},
+            {"source": "grant2", "sha256": digest(dict(rows[2]))},
+        ]
+        for number in range(3, through + 1):
+            vector.append({"source": f"grant{number}", "sha256": digest(dict(rows[number]))})
+        return rows, amendment, vector
+
+    def _later_repair_readback(
         self, spec: dict[str, Any], recovery: dict[str, Any], *, queued: bool
     ) -> None:
-        """Reprove grant two, the failed review and all stopped mixed-policy work."""
+        """Reprove the numbered chain, failed review, and stopped owned work."""
         from temporalio.service import RPCError
 
         from .delivery_broker import DeliveryBroker
@@ -2165,29 +2259,45 @@ class DeliveryStore:
         )
 
         run_id = spec["run_id"]
-        prior = recovery.get("prior_recovery")
-        scope = self._scope_recovery(prior)
+        chain, amended = self._numbered_recovery_chain(recovery)
+        number = recovery["grant_number"]
+        prior = chain[number - 1]
+        scope = amended.get("scope_recovery")
         state = recovery.get("state")
         original = self.spec(run_id)
+        brief = recovery.get("operator_brief")
+        prior_brief = prior.get("operator_brief") if number >= 4 else None
+        checks = state.get("checks") if isinstance(state, dict) else None
         if (
             recovery.get("kind") != "repair_continuation"
-            or recovery.get("grant_number") != 3
-            or not isinstance(prior, dict)
-            or prior.get("kind") != "repair_continuation"
-            or prior.get("grant_number") != 2
             or not isinstance(scope, dict)
+            or scope.get("kind") != "scope_amendment"
             or not isinstance(state, dict)
+            or not isinstance(checks, dict)
             or self.effective_spec(run_id) != spec
             or recovery.get("effective_spec") != spec
             or prior.get("effective_spec") != spec
-            or recovery.get("maximum_iteration") != prior.get("maximum_iteration", -2) + 2
-            or recovery.get("additional_iterations") != 2
+            or recovery.get("additional_iterations") not in (
+                (2,) if number == 3 else (1, 2)
+            )
+            or recovery.get("maximum_iteration")
+            != prior.get("maximum_iteration", -2) + recovery["additional_iterations"]
             or recovery.get("session_id") != prior.get("session_id")
             or recovery.get("candidate") != state.get("candidate")
             or recovery.get("pull_request") != state.get("pull_request")
             or recovery.get("grant_record_digest") != prior.get("grant_record_digest")
             or recovery.get("amendment_record_digest")
             != prior.get("amendment_record_digest")
+            or not isinstance(brief, dict)
+            or not isinstance(brief.get("criteria"), list)
+            or not brief["criteria"]
+            or digest(brief) != recovery.get("operator_brief_digest")
+            or (number >= 4 and (
+                not isinstance(prior_brief, dict)
+                or not isinstance(prior_brief.get("criteria"), list)
+                or brief["criteria"][:len(prior_brief["criteria"])]
+                != prior_brief["criteria"]
+            ))
             or state.get("run_id") != run_id
             or state.get("phase") != "blocked"
             or state.get("outcome") != "blocked"
@@ -2199,16 +2309,35 @@ class DeliveryStore:
             or state["candidate"].get("policy_digest") != spec["policy_digest"]
             or state["candidate"].get("head")
             != state.get("pull_request", {}).get("head")
-            or state.get("checks", {}).get("prepublish", {}).get("state") != "passed"
-            or state["checks"]["prepublish"].get("source_unchanged") is not True
-            or state.get("checks", {}).get("review", {}).get("state") != "failed"
-            or set(state["checks"]) != {"prepublish", "review"}
+            or checks.get("prepublish", {}).get("state") != "passed"
+            or checks["prepublish"].get("source_unchanged") is not True
+            or checks.get("review", {}).get("state") != "failed"
+            or set(checks) != {"prepublish", "review"}
             or not isinstance(state.get("roles"), list)
             or len(state["roles"]) < 2
-            or digest(recovery.get("operator_brief"))
-            != recovery.get("operator_brief_digest")
         ):
-            raise ValueError("closed review is not eligible for a third grant")
+            raise ValueError("closed review is not eligible for a later grant")
+        for ancestor_number in range(3, number + 1):
+            current_recovery = chain[ancestor_number]
+            predecessor = chain[ancestor_number - 1]
+            current_pr = current_recovery.get("pull_request")
+            predecessor_pr = predecessor.get("pull_request")
+            if (
+                current_recovery.get("state", {}).get("iteration")
+                != predecessor.get("maximum_iteration")
+                or current_recovery.get("effective_spec") != spec
+                or current_recovery.get("session_id") != predecessor.get("session_id")
+                or current_recovery.get("maximum_iteration")
+                != predecessor.get("maximum_iteration", -2)
+                + current_recovery.get("additional_iterations", -1)
+                or not isinstance(current_pr, dict)
+                or not isinstance(predecessor_pr, dict)
+                or any(
+                    current_pr.get(key) != predecessor_pr.get(key)
+                    for key in ("number", "base", "url")
+                )
+            ):
+                raise ValueError("numbered repair ancestry changed frozen authority")
         implementation, review = state["roles"][-2:]
         if (
             implementation.get("role") != "implement"
@@ -2257,18 +2386,9 @@ class DeliveryStore:
         root = Path(spec["state_dir"])
         with self._connect() as db:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
-            grant = db.execute(
-                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
-            ).fetchone()
-            amendment = db.execute(
-                "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
-            ).fetchone()
-            second = db.execute(
-                "SELECT * FROM delivery_repair_grant_extensions WHERE run_id=?", (run_id,)
-            ).fetchone()
-            third = db.execute(
-                "SELECT * FROM delivery_repair_grant_thirds WHERE run_id=?", (run_id,)
-            ).fetchone()
+            rows, amendment, vector = self._numbered_authority_rows(
+                db, run_id, number if queued else number - 1
+            )
             claim = self.state.claim_for(db, spec["work_id"])
             attempts = db.execute(
                 "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
@@ -2276,15 +2396,13 @@ class DeliveryStore:
             effects = db.execute(
                 "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
             ).fetchall()
+        grant, second = rows[1], rows[2]
         if (
             row is None
-            or grant is None
-            or amendment is None
-            or second is None
             or row["request_json"] != canonical_json(original)
             or row["recovery_json"] != canonical_json(recovery if queued else prior)
             or row["workflow_id"] != (
-                f"delivery-{run_id}-repair-continuation-3"
+                f"delivery-{run_id}-repair-continuation-{number}"
                 if queued else recovery["predecessor_workflow_id"]
             )
             or row["phase"] not in (
@@ -2304,45 +2422,19 @@ class DeliveryStore:
             or json.loads(row["candidate_json"] or "null") != state["candidate"]
             or json.loads(row["pr_json"] or "null") != state["pull_request"]
             or json.loads(row["checks_json"] or "{}") != state["checks"]
-            or digest(dict(grant)) != recovery["grant_record_digest"]
-            or digest(dict(amendment)) != recovery["amendment_record_digest"]
-            or digest(dict(second)) != recovery["prior_extension_digest"]
+            or grant["maximum_iteration"] + 1 != amendment["maximum_iteration"]
+            or amendment["original_policy_digest"] != original["policy_digest"]
+            or amendment["effective_policy_digest"] != spec["policy_digest"]
+            or json.loads(amendment["added_paths_json"]) != scope["added_paths"]
+            or amendment["maximum_iteration"] != scope["maximum_iteration"]
+            or vector[0]["sha256"] != recovery.get("grant_record_digest")
+            or vector[1]["sha256"] != recovery.get("amendment_record_digest")
             or second["grant_number"] != 2
-            or second["maximum_iteration"] != prior["maximum_iteration"]
+            or second["maximum_iteration"] != chain[2]["maximum_iteration"]
             or second["effective_policy_digest"] != spec["policy_digest"]
             or second["session_id"] != recovery["session_id"]
-            or second["candidate_id"] != prior["candidate"]["id"]
-            or second["pr_head"] != prior["pull_request"]["head"]
-            or second["grant_record_digest"] != recovery["grant_record_digest"]
-            or second["amendment_record_digest"] != recovery["amendment_record_digest"]
-            or (queued and (
-                third is None
-                or third["grant_number"] != 3
-                or third["predecessor_workflow_id"]
-                != recovery["predecessor_workflow_id"]
-                or third["predecessor_execution_run_id"]
-                != recovery["predecessor_execution_run_id"]
-                or third["predecessor_result_digest"]
-                != recovery["predecessor_result_digest"]
-                or third["review_job_key"] != recovery["review_job_key"]
-                or third["review_receipt_sha256"]
-                != recovery["review_receipt_sha256"]
-                or third["effective_policy_digest"] != spec["policy_digest"]
-                or third["grant_record_digest"] != recovery["grant_record_digest"]
-                or third["amendment_record_digest"]
-                != recovery["amendment_record_digest"]
-                or third["prior_extension_digest"]
-                != recovery["prior_extension_digest"]
-                or third["candidate_id"] != state["candidate"]["id"]
-                or third["pr_number"] != state["pull_request"]["number"]
-                or third["pr_head"] != state["pull_request"]["head"]
-                or third["session_id"] != recovery["session_id"]
-                or third["operator_brief_digest"]
-                != recovery["operator_brief_digest"]
-                or third["granted_iterations"] != 2
-                or third["maximum_iteration"] != recovery["maximum_iteration"]
-            ))
-            or (not queued and third is not None)
+            or second["grant_record_digest"] != vector[0]["sha256"]
+            or second["amendment_record_digest"] != vector[1]["sha256"]
             or claim is None
             or claim["owner"] != f"external:devflow:{run_id}"
             or any(item["state"] != "finished" or item["cleanup"] != "confirmed"
@@ -2350,7 +2442,82 @@ class DeliveryStore:
             or any(item["state"] != "complete" or item["observed_json"] is None
                    for item in effects)
         ):
-            raise ValueError("third grant lost its frozen run, claim or authority")
+            raise ValueError("later grant lost its frozen run, claim or authority")
+        second_recovery = chain[2]
+        if any(
+            second[field] != second_recovery[recovery_field]
+            for field, recovery_field in (
+                ("predecessor_workflow_id", "predecessor_workflow_id"),
+                ("predecessor_execution_run_id", "predecessor_execution_run_id"),
+                ("predecessor_result_digest", "predecessor_result_digest"),
+                ("review_job_key", "review_job_key"),
+                ("review_receipt_sha256", "review_receipt_sha256"),
+                ("candidate_id", "candidate_id"),
+            ) if recovery_field in second_recovery
+        ):
+            raise ValueError("later grant lost its frozen run, claim or authority")
+        if (
+            second["candidate_id"] != second_recovery["candidate"]["id"]
+            or second["pr_number"] != second_recovery["pull_request"]["number"]
+            or second["pr_head"] != second_recovery["pull_request"]["head"]
+            or second["granted_iterations"] != second_recovery["additional_iterations"]
+        ):
+            raise ValueError("later grant lost its frozen run, claim or authority")
+        for ancestor_number in range(3, number + 1):
+            ancestor = chain[ancestor_number]
+            predecessor = chain[ancestor_number - 1]
+            ancestor_row = rows.get(ancestor_number)
+            prior_vector = vector[:ancestor_number]
+            if (
+                ancestor.get("grant_record_digest") != vector[0]["sha256"]
+                or ancestor.get("amendment_record_digest") != vector[1]["sha256"]
+                or (ancestor_number == 3 and
+                    ancestor.get("prior_extension_digest") != vector[2]["sha256"])
+                or (ancestor_number >= 4 and (
+                    ancestor.get("ancestor_row_digests") != prior_vector
+                    or ancestor.get("prior_grant_digest") != prior_vector[-1]["sha256"]
+                ))
+                or ancestor.get("candidate") != ancestor.get("state", {}).get("candidate")
+                or ancestor.get("pull_request") != ancestor.get("state", {}).get("pull_request")
+                or ancestor.get("state", {}).get("iteration") != predecessor["maximum_iteration"]
+            ):
+                raise ValueError("numbered grant ancestry changed")
+            if ancestor_row is None:
+                if queued or ancestor_number != number:
+                    raise ValueError("numbered grant row is missing")
+                continue
+            if (
+                ancestor_row["grant_number"] != ancestor_number
+                or ancestor_row["predecessor_workflow_id"] != ancestor["predecessor_workflow_id"]
+                or ancestor_row["predecessor_execution_run_id"]
+                != ancestor["predecessor_execution_run_id"]
+                or ancestor_row["predecessor_result_digest"]
+                != ancestor["predecessor_result_digest"]
+                or ancestor_row["review_job_key"] != ancestor["review_job_key"]
+                or ancestor_row["review_receipt_sha256"]
+                != ancestor["review_receipt_sha256"]
+                or ancestor_row["effective_policy_digest"] != spec["policy_digest"]
+                or ancestor_row["candidate_id"] != ancestor["candidate"]["id"]
+                or ancestor_row["pr_number"] != ancestor["pull_request"]["number"]
+                or ancestor_row["pr_head"] != ancestor["pull_request"]["head"]
+                or ancestor_row["session_id"] != ancestor["session_id"]
+                or ancestor_row["operator_brief_digest"]
+                != ancestor["operator_brief_digest"]
+                or ancestor_row["granted_iterations"] != ancestor["additional_iterations"]
+                or ancestor_row["maximum_iteration"] != ancestor["maximum_iteration"]
+                or (ancestor_number == 3 and (
+                    ancestor_row["grant_record_digest"] != vector[0]["sha256"]
+                    or ancestor_row["amendment_record_digest"] != vector[1]["sha256"]
+                    or ancestor_row["prior_extension_digest"] != vector[2]["sha256"]
+                ))
+                or (ancestor_number >= 4 and (
+                    ancestor_row["ancestor_row_digests_json"] != canonical_json(prior_vector)
+                    or ancestor_row["prior_grant_digest"] != prior_vector[-1]["sha256"]
+                    or ancestor_row["review_container_log_sha256"]
+                    != ancestor["review_container_log_sha256"]
+                ))
+            ):
+                raise ValueError("numbered grant row changed after authorization")
         expected_job_key = digest({
             "run_id": run_id, "role": "review", "iteration": state["iteration"],
             "candidate_id": state["candidate"]["id"],
@@ -2390,7 +2557,7 @@ class DeliveryStore:
             != recovery["review_container_log_sha256"]
         ):
             raise ValueError("third grant review result changed")
-        extra = self._third_repair_intents(spec, recovery)
+        extra = self._later_repair_intents(spec, recovery)
         if extra != recovery.get("additional_intents"):
             raise ValueError("third grant amended execution inventory changed")
         latest = self._amended_repair_intents(spec, recovery)
@@ -2400,7 +2567,7 @@ class DeliveryStore:
         if broker.candidate() != state["candidate"]:
             raise ValueError("third grant candidate changed after review")
         published_identity(broker, state["candidate"], state["pull_request"])
-        earlier = prior["prior_recovery"]
+        earlier = amended
         role_sha = confirmed_amendment_lineage_cleanup(
             original, spec, scope["old_container_intents"], earlier["role_intent"],
             additional_intents=extra,
@@ -2573,8 +2740,8 @@ class DeliveryStore:
             "operator_brief": brief, "operator_brief_digest": digest(brief),
             "additional_iterations": 2, "maximum_iteration": state["iteration"] + 2,
         }
-        recovery["additional_intents"] = self._third_repair_intents(spec, recovery)
-        self._third_repair_readback(spec, recovery, queued=False)
+        recovery["additional_intents"] = self._later_repair_intents(spec, recovery)
+        self._later_repair_readback(spec, recovery, queued=False)
         workflow_id = f"delivery-{run_id}-repair-continuation-3"
         response = {
             "run_id": run_id,
@@ -2674,6 +2841,279 @@ class DeliveryStore:
                     "diagnostics_digest": digest(findings),
                     "operator_brief_digest": recovery["operator_brief_digest"],
                     "prior_extension_digest": recovery["prior_extension_digest"],
+                },
+            )
+            db.execute(
+                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                (supplied["command_id"], run_id, command_digest, canonical_json(response)),
+            )
+        return response
+
+    def _continue_later_repair(
+        self, run_id: str, supplied: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Append one explicitly numbered successor using the shared grant proof."""
+        from .delivery_repair import failed_gate_diagnostics
+
+        required = {
+            "command_id", "grant_number", "expected_revision", "expected_iteration",
+            "expected_candidate_id", "expected_pr_number", "expected_pr_head",
+            "expected_session_id", "expected_policy_digest",
+            "expected_execution_run_id", "expected_review_receipt_sha256",
+            "expected_prior_grant_digest", "additional_iterations", "operator_brief",
+        }
+        if not isinstance(supplied, dict) or set(supplied) != required:
+            raise ValueError("later repair grant fields do not match the contract")
+        brief = supplied["operator_brief"]
+        number = supplied["grant_number"]
+        increment = supplied["additional_iterations"]
+        if (
+            not isinstance(supplied["command_id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", supplied["command_id"])
+            or type(number) is not int or number < 4
+            or type(increment) is not int or increment not in (1, 2)
+            or any(type(supplied[key]) is not int or supplied[key] < 1 for key in (
+                "expected_revision", "expected_pr_number"
+            ))
+            or type(supplied["expected_iteration"]) is not int
+            or supplied["expected_iteration"] < 0
+            or not isinstance(supplied["expected_candidate_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", supplied["expected_candidate_id"])
+            or not isinstance(supplied["expected_pr_head"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", supplied["expected_pr_head"])
+            or not isinstance(supplied["expected_session_id"], str)
+            or not supplied["expected_session_id"]
+            or not isinstance(supplied["expected_policy_digest"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", supplied["expected_policy_digest"])
+            or not isinstance(supplied["expected_execution_run_id"], str)
+            or not supplied["expected_execution_run_id"]
+            or any(
+                not isinstance(supplied[key], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", supplied[key])
+                for key in ("expected_review_receipt_sha256", "expected_prior_grant_digest")
+            )
+            or not isinstance(brief, dict)
+            or set(brief) != {"label", "criteria"}
+            or not isinstance(brief["label"], str)
+            or not brief["label"].strip()
+            or len(brief["label"]) > 120
+            or not isinstance(brief["criteria"], list)
+            or not 1 <= len(brief["criteria"]) <= 32
+            or any(
+                not isinstance(item, str) or not item.strip() or len(item) > 1200
+                for item in brief["criteria"]
+            )
+        ):
+            raise ValueError("later repair grant identity, increment or brief is invalid")
+        command_digest = digest({"run_id": run_id, **supplied})
+        with self._connect() as db:
+            replay = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (supplied["command_id"],),
+            ).fetchone()
+            if replay:
+                if replay["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(replay["response_json"])
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            rows, _amendment, ancestry = self._numbered_authority_rows(db, run_id, number - 1)
+            attempts_snapshot = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects_snapshot = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+        if row is None:
+            raise ValueError("run ID not found")
+        prior = json.loads(row["recovery_json"] or "null")
+        if (
+            not isinstance(prior, dict)
+            or prior.get("kind") != "repair_continuation"
+            or prior.get("grant_number") != number - 1
+            or ancestry[-1]["sha256"] != supplied["expected_prior_grant_digest"]
+            or not isinstance(prior.get("operator_brief"), dict)
+            or not isinstance(prior["operator_brief"].get("criteria"), list)
+            or len(brief["criteria"]) <= len(prior["operator_brief"]["criteria"])
+            or brief["criteria"][:len(prior["operator_brief"]["criteria"])]
+            != prior["operator_brief"]["criteria"]
+        ):
+            raise ValueError("later grant does not bind the complete prior authority")
+        spec = self.effective_spec(run_id)
+        closed = self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+        state = closed["result"]
+        roles = state.get("roles") if isinstance(state, dict) else None
+        review = roles[-1] if isinstance(roles, list) and roles else None
+        candidate = state.get("candidate") if isinstance(state, dict) else None
+        pr = state.get("pull_request") if isinstance(state, dict) else None
+        if (
+            closed["workflow_id"] != row["workflow_id"]
+            or closed["request_digest"] != row["request_digest"]
+            or closed["recovery_digest"] != digest(prior)
+            or closed["execution_run_id"] != supplied["expected_execution_run_id"]
+            or not isinstance(state, dict)
+            or state.get("revision") != supplied["expected_revision"]
+            or state.get("iteration") != supplied["expected_iteration"]
+            or state.get("iteration") != prior["maximum_iteration"]
+            or not isinstance(candidate, dict)
+            or candidate.get("id") != supplied["expected_candidate_id"]
+            or not isinstance(pr, dict)
+            or pr.get("number") != supplied["expected_pr_number"]
+            or pr.get("head") != supplied["expected_pr_head"]
+            or spec["policy_digest"] != supplied["expected_policy_digest"]
+            or prior.get("session_id") != supplied["expected_session_id"]
+            or not isinstance(review, dict)
+            or review.get("role") != "review"
+            or review.get("iteration") != state["iteration"]
+        ):
+            raise ValueError("later grant does not match the closed reviewed candidate")
+        review_job_key = digest({
+            "run_id": run_id, "role": "review", "iteration": state["iteration"],
+            "candidate_id": candidate["id"], "policy_digest": spec["policy_digest"],
+        })
+        with self._connect() as db:
+            attempt = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
+                (run_id, review_job_key),
+            ).fetchone()
+        receipt = Path(spec["state_dir"]) / "attempts" / review_job_key / "result.json"
+        if (
+            attempt is None
+            or attempt["result_path"] != str(receipt)
+            or receipt.is_symlink()
+            or not receipt.is_file()
+            or receipt.stat().st_uid != os.getuid()
+            or stat.S_IMODE(receipt.stat().st_mode) != 0o600
+            or hashlib.sha256(receipt.read_bytes()).hexdigest()
+            != supplied["expected_review_receipt_sha256"]
+        ):
+            raise ValueError("later grant review receipt changed")
+        saved = json.loads(attempt["result_json"] or "null")
+        if not isinstance(saved, dict):
+            raise ValueError("later grant review result is missing")
+        findings = failed_gate_diagnostics(state, spec)
+        if not findings or findings != review.get("findings"):
+            raise ValueError("later grant has no sealed failed-review diagnostics")
+        recovery = {
+            "kind": "repair_continuation", "grant_number": number,
+            "prior_recovery": prior, "effective_spec": spec,
+            "predecessor_workflow_id": closed["workflow_id"],
+            "predecessor_execution_run_id": closed["execution_run_id"],
+            "predecessor_closed_at": closed["closed_at"],
+            "predecessor_result_digest": digest(state),
+            "state": state, "candidate": candidate, "pull_request": pr,
+            "session_id": prior["session_id"], "findings": findings,
+            "review_summary": review["summary"],
+            "review_job_key": review_job_key,
+            "review_receipt_sha256": supplied["expected_review_receipt_sha256"],
+            "review_container_id": saved.get("container_id"),
+            "review_container_log_sha256": saved.get("container_log_sha256"),
+            "grant_record_digest": ancestry[0]["sha256"],
+            "amendment_record_digest": ancestry[1]["sha256"],
+            "ancestor_row_digests": ancestry,
+            "prior_grant_digest": ancestry[-1]["sha256"],
+            "operator_brief": brief, "operator_brief_digest": digest(brief),
+            "additional_iterations": increment,
+            "maximum_iteration": state["iteration"] + increment,
+        }
+        recovery["additional_intents"] = self._later_repair_intents(spec, recovery)
+        self._later_repair_readback(spec, recovery, queued=False)
+        workflow_id = f"delivery-{run_id}-repair-continuation-{number}"
+        response = {
+            "run_id": run_id,
+            "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
+            "phase": "repair_continuation_queued", "workflow_id": workflow_id,
+            "grant_number": number,
+            "authorized_through_iteration": recovery["maximum_iteration"],
+            "existing": False,
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            replay = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (supplied["command_id"],),
+            ).fetchone()
+            if replay:
+                if replay["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(replay["response_json"])
+            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            _rows_now, _amendment_now, ancestry_now = self._numbered_authority_rows(
+                db, run_id, number - 1
+            )
+            claim = self.state.claim_for(db, spec["work_id"])
+            attempts_now = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects_now = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+            if (
+                current is None or tuple(current) != tuple(row)
+                or ancestry_now != ancestry
+                or claim is None or claim["owner"] != f"external:devflow:{run_id}"
+                or [tuple(item) for item in attempts_now]
+                != [tuple(item) for item in attempts_snapshot]
+                or [tuple(item) for item in effects_now]
+                != [tuple(item) for item in effects_snapshot]
+            ):
+                raise ValueError("later grant lost its frozen run or ownership")
+            db.execute(
+                """INSERT INTO delivery_repair_grant_successors
+                   (run_id,grant_number,command_id,predecessor_workflow_id,
+                    predecessor_execution_run_id,predecessor_result_digest,
+                    review_job_key,review_receipt_sha256,review_container_log_sha256,
+                    effective_policy_digest,ancestor_row_digests_json,prior_grant_digest,
+                    candidate_id,pr_number,pr_head,session_id,operator_brief_digest,
+                    granted_iterations,maximum_iteration,granted_at)
+                   VALUES (:run_id,:grant_number,:command_id,:predecessor_workflow_id,
+                    :predecessor_execution_run_id,:predecessor_result_digest,
+                    :review_job_key,:review_receipt_sha256,:review_container_log_sha256,
+                    :effective_policy_digest,:ancestor_row_digests_json,:prior_grant_digest,
+                    :candidate_id,:pr_number,:pr_head,:session_id,:operator_brief_digest,
+                    :granted_iterations,:maximum_iteration,:granted_at)""",
+                {
+                    "run_id": run_id, "grant_number": number,
+                    "command_id": supplied["command_id"],
+                    "predecessor_workflow_id": closed["workflow_id"],
+                    "predecessor_execution_run_id": closed["execution_run_id"],
+                    "predecessor_result_digest": digest(state),
+                    "review_job_key": review_job_key,
+                    "review_receipt_sha256": recovery["review_receipt_sha256"],
+                    "review_container_log_sha256": recovery["review_container_log_sha256"],
+                    "effective_policy_digest": spec["policy_digest"],
+                    "ancestor_row_digests_json": canonical_json(ancestry),
+                    "prior_grant_digest": ancestry[-1]["sha256"],
+                    "candidate_id": candidate["id"], "pr_number": pr["number"],
+                    "pr_head": pr["head"], "session_id": recovery["session_id"],
+                    "operator_brief_digest": recovery["operator_brief_digest"],
+                    "granted_iterations": increment,
+                    "maximum_iteration": recovery["maximum_iteration"],
+                    "granted_at": _now(),
+                },
+            )
+            revision = current["revision"] + 1
+            db.execute(
+                """UPDATE delivery_runs SET phase='repair_continuation_queued',
+                   execution_state='queued',outcome=NULL,error=NULL,revision=?,
+                   workflow_id=?,recovery_json=?,updated_at=? WHERE run_id=?""",
+                (revision, workflow_id, canonical_json(recovery), _now(), run_id),
+            )
+            db.execute(
+                """UPDATE delivery_outbox SET state='pending',last_error=NULL,updated_at=?
+                   WHERE run_id=?""",
+                (_now(), run_id),
+            )
+            self._event(
+                db, run_id, revision, "repair_continuation_queued",
+                "Explicit numbered repair grant queued after independent review",
+                {
+                    "grant_number": number, "iteration": state["iteration"],
+                    "authorized_through_iteration": recovery["maximum_iteration"],
+                    "candidate_id": candidate["id"], "pr_number": pr["number"],
+                    "predecessor_execution_run_id": closed["execution_run_id"],
+                    "diagnostics_digest": digest(findings),
+                    "operator_brief_digest": recovery["operator_brief_digest"],
+                    "prior_grant_digest": ancestry[-1]["sha256"],
                 },
             )
             db.execute(
@@ -3301,8 +3741,12 @@ class DeliveryStore:
 
     def repair_preflight(self, spec: dict[str, Any], recovery: dict[str, Any]) -> None:
         """Recheck the frozen command before a resumed implementer can execute."""
-        if recovery.get("kind") == "repair_continuation" and recovery.get("grant_number") == 3:
-            self._third_repair_readback(spec, recovery, queued=True)
+        if (
+            recovery.get("kind") == "repair_continuation"
+            and type(recovery.get("grant_number")) is int
+            and recovery["grant_number"] >= 3
+        ):
+            self._later_repair_readback(spec, recovery, queued=True)
             return
         if recovery.get("kind") == "repair_continuation" and recovery.get("grant_number") == 2:
             self._amended_repair_readback(spec, recovery, queued=True)
@@ -3598,12 +4042,20 @@ class DeliveryStore:
         """Resolve the sole amendment through explicitly numbered continuations."""
         if not isinstance(recovery, dict):
             return None
-        if recovery.get("kind") == "repair_continuation" and recovery.get("grant_number") == 3:
+        expected = None
+        while (
+            isinstance(recovery, dict)
+            and recovery.get("kind") == "repair_continuation"
+            and type(recovery.get("grant_number")) is int
+            and recovery["grant_number"] >= 2
+        ):
+            number = recovery["grant_number"]
+            if expected is not None and number != expected:
+                raise ValueError("numbered repair ancestry skips or repeats a grant")
+            expected = number - 1
             recovery = recovery.get("prior_recovery")
-        if not isinstance(recovery, dict):
-            return None
-        if recovery.get("kind") == "repair_continuation" and recovery.get("grant_number") == 2:
-            recovery = recovery.get("prior_recovery")
+        if expected is not None and expected != 1:
+            raise ValueError("numbered repair ancestry is incomplete")
         if isinstance(recovery, dict) and recovery.get("kind") == "precheck_prelaunch_recovery":
             recovery = recovery.get("scope_recovery")
         if isinstance(recovery, dict) and recovery.get("kind") == "scope_amendment":

@@ -5260,3 +5260,667 @@ async def test_cancelled_role_with_unknown_teardown_retains_unknown_cleanup(serv
     detail = store.detail(request["run_id"])
     assert detail["cleanup"] == "unknown"
     assert detail["capacity"]["active"] == 1
+
+
+def _closed_later_review_fixture(store, request, spec, prior, monkeypatch, *, revision):
+    """Complete only disposable contained review turns under an existing grant."""
+    run_id = request["run_id"]
+    root = Path(spec["state_dir"])
+    candidate = prior["state"]["candidate"]
+    pr = prior["state"]["pull_request"]
+    first = prior["state"]["iteration"] + 1
+    last = prior["maximum_iteration"]
+    appended = []
+    for iteration in range(first, last + 1):
+        for role_name in ("implement", "review"):
+            role = {
+                "role": role_name, "iteration": iteration,
+                "status": "pass" if role_name == "implement" else "findings",
+                "finish_reason": "done", "cleanup": "confirmed",
+                "session_id": (
+                    prior["session_id"] if role_name == "implement"
+                    else f"independent-review-{iteration}"
+                ),
+                "candidate": candidate, "input_candidate_id": candidate["id"],
+                "summary": "Independent review still found a bounded defect",
+                "findings": ["Copied activity counts do not prove a result"],
+                "container_id": f"{role_name}-container-{iteration}",
+                "container_log_sha256": hashlib.sha256(
+                    f"{role_name} {iteration} log\n".encode()
+                ).hexdigest(),
+            }
+            appended.append(role)
+            job_key = digest({
+                "run_id": run_id, "role": role_name, "iteration": iteration,
+                "candidate_id": candidate["id"], "policy_digest": spec["policy_digest"],
+            })
+            folder = root / "attempts" / job_key
+            container = folder / "container"
+            container.mkdir(parents=True, mode=0o700)
+            for path, content in (
+                (container / "container.log", f"{role_name} {iteration} log\n"),
+                (container / "container-id.json", json.dumps({
+                    "container_id": role["container_id"]
+                })),
+                (container / "container-intent.json", f"{role_name} {iteration} intent\n"),
+            ):
+                path.write_text(content)
+                path.chmod(0o600)
+            raw = {
+                key: value for key, value in role.items()
+                if key not in {
+                    "role", "iteration", "candidate", "input_candidate_id",
+                    "cleanup", "container_id", "container_log_sha256",
+                }
+            }
+            receipt = folder / "result.json"
+            receipt.write_text(json.dumps(raw))
+            receipt.chmod(0o600)
+            saved = {
+                **raw, "cleanup": "confirmed",
+                "container_id": role["container_id"],
+                "container_log_sha256": role["container_log_sha256"],
+            }
+            with store._connect() as db:
+                db.execute(
+                    """INSERT INTO delivery_attempts
+                       (job_key,run_id,role,iteration,candidate_id,state,session_id,
+                        result_json,result_path,cleanup)
+                       VALUES (?,?,?,?,?,'finished',?,?,?,'confirmed')""",
+                    (job_key, run_id, role_name, iteration, candidate["id"],
+                     role["session_id"], json.dumps(saved), str(receipt)),
+                )
+        container = root / "prechecks" / str(iteration) / "fixture-precheck" / "container"
+        container.mkdir(parents=True, mode=0o700)
+        for path, content in (
+            (container / "container.log", f"precheck {iteration} log\n"),
+            (container / "container-id.json", json.dumps({
+                "container_id": f"precheck-container-{iteration}"
+            })),
+            (container / "container-intent.json", f"precheck {iteration} intent\n"),
+        ):
+            path.write_text(content)
+            path.chmod(0o600)
+    review = appended[-1]
+    review_job = digest({
+        "run_id": run_id, "role": "review", "iteration": last,
+        "candidate_id": candidate["id"], "policy_digest": spec["policy_digest"],
+    })
+    review_receipt = root / "attempts" / review_job / "result.json"
+    precheck_log = root / "prechecks" / str(last) / "fixture-precheck/container/container.log"
+    checks = {
+        "prepublish": {
+            "candidate_id": candidate["id"], "state": "passed",
+            "source_unchanged": True, "results": [{
+                "id": "fixture-precheck", "passed": True, "cleanup": "confirmed",
+                "container_id": f"precheck-container-{last}",
+                "log": str(precheck_log),
+                "log_sha256": hashlib.sha256(precheck_log.read_bytes()).hexdigest(),
+            }],
+        },
+        "review": {
+            "candidate_id": candidate["id"], "detail": review["summary"],
+            "state": "failed",
+        },
+    }
+    state = {
+        **prior["state"], "revision": revision, "iteration": last,
+        "roles": [*prior["state"]["roles"], *appended], "checks": checks,
+        "phase": "blocked", "execution_state": "blocked", "outcome": "blocked",
+        "cleanup": "none", "error": "repair limit exhausted",
+    }
+    store.project(
+        run_id, phase="blocked", execution_state="blocked", event_type="blocked",
+        message=state["error"], candidate=candidate, pull_request=pr,
+        checks=checks, iteration=last, protocol_revision=revision,
+        outcome="blocked", cleanup="none", error=state["error"],
+    )
+    closed = {
+        "workflow_id": store.active_workflow_id(run_id),
+        "execution_run_id": f"closed-independent-review-{last}",
+        "closed_at": f"2026-09-27T{last:02d}:00:00+00:00",
+        "request_digest": store.spec(run_id)["request_digest"],
+        "recovery_digest": digest(prior), "result": state,
+    }
+    monkeypatch.setattr(
+        DeliveryStore, "_completed_temporal_result",
+        lambda self, _run_id, **_kwargs: closed,
+    )
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda _id, **_kw: closed)
+    with store._connect() as db:
+        _rows, _amendment, ancestry = store._numbered_authority_rows(
+            db, run_id, prior["grant_number"]
+        )
+    criteria = [*prior["operator_brief"]["criteria"]]
+    if prior["grant_number"] == 3:
+        criteria.extend([
+            "An outcome-sounding verb plus an activity count is not verified result "
+            "support; retain the production and demo framing question unless a "
+            "canonical result verifies it.",
+            "Treat constructor, toString, and __proto__ experience IDs as own data "
+            "keys without prototype inheritance or mutation.",
+        ])
+    else:
+        criteria.append("Disposable next-grant criterion; no live grant is authorized.")
+    command = {
+        "command_id": f"grant-repair-{prior['grant_number'] + 1}",
+        "grant_number": prior["grant_number"] + 1,
+        "expected_revision": revision, "expected_iteration": last,
+        "expected_candidate_id": candidate["id"],
+        "expected_pr_number": pr["number"], "expected_pr_head": pr["head"],
+        "expected_session_id": prior["session_id"],
+        "expected_policy_digest": spec["policy_digest"],
+        "expected_execution_run_id": closed["execution_run_id"],
+        "expected_review_receipt_sha256": hashlib.sha256(
+            review_receipt.read_bytes()
+        ).hexdigest(),
+        "expected_prior_grant_digest": ancestry[-1]["sha256"],
+        "additional_iterations": 1,
+        "operator_brief": {
+            "label": "Cumulative review acceptance criteria", "criteria": criteria,
+        },
+    }
+    return state, command, review_receipt
+
+
+def _fourth_repair_grant_fixture(store, request, monkeypatch):
+    spec, _state, third_command, _receipt = _third_repair_grant_fixture(
+        store, request, monkeypatch
+    )
+    store.continue_repair(request["run_id"], third_command)
+    with store._connect() as db:
+        prior = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id=?", (request["run_id"],)
+        ).fetchone()[0])
+    state, command, receipt = _closed_later_review_fixture(
+        store, request, spec, prior, monkeypatch, revision=60
+    )
+    return spec, state, command, receipt
+
+
+def test_later_grants_append_consecutive_rows_and_preserve_legacy_bytes(
+    service, monkeypatch
+):
+    store, request = service
+    spec, _state, fourth, _receipt = _fourth_repair_grant_fixture(
+        store, request, monkeypatch
+    )
+    legacy = (
+        "delivery_repair_grants", "delivery_scope_amendments",
+        "delivery_repair_grant_extensions", "delivery_repair_grant_thirds",
+    )
+    with store._connect() as db:
+        before = {
+            table: digest(dict(db.execute(
+                f"SELECT * FROM {table} WHERE run_id=?", (request["run_id"],)
+            ).fetchone())) for table in legacy
+        }
+    with pytest.raises(ValueError):
+        store.continue_repair(request["run_id"], {**fourth, "grant_number": 5})
+    response = store.continue_repair(request["run_id"], fourth)
+    assert response["grant_number"] == 4
+    assert response["authorized_through_iteration"] == 10
+    assert store.continue_repair(request["run_id"], fourth) == response
+    with pytest.raises(ValueError):
+        store.continue_repair(request["run_id"], {**fourth, "command_id": "another-fourth"})
+    with store._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id=?", (request["run_id"],)
+        ).fetchone()[0])
+        successor = db.execute(
+            "SELECT * FROM delivery_repair_grant_successors WHERE grant_number=4"
+        ).fetchone()
+        assert {
+            table: digest(dict(db.execute(
+                f"SELECT * FROM {table} WHERE run_id=?", (request["run_id"],)
+            ).fetchone())) for table in legacy
+        } == before
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_repair_grant_successors"
+        ).fetchone()[0] == 1
+    assert successor["ancestor_row_digests_json"] == json.dumps(
+        recovery["ancestor_row_digests"], sort_keys=True, separators=(",", ":")
+    )
+    store.repair_preflight(spec, recovery)
+    state, fifth, _receipt = _closed_later_review_fixture(
+        store, request, spec, recovery, monkeypatch, revision=70
+    )
+    assert state["iteration"] == 10
+    with pytest.raises(ValueError):
+        store.continue_repair(request["run_id"], {**fifth, "grant_number": 6})
+    fifth_response = store.continue_repair(request["run_id"], fifth)
+    assert fifth_response["grant_number"] == 5
+    assert fifth_response["authorized_through_iteration"] == 11
+    with store._connect() as db:
+        fifth_recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id=?", (request["run_id"],)
+        ).fetchone()[0])
+        rows = db.execute(
+            "SELECT grant_number,maximum_iteration FROM delivery_repair_grant_successors "
+            "ORDER BY grant_number"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [(4, 10), (5, 11)]
+    assert fifth_recovery["prior_grant_digest"] == digest(dict(successor))
+    store.repair_preflight(spec, fifth_recovery)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["success", "repair_then_success", "exhausted", "exhausted_two"]
+)
+async def test_public_later_grant_uses_temporal_and_original_session_with_stubbed_externals(
+    service, monkeypatch, mode
+):
+    store, request = service
+    async with await WorkflowEnvironment.start_local() as environment:
+        store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
+        store.config.raw["queue"] = f"later-grant-{mode}"
+        store.config.path.write_text(json.dumps(store.config.raw))
+        spec, state, command, _receipt = _fourth_repair_grant_fixture(
+            store, request, monkeypatch
+        )
+        command["additional_iterations"] = 1 if mode == "exhausted" else 2
+        app = create_app(store.config.path)
+        origin = app.state.delivery.config.dashboard_url
+        calls = {"roles": [], "precheck": 0, "publish": 0, "checks": 0, "ci": 0,
+                 "tracker": 0}
+
+        # Only Temporal/API/outbox are real; provider, GitHub, checks and tracker are stubs.
+        @activity.defn(name="delivery_role")
+        async def role_stub(payload):
+            calls["roles"].append(payload)
+            failed_review = payload["role"] == "review" and (
+                mode in {"exhausted", "exhausted_two"} or (
+                    mode == "repair_then_success"
+                    and payload["iteration"] == state["iteration"] + 1
+                )
+            )
+            return {
+                "role": payload["role"], "iteration": payload["iteration"],
+                "status": "findings" if failed_review else "pass",
+                "finish_reason": "done", "cleanup": "confirmed",
+                "candidate": payload["candidate"],
+                "summary": "Needs another bounded repair" if failed_review else "passed",
+                "findings": ["Preserve unrelated draft"] if failed_review else [],
+                "session_id": (
+                    command["expected_session_id"] if payload["role"] == "implement"
+                    else "independent-" + payload["role"]
+                ),
+            }
+
+        @activity.defn(name="delivery_precheck")
+        async def precheck_stub(payload):
+            calls["precheck"] += 1
+            return {
+                "state": "passed", "candidate_id": payload["candidate"]["id"],
+                "source_unchanged": True, "results": [],
+            }
+
+        @activity.defn(name="delivery_publish")
+        async def publish_stub(payload):
+            calls["publish"] += 1
+            return {**state["pull_request"], "candidate": payload["candidate"]}
+
+        @activity.defn(name="delivery_checks")
+        async def checks_stub(payload):
+            calls["checks"] += 1
+            return {"state": "passed", "candidate_id": payload["candidate"]["id"]}
+
+        @activity.defn(name="delivery_ci")
+        async def ci_stub(payload):
+            calls["ci"] += 1
+            return {"state": "passed", "head": payload["pull_request"]["head"]}
+
+        @activity.defn(name="delivery_tracker_start")
+        async def tracker_start_stub(_payload):
+            return {"state": "consistent"}
+
+        @activity.defn(name="delivery_tracker")
+        async def tracker_stub(_payload):
+            calls["tracker"] += 1
+            return {"state": "consistent"}
+
+        async with Worker(
+            environment.client, task_queue=f"later-grant-{mode}",
+            workflows=[DeliveryWorkflow],
+            activities=[
+                delivery_project, delivery_repair_preflight, tracker_start_stub,
+                role_stub, precheck_stub, publish_stub, checks_stub, ci_stub,
+                tracker_stub,
+            ],
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as browser:
+                login = await browser.post(
+                    "/api/session", json={"token": app.state.delivery.auth.secret},
+                    headers={"Origin": origin},
+                )
+                headers = {
+                    "Origin": origin, "X-Devflow-CSRF": login.json()["csrf_token"],
+                }
+                posted = await browser.post(
+                    "/api/runs/run-1/continue-repair", json=command, headers=headers,
+                )
+                assert posted.status_code == 200, posted.text
+                assert posted.json()["grant_number"] == 4
+                assert posted.json()["authorized_through_iteration"] == (
+                    state["iteration"] + command["additional_iterations"]
+                )
+                repeated = await browser.post(
+                    "/api/runs/run-1/continue-repair", json=command, headers=headers,
+                )
+                assert repeated.json() == posted.json()
+            await app.state.delivery.dispatch_once()
+            result = await asyncio.wait_for(
+                environment.client.get_workflow_handle(posted.json()["workflow_id"]).result(),
+                timeout=30,
+            )
+    assert result["outcome"] == (
+        "blocked" if mode in {"exhausted", "exhausted_two"} else "delivered"
+    )
+    assert result["iteration"] == state["iteration"] + (
+        2 if mode in {"repair_then_success", "exhausted_two"} else 1
+    )
+    assert result["roles"][:len(state["roles"])] == state["roles"]
+    note = (
+        "Operator acceptance criteria (requirements to assess, not evidence of success): "
+        + json.dumps(command["operator_brief"], sort_keys=True)
+    )
+    assert calls["roles"][0]["resume_session"] == command["expected_session_id"]
+    assert calls["roles"][0]["findings"] == [*state["roles"][-1]["findings"], note]
+    for payload in calls["roles"]:
+        assert note in payload["findings"]
+    assert calls["precheck"] == calls["publish"] == (
+        2 if mode in {"repair_then_success", "exhausted_two"} else 1
+    )
+    assert calls["checks"] == calls["ci"] == calls["tracker"] == (
+        0 if mode in {"exhausted", "exhausted_two"} else 1
+    )
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_repair_grant_successors"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_commands WHERE command_id=?",
+            (command["command_id"],)
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("drift", [
+    "third_row", "review_receipt", "review_log", "running_attempt",
+    "pending_effect", "claim", "candidate", "pr", "policy",
+    "session", "increment_zero", "increment_three", "stale_revision",
+])
+def test_later_grant_rejects_frozen_authority_drift_before_insert(
+    service, monkeypatch, drift
+):
+    store, request = service
+    spec, _state, command, receipt = _fourth_repair_grant_fixture(
+        store, request, monkeypatch
+    )
+    if drift == "third_row":
+        with store._connect() as db:
+            db.execute(
+                "UPDATE delivery_repair_grant_thirds SET predecessor_execution_run_id=?",
+                ("changed-closed-execution",),
+            )
+    elif drift == "review_receipt":
+        receipt.write_bytes(receipt.read_bytes() + b"changed")
+    elif drift == "review_log":
+        log = receipt.parent / "container/container.log"
+        log.write_bytes(log.read_bytes() + b"changed")
+    elif drift == "running_attempt":
+        with store._connect() as db:
+            db.execute(
+                "UPDATE delivery_attempts SET state='running' WHERE result_path=?",
+                (str(receipt),),
+            )
+    elif drift == "pending_effect":
+        with store._connect() as db:
+            db.execute(
+                "UPDATE delivery_effects SET state='pending' WHERE effect_key=("
+                "SELECT effect_key FROM delivery_effects WHERE run_id=? LIMIT 1)",
+                (request["run_id"],),
+            )
+    elif drift == "claim":
+        with store._connect() as db:
+            store.state.release_work(db, request["work_id"], "external:devflow:run-1")
+    elif drift == "candidate":
+        (Path(spec["checkout"]) / "tests/capability-a.test.ts").write_text("drift\n")
+    elif drift == "pr":
+        monkeypatch.setattr(
+            DeliveryBroker, "_existing_pr",
+            lambda self: {
+                "number": command["expected_pr_number"],
+                "url": "https://github.com/example/fixture/pull/7",
+                "state": "OPEN", "headRefOid": "0" * 40,
+            },
+        )
+    elif drift == "policy":
+        with store._connect() as db:
+            recovery = json.loads(db.execute(
+                "SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                (request["run_id"],),
+            ).fetchone()[0])
+        scope = store._scope_recovery(recovery)
+        Path(scope["amended_config_path"]).write_text("{}\n")
+    elif drift == "session":
+        command["expected_session_id"] = "another-session"
+    elif drift == "increment_zero":
+        command["additional_iterations"] = 0
+    elif drift == "increment_three":
+        command["additional_iterations"] = 3
+    elif drift == "stale_revision":
+        command["expected_revision"] += 1
+    with pytest.raises((ValueError, OSError)):
+        store.continue_repair(request["run_id"], command)
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_repair_grant_successors"
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_commands WHERE command_id=?",
+            (command["command_id"],),
+        ).fetchone()[0] == 0
+
+
+def test_successor_schema_reopens_without_touching_legacy_grants(service, monkeypatch):
+    store, request = service
+    _spec, _state, _command, _receipt = _fourth_repair_grant_fixture(
+        store, request, monkeypatch
+    )
+    tables = (
+        "delivery_repair_grants", "delivery_scope_amendments",
+        "delivery_repair_grant_extensions", "delivery_repair_grant_thirds",
+    )
+    with store._connect() as db:
+        before = {
+            table: digest(dict(db.execute(
+                f"SELECT * FROM {table} WHERE run_id=?", (request["run_id"],)
+            ).fetchone())) for table in tables
+        }
+        db.execute("DROP TABLE delivery_repair_grant_successors")
+    reopened = DeliveryStore(store.config)  # service fixture owns a disposable state DB
+    with reopened._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_repair_grant_successors"
+        ).fetchone()[0] == 0
+        assert {
+            table: digest(dict(db.execute(
+                f"SELECT * FROM {table} WHERE run_id=?", (request["run_id"],)
+            ).fetchone())) for table in tables
+        } == before
+
+
+@pytest.mark.asyncio
+async def test_public_later_grant_pending_preflight_can_cancel_without_role(
+    service, monkeypatch
+):
+    store, request = service
+    async with await WorkflowEnvironment.start_local() as environment:
+        store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
+        store.config.raw["queue"] = "later-grant-pending-cancel"
+        store.config.path.write_text(json.dumps(store.config.raw))
+        _spec, state, command, _receipt = _fourth_repair_grant_fixture(
+            store, request, monkeypatch
+        )
+        app = create_app(store.config.path)
+        origin = app.state.delivery.config.dashboard_url
+        entered = asyncio.Event()
+
+        @activity.defn(name="delivery_repair_preflight")
+        async def unavailable(_payload):
+            entered.set()
+            return {"state": "pending", "reason": "transient Docker readback unavailable"}
+
+        async with Worker(
+            environment.client, task_queue="later-grant-pending-cancel",
+            workflows=[DeliveryWorkflow], activities=[delivery_project, unavailable],
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as browser:
+                login = await browser.post(
+                    "/api/session", json={"token": app.state.delivery.auth.secret},
+                    headers={"Origin": origin},
+                )
+                headers = {
+                    "Origin": origin, "X-Devflow-CSRF": login.json()["csrf_token"],
+                }
+                posted = await browser.post(
+                    "/api/runs/run-1/continue-repair", json=command, headers=headers,
+                )
+                assert posted.status_code == 200, posted.text
+                await app.state.delivery.dispatch_once()
+                await asyncio.wait_for(entered.wait(), timeout=10)
+                handle = environment.client.get_workflow_handle(posted.json()["workflow_id"])
+                active = await handle.query("status")
+                cancelled = await browser.post(
+                    "/api/runs/run-1/cancel",
+                    json={
+                        "command_id": "cancel-later-grant",
+                        "expected_revision": active["revision"],
+                        "reason": "Stop while authority readback is unavailable",
+                    },
+                    headers=headers,
+                )
+                assert cancelled.status_code == 200, cancelled.text
+                result = await asyncio.wait_for(handle.result(), timeout=15)
+    assert result["outcome"] == "cancelled"
+    assert len(result["roles"]) == len(state["roles"])
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_repair_grant_successors"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_attempts WHERE run_id='run-1' AND iteration=10"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_public_later_grant_pending_preflight_survives_worker_restart_once(
+    service, monkeypatch
+):
+    store, request = service
+    async with await WorkflowEnvironment.start_local() as environment:
+        store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
+        store.config.raw["queue"] = "later-grant-restart"
+        store.config.path.write_text(json.dumps(store.config.raw))
+        _spec, state, command, _receipt = _fourth_repair_grant_fixture(
+            store, request, monkeypatch
+        )
+        command["additional_iterations"] = 1
+        app = create_app(store.config.path)
+        origin = app.state.delivery.config.dashboard_url
+        entered = asyncio.Event()
+        roles = []
+
+        @activity.defn(name="delivery_repair_preflight")
+        async def unavailable(_payload):
+            entered.set()
+            return {"state": "pending", "reason": "temporary Docker readback outage"}
+
+        async with Worker(
+            environment.client, task_queue="later-grant-restart",
+            workflows=[DeliveryWorkflow], activities=[delivery_project, unavailable],
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as browser:
+                login = await browser.post(
+                    "/api/session", json={"token": app.state.delivery.auth.secret},
+                    headers={"Origin": origin},
+                )
+                headers = {
+                    "Origin": origin, "X-Devflow-CSRF": login.json()["csrf_token"],
+                }
+                posted = await browser.post(
+                    "/api/runs/run-1/continue-repair", json=command, headers=headers,
+                )
+                assert posted.status_code == 200, posted.text
+            await app.state.delivery.dispatch_once()
+            await asyncio.wait_for(entered.wait(), timeout=10)
+        restarted = create_app(store.config.path)  # same disposable DB and outbox
+
+        @activity.defn(name="delivery_repair_preflight")
+        async def available(_payload):
+            return {"state": "confirmed"}
+
+        @activity.defn(name="delivery_tracker_start")
+        async def tracker_start_stub(_payload):
+            return {"state": "consistent"}
+
+        @activity.defn(name="delivery_role")
+        async def role_stub(payload):
+            roles.append(payload)
+            failed = payload["role"] == "review"
+            return {
+                "role": payload["role"], "iteration": payload["iteration"],
+                "status": "findings" if failed else "pass",
+                "finish_reason": "done", "cleanup": "confirmed",
+                "candidate": payload["candidate"],
+                "session_id": (
+                    command["expected_session_id"] if payload["role"] == "implement"
+                    else "independent-review"
+                ),
+                "summary": "Need a bounded repair" if failed else "pass",
+                "findings": ["Disposable review finding"] if failed else [],
+            }
+
+        @activity.defn(name="delivery_precheck")
+        async def precheck_stub(payload):
+            return {
+                "state": "passed", "candidate_id": payload["candidate"]["id"],
+                "source_unchanged": True, "results": [],
+            }
+
+        @activity.defn(name="delivery_publish")
+        async def publish_stub(payload):
+            return {**state["pull_request"], "candidate": payload["candidate"]}
+
+        async with Worker(
+            environment.client, task_queue="later-grant-restart",
+            workflows=[DeliveryWorkflow],
+            activities=[
+                delivery_project, available, tracker_start_stub,
+                role_stub, precheck_stub, publish_stub,
+            ],
+        ):
+            await restarted.state.delivery.dispatch_once()
+            result = await asyncio.wait_for(
+                environment.client.get_workflow_handle(posted.json()["workflow_id"]).result(),
+                timeout=25,
+            )
+    assert result["outcome"] == "blocked"
+    assert result["iteration"] == state["iteration"] + 1
+    assert [payload["role"] for payload in roles] == ["implement", "review"]
+    assert roles[0]["resume_session"] == command["expected_session_id"]
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_repair_grant_successors"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_commands WHERE command_id=?",
+            (command["command_id"],),
+        ).fetchone()[0] == 1

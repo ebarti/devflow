@@ -365,7 +365,7 @@ class DeliveryWorkflow:
             recovery.get("grant_number")
             if recovery.get("kind") == "repair_continuation" else None
         )
-        numbered = grant_number in (2, 3)
+        numbered = type(grant_number) is int and grant_number >= 2
         start = previous["iteration"] if prelaunch_retry else previous["iteration"] + 1
         limit = recovery["maximum_iteration"]
         roles = previous.get("roles", [])
@@ -379,19 +379,25 @@ class DeliveryWorkflow:
         )
         original = recovery.get("original_recovery") if prelaunch_retry else None
         prior = recovery.get("prior_recovery") if numbered else None
-        earlier = (
-            prior.get("prior_recovery")
-            if grant_number == 3 and isinstance(prior, dict) else prior
-        )
+        earlier = prior
+        if numbered and grant_number >= 3:
+            for expected in range(grant_number - 1, 1, -1):
+                if (
+                    not isinstance(earlier, dict)
+                    or earlier.get("kind") != "repair_continuation"
+                    or earlier.get("grant_number") != expected
+                ):
+                    raise ValueError("numbered repair ancestry is incomplete")
+                earlier = earlier.get("prior_recovery")
         scope = earlier.get("scope_recovery") if isinstance(earlier, dict) else None
         authorized_limit = (
-            prior.get("maximum_iteration", -2) + 2
-            if grant_number == 3 and isinstance(prior, dict)
+            prior.get("maximum_iteration", -2) + recovery.get("additional_iterations", -1)
+            if numbered and grant_number >= 3 and isinstance(prior, dict)
             else scope.get("maximum_iteration", -3) + 2
             if isinstance(scope, dict) and numbered
             else spec["policy"]["max_repairs"] + 2
         )
-        operator_brief = recovery.get("operator_brief") if grant_number == 3 else None
+        operator_brief = recovery.get("operator_brief") if numbered and grant_number >= 3 else None
         if (
             previous.get("run_id") != spec["run_id"]
             or previous.get("phase") != "blocked"
@@ -407,29 +413,38 @@ class DeliveryWorkflow:
         if numbered and (
             not isinstance(prior, dict)
             or prior.get("kind") != (
-                "repair_continuation" if grant_number == 3
+                "repair_continuation" if grant_number >= 3
                 else "precheck_prelaunch_recovery"
             )
-            or (grant_number == 3 and prior.get("grant_number") != 2)
+            or (grant_number >= 3 and prior.get("grant_number") != grant_number - 1)
             or not isinstance(scope, dict)
             or scope.get("kind") != "scope_amendment"
             or recovery.get("effective_spec") != spec
-            or recovery.get("additional_iterations") != 2
+            or type(recovery.get("additional_iterations")) is not int
+            or recovery["additional_iterations"] not in (
+                (2,) if grant_number in (2, 3) else (1, 2)
+            )
             or limit != authorized_limit
             or previous["iteration"] != (
-                prior.get("maximum_iteration") if grant_number == 3
+                prior.get("maximum_iteration") if grant_number >= 3
                 else scope.get("maximum_iteration")
             )
             or recovery.get("session_id") != prior.get("session_id")
         ):
             raise ValueError("numbered repair grant changed the amended authority")
-        if grant_number == 3 and (
+        if numbered and grant_number >= 3 and (
             not isinstance(operator_brief, dict)
             or not operator_brief.get("criteria")
             or digest(operator_brief) != recovery.get("operator_brief_digest")
-            or recovery.get("prior_extension_digest") is None
+            or (grant_number == 3 and recovery.get("prior_extension_digest") is None)
+            or (grant_number >= 4 and (
+                not isinstance(prior.get("operator_brief"), dict)
+                or operator_brief["criteria"][:len(prior["operator_brief"].get("criteria", []))]
+                != prior["operator_brief"].get("criteria")
+                or recovery.get("prior_grant_digest") is None
+            ))
         ):
-            raise ValueError("third grant changed the sealed acceptance criteria")
+            raise ValueError("numbered grant changed the sealed acceptance criteria")
         if prelaunch_retry:
             if (
                 not isinstance(original, dict)
