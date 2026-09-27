@@ -28,7 +28,7 @@ from devflow_temporal.delivery_activities import (
     delivery_role,
 )
 from devflow_temporal.delivery_api import DeliveryService, create_app
-from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_broker import BrokerReadbackUnavailable, DeliveryBroker
 from devflow_temporal.delivery_broker import _git as broker_git
 from devflow_temporal.delivery_config import (
     BOUNDARY_DENIAL_FIELDS,
@@ -39,7 +39,12 @@ from devflow_temporal.delivery_config import (
     security_binding,
 )
 from devflow_temporal.delivery_continuation import selected_digest, session_state_digest
-from devflow_temporal.delivery_repair import failed_gate_diagnostics
+from devflow_temporal.delivery_repair import (
+    RepairReadbackPending,
+    confirmed_container_cleanup,
+    failed_gate_diagnostics,
+    published_identity,
+)
 from devflow_temporal.delivery_sandbox import validate_network_domain
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow, _broker_findings
@@ -365,6 +370,85 @@ def test_repair_grant_rejects_changed_authority_before_queue(service, monkeypatc
             db.execute("SELECT state FROM delivery_outbox WHERE run_id='run-1'").fetchone()[0]
             == "sent"
         )
+
+
+def test_repair_preflight_distinguishes_remote_outage_from_pr_drift(service, monkeypatch):
+    store, request = service
+    spec, state, _command = _failed_published_repair_fixture(store, request, monkeypatch)
+    broker = DeliveryBroker(store, spec)
+
+    def offline(_broker):
+        raise BrokerReadbackUnavailable("temporary GitHub outage")
+
+    monkeypatch.setattr(DeliveryBroker, "_existing_pr", offline)
+    with pytest.raises(RepairReadbackPending, match="PR readback unavailable"):
+        published_identity(broker, state["candidate"], state["pull_request"])
+
+    monkeypatch.setattr(
+        DeliveryBroker,
+        "_existing_pr",
+        lambda _broker: {
+            "number": 7,
+            "url": state["pull_request"]["url"],
+            "state": "OPEN",
+            "headRefOid": "a" * 40,
+        },
+    )
+    with pytest.raises(ValueError, match="no longer matches"):
+        published_identity(broker, state["candidate"], state["pull_request"])
+
+    def collision(_broker):
+        raise RuntimeError("multiple PRs use the owned branch")
+
+    monkeypatch.setattr(DeliveryBroker, "_existing_pr", collision)
+    with pytest.raises(ValueError, match="PR authority conflicts"):
+        published_identity(broker, state["candidate"], state["pull_request"])
+
+
+def test_repair_preflight_distinguishes_docker_outage_from_lost_container(
+    service, monkeypatch
+):
+    store, request = service
+    spec, _state, _command = _failed_published_repair_fixture(store, request, monkeypatch)
+    spec = {
+        **spec,
+        "provider": "codex",
+        "policy": {"container": {"docker_bin": "docker", "image_id": "sha256:fixture"}},
+    }
+    folder = Path(spec["state_dir"]) / "attempts" / "fixture" / "container"
+    folder.mkdir(parents=True)
+    intent = folder / "container-intent.json"
+    intent.write_text(
+        json.dumps(
+            {
+                "name": "devflow-fixture",
+                "labels": {
+                    "devflow.run_id": request["run_id"],
+                    "devflow.policy": spec["policy_digest"],
+                },
+                "image_id": "sha256:fixture",
+            }
+        )
+    )
+    intent.chmod(0o600)
+    (folder / "container-id.json").write_text(
+        json.dumps({"name": "devflow-fixture", "container_id": "fixture-id"})
+    )
+    (folder / "container.log").write_text("finished\n")
+    daemon_available = {"value": False}
+
+    def docker(argv, **_kwargs):
+        if argv[1] == "inspect":
+            return subprocess.CompletedProcess(argv, 1, b"", b"missing or offline")
+        assert argv[1] == "info"
+        return subprocess.CompletedProcess(argv, 0 if daemon_available["value"] else 1, b"", b"")
+
+    monkeypatch.setattr("devflow_temporal.delivery_repair.subprocess.run", docker)
+    with pytest.raises(RepairReadbackPending, match="daemon readback unavailable"):
+        confirmed_container_cleanup(spec)
+    daemon_available["value"] = True
+    with pytest.raises(ValueError, match="cannot be inspected"):
+        confirmed_container_cleanup(spec)
 
 
 def test_ci_repair_diagnostic_binds_exact_failed_job_log_and_head(monkeypatch):
@@ -1464,8 +1548,17 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
     not Path("/usr/bin/sandbox-exec").is_file() or not shutil.which("temporal"),
     reason="macOS Seatbelt and local Temporal CLI required",
 )
+@pytest.mark.parametrize(
+    ("preflight_mode", "tracker_mode"),
+    [
+        ("transient", "pending"),
+        ("transient", "error"),
+        ("transient", "drift"),
+        ("authority", "none"),
+    ],
+)
 async def test_public_repair_grant_resumes_original_session_and_runs_broker_gates(
-    service, monkeypatch
+    service, monkeypatch, preflight_mode, tracker_mode
 ):
     original, request = service
     with socket.socket() as listener:
@@ -1483,7 +1576,14 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
     config["repositories"]["fixture"]["allowed_paths"].append("devflow-fake-change.txt")
     original.config.path.write_text(json.dumps(config))
     service_runtime = DeliveryService(original.config.path)
-    calls = {"publish": [], "precheck": [], "checks": [], "ci": []}
+    calls = {
+        "publish": [],
+        "precheck": [],
+        "checks": [],
+        "ci": [],
+        "preflight": 0,
+        "tracker_start": 0,
+    }
 
     def existing_pr(broker):
         head = _git(broker.checkout, "rev-parse", "HEAD")
@@ -1556,8 +1656,26 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
         return {"state": "passed", "head": payload["pull_request"]["head"]}
 
     @activity.defn(name="delivery_tracker_start")
-    async def tracker_start_stub(_payload):
+    async def tracker_start_stub(payload):
+        calls["tracker_start"] += 1
+        if calls["tracker_start"] == 2:
+            if tracker_mode == "pending":
+                return {"state": "pending", "reason": "temporary tracker readback"}
+            if tracker_mode == "error":
+                raise RuntimeError("temporary tracker timeout")
+            if tracker_mode == "drift":
+                checkout = Path(payload["spec"]["checkout"])
+                (checkout / "README.md").write_text("Changed after grant\n")
         return {"state": "consistent"}
+
+    @activity.defn(name="delivery_repair_preflight")
+    async def preflight_stub(payload):
+        calls["preflight"] += 1
+        if calls["preflight"] == 1:
+            if preflight_mode == "authority":
+                raise ValueError("candidate authority changed")
+            raise RepairReadbackPending("temporary Docker readback")
+        return await delivery_repair_preflight(payload)
 
     @activity.defn(name="delivery_tracker")
     async def tracker_stub(_payload):
@@ -1586,22 +1704,23 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
                     raise RuntimeError("Temporal dev server exited during fixture startup") from exc
                 await asyncio.sleep(0.1)
         assert client is not None
+        activities = [
+            delivery_project,
+            delivery_prepare,
+            role_stub,
+            preflight_stub,
+            publish_stub,
+            precheck_stub,
+            checks_stub,
+            ci_stub,
+            tracker_start_stub,
+            tracker_stub,
+        ]
         async with Worker(
             client,
             task_queue=config["queue"],
             workflows=[DeliveryWorkflow],
-            activities=[
-                delivery_project,
-                delivery_prepare,
-                role_stub,
-                delivery_repair_preflight,
-                publish_stub,
-                precheck_stub,
-                checks_stub,
-                ci_stub,
-                tracker_start_stub,
-                tracker_stub,
-            ],
+            activities=activities,
         ):
             service_runtime.store.submit(request)
             await service_runtime.dispatch_once()
@@ -1610,7 +1729,10 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
             )
             assert blocked["outcome"] == "blocked"
             assert blocked["error"] == "repair limit exhausted"
-            assert calls == {"publish": [0], "precheck": [0], "checks": [], "ci": []}
+            assert calls["publish"] == [0]
+            assert calls["precheck"] == [0]
+            assert calls["checks"] == []
+            assert calls["ci"] == []
             app = create_app(original.config.path)
             origin_url = app.state.delivery.config.dashboard_url
             async with httpx.AsyncClient(
@@ -1642,16 +1764,50 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
                 assert posted.status_code == 200, posted.text
                 assert posted.json()["authorized_through_iteration"] == 1
             await service_runtime.dispatch_once()
-            delivered = await asyncio.wait_for(
-                client.get_workflow_handle("delivery-run-1-repair-continuation-1").result(),
-                timeout=35,
-            )
+            repair_handle = client.get_workflow_handle("delivery-run-1-repair-continuation-1")
+            if preflight_mode == "authority":
+                delivered = await asyncio.wait_for(repair_handle.result(), timeout=35)
+            else:
+                # Stop the worker after Temporal has durably recorded the failed
+                # readback attempt. The same granted execution must resume on a
+                # new worker without a second command or role attempt.
+                for _ in range(100):
+                    pending = (await repair_handle.describe()).raw_description.pending_activities
+                    if any(
+                        item.activity_type.name == "delivery_repair_preflight"
+                        and item.HasField("last_failure")
+                        for item in pending
+                    ):
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise AssertionError("Temporal did not retain the failed preflight")
+                assert calls["preflight"] == 1
+                assert calls["publish"] == [0]
+        if preflight_mode == "transient":
+            async with Worker(
+                client,
+                task_queue=config["queue"],
+                workflows=[DeliveryWorkflow],
+                activities=activities,
+            ):
+                delivered = await asyncio.wait_for(repair_handle.result(), timeout=35)
+        if preflight_mode == "authority" or tracker_mode == "drift":
+            assert delivered["outcome"] == "blocked"
+            assert delivered["phase"] == "blocked"
+            assert calls["preflight"] == (1 if preflight_mode == "authority" else 3)
+            assert calls["publish"] == [0]
+            assert calls["tracker_start"] == (1 if preflight_mode == "authority" else 2)
+            assert len([role for role in delivered["roles"] if role["role"] == "implement"]) == 1
+            return
         assert delivered["outcome"] == "delivered"
         assert delivered["iteration"] == 1
         assert calls["publish"] == [0, 1]
         assert calls["precheck"] == [0, 1]
         assert calls["checks"] == [1]
         assert calls["ci"] == [delivered["pull_request"]["head"]]
+        assert calls["preflight"] == 3
+        assert calls["tracker_start"] == 3
         implement_sessions = [
             role["session_id"] for role in delivered["roles"] if role["role"] == "implement"
         ]

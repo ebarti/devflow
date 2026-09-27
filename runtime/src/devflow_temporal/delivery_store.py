@@ -936,7 +936,13 @@ class DeliveryStore:
             or row["request_json"] != canonical_json(spec)
             or row["workflow_id"] != f"delivery-{run_id}-repair-continuation-1"
             or row["recovery_json"] != canonical_json(recovery)
-            or row["phase"] not in {"repair_continuation_queued", "repair"}
+            or row["phase"]
+            not in {
+                "repair_continuation_queued",
+                "repair_preflight",
+                "tracker_start",
+                "repair",
+            }
             or row["execution_state"] not in {"queued", "running"}
             or grant["predecessor_workflow_id"] != recovery["predecessor_workflow_id"]
             or grant["predecessor_execution_run_id"]

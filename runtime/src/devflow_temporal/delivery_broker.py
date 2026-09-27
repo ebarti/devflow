@@ -59,6 +59,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+class BrokerReadbackUnavailable(RuntimeError):
+    """A remote PR query failed before its authority could be inspected."""
+
+
 class DeliveryBroker:
     def __init__(self, store: DeliveryStore, spec: dict[str, Any]) -> None:
         self.store = store
@@ -707,22 +711,25 @@ class DeliveryBroker:
         return execute_browser_qa(self, iteration, candidate)
 
     def _existing_pr(self) -> dict[str, Any] | None:
-        output = _run(
-            [
-                "gh",
-                "pr",
-                "list",
-                "--repo",
-                self.spec["github_repo"],
-                "--state",
-                "all",
-                "--head",
-                self.spec["branch"],
-                "--json",
-                "number,url,state,isDraft,baseRefName,headRefName,headRefOid",
-            ],
-            timeout=60,
-        )
+        try:
+            output = _run(
+                [
+                    "gh",
+                    "pr",
+                    "list",
+                    "--repo",
+                    self.spec["github_repo"],
+                    "--state",
+                    "all",
+                    "--head",
+                    self.spec["branch"],
+                    "--json",
+                    "number,url,state,isDraft,baseRefName,headRefName,headRefOid",
+                ],
+                timeout=60,
+            )
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+            raise BrokerReadbackUnavailable("owned branch PR readback unavailable") from exc
         matches = json.loads(output)
         if len(matches) > 1:
             raise RuntimeError("multiple PRs use the owned branch")

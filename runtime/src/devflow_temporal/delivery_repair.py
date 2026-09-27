@@ -13,9 +13,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .contracts import canonical_json
-from .delivery_broker import DeliveryBroker, _git
+from .delivery_broker import BrokerReadbackUnavailable, DeliveryBroker, _git
 from .delivery_output import visible_output
 from .delivery_workflow import _broker_findings
+
+
+class RepairReadbackPending(RuntimeError):
+    """An external authority readback is unavailable; no role may run yet."""
 
 
 def failed_gate_diagnostics(state: dict[str, Any], spec: dict[str, Any]) -> list[str]:
@@ -140,18 +144,29 @@ def published_identity(
 
     if not isinstance(candidate, dict) or not isinstance(pr, dict):
         raise ValueError("published candidate or PR is missing")
-    if broker.candidate() != candidate:
+    try:
+        observed_candidate = broker.candidate()
+        checkout_origin = _git(broker.checkout, "remote", "get-url", "--push", "origin")
+        source_origin = _git(broker.source, "remote", "get-url", "origin")
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+        raise ValueError("owned local candidate or Git origin cannot be verified") from exc
+    if observed_candidate != candidate:
         raise ValueError("published candidate changed since the closed gate")
     spec = broker.spec
-    if (
-        _git(broker.checkout, "remote", "get-url", "--push", "origin") != spec["origin_url"]
-        or _git(broker.source, "remote", "get-url", "origin") != spec["origin_url"]
-    ):
+    if checkout_origin != spec["origin_url"] or source_origin != spec["origin_url"]:
         raise ValueError("published Git destination changed")
-    remote = _git(broker.source, "ls-remote", "origin", f"refs/heads/{spec['branch']}")
+    try:
+        remote = _git(broker.source, "ls-remote", "origin", f"refs/heads/{spec['branch']}")
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+        raise RepairReadbackPending("published branch readback unavailable") from exc
     if not remote or remote.split()[0] != pr.get("head"):
         raise ValueError("published remote branch differs from the frozen PR")
-    found = broker._existing_pr()
+    try:
+        found = broker._existing_pr()
+    except BrokerReadbackUnavailable as exc:
+        raise RepairReadbackPending("published PR readback unavailable") from exc
+    except RuntimeError as exc:
+        raise ValueError("owned PR authority conflicts with the closed run") from exc
     if (
         found is None
         or found.get("number") != pr.get("number")
@@ -193,10 +208,24 @@ def confirmed_container_cleanup(spec: dict[str, Any]) -> None:
         if identity.is_symlink() or not identity.is_file() or log.is_symlink() or not log.is_file():
             raise ValueError("owned container has no confirmed result")
         recorded = json.loads(identity.read_text(encoding="utf-8"))
-        inspected = subprocess.run(
-            [docker, "inspect", name], capture_output=True, check=False, timeout=30
-        )
+        try:
+            inspected = subprocess.run(
+                [docker, "inspect", name], capture_output=True, check=False, timeout=30
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RepairReadbackPending("Docker cleanup readback unavailable") from exc
         if inspected.returncode:
+            try:
+                daemon = subprocess.run(
+                    [docker, "info", "--format", "{{.ServerVersion}}"],
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise RepairReadbackPending("Docker daemon readback unavailable") from exc
+            if daemon.returncode:
+                raise RepairReadbackPending("Docker daemon readback unavailable")
             raise ValueError("owned container cannot be inspected for cleanup")
         values = json.loads(inspected.stdout)
         if len(values) != 1:
