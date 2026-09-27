@@ -416,6 +416,7 @@ def test_prelaunch_retry_preserves_grant_attempt_and_review_findings(service, mo
     assert recovery["state"] == state
     assert recovery["findings"] == state["roles"][-2]["findings"]
     assert recovery["ci_evidence"]["state"] == "unconfigured"
+    assert recovery["ci_evidence"]["diagnostics_digest"] == digest([])
     assert recovery["session_id"] == "original-session"
     assert recovery["failed_job_key"] == "failed-prelaunch-4"
     assert run["workflow_id"] == "delivery-run-1-repair-prelaunch-retry-1"
@@ -424,6 +425,131 @@ def test_prelaunch_retry_preserves_grant_attempt_and_review_findings(service, mo
     store.repair_preflight(spec, recovery)
     with pytest.raises(ValueError, match="frozen repair authority"):
         store.retry_prelaunch("run-1", {**command, "command_id": "retry-prelaunch-2"})
+
+
+def test_prelaunch_retry_workflow_activates_same_iteration_with_sealed_context(
+    service, monkeypatch
+):
+    store, request = service
+    spec, state, command, _folder = _sealed_prelaunch_retry_fixture(
+        store, request, monkeypatch
+    )
+    store.retry_prelaunch(request["run_id"], command)
+    with store._connect() as db:
+        recovery = json.loads(
+            db.execute(
+                "SELECT recovery_json FROM delivery_runs WHERE run_id=?", (request["run_id"],)
+            ).fetchone()[0]
+        )
+    flow = DeliveryWorkflow()
+    captured = {}
+
+    async def project(_spec, _event, _message):
+        return None
+
+    async def preflight(_spec, _recovery):
+        return True
+
+    async def activity(name, _request):
+        assert name == "delivery_tracker_start"
+        return {"state": "consistent"}
+
+    async def run_iterations(_spec, **kwargs):
+        captured.update(kwargs)
+        return {"ready": True}
+
+    monkeypatch.setattr(flow, "_project", project)
+    monkeypatch.setattr(flow, "_confirm_repair_preflight", preflight)
+    monkeypatch.setattr(flow, "_activity", activity)
+    monkeypatch.setattr(flow, "_run_iterations", run_iterations)
+    assert asyncio.run(flow._resume_repair(spec, recovery)) == {"ready": True}
+    assert captured["start_iteration"] == state["iteration"]
+    assert captured["authorized_max_iteration"] == state["iteration"]
+    assert captured["attempt_generation"] == 1
+    assert captured["prior_implementer_session"] == "original-session"
+    assert captured["repair_findings"] == state["roles"][-2]["findings"]
+
+
+@pytest.mark.asyncio
+async def test_public_prelaunch_retry_without_required_ci_reaches_temporal_role(
+    service, monkeypatch
+):
+    store, request = service
+    async with await WorkflowEnvironment.start_local() as environment:
+        store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
+        store.config.raw["queue"] = "prelaunch-retry-public-test"
+        store.config.path.write_text(json.dumps(store.config.raw))
+        spec, state, command, _folder = _sealed_prelaunch_retry_fixture(
+            store, request, monkeypatch
+        )
+        closed = store._completed_temporal_result(request["run_id"])
+        monkeypatch.setattr(
+            DeliveryStore, "_completed_temporal_result", lambda self, _id, **_kw: closed
+        )
+        app = create_app(store.config.path)
+        origin = app.state.delivery.config.dashboard_url
+        observed = []
+
+        @activity.defn(name="delivery_tracker_start")
+        async def tracker_stub(_payload):
+            return {"state": "consistent"}
+
+        @activity.defn(name="delivery_role")
+        async def role_stub(payload):
+            observed.append(payload)
+            return {
+                "role": "implement",
+                "iteration": payload["iteration"],
+                "status": "blocked",
+                "cleanup": "confirmed",
+                "session_id": recovery["session_id"],
+                "findings": ["fixture stops after the resumed role boundary"],
+            }
+
+        async with Worker(
+            environment.client,
+            task_queue="prelaunch-retry-public-test",
+            workflows=[DeliveryWorkflow],
+            activities=[delivery_project, delivery_repair_preflight, tracker_stub, role_stub],
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as browser:
+                login = await browser.post(
+                    "/api/session",
+                    json={"token": app.state.delivery.auth.secret},
+                    headers={"Origin": origin},
+                )
+                assert login.status_code == 200
+                posted = await browser.post(
+                    "/api/runs/run-1/retry-prelaunch",
+                    json=command,
+                    headers={
+                        "Origin": origin,
+                        "X-Devflow-CSRF": login.json()["csrf_token"],
+                    },
+                )
+                assert posted.status_code == 200, posted.text
+            with store._connect() as db:
+                recovery = json.loads(
+                    db.execute(
+                        "SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                        (request["run_id"],),
+                    ).fetchone()[0]
+                )
+            assert recovery["ci_evidence"]["diagnostics_digest"] == digest([])
+            await app.state.delivery.dispatch_once()
+            result = await asyncio.wait_for(
+                environment.client.get_workflow_handle(posted.json()["workflow_id"]).result(),
+                timeout=30,
+            )
+    assert result["iteration"] == state["iteration"]
+    assert result["outcome"] == "blocked"
+    assert len(observed) == 1
+    assert observed[0]["attempt_generation"] == 1
+    assert observed[0]["resume_session"] == "original-session"
+    assert observed[0]["findings"] == state["roles"][-2]["findings"]
+    assert spec["policy"]["required_ci"] == []
 
 
 def test_prelaunch_retry_seals_current_head_failed_ci_with_review_findings(

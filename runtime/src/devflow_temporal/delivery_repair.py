@@ -148,7 +148,13 @@ def current_head_ci_evidence(
 
     required = broker.spec["policy"].get("required_ci", [])
     if not required:
-        return {"head": pr["head"], "state": "unconfigured", "failed": [], "diagnostics": []}
+        return {
+            "head": pr["head"],
+            "state": "unconfigured",
+            "failed": [],
+            "diagnostics": [],
+            "diagnostics_digest": digest([]),
+        }
     try:
         result = asyncio.run(broker.checks(pr, timeout_seconds=0))
     except (
