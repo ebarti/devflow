@@ -18,7 +18,7 @@ from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFai
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from devflow_temporal import delivery_broker
+from devflow_temporal import delivery_broker, delivery_store
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_activities import (
     delivery_prepare,
@@ -33,6 +33,7 @@ from devflow_temporal.delivery_broker import BrokerReadbackUnavailable, Delivery
 from devflow_temporal.delivery_broker import _git as broker_git
 from devflow_temporal.delivery_config import (
     BOUNDARY_DENIAL_FIELDS,
+    ContainerReadbackPending,
     DeliveryConfig,
     _boundary_probe_passed,
     _browser_qa_probe_passed,
@@ -51,7 +52,7 @@ from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow, _broker_findings
 from devflow_temporal.payload import payload_digest
 from devflow_temporal.role_runner import _task
-from devflow_temporal.supervisor import DeliverySupervisor
+from devflow_temporal.supervisor import DeliverySupervisor, get_supervisor
 
 
 def _git(path: Path, *args: str) -> str:
@@ -470,7 +471,7 @@ def test_prelaunch_retry_workflow_activates_same_iteration_with_sealed_context(
     assert captured["repair_findings"] == state["roles"][-2]["findings"]
 
 
-def _scope_amendment_fixture(store, request, monkeypatch):
+def _scope_amendment_fixture(store, request, monkeypatch, *, retry_generation=0):
     source = Path(store.config.raw["repositories"]["fixture"]["source_path"])
     additions = ["tests/capability-a.test.ts", "tests/capability-b.test.ts"]
     (source / "tests").mkdir()
@@ -491,6 +492,12 @@ def _scope_amendment_fixture(store, request, monkeypatch):
         previous_recovery = json.loads(
             db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0]
         )
+        if retry_generation:
+            previous_recovery["kind"] = "repair_prelaunch_retry"
+            db.execute(
+                "UPDATE delivery_runs SET recovery_json=? WHERE run_id='run-1'",
+                (json.dumps(previous_recovery),),
+            )
     broker = DeliveryBroker(store, original)
     (broker.checkout / "README.md").write_text("Further owned implementation\n")
     candidate = broker.candidate()
@@ -511,16 +518,37 @@ def _scope_amendment_fixture(store, request, monkeypatch):
     }
     role4 = {**raw4, "cleanup": "confirmed", "candidate": candidate}
     roles = [*initial["roles"], role3, review3, role4]
-    folder = Path(original["state_dir"]) / "attempts" / "role-implement-4"
+    identity = {
+        "run_id": request["run_id"], "role": "implement", "iteration": 4,
+        "candidate_id": initial["candidate"]["id"],
+        "policy_digest": original["policy_digest"],
+    }
+    final_job_key = digest({**identity, **(
+        {"attempt_generation": retry_generation} if retry_generation else {}
+    )})
+    folder = Path(original["state_dir"]) / "attempts" / final_job_key
     folder.mkdir(parents=True, mode=0o700)
     receipt = folder / "result.json"
     receipt.write_text(json.dumps(raw4))
     receipt.chmod(0o600)
     with store._connect() as db:
+        if retry_generation:
+            db.execute(
+                """INSERT INTO delivery_attempts
+                   (job_key,run_id,role,iteration,candidate_id,state,session_id,
+                    result_json,result_path,cleanup)
+                   VALUES (?,?,?,?,?,'finished',NULL,?,NULL,'confirmed')""",
+                (
+                    digest(identity), request["run_id"], "implement", 4,
+                    initial["candidate"]["id"],
+                    json.dumps({"status": "blocked", "finish_reason": "prelaunch",
+                                "cleanup": "confirmed", "session_id": None}),
+                ),
+            )
         for key, role, path in (
             ("role-implement-3", role3, None),
             ("role-review-3", review3, None),
-            ("role-implement-4", {**raw4, "cleanup": "confirmed"}, receipt),
+            (final_job_key, {**raw4, "cleanup": "confirmed"}, receipt),
         ):
             db.execute(
                 """INSERT INTO delivery_attempts
@@ -529,7 +557,8 @@ def _scope_amendment_fixture(store, request, monkeypatch):
                    VALUES (?,?,?,?,?,'finished',?,?,?,'confirmed')""",
                 (
                     key, request["run_id"], role["role"], role["iteration"],
-                    candidate["id"], role["session_id"], json.dumps(role),
+                    (initial["candidate"]["id"] if key == final_job_key
+                     else candidate["id"]), role["session_id"], json.dumps(role),
                     str(path) if path else None,
                 ),
             )
@@ -572,6 +601,35 @@ def _scope_amendment_fixture(store, request, monkeypatch):
         "amended_config_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
     return original, state, command, closed
+
+
+def test_scope_amendment_binds_finished_generation_after_prelaunch_retry(
+    service, monkeypatch
+):
+    store, request = service
+    original, _state, command, _closed = _scope_amendment_fixture(
+        store, request, monkeypatch, retry_generation=1
+    )
+    response = store.amend_scope("run-1", command)
+    assert response["phase"] == "scope_amendment_queued"
+    with store._connect() as db:
+        attempts = db.execute(
+            """SELECT job_key,session_id FROM delivery_attempts
+               WHERE role='implement' AND iteration=4 ORDER BY job_key"""
+        ).fetchall()
+        recovery = json.loads(
+            db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'")
+            .fetchone()[0]
+        )
+    assert len(attempts) == 2
+    assert recovery["attempt_job_key"] == digest({
+        "run_id": request["run_id"], "role": "implement", "iteration": 4,
+        "candidate_id": _state["candidate"]["id"],
+        "policy_digest": original["policy_digest"], "attempt_generation": 1,
+    })
+    assert next(row for row in attempts if row["job_key"] == recovery["attempt_job_key"])[
+        "session_id"
+    ] == "original-session"
 
 
 def test_scope_amendment_seals_only_two_paths_and_preserves_request_and_grant(
@@ -630,7 +688,9 @@ def test_scope_amendment_rejects_changed_authority_without_queue(
     elif drift == "receipt":
         with store._connect() as db:
             path = db.execute(
-                "SELECT result_path FROM delivery_attempts WHERE job_key='role-implement-4'"
+                """SELECT result_path FROM delivery_attempts
+                   WHERE role='implement' AND iteration=4
+                   AND session_id='original-session'"""
             ).fetchone()[0]
         Path(path).write_text("{}")
     elif drift == "path":
@@ -652,13 +712,13 @@ def test_scope_amendment_rejects_changed_authority_without_queue(
         with store._connect() as db:
             db.execute(
                 "UPDATE delivery_attempts SET cleanup='unknown' "
-                "WHERE job_key='role-implement-4'"
+                "WHERE role='implement' AND iteration=4 AND session_id='original-session'"
             )
     elif drift == "active_attempt":
         with store._connect() as db:
             db.execute(
                 "UPDATE delivery_attempts SET state='running' "
-                "WHERE job_key='role-implement-4'"
+                "WHERE role='implement' AND iteration=4 AND session_id='original-session'"
             )
     else:
         with store._connect() as db:
@@ -676,8 +736,9 @@ def test_scope_amendment_rejects_changed_authority_without_queue(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("image_outage", [False, True])
 async def test_public_scope_amendment_dispatches_one_original_session_temporal_role(
-    service, monkeypatch
+    service, monkeypatch, image_outage
 ):
     store, request = service
     async with await WorkflowEnvironment.start_local() as environment:
@@ -739,6 +800,19 @@ async def test_public_scope_amendment_dispatches_one_original_session_temporal_r
                     },
                 )
                 assert repeated.json() == posted.json()
+            outage_calls = []
+            if image_outage:
+                admitted = delivery_store.scope_amended_spec
+
+                def intermittent_readback(*args):
+                    outage_calls.append(True)
+                    if len(outage_calls) == 1:
+                        raise ContainerReadbackPending("temporary Docker daemon outage")
+                    return admitted(*args)
+
+                monkeypatch.setattr(
+                    delivery_store, "scope_amended_spec", intermittent_readback
+                )
             await app.state.delivery.dispatch_once()
             result = await asyncio.wait_for(
                 environment.client.get_workflow_handle(posted.json()["workflow_id"]).result(),
@@ -747,6 +821,12 @@ async def test_public_scope_amendment_dispatches_one_original_session_temporal_r
     assert result["iteration"] == state["iteration"] + 1
     assert result["outcome"] == "blocked"  # The fixture role returned findings.
     assert len(observed) == 1
+    if image_outage:
+        assert len(outage_calls) >= 2
+        assert any(
+            event["type"] == "repair_preflight_pending"
+            for event in store.detail("run-1")["events"]
+        )
     assert observed[0]["resume_session"] == "original-session"
     assert observed[0]["candidate"]["id"] == state["roles"][-1]["candidate"]["id"]
     assert observed[0]["spec"]["policy"]["allowed_paths"] == [
@@ -2164,6 +2244,55 @@ def test_real_check_fails_closed_without_admitted_container(service, tmp_path):
             broker.checkout, [check], broker.state_dir / "security-check", broker.candidate()
         )
     assert sentinel.read_text() == "SAFE\n"
+
+
+@pytest.mark.asyncio
+async def test_role_capacity_is_shared_across_original_and_amended_config_paths(service):
+    store, request = service
+    store.config.raw["capacity"] = 1
+    store.config.path.write_text(json.dumps(store.config.raw))
+    store.submit(request)
+    second_path = store.config.path.with_name("amended-capacity.json")
+    second_path.write_text(json.dumps(store.config.raw))
+    second_store = DeliveryStore(DeliveryConfig.load(second_path))
+    assert get_supervisor(store) is get_supervisor(second_store)
+    original = DeliverySupervisor(store, capacity=1)
+    amended = DeliverySupervisor(second_store, capacity=1)
+    with store._connect() as db:
+        for key in ("first-config-role", "amended-config-role"):
+            db.execute(
+                """INSERT INTO delivery_attempts
+                   (job_key,run_id,role,iteration,candidate_id,state,result_path)
+                   VALUES (?,'run-1','implement',0,'candidate','queued',?)""",
+                (key, str(store.config.state_root / key / "result.json")),
+            )
+    await original._acquire_capacity("first-config-role")
+    pending = asyncio.create_task(amended._acquire_capacity("amended-config-role"))
+    try:
+        await asyncio.sleep(0.1)
+        assert not pending.done()
+        with store._connect() as db:
+            assert db.execute(
+                """SELECT COUNT(*) FROM delivery_attempts
+                   WHERE state IN ('starting','running','unknown')"""
+            ).fetchone()[0] == 1
+            db.execute(
+                "UPDATE delivery_attempts SET state='finished',cleanup='confirmed' "
+                "WHERE job_key='first-config-role'"
+            )
+        await asyncio.wait_for(pending, timeout=3)
+        with store._connect() as db:
+            assert db.execute(
+                """SELECT COUNT(*) FROM delivery_attempts
+                   WHERE state IN ('starting','running','unknown')"""
+            ).fetchone()[0] == 1
+            assert db.execute(
+                "SELECT state FROM delivery_attempts WHERE job_key='amended-config-role'"
+            ).fetchone()[0] == "starting"
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio

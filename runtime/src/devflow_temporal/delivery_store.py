@@ -22,7 +22,7 @@ from temporalio.client import Client, WorkflowExecutionStatus
 
 from .candidate import candidate_for
 from .contracts import canonical_json, digest
-from .delivery_config import DeliveryConfig, scope_amended_spec
+from .delivery_config import DeliveryConfig, scope_amended_spec, scope_amendment_config
 from .delivery_continuation import (
     continuation_authority,
     selected_manifest,
@@ -662,6 +662,14 @@ class DeliveryStore:
         run_id = spec["run_id"]
         if recovery.get("kind") != "scope_amendment" or self.effective_spec(run_id) != spec:
             raise ValueError("scope amendment effective authority changed")
+        # External Docker image readback belongs at this cancellable boundary,
+        # not in ordinary projection or outbox dispatch.
+        admitted = scope_amended_spec(
+            self.spec(run_id), Path(recovery["amended_config_path"]),
+            recovery["amended_config_sha256"], recovery["added_paths"],
+        )
+        if admitted != spec:
+            raise ValueError("scope amendment image or policy changed")
         with self._connect() as db:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             amendment = db.execute(
@@ -836,6 +844,7 @@ class DeliveryStore:
             or iteration + supplied["additional_iterations"] > spec["policy"]["max_repairs"] + 2
             or not isinstance(candidate, dict)
             or candidate.get("id") != supplied["expected_candidate_id"]
+            or not isinstance(state.get("candidate"), dict)
             or not isinstance(pr, dict)
             or pr.get("number") != supplied["expected_pr_number"]
             or pr.get("head") != supplied["expected_pr_head"]
@@ -1437,7 +1446,6 @@ class DeliveryStore:
             or json.loads(row["pr_json"] or "null") != pr
             or json.loads(row["checks_json"] or "{}") != {}
             or not attempts
-            or len(attempts) != len(roles)
             or any(item["state"] != "finished" or item["cleanup"] != "confirmed"
                    for item in attempts)
             or any(item["state"] != "complete" or item["observed_json"] is None
@@ -1446,12 +1454,32 @@ class DeliveryStore:
             or any(item["effect_key"].endswith(f":{iteration}") for item in effects)
         ):
             raise ValueError("closed implementation result cannot amend this scope")
-        attempt = next(
-            (item for item in attempts if item["role"] == "implement"
-             and item["iteration"] == iteration), None,
+        # A prelaunch retry leaves a finished generation-zero attempt beside
+        # the generation-one provider result. Bind the closed Temporal tail
+        # to the exact durable attempt rather than selecting by iteration.
+        generation = (
+            1 if prior_recovery and prior_recovery.get("kind") == "repair_prelaunch_retry"
+            else 0
         )
+        attempt_identity = {
+            "run_id": run_id,
+            "role": "implement",
+            "iteration": iteration,
+            "candidate_id": state["candidate"]["id"],
+            "policy_digest": original["policy_digest"],
+        }
+        if generation:
+            attempt_identity["attempt_generation"] = generation
+        expected_job_key = hashlib.sha256(canonical_json(attempt_identity).encode()).hexdigest()
+        attempt = next((item for item in attempts if item["job_key"] == expected_job_key), None)
         if attempt is None or attempt["session_id"] != last["session_id"]:
             raise ValueError("finished implementation session is not durable")
+        if (
+            attempt["role"] != "implement"
+            or attempt["iteration"] != iteration
+            or attempt["candidate_id"] != attempt_identity["candidate_id"]
+        ):
+            raise ValueError("finished implementation attempt identity changed")
         result_path = Path(attempt["result_path"] or "")
         expected_receipt = (
             Path(original["state_dir"]) / "attempts" / attempt["job_key"] / "result.json"
@@ -1930,13 +1958,20 @@ class DeliveryStore:
             or amendment["maximum_iteration"] != recovery["maximum_iteration"]
         ):
             raise ValueError("scope amendment authority is not durable")
-        effective = scope_amended_spec(
+        amended = scope_amendment_config(
             original,
             Path(recovery["amended_config_path"]),
             recovery["amended_config_sha256"],
             recovery["added_paths"],
         )
-        if effective != recovery["effective_spec"]:
+        effective = recovery["effective_spec"]
+        if (
+            not isinstance(effective, dict)
+            or effective.get("config_digest") != digest(amended.raw)
+            or effective.get("config_path") != str(amended.path)
+            or effective.get("policy", {}).get("allowed_paths")
+            != amended.raw["repositories"][original["repository_key"]]["allowed_paths"]
+        ):
             raise ValueError("scope amendment effective authority changed")
         return effective
 

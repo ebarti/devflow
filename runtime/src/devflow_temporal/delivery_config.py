@@ -39,6 +39,10 @@ QA_PORT_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*_PORT$")
 QA_ENV_KEYS = {"JOBCTRL_E2E_ISOLATED", "PLAYWRIGHT_BROWSERS_PATH"}
 
 
+class ContainerReadbackPending(RuntimeError):
+    """Docker image identity could not be read while its daemon is unavailable."""
+
+
 def _boundary_probe_passed(observed: Any) -> bool:
     if not isinstance(observed, dict) or not isinstance(observed.get("child"), dict):
         return False
@@ -168,14 +172,29 @@ def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str,
         or hashlib.sha256(lock.read_bytes()).hexdigest() != container["pnpm_lock_sha256"]
     ):
         raise ValueError("admitted package lock is unavailable or changed")
-    inspected = subprocess.run(
-        [str(docker), "image", "inspect", container["image_id"]],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
+    try:
+        inspected = subprocess.run(
+            [str(docker), "image", "inspect", container["image_id"]],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ContainerReadbackPending("Docker image readback is unavailable") from exc
     if inspected.returncode:
+        try:
+            daemon = subprocess.run(
+                [str(docker), "info", "--format", "{{.ServerVersion}}"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ContainerReadbackPending("Docker daemon readback is unavailable") from exc
+        if daemon.returncode or not daemon.stdout.strip():
+            raise ContainerReadbackPending("Docker daemon readback is unavailable")
         raise ValueError("admitted container image is unavailable")
     try:
         values = json.loads(inspected.stdout)
@@ -672,11 +691,11 @@ class DeliveryConfig:
         }
 
 
-def scope_amended_spec(
+def scope_amendment_config(
     original: dict[str, Any], config_path: Path, config_sha256: str,
     added_paths: list[str],
-) -> dict[str, Any]:
-    """Admit one explicit file-scope delta without changing the submitted run."""
+) -> DeliveryConfig:
+    """Check the sealed local config delta without consulting external services."""
 
     if (
         not isinstance(added_paths, list)
@@ -725,6 +744,16 @@ def scope_amended_spec(
             new_container[field] = old_container[field]
     if new_raw != old_raw:
         raise ValueError("scope amendment changed unrelated execution authority")
+    return amended
+
+
+def scope_amended_spec(
+    original: dict[str, Any], config_path: Path, config_sha256: str,
+    added_paths: list[str],
+) -> dict[str, Any]:
+    """Admit one explicit file-scope delta without changing the submitted run."""
+
+    amended = scope_amendment_config(original, config_path, config_sha256, added_paths)
     submit_keys = {
         "command_id", "run_id", "work_id", "issue_url", "repository_key",
         "goal", "accepted_plan", "base_ref", "branch", "authorized_endpoint",

@@ -41,13 +41,34 @@ class DeliverySupervisor:
     def __init__(self, store: DeliveryStore, *, capacity: int) -> None:
         self.store = store
         self.capacity = capacity
-        with store._connect() as db:
-            occupied = db.execute(
-                """SELECT COUNT(*) FROM delivery_attempts
-                   WHERE state IN ('starting','running','unknown')"""
-            ).fetchone()[0]
-        self.semaphore = asyncio.Semaphore(max(0, capacity - occupied))
         self.job_locks: dict[str, asyncio.Lock] = {}
+
+    async def _acquire_capacity(self, job_key: str) -> None:
+        """Atomically claim one shared DB slot across config overlays and workers."""
+
+        while True:
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT state FROM delivery_attempts WHERE job_key=?", (job_key,)
+                ).fetchone()
+                if row is None or row["state"] != "queued":
+                    raise ContainerUnknown("role attempt changed while waiting for capacity")
+                occupied = db.execute(
+                    """SELECT COUNT(*) FROM delivery_attempts
+                       WHERE state IN ('starting','running','unknown')"""
+                ).fetchone()[0]
+                if occupied < self.capacity:
+                    updated = db.execute(
+                        """UPDATE delivery_attempts SET state='starting',started_at=?
+                           WHERE job_key=? AND state='queued'""",
+                        (_now(), job_key),
+                    ).rowcount
+                    if updated != 1:
+                        raise ContainerUnknown("role capacity claim changed before launch")
+                    return
+            # Ambiguous attempts retain their slots until reconciled.
+            await asyncio.sleep(1)
 
     def _claim(self, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         spec = request["spec"]
@@ -139,142 +160,123 @@ class DeliverySupervisor:
         start_path = folder / "start.json"
         request_path = folder / "request.json"
         request = {**request, "result_path": str(result_path), "start_path": str(start_path)}
-        async with self.semaphore:
-            while True:
-                with self.store._connect() as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    occupied = db.execute(
-                        """SELECT COUNT(*) FROM delivery_attempts
-                           WHERE state IN ('starting','running','unknown')"""
-                    ).fetchone()[0]
-                    if occupied < self.capacity:
-                        updated = db.execute(
-                            """UPDATE delivery_attempts SET state='starting',started_at=?
-                               WHERE job_key=? AND state='queued'""",
-                            (_now(), job_key),
-                        ).rowcount
-                        if updated != 1:
-                            raise RuntimeError("role attempt changed while waiting for capacity")
-                        break
-                # An ambiguous attempt retains its slot. An operator must
-                # resolve it before queued work can acquire authority.
-                await asyncio.sleep(5)
-            try:
-                _private_json(request_path, request)
-                if spec.get("provider") == "codex":
-                    _, role_env = prepare_native_role(request, folder)
-                    child_argv = [
-                        sys.executable,
-                        "-I",
-                        "-m",
-                        "devflow_temporal.role_runner",
-                        str(request_path),
-                    ]
-                elif Path("/usr/bin/sandbox-exec").is_file():
-                    profile, role_env = prepare_sandbox(request, folder)
-                    child_argv = [
-                        "/usr/bin/sandbox-exec",
-                        "-f",
-                        str(profile),
-                        sys.executable,
-                        "-I",
-                        "-m",
-                        "devflow_temporal.role_runner",
-                        str(request_path),
-                    ]
-                elif spec.get("provider") == "fake":
-                    # The fake role runs only fixed fixture code and never a
-                    # candidate-controlled command. Keep its protocol tests
-                    # executable on Linux CI, where Seatbelt is unavailable.
-                    role_env = _native_env(folder, folder / "unused-codex", folder)
-                    child_argv = [
-                        sys.executable,
-                        "-I",
-                        "-m",
-                        "devflow_temporal.role_runner",
-                        str(request_path),
-                    ]
-                else:
-                    raise ValueError("real role has no supported OS sandbox")
-                log_descriptor = os.open(
-                    folder / "process.log", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-                )
-            except Exception as exc:
-                return self._mark_prelaunch_blocked(job_key, type(exc).__name__)
-            log = os.fdopen(log_descriptor, "wb")
-            try:
-                child = await asyncio.create_subprocess_exec(
-                    *child_argv,
-                    cwd=request["workspace"],
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=log,
-                    stderr=log,
-                    env=role_env,
-                    start_new_session=True,
-                )
-                for _ in range(100):
-                    if start_path.is_file() or child.returncode is not None:
-                        break
-                    await asyncio.sleep(0.05)
-                if not start_path.is_file():
-                    await child.wait()
-                    return self._mark_unknown(
-                        job_key, "role child did not report a startup identity"
-                    )
-                identity = _process_identity(child.pid)
-                with self.store._connect() as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    db.execute(
-                        """UPDATE delivery_attempts SET state='running',pid=?,process_identity=?
-                           WHERE job_key=? AND state='starting'""",
-                        (child.pid, identity, job_key),
-                    )
-                assert child.stdin is not None
-                child.stdin.write(b"GO\n")
-                await child.stdin.drain()
-                child.stdin.close()
+        await self._acquire_capacity(job_key)
+        try:
+            _private_json(request_path, request)
+            if spec.get("provider") == "codex":
+                _, role_env = prepare_native_role(request, folder)
+                child_argv = [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "devflow_temporal.role_runner",
+                    str(request_path),
+                ]
+            elif Path("/usr/bin/sandbox-exec").is_file():
+                profile, role_env = prepare_sandbox(request, folder)
+                child_argv = [
+                    "/usr/bin/sandbox-exec",
+                    "-f",
+                    str(profile),
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "devflow_temporal.role_runner",
+                    str(request_path),
+                ]
+            elif spec.get("provider") == "fake":
+                # The fake role runs only fixed fixture code and never a
+                # candidate-controlled command. Keep its protocol tests
+                # executable on Linux CI, where Seatbelt is unavailable.
+                role_env = _native_env(folder, folder / "unused-codex", folder)
+                child_argv = [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "devflow_temporal.role_runner",
+                    str(request_path),
+                ]
+            else:
+                raise ValueError("real role has no supported OS sandbox")
+            log_descriptor = os.open(
+                folder / "process.log", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+        except Exception as exc:
+            return self._mark_prelaunch_blocked(job_key, type(exc).__name__)
+        log = os.fdopen(log_descriptor, "wb")
+        try:
+            child = await asyncio.create_subprocess_exec(
+                *child_argv,
+                cwd=request["workspace"],
+                stdin=asyncio.subprocess.PIPE,
+                stdout=log,
+                stderr=log,
+                env=role_env,
+                start_new_session=True,
+            )
+            for _ in range(100):
+                if start_path.is_file() or child.returncode is not None:
+                    break
+                await asyncio.sleep(0.05)
+            if not start_path.is_file():
                 await child.wait()
-                if not result_path.is_file():
-                    return self._mark_unknown(job_key, "role child exited without a final receipt")
-                result = json.loads(result_path.read_text(encoding="utf-8"))
-                with self.store._connect() as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    db.execute(
-                        """UPDATE delivery_attempts SET state='finished',result_json=?,
-                           session_id=?,finished_at=?,cleanup='confirmed' WHERE job_key=?""",
-                        (canonical_json(result), result.get("session_id"), _now(), job_key),
-                    )
-                return result
-            except asyncio.CancelledError:
-                if "child" in locals() and child.returncode is None:
-                    try:
-                        os.killpg(child.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        await asyncio.wait_for(child.wait(), timeout=5)
-                    except TimeoutError:
-                        os.killpg(child.pid, signal.SIGKILL)
-                        await child.wait()
-                self._mark_unknown(job_key, "role cancelled during provider work")
-                raise
-            except Exception as exc:
-                if "child" not in locals():
-                    return self._mark_prelaunch_blocked(job_key, type(exc).__name__)
-                if child.returncode is None:
-                    try:
-                        os.killpg(child.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        await asyncio.wait_for(child.wait(), timeout=5)
-                    except TimeoutError:
-                        os.killpg(child.pid, signal.SIGKILL)
-                        await child.wait()
-                self._mark_unknown(job_key, "role child failed without a final receipt")
-                raise
-            finally:
-                log.close()
+                return self._mark_unknown(
+                    job_key, "role child did not report a startup identity"
+                )
+            identity = _process_identity(child.pid)
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    """UPDATE delivery_attempts SET state='running',pid=?,process_identity=?
+                       WHERE job_key=? AND state='starting'""",
+                    (child.pid, identity, job_key),
+                )
+            assert child.stdin is not None
+            child.stdin.write(b"GO\n")
+            await child.stdin.drain()
+            child.stdin.close()
+            await child.wait()
+            if not result_path.is_file():
+                return self._mark_unknown(job_key, "role child exited without a final receipt")
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    """UPDATE delivery_attempts SET state='finished',result_json=?,
+                       session_id=?,finished_at=?,cleanup='confirmed' WHERE job_key=?""",
+                    (canonical_json(result), result.get("session_id"), _now(), job_key),
+                )
+            return result
+        except asyncio.CancelledError:
+            if "child" in locals() and child.returncode is None:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(child.wait(), timeout=5)
+                except TimeoutError:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    await child.wait()
+            self._mark_unknown(job_key, "role cancelled during provider work")
+            raise
+        except Exception as exc:
+            if "child" not in locals():
+                return self._mark_prelaunch_blocked(job_key, type(exc).__name__)
+            if child.returncode is None:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(child.wait(), timeout=5)
+                except TimeoutError:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    await child.wait()
+            self._mark_unknown(job_key, "role child failed without a final receipt")
+            raise
+        finally:
+            log.close()
 
     async def _run_contained(self, request: dict[str, Any], job_key: str) -> dict[str, Any]:
         """Run one real role in a durable private PID namespace."""
@@ -291,17 +293,7 @@ class DeliverySupervisor:
             return json.loads(row["result_json"])
         newly_occupied = row["state"] == "queued"
         if newly_occupied:
-            await self.semaphore.acquire()
-            with self.store._connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                updated = db.execute(
-                    """UPDATE delivery_attempts SET state='starting',started_at=?
-                       WHERE job_key=? AND state='queued'""",
-                    (_now(), job_key),
-                ).rowcount
-            if updated != 1:
-                self.semaphore.release()
-                raise ContainerUnknown("role capacity claim changed before launch")
+            await self._acquire_capacity(job_key)
         cleanup_confirmed = False
         try:
             _, role_env = prepare_native_role(request, folder, containerized=True)
@@ -447,9 +439,7 @@ class DeliverySupervisor:
                 )
             cleanup_confirmed = True
             return self._mark_prelaunch_blocked(job_key, type(exc).__name__)
-        finally:
-            if cleanup_confirmed:
-                self.semaphore.release()
+
 
     def _mark_prelaunch_blocked(self, job_key: str, reason: str) -> dict[str, Any]:
         result = {
@@ -498,13 +488,14 @@ class DeliverySupervisor:
         return result
 
 
-_SUPERVISORS: dict[str, DeliverySupervisor] = {}
+_SUPERVISORS: dict[tuple[str, str], DeliverySupervisor] = {}
 
 
 def get_supervisor(store: DeliveryStore) -> DeliverySupervisor:
-    key = str(store.config.path)
+    key = (str(store.config.tracking_db.resolve()), str(store.config.state_root.resolve()))
+    capacity = int(store.config.raw.get("capacity", 2))
     if key not in _SUPERVISORS:
-        _SUPERVISORS[key] = DeliverySupervisor(
-            store, capacity=int(store.config.raw.get("capacity", 2))
-        )
+        _SUPERVISORS[key] = DeliverySupervisor(store, capacity=capacity)
+    elif _SUPERVISORS[key].capacity != capacity:
+        raise ValueError("shared delivery capacity changed across service configurations")
     return _SUPERVISORS[key]
