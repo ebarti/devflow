@@ -2390,6 +2390,56 @@ def test_phase_gates_do_not_reuse_previous_repair_iteration(service):
     assert all(terminal[name] == "pending" for name in ("publish", "local_checks"))
 
 
+def test_tracker_gate_waits_for_final_delivery_after_initial_consistent_readback(service):
+    store, request = service
+    store.submit(request)
+
+    def tracker_gate() -> str:
+        return next(
+            gate["state"]
+            for gate in store.detail("run-1")["phase_gates"]
+            if gate["id"] == "tracker"
+        )
+
+    store.project(
+        "run-1",
+        phase="implement",
+        execution_state="running",
+        event_type="tracker_start",
+        message="Initial issue and claim readback confirmed",
+        tracker={"state": "consistent", "desired": "in-progress; claim retained"},
+        iteration=0,
+        key="tracker-start:0",
+    )
+    assert tracker_gate() == "pending"
+
+    for state, expected in (("unknown", "unknown"), ("conflict", "failed")):
+        store.project(
+            "run-1",
+            phase="tracker",
+            execution_state="running",
+            event_type="tracker_started",
+            message=f"Tracker readback {state}",
+            tracker={"state": state},
+            iteration=0,
+            key=f"tracker-{state}:0",
+        )
+        assert tracker_gate() == expected
+
+    store.project(
+        "run-1",
+        phase="delivered",
+        execution_state="terminal",
+        event_type="delivered",
+        message="Final tracker reconciliation confirmed",
+        tracker={"state": "consistent", "desired": "in-review; claim released"},
+        iteration=0,
+        outcome="delivered",
+        key="delivered:0",
+    )
+    assert tracker_gate() == "completed"
+
+
 def test_browser_gate_projects_current_candidate_failure_and_resets_on_repair(service):
     original, request = service
     config = json.loads(original.config.path.read_text())

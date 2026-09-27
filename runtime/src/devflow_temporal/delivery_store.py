@@ -3313,6 +3313,17 @@ class DeliveryStore:
 
         def gate_state(name: str, completion: str) -> str:
             relevant_events = event_types if name == "prepare" else current_event_types
+            if name == "tracker":
+                tracker_state = observed_gate_states[name]
+                if tracker_state in {"failed", "blocked", "conflict"}:
+                    return "failed"
+                if tracker_state == "unknown":
+                    return "unknown"
+                return (
+                    "completed"
+                    if row["outcome"] == "delivered" and tracker_state == "consistent"
+                    else "pending"
+                )
             if completion in relevant_events or observed_gate_states.get(name) in {
                 "passed",
                 "consistent",
