@@ -361,6 +361,10 @@ class DeliveryWorkflow:
     ) -> dict[str, Any]:
         previous = recovery["state"]
         prelaunch_retry = recovery.get("kind") == "repair_prelaunch_retry"
+        numbered = (
+            recovery.get("kind") == "repair_continuation"
+            and recovery.get("grant_number") == 2
+        )
         start = previous["iteration"] if prelaunch_retry else previous["iteration"] + 1
         limit = recovery["maximum_iteration"]
         roles = previous.get("roles", [])
@@ -373,6 +377,13 @@ class DeliveryWorkflow:
             None,
         )
         original = recovery.get("original_recovery") if prelaunch_retry else None
+        prior = recovery.get("prior_recovery") if numbered else None
+        scope = prior.get("scope_recovery") if isinstance(prior, dict) else None
+        authorized_limit = (
+            scope.get("maximum_iteration", -3) + 2
+            if isinstance(scope, dict) and numbered
+            else spec["policy"]["max_repairs"] + 2
+        )
         if (
             previous.get("run_id") != spec["run_id"]
             or previous.get("phase") != "blocked"
@@ -380,11 +391,23 @@ class DeliveryWorkflow:
             or previous.get("cleanup") != "none"
             or recovery.get("candidate") != previous.get("candidate")
             or recovery.get("session_id") != previous_implementer
-            or limit > spec["policy"]["max_repairs"] + 2
+            or limit > authorized_limit
             or start > limit
             or not recovery.get("findings")
         ):
             raise ValueError("repair continuation changed the bounded closed checkpoint")
+        if numbered and (
+            not isinstance(prior, dict)
+            or prior.get("kind") != "precheck_prelaunch_recovery"
+            or not isinstance(scope, dict)
+            or scope.get("kind") != "scope_amendment"
+            or recovery.get("effective_spec") != spec
+            or recovery.get("additional_iterations") != 2
+            or limit != authorized_limit
+            or previous["iteration"] != scope.get("maximum_iteration")
+            or recovery.get("session_id") != prior.get("session_id")
+        ):
+            raise ValueError("numbered repair grant changed the amended authority")
         if prelaunch_retry:
             if (
                 not isinstance(original, dict)

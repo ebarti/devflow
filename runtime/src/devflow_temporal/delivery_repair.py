@@ -315,23 +315,31 @@ def confirmed_amendment_lineage_cleanup(
     amended: dict[str, Any],
     old_intents: dict[str, str],
     role_intent: str,
+    *,
+    additional_intents: dict[str, str] | None = None,
 ) -> str:
-    """Prove one explicitly amended run has no unaccounted container process.
-
-    The original inventory belongs only to the original policy. The sole new
-    intent belongs only to the amended role; this is not a general mixed-policy
-    exemption for other runs or effects.
-    """
+    """Prove the exact sealed original and amended container inventories stopped."""
     from .delivery_container import Bind, ContainerUnknown, OwnedContainer
 
+    extra = additional_intents or {}
     if (
         original["run_id"] != amended["run_id"]
         or original["state_dir"] != amended["state_dir"]
         or original["provider"] != amended["provider"]
         or not isinstance(old_intents, dict)
+        or not isinstance(extra, dict)
         or role_intent in old_intents
         or not role_intent.startswith("attempts/")
         or not role_intent.endswith("/container/container-intent.json")
+        or any(
+            not isinstance(path, str)
+            or not isinstance(value, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value)
+            or path in old_intents
+            or path == role_intent
+            or not path.endswith("/container-intent.json")
+            for path, value in extra.items()
+        )
     ):
         raise ValueError("amended container lineage is not bounded")
     if original["provider"] != "codex":
@@ -342,7 +350,7 @@ def confirmed_amendment_lineage_cleanup(
         if path.is_symlink() or not path.is_file() or root not in path.resolve().parents:
             raise ValueError("owned container intent changed")
         observed[str(path.relative_to(root))] = path
-    if set(observed) != set(old_intents) | {role_intent}:
+    if set(observed) != set(old_intents) | {role_intent} | set(extra):
         raise ValueError("amended run has an unrecognized or missing container intent")
     def command(spec: dict[str, Any], *argv: str) -> subprocess.CompletedProcess[bytes]:
         policy = spec["policy"]["container"]
@@ -429,6 +437,8 @@ def confirmed_amendment_lineage_cleanup(
         actual_sha = hashlib.sha256(value).hexdigest()
         if relative in old_intents and actual_sha != old_intents[relative]:
             raise ValueError("original container intent changed after amendment")
+        if relative in extra and actual_sha != extra[relative]:
+            raise ValueError("amended container intent changed after review")
         try:
             intent = json.loads(value)
             labels = intent["labels"]

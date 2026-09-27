@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.service import RPCError
 
 from .candidate import candidate_for
 from .contracts import canonical_json, digest
@@ -187,6 +188,22 @@ class DeliveryStore:
                     predecessor_execution_run_id TEXT NOT NULL,
                     predecessor_result_digest TEXT NOT NULL,
                     granted_iterations INTEGER NOT NULL,
+                    maximum_iteration INTEGER NOT NULL,
+                    granted_at TEXT NOT NULL
+                )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_repair_grant_extensions (
+                    run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+                    grant_number INTEGER NOT NULL CHECK (grant_number = 2),
+                    command_id TEXT NOT NULL UNIQUE,
+                    predecessor_workflow_id TEXT NOT NULL,
+                    predecessor_execution_run_id TEXT NOT NULL,
+                    predecessor_result_digest TEXT NOT NULL,
+                    review_job_key TEXT NOT NULL,
+                    review_receipt_sha256 TEXT NOT NULL,
+                    effective_policy_digest TEXT NOT NULL,
+                    granted_iterations INTEGER NOT NULL CHECK (granted_iterations = 2),
                     maximum_iteration INTEGER NOT NULL,
                     granted_at TEXT NOT NULL
                 )"""
@@ -432,6 +449,10 @@ class DeliveryStore:
                 return pool.submit(
                     lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))
                 ).result(timeout=35)
+        except (RPCError, TimeoutError, ConnectionError, OSError) as exc:
+            from .delivery_repair import RepairReadbackPending
+
+            raise RepairReadbackPending("Temporal closure readback unavailable") from exc
         except Exception as exc:
             raise ValueError("continuation predecessor Temporal closure is unproven") from exc
 
@@ -1136,6 +1157,8 @@ class DeliveryStore:
 
     def continue_repair(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
+        if isinstance(supplied, dict) and supplied.get("grant_number") == 2:
+            return self._continue_amended_repair(run_id, supplied)
         from .delivery_broker import DeliveryBroker
         from .delivery_repair import (
             confirmed_container_cleanup,
@@ -1408,6 +1431,520 @@ class DeliveryStore:
                 (command_id, run_id, command_digest, canonical_json(response)),
             )
         return response
+
+    def _continue_amended_repair(
+        self, run_id: str, supplied: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Record exactly one numbered, two-iteration grant after the amended review."""
+        from .delivery_repair import failed_gate_diagnostics
+
+        required = {
+            "command_id", "grant_number", "expected_revision", "expected_iteration",
+            "expected_candidate_id", "expected_pr_number", "expected_pr_head",
+            "expected_session_id", "expected_policy_digest",
+            "expected_execution_run_id", "expected_review_receipt_sha256",
+            "additional_iterations",
+        }
+        if (
+            set(supplied) != required
+            or not isinstance(supplied["command_id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", supplied["command_id"])
+            or type(supplied["grant_number"]) is not int
+            or supplied["grant_number"] != 2
+            or type(supplied["expected_revision"]) is not int
+            or type(supplied["expected_iteration"]) is not int
+            or type(supplied["expected_pr_number"]) is not int
+            or type(supplied["additional_iterations"]) is not int
+            or supplied["additional_iterations"] != 2
+            or not isinstance(supplied["expected_candidate_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", supplied["expected_candidate_id"])
+            or not isinstance(supplied["expected_pr_head"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", supplied["expected_pr_head"])
+            or not isinstance(supplied["expected_session_id"], str)
+            or not supplied["expected_session_id"]
+            or not isinstance(supplied["expected_policy_digest"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", supplied["expected_policy_digest"])
+            or not isinstance(supplied["expected_execution_run_id"], str)
+            or not supplied["expected_execution_run_id"]
+            or not isinstance(supplied["expected_review_receipt_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", supplied["expected_review_receipt_sha256"])
+        ):
+            raise ValueError("numbered repair grant fields do not match the contract")
+        command_digest = digest({"run_id": run_id, **supplied})
+        with self._connect() as db:
+            prior_command = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (supplied["command_id"],),
+            ).fetchone()
+            if prior_command:
+                if prior_command["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(prior_command["response_json"])
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            attempts_snapshot = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects_snapshot = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+        if row is None:
+            raise ValueError("run ID not found")
+        prior = json.loads(row["recovery_json"] or "null")
+        scope = self._scope_recovery(prior)
+        if (
+            not isinstance(prior, dict)
+            or prior.get("kind") != "precheck_prelaunch_recovery"
+            or not isinstance(scope, dict)
+        ):
+            raise ValueError("numbered grant requires the closed amended precheck recovery")
+        spec = self.effective_spec(run_id)
+        closed = self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+        state = closed["result"]
+        roles = state.get("roles") if isinstance(state, dict) else None
+        review = roles[-1] if isinstance(roles, list) and roles else None
+        candidate = state.get("candidate") if isinstance(state, dict) else None
+        pr = state.get("pull_request") if isinstance(state, dict) else None
+        if (
+            closed["workflow_id"] != row["workflow_id"]
+            or closed["request_digest"] != row["request_digest"]
+            or closed["recovery_digest"] != digest(prior)
+            or closed["execution_run_id"] != supplied["expected_execution_run_id"]
+            or not isinstance(state, dict)
+            or state.get("revision") != supplied["expected_revision"]
+            or state.get("iteration") != supplied["expected_iteration"]
+            or state.get("iteration") != scope.get("maximum_iteration")
+            or not isinstance(candidate, dict)
+            or candidate.get("id") != supplied["expected_candidate_id"]
+            or not isinstance(pr, dict)
+            or pr.get("number") != supplied["expected_pr_number"]
+            or pr.get("head") != supplied["expected_pr_head"]
+            or spec["policy_digest"] != supplied["expected_policy_digest"]
+            or prior.get("session_id") != supplied["expected_session_id"]
+            or not isinstance(review, dict)
+            or review.get("role") != "review"
+            or review.get("iteration") != state["iteration"]
+        ):
+            raise ValueError("numbered grant does not match the closed reviewed candidate")
+        review_job_key = digest({
+            "run_id": run_id, "role": "review", "iteration": state["iteration"],
+            "candidate_id": candidate["id"], "policy_digest": spec["policy_digest"],
+        })
+        with self._connect() as db:
+            attempt = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
+                (run_id, review_job_key),
+            ).fetchone()
+        if attempt is None:
+            raise ValueError("finished independent review attempt is missing")
+        receipt = Path(spec["state_dir"]) / "attempts" / review_job_key / "result.json"
+        if (
+            attempt["result_path"] != str(receipt)
+            or receipt.is_symlink()
+            or not receipt.is_file()
+            or hashlib.sha256(receipt.read_bytes()).hexdigest()
+            != supplied["expected_review_receipt_sha256"]
+        ):
+            raise ValueError("finished independent review receipt changed")
+        saved_result = json.loads(attempt["result_json"] or "null")
+        if not isinstance(saved_result, dict):
+            raise ValueError("finished independent review result is missing")
+        findings = failed_gate_diagnostics(state, spec)
+        recovery = {
+            "kind": "repair_continuation",
+            "grant_number": 2,
+            "prior_recovery": prior,
+            "effective_spec": spec,
+            "predecessor_workflow_id": closed["workflow_id"],
+            "predecessor_execution_run_id": closed["execution_run_id"],
+            "predecessor_closed_at": closed["closed_at"],
+            "predecessor_result_digest": digest(state),
+            "state": state,
+            "candidate": candidate,
+            "pull_request": pr,
+            "session_id": prior["session_id"],
+            "findings": findings,
+            "review_summary": review["summary"],
+            "review_job_key": review_job_key,
+            "review_receipt_sha256": supplied["expected_review_receipt_sha256"],
+            "review_container_id": saved_result.get("container_id"),
+            "review_container_log_sha256": saved_result.get("container_log_sha256"),
+            "additional_iterations": 2,
+            "maximum_iteration": state["iteration"] + 2,
+        }
+        recovery["additional_intents"] = self._amended_repair_intents(spec, recovery)
+        self._amended_repair_readback(spec, recovery, queued=False)
+        workflow_id = f"delivery-{run_id}-repair-continuation-2"
+        response = {
+            "run_id": run_id,
+            "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
+            "phase": "repair_continuation_queued",
+            "workflow_id": workflow_id,
+            "grant_number": 2,
+            "authorized_through_iteration": recovery["maximum_iteration"],
+            "existing": False,
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            replay = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (supplied["command_id"],),
+            ).fetchone()
+            if replay:
+                if replay["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(replay["response_json"])
+            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            attempts_now = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects_now = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+            extension = db.execute(
+                "SELECT 1 FROM delivery_repair_grant_extensions WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if (
+                current is None
+                or tuple(current) != tuple(row)
+                or claim is None
+                or claim["owner"] != f"external:devflow:{run_id}"
+                or extension is not None
+                or [tuple(item) for item in attempts_now]
+                != [tuple(item) for item in attempts_snapshot]
+                or [tuple(item) for item in effects_now]
+                != [tuple(item) for item in effects_snapshot]
+            ):
+                raise ValueError("numbered grant lost its frozen run or ownership")
+            revision = current["revision"] + 1
+            db.execute(
+                "INSERT INTO delivery_repair_grant_extensions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    run_id, 2, supplied["command_id"], closed["workflow_id"],
+                    closed["execution_run_id"], digest(state), review_job_key,
+                    recovery["review_receipt_sha256"], spec["policy_digest"], 2,
+                    recovery["maximum_iteration"], _now(),
+                ),
+            )
+            db.execute(
+                """UPDATE delivery_runs SET phase='repair_continuation_queued',
+                   execution_state='queued',outcome=NULL,error=NULL,revision=?,
+                   workflow_id=?,recovery_json=?,updated_at=? WHERE run_id=?""",
+                (revision, workflow_id, canonical_json(recovery), _now(), run_id),
+            )
+            db.execute(
+                """UPDATE delivery_outbox SET state='pending',last_error=NULL,updated_at=?
+                   WHERE run_id=?""",
+                (_now(), run_id),
+            )
+            self._event(
+                db, run_id, revision, "repair_continuation_queued",
+                "Explicit numbered repair grant queued after amended independent review",
+                {
+                    "grant_number": 2,
+                    "iteration": state["iteration"],
+                    "authorized_through_iteration": recovery["maximum_iteration"],
+                    "candidate_id": candidate["id"],
+                    "pr_number": pr["number"],
+                    "predecessor_execution_run_id": closed["execution_run_id"],
+                    "diagnostics_digest": digest(findings),
+                },
+            )
+            db.execute(
+                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                (supplied["command_id"], run_id, command_digest, canonical_json(response)),
+            )
+        return response
+
+    def _amended_repair_readback(
+        self, spec: dict[str, Any], recovery: dict[str, Any], *, queued: bool
+    ) -> None:
+        """Recheck the closed review, same authority and exact mixed PID inventory."""
+        from .delivery_broker import DeliveryBroker
+        from .delivery_repair import (
+            confirmed_amendment_lineage_cleanup,
+            failed_gate_diagnostics,
+            published_identity,
+        )
+
+        run_id = spec["run_id"]
+        prior = recovery.get("prior_recovery")
+        scope = self._scope_recovery(prior)
+        state = recovery.get("state")
+        original = self.spec(run_id)
+        if (
+            recovery.get("kind") != "repair_continuation"
+            or recovery.get("grant_number") != 2
+            or not isinstance(prior, dict)
+            or prior.get("kind") != "precheck_prelaunch_recovery"
+            or not isinstance(scope, dict)
+            or not isinstance(state, dict)
+            or self.effective_spec(run_id) != spec
+            or prior.get("effective_spec") != spec
+            or recovery.get("effective_spec") != spec
+            or original["policy_digest"] == spec["policy_digest"]
+            or recovery.get("maximum_iteration") != scope.get("maximum_iteration", -3) + 2
+            or recovery.get("additional_iterations") != 2
+            or recovery.get("session_id") != prior.get("session_id")
+            or recovery.get("candidate") != state.get("candidate")
+            or recovery.get("pull_request") != state.get("pull_request")
+            or state.get("run_id") != run_id
+            or state.get("phase") != "blocked"
+            or state.get("outcome") != "blocked"
+            or state.get("execution_state") != "blocked"
+            or state.get("cleanup") != "none"
+            or state.get("error") != "repair limit exhausted"
+            or state.get("iteration") != scope.get("maximum_iteration")
+            or not isinstance(state.get("candidate"), dict)
+            or state["candidate"].get("policy_digest") != spec["policy_digest"]
+            or state["candidate"].get("head") != state.get("pull_request", {}).get("head")
+            or state.get("checks", {}).get("prepublish", {}).get("state") != "passed"
+            or state["checks"]["prepublish"].get("source_unchanged") is not True
+            or state["checks"]["prepublish"].get("candidate_id")
+            != prior.get("candidate", {}).get("id")
+            or state["checks"].get("review") != {
+                "candidate_id": state["candidate"]["id"],
+                "detail": recovery.get("review_summary"),
+                "state": "failed",
+            }
+            or set(state["checks"]) != {"prepublish", "review"}
+            or not isinstance(state.get("roles"), list)
+            or len(state["roles"]) < 2
+        ):
+            raise ValueError("closed amended review is not eligible for a second grant")
+        implementation, review = state["roles"][-2:]
+        if (
+            implementation.get("role") != "implement"
+            or implementation.get("iteration") != state["iteration"]
+            or implementation.get("status") != "pass"
+            or implementation.get("finish_reason") != "done"
+            or implementation.get("cleanup") != "confirmed"
+            or implementation.get("session_id") != recovery["session_id"]
+            or implementation.get("candidate") != prior.get("candidate")
+            or review.get("role") != "review"
+            or review.get("iteration") != state["iteration"]
+            or review.get("status") != "findings"
+            or review.get("finish_reason") != "done"
+            or review.get("cleanup") != "confirmed"
+            or review.get("candidate") != state["candidate"]
+            or review.get("summary") != recovery["review_summary"]
+            or review.get("session_id") == recovery["session_id"]
+            or review.get("findings") != recovery.get("findings")
+            or failed_gate_diagnostics(state, spec) != recovery.get("findings")
+        ):
+            raise ValueError("second grant does not bind the failed independent review")
+        closed = self._completed_temporal_result(
+            run_id, workflow_id=recovery["predecessor_workflow_id"]
+        )
+        if (
+            closed["workflow_id"] != recovery["predecessor_workflow_id"]
+            or closed["execution_run_id"] != recovery["predecessor_execution_run_id"]
+            or closed["request_digest"] != original["request_digest"]
+            or closed["recovery_digest"] != digest(prior)
+            or digest(closed["result"]) != recovery["predecessor_result_digest"]
+            or closed["result"] != state
+        ):
+            raise ValueError("second grant predecessor is not a closed Temporal review")
+        expected_job_key = digest({
+            "run_id": run_id, "role": "review", "iteration": state["iteration"],
+            "candidate_id": state["candidate"]["id"],
+            "policy_digest": spec["policy_digest"],
+        })
+        root = Path(spec["state_dir"])
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            grant = db.execute(
+                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+            amendment = db.execute(
+                "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
+            ).fetchone()
+            extension = db.execute(
+                "SELECT * FROM delivery_repair_grant_extensions WHERE run_id=?", (run_id,)
+            ).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            attempts = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+        review_attempts = [
+            item for item in attempts
+            if item["role"] == "review" and item["iteration"] == state["iteration"]
+        ]
+        if (
+            row is None
+            or grant is None
+            or amendment is None
+            or row["request_json"] != canonical_json(original)
+            or row["recovery_json"] != canonical_json(recovery if queued else prior)
+            or row["workflow_id"] != (
+                f"delivery-{run_id}-repair-continuation-2" if queued
+                else recovery["predecessor_workflow_id"]
+            )
+            or row["phase"] not in (
+                {"repair_continuation_queued", "repair_preflight", "tracker_start", "repair"}
+                if queued else {"blocked"}
+            )
+            or row["execution_state"] not in (
+                {"queued", "running"} if queued else {"blocked"}
+            )
+            or (not queued and (
+                row["outcome"] != "blocked"
+                or row["cleanup"] != "none"
+                or row["error"] != state["error"]
+                or row["protocol_revision"] != state["revision"]
+            ))
+            or row["iteration"] != state["iteration"]
+            or json.loads(row["candidate_json"] or "null") != state["candidate"]
+            or json.loads(row["pr_json"] or "null") != state["pull_request"]
+            or json.loads(row["checks_json"] or "{}") != state["checks"]
+            or grant["maximum_iteration"] + 1 != amendment["maximum_iteration"]
+            or amendment["maximum_iteration"] != state["iteration"]
+            or amendment["original_policy_digest"] != original["policy_digest"]
+            or amendment["effective_policy_digest"] != spec["policy_digest"]
+            or json.loads(amendment["added_paths_json"]) != scope["added_paths"]
+            or (queued and (
+                extension is None
+                or extension["grant_number"] != 2
+                or extension["predecessor_workflow_id"]
+                != recovery["predecessor_workflow_id"]
+                or extension["predecessor_execution_run_id"]
+                != recovery["predecessor_execution_run_id"]
+                or extension["predecessor_result_digest"]
+                != recovery["predecessor_result_digest"]
+                or extension["review_job_key"] != recovery["review_job_key"]
+                or extension["review_receipt_sha256"]
+                != recovery["review_receipt_sha256"]
+                or extension["effective_policy_digest"] != spec["policy_digest"]
+                or extension["granted_iterations"] != 2
+                or extension["maximum_iteration"] != recovery["maximum_iteration"]
+            ))
+            or (not queued and extension is not None)
+            or claim is None
+            or claim["owner"] != f"external:devflow:{run_id}"
+            or any(item["state"] != "finished" or item["cleanup"] != "confirmed"
+                   for item in attempts)
+            or any(item["state"] != "complete" or item["observed_json"] is None
+                   for item in effects)
+            or len(review_attempts) != 1
+            or recovery["review_job_key"] != expected_job_key
+            or review_attempts[0]["job_key"] != expected_job_key
+        ):
+            raise ValueError("second grant lost its frozen run, claim or authority")
+        attempt = review_attempts[0]
+        receipt = root / "attempts" / expected_job_key / "result.json"
+        if (
+            attempt["candidate_id"] != state["candidate"]["id"]
+            or attempt["session_id"] != review["session_id"]
+            or attempt["result_path"] != str(receipt)
+            or receipt.is_symlink()
+            or not receipt.is_file()
+            or receipt.stat().st_uid != os.getuid()
+            or stat.S_IMODE(receipt.stat().st_mode) != 0o600
+            or hashlib.sha256(receipt.read_bytes()).hexdigest()
+            != recovery["review_receipt_sha256"]
+        ):
+            raise ValueError("second grant review receipt changed")
+        raw = json.loads(receipt.read_text(encoding="utf-8"))
+        saved = json.loads(attempt["result_json"] or "null")
+        if (
+            not isinstance(saved, dict)
+            or raw != {key: value for key, value in saved.items()
+                       if key not in {"cleanup", "container_id", "container_log_sha256"}}
+            or any(review.get(key) != value for key, value in saved.items())
+            or saved.get("container_id") != recovery["review_container_id"]
+            or saved.get("container_log_sha256")
+            != recovery["review_container_log_sha256"]
+        ):
+            raise ValueError("second grant review result changed")
+        extra = self._amended_repair_intents(spec, recovery)
+        if extra != recovery.get("additional_intents"):
+            raise ValueError("second grant amended execution inventory changed")
+        broker = DeliveryBroker(self, spec)
+        if broker.candidate() != state["candidate"]:
+            raise ValueError("second grant candidate changed after review")
+        published_identity(broker, state["candidate"], state["pull_request"])
+        role_sha = confirmed_amendment_lineage_cleanup(
+            original, spec, scope["old_container_intents"], prior["role_intent"],
+            additional_intents=extra,
+        )
+        if role_sha != prior["role_intent_sha256"]:
+            raise ValueError("second grant changed the completed implementation container")
+
+    @staticmethod
+    def _amended_repair_intents(
+        spec: dict[str, Any], recovery: dict[str, Any]
+    ) -> dict[str, str]:
+        """Bind only the amended preparation, prechecks and failed review."""
+        state = recovery["state"]
+        iteration = state["iteration"]
+        precheck = state["checks"]["prepublish"]
+        results = precheck["results"]
+        configured = spec["policy"]["prepublish_checks"]
+        if (
+            not isinstance(results, list)
+            or [item.get("id") for item in results]
+            != [item.get("id") for item in configured]
+            or len({item.get("id") for item in results}) != len(results)
+        ):
+            raise ValueError("amended precheck results differ from the frozen gate list")
+        root = Path(spec["state_dir"])
+        expected = {
+            f"dependency-preparation-{spec['policy_digest']}/container-intent.json",
+            f"attempts/{recovery['review_job_key']}/container/container-intent.json",
+        }
+        for result in results:
+            key = f"prechecks/{iteration}/{result['id']}/container/container-intent.json"
+            expected.add(key)
+            log = root / f"prechecks/{iteration}/{result['id']}/container/container.log"
+            identity = log.parent / "container-id.json"
+            if (
+                result.get("cleanup") != "confirmed"
+                or result.get("passed") is not True
+                or result.get("log") != str(log)
+                or log.is_symlink()
+                or not log.is_file()
+                or log.stat().st_uid != os.getuid()
+                or stat.S_IMODE(log.stat().st_mode) != 0o600
+                or hashlib.sha256(log.read_bytes()).hexdigest() != result.get("log_sha256")
+                or identity.is_symlink()
+                or not identity.is_file()
+                or json.loads(identity.read_text(encoding="utf-8")).get("container_id")
+                != result.get("container_id")
+            ):
+                raise ValueError("amended precheck receipt or log changed")
+        review_log = root / "attempts" / recovery["review_job_key"] / "container" / "container.log"
+        review_identity = review_log.parent / "container-id.json"
+        if (
+            review_log.is_symlink()
+            or not review_log.is_file()
+            or review_log.stat().st_uid != os.getuid()
+            or stat.S_IMODE(review_log.stat().st_mode) != 0o600
+            or hashlib.sha256(review_log.read_bytes()).hexdigest()
+            != recovery["review_container_log_sha256"]
+            or review_identity.is_symlink()
+            or not review_identity.is_file()
+            or json.loads(review_identity.read_text(encoding="utf-8")).get("container_id")
+            != recovery["review_container_id"]
+        ):
+            raise ValueError("amended review container receipt or log changed")
+        observed: dict[str, str] = {}
+        for relative in expected:
+            path = root / relative
+            try:
+                info = path.lstat()
+            except OSError as exc:
+                raise ValueError("amended container intent is missing") from exc
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise ValueError("amended container intent is not private")
+            observed[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return observed
 
     def retry_prelaunch(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
         """Retry one proved no-process repair launch under its existing grant."""
@@ -2028,6 +2565,9 @@ class DeliveryStore:
 
     def repair_preflight(self, spec: dict[str, Any], recovery: dict[str, Any]) -> None:
         """Recheck the frozen command before a resumed implementer can execute."""
+        if recovery.get("kind") == "repair_continuation" and recovery.get("grant_number") == 2:
+            self._amended_repair_readback(spec, recovery, queued=True)
+            return
         from .delivery_broker import DeliveryBroker
         from .delivery_repair import confirmed_container_cleanup, published_identity
 
@@ -2314,6 +2854,19 @@ class DeliveryStore:
                 raise ValueError("run ID not found")
             return json.loads(row[0])
 
+    @staticmethod
+    def _scope_recovery(recovery: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Resolve the sole amendment through explicitly numbered continuations."""
+        if not isinstance(recovery, dict):
+            return None
+        if recovery.get("kind") == "repair_continuation" and recovery.get("grant_number") == 2:
+            recovery = recovery.get("prior_recovery")
+        if isinstance(recovery, dict) and recovery.get("kind") == "precheck_prelaunch_recovery":
+            recovery = recovery.get("scope_recovery")
+        if isinstance(recovery, dict) and recovery.get("kind") == "scope_amendment":
+            return recovery
+        return None
+
     def effective_spec(self, run_id: str) -> dict[str, Any]:
         """Read an explicit amended authority while preserving request_json."""
 
@@ -2325,15 +2878,9 @@ class DeliveryStore:
                 raise ValueError("run ID not found")
             original = json.loads(row["request_json"])
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-            if not recovery or recovery.get("kind") not in {
-                "scope_amendment", "precheck_prelaunch_recovery"
-            }:
+            scope = self._scope_recovery(recovery)
+            if scope is None:
                 return original
-            scope = (
-                recovery["scope_recovery"]
-                if recovery["kind"] == "precheck_prelaunch_recovery"
-                else recovery
-            )
             amendment = db.execute(
                 "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
             ).fetchone()
@@ -2651,11 +3198,7 @@ class DeliveryStore:
         compact = self._compact(row)
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-        scope_recovery = (
-            recovery.get("scope_recovery")
-            if recovery and recovery.get("kind") == "precheck_prelaunch_recovery"
-            else recovery
-        )
+        scope_recovery = self._scope_recovery(recovery)
         scope_amendment = (
             {
                 "added_paths": scope_recovery["added_paths"],

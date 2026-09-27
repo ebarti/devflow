@@ -918,6 +918,418 @@ def test_precheck_recovery_is_one_time_and_rejects_started_check(service, monkey
     assert store.effective_spec("run-1") == spec
 
 
+def _second_repair_grant_fixture(store, request, monkeypatch):
+    store.config.raw["repositories"]["fixture"]["prepublish_checks"] = [
+        {"id": "fixture-precheck", "argv": ["/usr/bin/true"]}
+    ]
+    store.config.path.write_text(json.dumps(store.config.raw))
+    spec, _blocked, precheck_command, _folder = _precheck_collision_fixture(
+        store, request, monkeypatch
+    )
+    store.recover_precheck_prelaunch(request["run_id"], precheck_command)
+    store.mark_start(request["run_id"], accepted=True)
+    with store._connect() as db:
+        prior = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0])
+    broker = DeliveryBroker(store, spec)
+    _git(broker.checkout, "add", "tests/capability-a.test.ts")
+    _git(
+        broker.checkout, "-c", "user.name=Delivery Test",
+        "-c", "user.email=delivery@example.invalid", "commit", "-qm", "amended candidate",
+    )
+    _git(broker.checkout, "push", "origin", f"HEAD:refs/heads/{spec['branch']}")
+    candidate = broker.candidate()
+    pr = {
+        **prior["pull_request"], "head": candidate["head"], "candidate": candidate,
+    }
+    monkeypatch.setattr(
+        DeliveryBroker, "_existing_pr",
+        lambda self: {
+            "number": pr["number"], "url": pr["url"], "state": "OPEN",
+            "headRefOid": pr["head"],
+        },
+    )
+    role = prior["state"]["roles"][-1]
+    assert role["role"] == "implement" and role["iteration"] == 5
+    summary = "Three precise current-candidate findings"
+    findings = [
+        "Unmatched overlong Required content must mark truncation",
+        "Reordered restatement is not independent evidence",
+        "Truncated saved text must not promise a complete retry",
+    ]
+    review = {
+        "role": "review", "iteration": 5, "status": "findings",
+        "finish_reason": "done", "cleanup": "confirmed",
+        "session_id": "independent-review-5", "candidate": candidate,
+        "summary": summary, "findings": findings,
+        "container_id": "review-container-5",
+        "container_log_sha256": hashlib.sha256(b"review log\n").hexdigest(),
+    }
+    raw = {
+        key: value for key, value in review.items()
+        if key not in {
+            "cleanup", "candidate", "role", "iteration", "container_id",
+            "container_log_sha256",
+        }
+    }
+    saved = {
+        **raw, "cleanup": "confirmed", "container_id": "review-container-5",
+        "container_log_sha256": hashlib.sha256(b"review log\n").hexdigest(),
+    }
+    review_job = digest({
+        "run_id": request["run_id"], "role": "review", "iteration": 5,
+        "candidate_id": candidate["id"], "policy_digest": spec["policy_digest"],
+    })
+    root = Path(spec["state_dir"])
+    review_dir = root / "attempts" / review_job
+    review_dir.mkdir(parents=True, mode=0o700)
+    review_receipt = review_dir / "result.json"
+    review_receipt.write_text(json.dumps(raw))
+    review_receipt.chmod(0o600)
+    contained = review_dir / "container"
+    contained.mkdir(mode=0o700)
+    for path, body in (
+        (contained / "container.log", "review log\n"),
+        (contained / "container-id.json", json.dumps({"container_id": "review-container-5"})),
+        (contained / "container-intent.json", "review intent\n"),
+    ):
+        path.write_text(body)
+        path.chmod(0o600)
+    dependency = root / f"dependency-preparation-{spec['policy_digest']}"
+    dependency.mkdir(mode=0o700)
+    (dependency / "container-intent.json").write_text("amended preparation intent\n")
+    (dependency / "container-intent.json").chmod(0o600)
+    precheck_container = root / "prechecks" / "5" / "fixture-precheck" / "container"
+    precheck_container.mkdir(parents=True, mode=0o700)
+    for path, body in (
+        (precheck_container / "container.log", "precheck log\n"),
+        (precheck_container / "container-id.json", json.dumps({
+            "container_id": "precheck-container-5"
+        })),
+        (precheck_container / "container-intent.json", "precheck intent\n"),
+    ):
+        path.write_text(body)
+        path.chmod(0o600)
+    with store._connect() as db:
+        db.execute(
+            """INSERT INTO delivery_attempts
+               (job_key,run_id,role,iteration,candidate_id,state,session_id,
+                result_json,result_path,cleanup)
+               VALUES (?,?,?,?,?,'finished',?,?,?,'confirmed')""",
+            (review_job, request["run_id"], "review", 5, candidate["id"],
+             review["session_id"], json.dumps(saved), str(review_receipt)),
+        )
+    checks = {
+        "prepublish": {
+            "candidate_id": prior["candidate"]["id"], "state": "passed",
+            "source_unchanged": True, "results": [{
+                "id": "fixture-precheck", "passed": True, "cleanup": "confirmed",
+                "container_id": "precheck-container-5",
+                "log": str(precheck_container / "container.log"),
+                "log_sha256": hashlib.sha256(b"precheck log\n").hexdigest(),
+            }],
+        },
+        "review": {"candidate_id": candidate["id"], "detail": summary, "state": "failed"},
+    }
+    state = {
+        **prior["state"], "revision": 38, "iteration": 5, "candidate": candidate,
+        "pull_request": pr, "roles": [*prior["state"]["roles"], review],
+        "checks": checks, "phase": "blocked", "execution_state": "blocked",
+        "outcome": "blocked", "cleanup": "none", "error": "repair limit exhausted",
+    }
+    store.project(
+        request["run_id"], phase="blocked", execution_state="blocked",
+        event_type="blocked", message=state["error"], candidate=candidate,
+        pull_request=pr, checks=checks, iteration=5, protocol_revision=38,
+        outcome="blocked", cleanup="none", error=state["error"],
+    )
+    closed = {
+        "workflow_id": f"delivery-{request['run_id']}-precheck-recovery-1",
+        "execution_run_id": "closed-independent-review-5",
+        "closed_at": "2026-09-27T04:00:00+00:00",
+        "request_digest": store.spec(request["run_id"])["request_digest"],
+        "recovery_digest": digest(prior), "result": state,
+    }
+    monkeypatch.setattr(
+        DeliveryStore, "_completed_temporal_result", lambda self, _id, **_kw: closed
+    )
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda _id, **_kw: closed)
+    monkeypatch.setattr(
+        delivery_repair, "confirmed_amendment_lineage_cleanup",
+        lambda _old, _new, _inventory, _relative, **_kw: prior["role_intent_sha256"],
+    )
+    command = {
+        "command_id": "grant-repair-2", "grant_number": 2,
+        "expected_revision": 38, "expected_iteration": 5,
+        "expected_candidate_id": candidate["id"], "expected_pr_number": pr["number"],
+        "expected_pr_head": pr["head"], "expected_session_id": prior["session_id"],
+        "expected_policy_digest": spec["policy_digest"],
+        "expected_execution_run_id": closed["execution_run_id"],
+        "expected_review_receipt_sha256": hashlib.sha256(review_receipt.read_bytes()).hexdigest(),
+        "additional_iterations": 2,
+    }
+    return spec, state, command, review_receipt
+
+
+def test_second_grant_binds_review_and_preserves_prior_authority(service, monkeypatch):
+    store, request = service
+    spec, state, command, receipt = _second_repair_grant_fixture(
+        store, request, monkeypatch
+    )
+    response = store.continue_repair(request["run_id"], command)
+    assert response["authorized_through_iteration"] == 7
+    assert response["grant_number"] == 2
+    assert store.continue_repair(request["run_id"], command) == response
+    assert store.effective_spec(request["run_id"]) == spec
+    with store._connect() as db:
+        assert db.execute("SELECT maximum_iteration FROM delivery_repair_grants").fetchone()[0] == 4
+        assert db.execute(
+            "SELECT maximum_iteration FROM delivery_scope_amendments"
+        ).fetchone()[0] == 5
+        assert db.execute(
+            "SELECT maximum_iteration FROM delivery_repair_grant_extensions"
+        ).fetchone()[0] == 7
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0])
+    assert recovery["review_receipt_sha256"] == command["expected_review_receipt_sha256"]
+    assert recovery["findings"] == state["roles"][-1]["findings"]
+    store.repair_preflight(spec, recovery)
+    with pytest.raises(ValueError, match="already belongs"):
+        store.continue_repair(request["run_id"], {**command, "expected_pr_number": 8})
+    with pytest.raises(ValueError):
+        store.continue_repair(request["run_id"], {**command, "command_id": "another-grant"})
+    receipt_bytes = receipt.read_bytes()
+    receipt.write_bytes(receipt.read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="review receipt changed"):
+        store.repair_preflight(spec, recovery)
+    receipt.write_bytes(receipt_bytes)
+    precheck_log = (
+        Path(spec["state_dir"]) / "prechecks/5/fixture-precheck/container/container.log"
+    )
+    precheck_log.write_text("changed after grant\n")
+    with pytest.raises(ValueError, match="precheck receipt or log changed"):
+        store.repair_preflight(spec, recovery)
+
+
+@pytest.mark.parametrize(
+    "drift", ["claim", "candidate", "pr", "review_receipt", "effect", "attempt"]
+)
+def test_second_grant_rejects_changed_authority_before_recording(
+    service, monkeypatch, drift
+):
+    store, request = service
+    spec, _state, command, receipt = _second_repair_grant_fixture(
+        store, request, monkeypatch
+    )
+    if drift == "claim":
+        with store._connect() as db:
+            store.state.release_work(db, request["work_id"], "external:devflow:run-1")
+    elif drift == "candidate":
+        (Path(spec["checkout"]) / "tests/capability-a.test.ts").write_text(
+            "changed after review\n"
+        )
+    elif drift == "pr":
+        monkeypatch.setattr(
+            DeliveryBroker, "_existing_pr",
+            lambda self: {
+                "number": 7, "url": "https://github.com/example/fixture/pull/7",
+                "state": "OPEN", "headRefOid": "0" * 40,
+            },
+        )
+    elif drift == "review_receipt":
+        receipt.write_bytes(receipt.read_bytes() + b"changed")
+    elif drift == "effect":
+        with store._connect() as db:
+            db.execute("UPDATE delivery_effects SET state='pending' WHERE run_id='run-1'")
+    else:
+        with store._connect() as db:
+            db.execute(
+                "UPDATE delivery_attempts SET cleanup='unknown' "
+                "WHERE run_id='run-1' AND role='review' AND iteration=5"
+            )
+    with pytest.raises(ValueError):
+        store.continue_repair(request["run_id"], command)
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_repair_grant_extensions"
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_commands WHERE command_id=?",
+            (command["command_id"],),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_public_second_grant_resumes_original_session_and_all_gates(
+    service, monkeypatch
+):
+    store, request = service
+    async with await WorkflowEnvironment.start_local() as environment:
+        store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
+        store.config.raw["queue"] = "second-grant-public-test"
+        store.config.path.write_text(json.dumps(store.config.raw))
+        spec, state, command, _receipt = _second_repair_grant_fixture(
+            store, request, monkeypatch
+        )
+        app = create_app(store.config.path)
+        origin = app.state.delivery.config.dashboard_url
+        calls = {"roles": [], "precheck": 0, "publish": 0, "checks": 0, "ci": 0}
+
+        @activity.defn(name="delivery_role")
+        async def role_stub(payload):
+            calls["roles"].append({
+                "role": payload["role"], "iteration": payload["iteration"],
+                "resume": payload.get("resume_session"),
+                "findings": payload.get("findings"),
+            })
+            return {
+                "role": payload["role"], "iteration": payload["iteration"],
+                "status": "pass", "finish_reason": "done", "cleanup": "confirmed",
+                "candidate": payload["candidate"],
+                "session_id": (
+                    "original-session" if payload["role"] == "implement"
+                    else "independent-" + payload["role"]
+                ),
+            }
+
+        @activity.defn(name="delivery_precheck")
+        async def precheck_stub(payload):
+            calls["precheck"] += 1
+            return {
+                "state": "passed", "candidate_id": payload["candidate"]["id"],
+                "source_unchanged": True, "results": [],
+            }
+
+        @activity.defn(name="delivery_publish")
+        async def publish_stub(payload):
+            calls["publish"] += 1
+            return {**state["pull_request"], "candidate": payload["candidate"]}
+
+        @activity.defn(name="delivery_checks")
+        async def checks_stub(payload):
+            calls["checks"] += 1
+            return {"state": "passed", "candidate_id": payload["candidate"]["id"]}
+
+        @activity.defn(name="delivery_ci")
+        async def ci_stub(payload):
+            calls["ci"] += 1
+            return {"state": "passed", "head": payload["pull_request"]["head"]}
+
+        @activity.defn(name="delivery_tracker_start")
+        async def tracker_start_stub(_payload):
+            return {"state": "consistent"}
+
+        @activity.defn(name="delivery_tracker")
+        async def tracker_stub(_payload):
+            return {"state": "consistent"}
+
+        async with Worker(
+            environment.client, task_queue="second-grant-public-test",
+            workflows=[DeliveryWorkflow],
+            activities=[
+                delivery_project, delivery_repair_preflight, tracker_start_stub,
+                role_stub, precheck_stub, publish_stub, checks_stub, ci_stub,
+                tracker_stub,
+            ],
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as browser:
+                login = await browser.post(
+                    "/api/session", json={"token": app.state.delivery.auth.secret},
+                    headers={"Origin": origin},
+                )
+                headers = {
+                    "Origin": origin, "X-Devflow-CSRF": login.json()["csrf_token"],
+                }
+                posted = await browser.post(
+                    "/api/runs/run-1/continue-repair", json=command,
+                    headers=headers,
+                )
+                assert posted.status_code == 200, posted.text
+                assert posted.json()["grant_number"] == 2
+                repeated = await browser.post(
+                    "/api/runs/run-1/continue-repair", json=command,
+                    headers=headers,
+                )
+                assert repeated.json() == posted.json()
+            await app.state.delivery.dispatch_once()
+            result = await asyncio.wait_for(
+                environment.client.get_workflow_handle(posted.json()["workflow_id"]).result(),
+                timeout=30,
+            )
+    assert result["outcome"] == "delivered"
+    assert result["iteration"] == state["iteration"] + 1
+    assert result["roles"][:len(state["roles"])] == state["roles"]
+    assert calls["roles"][0] == {
+        "role": "implement", "iteration": 6, "resume": "original-session",
+        "findings": state["roles"][-1]["findings"],
+    }
+    assert [call["role"] for call in calls["roles"]] == ["implement", "review", "verify"]
+    assert calls["precheck"] == calls["publish"] == calls["checks"] == calls["ci"] == 1
+    assert store.effective_spec(request["run_id"]) == spec
+
+
+@pytest.mark.asyncio
+async def test_public_second_grant_pending_readback_remains_cancellable(
+    service, monkeypatch
+):
+    store, request = service
+    async with await WorkflowEnvironment.start_local() as environment:
+        store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
+        store.config.raw["queue"] = "second-grant-cancel-test"
+        store.config.path.write_text(json.dumps(store.config.raw))
+        _spec, state, command, _receipt = _second_repair_grant_fixture(
+            store, request, monkeypatch
+        )
+        app = create_app(store.config.path)
+        origin = app.state.delivery.config.dashboard_url
+        entered = asyncio.Event()
+
+        @activity.defn(name="delivery_repair_preflight")
+        async def unavailable(_payload):
+            entered.set()
+            return {"state": "pending", "reason": "Docker daemon readback unavailable"}
+
+        async with Worker(
+            environment.client, task_queue="second-grant-cancel-test",
+            workflows=[DeliveryWorkflow], activities=[delivery_project, unavailable],
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as browser:
+                login = await browser.post(
+                    "/api/session", json={"token": app.state.delivery.auth.secret},
+                    headers={"Origin": origin},
+                )
+                headers = {
+                    "Origin": origin, "X-Devflow-CSRF": login.json()["csrf_token"],
+                }
+                posted = await browser.post(
+                    "/api/runs/run-1/continue-repair", json=command, headers=headers,
+                )
+                assert posted.status_code == 200, posted.text
+                await app.state.delivery.dispatch_once()
+                await asyncio.wait_for(entered.wait(), timeout=10)
+                handle = environment.client.get_workflow_handle(posted.json()["workflow_id"])
+                active = await handle.query("status")
+                cancelled = await browser.post(
+                    "/api/runs/run-1/cancel",
+                    json={
+                        "command_id": "cancel-second-grant",
+                        "expected_revision": active["revision"],
+                        "reason": "Stop while authority readback is unavailable",
+                    },
+                    headers=headers,
+                )
+                assert cancelled.status_code == 200, cancelled.text
+                result = await asyncio.wait_for(handle.result(), timeout=15)
+    assert result["outcome"] == "cancelled"
+    assert len(result["roles"]) == len(state["roles"])
+
+
 @pytest.mark.parametrize("drift", ["candidate", "claim", "receipt", "pr"])
 def test_precheck_recovery_rejects_changed_authority_before_queue(
     service, monkeypatch, drift
@@ -2320,6 +2732,17 @@ def test_continuation_rejects_temporal_projection_before_workflow_close(service,
 
     monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", connect)
     with pytest.raises(ValueError, match="Temporal closure is unproven"):
+        store._completed_temporal_result("run-1")
+
+
+def test_continuation_temporal_outage_is_pending_not_closed_conflict(service, monkeypatch):
+    store, _request = service
+
+    async def unavailable(*_args, **_kwargs):
+        raise OSError("disposable Temporal connection refused")
+
+    monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", unavailable)
+    with pytest.raises(RepairReadbackPending, match="Temporal closure readback unavailable"):
         store._completed_temporal_result("run-1")
 
 
