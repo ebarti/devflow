@@ -76,15 +76,31 @@ def _sha256(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def _docker(binary: str, *argv: str, timeout: int = 30) -> subprocess.CompletedProcess[bytes]:
+def _docker(
+    binary: str, *argv: str, expected_sha256: str, timeout: int = 30
+) -> subprocess.CompletedProcess[bytes]:
     try:
-        return subprocess.run([binary, *argv], capture_output=True, check=False, timeout=timeout)
+        executable = Path(binary).resolve(strict=True)
+        if (
+            not executable.is_file()
+            or not os.access(executable, os.X_OK)
+            or _sha256(executable) != expected_sha256
+        ):
+            raise ContainerUnknown("admitted Docker CLI changed before an operation")
+    except OSError as exc:
+        raise ContainerUnknown("admitted Docker CLI is unavailable") from exc
+    try:
+        return subprocess.run(
+            [str(executable), *argv], capture_output=True, check=False, timeout=timeout
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ContainerUnknown("Docker daemon or CLI did not provide a bounded response") from exc
 
 
-def _docker_checked(binary: str, *argv: str, timeout: int = 30) -> bytes:
-    completed = _docker(binary, *argv, timeout=timeout)
+def _docker_checked(
+    binary: str, *argv: str, expected_sha256: str, timeout: int = 30
+) -> bytes:
+    completed = _docker(binary, *argv, expected_sha256=expected_sha256, timeout=timeout)
     if completed.returncode:
         raise ContainerUnknown(
             "Docker operation failed: "
@@ -98,6 +114,7 @@ def dependency_volume(spec: dict[str, Any], lock_sha256: str) -> str:
 
     policy = spec["policy"]["container"]
     binary = str(policy["docker_bin"])
+    binary_sha256 = str(policy["docker_bin_sha256"])
     name = (
         "devflow-"
         + digest({"run_id": spec["run_id"], "policy": spec["policy_digest"], "lock": lock_sha256})[
@@ -114,10 +131,14 @@ def dependency_volume(spec: dict[str, Any], lock_sha256: str) -> str:
     for key, value in sorted(labels.items()):
         command.extend(("--label", f"{key}={value}"))
     command.append(name)
-    observed_name = _docker_checked(binary, *command).decode().strip()
+    observed_name = _docker_checked(
+        binary, *command, expected_sha256=binary_sha256
+    ).decode().strip()
     if observed_name != name:
         raise ContainerUnknown("Docker returned a different dependency volume")
-    inspected = _docker_checked(binary, "volume", "inspect", name)
+    inspected = _docker_checked(
+        binary, "volume", "inspect", name, expected_sha256=binary_sha256
+    )
     try:
         values = json.loads(inspected)
         volume = values[0]
@@ -159,6 +180,7 @@ class OwnedContainer:
         self.spec = spec
         self.policy = policy
         self.binary = str(policy["docker_bin"])
+        self.binary_sha256 = str(policy["docker_bin_sha256"])
         self.image_id = str(policy["image_id"])
         self.seccomp = Path(policy["seccomp_profile"])
         if _sha256(self.seccomp) != policy["seccomp_sha256"]:
@@ -203,7 +225,9 @@ class OwnedContainer:
         )
 
     def _inspect(self) -> dict[str, Any] | None:
-        result = _docker(self.binary, "inspect", self.name)
+        result = _docker(
+            self.binary, "inspect", self.name, expected_sha256=self.binary_sha256
+        )
         if result.returncode:
             if (
                 b"no such object" in result.stderr.lower()
@@ -269,7 +293,10 @@ class OwnedContainer:
             or target.split("/")[1] not in {"store", "deps"}
         ):
             raise ValueError("container volume name or target is invalid")
-        observed = _docker_checked(self.binary, "volume", "inspect", name)
+        observed = _docker_checked(
+            self.binary, "volume", "inspect", name,
+            expected_sha256=self.binary_sha256,
+        )
         try:
             values = json.loads(observed)
             volume = values[0]
@@ -409,7 +436,10 @@ class OwnedContainer:
             if start.exists() or start.is_symlink():
                 raise ContainerUnknown("started container disappeared before cleanup proof")
             created = (
-                _docker_checked(self.binary, *self._create_argv(), timeout=90).decode().strip()
+                _docker_checked(
+                    self.binary, *self._create_argv(),
+                    expected_sha256=self.binary_sha256, timeout=90,
+                ).decode().strip()
             )
             if not re.fullmatch(r"[0-9a-f]{64}", created):
                 raise ContainerUnknown("Docker did not return a complete container ID")
@@ -432,14 +462,23 @@ class OwnedContainer:
                 self.evidence_dir / "container-start-authorized.json",
                 (canonical_json({"container_id": container_id, "name": self.name}) + "\n").encode(),
             )
-            _docker_checked(self.binary, "start", container_id, timeout=60)
+            _docker_checked(
+                self.binary, "start", container_id,
+                expected_sha256=self.binary_sha256, timeout=60,
+            )
         elif status not in {"running", "exited"}:
             raise ContainerUnknown("owned container is neither created, running nor exited")
         if status != "exited":
             try:
-                _docker_checked(self.binary, "wait", container_id, timeout=self.timeout_seconds)
+                _docker_checked(
+                    self.binary, "wait", container_id,
+                    expected_sha256=self.binary_sha256, timeout=self.timeout_seconds,
+                )
             except ContainerUnknown:
-                _docker_checked(self.binary, "stop", "--time", "2", container_id, timeout=20)
+                _docker_checked(
+                    self.binary, "stop", "--time", "2", container_id,
+                    expected_sha256=self.binary_sha256, timeout=20,
+                )
         inspected = self._inspect()
         if inspected is None or self._validate_inspection(inspected) != container_id:
             raise ContainerUnknown("Docker lost the owned container during execution")
@@ -449,7 +488,10 @@ class OwnedContainer:
         code = final.get("ExitCode")
         if type(code) is not int:
             raise ContainerUnknown("Docker did not provide an exit code")
-        logs = _docker(self.binary, "logs", "--timestamps", container_id, timeout=30)
+        logs = _docker(
+            self.binary, "logs", "--timestamps", container_id,
+            expected_sha256=self.binary_sha256, timeout=30,
+        )
         if logs.returncode:
             raise ContainerUnknown("Docker could not read both container output streams")
         log_bytes = logs.stdout + (b"\n[stderr]\n" + logs.stderr if logs.stderr else b"")

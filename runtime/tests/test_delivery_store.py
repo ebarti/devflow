@@ -40,6 +40,7 @@ from devflow_temporal.delivery_config import (
     _contained_probe_passed,
     security_binding,
 )
+from devflow_temporal.delivery_container import ContainerUnknown, _docker
 from devflow_temporal.delivery_continuation import selected_digest, session_state_digest
 from devflow_temporal.delivery_repair import (
     RepairReadbackPending,
@@ -2293,6 +2294,17 @@ async def test_role_capacity_is_shared_across_original_and_amended_config_paths(
         if not pending.done():
             pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
+
+
+def test_docker_command_rechecks_admitted_cli_bytes_before_each_effect(tmp_path):
+    binary = tmp_path / "owned-docker"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o700)
+    expected = hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert _docker(str(binary), "version", expected_sha256=expected).returncode == 0
+    binary.write_text("#!/bin/sh\nexit 17\n")
+    with pytest.raises(ContainerUnknown, match="Docker CLI changed"):
+        _docker(str(binary), "version", expected_sha256=expected)
 
 
 @pytest.mark.asyncio
