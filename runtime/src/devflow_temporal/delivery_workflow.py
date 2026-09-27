@@ -361,10 +361,11 @@ class DeliveryWorkflow:
     ) -> dict[str, Any]:
         previous = recovery["state"]
         prelaunch_retry = recovery.get("kind") == "repair_prelaunch_retry"
-        numbered = (
-            recovery.get("kind") == "repair_continuation"
-            and recovery.get("grant_number") == 2
+        grant_number = (
+            recovery.get("grant_number")
+            if recovery.get("kind") == "repair_continuation" else None
         )
+        numbered = grant_number in (2, 3)
         start = previous["iteration"] if prelaunch_retry else previous["iteration"] + 1
         limit = recovery["maximum_iteration"]
         roles = previous.get("roles", [])
@@ -378,12 +379,19 @@ class DeliveryWorkflow:
         )
         original = recovery.get("original_recovery") if prelaunch_retry else None
         prior = recovery.get("prior_recovery") if numbered else None
-        scope = prior.get("scope_recovery") if isinstance(prior, dict) else None
+        earlier = (
+            prior.get("prior_recovery")
+            if grant_number == 3 and isinstance(prior, dict) else prior
+        )
+        scope = earlier.get("scope_recovery") if isinstance(earlier, dict) else None
         authorized_limit = (
-            scope.get("maximum_iteration", -3) + 2
+            prior.get("maximum_iteration", -2) + 2
+            if grant_number == 3 and isinstance(prior, dict)
+            else scope.get("maximum_iteration", -3) + 2
             if isinstance(scope, dict) and numbered
             else spec["policy"]["max_repairs"] + 2
         )
+        operator_brief = recovery.get("operator_brief") if grant_number == 3 else None
         if (
             previous.get("run_id") != spec["run_id"]
             or previous.get("phase") != "blocked"
@@ -398,16 +406,30 @@ class DeliveryWorkflow:
             raise ValueError("repair continuation changed the bounded closed checkpoint")
         if numbered and (
             not isinstance(prior, dict)
-            or prior.get("kind") != "precheck_prelaunch_recovery"
+            or prior.get("kind") != (
+                "repair_continuation" if grant_number == 3
+                else "precheck_prelaunch_recovery"
+            )
+            or (grant_number == 3 and prior.get("grant_number") != 2)
             or not isinstance(scope, dict)
             or scope.get("kind") != "scope_amendment"
             or recovery.get("effective_spec") != spec
             or recovery.get("additional_iterations") != 2
             or limit != authorized_limit
-            or previous["iteration"] != scope.get("maximum_iteration")
+            or previous["iteration"] != (
+                prior.get("maximum_iteration") if grant_number == 3
+                else scope.get("maximum_iteration")
+            )
             or recovery.get("session_id") != prior.get("session_id")
         ):
             raise ValueError("numbered repair grant changed the amended authority")
+        if grant_number == 3 and (
+            not isinstance(operator_brief, dict)
+            or not operator_brief.get("criteria")
+            or digest(operator_brief) != recovery.get("operator_brief_digest")
+            or recovery.get("prior_extension_digest") is None
+        ):
+            raise ValueError("third grant changed the sealed acceptance criteria")
         if prelaunch_retry:
             if (
                 not isinstance(original, dict)
@@ -508,6 +530,7 @@ class DeliveryWorkflow:
             start_iteration=start,
             prior_implementer_session=recovery["session_id"],
             repair_findings=list(recovery["findings"]),
+            operator_brief=operator_brief,
             continuation=None,
             recovery=None,
             authorized_max_iteration=limit,
@@ -678,6 +701,7 @@ class DeliveryWorkflow:
         start_iteration: int,
         prior_implementer_session: str | None,
         repair_findings: list[str],
+        operator_brief: dict[str, Any] | None = None,
         continuation: dict[str, Any] | None,
         recovery: dict[str, Any] | None,
         authorized_max_iteration: int | None = None,
@@ -688,6 +712,11 @@ class DeliveryWorkflow:
             authorized_max_iteration
             if authorized_max_iteration is not None
             else spec["policy"]["max_repairs"]
+        )
+        acceptance_note = (
+            "Operator acceptance criteria (requirements to assess, not evidence of success): "
+            + json.dumps(operator_brief, sort_keys=True)
+            if operator_brief else None
         )
         for iteration in range(start_iteration, max_repairs + 1):
             self.state["iteration"] = iteration
@@ -734,7 +763,10 @@ class DeliveryWorkflow:
                                 "role": "implement",
                                 "iteration": iteration,
                                 "candidate": self.state["candidate"],
-                                "findings": repair_findings,
+                                "findings": [
+                                    *repair_findings,
+                                    *([acceptance_note] if acceptance_note else []),
+                                ],
                                 "resume_session": prior_implementer_session,
                                 "continuation": bool(continuation and iteration == 0),
                                 "attempt_generation": (
@@ -939,7 +971,7 @@ class DeliveryWorkflow:
                             "role": role,
                             "iteration": iteration,
                             "candidate": self.state["candidate"],
-                            "findings": [],
+                            "findings": [acceptance_note] if acceptance_note else [],
                             "resume_session": None,
                             "qa_evidence": qa_evidence if role == "verify" else None,
                         },
