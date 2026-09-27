@@ -654,6 +654,387 @@ class DeliveryStore:
             )
         return response
 
+    def _precheck_recovery_readback(
+        self, spec: dict[str, Any], recovery: dict[str, Any], *, queued: bool
+    ) -> None:
+        """Prove the scope-amended role ended before a single check could start."""
+        from .delivery_broker import DeliveryBroker
+        from .delivery_repair import (
+            confirmed_amendment_lineage_cleanup,
+            published_identity,
+        )
+
+        run_id = spec["run_id"]
+        scope = recovery.get("scope_recovery")
+        state = recovery.get("state")
+        candidate = recovery.get("candidate")
+        role = state.get("roles", [])[-1] if isinstance(state, dict) else None
+        if (
+            recovery.get("kind") != "precheck_prelaunch_recovery"
+            or not isinstance(scope, dict)
+            or scope.get("kind") != "scope_amendment"
+            or scope.get("effective_spec") != spec
+            or self.effective_spec(run_id) != spec
+            or not isinstance(role, dict)
+            or state.get("candidate") != candidate
+            or role.get("candidate") != candidate
+            or role.get("role") != "implement"
+            or role.get("iteration") != recovery.get("iteration")
+            or role.get("status") != "pass"
+            or role.get("finish_reason") != "done"
+            or role.get("cleanup") != "confirmed"
+            or role.get("session_id") != recovery.get("session_id")
+            or role.get("session_id") != scope.get("session_id")
+            or role.get("container_id") != recovery.get("role_container_id")
+            or recovery.get("iteration") != scope.get("maximum_iteration")
+            or recovery.get("predecessor_result_digest") != digest(state)
+            or recovery.get("pull_request") != state.get("pull_request")
+            or state.get("checks") != {
+                "prepublish": {
+                    "candidate_id": candidate.get("id") if isinstance(candidate, dict) else None,
+                    "cleanup": "unknown",
+                    "reason": "ContainerUnknown",
+                    "state": "unknown",
+                }
+            }
+        ):
+            raise ValueError("closed precheck checkpoint changed")
+        original = self.spec(run_id)
+        if (
+            original["policy_digest"] == spec["policy_digest"]
+            or "dependency-preparation/container-intent.json"
+            not in scope.get("old_container_intents", {})
+        ):
+            raise ValueError("precheck recovery has no original-policy dependency collision")
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            attempts = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+            amendment = db.execute(
+                "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
+            ).fetchone()
+            grant = db.execute(
+                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if (
+            row is None
+            or amendment is None
+            or grant is None
+            or row["request_json"] != canonical_json(original)
+            or row["recovery_json"] != canonical_json(recovery if queued else scope)
+            or row["workflow_id"] != (
+                f"delivery-{run_id}-precheck-recovery-1" if queued
+                else recovery["predecessor_workflow_id"]
+            )
+            or row["phase"] not in (
+                {"precheck_recovery_queued", "repair_preflight", "prepublish_checks"}
+                if queued else {"blocked"}
+            )
+            or row["execution_state"] not in (
+                {"queued", "running"} if queued else {"blocked"}
+            )
+            or (not queued and (
+                row["outcome"] != "blocked"
+                or row["cleanup"] != "unknown"
+                or row["error"] != "prepublication container cleanup is unknown"
+                or row["protocol_revision"] != state["revision"]
+            ))
+            or row["iteration"] != recovery["iteration"]
+            or json.loads(row["candidate_json"] or "null") != candidate
+            or json.loads(row["pr_json"] or "null") != recovery["pull_request"]
+            or (not queued and json.loads(row["checks_json"] or "{}") != state["checks"])
+            or claim is None
+            or claim["owner"] != f"external:devflow:{run_id}"
+            or amendment["effective_policy_digest"] != spec["policy_digest"]
+            or amendment["original_policy_digest"] != original["policy_digest"]
+            or amendment["maximum_iteration"] != recovery["iteration"]
+            or amendment["predecessor_workflow_id"] != scope["predecessor_workflow_id"]
+            or amendment["predecessor_execution_run_id"]
+            != scope["predecessor_execution_run_id"]
+            or amendment["predecessor_result_digest"] != digest(scope["state"])
+            or amendment["predecessor_attempt_job_key"] != scope["attempt_job_key"]
+            or amendment["predecessor_attempt_result_sha256"]
+            != scope["attempt_result_sha256"]
+            or json.loads(amendment["added_paths_json"]) != scope["added_paths"]
+            or grant["maximum_iteration"] + 1 != recovery["iteration"]
+            or any(item["state"] != "finished" or item["cleanup"] != "confirmed"
+                   for item in attempts)
+            or any(item["state"] != "complete" or item["observed_json"] is None
+                   for item in effects)
+            or any(item["effect_key"].endswith(f":{recovery['iteration']}")
+                   for item in effects)
+        ):
+            raise ValueError("precheck recovery lost the frozen run or claim")
+        current_role = [
+            item for item in attempts
+            if item["role"] == "implement" and item["iteration"] == recovery["iteration"]
+        ]
+        if len(current_role) != 1 or current_role[0]["job_key"] != recovery["role_job_key"]:
+            raise ValueError("amended implementation attempt is ambiguous")
+        attempt = current_role[0]
+        expected_job_key = digest({
+            "run_id": run_id,
+            "role": "implement",
+            "iteration": recovery["iteration"],
+            "candidate_id": scope["amended_candidate"]["id"],
+            "policy_digest": spec["policy_digest"],
+        })
+        receipt = Path(spec["state_dir"]) / "attempts" / attempt["job_key"] / "result.json"
+        if (
+            attempt["job_key"] != expected_job_key
+            or attempt["candidate_id"] != scope["amended_candidate"]["id"]
+            or attempt["session_id"] != recovery["session_id"]
+            or attempt["result_path"] != str(receipt)
+            or receipt.is_symlink()
+            or not receipt.is_file()
+        ):
+            raise ValueError("amended implementation receipt is missing")
+        info = receipt.stat()
+        result_bytes = receipt.read_bytes()
+        raw_result = json.loads(result_bytes)
+        result = json.loads(attempt["result_json"] or "null")
+        if (
+            info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or hashlib.sha256(result_bytes).hexdigest() != recovery["role_receipt_sha256"]
+            or not isinstance(result, dict)
+            or result_bytes != (
+                json.dumps(raw_result, sort_keys=True, indent=2) + "\n"
+            ).encode()
+            or raw_result != {
+                key: value for key, value in result.items()
+                if key not in {"cleanup", "container_id", "container_log_sha256"}
+            }
+            or any(role.get(key) != value for key, value in result.items())
+            or result.get("container_id") != recovery["role_container_id"]
+        ):
+            raise ValueError("amended implementation receipt changed")
+        root = Path(spec["state_dir"])
+        prechecks = root / "prechecks" / str(recovery["iteration"])
+        meta = prechecks.lstat()
+        if (
+            not stat.S_ISDIR(meta.st_mode)
+            or meta.st_uid != os.getuid()
+            or stat.S_IMODE(meta.st_mode) != 0o700
+            or any(prechecks.iterdir())
+            or any(
+                (root / folder / str(recovery["iteration"])).exists()
+                for folder in ("checks", "browser-qa", "gate-evidence", "gates")
+            )
+            or (root / f"dependency-preparation-{spec['policy_digest']}").exists()
+        ):
+            raise ValueError("prepublication execution already started or is ambiguous")
+        broker = DeliveryBroker(self, spec)
+        if broker.candidate() != candidate:
+            raise ValueError("amended candidate changed after role completion")
+        published_identity(broker, candidate, recovery["pull_request"])
+        intent_sha = confirmed_amendment_lineage_cleanup(
+            original, spec, scope["old_container_intents"], recovery["role_intent"]
+        )
+        if intent_sha != recovery["role_intent_sha256"]:
+            raise ValueError("amended role container intent changed")
+
+    def recover_precheck_prelaunch(
+        self, run_id: str, supplied: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Queue one same-run precheck retry after a proven prelaunch collision."""
+        required = {
+            "command_id", "expected_revision", "expected_iteration",
+            "expected_candidate_id", "expected_pr_number", "expected_pr_head",
+            "expected_session_id", "expected_policy_digest",
+            "expected_execution_run_id",
+        }
+        if not isinstance(supplied, dict) or set(supplied) != required:
+            raise ValueError("precheck recovery fields do not match the contract")
+        if (
+            not isinstance(supplied["command_id"], str)
+            or not supplied["command_id"]
+            or type(supplied["expected_revision"]) is not int
+            or type(supplied["expected_iteration"]) is not int
+            or type(supplied["expected_pr_number"]) is not int
+            or not isinstance(supplied["expected_candidate_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", supplied["expected_candidate_id"])
+            or not isinstance(supplied["expected_pr_head"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", supplied["expected_pr_head"])
+            or not isinstance(supplied["expected_session_id"], str)
+            or not isinstance(supplied["expected_policy_digest"], str)
+            or not isinstance(supplied["expected_execution_run_id"], str)
+        ):
+            raise ValueError("invalid precheck recovery identity")
+        command_digest = digest({"run_id": run_id, **supplied})
+        with self._connect() as db:
+            prior = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (supplied["command_id"],),
+            ).fetchone()
+            if prior:
+                if prior["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(prior["response_json"])
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            attempts_snapshot = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects_snapshot = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+        if row is None:
+            raise ValueError("run ID not found")
+        scope = json.loads(row["recovery_json"] or "null")
+        if not isinstance(scope, dict) or scope.get("kind") != "scope_amendment":
+            raise ValueError("run has no eligible scope-amendment predecessor")
+        spec = self.effective_spec(run_id)
+        closed = self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+        state = closed["result"]
+        candidate = state.get("candidate") if isinstance(state, dict) else None
+        roles = state.get("roles") if isinstance(state, dict) else None
+        role = roles[-1] if isinstance(roles, list) and roles else None
+        pr = state.get("pull_request") if isinstance(state, dict) else None
+        if (
+            closed["workflow_id"] != row["workflow_id"]
+            or closed["execution_run_id"] != supplied["expected_execution_run_id"]
+            or closed["request_digest"] != row["request_digest"]
+            or closed["recovery_digest"] != digest(scope)
+            or not isinstance(state, dict)
+            or state.get("run_id") != run_id
+            or state.get("phase") != "blocked"
+            or state.get("outcome") != "blocked"
+            or state.get("execution_state") != "blocked"
+            or state.get("cleanup") != "unknown"
+            or state.get("error") != "prepublication container cleanup is unknown"
+            or state.get("revision") != supplied["expected_revision"]
+            or state.get("iteration") != supplied["expected_iteration"]
+            or state.get("iteration") != scope.get("maximum_iteration")
+            or not isinstance(candidate, dict)
+            or candidate.get("id") != supplied["expected_candidate_id"]
+            or candidate.get("policy_digest") != supplied["expected_policy_digest"]
+            or candidate.get("policy_digest") != spec["policy_digest"]
+            or not isinstance(pr, dict)
+            or pr.get("number") != supplied["expected_pr_number"]
+            or pr.get("head") != supplied["expected_pr_head"]
+            or candidate.get("head") != pr.get("head")
+            or not isinstance(role, dict)
+            or role.get("role") != "implement"
+            or role.get("iteration") != state["iteration"]
+            or role.get("status") != "pass"
+            or role.get("finish_reason") != "done"
+            or role.get("cleanup") != "confirmed"
+            or role.get("session_id") != supplied["expected_session_id"]
+            or role.get("session_id") != scope.get("session_id")
+            or role.get("candidate") != candidate
+        ):
+            raise ValueError("closed Temporal result is not a prelaunch precheck collision")
+        with self._connect() as db:
+            attempts = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=? AND role='implement' "
+                "AND iteration=?", (run_id, state["iteration"]),
+            ).fetchall()
+        if len(attempts) != 1:
+            raise ValueError("amended implementation attempt is ambiguous")
+        attempt = attempts[0]
+        receipt = Path(spec["state_dir"]) / "attempts" / attempt["job_key"] / "result.json"
+        intent = f"attempts/{attempt['job_key']}/container/container-intent.json"
+        if not receipt.is_file() or not (Path(spec["state_dir"]) / intent).is_file():
+            raise ValueError("amended implementation evidence is missing")
+        recovery = {
+            "kind": "precheck_prelaunch_recovery",
+            "scope_recovery": scope,
+            "effective_spec": spec,
+            "predecessor_workflow_id": closed["workflow_id"],
+            "predecessor_execution_run_id": closed["execution_run_id"],
+            "predecessor_closed_at": closed["closed_at"],
+            "predecessor_result_digest": digest(state),
+            "state": state,
+            "iteration": state["iteration"],
+            "candidate": candidate,
+            "pull_request": pr,
+            "session_id": role["session_id"],
+            "role_job_key": attempt["job_key"],
+            "role_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            "role_intent": intent,
+            "role_intent_sha256": hashlib.sha256(
+                (Path(spec["state_dir"]) / intent).read_bytes()
+            ).hexdigest(),
+            "role_container_id": json.loads(attempt["result_json"])["container_id"],
+        }
+        self._precheck_recovery_readback(spec, recovery, queued=False)
+        workflow_id = f"delivery-{run_id}-precheck-recovery-1"
+        response = {
+            "run_id": run_id,
+            "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
+            "phase": "precheck_recovery_queued",
+            "workflow_id": workflow_id,
+            "iteration": state["iteration"],
+            "existing": False,
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (supplied["command_id"],),
+            ).fetchone()
+            if prior:
+                if prior["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(prior["response_json"])
+            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            attempts_now = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects_now = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+            if (
+                current is None
+                or tuple(current) != tuple(row)
+                or claim is None
+                or claim["owner"] != f"external:devflow:{run_id}"
+                or [tuple(item) for item in attempts_now]
+                != [tuple(item) for item in attempts_snapshot]
+                or [tuple(item) for item in effects_now]
+                != [tuple(item) for item in effects_snapshot]
+            ):
+                raise ValueError("precheck recovery lost its frozen run or ownership")
+            revision = current["revision"] + 1
+            db.execute(
+                """UPDATE delivery_runs SET phase='precheck_recovery_queued',
+                   execution_state='queued',outcome=NULL,error=NULL,revision=?,
+                   workflow_id=?,recovery_json=?,updated_at=? WHERE run_id=?""",
+                (revision, workflow_id, canonical_json(recovery), _now(), run_id),
+            )
+            db.execute(
+                """UPDATE delivery_outbox SET state='pending',last_error=NULL,updated_at=?
+                   WHERE run_id=?""",
+                (_now(), run_id),
+            )
+            self._event(
+                db, run_id, revision, "precheck_recovery_queued",
+                "Sealed amended role and stopped containers; resuming prechecks without a role",
+                {
+                    "candidate_id": candidate["id"],
+                    "iteration": state["iteration"],
+                    "role_job_key": attempt["job_key"],
+                    "session_id": role["session_id"],
+                    "predecessor_execution_run_id": closed["execution_run_id"],
+                },
+            )
+            db.execute(
+                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                (supplied["command_id"], run_id, command_digest, canonical_json(response)),
+            )
+        return response
+
+    def precheck_recovery_preflight(
+        self, spec: dict[str, Any], recovery: dict[str, Any]
+    ) -> None:
+        self._precheck_recovery_readback(spec, recovery, queued=True)
+
     def scope_preflight(self, spec: dict[str, Any], recovery: dict[str, Any]) -> None:
         """Recheck the sealed amendment before the sole enlarged-scope role."""
         from .delivery_broker import DeliveryBroker
@@ -1944,27 +2325,34 @@ class DeliveryStore:
                 raise ValueError("run ID not found")
             original = json.loads(row["request_json"])
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-            if not recovery or recovery.get("kind") != "scope_amendment":
+            if not recovery or recovery.get("kind") not in {
+                "scope_amendment", "precheck_prelaunch_recovery"
+            }:
                 return original
+            scope = (
+                recovery["scope_recovery"]
+                if recovery["kind"] == "precheck_prelaunch_recovery"
+                else recovery
+            )
             amendment = db.execute(
                 "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
             ).fetchone()
         if (
             amendment is None
             or amendment["effective_policy_digest"]
-            != recovery["effective_spec"]["policy_digest"]
+            != scope["effective_spec"]["policy_digest"]
             or amendment["original_policy_digest"] != original["policy_digest"]
-            or json.loads(amendment["added_paths_json"]) != recovery["added_paths"]
-            or amendment["maximum_iteration"] != recovery["maximum_iteration"]
+            or json.loads(amendment["added_paths_json"]) != scope["added_paths"]
+            or amendment["maximum_iteration"] != scope["maximum_iteration"]
         ):
             raise ValueError("scope amendment authority is not durable")
         amended = scope_amendment_config(
             original,
-            Path(recovery["amended_config_path"]),
-            recovery["amended_config_sha256"],
-            recovery["added_paths"],
+            Path(scope["amended_config_path"]),
+            scope["amended_config_sha256"],
+            scope["added_paths"],
         )
-        effective = recovery["effective_spec"]
+        effective = scope["effective_spec"]
         if (
             not isinstance(effective, dict)
             or effective.get("config_digest") != digest(amended.raw)
@@ -2008,6 +2396,7 @@ class DeliveryStore:
                 "repair_continuation_queued",
                 "repair_prelaunch_retry_queued",
                 "scope_amendment_queued",
+                "precheck_recovery_queued",
             }:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
@@ -2024,7 +2413,7 @@ class DeliveryStore:
                 else "repair"
                 if row[1] in {
                     "repair_continuation_queued", "repair_prelaunch_retry_queued",
-                    "scope_amendment_queued",
+                    "scope_amendment_queued", "precheck_recovery_queued",
                 }
                 and accepted
                 else "preparing"
@@ -2262,15 +2651,20 @@ class DeliveryStore:
         compact = self._compact(row)
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        scope_recovery = (
+            recovery.get("scope_recovery")
+            if recovery and recovery.get("kind") == "precheck_prelaunch_recovery"
+            else recovery
+        )
         scope_amendment = (
             {
-                "added_paths": recovery["added_paths"],
+                "added_paths": scope_recovery["added_paths"],
                 "original_policy_digest": spec["policy_digest"],
-                "effective_policy_digest": recovery["effective_spec"]["policy_digest"],
-                "authorized_through_iteration": recovery["maximum_iteration"],
-                "predecessor_execution_run_id": recovery["predecessor_execution_run_id"],
+                "effective_policy_digest": scope_recovery["effective_spec"]["policy_digest"],
+                "authorized_through_iteration": scope_recovery["maximum_iteration"],
+                "predecessor_execution_run_id": scope_recovery["predecessor_execution_run_id"],
             }
-            if recovery and recovery.get("kind") == "scope_amendment"
+            if scope_recovery and scope_recovery.get("kind") == "scope_amendment"
             else None
         )
         candidate = json.loads(row["candidate_json"]) if row["candidate_json"] else None

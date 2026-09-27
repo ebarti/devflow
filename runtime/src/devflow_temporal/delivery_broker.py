@@ -629,8 +629,39 @@ class DeliveryBroker:
             or _sha256(lock) != container_policy["pnpm_lock_sha256"]
         ):
             raise ValueError("admitted package lock changed before dependency preparation")
-        volume = dependency_volume(self.spec, container_policy["pnpm_lock_sha256"])
-        folder = self.state_dir / "dependency-preparation"
+        legacy = self.state_dir / "dependency-preparation"
+        legacy_intent = legacy / "container-intent.json"
+        # The original run used one policy, so its dependency preparation had
+        # a run-wide identity. An explicit scope amendment changes the image
+        # and policy within that run. Preserve an exact legacy retry, but never
+        # reuse its evidence path or Docker name for the amended authority.
+        amended_identity = False
+        if legacy_intent.exists() or legacy_intent.is_symlink():
+            info = legacy_intent.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise ValueError("dependency preparation intent is not private")
+            try:
+                saved = json.loads(legacy_intent.read_text(encoding="utf-8"))
+            except (ValueError, OSError) as exc:
+                raise ValueError("dependency preparation intent is malformed") from exc
+            if not isinstance(saved, dict) or not isinstance(saved.get("labels"), dict):
+                raise ValueError("dependency preparation intent is malformed")
+            amended_identity = (
+                saved["labels"].get("devflow.policy") != self.spec["policy_digest"]
+                or saved.get("image_id") != container_policy["image_id"]
+            )
+        folder = (
+            self.state_dir / f"dependency-preparation-{self.spec['policy_digest']}"
+            if amended_identity
+            else legacy
+        )
+        identity = {"lock_sha256": container_policy["pnpm_lock_sha256"]}
+        if amended_identity:
+            identity["policy_digest"] = self.spec["policy_digest"]
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         if (
             folder.is_symlink()
@@ -655,10 +686,11 @@ class DeliveryBroker:
             descriptor = os.open(frozen_lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(lock.read_bytes())
+        volume = dependency_volume(self.spec, container_policy["pnpm_lock_sha256"])
         prepared = OwnedContainer(
             self.spec,
             kind="dependency-preparation",
-            identity={"lock_sha256": container_policy["pnpm_lock_sha256"]},
+            identity=identity,
             evidence_dir=folder,
             binds=(Bind(scratch, "/deps"),),
             command=(

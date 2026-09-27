@@ -165,6 +165,8 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
             store, _ = _context(request["spec"])
             if request["recovery"].get("kind") == "scope_amendment":
                 store.scope_preflight(request["spec"], request["recovery"])
+            elif request["recovery"].get("kind") == "precheck_prelaunch_recovery":
+                store.precheck_recovery_preflight(request["spec"], request["recovery"])
             else:
                 store.repair_preflight(request["spec"], request["recovery"])
         except (

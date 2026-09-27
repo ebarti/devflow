@@ -10,6 +10,7 @@ import socket
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -18,7 +19,7 @@ from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFai
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from devflow_temporal import delivery_broker, delivery_store
+from devflow_temporal import delivery_broker, delivery_repair, delivery_store
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_activities import (
     delivery_prepare,
@@ -40,10 +41,11 @@ from devflow_temporal.delivery_config import (
     _contained_probe_passed,
     security_binding,
 )
-from devflow_temporal.delivery_container import ContainerUnknown, _docker
+from devflow_temporal.delivery_container import ContainerUnknown, OwnedContainer, _docker
 from devflow_temporal.delivery_continuation import selected_digest, session_state_digest
 from devflow_temporal.delivery_repair import (
     RepairReadbackPending,
+    confirmed_amendment_lineage_cleanup,
     confirmed_container_cleanup,
     failed_gate_diagnostics,
     published_identity,
@@ -61,6 +63,159 @@ def _git(path: Path, *args: str) -> str:
         ["git", "-C", str(path), *args], check=True, capture_output=True, text=True
     )
     return completed.stdout.strip()
+
+
+def test_dependency_preparation_amendment_preserves_legacy_intent_and_name(
+    tmp_path, monkeypatch
+):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    lock = checkout / "pnpm-lock.yaml"
+    lock.write_text("lockfileVersion: '9.0'\n")
+    lock_sha = hashlib.sha256(lock.read_bytes()).hexdigest()
+    seccomp = tmp_path / "seccomp.json"
+    seccomp.write_text("{}")
+    seccomp_sha = hashlib.sha256(seccomp.read_bytes()).hexdigest()
+    state = tmp_path / "state"
+    state.mkdir()
+    container = {
+        "pnpm_lock_sha256": lock_sha,
+        "seccomp_profile": str(seccomp),
+        "seccomp_sha256": seccomp_sha,
+        "docker_bin": "/usr/bin/false",
+        "docker_bin_sha256": "0" * 64,
+        "image_id": "sha256:" + "1" * 64,
+    }
+    original = {
+        "run_id": "mixed-run", "provider": "codex", "checkout": str(checkout),
+        "state_dir": str(state), "source_path": str(checkout),
+        "policy_digest": "a" * 64, "policy": {"container": container},
+    }
+    observed = []
+
+    def completed(self):
+        observed.append((self.name, self.evidence_dir, self.identity))
+        return SimpleNamespace(exit_code=0)
+
+    monkeypatch.setattr(delivery_broker, "dependency_volume", lambda *_: "fixture-volume")
+    monkeypatch.setattr(OwnedContainer, "run", completed)
+    assert DeliveryBroker(None, original)._ensure_dependency_store() == "fixture-volume"
+    legacy = state / "dependency-preparation" / "container-intent.json"
+    legacy_bytes = legacy.read_bytes()
+    assert DeliveryBroker(None, original)._ensure_dependency_store() == "fixture-volume"
+    assert observed[0] == observed[1]
+    amended = {
+        **original, "policy_digest": "b" * 64,
+        "policy": {"container": {**container, "image_id": "sha256:" + "2" * 64}},
+    }
+    assert DeliveryBroker(None, amended)._ensure_dependency_store() == "fixture-volume"
+    assert DeliveryBroker(None, amended)._ensure_dependency_store() == "fixture-volume"
+    assert legacy.read_bytes() == legacy_bytes
+    assert observed[2] == observed[3]
+    assert observed[2][0] != observed[0][0]
+    assert observed[2][1] == state / ("dependency-preparation-" + "b" * 64)
+    assert observed[2][2]["policy_digest"] == "b" * 64
+
+
+def test_amended_cleanup_rejects_missing_or_active_container(tmp_path, monkeypatch):
+    root = tmp_path / "runs" / "one"
+    old_relative = "dependency-preparation/container-intent.json"
+    role_relative = "attempts/role/container/container-intent.json"
+    old_policy, new_policy = "a" * 64, "b" * 64
+    old_image, new_image = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    docker = Path("/usr/bin/false")
+    docker_sha = hashlib.sha256(docker.read_bytes()).hexdigest()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    lock = checkout / "pnpm-lock.yaml"
+    lock.write_text("lockfileVersion: '9.0'\n")
+    lock_sha = hashlib.sha256(lock.read_bytes()).hexdigest()
+    seccomp = tmp_path / "seccomp.json"
+    seccomp.write_text("{}")
+    runner = Path(delivery_repair.__file__).with_name("role_runner.py")
+    original = {
+        "run_id": "one", "state_dir": str(root), "provider": "codex",
+        "checkout": str(checkout),
+        "policy_digest": old_policy,
+        "policy": {"container": {
+            "docker_bin": str(docker), "docker_bin_sha256": docker_sha,
+            "image_id": old_image,
+            "seccomp_profile": str(seccomp),
+            "seccomp_sha256": hashlib.sha256(seccomp.read_bytes()).hexdigest(),
+            "role_runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
+            "pnpm_lock_sha256": lock_sha,
+            "runtime_payload_sha256": "c" * 64,
+            "codex_bin_sha256": "d" * 64,
+            "platform": "linux/arm64",
+        }},
+    }
+    amended = copy.deepcopy(original)
+    amended["policy_digest"] = new_policy
+    amended["policy"]["container"]["image_id"] = new_image
+
+    def intent(relative, policy, image, name):
+        path = root / relative
+        path.parent.mkdir(parents=True, mode=0o700)
+        value = {
+            "name": name, "image_id": image,
+            "seccomp_sha256": original["policy"]["container"]["seccomp_sha256"],
+            "labels": {"devflow.run_id": "one", "devflow.policy": policy},
+        }
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+        identity = path.parent / "container-id.json"
+        identity.write_text(json.dumps({"container_id": "d" * 64, "name": name}))
+        identity.chmod(0o600)
+        log = path.parent / "container.log"
+        log.write_text("finished")
+        log.chmod(0o600)
+        return path
+
+    old = intent(old_relative, old_policy, old_image, "devflow-old")
+    old_inventory = {old_relative: hashlib.sha256(old.read_bytes()).hexdigest()}
+    with pytest.raises(ValueError, match="missing container intent"):
+        confirmed_amendment_lineage_cleanup(
+            original, amended, old_inventory, role_relative
+        )
+    intent(role_relative, new_policy, new_image, "devflow-new")
+
+    def running_inspect(argv, **_kwargs):
+        if argv[1:3] == ["image", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                "Id": new_image, "Os": "linux", "Architecture": "arm64",
+                "Config": {"Labels": {
+                    "devflow.role_runner_sha256": amended["policy"]["container"][
+                        "role_runner_sha256"
+                    ],
+                    "devflow.runtime_payload_sha256": "c" * 64,
+                    "devflow.codex_bin_sha256": "d" * 64,
+                }},
+            }]).encode())
+        if argv[1:3] == ["volume", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                "Name": argv[3], "Driver": "local", "Labels": {
+                    "devflow.owner": "temporal-delivery",
+                    "devflow.policy": new_policy,
+                    "devflow.purpose": "dependencies", "devflow.lock": lock_sha,
+                },
+            }]).encode())
+        assert argv[1] == "inspect"
+        name = argv[2]
+        labels = {"devflow.run_id": "one", "devflow.policy": old_policy}
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([{
+                "Id": "d" * 64, "Name": "/" + name,
+                "Image": old_image, "Config": {"Labels": labels},
+                "State": {"Status": "running", "Running": True, "Pid": 123},
+            }]).encode(),
+        )
+
+    monkeypatch.setattr(delivery_repair.subprocess, "run", running_inspect)
+    with pytest.raises(ValueError, match="cleanup is not confirmed"):
+        confirmed_amendment_lineage_cleanup(
+            original, amended, old_inventory, role_relative
+        )
 
 
 @pytest.fixture
@@ -631,6 +786,344 @@ def test_scope_amendment_binds_finished_generation_after_prelaunch_retry(
     assert next(row for row in attempts if row["job_key"] == recovery["attempt_job_key"])[
         "session_id"
     ] == "original-session"
+
+
+def _precheck_collision_fixture(store, request, monkeypatch):
+    original, _previous, amendment, _closed = _scope_amendment_fixture(
+        store, request, monkeypatch
+    )
+    legacy = Path(original["state_dir"]) / "dependency-preparation"
+    legacy.mkdir(mode=0o700)
+    (legacy / "container-intent.json").write_text(json.dumps({"fixture": "old policy"}))
+    (legacy / "container-intent.json").chmod(0o600)
+    store.amend_scope(request["run_id"], amendment)
+    store.mark_start(request["run_id"], accepted=True)
+    with store._connect() as db:
+        scope = json.loads(
+            db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'")
+            .fetchone()[0]
+        )
+    spec = store.effective_spec(request["run_id"])
+    broker = DeliveryBroker(store, spec)
+    (broker.checkout / amendment["added_paths"][0]).write_text(
+        "expect(138).toBe(138)\nexpect(true).toBe(true)\n"
+    )
+    candidate = broker.candidate()
+    iteration = scope["maximum_iteration"]
+    job_key = digest({
+        "run_id": request["run_id"], "role": "implement", "iteration": iteration,
+        "candidate_id": scope["amended_candidate"]["id"],
+        "policy_digest": spec["policy_digest"],
+    })
+    folder = Path(spec["state_dir"]) / "attempts" / job_key
+    folder.mkdir(parents=True, mode=0o700)
+    raw = {
+        "role": "implement", "iteration": iteration, "status": "pass",
+        "session_id": "original-session", "finish_reason": "done",
+    }
+    saved = {**raw, "cleanup": "confirmed", "container_id": "fixture-contained-role"}
+    receipt = folder / "result.json"
+    receipt.write_text(json.dumps(raw, sort_keys=True, indent=2) + "\n")
+    receipt.chmod(0o600)
+    intent_path = folder / "container" / "container-intent.json"
+    intent_path.parent.mkdir(mode=0o700)
+    intent_path.write_text(json.dumps({"fixture": "contained role"}))
+    intent_path.chmod(0o600)
+    with store._connect() as db:
+        db.execute(
+            """INSERT INTO delivery_attempts
+               (job_key,run_id,role,iteration,candidate_id,state,session_id,
+                result_json,result_path,cleanup)
+               VALUES (?,?,?,?,?,'finished',?,?,?,'confirmed')""",
+            (
+                job_key, request["run_id"], "implement", iteration,
+                scope["amended_candidate"]["id"], raw["session_id"],
+                json.dumps(saved), str(receipt),
+            ),
+        )
+    prechecks = Path(spec["state_dir"]) / "prechecks" / str(iteration)
+    prechecks.mkdir(parents=True, mode=0o700)
+    unknown = {
+        "prepublish": {
+            "candidate_id": candidate["id"], "cleanup": "unknown",
+            "reason": "ContainerUnknown", "state": "unknown",
+        }
+    }
+    state = {
+        **scope["state"], "revision": 31, "iteration": iteration,
+        "candidate": candidate, "candidate_revision": 9,
+        "phase": "blocked", "execution_state": "blocked", "outcome": "blocked",
+        "cleanup": "unknown", "error": "prepublication container cleanup is unknown",
+        "roles": [*scope["state"]["roles"], {**saved, "candidate": candidate}],
+        "checks": unknown,
+    }
+    store.project(
+        request["run_id"], phase="blocked", execution_state="blocked",
+        event_type="blocked", message=state["error"], candidate=candidate,
+        pull_request=state["pull_request"], checks=unknown, iteration=iteration,
+        protocol_revision=31, outcome="blocked", cleanup="unknown", error=state["error"],
+    )
+    closed = {
+        "workflow_id": f"delivery-{request['run_id']}-scope-amendment-1",
+        "execution_run_id": "closed-precheck-collision", "closed_at": "2026-09-27T03:00:00+00:00",
+        "request_digest": original["request_digest"],
+        "recovery_digest": digest(scope), "result": state,
+    }
+    monkeypatch.setattr(
+        DeliveryStore, "_completed_temporal_result", lambda self, _id, **_kw: closed
+    )
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda _id, **_kw: closed)
+    monkeypatch.setattr(
+        delivery_repair, "confirmed_amendment_lineage_cleanup",
+        lambda _old, _new, _inventory, _relative: hashlib.sha256(
+            intent_path.read_bytes()
+        ).hexdigest(),
+    )
+    command = {
+        "command_id": "recover-precheck-1", "expected_revision": 31,
+        "expected_iteration": iteration, "expected_candidate_id": candidate["id"],
+        "expected_pr_number": 7, "expected_pr_head": candidate["head"],
+        "expected_session_id": "original-session",
+        "expected_policy_digest": spec["policy_digest"],
+        "expected_execution_run_id": closed["execution_run_id"],
+    }
+    return spec, state, command, prechecks
+
+
+def test_precheck_recovery_is_one_time_and_rejects_started_check(service, monkeypatch):
+    store, request = service
+    spec, state, command, prechecks = _precheck_collision_fixture(
+        store, request, monkeypatch
+    )
+    (prechecks / "container-intent.json").write_text("already started")
+    with pytest.raises(ValueError, match="already started or is ambiguous"):
+        store.recover_precheck_prelaunch(request["run_id"], command)
+    (prechecks / "container-intent.json").unlink()
+    with pytest.raises(ValueError, match="precheck recovery identity"):
+        store.recover_precheck_prelaunch(
+            request["run_id"], {**command, "expected_candidate_id": "wrong"}
+        )
+    response = store.recover_precheck_prelaunch(request["run_id"], command)
+    assert response["phase"] == "precheck_recovery_queued"
+    assert store.recover_precheck_prelaunch(request["run_id"], command) == response
+    with pytest.raises(ValueError, match="eligible scope-amendment predecessor"):
+        store.recover_precheck_prelaunch(
+            request["run_id"], {**command, "command_id": "recover-precheck-2"}
+        )
+    with store._connect() as db:
+        saved = db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone()
+        grant = db.execute("SELECT * FROM delivery_repair_grants WHERE run_id='run-1'")
+        assert grant.fetchone()["maximum_iteration"] == state["iteration"] - 1
+    assert json.loads(saved["request_json"])["policy_digest"] != spec["policy_digest"]
+    assert store.effective_spec("run-1") == spec
+
+
+@pytest.mark.parametrize("drift", ["candidate", "claim", "receipt", "pr"])
+def test_precheck_recovery_rejects_changed_authority_before_queue(
+    service, monkeypatch, drift
+):
+    store, request = service
+    spec, _state, command, _prechecks = _precheck_collision_fixture(
+        store, request, monkeypatch
+    )
+    if drift == "candidate":
+        path = Path(spec["checkout"]) / "tests/capability-a.test.ts"
+        path.write_text("different candidate bytes\n")
+    elif drift == "claim":
+        with store._connect() as db:
+            store.state.release_work(db, request["work_id"], "external:devflow:run-1")
+    elif drift == "receipt":
+        with store._connect() as db:
+            path = Path(db.execute(
+                "SELECT result_path FROM delivery_attempts WHERE iteration=5"
+            ).fetchone()[0])
+        path.write_bytes(path.read_bytes() + b"\n")
+    else:
+        monkeypatch.setattr(
+            DeliveryBroker, "_existing_pr", lambda self: {
+                "number": 7, "url": "https://github.com/example/fixture/pull/7",
+                "state": "OPEN", "headRefOid": "0" * 40,
+            }
+        )
+    with pytest.raises(ValueError):
+        store.recover_precheck_prelaunch(request["run_id"], command)
+    with store._connect() as db:
+        row = db.execute("SELECT phase,outcome FROM delivery_runs WHERE run_id='run-1'")
+        assert tuple(row.fetchone()) == ("blocked", "blocked")
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_commands WHERE command_id=?",
+            (command["command_id"],),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_public_precheck_recovery_resumes_broker_without_another_implementer(
+    service, monkeypatch
+):
+    store, request = service
+    async with await WorkflowEnvironment.start_local() as environment:
+        store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
+        store.config.raw["queue"] = "precheck-recovery-public-test"
+        store.config.path.write_text(json.dumps(store.config.raw))
+        spec, state, command, _folder = _precheck_collision_fixture(
+            store, request, monkeypatch
+        )
+        app = create_app(store.config.path)
+        origin = app.state.delivery.config.dashboard_url
+        calls = {"implement": 0, "precheck": [], "publish": 0, "roles": []}
+
+        @activity.defn(name="delivery_precheck")
+        async def precheck_stub(payload):
+            calls["precheck"].append(payload["iteration"])
+            return {
+                "state": "passed", "candidate_id": payload["candidate"]["id"],
+                "source_unchanged": True, "results": [{"passed": True, "cleanup": "confirmed"}],
+            }
+
+        @activity.defn(name="delivery_publish")
+        async def publish_stub(payload):
+            calls["publish"] += 1
+            return {
+                **state["pull_request"], "candidate": payload["candidate"],
+            }
+
+        @activity.defn(name="delivery_role")
+        async def role_stub(payload):
+            calls["roles"].append(payload["role"])
+            if payload["role"] == "implement":
+                calls["implement"] += 1
+            return {
+                "role": payload["role"], "iteration": payload["iteration"],
+                "status": "pass", "cleanup": "confirmed",
+                "candidate": payload["candidate"],
+                "session_id": "independent-" + payload["role"],
+            }
+
+        @activity.defn(name="delivery_checks")
+        async def checks_stub(payload):
+            return {"state": "passed", "candidate_id": payload["candidate"]["id"]}
+
+        @activity.defn(name="delivery_ci")
+        async def ci_stub(payload):
+            return {"state": "passed", "head": payload["pull_request"]["head"]}
+
+        @activity.defn(name="delivery_tracker")
+        async def tracker_stub(_payload):
+            return {"state": "consistent"}
+
+        async with Worker(
+            environment.client,
+            task_queue="precheck-recovery-public-test",
+            workflows=[DeliveryWorkflow],
+            activities=[
+                delivery_project, delivery_repair_preflight, precheck_stub,
+                publish_stub, role_stub, checks_stub, ci_stub, tracker_stub,
+            ],
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as browser:
+                login = await browser.post(
+                    "/api/session", json={"token": app.state.delivery.auth.secret},
+                    headers={"Origin": origin},
+                )
+                headers = {
+                    "Origin": origin, "X-Devflow-CSRF": login.json()["csrf_token"],
+                }
+                posted = await browser.post(
+                    "/api/runs/run-1/recover-precheck-prelaunch",
+                    json=command, headers=headers,
+                )
+                assert posted.status_code == 200, posted.text
+                repeated = await browser.post(
+                    "/api/runs/run-1/recover-precheck-prelaunch",
+                    json=command, headers=headers,
+                )
+                assert repeated.json() == posted.json()
+            await app.state.delivery.dispatch_once()
+            result = await asyncio.wait_for(
+                environment.client.get_workflow_handle(posted.json()["workflow_id"]).result(),
+                timeout=30,
+            )
+    assert result["outcome"] == "delivered"
+    assert result["iteration"] == state["iteration"]
+    assert result["roles"][:len(state["roles"])] == state["roles"]
+    assert calls == {
+        "implement": 0, "precheck": [state["iteration"]],
+        "publish": 1, "roles": ["review", "verify"],
+    }
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_attempts WHERE role='implement' AND iteration=?",
+            (state["iteration"],),
+        ).fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM delivery_scope_amendments").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 1
+    assert store.effective_spec("run-1") == spec
+
+
+@pytest.mark.asyncio
+async def test_public_precheck_recovery_can_cancel_unavailable_readback(
+    service, monkeypatch
+):
+    store, request = service
+    async with await WorkflowEnvironment.start_local() as environment:
+        store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
+        store.config.raw["queue"] = "precheck-recovery-cancel-test"
+        store.config.path.write_text(json.dumps(store.config.raw))
+        _spec, _state, command, _folder = _precheck_collision_fixture(
+            store, request, monkeypatch
+        )
+        app = create_app(store.config.path)
+        origin = app.state.delivery.config.dashboard_url
+        entered = asyncio.Event()
+
+        @activity.defn(name="delivery_repair_preflight")
+        async def unavailable(_payload):
+            entered.set()
+            return {"state": "pending", "reason": "Docker daemon readback unavailable"}
+
+        async with Worker(
+            environment.client,
+            task_queue="precheck-recovery-cancel-test",
+            workflows=[DeliveryWorkflow],
+            activities=[delivery_project, unavailable],
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as browser:
+                login = await browser.post(
+                    "/api/session", json={"token": app.state.delivery.auth.secret},
+                    headers={"Origin": origin},
+                )
+                headers = {
+                    "Origin": origin, "X-Devflow-CSRF": login.json()["csrf_token"],
+                }
+                posted = await browser.post(
+                    "/api/runs/run-1/recover-precheck-prelaunch",
+                    json=command, headers=headers,
+                )
+                assert posted.status_code == 200, posted.text
+                await app.state.delivery.dispatch_once()
+                await asyncio.wait_for(entered.wait(), timeout=10)
+                handle = environment.client.get_workflow_handle(posted.json()["workflow_id"])
+                active = await handle.query("status")
+                cancelled = await browser.post(
+                    "/api/runs/run-1/cancel",
+                    json={
+                        "command_id": "cancel-readback-1",
+                        "expected_revision": active["revision"],
+                        "reason": "Stop while Docker is unavailable",
+                    },
+                    headers=headers,
+                )
+                assert cancelled.status_code == 200, cancelled.text
+                result = await asyncio.wait_for(handle.result(), timeout=15)
+    assert result["outcome"] == "cancelled"
+    assert result["cleanup"] == "unknown"
+    assert not any(role.get("iteration") == command["expected_iteration"]
+                   and role.get("role") in {"review", "verify"}
+                   for role in result["roles"])
 
 
 def test_scope_amendment_seals_only_two_paths_and_preserves_request_and_grant(

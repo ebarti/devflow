@@ -242,6 +242,8 @@ class DeliveryWorkflow:
         if recovery is not None:
             if recovery.get("kind") == "scope_amendment":
                 return await self._resume_scope(spec, recovery)
+            if recovery.get("kind") == "precheck_prelaunch_recovery":
+                return await self._resume_prechecks(spec, recovery)
             if recovery.get("kind") in {"repair_continuation", "repair_prelaunch_retry"}:
                 return await self._resume_repair(spec, recovery)
             return await self._resume_publication(spec, recovery)
@@ -588,6 +590,64 @@ class DeliveryWorkflow:
             authorized_max_iteration=recovery["maximum_iteration"],
         )
 
+    async def _resume_prechecks(
+        self, spec: dict[str, Any], recovery: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resume the broker gate after a sealed role and no check launch."""
+        previous = recovery.get("state")
+        roles = previous.get("roles") if isinstance(previous, dict) else None
+        role = roles[-1] if isinstance(roles, list) and roles else None
+        if (
+            recovery.get("effective_spec") != spec
+            or not isinstance(previous, dict)
+            or previous.get("run_id") != spec["run_id"]
+            or previous.get("phase") != "blocked"
+            or previous.get("outcome") != "blocked"
+            or previous.get("cleanup") != "unknown"
+            or previous.get("error") != "prepublication container cleanup is unknown"
+            or previous.get("candidate") != recovery.get("candidate")
+            or previous.get("iteration") != recovery.get("iteration")
+            or previous.get("pull_request") != recovery.get("pull_request")
+            or not isinstance(role, dict)
+            or role.get("role") != "implement"
+            or role.get("iteration") != recovery.get("iteration")
+            or role.get("status") != "pass"
+            or role.get("cleanup") != "confirmed"
+            or role.get("session_id") != recovery.get("session_id")
+            or role.get("candidate") != recovery.get("candidate")
+        ):
+            raise ValueError("precheck recovery changed the closed role checkpoint")
+        self.state = {
+            **previous,
+            "phase": "repair_preflight",
+            "execution_state": "running",
+            "outcome": None,
+            "error": None,
+        }
+        self.state["revision"] += 1
+        await self._project(
+            spec, "precheck_recovery_started",
+            "Proving old and amended container teardown before retrying checks",
+        )
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        self.state["cleanup"] = "none"
+        self.state["revision"] += 1
+        await self._project(
+            spec, "precheck_recovery_confirmed",
+            "No amended check process started; sealed role and candidate retained",
+        )
+        return await self._run_iterations(
+            spec,
+            start_iteration=recovery["iteration"],
+            prior_implementer_session=recovery["session_id"],
+            repair_findings=[],
+            continuation=None,
+            recovery=None,
+            authorized_max_iteration=recovery["iteration"],
+            resume_prechecks=True,
+        )
+
     async def _run_iterations(
         self,
         spec: dict[str, Any],
@@ -599,6 +659,7 @@ class DeliveryWorkflow:
         recovery: dict[str, Any] | None,
         authorized_max_iteration: int | None = None,
         attempt_generation: int = 0,
+        resume_prechecks: bool = False,
     ) -> dict[str, Any]:
         max_repairs = (
             authorized_max_iteration
@@ -635,57 +696,67 @@ class DeliveryWorkflow:
                     spec, "published", "Existing regular PR read back at candidate head"
                 )
             else:
-                self.state["checks"] = {}
-                if self.cancel_requested:
-                    return await self._cancelled(spec)
-                self.state["phase"] = "implement" if iteration == 0 else "repair"
-                self.state["revision"] += 1
-                await self._project(spec, "role_started", self.state["phase"] + " role started")
-                try:
-                    implementation = await self._activity(
-                        "delivery_role",
-                        {
-                            "spec": spec,
-                            "role": "implement",
-                            "iteration": iteration,
-                            "candidate": self.state["candidate"],
-                            "findings": repair_findings,
-                            "resume_session": prior_implementer_session,
-                            "continuation": bool(continuation and iteration == 0),
-                            "attempt_generation": (
-                                attempt_generation if iteration == start_iteration else 0
-                            ),
-                        },
-                    )
-                except Exception as exc:
-                    return await self._stop(
-                        spec, f"implementer activity failed: {type(exc).__name__}"
-                    )
-                self.state["roles"].append(implementation)
-                self.state["usage"][f"implement:{iteration}"] = implementation.get("usage")
-                if self.cancel_requested:
-                    return await self._cancelled(spec)
-                if implementation.get("status") != "pass":
-                    return await self._stop(spec, "implementer did not establish a pass")
-                if (
-                    continuation
-                    and iteration == 0
-                    and (implementation.get("session_id") != continuation["session_id"])
-                ):
-                    return await self._stop(
-                        spec, "continuation did not resume the original implementer"
-                    )
-                if iteration and implementation.get("session_id") != prior_implementer_session:
-                    return await self._stop(spec, "repair did not resume the original implementer")
-                prior_implementer_session = implementation.get("session_id")
-                if not prior_implementer_session and spec["provider"] == "codex":
-                    return await self._stop(spec, "implementer session identity is missing")
-                self.state["candidate"] = implementation["candidate"]
-                self.state["candidate_revision"] += 1
+                if not (resume_prechecks and iteration == start_iteration):
+                    self.state["checks"] = {}
+                    if self.cancel_requested:
+                        return await self._cancelled(spec)
+                    self.state["phase"] = "implement" if iteration == 0 else "repair"
+                    self.state["revision"] += 1
+                    await self._project(spec, "role_started", self.state["phase"] + " role started")
+                    try:
+                        implementation = await self._activity(
+                            "delivery_role",
+                            {
+                                "spec": spec,
+                                "role": "implement",
+                                "iteration": iteration,
+                                "candidate": self.state["candidate"],
+                                "findings": repair_findings,
+                                "resume_session": prior_implementer_session,
+                                "continuation": bool(continuation and iteration == 0),
+                                "attempt_generation": (
+                                    attempt_generation if iteration == start_iteration else 0
+                                ),
+                            },
+                        )
+                    except Exception as exc:
+                        return await self._stop(
+                            spec, f"implementer activity failed: {type(exc).__name__}"
+                        )
+                    self.state["roles"].append(implementation)
+                    self.state["usage"][f"implement:{iteration}"] = implementation.get("usage")
+                    if self.cancel_requested:
+                        return await self._cancelled(spec)
+                    if implementation.get("status") != "pass":
+                        return await self._stop(spec, "implementer did not establish a pass")
+                    if (
+                        continuation
+                        and iteration == 0
+                        and (implementation.get("session_id") != continuation["session_id"])
+                    ):
+                        return await self._stop(
+                            spec, "continuation did not resume the original implementer"
+                        )
+                    if iteration and implementation.get("session_id") != prior_implementer_session:
+                        return await self._stop(
+                            spec, "repair did not resume the original implementer"
+                        )
+                    prior_implementer_session = implementation.get("session_id")
+                    if not prior_implementer_session and spec["provider"] == "codex":
+                        return await self._stop(spec, "implementer session identity is missing")
+                    self.state["candidate"] = implementation["candidate"]
+                    self.state["candidate_revision"] += 1
+                else:
+                    self.state["checks"] = {}
+                    if self.cancel_requested:
+                        return await self._cancelled(spec)
                 self.state["phase"] = "prepublish_checks"
                 self.state["revision"] += 1
                 await self._project(
-                    spec, "prepublish_checks", "Checking candidate before the first PR"
+                    spec, "prepublish_checks",
+                    "Checking preserved candidate before the PR"
+                    if resume_prechecks and iteration == start_iteration
+                    else "Checking candidate before the first PR",
                 )
                 try:
                     prechecked = await self._activity(

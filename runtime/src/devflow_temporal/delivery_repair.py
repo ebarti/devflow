@@ -308,3 +308,210 @@ def confirmed_container_cleanup(spec: dict[str, Any]) -> None:
             or state.get("Pid") != 0
         ):
             raise ValueError("owned container cleanup is not confirmed")
+
+
+def confirmed_amendment_lineage_cleanup(
+    original: dict[str, Any],
+    amended: dict[str, Any],
+    old_intents: dict[str, str],
+    role_intent: str,
+) -> str:
+    """Prove one explicitly amended run has no unaccounted container process.
+
+    The original inventory belongs only to the original policy. The sole new
+    intent belongs only to the amended role; this is not a general mixed-policy
+    exemption for other runs or effects.
+    """
+    from .delivery_container import Bind, ContainerUnknown, OwnedContainer
+
+    if (
+        original["run_id"] != amended["run_id"]
+        or original["state_dir"] != amended["state_dir"]
+        or original["provider"] != amended["provider"]
+        or not isinstance(old_intents, dict)
+        or role_intent in old_intents
+        or not role_intent.startswith("attempts/")
+        or not role_intent.endswith("/container/container-intent.json")
+    ):
+        raise ValueError("amended container lineage is not bounded")
+    if original["provider"] != "codex":
+        raise ValueError("precheck recovery requires a contained provider")
+    root = Path(original["state_dir"]).resolve(strict=True)
+    observed = {}
+    for path in root.rglob("container-intent.json"):
+        if path.is_symlink() or not path.is_file() or root not in path.resolve().parents:
+            raise ValueError("owned container intent changed")
+        observed[str(path.relative_to(root))] = path
+    if set(observed) != set(old_intents) | {role_intent}:
+        raise ValueError("amended run has an unrecognized or missing container intent")
+    def command(spec: dict[str, Any], *argv: str) -> subprocess.CompletedProcess[bytes]:
+        policy = spec["policy"]["container"]
+        binary = Path(policy["docker_bin"]).resolve(strict=True)
+        if (
+            not binary.is_file()
+            or not os.access(binary, os.X_OK)
+            or hashlib.sha256(binary.read_bytes()).hexdigest()
+            != policy["docker_bin_sha256"]
+        ):
+            raise ValueError("admitted Docker CLI changed")
+        try:
+            result = subprocess.run(
+                [str(binary), *argv], capture_output=True, check=False, timeout=30
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RepairReadbackPending("Docker cleanup readback unavailable") from exc
+        if result.returncode:
+            try:
+                daemon = subprocess.run(
+                    [str(binary), "info", "--format", "{{.ServerVersion}}"],
+                    capture_output=True, check=False, timeout=10,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise RepairReadbackPending("Docker daemon readback unavailable") from exc
+            if daemon.returncode:
+                raise RepairReadbackPending("Docker daemon readback unavailable")
+            raise ValueError("owned Docker resource is missing")
+        return result
+
+    policy = amended["policy"]["container"]
+    seccomp = Path(policy["seccomp_profile"])
+    runner = Path(__file__).with_name("role_runner.py")
+    lock = Path(amended["checkout"]) / "pnpm-lock.yaml"
+    if (
+        seccomp.is_symlink()
+        or not seccomp.is_file()
+        or hashlib.sha256(seccomp.read_bytes()).hexdigest() != policy["seccomp_sha256"]
+        or runner.is_symlink()
+        or hashlib.sha256(runner.read_bytes()).hexdigest() != policy["role_runner_sha256"]
+        or lock.is_symlink()
+        or not lock.is_file()
+        or hashlib.sha256(lock.read_bytes()).hexdigest() != policy["pnpm_lock_sha256"]
+    ):
+        raise ValueError("frozen contained executable policy or lock changed")
+    image = json.loads(command(amended, "image", "inspect", policy["image_id"]).stdout)
+    if len(image) != 1:
+        raise ValueError("amended image inspection is ambiguous")
+    labels = image[0].get("Config", {}).get("Labels") or {}
+    if (
+        image[0].get("Id") != policy["image_id"]
+        or f"{image[0].get('Os')}/{image[0].get('Architecture')}" != policy["platform"]
+        or labels.get("devflow.role_runner_sha256") != policy["role_runner_sha256"]
+        or labels.get("devflow.runtime_payload_sha256")
+        != policy["runtime_payload_sha256"]
+        or labels.get("devflow.codex_bin_sha256") != policy["codex_bin_sha256"]
+    ):
+        raise ValueError("amended execution image changed after role completion")
+    volume_name = "devflow-" + digest({
+        "run_id": amended["run_id"], "policy": amended["policy_digest"],
+        "lock": policy["pnpm_lock_sha256"],
+    })[:32]
+    volumes = json.loads(command(amended, "volume", "inspect", volume_name).stdout)
+    volume_labels = volumes[0].get("Labels", {}) if len(volumes) == 1 else {}
+    if (
+        len(volumes) != 1
+        or volumes[0].get("Name") != volume_name
+        or volumes[0].get("Driver") != "local"
+        or volume_labels.get("devflow.owner") != "temporal-delivery"
+        or volume_labels.get("devflow.policy") != amended["policy_digest"]
+        or volume_labels.get("devflow.purpose") != "dependencies"
+        or volume_labels.get("devflow.lock") != policy["pnpm_lock_sha256"]
+    ):
+        raise ValueError("amended dependency volume has different authority")
+
+    identities: set[str] = set()
+    names: set[str] = set()
+    for relative, path in observed.items():
+        spec = original if relative in old_intents else amended
+        info = path.stat()
+        value = path.read_bytes()
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("owned container intent is not private")
+        actual_sha = hashlib.sha256(value).hexdigest()
+        if relative in old_intents and actual_sha != old_intents[relative]:
+            raise ValueError("original container intent changed after amendment")
+        try:
+            intent = json.loads(value)
+            labels = intent["labels"]
+            name = intent["name"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError("owned container intent is malformed") from exc
+        if (
+            not isinstance(name, str)
+            or not isinstance(labels, dict)
+            or labels.get("devflow.run_id") != spec["run_id"]
+            or labels.get("devflow.policy") != spec["policy_digest"]
+            or intent.get("image_id") != spec["policy"]["container"]["image_id"]
+            or intent.get("seccomp_sha256")
+            != spec["policy"]["container"]["seccomp_sha256"]
+        ):
+            raise ValueError("owned container intent has different authority")
+        identity_path = path.parent / "container-id.json"
+        log = path.parent / "container.log"
+        for artifact in (identity_path, log):
+            if artifact.is_symlink() or not artifact.is_file():
+                raise ValueError("owned container has no confirmed result")
+            meta = artifact.stat()
+            if meta.st_uid != os.getuid() or stat.S_IMODE(meta.st_mode) != 0o600:
+                raise ValueError("owned container result is not private")
+        recorded = json.loads(identity_path.read_text(encoding="utf-8"))
+        inspected = json.loads(command(spec, "inspect", name).stdout)
+        if len(inspected) != 1:
+            raise ValueError("owned container inspection is ambiguous")
+        actual = inspected[0]
+        state = actual.get("State") or {}
+        if (
+            actual.get("Id") != recorded.get("container_id")
+            or recorded.get("name") != name
+            or actual.get("Name") != "/" + name
+            or actual.get("Image") != intent["image_id"]
+            or any(
+                actual.get("Config", {}).get("Labels", {}).get(key) != value
+                for key, value in labels.items()
+            )
+            or state.get("Status") != "exited"
+            or state.get("Running") is not False
+            or state.get("Pid") != 0
+        ):
+            raise ValueError("owned container cleanup is not confirmed")
+        if name in names or actual["Id"] in identities:
+            raise ValueError("owned container identity was reused across policies")
+        # Recheck the Docker authority against the immutable intent, not just
+        # the label. In particular, a candidate must not rewrite an attempt
+        # bind or command and have that changed file accepted as a new baseline.
+        try:
+            container = object.__new__(OwnedContainer)
+            container.spec = spec
+            container.policy = spec["policy"]["container"]
+            container.binary = str(container.policy["docker_bin"])
+            container.binary_sha256 = str(container.policy["docker_bin_sha256"])
+            container.image_id = str(intent["image_id"])
+            container.seccomp = Path(container.policy["seccomp_profile"])
+            container.labels = labels
+            container.binds = tuple(
+                Bind(Path(item["source"]), item["target"], item["readonly"])
+                for item in intent["binds"]
+            )
+            container.volume_mounts = tuple(tuple(item) for item in intent["volumes"])
+            container.command = tuple(intent["command"])
+            container.cwd = intent["cwd"]
+            container.environment = intent["environment"]
+            container.network = intent["network"]
+            for bind in container.binds:
+                container._validate_bind(bind)
+            container._validate_inspection(actual)
+        except ContainerUnknown as exc:
+            # Distinguish a transient daemon outage from a healthy daemon
+            # reporting a changed mount, profile, command or volume.
+            command(spec, "info", "--format", "{{.ServerVersion}}")
+            raise ValueError("owned container authority changed") from exc
+        except (KeyError, TypeError, OSError) as exc:
+            raise ValueError("owned container authority is malformed") from exc
+        identities.add(actual["Id"])
+        names.add(name)
+    listed = command(
+        amended, "ps", "-a", "--no-trunc", "--filter",
+        f"label=devflow.run_id={amended['run_id']}", "--format", "{{.ID}}",
+    )
+    if set(listed.stdout.decode().splitlines()) != identities:
+        raise ValueError("owned run has an unrecognized or missing container")
+    return hashlib.sha256(observed[role_intent].read_bytes()).hexdigest()
