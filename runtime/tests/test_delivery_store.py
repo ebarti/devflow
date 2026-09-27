@@ -1171,8 +1171,12 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not shutil.which("temporal"), reason="local Temporal CLI required")
+@pytest.mark.parametrize(
+    "failure_window",
+    ["pending_after_push", "complete_before_ack", "pending_reconcile_error"],
+)
 async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remaining_gates(
-    service, monkeypatch
+    service, monkeypatch, failure_window
 ):
     original, request = service
     with socket.socket() as listener:
@@ -1193,6 +1197,7 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
     readback = {"fresh": False}
     observations = {"publish": [], "precheck": []}
     first_head = {"value": None}
+    reconcile_error = {"remaining": failure_window == "pending_reconcile_error"}
 
     def pr_for_broker(broker):
         return {
@@ -1239,9 +1244,24 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
             }
             broker._finish_effect(key, result)
             return result
-        pending = broker.publish(iteration, payload["candidate"])
-        assert pending["state"] == "pending"
-        raise RuntimeError("published PR head did not read back at the expected commit")
+        if failure_window == "complete_before_ack":
+            readback["fresh"] = True
+        published = broker.publish(iteration, payload["candidate"])
+        if failure_window == "pending_reconcile_error":
+            assert published["state"] == "pending"
+            return published
+        if failure_window == "pending_after_push":
+            assert published["state"] == "pending"
+        else:
+            assert published["head"] == _git(broker.checkout, "rev-parse", "HEAD")
+        raise RuntimeError("publication activity result was not recorded by Temporal")
+
+    @activity.defn(name="delivery_reconcile_publish")
+    async def reconcile_stub(payload):
+        if reconcile_error["remaining"]:
+            reconcile_error["remaining"] = False
+            raise RuntimeError("publication readback activity result was not recorded")
+        return await delivery_reconcile_publish(payload)
 
     @activity.defn(name="delivery_precheck")
     async def precheck_stub(payload):
@@ -1305,7 +1325,7 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
                 delivery_prepare,
                 role_stub,
                 publish_stub,
-                delivery_reconcile_publish,
+                reconcile_stub,
                 precheck_stub,
                 checks_stub,
                 ci_stub,
@@ -1320,6 +1340,11 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
             )
             assert blocked["error"] == "publication unresolved: ActivityError"
             assert blocked["iteration"] == 1
+            assert blocked["cleanup"] == (
+                "pending_publication_readback"
+                if failure_window == "pending_reconcile_error"
+                else "none"
+            )
             broker = DeliveryBroker(service_runtime.store, service_runtime.store.spec("run-1"))
             head = _git(broker.checkout, "rev-parse", "HEAD")
             assert (
@@ -1332,11 +1357,10 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
                 == head
             )
             with service_runtime.store._connect() as db:
-                assert (
-                    db.execute(
-                        "SELECT state FROM delivery_effects WHERE effect_key='publish:run-1:1'"
-                    ).fetchone()[0]
-                    == "pending"
+                assert db.execute(
+                    "SELECT state FROM delivery_effects WHERE effect_key='publish:run-1:1'"
+                ).fetchone()[0] == (
+                    "complete" if failure_window == "complete_before_ack" else "pending"
                 )
             readback["fresh"] = True
             app = create_app(original.config.path)
@@ -1366,6 +1390,32 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
                         headers=headers,
                     )
                     assert wrong.status_code == 409
+                if failure_window == "complete_before_ack":
+                    with service_runtime.store._connect() as db:
+                        saved_receipt = db.execute(
+                            "SELECT observed_json FROM delivery_effects "
+                            "WHERE effect_key='publish:run-1:1'"
+                        ).fetchone()[0]
+                        altered_receipt = json.loads(saved_receipt)
+                        altered_receipt["url"] = "https://example.invalid/pull/other"
+                        db.execute(
+                            "UPDATE delivery_effects SET observed_json=? "
+                            "WHERE effect_key='publish:run-1:1'",
+                            (json.dumps(altered_receipt),),
+                        )
+                    assert (
+                        await browser.post(
+                            "/api/runs/run-1/recover-publication",
+                            json={**payload, "command_id": "altered-receipt"},
+                            headers=headers,
+                        )
+                    ).status_code == 409
+                    with service_runtime.store._connect() as db:
+                        db.execute(
+                            "UPDATE delivery_effects SET observed_json=? "
+                            "WHERE effect_key='publish:run-1:1'",
+                            (saved_receipt,),
+                        )
                 source_file = broker.checkout / "README.md"
                 source_file.write_text("Unreviewed concurrent edit\n")
                 assert (
@@ -1386,7 +1436,10 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
                     )
                 ).status_code == 409
                 with service_runtime.store._connect() as db:
-                    db.execute("UPDATE delivery_runs SET cleanup='none' WHERE run_id='run-1'")
+                    db.execute(
+                        "UPDATE delivery_runs SET cleanup=? WHERE run_id='run-1'",
+                        (blocked["cleanup"],),
+                    )
                 queued = await browser.post(
                     "/api/runs/run-1/recover-publication", json=payload, headers=headers
                 )

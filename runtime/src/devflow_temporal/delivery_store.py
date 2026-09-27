@@ -466,7 +466,7 @@ class DeliveryStore:
             or state.get("outcome") != "blocked"
             or state.get("execution_state") != "blocked"
             or state.get("error") != "publication unresolved: ActivityError"
-            or state.get("cleanup") != "none"
+            or state.get("cleanup") not in {"none", "pending_publication_readback"}
             or state.get("revision") != supplied["expected_revision"]
             or type(iteration) is not int
             or iteration < 0
@@ -542,21 +542,22 @@ class DeliveryStore:
             current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             claim = self.state.claim_for(db, spec["work_id"])
             effects = db.execute(
-                "SELECT effect_key,kind,request_json,state FROM delivery_effects WHERE run_id=?",
+                "SELECT effect_key,kind,request_json,state,observed_json "
+                "FROM delivery_effects WHERE run_id=?",
                 (run_id,),
             ).fetchall()
             attempts = db.execute(
                 "SELECT state,cleanup FROM delivery_attempts WHERE run_id=?", (run_id,)
             ).fetchall()
             key = f"publish:{run_id}:{iteration}"
-            pending = [item for item in effects if item["state"] == "pending"]
+            target = [item for item in effects if item["effect_key"] == key]
             if (
                 current is None
                 or current["request_json"] != row["request_json"]
                 or current["outcome"] != "blocked"
                 or current["phase"] != "blocked"
                 or current["error"] != state["error"]
-                or current["cleanup"] != "none"
+                or current["cleanup"] != state["cleanup"]
                 or current["protocol_revision"] != state["revision"]
                 or current["recovery_json"] is not None
                 or current["workflow_id"] is not None
@@ -565,17 +566,23 @@ class DeliveryStore:
                 or json.loads(current["pr_json"] or "null") != previous_pr
                 or claim is None
                 or claim["owner"] != f"external:devflow:{run_id}"
-                or len(pending) != 1
-                or pending[0]["effect_key"] != key
-                or pending[0]["kind"] != "publish"
-                or pending[0]["request_json"]
+                or len(target) != 1
+                or target[0]["state"] not in {"pending", "complete"}
+                or target[0]["kind"] != "publish"
+                or target[0]["request_json"]
                 != canonical_json(
                     {
                         "iteration": iteration,
                         "input_candidate_id": candidate["id"],
                     }
                 )
-                or any(item["state"] not in {"complete", "pending"} for item in effects)
+                or (
+                    target[0]["state"] == "complete"
+                    and target[0]["observed_json"] != canonical_json(observed)
+                )
+                or any(
+                    item["state"] != "complete" for item in effects if item["effect_key"] != key
+                )
                 or len(attempts) != len(roles)
                 or any(
                     item["state"] in {"starting", "running", "unknown"}

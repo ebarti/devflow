@@ -908,7 +908,15 @@ class DeliveryBroker:
             raise ValueError("publication resolved to a different PR")
         if saved["state"] == "complete":
             done = json.loads(saved["observed_json"])
-            if done["head"] != head or done["number"] != found["number"]:
+            expected = {
+                "number": found["number"],
+                "url": found["url"],
+                "state": found["state"],
+                "head": head,
+                "base": self.spec["base_sha"],
+                "candidate": current,
+            }
+            if done != expected:
                 raise ValueError("durable publication receipt disagrees with current PR")
             return done
         if saved["state"] != "pending":

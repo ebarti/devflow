@@ -274,7 +274,7 @@ class DeliveryWorkflow:
             previous.get("run_id") != spec["run_id"]
             or previous.get("phase") != "blocked"
             or previous.get("error") != "publication unresolved: ActivityError"
-            or previous.get("cleanup") != "none"
+            or previous.get("cleanup") not in {"none", "pending_publication_readback"}
             or not previous.get("roles")
             or previous["roles"][-1].get("role") != "implement"
             or previous["roles"][-1].get("status") != "pass"
