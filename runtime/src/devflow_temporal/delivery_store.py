@@ -4423,17 +4423,52 @@ class DeliveryStore:
                     "cleanup": attempt["cleanup"],
                 }
             )
+        gate_specs = [
+            ("prepare", "Prepare", "tracker_start"),
+            ("prepublish", "Before PR checks", "candidate_ready"),
+            ("publish", "Publish", "published"),
+            (
+                "local_checks",
+                "Local checks",
+                "browser_qa_started" if spec["policy"].get("browser_qa") else "ci_wait",
+            ),
+        ]
+        if spec["policy"].get("browser_qa"):
+            gate_specs.append(("browser_qa", "Browser / API QA", "browser_qa_passed"))
+        gate_specs.extend(
+            (
+                ("required_ci", "Required CI", "tracker_started"),
+                ("tracker", "Tracker", "delivered"),
+            )
+        )
+        completion_types = tuple(sorted({completion for _, _, completion in gate_specs}))
         with self._connect() as db:
             active = db.execute(
                 """SELECT COUNT(*) FROM delivery_attempts
                    WHERE state IN ('starting','running','unknown')"""
             ).fetchone()[0]
-        events = self.events(run_id)
-        event_types = {event["type"] for event in events}
+            # events() pages oldest-first for SSE replay; detail shows the newest activity.
+            recent_event_rows = db.execute(
+                """SELECT sequence,timestamp,type,message,run_revision,payload_json
+                   FROM delivery_events WHERE run_id=?
+                   ORDER BY sequence DESC LIMIT 200""",
+                (run_id,),
+            ).fetchall()
+            # Gate evidence must include relevant events outside the display window.
+            gate_event_rows = db.execute(
+                f"""SELECT type,payload_json FROM delivery_events
+                    WHERE run_id=? AND type IN ({','.join('?' for _ in completion_types)})""",
+                (run_id, *completion_types),
+            ).fetchall()
+        events = [
+            {**dict(event), "payload": json.loads(event["payload_json"]), "evidence_refs": []}
+            for event in reversed(recent_event_rows)
+        ]
+        event_types = {event["type"] for event in gate_event_rows}
         current_event_types = {
             event["type"]
-            for event in events
-            if event["payload"].get("iteration") == row["iteration"]
+            for event in gate_event_rows
+            if json.loads(event["payload_json"]).get("iteration") == row["iteration"]
         }
         checks = json.loads(row["checks_json"]) if row["checks_json"] else {}
         tracker = json.loads(row["tracker_json"]) if row["tracker_json"] else {}
@@ -4469,24 +4504,6 @@ class DeliveryStore:
                 return "unknown"
             return "pending"
 
-        gate_specs = [
-            ("prepare", "Prepare", "tracker_start"),
-            ("prepublish", "Before PR checks", "candidate_ready"),
-            ("publish", "Publish", "published"),
-            (
-                "local_checks",
-                "Local checks",
-                "browser_qa_started" if spec["policy"].get("browser_qa") else "ci_wait",
-            ),
-        ]
-        if spec["policy"].get("browser_qa"):
-            gate_specs.append(("browser_qa", "Browser / API QA", "browser_qa_passed"))
-        gate_specs.extend(
-            (
-                ("required_ci", "Required CI", "tracker_started"),
-                ("tracker", "Tracker", "delivered"),
-            )
-        )
         gates = [
             {
                 "id": name,

@@ -3045,6 +3045,77 @@ def test_phase_gates_do_not_reuse_previous_repair_iteration(service):
     assert all(terminal[name] == "pending" for name in ("publish", "local_checks"))
 
 
+@pytest.mark.asyncio
+async def test_long_history_projects_recent_activity_without_losing_gate_evidence(service):
+    store, request = service
+    store.submit(request)
+    for iteration, event_types in (
+        (0, ("tracker_start", "candidate_ready", "published")),
+        (1, ("role_started", "candidate_ready", "published")),
+    ):
+        for event_type in event_types:
+            store.project(
+                "run-1",
+                phase="repair" if iteration else "implement",
+                execution_state="running",
+                event_type=event_type,
+                message=f"{event_type} in iteration {iteration}",
+                iteration=iteration,
+                key=f"{event_type}:{iteration}",
+            )
+    with store._connect() as db:
+        revision = db.execute(
+            "SELECT revision FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0]
+        for index in range(205):
+            store._event(
+                db, "run-1", revision, "temporal_pending", f"Retry {index}", {"error": "RPCError"}
+            )
+        sequences = [
+            row[0]
+            for row in db.execute(
+                "SELECT sequence FROM delivery_events WHERE run_id='run-1' ORDER BY sequence"
+            )
+        ]
+
+    detail = store.detail("run-1")
+    assert [event["sequence"] for event in detail["events"]] == sequences[-200:]
+    gates = {gate["id"]: gate["state"] for gate in detail["phase_gates"]}
+    assert gates["prepare"] == gates["prepublish"] == gates["publish"] == "completed"
+
+    first_page = store.events("run-1")
+    second_page = store.events("run-1", first_page[-1]["sequence"])
+    assert len(first_page) == 200
+    assert [event["sequence"] for event in first_page + second_page] == sequences
+
+    app = create_app(store.config.path)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
+        token = (Path(store.config.raw["state_root"]) / "service-token").read_text().strip()
+        login = await browser.post(
+            "/api/session", json={"token": token}, headers={"Origin": "http://127.0.0.1:18770"}
+        )
+        assert login.status_code == 200
+        response = await browser.get("/api/runs/run-1")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["run"]["sequence"] == sequences[-1]
+        assert body["events"] == detail["events"]
+
+    store.project(
+        "run-1",
+        phase="repair",
+        execution_state="running",
+        event_type="role_started",
+        message="Next repair started",
+        iteration=2,
+        key="role_started:2",
+    )
+    next_gates = {gate["id"]: gate["state"] for gate in store.detail("run-1")["phase_gates"]}
+    assert next_gates["prepare"] == "completed"
+    assert next_gates["prepublish"] == next_gates["publish"] == "pending"
+
+
 def test_tracker_gate_waits_for_final_delivery_after_initial_consistent_readback(service):
     store, request = service
     store.submit(request)
