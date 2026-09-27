@@ -230,6 +230,7 @@ def main() -> None:
             "decision",
             "cancel",
             "recover-publication",
+            "continue-repair",
         ),
     )
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
@@ -255,6 +256,7 @@ def main() -> None:
         "decision",
         "cancel",
         "recover-publication",
+        "continue-repair",
     }:
         caller = api_client(config.path)
         request = json.loads(args.request.read_text(encoding="utf-8")) if args.request else None
@@ -263,10 +265,12 @@ def main() -> None:
             "decision",
             "cancel",
             "recover-publication",
+            "continue-repair",
         } and not isinstance(request, dict):
             parser.error("--request must name a JSON object file for this command")
         if (
-            args.command in {"run", "evidence", "decision", "cancel", "recover-publication"}
+            args.command
+            in {"run", "evidence", "decision", "cancel", "recover-publication", "continue-repair"}
             and not args.id
         ):
             parser.error("--id is required for this command")
@@ -280,6 +284,7 @@ def main() -> None:
             "decision": lambda: caller.decision(args.id, request),
             "cancel": lambda: caller.cancel(args.id, request),
             "recover-publication": lambda: caller.recover_publication(args.id, request),
+            "continue-repair": lambda: caller.continue_repair(args.id, request),
         }[args.command]()
         print(json.dumps(result, sort_keys=True, indent=2))
         return

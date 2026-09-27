@@ -193,6 +193,8 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if recovery is not None:
+            if recovery.get("kind") == "repair_continuation":
+                return await self._resume_repair(spec, recovery)
             return await self._resume_publication(spec, recovery)
         self.state = {
             "run_id": spec["run_id"],
@@ -303,6 +305,77 @@ class DeliveryWorkflow:
             recovery=recovery,
         )
 
+    async def _resume_repair(
+        self, spec: dict[str, Any], recovery: dict[str, Any]
+    ) -> dict[str, Any]:
+        previous = recovery["state"]
+        start = previous["iteration"] + 1
+        limit = recovery["maximum_iteration"]
+        if (
+            previous.get("run_id") != spec["run_id"]
+            or previous.get("phase") != "blocked"
+            or previous.get("outcome") != "blocked"
+            or previous.get("cleanup") != "none"
+            or recovery.get("candidate") != previous.get("candidate")
+            or recovery.get("session_id") != next(
+                (
+                    role.get("session_id")
+                    for role in reversed(previous.get("roles", []))
+                    if role.get("role") == "implement"
+                ),
+                None,
+            )
+            or recovery.get("additional_iterations") not in (1, 2)
+            or limit != previous["iteration"] + recovery["additional_iterations"]
+            or limit > spec["policy"]["max_repairs"] + 2
+            or start > limit
+            or not recovery.get("findings")
+        ):
+            raise ValueError("repair continuation changed the bounded closed checkpoint")
+        self.state = {
+            **previous,
+            "phase": "repair_continuation_queued",
+            "execution_state": "running",
+            "outcome": None,
+            "error": None,
+            "cleanup": "none",
+        }
+        try:
+            await self._activity(
+                "delivery_repair_preflight", {"spec": spec, "recovery": recovery}
+            )
+        except Exception as exc:
+            return await self._stop(
+                spec, f"repair continuation preflight failed: {type(exc).__name__}"
+            )
+        self.state["revision"] += 1
+        await self._project(
+            spec,
+            "repair_continuation_started",
+            "Explicit repair grant and published PR read back",
+        )
+        self.state["phase"] = "tracker_start"
+        self.state["revision"] += 1
+        await self._project(spec, "tracker_start", "Claimed issue entering In progress")
+        try:
+            tracker = await self._activity("delivery_tracker_start", {"spec": spec})
+        except Exception as exc:
+            return await self._stop(
+                spec, f"repair tracker synchronization pending: {type(exc).__name__}"
+            )
+        self.state["tracker"] = tracker
+        if tracker.get("state") != "consistent":
+            return await self._stop(spec, "repair tracker readback remains pending")
+        return await self._run_iterations(
+            spec,
+            start_iteration=start,
+            prior_implementer_session=recovery["session_id"],
+            repair_findings=list(recovery["findings"]),
+            continuation=None,
+            recovery=None,
+            authorized_max_iteration=limit,
+        )
+
     async def _run_iterations(
         self,
         spec: dict[str, Any],
@@ -312,8 +385,13 @@ class DeliveryWorkflow:
         repair_findings: list[str],
         continuation: dict[str, Any] | None,
         recovery: dict[str, Any] | None,
+        authorized_max_iteration: int | None = None,
     ) -> dict[str, Any]:
-        max_repairs = spec["policy"]["max_repairs"]
+        max_repairs = (
+            authorized_max_iteration
+            if authorized_max_iteration is not None
+            else spec["policy"]["max_repairs"]
+        )
         for iteration in range(start_iteration, max_repairs + 1):
             self.state["iteration"] = iteration
             if recovery is not None and iteration == start_iteration:

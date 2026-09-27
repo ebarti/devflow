@@ -156,6 +156,16 @@ async def delivery_reconcile_publish(request: dict[str, Any]) -> dict[str, Any]:
     return await asyncio.to_thread(execute)
 
 
+@activity.defn(name="delivery_repair_preflight")
+async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
+    def execute() -> dict[str, Any]:
+        store, _ = _context(request["spec"])
+        store.repair_preflight(request["spec"], request["recovery"])
+        return {"state": "confirmed"}
+
+    return await asyncio.to_thread(execute)
+
+
 @activity.defn(name="delivery_checks")
 async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
@@ -328,6 +338,7 @@ DELIVERY_ACTIVITIES = [
     delivery_role,
     delivery_publish,
     delivery_reconcile_publish,
+    delivery_repair_preflight,
     delivery_checks,
     delivery_browser_qa,
     delivery_precheck,

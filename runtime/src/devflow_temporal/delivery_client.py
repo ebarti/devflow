@@ -78,6 +78,13 @@ class DeliveryClient:
             payload,
         )
 
+    def continue_repair(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST",
+            "/api/runs/" + quote(run_id, safe="") + "/continue-repair",
+            payload,
+        )
+
 
 def client(config_path: Path) -> DeliveryClient:
     caller = DeliveryClient(DeliveryConfig.load(config_path))

@@ -179,6 +179,18 @@ class DeliveryStore:
                     response_json TEXT
                 )"""
             )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_repair_grants (
+                    run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+                    command_id TEXT NOT NULL UNIQUE,
+                    predecessor_workflow_id TEXT NOT NULL,
+                    predecessor_execution_run_id TEXT NOT NULL,
+                    predecessor_result_digest TEXT NOT NULL,
+                    granted_iterations INTEGER NOT NULL,
+                    maximum_iteration INTEGER NOT NULL,
+                    granted_at TEXT NOT NULL
+                )"""
+            )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -370,7 +382,9 @@ class DeliveryStore:
             )
             return response
 
-    def _completed_temporal_result(self, run_id: str) -> dict[str, Any]:
+    def _completed_temporal_result(
+        self, run_id: str, *, workflow_id: str | None = None
+    ) -> dict[str, Any]:
         """Read a closed workflow from Temporal, never from caller-authored JSON."""
 
         async def read() -> dict[str, Any]:
@@ -378,7 +392,7 @@ class DeliveryStore:
                 self.config.temporal_address,
                 namespace=self.config.raw.get("temporal_namespace", "default"),
             )
-            handle = client.get_workflow_handle("delivery-" + run_id)
+            handle = client.get_workflow_handle(workflow_id or "delivery-" + run_id)
             description = await handle.describe()
             if (
                 description.status != WorkflowExecutionStatus.COMPLETED
@@ -390,6 +404,7 @@ class DeliveryStore:
                 "execution_run_id": description.run_id,
                 "closed_at": description.close_time.isoformat(),
                 "request_digest": await description.memo_value("request_digest", "unknown"),
+                "recovery_digest": await description.memo_value("recovery_digest", None),
                 "result": await client.get_workflow_handle(
                     description.id, run_id=description.run_id
                 ).result(),
@@ -623,6 +638,328 @@ class DeliveryStore:
             )
         return response
 
+    def continue_repair(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+        """Spend one explicit, bounded grant on a closed failed gate of this run."""
+        from .delivery_broker import DeliveryBroker
+        from .delivery_repair import (
+            confirmed_container_cleanup,
+            failed_gate_diagnostics,
+            published_identity,
+        )
+
+        required = {
+            "command_id",
+            "expected_revision",
+            "expected_iteration",
+            "expected_candidate_id",
+            "expected_pr_number",
+            "expected_pr_head",
+            "additional_iterations",
+        }
+        if not isinstance(supplied, dict) or set(supplied) != required:
+            raise ValueError("repair continuation fields do not match the contract")
+        command_id = supplied["command_id"]
+        if (
+            not isinstance(command_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", command_id)
+            or any(
+                type(supplied[key]) is not int
+                for key in (
+                    "expected_revision",
+                    "expected_iteration",
+                    "expected_pr_number",
+                    "additional_iterations",
+                )
+            )
+            or supplied["expected_revision"] < 1
+            or supplied["expected_iteration"] < 0
+            or supplied["expected_pr_number"] < 1
+            or supplied["additional_iterations"] not in (1, 2)
+            or not isinstance(supplied["expected_candidate_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", supplied["expected_candidate_id"])
+            or not isinstance(supplied["expected_pr_head"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", supplied["expected_pr_head"])
+        ):
+            raise ValueError("invalid repair continuation identity or grant")
+        command_digest = digest({"run_id": run_id, **supplied})
+        with self._connect() as db:
+            prior = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            if prior:
+                if prior["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(prior["response_json"])
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            granted = db.execute(
+                "SELECT 1 FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError("run ID not found")
+        if granted:
+            raise ValueError("this run already received its one repair grant")
+        spec = json.loads(row["request_json"])
+        if digest(DeliveryConfig.load(self.config.path).raw) != spec["config_digest"]:
+            raise ValueError("frozen service configuration changed before repair grant")
+        current_workflow_id = row["workflow_id"] or f"delivery-{run_id}"
+        previous_recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        closed = self._completed_temporal_result(run_id, workflow_id=current_workflow_id)
+        state = closed["result"]
+        if not isinstance(state, dict):
+            raise ValueError("closed Temporal result has no terminal state")
+        candidate = state.get("candidate")
+        pr = state.get("pull_request")
+        roles = state.get("roles")
+        checks = state.get("checks")
+        iteration = state.get("iteration")
+        if (
+            closed["workflow_id"] != current_workflow_id
+            or closed["request_digest"] != row["request_digest"]
+            or closed["recovery_digest"]
+            != (digest(previous_recovery) if previous_recovery is not None else None)
+            or state.get("run_id") != run_id
+            or state.get("phase") != "blocked"
+            or state.get("outcome") != "blocked"
+            or state.get("execution_state") != "blocked"
+            or state.get("cleanup") != "none"
+            or state.get("revision") != supplied["expected_revision"]
+            or type(iteration) is not int
+            or iteration != supplied["expected_iteration"]
+            or iteration + supplied["additional_iterations"] > spec["policy"]["max_repairs"] + 2
+            or not isinstance(candidate, dict)
+            or candidate.get("id") != supplied["expected_candidate_id"]
+            or not isinstance(pr, dict)
+            or pr.get("number") != supplied["expected_pr_number"]
+            or pr.get("head") != supplied["expected_pr_head"]
+            or not isinstance(roles, list)
+            or not isinstance(checks, dict)
+        ):
+            raise ValueError("closed Temporal result does not authorize repair continuation")
+        implementation = next(
+            (
+                role
+                for role in reversed(roles)
+                if role.get("role") == "implement" and role.get("iteration") == iteration
+            ),
+            None,
+        )
+        if (
+            implementation is None
+            or implementation.get("status") != "pass"
+            or implementation.get("cleanup") != "confirmed"
+            or not implementation.get("session_id")
+            or any(
+                role.get("session_id") != implementation["session_id"]
+                for role in roles
+                if role.get("role") == "implement"
+            )
+            or any(
+                role.get("cleanup") != "confirmed"
+                or role.get("finish_reason") == "recovery_unknown"
+                for role in roles
+            )
+        ):
+            raise ValueError("original implementer session or role cleanup is unconfirmed")
+        for key in ("prepublish", "local", "browser_qa"):
+            result = checks.get(key)
+            if result is None:
+                continue
+            if not isinstance(result, dict) or result.get("state") == "unknown":
+                raise ValueError("a check has an unknown outcome")
+            if result.get("cleanup") == "unknown" or (
+                key == "browser_qa" and result.get("cleanup") != "confirmed"
+            ):
+                raise ValueError("a check has unconfirmed cleanup")
+            if any(
+                not isinstance(item, dict) or item.get("cleanup") != "confirmed"
+                for item in result.get("results", [])
+            ):
+                raise ValueError("a check child has unconfirmed cleanup")
+        findings = failed_gate_diagnostics(state, spec)
+        if not findings:
+            raise ValueError("failed gate supplied no repair diagnostics")
+        broker = DeliveryBroker(self, spec)
+        observed_pr = published_identity(broker, candidate, pr)
+        confirmed_container_cleanup(spec)
+        workflow_id = f"delivery-{run_id}-repair-continuation-1"
+        recovery = {
+            "kind": "repair_continuation",
+            "predecessor_workflow_id": current_workflow_id,
+            "predecessor_execution_run_id": closed["execution_run_id"],
+            "predecessor_closed_at": closed["closed_at"],
+            "predecessor_result_digest": digest(state),
+            "state": state,
+            "candidate": candidate,
+            "pull_request": observed_pr,
+            "session_id": implementation["session_id"],
+            "findings": findings,
+            "additional_iterations": supplied["additional_iterations"],
+            "maximum_iteration": iteration + supplied["additional_iterations"],
+        }
+        response = {
+            "run_id": run_id,
+            "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
+            "phase": "repair_continuation_queued",
+            "workflow_id": workflow_id,
+            "authorized_through_iteration": recovery["maximum_iteration"],
+            "existing": False,
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            if prior:
+                if prior["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(prior["response_json"])
+            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            attempts = db.execute(
+                "SELECT role,iteration,state,session_id,cleanup "
+                "FROM delivery_attempts WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+            effects = db.execute(
+                "SELECT kind,state,observed_json FROM delivery_effects WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+            if (
+                current is None
+                or current["request_json"] != row["request_json"]
+                or current["workflow_id"] != row["workflow_id"]
+                or current["recovery_json"] != row["recovery_json"]
+                or current["phase"] != "blocked"
+                or current["outcome"] != "blocked"
+                or current["execution_state"] != "blocked"
+                or current["cleanup"] != "none"
+                or current["error"] != state["error"]
+                or current["protocol_revision"] != state["revision"]
+                or current["iteration"] != iteration
+                or json.loads(current["candidate_json"] or "null") != candidate
+                or json.loads(current["pr_json"] or "null") != pr
+                or json.loads(current["checks_json"] or "{}") != checks
+                or db.execute(
+                    "SELECT 1 FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+                ).fetchone()
+                or claim is None
+                or claim["owner"] != f"external:devflow:{run_id}"
+                or len(attempts) != len(roles)
+                or any(
+                    item["state"] != "finished" or item["cleanup"] != "confirmed"
+                    for item in attempts
+                )
+                or sorted(
+                    (item["role"], item["iteration"], item["session_id"])
+                    for item in attempts
+                )
+                != sorted(
+                    (item["role"], item["iteration"], item["session_id"])
+                    for item in roles
+                )
+                or not any(item["kind"] == "publish" for item in effects)
+                or any(
+                    item["state"] != "complete" or item["observed_json"] is None
+                    for item in effects
+                )
+            ):
+                raise ValueError("repair continuation lost its frozen run or ownership")
+            revision = current["revision"] + 1
+            db.execute(
+                """INSERT INTO delivery_repair_grants VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    command_id,
+                    current_workflow_id,
+                    closed["execution_run_id"],
+                    digest(state),
+                    supplied["additional_iterations"],
+                    recovery["maximum_iteration"],
+                    _now(),
+                ),
+            )
+            db.execute(
+                """UPDATE delivery_runs SET phase='repair_continuation_queued',
+                   execution_state='queued',outcome=NULL,error=NULL,revision=?,
+                   workflow_id=?,recovery_json=?,updated_at=? WHERE run_id=?""",
+                (revision, workflow_id, canonical_json(recovery), _now(), run_id),
+            )
+            db.execute(
+                """UPDATE delivery_outbox SET state='pending',last_error=NULL,updated_at=?
+                   WHERE run_id=?""",
+                (_now(), run_id),
+            )
+            self._event(
+                db,
+                run_id,
+                revision,
+                "repair_continuation_queued",
+                "Explicit bounded repair grant queued after failed gate",
+                {
+                    "iteration": iteration,
+                    "authorized_through_iteration": recovery["maximum_iteration"],
+                    "candidate_id": candidate["id"],
+                    "pr_number": pr["number"],
+                    "predecessor_execution_run_id": closed["execution_run_id"],
+                    "diagnostics_digest": digest(findings),
+                },
+            )
+            db.execute(
+                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                (command_id, run_id, command_digest, canonical_json(response)),
+            )
+        return response
+
+    def repair_preflight(self, spec: dict[str, Any], recovery: dict[str, Any]) -> None:
+        """Recheck the frozen command before a resumed implementer can execute."""
+        from .delivery_broker import DeliveryBroker
+        from .delivery_repair import confirmed_container_cleanup, published_identity
+
+        run_id = spec["run_id"]
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            grant = db.execute(
+                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            attempts = db.execute(
+                "SELECT state,cleanup FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects = db.execute(
+                "SELECT state FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+        if (
+            row is None
+            or grant is None
+            or row["request_json"] != canonical_json(spec)
+            or row["workflow_id"] != f"delivery-{run_id}-repair-continuation-1"
+            or row["recovery_json"] != canonical_json(recovery)
+            or row["phase"] not in {"repair_continuation_queued", "repair"}
+            or row["execution_state"] not in {"queued", "running"}
+            or grant["predecessor_workflow_id"] != recovery["predecessor_workflow_id"]
+            or grant["predecessor_execution_run_id"]
+            != recovery["predecessor_execution_run_id"]
+            or grant["predecessor_result_digest"] != digest(recovery["state"])
+            or grant["granted_iterations"] != recovery["additional_iterations"]
+            or grant["maximum_iteration"] != recovery["maximum_iteration"]
+            or claim is None
+            or claim["owner"] != f"external:devflow:{run_id}"
+            or any(
+                item["state"] != "finished" or item["cleanup"] != "confirmed"
+                for item in attempts
+            )
+            or any(item["state"] != "complete" for item in effects)
+        ):
+            raise ValueError("repair grant or owned resources changed before resume")
+        published_identity(
+            DeliveryBroker(self, spec),
+            recovery["candidate"],
+            recovery["state"]["pull_request"],
+        )
+        confirmed_container_cleanup(spec)
+
     def _post_role_continuation(
         self,
         db: sqlite3.Connection,
@@ -837,7 +1174,11 @@ class DeliveryStore:
             ).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
-            if row[1] not in {"accepted", "publication_recovery_queued"}:
+            if row[1] not in {
+                "accepted",
+                "publication_recovery_queued",
+                "repair_continuation_queued",
+            }:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
                     # recorded start_workflow's acknowledgement.
@@ -850,6 +1191,8 @@ class DeliveryStore:
             new_phase = (
                 "publishing"
                 if row[1] == "publication_recovery_queued" and accepted
+                else "repair"
+                if row[1] == "repair_continuation_queued" and accepted
                 else "preparing"
                 if accepted
                 else row[1]
