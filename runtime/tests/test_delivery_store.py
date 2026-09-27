@@ -1113,6 +1113,35 @@ def test_second_grant_binds_review_and_preserves_prior_authority(service, monkey
         store.repair_preflight(spec, recovery)
 
 
+def test_second_grant_migrates_empty_earlier_extension_table(service, monkeypatch):
+    store, request = service
+    with store._connect() as db:
+        db.execute("DROP TABLE delivery_repair_grant_extensions")
+        db.execute(
+            """CREATE TABLE delivery_repair_grant_extensions (
+                run_id TEXT PRIMARY KEY, grant_number INTEGER NOT NULL,
+                command_id TEXT NOT NULL, predecessor_workflow_id TEXT NOT NULL,
+                predecessor_execution_run_id TEXT NOT NULL,
+                predecessor_result_digest TEXT NOT NULL,
+                review_job_key TEXT NOT NULL, review_receipt_sha256 TEXT NOT NULL,
+                effective_policy_digest TEXT NOT NULL, granted_iterations INTEGER NOT NULL,
+                maximum_iteration INTEGER NOT NULL, granted_at TEXT NOT NULL
+            )"""
+        )
+    upgraded = DeliveryStore(store.config)
+    spec, _state, command, _receipt = _second_repair_grant_fixture(
+        upgraded, request, monkeypatch
+    )
+    assert upgraded.continue_repair(request["run_id"], command)[
+        "authorized_through_iteration"
+    ] == 7
+    with upgraded._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0])
+    upgraded.repair_preflight(spec, recovery)
+
+
 @pytest.mark.parametrize(
     "drift", ["claim", "candidate", "pr", "review_receipt", "effect", "attempt"]
 )
@@ -1155,6 +1184,32 @@ def test_second_grant_rejects_changed_authority_before_recording(
         assert db.execute(
             "SELECT COUNT(*) FROM delivery_repair_grant_extensions"
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "table,column,value", [
+        ("delivery_repair_grants", "predecessor_execution_run_id", "changed-old-execution"),
+        ("delivery_repair_grants", "granted_iterations", 1),
+        ("delivery_scope_amendments", "predecessor_execution_run_id", "changed-amendment"),
+        ("delivery_repair_grant_extensions", "session_id", "changed-session"),
+        ("delivery_repair_grant_extensions", "pr_head", "0" * 40),
+    ],
+)
+def test_second_grant_preflight_rejects_mutated_prior_authority(
+    service, monkeypatch, table, column, value
+):
+    store, request = service
+    spec, _state, command, _receipt = _second_repair_grant_fixture(
+        store, request, monkeypatch
+    )
+    store.continue_repair(request["run_id"], command)
+    with store._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0])
+        db.execute(f"UPDATE {table} SET {column}=? WHERE run_id='run-1'", (value,))
+    with pytest.raises(ValueError, match="frozen run, claim or authority"):
+        store.repair_preflight(spec, recovery)
         assert db.execute(
             "SELECT COUNT(*) FROM delivery_commands WHERE command_id=?",
             (command["command_id"],),
@@ -2735,15 +2790,26 @@ def test_continuation_rejects_temporal_projection_before_workflow_close(service,
         store._completed_temporal_result("run-1")
 
 
-def test_continuation_temporal_outage_is_pending_not_closed_conflict(service, monkeypatch):
-    store, _request = service
+def test_second_grant_preflight_temporal_outage_is_pending(service, monkeypatch):
+    store, request = service
+    spec, _state, command, _receipt = _second_repair_grant_fixture(
+        store, request, monkeypatch
+    )
+    store.continue_repair(request["run_id"], command)
+    with store._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0])
 
-    async def unavailable(*_args, **_kwargs):
-        raise OSError("disposable Temporal connection refused")
+    def unavailable(*_args, **_kwargs):
+        try:
+            raise OSError("disposable Temporal connection refused")
+        except OSError as exc:
+            raise ValueError("continuation predecessor Temporal closure is unproven") from exc
 
-    monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", unavailable)
+    monkeypatch.setattr(store, "_completed_temporal_result", unavailable)
     with pytest.raises(RepairReadbackPending, match="Temporal closure readback unavailable"):
-        store._completed_temporal_result("run-1")
+        store.repair_preflight(spec, recovery)
 
 
 def test_check_network_domains_reject_local_destinations():

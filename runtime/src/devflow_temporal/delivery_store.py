@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 from temporalio.client import Client, WorkflowExecutionStatus
-from temporalio.service import RPCError
 
 from .candidate import candidate_for
 from .contracts import canonical_json, digest
@@ -203,11 +202,34 @@ class DeliveryStore:
                     review_job_key TEXT NOT NULL,
                     review_receipt_sha256 TEXT NOT NULL,
                     effective_policy_digest TEXT NOT NULL,
+                    grant_record_digest TEXT NOT NULL,
+                    amendment_record_digest TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    pr_head TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
                     granted_iterations INTEGER NOT NULL CHECK (granted_iterations = 2),
                     maximum_iteration INTEGER NOT NULL,
                     granted_at TEXT NOT NULL
                 )"""
             )
+            extension_columns = {
+                row[1] for row in db.execute(
+                    "PRAGMA table_info(delivery_repair_grant_extensions)"
+                )
+            }
+            for name, kind in (
+                ("grant_record_digest", "TEXT"),
+                ("amendment_record_digest", "TEXT"),
+                ("candidate_id", "TEXT"),
+                ("pr_number", "INTEGER"),
+                ("pr_head", "TEXT"),
+                ("session_id", "TEXT"),
+            ):
+                if name not in extension_columns:
+                    db.execute(
+                        f"ALTER TABLE delivery_repair_grant_extensions ADD COLUMN {name} {kind}"
+                    )
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_scope_amendments (
                     run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
@@ -449,10 +471,6 @@ class DeliveryStore:
                 return pool.submit(
                     lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))
                 ).result(timeout=35)
-        except (RPCError, TimeoutError, ConnectionError, OSError) as exc:
-            from .delivery_repair import RepairReadbackPending
-
-            raise RepairReadbackPending("Temporal closure readback unavailable") from exc
         except Exception as exc:
             raise ValueError("continuation predecessor Temporal closure is unproven") from exc
 
@@ -1481,14 +1499,20 @@ class DeliveryStore:
                     raise ValueError("command ID already belongs to different inputs")
                 return json.loads(prior_command["response_json"])
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            prior_grant = db.execute(
+                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+            prior_amendment = db.execute(
+                "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
+            ).fetchone()
             attempts_snapshot = db.execute(
                 "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
             ).fetchall()
             effects_snapshot = db.execute(
                 "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
             ).fetchall()
-        if row is None:
-            raise ValueError("run ID not found")
+        if row is None or prior_grant is None or prior_amendment is None:
+            raise ValueError("numbered grant requires the original grant and amendment")
         prior = json.loads(row["recovery_json"] or "null")
         scope = self._scope_recovery(prior)
         if (
@@ -1568,6 +1592,8 @@ class DeliveryStore:
             "review_receipt_sha256": supplied["expected_review_receipt_sha256"],
             "review_container_id": saved_result.get("container_id"),
             "review_container_log_sha256": saved_result.get("container_log_sha256"),
+            "grant_record_digest": digest(dict(prior_grant)),
+            "amendment_record_digest": digest(dict(prior_amendment)),
             "additional_iterations": 2,
             "maximum_iteration": state["iteration"] + 2,
         }
@@ -1601,6 +1627,12 @@ class DeliveryStore:
             effects_now = db.execute(
                 "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
             ).fetchall()
+            grant_now = db.execute(
+                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+            amendment_now = db.execute(
+                "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
+            ).fetchone()
             extension = db.execute(
                 "SELECT 1 FROM delivery_repair_grant_extensions WHERE run_id=?", (run_id,)
             ).fetchone()
@@ -1610,6 +1642,10 @@ class DeliveryStore:
                 or claim is None
                 or claim["owner"] != f"external:devflow:{run_id}"
                 or extension is not None
+                or grant_now is None
+                or digest(dict(grant_now)) != recovery["grant_record_digest"]
+                or amendment_now is None
+                or digest(dict(amendment_now)) != recovery["amendment_record_digest"]
                 or [tuple(item) for item in attempts_now]
                 != [tuple(item) for item in attempts_snapshot]
                 or [tuple(item) for item in effects_now]
@@ -1618,12 +1654,21 @@ class DeliveryStore:
                 raise ValueError("numbered grant lost its frozen run or ownership")
             revision = current["revision"] + 1
             db.execute(
-                "INSERT INTO delivery_repair_grant_extensions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                """INSERT INTO delivery_repair_grant_extensions
+                   (run_id,grant_number,command_id,predecessor_workflow_id,
+                    predecessor_execution_run_id,predecessor_result_digest,
+                    review_job_key,review_receipt_sha256,effective_policy_digest,
+                    grant_record_digest,amendment_record_digest,candidate_id,
+                    pr_number,pr_head,session_id,granted_iterations,
+                    maximum_iteration,granted_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id, 2, supplied["command_id"], closed["workflow_id"],
                     closed["execution_run_id"], digest(state), review_job_key,
-                    recovery["review_receipt_sha256"], spec["policy_digest"], 2,
-                    recovery["maximum_iteration"], _now(),
+                    recovery["review_receipt_sha256"], spec["policy_digest"],
+                    recovery["grant_record_digest"], recovery["amendment_record_digest"],
+                    candidate["id"], pr["number"], pr["head"], recovery["session_id"],
+                    2, recovery["maximum_iteration"], _now(),
                 ),
             )
             db.execute(
@@ -1733,9 +1778,18 @@ class DeliveryStore:
             or failed_gate_diagnostics(state, spec) != recovery.get("findings")
         ):
             raise ValueError("second grant does not bind the failed independent review")
-        closed = self._completed_temporal_result(
-            run_id, workflow_id=recovery["predecessor_workflow_id"]
-        )
+        try:
+            closed = self._completed_temporal_result(
+                run_id, workflow_id=recovery["predecessor_workflow_id"]
+            )
+        except ValueError as exc:
+            from temporalio.service import RPCError
+
+            from .delivery_repair import RepairReadbackPending
+
+            if isinstance(exc.__cause__, (RPCError, TimeoutError, ConnectionError, OSError)):
+                raise RepairReadbackPending("Temporal closure readback unavailable") from exc
+            raise
         if (
             closed["workflow_id"] != recovery["predecessor_workflow_id"]
             or closed["execution_run_id"] != recovery["predecessor_execution_run_id"]
@@ -1805,6 +1859,8 @@ class DeliveryStore:
             or amendment["original_policy_digest"] != original["policy_digest"]
             or amendment["effective_policy_digest"] != spec["policy_digest"]
             or json.loads(amendment["added_paths_json"]) != scope["added_paths"]
+            or digest(dict(grant)) != recovery.get("grant_record_digest")
+            or digest(dict(amendment)) != recovery.get("amendment_record_digest")
             or (queued and (
                 extension is None
                 or extension["grant_number"] != 2
@@ -1818,6 +1874,13 @@ class DeliveryStore:
                 or extension["review_receipt_sha256"]
                 != recovery["review_receipt_sha256"]
                 or extension["effective_policy_digest"] != spec["policy_digest"]
+                or extension["grant_record_digest"] != recovery["grant_record_digest"]
+                or extension["amendment_record_digest"]
+                != recovery["amendment_record_digest"]
+                or extension["candidate_id"] != state["candidate"]["id"]
+                or extension["pr_number"] != state["pull_request"]["number"]
+                or extension["pr_head"] != state["pull_request"]["head"]
+                or extension["session_id"] != recovery["session_id"]
                 or extension["granted_iterations"] != 2
                 or extension["maximum_iteration"] != recovery["maximum_iteration"]
             ))
