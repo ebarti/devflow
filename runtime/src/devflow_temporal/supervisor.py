@@ -51,6 +51,11 @@ class DeliverySupervisor:
 
     def _claim(self, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         spec = request["spec"]
+        generation = request.get("attempt_generation", 0)
+        if type(generation) is not int or generation not in (0, 1) or (
+            generation and request["role"] != "implement"
+        ):
+            raise ValueError("unsupported role attempt recovery generation")
         identity = {
             "run_id": spec["run_id"],
             "role": request["role"],
@@ -58,6 +63,8 @@ class DeliverySupervisor:
             "candidate_id": request["candidate"]["id"],
             "policy_digest": spec["policy_digest"],
         }
+        if generation:
+            identity["attempt_generation"] = generation
         job_key = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
         folder = Path(spec["state_dir"]) / "attempts" / job_key
         folder.mkdir(parents=True, mode=0o700, exist_ok=True)

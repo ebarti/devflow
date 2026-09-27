@@ -128,6 +128,31 @@ def _write_once(path: Path, content: bytes) -> None:
         stream.write(content)
 
 
+def _remove_generated_project_directory(workspace: Path) -> None:
+    """Discard only Codex's empty project directory between owned role turns.
+
+    rmdir supplies the final atomic emptiness check. A project config, symlink,
+    non-owned directory, or concurrent replacement remains a hard failure.
+    """
+
+    project = workspace / ".codex"
+    try:
+        info = project.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError("project Codex configuration is not admitted")
+    try:
+        current = project.lstat()
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError("project Codex directory changed before role launch")
+        project.rmdir()
+    except OSError as exc:
+        raise ValueError("project Codex configuration is not admitted") from exc
+    if project.exists() or project.is_symlink():
+        raise ValueError("project Codex directory changed before role launch")
+
+
 def _native_env(
     home: Path, codex_home: Path, scratch: Path, toolchain_roots: tuple[Path, ...] = ()
 ) -> dict[str, str]:
@@ -246,8 +271,7 @@ def prepare_native_role(
     if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
         raise ValueError("real role did not require the native profile boundary")
     workspace = Path(request["workspace"]).resolve(strict=True)
-    if (workspace / ".codex").exists() or (workspace / ".codex").is_symlink():
-        raise ValueError("project Codex configuration is not admitted")
+    _remove_generated_project_directory(workspace)
     role_home = Path(spec["state_dir"]) / "role-homes" / request["role"]
     if request["role"] != "implement":
         role_home /= str(request["iteration"])

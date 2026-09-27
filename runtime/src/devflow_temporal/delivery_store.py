@@ -912,12 +912,309 @@ class DeliveryStore:
             )
         return response
 
+    def retry_prelaunch(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+        """Retry one proved no-process repair launch under its existing grant."""
+        from .delivery_broker import DeliveryBroker
+        from .delivery_repair import (
+            confirmed_container_cleanup,
+            current_head_ci_evidence,
+            published_identity,
+        )
+
+        required = {
+            "command_id",
+            "expected_revision",
+            "expected_iteration",
+            "expected_candidate_id",
+            "expected_pr_number",
+            "expected_pr_head",
+        }
+        if not isinstance(supplied, dict) or set(supplied) != required:
+            raise ValueError("prelaunch retry fields do not match the contract")
+        command_id = supplied["command_id"]
+        if (
+            not isinstance(command_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", command_id)
+            or type(supplied["expected_revision"]) is not int
+            or type(supplied["expected_iteration"]) is not int
+            or type(supplied["expected_pr_number"]) is not int
+            or supplied["expected_revision"] < 1
+            or supplied["expected_iteration"] < 1
+            or supplied["expected_pr_number"] < 1
+            or not isinstance(supplied["expected_candidate_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", supplied["expected_candidate_id"])
+            or not isinstance(supplied["expected_pr_head"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", supplied["expected_pr_head"])
+        ):
+            raise ValueError("invalid prelaunch retry identity")
+        command_digest = digest({"run_id": run_id, **supplied})
+        with self._connect() as db:
+            prior = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            if prior:
+                if prior["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(prior["response_json"])
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            grant = db.execute(
+                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if row is None or grant is None or not row["recovery_json"]:
+            raise ValueError("prelaunch retry has no original repair grant")
+        spec = json.loads(row["request_json"])
+        original = json.loads(row["recovery_json"])
+        if (
+            original.get("kind") != "repair_continuation"
+            or digest(DeliveryConfig.load(self.config.path).raw) != spec["config_digest"]
+        ):
+            raise ValueError("prelaunch retry changed the frozen repair authority")
+        closed = self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+        state = closed["result"]
+        if not isinstance(state, dict):
+            raise ValueError("closed prelaunch result is missing")
+        candidate = state.get("candidate")
+        pr = state.get("pull_request")
+        roles = state.get("roles")
+        iteration = state.get("iteration")
+        if (
+            closed["workflow_id"] != row["workflow_id"]
+            or closed["request_digest"] != row["request_digest"]
+            or closed["recovery_digest"] != digest(original)
+            or state.get("run_id") != run_id
+            or state.get("phase") != "blocked"
+            or state.get("outcome") != "blocked"
+            or state.get("execution_state") != "blocked"
+            or state.get("cleanup") != "none"
+            or state.get("error") != "implementer did not establish a pass"
+            or state.get("revision") != supplied["expected_revision"]
+            or type(iteration) is not int
+            or iteration != supplied["expected_iteration"]
+            or iteration != grant["maximum_iteration"]
+            or iteration != original.get("maximum_iteration")
+            or iteration > spec["policy"]["max_repairs"] + 2
+            or not isinstance(candidate, dict)
+            or candidate.get("id") != supplied["expected_candidate_id"]
+            or not isinstance(pr, dict)
+            or pr.get("number") != supplied["expected_pr_number"]
+            or pr.get("head") != supplied["expected_pr_head"]
+            or not isinstance(roles, list)
+            or len(roles) < 2
+            or state.get("checks") != {}
+            or grant["predecessor_workflow_id"] != original.get("predecessor_workflow_id")
+            or grant["predecessor_execution_run_id"]
+            != original.get("predecessor_execution_run_id")
+            or grant["predecessor_result_digest"] != digest(original.get("state"))
+            or grant["granted_iterations"] != original.get("additional_iterations")
+        ):
+            raise ValueError("closed result does not authorize a prelaunch retry")
+        failed, review = roles[-1], roles[-2]
+        session = original.get("session_id")
+        if (
+            not isinstance(failed, dict)
+            or failed.get("role") != "implement"
+            or failed.get("iteration") != iteration
+            or failed.get("status") != "blocked"
+            or failed.get("finish_reason") != "prelaunch"
+            or failed.get("cleanup") != "confirmed"
+            or failed.get("session_id") is not None
+            or not isinstance(review, dict)
+            or review.get("role") != "review"
+            or review.get("iteration") != iteration - 1
+            or review.get("status") != "findings"
+            or review.get("cleanup") != "confirmed"
+            or not isinstance(review.get("findings"), list)
+            or not review["findings"]
+            or not isinstance(session, str)
+            or not session
+            or any(
+                role.get("session_id") != session
+                for role in roles
+                if role.get("role") == "implement" and role.get("session_id")
+            )
+            or any(role.get("cleanup") != "confirmed" for role in roles)
+        ):
+            raise ValueError("failed role or sealed review findings cannot be retried")
+        with self._connect() as db:
+            attempts = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+        failed_attempts = [
+            item
+            for item in attempts
+            if item["role"] == "implement" and item["iteration"] == iteration
+        ]
+        if len(failed_attempts) != 1:
+            raise ValueError("failed prelaunch attempt is ambiguous")
+        failed_attempt = failed_attempts[0]
+        receipt = json.loads(failed_attempt["result_json"] or "null")
+        folder = Path(spec["state_dir"]) / "attempts" / failed_attempt["job_key"]
+        try:
+            metadata = folder.lstat()
+        except OSError as exc:
+            raise ValueError("failed prelaunch attempt directory is unavailable") from exc
+        if (
+            failed_attempt["state"] != "finished"
+            or failed_attempt["cleanup"] != "confirmed"
+            or failed_attempt["session_id"] is not None
+            or failed_attempt["pid"] is not None
+            or failed_attempt["process_identity"] is not None
+            or failed_attempt["result_path"] != str(folder / "result.json")
+            or not isinstance(receipt, dict)
+            or receipt.get("status") != "blocked"
+            or receipt.get("finish_reason") != "prelaunch"
+            or receipt.get("session_id") is not None
+            or receipt.get("cleanup") != "confirmed"
+            or not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.getuid()
+            or any(folder.iterdir())
+            or len(attempts) != len(roles)
+            or any(
+                item["state"] != "finished" or item["cleanup"] != "confirmed"
+                for item in attempts
+            )
+        ):
+            raise ValueError("prelaunch provider absence or cleanup is unproven")
+        broker = DeliveryBroker(self, spec)
+        observed_pr = published_identity(broker, candidate, pr)
+        confirmed_container_cleanup(spec)
+        ci_evidence = current_head_ci_evidence(broker, observed_pr)
+        review_findings = list(review["findings"])
+        findings = [*review_findings, *ci_evidence["diagnostics"]]
+        workflow_id = f"delivery-{run_id}-repair-prelaunch-retry-1"
+        recovery = {
+            "kind": "repair_prelaunch_retry",
+            "original_recovery": original,
+            "predecessor_workflow_id": closed["workflow_id"],
+            "predecessor_execution_run_id": closed["execution_run_id"],
+            "predecessor_closed_at": closed["closed_at"],
+            "predecessor_result_digest": digest(state),
+            "failed_job_key": failed_attempt["job_key"],
+            "state": state,
+            "candidate": candidate,
+            "pull_request": observed_pr,
+            "session_id": session,
+            "review_findings": review_findings,
+            "ci_evidence": ci_evidence,
+            "findings": findings,
+            "maximum_iteration": iteration,
+        }
+        response = {
+            "run_id": run_id,
+            "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
+            "phase": "repair_prelaunch_retry_queued",
+            "workflow_id": workflow_id,
+            "authorized_through_iteration": iteration,
+            "existing": False,
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            if prior:
+                if prior["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(prior["response_json"])
+            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            current_grant = db.execute(
+                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            current_attempts = db.execute(
+                "SELECT job_key,state,cleanup,result_json,session_id,pid,process_identity "
+                "FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects = db.execute(
+                "SELECT kind,state,observed_json FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+            if (
+                current is None
+                or current["request_json"] != row["request_json"]
+                or current["workflow_id"] != row["workflow_id"]
+                or current["recovery_json"] != row["recovery_json"]
+                or current["phase"] != "blocked"
+                or current["outcome"] != "blocked"
+                or current["execution_state"] != "blocked"
+                or current["cleanup"] != "none"
+                or current["error"] != state["error"]
+                or current["protocol_revision"] != state["revision"]
+                or current["iteration"] != iteration
+                or json.loads(current["candidate_json"] or "null") != candidate
+                or json.loads(current["pr_json"] or "null") != pr
+                or json.loads(current["checks_json"] or "{}") != state["checks"]
+                or current_grant is None
+                or dict(current_grant) != dict(grant)
+                or claim is None
+                or claim["owner"] != f"external:devflow:{run_id}"
+                or len(current_attempts) != len(attempts)
+                or sorted(tuple(item) for item in current_attempts)
+                != sorted(
+                    (
+                        item["job_key"], item["state"], item["cleanup"], item["result_json"],
+                        item["session_id"], item["pid"], item["process_identity"]
+                    )
+                    for item in attempts
+                )
+                or not any(item["kind"] == "publish" for item in effects)
+                or any(
+                    item["state"] != "complete" or item["observed_json"] is None
+                    for item in effects
+                )
+                or any(folder.iterdir())
+            ):
+                raise ValueError("prelaunch retry lost its frozen run or ownership")
+            revision = current["revision"] + 1
+            db.execute(
+                """UPDATE delivery_runs SET phase='repair_prelaunch_retry_queued',
+                   execution_state='queued',outcome=NULL,error=NULL,revision=?,
+                   workflow_id=?,recovery_json=?,updated_at=? WHERE run_id=?""",
+                (revision, workflow_id, canonical_json(recovery), _now(), run_id),
+            )
+            db.execute(
+                """UPDATE delivery_outbox SET state='pending',last_error=NULL,updated_at=?
+                   WHERE run_id=?""",
+                (_now(), run_id),
+            )
+            self._event(
+                db,
+                run_id,
+                revision,
+                "repair_prelaunch_retry_queued",
+                "Sealed no-process repair attempt queued under the existing grant",
+                {
+                    "iteration": iteration,
+                    "candidate_id": candidate["id"],
+                    "pr_number": pr["number"],
+                    "failed_job_key": failed_attempt["job_key"],
+                    "predecessor_execution_run_id": closed["execution_run_id"],
+                    "diagnostics_digest": digest(findings),
+                },
+            )
+            db.execute(
+                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                (command_id, run_id, command_digest, canonical_json(response)),
+            )
+        return response
+
     def repair_preflight(self, spec: dict[str, Any], recovery: dict[str, Any]) -> None:
         """Recheck the frozen command before a resumed implementer can execute."""
         from .delivery_broker import DeliveryBroker
         from .delivery_repair import confirmed_container_cleanup, published_identity
 
         run_id = spec["run_id"]
+        retry = recovery.get("kind") == "repair_prelaunch_retry"
+        original = recovery.get("original_recovery") if retry else recovery
+        if not isinstance(original, dict) or original.get("kind") != "repair_continuation":
+            raise ValueError("repair preflight has no original grant")
+        expected_workflow = (
+            f"delivery-{run_id}-repair-prelaunch-retry-1"
+            if retry
+            else f"delivery-{run_id}-repair-continuation-1"
+        )
         with self._connect() as db:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             grant = db.execute(
@@ -930,25 +1227,35 @@ class DeliveryStore:
             effects = db.execute(
                 "SELECT state FROM delivery_effects WHERE run_id=?", (run_id,)
             ).fetchall()
+            failed_attempt = (
+                db.execute(
+                    "SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?",
+                    (recovery.get("failed_job_key"), run_id),
+                ).fetchone()
+                if retry
+                else None
+            )
         if (
             row is None
             or grant is None
             or row["request_json"] != canonical_json(spec)
-            or row["workflow_id"] != f"delivery-{run_id}-repair-continuation-1"
+            or row["workflow_id"] != expected_workflow
             or row["recovery_json"] != canonical_json(recovery)
             or row["phase"]
             not in {
                 "repair_continuation_queued",
+                "repair_prelaunch_retry_queued",
                 "repair_preflight",
                 "tracker_start",
                 "repair",
             }
             or row["execution_state"] not in {"queued", "running"}
-            or grant["predecessor_workflow_id"] != recovery["predecessor_workflow_id"]
+            or grant["predecessor_workflow_id"] != original["predecessor_workflow_id"]
             or grant["predecessor_execution_run_id"]
-            != recovery["predecessor_execution_run_id"]
-            or grant["predecessor_result_digest"] != digest(recovery["state"])
-            or grant["granted_iterations"] != recovery["additional_iterations"]
+            != original["predecessor_execution_run_id"]
+            or grant["predecessor_result_digest"] != digest(original["state"])
+            or grant["granted_iterations"] != original["additional_iterations"]
+            or grant["maximum_iteration"] != original["maximum_iteration"]
             or grant["maximum_iteration"] != recovery["maximum_iteration"]
             or claim is None
             or claim["owner"] != f"external:devflow:{run_id}"
@@ -959,6 +1266,34 @@ class DeliveryStore:
             or any(item["state"] != "complete" for item in effects)
         ):
             raise ValueError("repair grant or owned resources changed before resume")
+        if retry:
+            folder = Path(spec["state_dir"]) / "attempts" / recovery["failed_job_key"]
+            try:
+                metadata = folder.lstat()
+            except OSError as exc:
+                raise ValueError("failed prelaunch attempt directory is unavailable") from exc
+            receipt = (
+                json.loads(failed_attempt["result_json"] or "null")
+                if failed_attempt
+                else None
+            )
+            if (
+                failed_attempt is None
+                or failed_attempt["role"] != "implement"
+                or failed_attempt["iteration"] != recovery["maximum_iteration"]
+                or failed_attempt["state"] != "finished"
+                or failed_attempt["cleanup"] != "confirmed"
+                or failed_attempt["session_id"] is not None
+                or failed_attempt["pid"] is not None
+                or failed_attempt["process_identity"] is not None
+                or not isinstance(receipt, dict)
+                or receipt.get("finish_reason") != "prelaunch"
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+                or any(folder.iterdir())
+            ):
+                raise ValueError("failed prelaunch attempt changed before retry")
         published_identity(
             DeliveryBroker(self, spec),
             recovery["candidate"],
@@ -1184,6 +1519,7 @@ class DeliveryStore:
                 "accepted",
                 "publication_recovery_queued",
                 "repair_continuation_queued",
+                "repair_prelaunch_retry_queued",
             }:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
@@ -1198,7 +1534,8 @@ class DeliveryStore:
                 "publishing"
                 if row[1] == "publication_recovery_queued" and accepted
                 else "repair"
-                if row[1] == "repair_continuation_queued" and accepted
+                if row[1] in {"repair_continuation_queued", "repair_prelaunch_retry_queued"}
+                and accepted
                 else "preparing"
                 if accepted
                 else row[1]

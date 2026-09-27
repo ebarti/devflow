@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .contracts import canonical_json
+from .contracts import canonical_json, digest
 from .delivery_broker import BrokerReadbackUnavailable, DeliveryBroker, _git
 from .delivery_output import visible_output
 from .delivery_workflow import _broker_findings
@@ -135,6 +136,61 @@ def _ci_diagnostics(
             )
         )
     return findings
+
+
+def current_head_ci_evidence(
+    broker: DeliveryBroker, pr: dict[str, Any]
+) -> dict[str, Any]:
+    """Seal terminal required-CI readback for the exact published head.
+
+    This is repair context, never a replacement for the later required CI gate.
+    """
+
+    required = broker.spec["policy"].get("required_ci", [])
+    if not required:
+        return {"head": pr["head"], "state": "unconfigured", "failed": [], "diagnostics": []}
+    try:
+        result = asyncio.run(broker.checks(pr, timeout_seconds=0))
+    except (
+        OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, TypeError, KeyError
+    ) as exc:
+        raise ValueError("current-head required CI readback is unavailable") from exc
+    checks = result.get("checks")
+    terminal = {"SUCCESS", "FAILURE", "CANCELLED", "TIMED_OUT"}
+    if (
+        result.get("state") not in {"passed", "failed"}
+        or not isinstance(checks, dict)
+        or any(
+            not isinstance(checks.get(name), dict)
+            or checks[name].get("conclusion") not in terminal
+            for name in required
+        )
+        or (result.get("head") is not None and result["head"] != pr["head"])
+    ):
+        raise ValueError("current-head required CI is incomplete or mismatched")
+    reported_failed = result.get("failed", [])
+    if not isinstance(reported_failed, list):
+        raise ValueError("current-head required CI failure identity is malformed")
+    failed = sorted(
+        name for name in required if checks[name]["conclusion"] != "SUCCESS"
+    )
+    if result.get("state") != ("failed" if failed else "passed") or set(
+        reported_failed
+    ) != set(failed):
+        raise ValueError("current-head required CI failure identity changed")
+    try:
+        diagnostics = _ci_diagnostics(result, broker.spec, pr) if failed else []
+    except (OSError, subprocess.TimeoutExpired, TypeError, KeyError, ValueError) as exc:
+        raise ValueError("current-head required CI job log is unavailable") from exc
+    if len(diagnostics) != len(failed):
+        raise ValueError("current-head required CI diagnostics are incomplete")
+    return {
+        "head": pr["head"],
+        "state": result["state"],
+        "failed": failed,
+        "diagnostics": diagnostics,
+        "diagnostics_digest": digest(diagnostics),
+    }
 
 
 def published_identity(

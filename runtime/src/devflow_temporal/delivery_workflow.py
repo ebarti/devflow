@@ -10,6 +10,8 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
+from .contracts import digest
+
 
 def _broker_findings(stage: str, result: dict[str, Any], *, iteration: int) -> list[str]:
     """Give a repair role bounded, candidate-bound broker diagnostics as data."""
@@ -238,7 +240,7 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if recovery is not None:
-            if recovery.get("kind") == "repair_continuation":
+            if recovery.get("kind") in {"repair_continuation", "repair_prelaunch_retry"}:
                 return await self._resume_repair(spec, recovery)
             return await self._resume_publication(spec, recovery)
         self.state = {
@@ -354,29 +356,66 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any]
     ) -> dict[str, Any]:
         previous = recovery["state"]
-        start = previous["iteration"] + 1
+        prelaunch_retry = recovery.get("kind") == "repair_prelaunch_retry"
+        start = previous["iteration"] if prelaunch_retry else previous["iteration"] + 1
         limit = recovery["maximum_iteration"]
+        roles = previous.get("roles", [])
+        previous_implementer = next(
+            (
+                role.get("session_id")
+                for role in reversed(roles)
+                if role.get("role") == "implement" and role.get("session_id")
+            ),
+            None,
+        )
+        original = recovery.get("original_recovery") if prelaunch_retry else None
         if (
             previous.get("run_id") != spec["run_id"]
             or previous.get("phase") != "blocked"
             or previous.get("outcome") != "blocked"
             or previous.get("cleanup") != "none"
             or recovery.get("candidate") != previous.get("candidate")
-            or recovery.get("session_id") != next(
-                (
-                    role.get("session_id")
-                    for role in reversed(previous.get("roles", []))
-                    if role.get("role") == "implement"
-                ),
-                None,
-            )
-            or recovery.get("additional_iterations") not in (1, 2)
-            or limit != previous["iteration"] + recovery["additional_iterations"]
+            or recovery.get("session_id") != previous_implementer
             or limit > spec["policy"]["max_repairs"] + 2
             or start > limit
             or not recovery.get("findings")
         ):
             raise ValueError("repair continuation changed the bounded closed checkpoint")
+        if prelaunch_retry:
+            if (
+                not isinstance(original, dict)
+                or original.get("kind") != "repair_continuation"
+                or original.get("maximum_iteration") != limit
+                or original.get("session_id") != previous_implementer
+                or previous.get("error") != "implementer did not establish a pass"
+                or len(roles) < 2
+                or roles[-1].get("role") != "implement"
+                or roles[-1].get("iteration") != start
+                or roles[-1].get("status") != "blocked"
+                or roles[-1].get("finish_reason") != "prelaunch"
+                or roles[-1].get("session_id") is not None
+                or roles[-1].get("cleanup") != "confirmed"
+                or roles[-2].get("role") != "review"
+                or roles[-2].get("iteration") != start - 1
+                or roles[-2].get("status") != "findings"
+                or recovery.get("review_findings") != roles[-2].get("findings")
+                or not isinstance(recovery.get("ci_evidence"), dict)
+                or recovery["ci_evidence"].get("head")
+                != previous["pull_request"]["head"]
+                or recovery["ci_evidence"].get("diagnostics_digest")
+                != digest(recovery["ci_evidence"].get("diagnostics"))
+                or recovery["findings"]
+                != [
+                    *recovery["review_findings"],
+                    *recovery["ci_evidence"]["diagnostics"],
+                ]
+            ):
+                raise ValueError("repair retry did not bind the failed prelaunch attempt")
+        elif (
+            recovery.get("additional_iterations") not in (1, 2)
+            or limit != previous["iteration"] + recovery["additional_iterations"]
+        ):
+            raise ValueError("repair continuation changed the original grant")
         self.state = {
             **previous,
             "phase": "repair_preflight",
@@ -445,6 +484,7 @@ class DeliveryWorkflow:
             continuation=None,
             recovery=None,
             authorized_max_iteration=limit,
+            attempt_generation=1 if prelaunch_retry else 0,
         )
 
     async def _run_iterations(
@@ -457,6 +497,7 @@ class DeliveryWorkflow:
         continuation: dict[str, Any] | None,
         recovery: dict[str, Any] | None,
         authorized_max_iteration: int | None = None,
+        attempt_generation: int = 0,
     ) -> dict[str, Any]:
         max_repairs = (
             authorized_max_iteration
@@ -510,6 +551,9 @@ class DeliveryWorkflow:
                             "findings": repair_findings,
                             "resume_session": prior_implementer_session,
                             "continuation": bool(continuation and iteration == 0),
+                            "attempt_generation": (
+                                attempt_generation if iteration == start_iteration else 0
+                            ),
                         },
                     )
                 except Exception as exc:

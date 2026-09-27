@@ -285,6 +285,16 @@ def create_app(config_path: Path) -> FastAPI:
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.post("/api/runs/{run_id}/retry-prelaunch")
+    async def retry_prelaunch(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        try:
+            return await asyncio.to_thread(
+                service.store.retry_prelaunch, run_id, await request.json()
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.get("/api/runs/{run_id}")
     async def detail(request: Request, run_id: str) -> dict[str, Any]:
         _session(request)
