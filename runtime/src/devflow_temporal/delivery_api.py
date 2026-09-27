@@ -110,9 +110,9 @@ class DeliveryService:
         if not pending:
             return
         for item in pending:
-            spec = json.loads(item["request_json"])
-            workflow_id = item["workflow_id"] or "delivery-" + spec["run_id"]
             recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
+            spec = self.store.effective_spec(item["run_id"])
+            workflow_id = item["workflow_id"] or "delivery-" + spec["run_id"]
             handle = client.get_workflow_handle(workflow_id)
             try:
                 description = await handle.describe()
@@ -293,6 +293,16 @@ def create_app(config_path: Path) -> FastAPI:
                 service.store.retry_prelaunch, run_id, await request.json()
             )
         except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/amend-scope")
+    async def amend_scope(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        try:
+            return await asyncio.to_thread(
+                service.store.amend_scope, run_id, await request.json()
+            )
+        except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/runs/{run_id}")

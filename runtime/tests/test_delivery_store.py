@@ -470,6 +470,302 @@ def test_prelaunch_retry_workflow_activates_same_iteration_with_sealed_context(
     assert captured["repair_findings"] == state["roles"][-2]["findings"]
 
 
+def _scope_amendment_fixture(store, request, monkeypatch):
+    source = Path(store.config.raw["repositories"]["fixture"]["source_path"])
+    additions = ["tests/capability-a.test.ts", "tests/capability-b.test.ts"]
+    (source / "tests").mkdir()
+    for name in additions:
+        (source / name).write_text("expect(138).toBe(138)\n")
+    _git(source, "add", "tests")
+    _git(source, "commit", "-qm", "Tracked test consumers")
+    store.config.raw["repositories"]["fixture"]["expected_base_sha"] = _git(
+        source, "rev-parse", "HEAD"
+    )
+    store.config.path.write_text(json.dumps(store.config.raw))
+    original, initial, grant = _failed_published_repair_fixture(
+        store, request, monkeypatch
+    )
+    store.continue_repair(request["run_id"], grant)
+    store.mark_start(request["run_id"], accepted=True)
+    with store._connect() as db:
+        previous_recovery = json.loads(
+            db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0]
+        )
+    broker = DeliveryBroker(store, original)
+    (broker.checkout / "README.md").write_text("Further owned implementation\n")
+    candidate = broker.candidate()
+    role3 = {
+        "role": "implement", "iteration": 3, "status": "pass",
+        "cleanup": "confirmed", "session_id": "original-session", "candidate": candidate,
+    }
+    review3 = {
+        "role": "review", "iteration": 3, "status": "findings",
+        "cleanup": "confirmed", "session_id": "independent-session-3",
+        "candidate": candidate, "findings": ["Preserve the new Required capability"],
+    }
+    raw4 = {
+        "role": "implement", "iteration": 4, "status": "findings",
+        "session_id": "original-session",
+        "finish_reason": "done",
+        "findings": ["Two tracked manifest tests expect 137, observed 138"],
+    }
+    role4 = {**raw4, "cleanup": "confirmed", "candidate": candidate}
+    roles = [*initial["roles"], role3, review3, role4]
+    folder = Path(original["state_dir"]) / "attempts" / "role-implement-4"
+    folder.mkdir(parents=True, mode=0o700)
+    receipt = folder / "result.json"
+    receipt.write_text(json.dumps(raw4))
+    receipt.chmod(0o600)
+    with store._connect() as db:
+        for key, role, path in (
+            ("role-implement-3", role3, None),
+            ("role-review-3", review3, None),
+            ("role-implement-4", {**raw4, "cleanup": "confirmed"}, receipt),
+        ):
+            db.execute(
+                """INSERT INTO delivery_attempts
+                   (job_key,run_id,role,iteration,candidate_id,state,session_id,
+                    result_json,result_path,cleanup)
+                   VALUES (?,?,?,?,?,'finished',?,?,?,'confirmed')""",
+                (
+                    key, request["run_id"], role["role"], role["iteration"],
+                    candidate["id"], role["session_id"], json.dumps(role),
+                    str(path) if path else None,
+                ),
+            )
+    state = {
+        **initial,
+        "revision": 23,
+        "iteration": 4,
+        "error": "implementer did not establish a pass",
+        "candidate": initial["candidate"],  # Public projection can lag the final activity.
+        "roles": roles,
+        "checks": {},
+        "candidate_revision": 4,
+    }
+    store.project(
+        request["run_id"], phase="blocked", execution_state="blocked",
+        event_type="blocked", message=state["error"], candidate=initial["candidate"],
+        pull_request=state["pull_request"], checks={}, iteration=4,
+        protocol_revision=23, outcome="blocked", cleanup="none", error=state["error"],
+    )
+    closed = {
+        "workflow_id": "delivery-run-1-repair-continuation-1",
+        "execution_run_id": "closed-implementation-4",
+        "closed_at": "2026-09-27T02:48:01+00:00",
+        "request_digest": original["request_digest"],
+        "recovery_digest": digest(previous_recovery),
+        "result": state,
+    }
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda _id, **_kw: closed)
+    amended = copy.deepcopy(store.config.raw)
+    amended["repositories"]["fixture"]["allowed_paths"] += additions
+    path = store.config.state_root / "amendments" / "one.json"
+    path.parent.mkdir(mode=0o700)
+    path.write_text(json.dumps(amended))
+    path.chmod(0o600)
+    command = {
+        "command_id": "amend-scope-1", "expected_revision": 23,
+        "expected_iteration": 4, "expected_candidate_id": candidate["id"],
+        "expected_pr_number": 7, "expected_pr_head": candidate["head"],
+        "added_paths": additions, "amended_config_path": str(path),
+        "amended_config_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    return original, state, command, closed
+
+
+def test_scope_amendment_seals_only_two_paths_and_preserves_request_and_grant(
+    service, monkeypatch
+):
+    store, request = service
+    original, state, command, _closed = _scope_amendment_fixture(
+        store, request, monkeypatch
+    )
+    response = store.amend_scope("run-1", command)
+    assert response["phase"] == "scope_amendment_queued"
+    assert response["authorized_through_iteration"] == 5
+    assert store.amend_scope("run-1", command) == response
+    with store._connect() as db:
+        run = db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone()
+        grant = db.execute("SELECT * FROM delivery_repair_grants WHERE run_id='run-1'").fetchone()
+        amendment = db.execute(
+            "SELECT * FROM delivery_scope_amendments WHERE run_id='run-1'"
+        ).fetchone()
+        claim = store.state.claim_for(db, request["work_id"])
+    recovery = json.loads(run["recovery_json"])
+    effective = store.effective_spec("run-1")
+    assert json.loads(run["request_json"]) == original
+    assert grant["maximum_iteration"] == 4
+    assert amendment["maximum_iteration"] == 5
+    assert claim["owner"] == "external:devflow:run-1"
+    assert recovery["state"] == state
+    assert recovery["source_candidate"] == state["roles"][-1]["candidate"]
+    assert recovery["source_candidate"] != state["candidate"]
+    assert effective["policy"]["allowed_paths"] == ["README.md", *command["added_paths"]]
+    assert effective["request_digest"] == original["request_digest"]
+    assert effective["policy_digest"] != original["policy_digest"]
+    store.scope_preflight(effective, recovery)
+    with pytest.raises(ValueError, match="scope amendment"):
+        store.amend_scope("run-1", {**command, "command_id": "another-amendment"})
+
+
+@pytest.mark.parametrize(
+    "drift", [
+        "claim", "candidate", "receipt", "path", "config", "authority",
+        "extra_path", "head", "cleanup", "active_attempt", "unknown_effect",
+    ]
+)
+def test_scope_amendment_rejects_changed_authority_without_queue(
+    service, monkeypatch, drift
+):
+    store, request = service
+    original, _state, command, _closed = _scope_amendment_fixture(
+        store, request, monkeypatch
+    )
+    if drift == "claim":
+        with store._connect() as db:
+            store.state.release_work(db, request["work_id"], "external:devflow:run-1")
+    elif drift == "candidate":
+        (Path(original["checkout"]) / "README.md").write_text("Late unauthorized edit\n")
+    elif drift == "receipt":
+        with store._connect() as db:
+            path = db.execute(
+                "SELECT result_path FROM delivery_attempts WHERE job_key='role-implement-4'"
+            ).fetchone()[0]
+        Path(path).write_text("{}")
+    elif drift == "path":
+        command["added_paths"] = ["tests/capability-a.test.ts", "tests/not-tracked.test.ts"]
+    elif drift == "config":
+        Path(command["amended_config_path"]).write_text("{}")
+    elif drift in {"authority", "extra_path"}:
+        path = Path(command["amended_config_path"])
+        config = json.loads(path.read_text())
+        if drift == "authority":
+            config["roles"]["implement"]["model"] = "different-model"
+        else:
+            config["repositories"]["fixture"]["allowed_paths"].append("tests/third.test.ts")
+        path.write_text(json.dumps(config))
+        command["amended_config_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    elif drift == "head":
+        command["expected_pr_head"] = "a" * 40
+    elif drift == "cleanup":
+        with store._connect() as db:
+            db.execute(
+                "UPDATE delivery_attempts SET cleanup='unknown' "
+                "WHERE job_key='role-implement-4'"
+            )
+    elif drift == "active_attempt":
+        with store._connect() as db:
+            db.execute(
+                "UPDATE delivery_attempts SET state='running' "
+                "WHERE job_key='role-implement-4'"
+            )
+    else:
+        with store._connect() as db:
+            db.execute(
+                "UPDATE delivery_effects SET state='pending' "
+                "WHERE effect_key='publish:run-1:2'"
+            )
+    with pytest.raises((ValueError, OSError)):
+        store.amend_scope("run-1", command)
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_scope_amendments").fetchone()[0] == 0
+        assert db.execute(
+            "SELECT workflow_id FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0] == "delivery-run-1-repair-continuation-1"
+
+
+@pytest.mark.asyncio
+async def test_public_scope_amendment_dispatches_one_original_session_temporal_role(
+    service, monkeypatch
+):
+    store, request = service
+    async with await WorkflowEnvironment.start_local() as environment:
+        store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
+        store.config.raw["queue"] = "scope-amendment-public-test"
+        store.config.path.write_text(json.dumps(store.config.raw))
+        original, state, command, closed = _scope_amendment_fixture(
+            store, request, monkeypatch
+        )
+        monkeypatch.setattr(
+            DeliveryStore, "_completed_temporal_result", lambda self, _id, **_kw: closed
+        )
+        app = create_app(store.config.path)
+        origin = app.state.delivery.config.dashboard_url
+        observed = []
+
+        @activity.defn(name="delivery_tracker_start")
+        async def tracker_stub(_payload):
+            return {"state": "consistent"}
+
+        @activity.defn(name="delivery_role")
+        async def role_stub(payload):
+            observed.append(payload)
+            return {
+                "role": "implement", "iteration": payload["iteration"],
+                "status": "findings", "cleanup": "confirmed",
+                "session_id": payload["resume_session"],
+                "findings": ["fixture stops at the role boundary"],
+            }
+
+        async with Worker(
+            environment.client,
+            task_queue="scope-amendment-public-test",
+            workflows=[DeliveryWorkflow],
+            activities=[delivery_project, delivery_repair_preflight, tracker_stub, role_stub],
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as browser:
+                login = await browser.post(
+                    "/api/session", json={"token": app.state.delivery.auth.secret},
+                    headers={"Origin": origin},
+                )
+                assert login.status_code == 200
+                posted = await browser.post(
+                    "/api/runs/run-1/amend-scope", json=command,
+                    headers={
+                        "Origin": origin,
+                        "X-Devflow-CSRF": login.json()["csrf_token"],
+                    },
+                )
+                assert posted.status_code == 200, posted.text
+                assert posted.json()["authorized_through_iteration"] == 5
+                repeated = await browser.post(
+                    "/api/runs/run-1/amend-scope", json=command,
+                    headers={
+                        "Origin": origin,
+                        "X-Devflow-CSRF": login.json()["csrf_token"],
+                    },
+                )
+                assert repeated.json() == posted.json()
+            await app.state.delivery.dispatch_once()
+            result = await asyncio.wait_for(
+                environment.client.get_workflow_handle(posted.json()["workflow_id"]).result(),
+                timeout=30,
+            )
+    assert result["iteration"] == state["iteration"] + 1
+    assert result["outcome"] == "blocked"  # The fixture role returned findings.
+    assert len(observed) == 1
+    assert observed[0]["resume_session"] == "original-session"
+    assert observed[0]["candidate"]["id"] == state["roles"][-1]["candidate"]["id"]
+    assert observed[0]["spec"]["policy"]["allowed_paths"] == [
+        "README.md", *command["added_paths"]
+    ]
+    assert observed[0]["findings"] == [
+        *state["roles"][-1]["findings"],
+    ]
+    with store._connect() as db:
+        assert json.loads(
+            db.execute("SELECT request_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0]
+        ) == original
+        assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM delivery_scope_amendments").fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM delivery_effects WHERE effect_key LIKE '%:5'"
+        ).fetchone()[0] == 0
+
+
 @pytest.mark.asyncio
 async def test_public_prelaunch_retry_without_required_ci_reaches_temporal_role(
     service, monkeypatch

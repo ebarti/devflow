@@ -240,6 +240,8 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if recovery is not None:
+            if recovery.get("kind") == "scope_amendment":
+                return await self._resume_scope(spec, recovery)
             if recovery.get("kind") in {"repair_continuation", "repair_prelaunch_retry"}:
                 return await self._resume_repair(spec, recovery)
             return await self._resume_publication(spec, recovery)
@@ -485,6 +487,105 @@ class DeliveryWorkflow:
             recovery=None,
             authorized_max_iteration=limit,
             attempt_generation=1 if prelaunch_retry else 0,
+        )
+
+    async def _resume_scope(
+        self, spec: dict[str, Any], recovery: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Run one expressly amended file-scope turn, then every normal gate."""
+
+        previous = recovery["state"]
+        roles = previous.get("roles")
+        last = roles[-1] if isinstance(roles, list) and roles else None
+        source = recovery.get("source_candidate")
+        amended = recovery.get("amended_candidate")
+        ci = recovery.get("ci_evidence")
+        findings = last.get("findings") if isinstance(last, dict) else None
+        if (
+            recovery.get("effective_spec") != spec
+            or previous.get("run_id") != spec["run_id"]
+            or previous.get("phase") != "blocked"
+            or previous.get("outcome") != "blocked"
+            or previous.get("cleanup") != "none"
+            or previous.get("error") != "implementer did not establish a pass"
+            or previous.get("checks") != {}
+            or not isinstance(last, dict)
+            or last.get("role") != "implement"
+            or last.get("iteration") != previous.get("iteration")
+            or last.get("status") != "findings"
+            or not isinstance(findings, list)
+            or last.get("finish_reason") != "done"
+            or last.get("cleanup") != "confirmed"
+            or last.get("candidate") != source
+            or last.get("session_id") != recovery.get("session_id")
+            or not isinstance(amended, dict)
+            or amended.get("policy_digest") != spec["policy_digest"]
+            or not isinstance(source, dict)
+            or any(amended.get(key) != source.get(key) for key in (
+                "head", "content_sha256", "base_sha", "environment_digest", "id"
+            ))
+            or recovery.get("maximum_iteration") != previous["iteration"] + 1
+            or not isinstance(ci, dict)
+            or ci.get("head") != previous["pull_request"]["head"]
+            or ci.get("diagnostics_digest") != digest(ci.get("diagnostics"))
+            or recovery.get("findings")
+            != [*findings[:8], *ci["diagnostics"]]
+        ):
+            raise ValueError("scope amendment changed the closed implementation authority")
+        self.state = {
+            **previous,
+            "candidate": amended,
+            "candidate_revision": previous["candidate_revision"] + 1,
+            "phase": "repair_preflight",
+            "execution_state": "running",
+            "outcome": None,
+            "error": None,
+            "cleanup": "none",
+        }
+        self.state["revision"] += 1
+        await self._project(
+            spec, "scope_amendment_started",
+            "Explicit two-file-or-smaller authority amendment entered preflight",
+        )
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        self.state["phase"] = "tracker_start"
+        self.state["revision"] += 1
+        await self._project(spec, "tracker_start", "Claimed issue entering In progress")
+        delay = 5
+        while True:
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            try:
+                tracker = await self._activity(
+                    "delivery_tracker_start",
+                    {"spec": spec, "repair_continuation": True},
+                )
+            except Exception as exc:
+                return await self._stop(
+                    spec, f"scope amendment tracker authority failed: {type(exc).__name__}"
+                )
+            self.state["tracker"] = tracker
+            if tracker.get("state") == "consistent":
+                break
+            if tracker.get("state") != "pending" or tracker.get("conflict"):
+                return await self._stop(
+                    spec, "scope amendment tracker readback conflicts with authority"
+                )
+            if not await self._confirm_repair_preflight(spec, recovery):
+                return self.state
+            await self._wait_repair_readback(delay)
+            delay = min(delay * 2, 30)
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        return await self._run_iterations(
+            spec,
+            start_iteration=recovery["maximum_iteration"],
+            prior_implementer_session=recovery["session_id"],
+            repair_findings=list(recovery["findings"]),
+            continuation=None,
+            recovery=None,
+            authorized_max_iteration=recovery["maximum_iteration"],
         )
 
     async def _run_iterations(

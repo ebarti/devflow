@@ -22,7 +22,7 @@ from temporalio.client import Client, WorkflowExecutionStatus
 
 from .candidate import candidate_for
 from .contracts import canonical_json, digest
-from .delivery_config import DeliveryConfig
+from .delivery_config import DeliveryConfig, scope_amended_spec
 from .delivery_continuation import (
     continuation_authority,
     selected_manifest,
@@ -189,6 +189,22 @@ class DeliveryStore:
                     granted_iterations INTEGER NOT NULL,
                     maximum_iteration INTEGER NOT NULL,
                     granted_at TEXT NOT NULL
+                )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_scope_amendments (
+                    run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+                    command_id TEXT NOT NULL UNIQUE,
+                    predecessor_workflow_id TEXT NOT NULL,
+                    predecessor_execution_run_id TEXT NOT NULL,
+                    predecessor_result_digest TEXT NOT NULL,
+                    predecessor_attempt_job_key TEXT NOT NULL,
+                    predecessor_attempt_result_sha256 TEXT NOT NULL,
+                    original_policy_digest TEXT NOT NULL,
+                    effective_policy_digest TEXT NOT NULL,
+                    added_paths_json TEXT NOT NULL,
+                    maximum_iteration INTEGER NOT NULL,
+                    authorized_at TEXT NOT NULL
                 )"""
             )
 
@@ -637,6 +653,97 @@ class DeliveryStore:
                 (command_id, run_id, request_digest, canonical_json(response)),
             )
         return response
+
+    def scope_preflight(self, spec: dict[str, Any], recovery: dict[str, Any]) -> None:
+        """Recheck the sealed amendment before the sole enlarged-scope role."""
+        from .delivery_broker import DeliveryBroker
+        from .delivery_repair import confirmed_container_cleanup, published_identity
+
+        run_id = spec["run_id"]
+        if recovery.get("kind") != "scope_amendment" or self.effective_spec(run_id) != spec:
+            raise ValueError("scope amendment effective authority changed")
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            amendment = db.execute(
+                "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
+            ).fetchone()
+            grant = db.execute(
+                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            attempts = db.execute(
+                "SELECT state,cleanup FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects = db.execute(
+                "SELECT state,observed_json FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+        if (
+            row is None
+            or amendment is None
+            or grant is None
+            or row["recovery_json"] != canonical_json(recovery)
+            or row["workflow_id"] != f"delivery-{run_id}-scope-amendment-1"
+            or row["phase"] not in {
+                "scope_amendment_queued", "repair_preflight", "tracker_start", "repair"
+            }
+            or row["execution_state"] not in {"queued", "running"}
+            or amendment["predecessor_workflow_id"]
+            != recovery["predecessor_workflow_id"]
+            or amendment["predecessor_execution_run_id"]
+            != recovery["predecessor_execution_run_id"]
+            or amendment["predecessor_result_digest"] != digest(recovery["state"])
+            or amendment["predecessor_attempt_job_key"] != recovery["attempt_job_key"]
+            or amendment["predecessor_attempt_result_sha256"]
+            != recovery["attempt_result_sha256"]
+            or amendment["original_policy_digest"]
+            != self.spec(run_id)["policy_digest"]
+            or amendment["effective_policy_digest"] != spec["policy_digest"]
+            or amendment["maximum_iteration"] != recovery["maximum_iteration"]
+            or grant["maximum_iteration"] + 1 != recovery["maximum_iteration"]
+            or claim is None
+            or claim["owner"] != f"external:devflow:{run_id}"
+            or any(item["state"] != "finished" or item["cleanup"] != "confirmed"
+                   for item in attempts)
+            or any(item["state"] != "complete" or item["observed_json"] is None
+                   for item in effects)
+        ):
+            raise ValueError("scope amendment or owned resources changed before resume")
+        original = self.spec(run_id)
+        if row["request_json"] != canonical_json(original):
+            raise ValueError("original request changed before scope repair")
+        confirmed_container_cleanup(original)
+        if self._container_intent_inventory(original) != recovery["old_container_intents"]:
+            raise ValueError("predecessor container inventory changed")
+        with self._connect() as db:
+            attempt = db.execute(
+                "SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?",
+                (amendment["predecessor_attempt_job_key"], run_id),
+            ).fetchone()
+        receipt_path = Path(attempt["result_path"] or "") if attempt else Path()
+        receipt_info = receipt_path.lstat() if attempt and receipt_path.is_absolute() else None
+        if (
+            attempt is None
+            or attempt["state"] != "finished"
+            or attempt["cleanup"] != "confirmed"
+            or attempt["session_id"] != recovery["session_id"]
+            or receipt_path
+            != Path(original["state_dir"]) / "attempts" / attempt["job_key"] / "result.json"
+            or receipt_info is None
+            or not stat.S_ISREG(receipt_info.st_mode)
+            or receipt_info.st_uid != os.getuid()
+            or stat.S_IMODE(receipt_info.st_mode) != 0o600
+            or hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+            != amendment["predecessor_attempt_result_sha256"]
+        ):
+            raise ValueError("predecessor role receipt changed before scope repair")
+        old_broker = DeliveryBroker(self, original)
+        if old_broker.candidate() != recovery["source_candidate"]:
+            raise ValueError("post-role source candidate changed")
+        published_identity(
+            old_broker, recovery["source_candidate"], recovery["state"]["pull_request"]
+        )
+        if DeliveryBroker(self, spec).candidate() != recovery["amended_candidate"]:
+            raise ValueError("amended candidate changed before repair")
 
     def continue_repair(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
@@ -1200,6 +1307,316 @@ class DeliveryStore:
             )
         return response
 
+    @staticmethod
+    def _container_intent_inventory(spec: dict[str, Any]) -> dict[str, str]:
+        root = Path(spec["state_dir"])
+        return {
+            str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(root.rglob("container-intent.json"))
+        }
+
+    def amend_scope(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+        """Authorize one contained original-session turn for omitted test files."""
+        from .delivery_broker import DeliveryBroker, _git
+        from .delivery_repair import (
+            confirmed_container_cleanup,
+            current_head_ci_evidence,
+            published_identity,
+        )
+
+        required = {
+            "command_id", "expected_revision", "expected_iteration",
+            "expected_candidate_id", "expected_pr_number", "expected_pr_head",
+            "added_paths", "amended_config_path", "amended_config_sha256",
+        }
+        if not isinstance(supplied, dict) or set(supplied) != required:
+            raise ValueError("scope amendment fields do not match the contract")
+        command_id = supplied["command_id"]
+        added = supplied["added_paths"]
+        if (
+            not isinstance(command_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", command_id)
+            or type(supplied["expected_revision"]) is not int
+            or type(supplied["expected_iteration"]) is not int
+            or type(supplied["expected_pr_number"]) is not int
+            or supplied["expected_revision"] < 1
+            or supplied["expected_iteration"] < 0
+            or supplied["expected_pr_number"] < 1
+            or not isinstance(supplied["expected_candidate_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", supplied["expected_candidate_id"])
+            or not isinstance(supplied["expected_pr_head"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", supplied["expected_pr_head"])
+            or not isinstance(added, list)
+            or not 1 <= len(added) <= 2
+            or any(not isinstance(path, str) for path in added)
+            or added != sorted(set(added))
+            or any(
+                Path(path).is_absolute()
+                or not Path(path).parts
+                or path != Path(path).as_posix()
+                or any(part in {".", "..", ".git", ".codex"} for part in Path(path).parts)
+                for path in added
+            )
+            or not isinstance(supplied["amended_config_path"], str)
+            or not isinstance(supplied["amended_config_sha256"], str)
+        ):
+            raise ValueError("invalid scope amendment identity")
+        command_digest = digest({"run_id": run_id, **supplied})
+        with self._connect() as db:
+            command = db.execute(
+                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            if command:
+                if command["request_digest"] != command_digest:
+                    raise ValueError("command ID already belongs to different inputs")
+                return json.loads(command["response_json"])
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            grant = db.execute(
+                "SELECT * FROM delivery_repair_grants WHERE run_id=?", (run_id,)
+            ).fetchone()
+            amendment = db.execute(
+                "SELECT 1 FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
+            ).fetchone()
+            attempts = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            effects = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+        if row is None or grant is None or amendment:
+            raise ValueError("scope amendment requires one exhausted original repair grant")
+        original = json.loads(row["request_json"])
+        prior_recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        closed = self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+        state = closed["result"]
+        roles = state.get("roles") if isinstance(state, dict) else None
+        last = roles[-1] if isinstance(roles, list) and roles else None
+        candidate = last.get("candidate") if isinstance(last, dict) else None
+        pr = state.get("pull_request") if isinstance(state, dict) else None
+        iteration = supplied["expected_iteration"]
+        if (
+            closed["workflow_id"] != row["workflow_id"]
+            or closed["request_digest"] != row["request_digest"]
+            or closed["recovery_digest"]
+            != (digest(prior_recovery) if prior_recovery is not None else None)
+            or state.get("run_id") != run_id
+            or state.get("phase") != "blocked"
+            or state.get("execution_state") != "blocked"
+            or state.get("outcome") != "blocked"
+            or state.get("cleanup") != "none"
+            or state.get("error") != "implementer did not establish a pass"
+            or state.get("checks") != {}
+            or state.get("revision") != supplied["expected_revision"]
+            or state.get("iteration") != iteration
+            or iteration != grant["maximum_iteration"]
+            or iteration != original["policy"]["max_repairs"] + 2
+            or not isinstance(last, dict)
+            or last.get("role") != "implement"
+            or last.get("iteration") != iteration
+            or last.get("status") != "findings"
+            or last.get("finish_reason") != "done"
+            or last.get("cleanup") != "confirmed"
+            or not isinstance(last.get("session_id"), str)
+            or not last["session_id"]
+            or not isinstance(last.get("findings"), list)
+            or not last["findings"]
+            or not isinstance(candidate, dict)
+            or candidate.get("id") != supplied["expected_candidate_id"]
+            or not isinstance(pr, dict)
+            or pr.get("number") != supplied["expected_pr_number"]
+            or pr.get("head") != supplied["expected_pr_head"]
+            or candidate.get("head") != pr["head"]
+            or row["phase"] != "blocked"
+            or row["execution_state"] != "blocked"
+            or row["outcome"] != "blocked"
+            or row["cleanup"] != "none"
+            or row["error"] != state["error"]
+            or row["protocol_revision"] != state["revision"]
+            or row["iteration"] != iteration
+            or json.loads(row["pr_json"] or "null") != pr
+            or json.loads(row["checks_json"] or "{}") != {}
+            or not attempts
+            or len(attempts) != len(roles)
+            or any(item["state"] != "finished" or item["cleanup"] != "confirmed"
+                   for item in attempts)
+            or any(item["state"] != "complete" or item["observed_json"] is None
+                   for item in effects)
+            or not any(item["kind"] == "publish" for item in effects)
+            or any(item["effect_key"].endswith(f":{iteration}") for item in effects)
+        ):
+            raise ValueError("closed implementation result cannot amend this scope")
+        attempt = next(
+            (item for item in attempts if item["role"] == "implement"
+             and item["iteration"] == iteration), None,
+        )
+        if attempt is None or attempt["session_id"] != last["session_id"]:
+            raise ValueError("finished implementation session is not durable")
+        result_path = Path(attempt["result_path"] or "")
+        expected_receipt = (
+            Path(original["state_dir"]) / "attempts" / attempt["job_key"] / "result.json"
+        )
+        if result_path != expected_receipt:
+            raise ValueError("finished implementation receipt left its owned attempt")
+        info = result_path.lstat()
+        result_bytes = result_path.read_bytes()
+        raw_result = json.loads(result_bytes)
+        saved_result = json.loads(attempt["result_json"] or "null")
+        if (
+            not result_path.is_absolute()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or not isinstance(raw_result, dict)
+            or not isinstance(saved_result, dict)
+            or raw_result
+            != {
+                key: value for key, value in saved_result.items()
+                if key not in {"cleanup", "container_id", "container_log_sha256"}
+            }
+            or any(saved_result.get(key) != last.get(key)
+                   for key in ("status", "session_id", "cleanup", "finish_reason", "findings"))
+        ):
+            raise ValueError("finished implementation receipt changed")
+        for folder in ("prechecks", "checks", "browser-qa", "gate-evidence", "gates"):
+            if (Path(original["state_dir"]) / folder / str(iteration)).exists():
+                raise ValueError("implementation already crossed a broker gate")
+        original_broker = DeliveryBroker(self, original)
+        if original_broker.candidate() != candidate:
+            raise ValueError("post-role candidate changed after Temporal closure")
+        changed = original_broker._changed_paths()
+        if not changed or changed - set(original["policy"]["allowed_paths"]):
+            raise ValueError("post-role edits exceeded the original file scope")
+        for path in added:
+            try:
+                tracked = _git(
+                    original_broker.checkout, "ls-files", "--error-unmatch", "--", path
+                )
+            except RuntimeError as exc:
+                raise ValueError("added test path is not tracked") from exc
+            target = original_broker.checkout / path
+            if path in changed or tracked != path or not target.is_file() or target.is_symlink():
+                raise ValueError("added test path was already changed or is not tracked")
+            parent = target.parent
+            while parent != original_broker.checkout:
+                info = parent.lstat()
+                if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    raise ValueError("added test path has an unsafe ancestor")
+                parent = parent.parent
+        observed_pr = published_identity(original_broker, candidate, pr)
+        confirmed_container_cleanup(original)
+        intents = self._container_intent_inventory(original)
+        effective = scope_amended_spec(
+            original, Path(supplied["amended_config_path"]),
+            supplied["amended_config_sha256"], added,
+        )
+        amended_candidate = DeliveryBroker(self, effective).candidate()
+        if any(amended_candidate.get(key) != candidate.get(key)
+               for key in ("head", "content_sha256", "base_sha", "environment_digest", "id")):
+            raise ValueError("amended policy changed the implementation bytes")
+        ci_evidence = current_head_ci_evidence(original_broker, pr)
+        findings = [*last["findings"][:8], *ci_evidence["diagnostics"]]
+        if not findings:
+            raise ValueError("scope amendment lacks sealed repair diagnostics")
+        workflow_id = f"delivery-{run_id}-scope-amendment-1"
+        recovery = {
+            "kind": "scope_amendment",
+            "predecessor_workflow_id": closed["workflow_id"],
+            "predecessor_execution_run_id": closed["execution_run_id"],
+            "predecessor_closed_at": closed["closed_at"],
+            "predecessor_result_digest": digest(state),
+            "state": state,
+            "source_candidate": candidate,
+            "amended_candidate": amended_candidate,
+            "pull_request": observed_pr,
+            "session_id": last["session_id"],
+            "attempt_job_key": attempt["job_key"],
+            "attempt_result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+            "old_container_intents": intents,
+            "ci_evidence": ci_evidence,
+            "findings": findings,
+            "added_paths": added,
+            "amended_config_path": effective["config_path"],
+            "amended_config_sha256": supplied["amended_config_sha256"],
+            "effective_spec": effective,
+            "maximum_iteration": iteration + 1,
+        }
+        response = {
+            "run_id": run_id,
+            "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
+            "phase": "scope_amendment_queued",
+            "workflow_id": workflow_id,
+            "authorized_through_iteration": iteration + 1,
+            "existing": False,
+        }
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            current_attempts = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
+            ).fetchall()
+            current_effects = db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
+            ).fetchall()
+            claim = self.state.claim_for(db, original["work_id"])
+            if (
+                current is None
+                or current["request_json"] != row["request_json"]
+                or current["recovery_json"] != row["recovery_json"]
+                or current["workflow_id"] != row["workflow_id"]
+                or current["protocol_revision"] != state["revision"]
+                or current["phase"] != "blocked"
+                or current["outcome"] != "blocked"
+                or current["cleanup"] != "none"
+                or [tuple(item) for item in current_attempts]
+                != [tuple(item) for item in attempts]
+                or [tuple(item) for item in current_effects]
+                != [tuple(item) for item in effects]
+                or claim is None
+                or claim["owner"] != f"external:devflow:{run_id}"
+                or db.execute(
+                    "SELECT 1 FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
+                ).fetchone()
+            ):
+                raise ValueError("scope amendment lost its frozen run or claim")
+            revision = current["revision"] + 1
+            db.execute(
+                """INSERT INTO delivery_scope_amendments VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    run_id, command_id, closed["workflow_id"], closed["execution_run_id"],
+                    digest(state), attempt["job_key"], recovery["attempt_result_sha256"],
+                    original["policy_digest"], effective["policy_digest"],
+                    canonical_json(added), iteration + 1, _now(),
+                ),
+            )
+            db.execute(
+                """UPDATE delivery_runs SET phase='scope_amendment_queued',
+                   execution_state='queued',outcome=NULL,error=NULL,revision=?,
+                   workflow_id=?,recovery_json=?,updated_at=? WHERE run_id=?""",
+                (revision, workflow_id, canonical_json(recovery), _now(), run_id),
+            )
+            db.execute(
+                """UPDATE delivery_outbox SET state='pending',last_error=NULL,updated_at=?
+                   WHERE run_id=?""",
+                (_now(), run_id),
+            )
+            self._event(
+                db, run_id, revision, "scope_amendment_queued",
+                "Two-file-or-smaller scope amendment queued for one original-session repair",
+                {
+                    "added_paths": added,
+                    "source_candidate_id": candidate["id"],
+                    "effective_policy_digest": effective["policy_digest"],
+                    "predecessor_execution_run_id": closed["execution_run_id"],
+                    "authorized_through_iteration": iteration + 1,
+                },
+            )
+            db.execute(
+                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                (command_id, run_id, command_digest, canonical_json(response)),
+            )
+        return response
+
     def repair_preflight(self, spec: dict[str, Any], recovery: dict[str, Any]) -> None:
         """Recheck the frozen command before a resumed implementer can execute."""
         from .delivery_broker import DeliveryBroker
@@ -1488,6 +1905,41 @@ class DeliveryStore:
                 raise ValueError("run ID not found")
             return json.loads(row[0])
 
+    def effective_spec(self, run_id: str) -> dict[str, Any]:
+        """Read an explicit amended authority while preserving request_json."""
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT request_json,recovery_json FROM delivery_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("run ID not found")
+            original = json.loads(row["request_json"])
+            recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            if not recovery or recovery.get("kind") != "scope_amendment":
+                return original
+            amendment = db.execute(
+                "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if (
+            amendment is None
+            or amendment["effective_policy_digest"]
+            != recovery["effective_spec"]["policy_digest"]
+            or amendment["original_policy_digest"] != original["policy_digest"]
+            or json.loads(amendment["added_paths_json"]) != recovery["added_paths"]
+            or amendment["maximum_iteration"] != recovery["maximum_iteration"]
+        ):
+            raise ValueError("scope amendment authority is not durable")
+        effective = scope_amended_spec(
+            original,
+            Path(recovery["amended_config_path"]),
+            recovery["amended_config_sha256"],
+            recovery["added_paths"],
+        )
+        if effective != recovery["effective_spec"]:
+            raise ValueError("scope amendment effective authority changed")
+        return effective
+
     def active_workflow_id(self, run_id: str) -> str:
         with self._connect() as db:
             row = db.execute(
@@ -1520,6 +1972,7 @@ class DeliveryStore:
                 "publication_recovery_queued",
                 "repair_continuation_queued",
                 "repair_prelaunch_retry_queued",
+                "scope_amendment_queued",
             }:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
@@ -1534,7 +1987,10 @@ class DeliveryStore:
                 "publishing"
                 if row[1] == "publication_recovery_queued" and accepted
                 else "repair"
-                if row[1] in {"repair_continuation_queued", "repair_prelaunch_retry_queued"}
+                if row[1] in {
+                    "repair_continuation_queued", "repair_prelaunch_retry_queued",
+                    "scope_amendment_queued",
+                }
                 and accepted
                 else "preparing"
                 if accepted
@@ -1770,6 +2226,18 @@ class DeliveryStore:
             ]
         compact = self._compact(row)
         spec = json.loads(row["request_json"])
+        recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        scope_amendment = (
+            {
+                "added_paths": recovery["added_paths"],
+                "original_policy_digest": spec["policy_digest"],
+                "effective_policy_digest": recovery["effective_spec"]["policy_digest"],
+                "authorized_through_iteration": recovery["maximum_iteration"],
+                "predecessor_execution_run_id": recovery["predecessor_execution_run_id"],
+            }
+            if recovery and recovery.get("kind") == "scope_amendment"
+            else None
+        )
         candidate = json.loads(row["candidate_json"]) if row["candidate_json"] else None
         roles = []
         for attempt in attempts:
@@ -1861,11 +2329,12 @@ class DeliveryStore:
                 **candidate,
                 "revision": row["candidate_revision"],
                 "base_sha": spec["base_sha"],
-                "policy_digest": spec["policy_digest"],
+                "policy_digest": candidate.get("policy_digest", spec["policy_digest"]),
             }
             if candidate
             else None,
             "pull_request": json.loads(row["pr_json"]) if row["pr_json"] else None,
+            "scope_amendment": scope_amendment,
             "checks": checks,
             "tracker": tracker,
             "usage": json.loads(row["usage_json"]) if row["usage_json"] else {},

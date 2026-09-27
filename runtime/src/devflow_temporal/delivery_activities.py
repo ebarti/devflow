@@ -27,7 +27,7 @@ def _context(spec: dict[str, Any]) -> tuple[DeliveryStore, DeliveryBroker]:
     if digest(config.raw) != spec["config_digest"]:
         raise ValueError("service configuration changed during an active run")
     store = DeliveryStore(config)
-    saved = store.spec(spec["run_id"])
+    saved = store.effective_spec(spec["run_id"])
     if saved != spec:
         raise ValueError("Temporal input no longer matches the durable submitted run")
     return store, DeliveryBroker(store, spec)
@@ -163,7 +163,10 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
         try:
             store, _ = _context(request["spec"])
-            store.repair_preflight(request["spec"], request["recovery"])
+            if request["recovery"].get("kind") == "scope_amendment":
+                store.scope_preflight(request["spec"], request["recovery"])
+            else:
+                store.repair_preflight(request["spec"], request["recovery"])
         except (
             RepairReadbackPending,
             subprocess.TimeoutExpired,

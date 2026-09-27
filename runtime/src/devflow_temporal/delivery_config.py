@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import tomllib
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -669,3 +670,75 @@ class DeliveryConfig:
             "config_digest": digest(self.raw),
             "config_path": str(self.path),
         }
+
+
+def scope_amended_spec(
+    original: dict[str, Any], config_path: Path, config_sha256: str,
+    added_paths: list[str],
+) -> dict[str, Any]:
+    """Admit one explicit file-scope delta without changing the submitted run."""
+
+    if (
+        not isinstance(added_paths, list)
+        or not 1 <= len(added_paths) <= 2
+        or any(not isinstance(path, str) for path in added_paths)
+        or added_paths != sorted(set(added_paths))
+        or not re.fullmatch(r"[0-9a-f]{64}", config_sha256)
+    ):
+        raise ValueError("scope amendment must name one or two distinct sorted files")
+    if not config_path.is_absolute():
+        raise ValueError("scope amendment configuration must be absolute")
+    root = Path(original["state_dir"]).parents[1].resolve(strict=True)
+    info = config_path.lstat()
+    path = config_path.resolve(strict=True)
+    if (
+        not path.is_relative_to(root)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or hashlib.sha256(path.read_bytes()).hexdigest() != config_sha256
+    ):
+        raise ValueError("scope amendment configuration is not private or changed")
+    original_config = DeliveryConfig.load(Path(original["config_path"]))
+    if digest(original_config.raw) != original["config_digest"]:
+        raise ValueError("original service configuration changed")
+    amended = DeliveryConfig.load(path)
+    repository_key = original["repository_key"]
+    old_raw, new_raw = deepcopy(original_config.raw), deepcopy(amended.raw)
+    old_repository = old_raw["repositories"][repository_key]
+    new_repository = new_raw["repositories"][repository_key]
+    old_allowed = old_repository["allowed_paths"]
+    if (
+        old_allowed != original["policy"]["allowed_paths"]
+        or any(name in old_allowed for name in added_paths)
+        or new_repository["allowed_paths"] != [*old_allowed, *added_paths]
+    ):
+        raise ValueError("scope amendment changed more than the named file list")
+    new_repository["allowed_paths"] = old_allowed
+    if original["provider"] == "codex":
+        if "sandbox_attestation_path" not in new_raw:
+            raise ValueError("scope amendment requires fresh boundary attestation")
+        new_raw["sandbox_attestation_path"] = old_raw["sandbox_attestation_path"]
+        old_container = old_raw["container"]
+        new_container = new_raw["container"]
+        for field in ("image_id", "runtime_payload_sha256"):
+            new_container[field] = old_container[field]
+    if new_raw != old_raw:
+        raise ValueError("scope amendment changed unrelated execution authority")
+    submit_keys = {
+        "command_id", "run_id", "work_id", "issue_url", "repository_key",
+        "goal", "accepted_plan", "base_ref", "branch", "authorized_endpoint",
+        "recovery_key", "supersedes_run_id",
+    }
+    effective = amended.admit({key: original[key] for key in submit_keys if key in original})
+    for key in (
+        "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
+        "base_ref", "branch", "authorized_endpoint", "source_path", "origin_url",
+        "github_repo", "base_sha", "state_dir", "checkout", "provider",
+    ):
+        if effective[key] != original[key]:
+            raise ValueError("scope amendment changed the admitted run identity")
+    effective["request_digest"] = original["request_digest"]
+    if "continuation" in original:
+        effective["continuation"] = original["continuation"]
+    return effective

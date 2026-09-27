@@ -92,6 +92,13 @@ class DeliveryClient:
             payload,
         )
 
+    def amend_scope(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST",
+            "/api/runs/" + quote(run_id, safe="") + "/amend-scope",
+            payload,
+        )
+
 
 def client(config_path: Path) -> DeliveryClient:
     caller = DeliveryClient(DeliveryConfig.load(config_path))

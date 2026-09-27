@@ -232,6 +232,7 @@ def main() -> None:
             "recover-publication",
             "continue-repair",
             "retry-prelaunch",
+            "amend-scope",
         ),
     )
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
@@ -259,6 +260,7 @@ def main() -> None:
         "recover-publication",
         "continue-repair",
         "retry-prelaunch",
+        "amend-scope",
     }:
         caller = api_client(config.path)
         request = json.loads(args.request.read_text(encoding="utf-8")) if args.request else None
@@ -269,6 +271,7 @@ def main() -> None:
             "recover-publication",
             "continue-repair",
             "retry-prelaunch",
+            "amend-scope",
         } and not isinstance(request, dict):
             parser.error("--request must name a JSON object file for this command")
         if (
@@ -276,6 +279,7 @@ def main() -> None:
             in {
                 "run", "evidence", "decision", "cancel", "recover-publication",
                 "continue-repair", "retry-prelaunch",
+                "amend-scope",
             }
             and not args.id
         ):
@@ -292,6 +296,7 @@ def main() -> None:
             "recover-publication": lambda: caller.recover_publication(args.id, request),
             "continue-repair": lambda: caller.continue_repair(args.id, request),
             "retry-prelaunch": lambda: caller.retry_prelaunch(args.id, request),
+            "amend-scope": lambda: caller.amend_scope(args.id, request),
         }[args.command]()
         print(json.dumps(result, sort_keys=True, indent=2))
         return
