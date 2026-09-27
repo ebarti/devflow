@@ -19,7 +19,7 @@ cd ..
 ./docker/build.sh
 ```
 
-The service configuration is a private JSON file outside the target checkout. It owns absolute paths for `state_root`, `tracking_db`, `helpers_dir`, and `codex_bin`, plus fixed ports and allowlisted repositories. A repository policy fixes its source, origin URL, GitHub repository, base ref and expected SHA, Project and assignee, exact allowed feature paths, recovery paths, prepublication and final check commands, an optional owned browser QA command, and required CI names. Roles have explicit model and effort selections. Clients cannot submit paths, check commands, model settings, or a broader endpoint. The public submit body is:
+The service configuration is a private JSON file outside the target checkout. It owns absolute paths for `state_root`, `tracking_db`, `helpers_dir`, and `codex_bin`, plus fixed ports and allowlisted repositories. A repository policy fixes its source, origin URL, GitHub repository, base ref and expected SHA, Project and assignee, exact allowed feature paths, recovery paths, prepublication and final check commands, an optional owned browser QA command, and required CI names. Roles have explicit model and effort selections. Clients cannot submit paths, check commands, model settings, or a broader endpoint. Each real new run needs a private attestation bound to its exact run ID, branch, checkout, state directory, image and policy, even when it uses an already configured repository. Installing the CLI or MCP does not authorize arbitrary future runs. The public submit body is:
 
 ```json
 {
