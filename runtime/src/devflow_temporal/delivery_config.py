@@ -436,6 +436,15 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
+        for role, selected in policy["roles"].items():
+            if (
+                not isinstance(selected, dict)
+                or not isinstance(selected.get("model"), str)
+                or not selected["model"].strip()
+                or not isinstance(selected.get("effort"), str)
+                or not selected["effort"].strip()
+            ):
+                raise ValueError(f"{role} model and effort must be configured")
         if policy["max_repairs"] < 0 or policy["max_repairs"] > 3:
             raise ValueError("max_repairs must be between 0 and 3")
         prompt = policy["initial_decision_prompt"]
@@ -485,10 +494,6 @@ class DeliveryConfig:
                 raise ValueError("real delivery requires named CI checks")
             if not repository.get("project_url") or not repository.get("assignee"):
                 raise ValueError("real delivery requires a managed tracker target")
-            for role in ("implement", "review", "verify"):
-                selected = policy["roles"][role]
-                if not selected.get("model") or not selected.get("effort"):
-                    raise ValueError(f"{role} model and effort must be configured")
             for stage in ("prepublish_checks", "checks"):
                 ids = set()
                 for check in policy[stage]:

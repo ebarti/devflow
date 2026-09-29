@@ -118,6 +118,19 @@ def test_raw_goal_admission_and_legacy_plan(intake_fixture):
     assert store.spec("run-legacy")["intake_required"] is False
 
 
+def test_unpinned_intake_role_rejected_before_work_claim(intake_fixture):
+    path, request = intake_fixture
+    config = json.loads(path.read_text())
+    config["roles"]["intake"] = {}
+    path.write_text(json.dumps(config))
+    store = create_app(path).state.delivery.store
+    with pytest.raises(ValueError, match="intake model and effort"):
+        store.submit(request)
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 0
+        assert store.state.row(db, "works", request["work_id"]) is None
+
+
 @pytest.mark.asyncio
 async def test_raw_goal_questions_revision_restart_plan_change_and_acceptance(
     intake_fixture, tmp_path
