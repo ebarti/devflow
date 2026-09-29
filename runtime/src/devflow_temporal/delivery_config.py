@@ -605,15 +605,30 @@ class DeliveryConfig:
             )
             attestation_path = Path(self.raw.get("sandbox_attestation_path", ""))
             if not attestation_path.is_absolute():
-                raise ValueError("real role policy requires an absolute sandbox attestation path")
-            metadata = attestation_path.lstat()
+                raise ValueError(
+                    "real role policy requires an absolute path to a fresh per-run "
+                    "sandbox attestation"
+                )
+            try:
+                metadata = attestation_path.lstat()
+            except OSError as exc:
+                raise ValueError(
+                    "sandbox attestation is unavailable; prepare a fresh exact per-run "
+                    "boundary attestation before submitting"
+                ) from exc
             if (
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_uid != os.getuid()
                 or stat.S_IMODE(metadata.st_mode) != 0o600
             ):
                 raise ValueError("sandbox attestation must be an owned private file")
-            attestation_bytes = attestation_path.read_bytes()
+            try:
+                attestation_bytes = attestation_path.read_bytes()
+            except OSError as exc:
+                raise ValueError(
+                    "sandbox attestation is unavailable; prepare a fresh exact per-run "
+                    "boundary attestation before submitting"
+                ) from exc
             attestation = json.loads(attestation_bytes)
             project_root = Path(__file__).resolve().parents[2]
             with (project_root / "pyproject.toml").open("rb") as stream:

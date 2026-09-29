@@ -137,6 +137,62 @@ def test_unpinned_intake_role_rejected_before_work_claim(intake_fixture):
         assert store.state.row(db, "works", request["work_id"]) is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unavailable", ["missing", "unreadable"])
+async def test_public_submit_reports_unavailable_per_run_attestation_before_claim(
+    intake_fixture, tmp_path, monkeypatch, unavailable
+):
+    path, request = intake_fixture
+    config = json.loads(path.read_text())
+    config["provider"] = "codex"
+    config["container"] = {}
+    repository = config["repositories"]["fixture"]
+    repository.update({
+        "prepublish_checks": [{"id": "precheck", "argv": ["/usr/bin/true"]}],
+        "checks": [{"id": "test", "argv": ["/usr/bin/true"]}],
+        "required_ci": ["test"],
+        "project_url": "https://github.com/orgs/example/projects/1",
+        "assignee": "example",
+    })
+    attestation_path = tmp_path / "run-1-attestation.json"
+    config["sandbox_attestation_path"] = str(attestation_path)
+    path.write_text(json.dumps(config))
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_config._container_identity",
+        lambda _container, *, source: {},
+    )
+    if unavailable == "unreadable":
+        attestation_path.write_text("{}")
+        attestation_path.chmod(0o600)
+        original_read_bytes = Path.read_bytes
+
+        def unreadable_attestation(target):
+            if target == attestation_path:
+                raise PermissionError("fixture attestation read failure")
+            return original_read_bytes(target)
+
+        monkeypatch.setattr(Path, "read_bytes", unreadable_attestation)
+
+    app = create_app(path)
+    store = app.state.delivery.store
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    async with httpx.AsyncClient(transport=transport, base_url=config["dashboard_url"]) as browser:
+        token = (Path(config["state_root"]) / "service-token").read_text().strip()
+        origin = {"Origin": config["dashboard_url"]}
+        login = await browser.post("/api/session", json={"token": token}, headers=origin)
+        assert login.status_code == 200
+        response = await browser.post(
+            "/api/runs", json=request,
+            headers={**origin, "X-Devflow-CSRF": login.json()["csrf_token"]},
+        )
+    assert response.status_code == 409
+    assert "prepare a fresh exact per-run boundary attestation" in response.json()["detail"]
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM delivery_commands").fetchone()[0] == 0
+        assert store.state.row(db, "works", request["work_id"]) is None
+
+
 def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):
     path, request = intake_fixture
     store = create_app(path).state.delivery.store
