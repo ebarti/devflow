@@ -4403,6 +4403,35 @@ class DeliveryStore:
                     "candidate_id": candidate["id"] if candidate else None,
                 },
             )
+            if (
+                event_type == "cancelled"
+                and outcome == "cancelled"
+                and cleanup == "confirmed_after_role_boundary"
+                and json.loads(row["request_json"]).get("intake_required")
+                and row["accepted_plan_text"] is None
+                and json.loads(values["intake_json"] or "{}").get("accepted_plan") is None
+                and json.loads(values["tracker_json"] or "{}") == {}
+                and values["pr_json"] is None
+            ):
+                attempts = db.execute(
+                    "SELECT role,state,cleanup FROM delivery_attempts WHERE run_id=?", (run_id,)
+                ).fetchall()
+                effects = db.execute(
+                    "SELECT kind,state FROM delivery_effects WHERE run_id=?", (run_id,)
+                ).fetchall()
+                if all(
+                    attempt["role"] == "intake"
+                    and attempt["state"] == "finished"
+                    and attempt["cleanup"] == "confirmed"
+                    for attempt in attempts
+                ) and all(
+                    effect["kind"] == "prepare" and effect["state"] == "complete"
+                    for effect in effects
+                ):
+                    owner = f"external:devflow:{run_id}"
+                    claim = self.state.claim_for(db, row["work_id"])
+                    if claim is not None and claim["owner"] == owner:
+                        self.state.release_work(db, row["work_id"], owner)
             return dict(
                 db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             )

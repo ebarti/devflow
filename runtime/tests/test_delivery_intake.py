@@ -380,3 +380,23 @@ async def test_cancellation_while_waiting_for_clarification(intake_fixture, tmp_
             final = await asyncio.wait_for(handle.result(), 15)
             assert final["outcome"] == "cancelled"
             assert calls == []
+            with store._connect() as db:
+                assert store.state.claim_for(db, request["work_id"]) is None
+            retry = {
+                **request, "command_id": "submit-2", "run_id": "run-2",
+                "branch": "feat/fixture-retry",
+            }
+            assert store.submit(retry)["phase"] == "accepted"
+            cancel_event = next(
+                event for event in store.events("run-1") if event["type"] == "cancelled"
+            )
+            store.project(
+                "run-1", phase="cancelled", execution_state="terminal",
+                event_type="cancelled", message="Cancellation reached a role boundary",
+                outcome="cancelled", cleanup="confirmed_after_role_boundary",
+                key=cancel_event["payload"]["key"],
+            )
+            with store._connect() as db:
+                assert store.state.claim_for(db, request["work_id"])["owner"] == (
+                    "external:devflow:run-2"
+                )
