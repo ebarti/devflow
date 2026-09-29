@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -204,6 +205,7 @@ async def test_raw_goal_questions_revision_restart_plan_change_and_acceptance(
         tracker_start, role_stub,
     ]
     async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "intake-temporal.sqlite3"),
     ) as environment:
         async def temporal_client():
@@ -351,6 +353,7 @@ async def test_cancellation_while_waiting_for_clarification(intake_fixture, tmp_
         return {"status": "blocked", "candidate": payload["candidate"]}
 
     async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "cancel-temporal.sqlite3"),
     ) as environment:
         queue = "intake-cancel"
