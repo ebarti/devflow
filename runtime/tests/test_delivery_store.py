@@ -3252,12 +3252,36 @@ def test_blocked_pre_role_run_can_transfer_claim_to_explicit_successor(service):
     assert store.detail("run-1")["outcome"] == "blocked"
 
 
+@pytest.mark.parametrize("raw_intake", [False, True])
 def test_post_role_continuation_carries_sealed_candidate_and_session_without_auth(
-    service, tmp_path, monkeypatch
+    service, tmp_path, monkeypatch, raw_intake
 ):
     store, request = service
+    if raw_intake:
+        configuration = json.loads(store.config.path.read_text())
+        configuration["roles"]["intake"] = {"model": "fixture", "effort": "low"}
+        store.config.path.write_text(json.dumps(configuration))
+        store = DeliveryStore(DeliveryConfig.load(store.config.path))
+        request = {key: value for key, value in request.items() if key != "accepted_plan"}
     store.submit(request)
-    old_spec = store.spec("run-1")
+    intake_role = None
+    if raw_intake:
+        plan = {
+            "scope": "Make one bounded edit and test it.",
+            "steps": ["Edit README.md"],
+            "verification": ["Read the result"],
+            "acceptance": ["The requested text is present"],
+        }
+        store.project(
+            "run-1", phase="waiting_plan", execution_state="waiting",
+            event_type="plan_pending", message="fixture plan proposed",
+            intake={
+                "plans": [{"revision": 1, "digest": digest(plan), "content": plan}],
+                "answers": [], "questions": [], "round": 0,
+            },
+        )
+        store.accept_intake_plan("run-1", 1, digest(plan), plan)
+    old_spec = store.intake_execution_spec("run-1")
     old_broker = DeliveryBroker(store, old_spec)
     initial = old_broker.prepare()["candidate"]
     store.project(
@@ -3294,6 +3318,17 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
         "input_candidate_id": initial["id"],
         "candidate": final,
     }
+    if raw_intake:
+        intake_raw = {
+            "status": "plan", "summary": "Scoped fixture plan", "findings": [],
+            "plan": plan, "questions": [], "session_id": "intake-fixture-1",
+            "cleanup": "confirmed", "finish_reason": "done",
+        }
+        intake_role = {
+            **intake_raw, "role": "intake", "iteration": 0,
+            "input_candidate_id": initial["id"], "candidate": initial,
+            "provider": "fake",
+        }
     history = tmp_path / "completed-temporal-result.json"
     history.write_text(
         json.dumps(
@@ -3309,6 +3344,18 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     history.chmod(0o600)
     finished = datetime.now(UTC).isoformat()
     with store._connect() as db:
+        if intake_role is not None:
+            db.execute(
+                """INSERT INTO delivery_attempts
+                   (job_key,run_id,role,iteration,candidate_id,state,session_id,
+                    result_json,started_at,finished_at,cleanup)
+                   VALUES (?,?,?,?,?,'finished',?,?,?,?,'confirmed')""",
+                (
+                    "intake-attempt-1", "run-1", "intake", 0, initial["id"],
+                    "intake-fixture-1", json.dumps(intake_raw, sort_keys=True),
+                    finished, finished,
+                ),
+            )
         db.execute(
             """INSERT INTO delivery_attempts
                (job_key,run_id,role,iteration,candidate_id,state,session_id,result_json,
@@ -3372,12 +3419,13 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
             "outcome": "blocked",
             "cleanup": "none",
             "error": "implementer did not establish a pass",
-            "roles": [role],
+            "roles": [*([intake_role] if intake_role else []), role],
         },
     }
     monkeypatch.setattr(successor, "_completed_temporal_result", lambda _id: live)
     request2 = {
         **request,
+        **({"accepted_plan": old_spec["accepted_plan"]} if raw_intake else {}),
         "command_id": "command-2",
         "run_id": "run-2",
         "branch": "feat/fixture-2",
@@ -3427,7 +3475,10 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     stale_live = copy.deepcopy(live)
     stale_live["result"]["roles"][0]["candidate"]["id"] = "wrong-history"
     monkeypatch.setattr(successor, "_completed_temporal_result", lambda _id: stale_live)
-    with pytest.raises(ValueError, match="closed Temporal result"):
+    with pytest.raises(
+        ValueError,
+        match="intake history differs" if raw_intake else "closed Temporal result",
+    ):
         successor.submit(request2)
     monkeypatch.setattr(
         successor,

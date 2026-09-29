@@ -3905,7 +3905,6 @@ class DeliveryStore:
             or previous["cleanup"] != "none"
             or previous["error"] != "implementer did not establish a pass"
             or previous["checks_json"] not in (None, "{}")
-            or len(attempts) != 1
         ):
             raise ValueError("continuation changed authority or predecessor identity")
         old_state = Path(prior_spec["state_dir"])
@@ -3919,7 +3918,16 @@ class DeliveryStore:
             )
         ):
             raise ValueError("continuation predecessor crossed a broker check gate")
-        attempt = attempts[0]
+        implement_attempts = [item for item in attempts if item["role"] == "implement"]
+        intake_attempts = [item for item in attempts if item["role"] == "intake"]
+        if (
+            len(implement_attempts) != 1
+            or len(attempts) != 1 + len(intake_attempts)
+            or (not prior_spec.get("intake_required") and intake_attempts)
+            or (prior_spec.get("intake_required") and not intake_attempts)
+        ):
+            raise ValueError("continuation predecessor role inventory changed")
+        attempt = implement_attempts[0]
         if (
             attempt["role"] != "implement"
             or attempt["iteration"] != 0
@@ -3955,6 +3963,48 @@ class DeliveryStore:
         raw = json.loads(attempt["result_json"])
         live = temporal_result or {}
         live_result = live.get("result")
+        live_roles = live_result.get("roles") if isinstance(live_result, dict) else None
+        if not isinstance(live_roles, list) or len(live_roles) != len(attempts):
+            raise ValueError("continuation history differs from closed Temporal result")
+        prior_intake_roles = live_roles[:-1]
+        for intake_attempt, intake_role in zip(
+            sorted(intake_attempts, key=lambda item: item["iteration"]),
+            prior_intake_roles,
+            strict=True,
+        ):
+            saved = (
+                json.loads(intake_attempt["result_json"])
+                if intake_attempt["result_json"] else None
+            )
+            if (
+                intake_attempt["state"] != "finished"
+                or intake_attempt["cleanup"] != "confirmed"
+                or not intake_attempt["finished_at"]
+                or not isinstance(saved, dict)
+                or not isinstance(intake_role, dict)
+                or intake_role.get("role") != "intake"
+                or intake_role.get("iteration") != intake_attempt["iteration"]
+                or intake_role.get("input_candidate_id") != intake_attempt["candidate_id"]
+                or not isinstance(intake_role.get("candidate"), dict)
+                or intake_role["candidate"].get("id") != intake_attempt["candidate_id"]
+                or intake_role.get("session_id") != intake_attempt["session_id"]
+                or any(intake_role.get(key) != value for key, value in saved.items())
+            ):
+                raise ValueError("continuation intake history differs from its receipt")
+        if prior_spec.get("intake_required"):
+            intake_row = db.execute(
+                "SELECT intake_json FROM delivery_runs WHERE run_id=?", (old_id,)
+            ).fetchone()
+            intake = json.loads(intake_row[0]) if intake_row and intake_row[0] else None
+            accepted = intake.get("accepted_plan") if isinstance(intake, dict) else None
+            if (
+                not isinstance(accepted, dict)
+                or digest(accepted.get("content")) != accepted.get("digest")
+                or json.dumps(accepted["content"], sort_keys=True, indent=2)
+                != previous["accepted_plan_text"]
+                or prior_spec["accepted_plan"] != previous["accepted_plan_text"]
+            ):
+                raise ValueError("continuation accepted intake plan changed")
         if (
             history.get("workflow_id") != f"delivery-{old_id}"
             or history.get("run_id") != old_id
@@ -3976,7 +4026,7 @@ class DeliveryStore:
             or live_result.get("outcome") != "blocked"
             or live_result.get("cleanup") != previous["cleanup"]
             or live_result.get("error") != previous["error"]
-            or live_result.get("roles") != [role]
+            or live_roles[-1] != role
             or not isinstance(live.get("closed_at"), str)
             or datetime.fromisoformat(live["closed_at"])
             <= datetime.fromisoformat(attempt["finished_at"])

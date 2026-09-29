@@ -8,6 +8,7 @@ function freshFields(): Fields {
   return {
     run_id: `run-${crypto.randomUUID()}`,
     work_id: '', issue_url: '', repository_key: '', goal: '',
+    accepted_plan: '',
     base_ref: '', branch: '',
   }
 }
@@ -18,6 +19,7 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const repositories = service?.repositories ?? []
+  const intakeEnabled = service?.policy?.intake_enabled === true
   const selected = useMemo(() => repositories.find(repo => repo.key === fields.repository_key), [repositories, fields.repository_key])
 
   function set<K extends keyof Fields>(key: K, value: Fields[K]) {
@@ -31,7 +33,13 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
     if (!selected || busy) return
     setBusy(true); setError('')
     try {
-      const result = await api.newRun({ ...fields, command_id: commandId, authorized_endpoint: 'published_unmerged', base_ref: fields.base_ref || selected.base_ref || '' })
+      const { accepted_plan, ...requestFields } = fields
+      const result = await api.newRun({
+        ...requestFields,
+        ...(!intakeEnabled ? { accepted_plan } : {}),
+        command_id: commandId, authorized_endpoint: 'published_unmerged',
+        base_ref: fields.base_ref || selected.base_ref || '',
+      })
       onCreated(result.run_id)
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'The run could not be submitted.')
@@ -39,7 +47,7 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
   }
 
   return <div className="form-page">
-    <div className="form-page__heading"><h1>New run</h1><p>Devflow investigates your goal, asks for needed clarification, and proposes a plan before implementation.</p></div>
+    <div className="form-page__heading"><h1>New run</h1><p>{intakeEnabled ? 'Devflow investigates your goal, asks for needed clarification, and proposes a plan before implementation.' : 'Submit a goal with its already accepted plan.'}</p></div>
     {repositories.length ? <form onSubmit={event => void submit(event)} className="run-form">
       <div className="field-grid">
         <label>Run ID<input value={fields.run_id} onChange={event => set('run_id', event.target.value)} pattern="[A-Za-z0-9][A-Za-z0-9._-]*" maxLength={128} required autoComplete="off" /></label>
@@ -54,10 +62,11 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
         <label className="field-wide">Branch<input value={fields.branch} onChange={event => set('branch', event.target.value)} required autoComplete="off" placeholder="feat/issue-description" /></label>
         {selected?.recovery_keys?.length ? <label className="field-wide">Approved recovery source<select value={fields.recovery_key ?? ''} onChange={event => set('recovery_key', event.target.value || undefined)}><option value="">None</option>{selected.recovery_keys.map(key => <option key={key} value={key}>{key}</option>)}</select></label> : null}
         <label className="field-wide">Goal<textarea value={fields.goal} onChange={event => set('goal', event.target.value)} rows={5} required /></label>
+        {!intakeEnabled ? <label className="field-wide">Accepted plan<textarea value={fields.accepted_plan ?? ''} onChange={event => set('accepted_plan', event.target.value)} rows={7} required /></label> : null}
       </div>
       <div className="submission-scope"><strong>Authorized endpoint</strong><span>Published, unmerged pull request</span><small>Repository, base, recovery sources, role models and checks are controlled by the service policy.</small></div>
       {error ? <p className="form-error" role="alert">{error}</p> : null}
-      <div className="button-row"><button className="primary-button" type="submit" disabled={busy}>{busy ? 'Submitting…' : 'Start investigation'}</button><button className="text-button" type="button" onClick={onBack}>Back to runs</button></div>
+      <div className="button-row"><button className="primary-button" type="submit" disabled={busy}>{busy ? 'Submitting…' : intakeEnabled ? 'Start investigation' : 'Start run'}</button><button className="text-button" type="button" onClick={onBack}>Back to runs</button></div>
     </form> : <div className="empty-state"><h2>No repositories available</h2><p>The local service has not provided an allowlisted repository. Refresh Settings after the service is configured.</p><button className="text-button" onClick={onBack}>Back to runs</button></div>}
   </div>
 }

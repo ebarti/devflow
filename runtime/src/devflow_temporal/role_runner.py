@@ -160,8 +160,14 @@ def _task(request: dict[str, Any]) -> AgentTask:
         if qa_evidence and role == "verify"
         else ""
     )
+    intake_context = (
+        f"Frozen work ID: {json.dumps(spec['work_id'])}\n"
+        f"Frozen issue URL: {json.dumps(spec['issue_url'])}\n"
+        if role == "intake" else ""
+    )
     prompt = (
         f"{instructions}\n\n"
+        f"{intake_context}"
         f"Goal: {spec['goal']}\n\nAccepted plan:\n{spec['accepted_plan']}\n\n"
         f"Intake history: {json.dumps(request.get('intake') or {}, sort_keys=True)}\n\n"
         f"Candidate: {candidate['id']} at {candidate['head']}\n"

@@ -79,7 +79,8 @@ async def delivery_intake(request: dict[str, Any]) -> dict[str, Any]:
         result.setdefault("findings", []).append("intake changed the read-only checkout")
     return {
         **result, "role": "intake", "iteration": request["iteration"],
-        "candidate": candidate, "provider": request["spec"]["provider"],
+        "input_candidate_id": candidate["id"], "candidate": candidate,
+        "provider": request["spec"]["provider"],
     }
 
 

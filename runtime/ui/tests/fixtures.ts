@@ -24,5 +24,5 @@ export const mockRun: RunDetail = {
 export const mockService: ServiceInfo = {
   status: 'running', version: 'fixture-only',
   repositories: [{ key: 'fixture-repo', label: 'Fixture repository', base_ref: 'main', base_sha: 'fixture-sha', recovery_keys: ['fixture-recovery'] }],
-  policy: { roles: { implement: { model: 'fixture-model', effort: 'fixture-effort' } } },
+  policy: { roles: { implement: { model: 'fixture-model', effort: 'fixture-effort' } }, intake_enabled: true },
 }

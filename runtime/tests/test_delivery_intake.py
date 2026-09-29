@@ -21,6 +21,7 @@ from devflow_temporal.delivery_activities import (
 )
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+from devflow_temporal.role_runner import _task
 
 
 def _git(path: Path, *args: str) -> str:
@@ -129,6 +130,20 @@ def test_unpinned_intake_role_rejected_before_work_claim(intake_fixture):
     with store._connect() as db:
         assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 0
         assert store.state.row(db, "works", request["work_id"]) is None
+
+
+def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):
+    path, request = intake_fixture
+    store = create_app(path).state.delivery.store
+    store.submit(request)
+    spec = store.spec("run-1")
+    task = _task({
+        "spec": spec, "role": "intake", "iteration": 0,
+        "candidate": {"id": "candidate", "head": spec["base_sha"]},
+        "workspace": str(Path(spec["checkout"])),
+    })
+    assert 'Frozen work ID: "work-1"' in task.goal
+    assert 'Frozen issue URL: "https://github.com/example/fixture/issues/3"' in task.goal
 
 
 @pytest.mark.asyncio

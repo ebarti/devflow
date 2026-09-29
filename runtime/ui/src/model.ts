@@ -169,7 +169,7 @@ export interface ServiceInfo {
   temporal?: string | { status?: string | null; address?: string | null } | null
   capacity?: { active?: number | null; queued?: number | null; limit?: number | null } | null
   repositories?: RepositoryInfo[] | null
-  policy?: { roles?: Record<string, { model?: string | null; effort?: string | null }> | null; repositories?: RepositoryInfo[] | null; authorized_endpoint?: string | null } | null
+  policy?: { roles?: Record<string, { model?: string | null; effort?: string | null }> | null; repositories?: RepositoryInfo[] | null; authorized_endpoint?: string | null; intake_enabled?: boolean | null } | null
 }
 
 export interface NewRunRequest {

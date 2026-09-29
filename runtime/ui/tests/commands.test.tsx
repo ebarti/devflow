@@ -126,6 +126,25 @@ describe('dashboard commands', () => {
     expect(body).not.toHaveProperty('model')
   })
 
+  it('requires and submits the accepted plan for a service without intake', async () => {
+    const user = userEvent.setup()
+    const submit = vi.spyOn(api, 'newRun').mockResolvedValue({ run_id: 'legacy-new', dashboard_url: '/runs/legacy-new', existing: false, phase: 'queued' })
+    const onCreated = vi.fn()
+    render(<NewRun service={{ ...mockService, policy: { ...mockService.policy, intake_enabled: false } }} onCreated={onCreated} onBack={vi.fn()} />)
+    await user.type(screen.getByLabelText('Work ID'), 'legacy-work')
+    await user.type(screen.getByLabelText('GitHub issue URL'), 'https://github.com/example/repository/issues/2')
+    await user.selectOptions(screen.getByLabelText('Repository'), 'fixture-repo')
+    await user.type(screen.getByLabelText('Branch'), 'feat/legacy')
+    await user.type(screen.getByLabelText('Goal'), 'Legacy task')
+    expect(screen.getByLabelText('Accepted plan').hasAttribute('required')).toBe(true)
+    await user.type(screen.getByLabelText('Accepted plan'), 'Implement the previously accepted scope')
+    await user.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith('legacy-new'))
+    expect(submit.mock.calls[0][0]).toMatchObject({
+      goal: 'Legacy task', accepted_plan: 'Implement the previously accepted scope',
+    })
+  })
+
   it('sends a free-text clarification and renders the retained answer', async () => {
     const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
     const user = userEvent.setup()
