@@ -3894,6 +3894,10 @@ def test_real_admission_rejects_unattested_container_and_check_network(service, 
     original, request = service
     configuration = json.loads(original.config.path.read_text())
     configuration["provider"] = "codex"
+    attestation_path = original.config.path.parent / "attestation.json"
+    attestation_path.write_text("{}")
+    attestation_path.chmod(0o600)
+    configuration["sandbox_attestation_path"] = str(attestation_path)
     repository = configuration["repositories"]["fixture"]
     repository.update(
         {
