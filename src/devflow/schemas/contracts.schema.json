@@ -261,6 +261,27 @@
         },
         "endpoint": {
           "$ref": "#/$defs/Endpoint"
+        },
+        "requested_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "autonomy_eligibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "eligible": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "eligible",
+            "reason"
+          ]
         }
       },
       "required": [
@@ -457,6 +478,70 @@
             "done",
             "canceled",
             "failed"
+          ]
+        },
+        "accounting": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "purpose": {
+              "enum": [
+                "normal",
+                "repair",
+                "experiment"
+              ]
+            },
+            "origin_work_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "experiment_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "case_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "arm_id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "purpose"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "purpose": {
+                    "const": "repair"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "origin_work_id"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "purpose": {
+                    "const": "experiment"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "experiment_id",
+                  "case_id",
+                  "arm_id"
+                ]
+              }
+            }
           ]
         }
       },
@@ -1430,6 +1515,34 @@
             "exposed_unverified",
             "queued"
           ]
+        },
+        "gate_observation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "required_roles": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "review",
+                  "qa"
+                ]
+              }
+            },
+            "unresolved_blocking_finding_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "required": [
+            "required_roles",
+            "unresolved_blocking_finding_ids"
+          ]
         }
       },
       "required": [
@@ -1619,7 +1732,10 @@
           "pattern": "^[a-f0-9]{64}$"
         },
         "model_policy_hash": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[a-f0-9]{64}$"
         },
         "started_at": {
@@ -1828,7 +1944,10 @@
           "pattern": "^[a-f0-9]{64}$"
         },
         "model_policy_hash": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[a-f0-9]{64}$"
         },
         "instruction_sources": {
@@ -1868,8 +1987,57 @@
         "package_revision": {
           "type": "string",
           "pattern": "^[a-f0-9]{40}$"
+        },
+        "model_policy_status": {
+          "enum": [
+            "captured",
+            "unavailable"
+          ]
+        },
+        "model_policy_reference": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "model_policy_sources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "reference",
+              "hash"
+            ],
+            "properties": {
+              "reference": {
+                "type": "string",
+                "minLength": 1
+              },
+              "hash": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            }
+          }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "model_policy_status"
+            ]
+          },
+          "then": {
+            "required": [
+              "model_policy_reference",
+              "model_policy_sources"
+            ]
+          }
+        }
+      ]
     },
     "ObservationEvidence": {
       "type": "object",
@@ -2055,7 +2223,12 @@
             "first_ready_handoff",
             "exposed",
             "defect_confirmed",
-            "intervention"
+            "intervention",
+            "verification_started",
+            "blocking_wait",
+            "rework",
+            "observation_window",
+            "attempt_status"
           ]
         },
         "occurred_at": {
@@ -2194,6 +2367,242 @@
                   },
                   "avoidable": {
                     "type": "boolean"
+                  },
+                  "episode_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "kind": {
+                    "enum": [
+                      "corrective",
+                      "required_authorization",
+                      "new_requirement"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "event_kind": {
+                "const": "verification_started"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "required_roles": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "review",
+                        "qa"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "required_roles"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "event_kind": {
+                "const": "blocking_wait"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "interval_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "started_at": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "ended_at": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "format": "date-time"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "cause": {
+                    "enum": [
+                      "user_answer",
+                      "required_approval",
+                      "ci",
+                      "external_service",
+                      "dependency",
+                      "usage_limit",
+                      "other"
+                    ]
+                  },
+                  "blocking": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "interval_id",
+                  "started_at",
+                  "ended_at",
+                  "cause",
+                  "blocking"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "event_kind": {
+                "const": "rework"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "cycle_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "from_phase": {
+                    "enum": [
+                      "verify",
+                      "deliver"
+                    ]
+                  },
+                  "cause": {
+                    "enum": [
+                      "misunderstood_requirement",
+                      "product_defect",
+                      "integration",
+                      "fixture_harness",
+                      "infrastructure",
+                      "invalid_evidence"
+                    ]
+                  },
+                  "started_at": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "ended_at": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "format": "date-time"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "cycle_id",
+                  "from_phase",
+                  "cause",
+                  "started_at",
+                  "ended_at"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "event_kind": {
+                "const": "observation_window"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "started_at": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "ended_at": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "complete_kinds": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "intervention",
+                        "blocking_wait",
+                        "rework"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "started_at",
+                  "ended_at",
+                  "complete_kinds"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "event_kind": {
+                "const": "attempt_status"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "details": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "active",
+                      "done",
+                      "canceled",
+                      "failed"
+                    ]
                   }
                 }
               }

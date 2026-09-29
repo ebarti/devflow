@@ -721,7 +721,18 @@ def record_gate(state, record):
 
 def verify_delivery(state, record, observation):
     validate_record(record, "delivery")
+    record = deepcopy(record)
     candidate = current_candidate(state, record["candidate_id"])
+    gate_observation = {
+        "required_roles": required_roles(state),
+        "unresolved_blocking_finding_ids": sorted(blocking_findings(state, record["candidate_id"])),
+    }
+    require(
+        "gate_observation" not in record or record["gate_observation"] == gate_observation,
+        "delivery_gate_observation",
+        "Delivery gate observation is derived from the evaluated state",
+    )
+    record["gate_observation"] = gate_observation
     require(
         record["work_id"] == state["work_id"]
         and record["attempt_id"] == state["attempt"]["attempt_id"],
@@ -1060,6 +1071,12 @@ def transition(original, command, request, now, dependency_states=None, *,
             )
         ids = [a["id"] for a in record["acceptance"]]
         require(len(ids) == len(set(ids)), "duplicate_acceptance", "Acceptance IDs must be unique")
+        if record.get("requested_at"):
+            requested = datetime.fromisoformat(record["requested_at"].replace("Z", "+00:00"))
+            require(requested <= now, "future_request", "The original request cannot be in the future")
+        if original["contract"] and original["contract"].get("requested_at"):
+            require(record.get("requested_at") == original["contract"]["requested_at"],
+                    "request_time_changed", "Scope amendments preserve the original request time")
         dependencies = dependency_states or {}
         require(
             all(
@@ -1171,21 +1188,33 @@ def transition(original, command, request, now, dependency_states=None, *,
         )
     elif command == "outcome.record":
         record = validate_record(request["record"], "outcome_event")
+        historical_attempt = get(state, "attempt", record["attempt_id"])
         require(
             state["attempt"] is not None
             and record["work_id"] == state["work_id"]
-            and record["attempt_id"] == state["attempt"]["attempt_id"],
+            and historical_attempt["work_id"] == state["work_id"],
             "outcome_identity",
             "Outcome must identify its historical work and attempt",
         )
+        occurred_at = datetime.fromisoformat(record["occurred_at"].replace("Z", "+00:00"))
+        require(occurred_at <= now, "future_observation", "An observation cannot be in the future")
         if record["candidate_id"]:
-            get(state, "candidate", record["candidate_id"])
-        if record["event_kind"] in {"first_ready_handoff", "exposed"}:
+            candidate = get(state, "candidate", record["candidate_id"])
+            require(candidate["attempt_id"] == record["attempt_id"],
+                    "outcome_identity", "Observed candidate belongs to another attempt")
+        if record["event_kind"] in {"first_ready_handoff", "exposed", "verification_started"}:
             require(
                 record["candidate_id"] is not None,
                 "missing_candidate",
-                "Exposure and handoff require a candidate",
+                "Exposure, handoff and verification require a candidate",
             )
+        if record["event_kind"] in {"blocking_wait", "rework", "observation_window"}:
+            interval = record["details"]
+            start = datetime.fromisoformat(interval["started_at"].replace("Z", "+00:00"))
+            end = (datetime.fromisoformat(interval["ended_at"].replace("Z", "+00:00"))
+                   if interval["ended_at"] else occurred_at)
+            require(start <= end <= occurred_at, "invalid_metric_interval",
+                    "Observed intervals must end after their start and by the observation time")
         if record["event_kind"] == "defect_confirmed":
             origin = record["details"]["origin_candidate_id"]
             if origin:
@@ -1481,6 +1510,20 @@ def transition(original, command, request, now, dependency_states=None, *,
             state["assignments"][record["assignment_id"]] = deepcopy(record)
             # Assignment revisions are projections; their originals remain immutable history.
             state["records"][f"assignment_event:{digest(record)}"] = deepcopy(record)
+            if (record["role"] in {"review", "qa"} and record["status"] in {"running", "completed"}
+                    and not any(r.get("record_type") == "outcome_event"
+                                and r["event_kind"] == "verification_started"
+                                and r["candidate_id"] == record["candidate_id"]
+                                for r in state["records"].values())):
+                save(state, {
+                    "schema_version": 1, "record_type": "outcome_event",
+                    "event_id": f"verification-start:{record['candidate_id']}",
+                    "work_id": state["work_id"], "attempt_id": record["attempt_id"],
+                    "candidate_id": record["candidate_id"], "event_kind": "verification_started",
+                    "occurred_at": now.isoformat(),
+                    "source_reference": f"operation:{request['operation_id']}",
+                    "details": {"required_roles": required_roles(state)},
+                })
         elif command == "action.prepare":
             require(
                 request["operation"] not in {"merge", "release", "local_delivery"},
@@ -1701,6 +1744,16 @@ def transition(original, command, request, now, dependency_states=None, *,
         else:
             raise WorkflowError("unknown_command", f"Unsupported command: {command}")
     timestamp = now.isoformat()
+    previous_status = original["attempt"]["status"] if original["attempt"] else None
+    if state["attempt"] and state["attempt"]["status"] != previous_status:
+        save(state, {
+            "schema_version": 1, "record_type": "outcome_event",
+            "event_id": f"attempt-status:{request['operation_id']}",
+            "work_id": state["work_id"], "attempt_id": state["attempt"]["attempt_id"],
+            "candidate_id": state["candidate_id"], "event_kind": "attempt_status",
+            "occurred_at": timestamp, "source_reference": f"operation:{request['operation_id']}",
+            "details": {"status": state["attempt"]["status"]},
+        })
     old_phase = original["phase"] if original["lifecycle"] == "active" else None
     new_phase = state["phase"] if state["lifecycle"] == "active" else None
     if old_phase != new_phase:
