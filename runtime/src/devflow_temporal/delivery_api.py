@@ -241,6 +241,10 @@ def create_app(config_path: Path) -> FastAPI:
     @app.get("/api/service")
     async def service_info(request: Request) -> dict[str, Any]:
         _session(request)
+        try:
+            await asyncio.wait_for(service.healthy_client(), timeout=2)
+        except Exception:
+            service.temporal_status = "disconnected"
         with service.store._connect() as db:
             active = db.execute(
                 """SELECT COUNT(*) FROM delivery_attempts
@@ -248,6 +252,7 @@ def create_app(config_path: Path) -> FastAPI:
             ).fetchone()[0]
         return {
             "status": "running",
+            "pid": os.getpid(),
             "version": "0.2.0-local",
             "temporal": service.temporal_status,
             "capacity": {"limit": service.config.raw.get("capacity", 2), "active": active},
