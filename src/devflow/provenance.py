@@ -16,6 +16,25 @@ from devflow.runtime import package_root
 from devflow.validation import validate_record
 
 
+def effective_settings_values(settings: dict) -> dict:
+    """Validate observed settings and separate execution values from provenance."""
+    if not isinstance(settings, dict) or not settings:
+        raise WorkflowError(
+            "settings_required", "Supply observed effective settings; defaults are not inferred"
+        )
+    allowed = {"model", "reasoning_effort", "service_tier", "role", "source_reference"}
+    if not set(settings) <= allowed or not all(
+        isinstance(settings.get(k), str) and settings[k]
+        for k in ("model", "reasoning_effort", "source_reference")
+    ) or any(settings.get(k) is not None and not (
+        isinstance(settings[k], str) and settings[k]
+    ) for k in ("service_tier", "role")):
+        raise WorkflowError(
+            "settings_invalid", "Only observed nonsecret model settings are accepted"
+        )
+    return {key: settings.get(key) for key in ("model", "reasoning_effort", "service_tier", "role")}
+
+
 def observe_subagent_startup(assignment: dict, request: dict, put_artifact) -> dict:
     """Read two explicitly selected native metadata records, never transcript payloads.
 
@@ -163,20 +182,7 @@ def capture_snapshot(repository: Path, request: dict, put_artifact, *, continuat
             raise WorkflowError("artifact_mismatch", "Instruction artifact hash mismatch")
         sources.append({"reference": str(path.resolve()), "hash": key})
     settings = request.get("effective_settings")
-    if not isinstance(settings, dict) or not settings:
-        raise WorkflowError(
-            "settings_required", "Supply observed effective settings; defaults are not inferred"
-        )
-    allowed = {"model", "reasoning_effort", "service_tier", "role", "source_reference"}
-    if not set(settings) <= allowed or not all(
-        isinstance(settings.get(k), str) and settings[k]
-        for k in ("model", "reasoning_effort", "source_reference")
-    ) or (settings.get("service_tier") is not None and not (
-        isinstance(settings["service_tier"], str) and settings["service_tier"]
-    )):
-        raise WorkflowError(
-            "settings_invalid", "Only observed nonsecret model settings are accepted"
-        )
+    effective_settings_values(settings)
     raw_settings = json.dumps(settings, sort_keys=True, separators=(",", ":")).encode()
     settings_hash = put_artifact(raw_settings)
     workflow_hash = digest(

@@ -23,6 +23,7 @@ from devflow.domain.rules import (
     authority,
     blank,
     next_actions,
+    scope_hash,
     transition,
     unblocked,
     validate_action_admission,
@@ -137,6 +138,25 @@ class WorkflowService:
         state = self.snapshot(work_id)
         return {"work_id": work_id, "revision": state["revision"], "actions": self.permitted_actions(state)}
 
+    def read_effective_settings(self, snapshot):
+        from devflow.provenance import effective_settings_values
+
+        validate_record(snapshot, "workflow_snapshot")
+        artifact_hash = snapshot["model_policy_hash"]
+        if snapshot["effective_settings_reference"] != f"sha256:{artifact_hash}":
+            raise WorkflowError("settings_mismatch", "Observed settings must bind their stored bytes")
+        self.store.require_artifact(artifact_hash)
+        try:
+            fd = os.open(self.store.root / "artifacts" / artifact_hash, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as stream:
+                content = stream.read()
+            if hashlib.sha256(content).hexdigest() != artifact_hash:
+                raise WorkflowError("corrupt_artifact", "Settings changed during comparison")
+            settings = json.loads(content, parse_float=Decimal)
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise WorkflowError("settings_invalid", "Settings comparison requires readable original JSON") from exc
+        return effective_settings_values(settings)
+
     def read_recovery_original(self, request):
         artifact_hash = request.get("original_result_artifact_hash")
         self.store.require_artifact(artifact_hash)
@@ -212,12 +232,24 @@ class WorkflowService:
             }
             recovery_input = (self.read_recovery_original(request)
                               if command == "host.recover-result" else None)
+            amendment_settings = None
+            if (command == "work.amend" and state["blocker"] and state["attempt"]
+                    and scope_hash(request["record"]) == state["scope_hash"]
+                    and "workflow_snapshot" in request):
+                current = state["records"]["workflow_snapshot:" + state["attempt"]["workflow_snapshot_id"]]
+                proposed = request["workflow_snapshot"]
+                validate_record(proposed, "workflow_snapshot")
+                if any(current.get(key) != proposed.get(key)
+                       for key in ("model_policy_hash", "effective_settings_reference")):
+                    amendment_settings = (self.read_effective_settings(current),
+                                          self.read_effective_settings(proposed))
             try:
                 updated, details = transition(
                     state, command, request, datetime.now(timezone.utc), dependencies,
                     trusted_verifier=self.trusted_verifier, repository=self.repository,
                     deferral_observation=deferral_observation, recovery_input=recovery_input,
                     continuation_observation=continuation_observation,
+                    amendment_settings=amendment_settings,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise WorkflowError(

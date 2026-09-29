@@ -511,9 +511,12 @@ def scope_hash(contract):
     return digest({k: v for k, v in contract.items() if k not in {"title", "scope_revision"}})
 
 
-def operative_workflow(snapshot):
-    return {k: v for k, v in snapshot.items()
-            if k not in {"snapshot_id", "captured_at", "continuation_upgrade"}}
+def operative_workflow(snapshot, settings=None):
+    excluded = {"snapshot_id", "captured_at", "continuation_upgrade"}
+    if settings is not None:
+        excluded |= {"model_policy_hash", "effective_settings_reference"}
+    return {k: v for k, v in snapshot.items() if k not in excluded} | (
+        {"effective_settings": settings} if settings is not None else {})
 
 
 def recover_operational_blocker(state, request, now):
@@ -1710,7 +1713,7 @@ def validate_action_admission(state, action, now):
 
 def transition(original, command, request, now, dependency_states=None, *,
                trusted_verifier=None, repository=None, deferral_observation=None, recovery_input=None,
-               continuation_observation=None):
+               continuation_observation=None, amendment_settings=None):
     state = deepcopy(original)
     details = {}
     admission = None
@@ -1784,7 +1787,16 @@ def transition(original, command, request, now, dependency_states=None, *,
         if command == "work.amend" and state["blocker"] and scope_hash(record) == state["scope_hash"]:
             current_snapshot = (get(state, "workflow_snapshot", state["attempt"]["workflow_snapshot_id"])
                                 if state["attempt"] else {})
-            blocked_noop = operative_workflow(request.get("workflow_snapshot", current_snapshot)) == operative_workflow(current_snapshot)
+            proposed_snapshot = request.get("workflow_snapshot", current_snapshot)
+            settings_changed = any(current_snapshot.get(k) != proposed_snapshot.get(k)
+                                   for k in ("model_policy_hash", "effective_settings_reference"))
+            if settings_changed:
+                require(amendment_settings is not None, "settings_comparison_required",
+                        "Verify both settings artifacts before evaluating a blocked amendment")
+                blocked_noop = (operative_workflow(current_snapshot, amendment_settings[0])
+                                == operative_workflow(proposed_snapshot, amendment_settings[1]))
+            else:
+                blocked_noop = operative_workflow(proposed_snapshot) == operative_workflow(current_snapshot)
         state["scope_hash"] = scope_hash(record)
         # Caller-written Authority records are historical claims, never decisions.
         auth = derived_authority(admission)
