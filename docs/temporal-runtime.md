@@ -1,6 +1,6 @@
 # Local Temporal delivery runtime
 
-The runtime under `runtime/` is a single-host, local development service. It accepts an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. The managed path owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. Its endpoint is a **published, unmerged PR**. It does not merge, release, deploy, or update personal production data.
+The runtime under `runtime/` is a single-host, local development service. It accepts a raw goal with an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. A read-only intake role investigates repository evidence, asks material questions, and proposes a scoped plan for explicit acceptance. The managed path then owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. Its endpoint is a **published, unmerged PR**. It does not merge, release, deploy, or update personal production data.
 
 The older `devflow-temporal` CLI remains a disposable role-ordering demonstration. It does not publish a PR or reconcile an issue. Use the managed `devflow-delivery` service for an end-to-end delivery.
 
@@ -28,13 +28,14 @@ The service configuration is a private JSON file outside the target checkout. It
   "work_id": "issue-work-001",
   "issue_url": "https://github.com/OWNER/REPO/issues/123",
   "repository_key": "configured-repository",
-  "goal": "Implement the accepted issue scope",
-  "accepted_plan": "The reviewed implementation and verification contract",
+  "goal": "Add the requested behavior to the configured repository",
   "base_ref": "main",
   "branch": "feat/issue-123",
   "authorized_endpoint": "published_unmerged"
 }
 ```
+
+The `intake` role requires an explicit server-owned model and effort policy. A raw-goal run waits for each clarification answer, and then for a decision on the proposed plan. Question answers may use a suggestion or free text. A plan decision uses `proceed`, `change` with a free-text `response`, or `cancel`, bound to its plan revision and digest. Changes return to planning; no model is invoked while waiting. The accepted plan is saved with its exact revision and passed to implementation without changing repository, path, check, model, or endpoint authority. Older submissions may still include an explicit `accepted_plan` to retain their prior execution contract.
 
 `recovery_key` selects a server-configured source import. `supersedes_run_id` can transfer the claim of an explicitly named blocked, unpublished run into a new run and branch. A pre-role run has no session to carry. A post-role continuation is narrower: the predecessor must have stopped at the implementation checkpoint with one finished, cleanup-confirmed role and no broker check, unknown effect or remote PR. Before claim transfer, the service reads the completed predecessor execution and candidate directly from Temporal, matches its memo and result to the durable attempt and private file manifest, and rechecks the DB claim and source under one transaction. The goal, accepted plan, endpoint and feature/check/QA authority must match. The broker imports only bound feature files and provider session data, then regenerates credentials and the permission profile. The old checkout and history remain auditable. An identical submit retry reuses its run, while a changed request with the same run ID is rejected. The service records an outbox intent before Temporal start and compares the remote workflow memo on recovery.
 
@@ -83,7 +84,7 @@ For a later eligible failed independent review, the same endpoint accepts an exp
 
 The optional [Desktop entry point](../runtime/desktop/README.md) installs a narrow local skill and MCP command for submitting and opening these same runs. Its guarded installer requires the explicit runtime, private config and Codex-home paths; it neither starts an independent orchestrator nor broadens a submit request. Install it only after the local service and its exact policy have passed admission checks.
 
-An optional managed decision is a Temporal wait with a persisted ID and candidate revision. A wrong/stale answer returns a conflict; a worker restart does not invoke a model while waiting. Cancellation stops at a role/check boundary. An accepted cancellation cannot later become a blocked or successful outcome because a check finishes concurrently. If a child or external effect cannot be proven stopped, cleanup is explicitly unknown. A completed role receipt is reused only for its bound request; an ambiguous in-flight role is quarantined rather than repeated.
+Each clarification and plan decision is a Temporal wait with a persisted ID and revision. A wrong/stale answer returns a conflict; a worker restart does not invoke a model while waiting. Cancellation stops at a role/check boundary. An accepted cancellation cannot later become a blocked or successful outcome because a check finishes concurrently. If a child or external effect cannot be proven stopped, cleanup is explicitly unknown. A completed role receipt is reused only for its bound request; an ambiguous in-flight role is quarantined rather than repeated.
 
 ## Verification and limits
 

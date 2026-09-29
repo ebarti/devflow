@@ -48,6 +48,7 @@ async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
         tracker=request.get("tracker"),
         usage=request.get("usage"),
         decision=request.get("decision"),
+        intake=request.get("intake"),
         iteration=request.get("iteration"),
         protocol_revision=request.get("protocol_revision"),
         outcome=request.get("outcome"),
@@ -62,6 +63,42 @@ async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
 async def delivery_prepare(request: dict[str, Any]) -> dict[str, Any]:
     _, broker = _context(request["spec"])
     return broker.prepare()
+
+
+@activity.defn(name="delivery_intake")
+async def delivery_intake(request: dict[str, Any]) -> dict[str, Any]:
+    store, broker = _context(request["spec"])
+    candidate = request["candidate"]
+    if broker.candidate() != candidate:
+        raise ValueError("intake checkout changed before investigation")
+    result = await get_supervisor(store).run(
+        {**request, "role": "intake", "workspace": str(broker.checkout)}
+    )
+    if broker.candidate() != candidate:
+        result["status"] = "blocked"
+        result.setdefault("findings", []).append("intake changed the read-only checkout")
+    return {
+        **result, "role": "intake", "iteration": request["iteration"],
+        "candidate": candidate, "provider": request["spec"]["provider"],
+    }
+
+
+@activity.defn(name="delivery_accept_plan")
+async def delivery_accept_plan(request: dict[str, Any]) -> dict[str, Any]:
+    spec = request["spec"]
+    config = DeliveryConfig.load(Path(spec["config_path"]))
+    if digest(config.raw) != spec["config_digest"]:
+        raise ValueError("service configuration changed during intake")
+    store = DeliveryStore(config)
+    saved = store.effective_spec(spec["run_id"])
+    if {key: value for key, value in saved.items() if key != "accepted_plan"} != {
+        key: value for key, value in spec.items() if key != "accepted_plan"
+    }:
+        raise ValueError("intake authority changed before acceptance")
+    return store.accept_intake_plan(
+        request["spec"]["run_id"], request["plan_revision"],
+        request["plan_digest"], request["plan"],
+    )
 
 
 @activity.defn(name="delivery_role")
@@ -355,6 +392,8 @@ async def delivery_tracker(request: dict[str, Any]) -> dict[str, Any]:
 DELIVERY_ACTIVITIES = [
     delivery_project,
     delivery_prepare,
+    delivery_intake,
+    delivery_accept_plan,
     delivery_role,
     delivery_publish,
     delivery_reconcile_publish,

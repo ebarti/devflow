@@ -282,8 +282,11 @@ class DeliveryConfig:
                 raise ValueError(f"{key} must be absolute")
         if not value.get("repositories") or not value.get("roles"):
             raise ValueError("service requires repository and role policy")
-        if set(value["roles"]) != {"implement", "review", "verify"}:
-            raise ValueError("service role policy must define implement, review, and verify")
+        roles = set(value["roles"])
+        if not {"implement", "review", "verify"} <= roles or roles - {
+            "intake", "implement", "review", "verify"
+        }:
+            raise ValueError("service role policy has missing or unknown roles")
         if value.get("provider", "codex") not in {"codex", "fake"}:
             raise ValueError("unsupported configured role provider")
         return cls(path=path.resolve(), raw=value)
@@ -326,6 +329,7 @@ class DeliveryConfig:
                 for key, value in sorted(self.raw["repositories"].items())
             ],
             "authorized_endpoint": "published_unmerged",
+            "intake_enabled": "intake" in self.raw["roles"],
         }
 
     def admit(self, supplied: dict[str, Any]) -> dict[str, Any]:
@@ -336,16 +340,22 @@ class DeliveryConfig:
             "issue_url",
             "repository_key",
             "goal",
-            "accepted_plan",
             "base_ref",
             "branch",
             "authorized_endpoint",
         }
-        optional = {"recovery_key", "supersedes_run_id"}
+        optional = {"accepted_plan", "recovery_key", "supersedes_run_id"}
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
             raise ValueError("required submit fields must be non-empty strings")
+        accepted_plan = supplied.get("accepted_plan")
+        if accepted_plan is not None and (
+            not isinstance(accepted_plan, str) or not accepted_plan.strip()
+        ):
+            raise ValueError("supplied accepted plan must be a non-empty string")
+        if accepted_plan is None and "intake" not in self.raw["roles"]:
+            raise ValueError("raw goals require a configured intake role")
         if not COMMAND_RE.fullmatch(supplied["command_id"]):
             raise ValueError("invalid command ID")
         if not RUN_ID_RE.fullmatch(supplied["run_id"]):
@@ -422,6 +432,9 @@ class DeliveryConfig:
             "fake_findings": self.raw.get("fake_findings", {})
             if self.raw.get("provider") == "fake"
             else {},
+            "fake_intake": self.raw.get("fake_intake", [])
+            if self.raw.get("provider") == "fake"
+            else [],
         }
         if policy["max_repairs"] < 0 or policy["max_repairs"] > 3:
             raise ValueError("max_repairs must be between 0 and 3")
@@ -676,6 +689,8 @@ class DeliveryConfig:
             policy["host_sandbox"] = "native-profile"
         return {
             **supplied,
+            "accepted_plan": accepted_plan or "",
+            "intake_required": accepted_plan is None,
             "version": 1,
             "provider": self.raw.get("provider", "codex"),
             "source_path": str(source),
@@ -760,6 +775,7 @@ def scope_amended_spec(
         "recovery_key", "supersedes_run_id",
     }
     effective = amended.admit({key: original[key] for key in submit_keys if key in original})
+    effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
         "base_ref", "branch", "authorized_endpoint", "source_path", "origin_url",

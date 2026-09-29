@@ -65,10 +65,30 @@ export interface CheckState {
 export interface Decision {
   id: string
   revision: number
+  kind?: 'question' | 'plan' | null
+  question_id?: string | null
+  plan_revision?: number | null
+  plan_digest?: string | null
+  allow_free_text?: boolean | null
   candidate_revision?: number | null
   prompt: string
   options: Array<string | { value: string; label: string; consequence?: string | null }>
   state?: string | null
+}
+
+export interface IntakePlan {
+  scope: string
+  steps: string[]
+  verification: string[]
+  acceptance: string[]
+}
+
+export interface IntakeState {
+  questions: Array<{ id: string; revision: number; prompt: string; options: string[]; state: string }>
+  answers: Array<{ question_id: string; question_revision: number; prompt: string; answer: string }>
+  plans: Array<{ revision: number; digest: string; content: IntakePlan; state: string; change_request?: string }>
+  accepted_plan?: { revision: number; digest: string; content: IntakePlan } | null
+  change_requests?: Array<{ plan_revision: number; response: string }>
 }
 
 export interface ActivityEvent {
@@ -130,6 +150,7 @@ export interface RunDetail extends RunSummary {
   } | null
   usage?: Usage | null
   decisions?: Decision[] | null
+  intake?: IntakeState | null
   events?: ActivityEvent[] | null
   evidence?: Evidence[] | null
 }
@@ -158,7 +179,7 @@ export interface NewRunRequest {
   issue_url: string
   repository_key: string
   goal: string
-  accepted_plan: string
+  accepted_plan?: string
   base_ref: string
   branch: string
   authorized_endpoint: 'published_unmerged'

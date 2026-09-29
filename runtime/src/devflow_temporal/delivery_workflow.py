@@ -70,7 +70,7 @@ class DeliveryWorkflow:
     def __init__(self) -> None:
         self.state: dict[str, Any] = {}
         self.cancel_requested = False
-        self.decision_answer: str | None = None
+        self.decision_answer: str | dict[str, Any] | None = None
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
         return await workflow.execute_activity(
@@ -140,6 +140,7 @@ class DeliveryWorkflow:
                 "tracker": self.state.get("tracker"),
                 "usage": self.state.get("usage"),
                 "decision": self.state.get("decision"),
+                "intake": self.state.get("intake"),
                 "iteration": self.state["iteration"],
                 "protocol_revision": self.state["revision"],
                 "outcome": self.state.get("outcome"),
@@ -235,6 +236,168 @@ class DeliveryWorkflow:
         self.state["cleanup"] = "none"
         return result
 
+    async def _run_intake(self, spec: dict[str, Any]) -> dict[str, Any] | None:
+        """Investigate and revise a raw goal before any implementation role starts."""
+
+        self.state["intake"] = {
+            "round": 0, "questions": [], "answers": [], "plans": [],
+            "accepted_plan": None, "change_requests": [],
+        }
+        while True:
+            if self.cancel_requested:
+                await self._cancelled(spec)
+                return None
+            intake = self.state["intake"]
+            turn = intake["round"]
+            self.state["phase"] = "investigating"
+            self.state["revision"] += 1
+            await self._project(spec, "intake_started", "Investigating the raw request")
+            try:
+                result = await self._activity(
+                    "delivery_intake",
+                    {
+                        "spec": spec, "iteration": turn,
+                        "candidate": self.state["candidate"], "intake": intake,
+                    },
+                )
+            except Exception as exc:
+                await self._stop(spec, f"intake activity failed: {type(exc).__name__}")
+                return None
+            self.state["roles"].append(result)
+            self.state["usage"][f"intake:{turn}"] = result.get("usage")
+            if self.cancel_requested:
+                await self._cancelled(spec)
+                return None
+            if result.get("cleanup") == "unknown" or result.get("status") == "recovery_unknown":
+                self.state["cleanup"] = "unknown"
+                await self._stop(spec, "intake role cleanup is unknown")
+                return None
+            if result.get("status") == "questions":
+                questions = result.get("questions")
+                if not isinstance(questions, list) or not questions:
+                    await self._stop(spec, "intake returned no material questions")
+                    return None
+                for item in questions:
+                    if self.cancel_requested:
+                        await self._cancelled(spec)
+                        return None
+                    question = {
+                        "id": f"{turn}:{item['id']}", "revision": turn + 1,
+                        "prompt": item["prompt"], "options": item["options"],
+                        "state": "pending",
+                    }
+                    intake["questions"].append(question)
+                    self.state["phase"] = "waiting_question"
+                    self.state["execution_state"] = "waiting"
+                    self.state["revision"] += 1
+                    self.state["decision"] = {
+                        "id": f"{spec['run_id']}:question:{question['id']}",
+                        "kind": "question", "revision": question["revision"],
+                        "candidate_revision": self.state["candidate_revision"],
+                        "question_id": question["id"], "prompt": question["prompt"],
+                        "options": question["options"], "allow_free_text": True,
+                        "state": "pending",
+                    }
+                    await self._project(spec, "question_pending", "Clarification needed")
+                    await workflow.wait_condition(
+                        lambda: self.decision_answer is not None or self.cancel_requested
+                    )
+                    if self.cancel_requested:
+                        await self._cancelled(spec)
+                        return None
+                    answer = self.decision_answer
+                    self.decision_answer = None
+                    if not isinstance(answer, dict) or answer.get("kind") != "question":
+                        await self._stop(spec, "clarification answer was invalid")
+                        return None
+                    question["state"] = "answered"
+                    intake["answers"].append({
+                        "question_id": question["id"],
+                        "question_revision": question["revision"],
+                        "prompt": question["prompt"],
+                        "answer": answer["answer"],
+                        "command_id": answer["command_id"],
+                    })
+                    self.state["execution_state"] = "running"
+                    self.state["revision"] += 1
+                    await self._project(spec, "question_answered", "Clarification saved")
+                intake["round"] += 1
+                continue
+            if result.get("status") == "plan":
+                plan = result.get("plan")
+                if not isinstance(plan, dict) or not plan.get("scope") or not all(
+                    plan.get(field) for field in ("steps", "verification", "acceptance")
+                ):
+                    await self._stop(spec, "intake returned an incomplete plan")
+                    return None
+                revision = len(intake["plans"]) + 1
+                plan_record = {
+                    "revision": revision, "digest": digest(plan),
+                    "content": plan, "state": "proposed",
+                }
+                intake["plans"].append(plan_record)
+                self.state["phase"] = "waiting_plan"
+                self.state["execution_state"] = "waiting"
+                self.state["revision"] += 1
+                self.state["decision"] = {
+                    "id": f"{spec['run_id']}:plan:{revision}",
+                    "kind": "plan", "revision": revision,
+                    "plan_revision": revision, "plan_digest": plan_record["digest"],
+                    "candidate_revision": self.state["candidate_revision"],
+                    "prompt": "Review this Devflow plan before implementation.",
+                    "options": ["proceed", "change", "cancel"],
+                    "state": "pending",
+                }
+                await self._project(spec, "plan_pending", "Plan proposed for acceptance")
+                await workflow.wait_condition(
+                    lambda: self.decision_answer is not None or self.cancel_requested
+                )
+                if self.cancel_requested:
+                    await self._cancelled(spec)
+                    return None
+                answer = self.decision_answer
+                self.decision_answer = None
+                if not isinstance(answer, dict) or answer.get("kind") != "plan":
+                    await self._stop(spec, "plan response was invalid")
+                    return None
+                if answer["answer"] == "cancel":
+                    await self._cancelled(spec)
+                    return None
+                if answer["answer"] == "change":
+                    plan_record["state"] = "change_requested"
+                    plan_record["change_request"] = answer["response"]
+                    intake["change_requests"].append({
+                        "plan_revision": revision, "response": answer["response"],
+                        "command_id": answer["command_id"],
+                    })
+                    intake["round"] += 1
+                    self.state["execution_state"] = "running"
+                    self.state["revision"] += 1
+                    await self._project(
+                        spec, "plan_change_requested", "Planning revision requested"
+                    )
+                    continue
+                try:
+                    accepted_spec = await self._activity(
+                        "delivery_accept_plan",
+                        {"spec": spec, "plan_revision": revision,
+                         "plan_digest": plan_record["digest"], "plan": plan},
+                    )
+                except Exception as exc:
+                    await self._stop(spec, f"plan acceptance failed: {type(exc).__name__}")
+                    return None
+                plan_record["state"] = "accepted"
+                intake["accepted_plan"] = {
+                    "revision": revision, "digest": plan_record["digest"], "content": plan,
+                    "command_id": answer["command_id"],
+                }
+                self.state["execution_state"] = "running"
+                self.state["revision"] += 1
+                await self._project(accepted_spec, "plan_accepted", "Exact plan accepted")
+                return accepted_spec
+            await self._stop(spec, "intake did not produce questions or a plan")
+            return None
+
     @workflow.run
     async def run(
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
@@ -273,6 +436,11 @@ class DeliveryWorkflow:
             return await self._stop(spec, f"preparation failed: {type(exc).__name__}")
         self.state["candidate"] = prepared["candidate"]
         self.state["candidate_revision"] += 1
+        if spec.get("intake_required"):
+            accepted_spec = await self._run_intake(spec)
+            if accepted_spec is None:
+                return self.state
+            spec = accepted_spec
         self.state["phase"] = "tracker_start"
         self.state["revision"] += 1
         await self._project(spec, "tracker_start", "Claimed issue entering In progress")
@@ -1090,9 +1258,36 @@ class DeliveryWorkflow:
             raise ApplicationError("stale decision", non_retryable=True)
         if request.get("candidate_revision") != pending["candidate_revision"]:
             raise ApplicationError("decision candidate changed", non_retryable=True)
-        if request.get("answer") not in pending["options"]:
-            raise ApplicationError("answer is outside the decision options", non_retryable=True)
-        self.decision_answer = request["answer"]
+        answer = request.get("answer")
+        response = request.get("response")
+        if pending.get("kind") == "question":
+            if (
+                not isinstance(answer, str)
+                or not answer.strip()
+                or len(answer) > 4000
+                or response is not None
+            ):
+                raise ApplicationError("question answer must be non-empty text", non_retryable=True)
+            self.decision_answer = {
+                "kind": "question", "answer": answer.strip(),
+                "command_id": request["command_id"],
+            }
+        elif pending.get("kind") == "plan":
+            if answer not in pending["options"] or (
+                answer == "change" and (
+                    not isinstance(response, str) or not response.strip() or len(response) > 4000
+                )
+            ) or (answer != "change" and response is not None):
+                raise ApplicationError("plan response is invalid", non_retryable=True)
+            self.decision_answer = {
+                "kind": "plan", "answer": answer,
+                "response": response.strip() if isinstance(response, str) else None,
+                "command_id": request["command_id"],
+            }
+        else:
+            if answer not in pending["options"] or response is not None:
+                raise ApplicationError("answer is outside the decision options", non_retryable=True)
+            self.decision_answer = answer
         self.state["decision"] = None
         self.state["revision"] += 1
         return self.state

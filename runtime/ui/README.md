@@ -25,7 +25,7 @@ The browser starts with `GET /api/session`. If it returns `{authenticated:false}
 | `GET /api/runs/{id}` | `{run, events, evidence}`; `run` has `id`, nullable Temporal `revision`/`protocol_revision`, `projection_revision`, `iteration`, `sequence`, ordered `phase_gates`, `roles`, `capacity:{limit,active}`, boolean `queued`, top-level `cleanup`, `candidate`, `pull_request`, `checks`, `tracker`, role-keyed `usage`, and `decisions` with string `options` |
 | `GET /api/runs/{id}/events?after=N` | SSE `event: update`, numeric `id`, optional JSON `sequence`; snapshot refetched on new event and reconnect |
 | `GET /api/service` | Service health, version, Temporal, capacity, and `policy` containing allowlisted `repositories` and role settings |
-| `POST /api/runs` | Revisioned command with `command_id`, `run_id`, `work_id`, `issue_url`, `repository_key`, `goal`, `accepted_plan`, `base_ref`, `branch`, `authorized_endpoint: published_unmerged`, optional `recovery_key`; returns `{run_id,dashboard_url,existing,phase}` |
+| `POST /api/runs` | Revisioned raw-goal command with `command_id`, `run_id`, `work_id`, `issue_url`, `repository_key`, `goal`, `base_ref`, `branch`, `authorized_endpoint: published_unmerged`, optional legacy `accepted_plan` and `recovery_key`; returns `{run_id,dashboard_url,existing,phase}` |
 | `POST /api/runs/{id}/decision` | `{command_id,expected_revision,decision_id,decision_revision,candidate_revision,answer}` |
 | `POST /api/runs/{id}/cancel` | `{command_id,expected_revision,reason}` |
 

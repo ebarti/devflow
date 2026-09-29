@@ -85,6 +85,8 @@ class DeliveryStore:
                     tracker_json TEXT,
                     usage_json TEXT,
                     decision_json TEXT,
+                    intake_json TEXT,
+                    accepted_plan_text TEXT,
                     outcome TEXT,
                     cleanup TEXT NOT NULL DEFAULT 'none',
                     error TEXT,
@@ -101,6 +103,10 @@ class DeliveryStore:
                 )
             if "decision_json" not in columns:
                 db.execute("ALTER TABLE delivery_runs ADD COLUMN decision_json TEXT")
+            if "intake_json" not in columns:
+                db.execute("ALTER TABLE delivery_runs ADD COLUMN intake_json TEXT")
+            if "accepted_plan_text" not in columns:
+                db.execute("ALTER TABLE delivery_runs ADD COLUMN accepted_plan_text TEXT")
             if "cleanup" not in columns:
                 db.execute(
                     "ALTER TABLE delivery_runs ADD COLUMN cleanup TEXT NOT NULL DEFAULT 'none'"
@@ -418,7 +424,8 @@ class DeliveryStore:
             if superseded:
                 previous = db.execute(
                     """SELECT work_id,issue_url,repository_key,phase,outcome,execution_state,
-                              cleanup,error,pr_json,checks_json,request_digest,request_json
+                              cleanup,error,pr_json,checks_json,request_digest,request_json,
+                              accepted_plan_text
                        FROM delivery_runs WHERE run_id=?""",
                     (superseded,),
                 ).fetchone()
@@ -435,6 +442,8 @@ class DeliveryStore:
                 ):
                     raise ValueError("only a blocked unpublished run may be superseded")
                 prior_spec = json.loads(previous["request_json"])
+                if previous["accepted_plan_text"] is not None:
+                    prior_spec["accepted_plan"] = previous["accepted_plan_text"]
                 if prior_spec["branch"] == spec["branch"]:
                     raise ValueError("superseded run retains the owned branch; choose a new branch")
                 if attempts:
@@ -1136,7 +1145,7 @@ class DeliveryStore:
         # External Docker image readback belongs at this cancellable boundary,
         # not in ordinary projection or outbox dispatch.
         admitted = scope_amended_spec(
-            self.spec(run_id), Path(recovery["amended_config_path"]),
+            self.intake_execution_spec(run_id), Path(recovery["amended_config_path"]),
             recovery["amended_config_sha256"], recovery["added_paths"],
         )
         if admitted != spec:
@@ -3492,6 +3501,8 @@ class DeliveryStore:
         if row is None or grant is None or amendment:
             raise ValueError("scope amendment requires one exhausted original repair grant")
         original = json.loads(row["request_json"])
+        if row["accepted_plan_text"] is not None:
+            original["accepted_plan"] = row["accepted_plan_text"]
         prior_recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         closed = self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
         state = closed["result"]
@@ -4039,6 +4050,63 @@ class DeliveryStore:
                 raise ValueError("run ID not found")
             return json.loads(row[0])
 
+    def intake_execution_spec(self, run_id: str) -> dict[str, Any]:
+        """Read the frozen request with its single accepted intake plan."""
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT request_json,accepted_plan_text FROM delivery_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("run ID not found")
+            spec = json.loads(row["request_json"])
+            if row["accepted_plan_text"] is not None:
+                spec["accepted_plan"] = row["accepted_plan_text"]
+            return spec
+
+    def accept_intake_plan(
+        self, run_id: str, revision: int, plan_digest: str, plan: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Bind exactly the reviewed plan without changing repository authority."""
+
+        if digest(plan) != plan_digest or type(revision) is not int:
+            raise ValueError("accepted plan does not match the reviewed revision")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT request_json,intake_json,accepted_plan_text
+                   FROM delivery_runs WHERE run_id=?""",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("run ID not found")
+            original = json.loads(row["request_json"])
+            if not original.get("intake_required"):
+                raise ValueError("run was submitted with an accepted plan")
+            intake = json.loads(row["intake_json"]) if row["intake_json"] else None
+            if (
+                not isinstance(intake, dict)
+                or not intake.get("plans")
+                or intake["plans"][-1].get("revision") != revision
+                or intake["plans"][-1].get("digest") != plan_digest
+                or intake["plans"][-1].get("content") != plan
+            ):
+                raise ValueError("plan changed before acceptance")
+            accepted = json.dumps(plan, sort_keys=True, indent=2)
+            if row["accepted_plan_text"] is not None:
+                if row["accepted_plan_text"] != accepted:
+                    raise ValueError("another plan was already accepted")
+            else:
+                intake["accepted_plan"] = {
+                    "revision": revision, "digest": plan_digest, "content": plan
+                }
+                db.execute(
+                    "UPDATE delivery_runs SET accepted_plan_text=?,intake_json=? WHERE run_id=?",
+                    (accepted, canonical_json(intake), run_id),
+                )
+        return {**original, "accepted_plan": accepted}
+
     @staticmethod
     def _scope_recovery(recovery: dict[str, Any] | None) -> dict[str, Any] | None:
         """Resolve the sole amendment through explicitly numbered continuations."""
@@ -4069,11 +4137,15 @@ class DeliveryStore:
 
         with self._connect() as db:
             row = db.execute(
-                "SELECT request_json,recovery_json FROM delivery_runs WHERE run_id=?", (run_id,)
+                """SELECT request_json,recovery_json,accepted_plan_text
+                   FROM delivery_runs WHERE run_id=?""",
+                (run_id,),
             ).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
             original = json.loads(row["request_json"])
+            if row["accepted_plan_text"] is not None:
+                original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
             scope = self._scope_recovery(recovery)
             if scope is None:
@@ -4199,6 +4271,7 @@ class DeliveryStore:
         tracker: dict[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
         decision: dict[str, Any] | None = None,
+        intake: dict[str, Any] | None = None,
         iteration: int | None = None,
         protocol_revision: int | None = None,
         outcome: str | None = None,
@@ -4249,6 +4322,8 @@ class DeliveryStore:
                 else row["tracker_json"],
                 "usage_json": canonical_json(usage) if usage is not None else row["usage_json"],
                 "decision_json": canonical_json(decision),
+                "intake_json": canonical_json(intake)
+                if intake is not None else row["intake_json"],
                 "outcome": outcome if outcome is not None else row["outcome"],
                 "cleanup": cleanup if cleanup is not None else row["cleanup"],
                 "error": error if error is not None else row["error"],
@@ -4538,6 +4613,7 @@ class DeliveryStore:
             "decisions": [json.loads(row["decision_json"])]
             if row["decision_json"] and json.loads(row["decision_json"]) is not None
             else [],
+            "intake": json.loads(row["intake_json"]) if row["intake_json"] else None,
             "events": events,
             "error": row["error"],
         }

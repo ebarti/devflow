@@ -301,7 +301,7 @@ class DeliverySupervisor:
             if request["role"] != "implement":
                 role_home /= str(request["iteration"])
             binds = [
-                Bind(Path(request["workspace"]), "/work", request["role"] == "review"),
+                Bind(Path(request["workspace"]), "/work", request["role"] in {"intake", "review"}),
                 Bind(role_home, "/rolehome"),
                 Bind(folder, "/attempt"),
             ]
@@ -334,6 +334,7 @@ class DeliverySupervisor:
                     "run_id": spec["run_id"],
                     "goal": spec["goal"],
                     "accepted_plan": spec["accepted_plan"],
+                    "intake_required": spec.get("intake_required", False),
                     "provider": "codex",
                     "state_dir": "/attempt",
                     "policy": role_policy,
@@ -348,6 +349,7 @@ class DeliverySupervisor:
                 "findings": request.get("findings"),
                 "resume_session": request.get("resume_session"),
                 "continuation": request.get("continuation"),
+                "intake": request.get("intake"),
                 "recovery_path": "/recovery" if recovery.is_dir() else None,
                 "review_diff": {**review_diff, "path": "/evidence/diff.patch"}
                 if review_diff

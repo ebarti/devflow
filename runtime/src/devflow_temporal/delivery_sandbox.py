@@ -72,7 +72,7 @@ def prepare_sandbox(request: dict[str, Any], attempt_dir: Path) -> tuple[Path, d
     for path in readable:
         lines.append(f"(allow file-read* (subpath {_path(path)}))")
     writable = [attempt_dir, role_home]
-    if role != "review":
+    if role not in {"intake", "review"}:
         writable.append(workspace)
     for path in writable:
         lines.append(f"(allow file-write* (subpath {_path(path)}))")
@@ -307,7 +307,7 @@ def prepare_native_role(
         ):
             raise ValueError("controller-bound diff is unavailable or changed")
     elif review_diff is not None:
-        raise ValueError("implementer may not receive an independent gate diff")
+        raise ValueError("non-gate role may not receive an independent gate diff")
     qa_evidence = request.get("qa_evidence")
     if qa_evidence is not None:
         if request["role"] != "verify" or not isinstance(qa_evidence, dict):
@@ -368,7 +368,7 @@ def prepare_native_role(
     lines = _profile_lines(
         profile_name,
         workspace=profile_workspace,
-        workspace_access="read" if request["role"] == "review" else "write",
+        workspace_access="read" if request["role"] in {"intake", "review"} else "write",
         home=profile_home,
         codex_home=profile_codex_home,
         scratch=profile_scratch,

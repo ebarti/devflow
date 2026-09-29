@@ -376,6 +376,8 @@ def create_app(config_path: Path) -> FastAPI:
                 "answer",
             }
         )
+        if name == "decision" and "response" in payload:
+            expected = expected | {"response"}
         if set(payload) != expected:
             raise HTTPException(400, "mutation fields do not match the contract")
         try:

@@ -16,7 +16,7 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool()
     def submit_run(request_json: str) -> dict:
-        """Submit an authorized run as JSON; return its durable run ID and dashboard URL."""
+        """Submit a raw goal and authorized endpoint; Devflow investigates and plans."""
         value = json.loads(request_json)
         if not isinstance(value, dict):
             raise ValueError("submit request must be a JSON object")
@@ -39,7 +39,7 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool()
     def answer_decision(run_id: str, request_json: str) -> dict:
-        """Answer a pending decision with command ID and revision checks."""
+        """Answer a question or accept/change a plan with command ID and revisions."""
         return client(config_path).decision(run_id, json.loads(request_json))
 
     @server.tool()

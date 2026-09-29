@@ -106,7 +106,7 @@ describe('dashboard commands', () => {
     expect((screen.getByRole('button', { name: 'Cancel run' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
-  it('submits only allowlisted repository, endpoint and accepted plan fields', async () => {
+  it('submits a raw goal with the allowlisted repository and endpoint', async () => {
     const user = userEvent.setup()
     const submit = vi.spyOn(api, 'newRun').mockResolvedValue({ run_id: 'fixture-new', dashboard_url: '/runs/fixture-new', existing: false, phase: 'queued' })
     const onCreated = vi.fn()
@@ -116,13 +116,58 @@ describe('dashboard commands', () => {
     await user.selectOptions(screen.getByLabelText('Repository'), 'fixture-repo')
     await user.type(screen.getByLabelText('Branch'), 'feat/fixture')
     await user.type(screen.getByLabelText('Goal'), 'Fixture task')
-    await user.type(screen.getByLabelText('Accepted plan'), 'A fixture plan accepted for this UI test.')
-    await user.click(screen.getByRole('button', { name: 'Start run' }))
+    await user.click(screen.getByRole('button', { name: 'Start investigation' }))
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith('fixture-new'))
     const body = submit.mock.calls[0][0]
-    expect(body).toMatchObject({ repository_key: 'fixture-repo', base_ref: 'main', authorized_endpoint: 'published_unmerged', accepted_plan: 'A fixture plan accepted for this UI test.' })
+    expect(body).toMatchObject({ repository_key: 'fixture-repo', base_ref: 'main', authorized_endpoint: 'published_unmerged', goal: 'Fixture task' })
+    expect(body).not.toHaveProperty('accepted_plan')
     expect(body).not.toHaveProperty('repo_path')
     expect(body).not.toHaveProperty('state_dir')
     expect(body).not.toHaveProperty('model')
+  })
+
+  it('sends a free-text clarification and renders the retained answer', async () => {
+    const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
+    const user = userEvent.setup()
+    render(<RunDetails run={{
+      ...mockRun, protocol_revision: 4,
+      intake: {
+        questions: [{ id: '0:scope', revision: 1, prompt: 'Which scope?', options: ['Small'], state: 'pending' }],
+        answers: [{ question_id: 'older', question_revision: 1, prompt: 'Why?', answer: 'Needed by users' }],
+        plans: [], accepted_plan: null,
+      },
+      decisions: [{ id: 'fixture:question:0:scope', revision: 1, kind: 'question', candidate_revision: 1, prompt: 'Which scope?', options: ['Small'], state: 'pending' }],
+    }} onRefresh={vi.fn().mockResolvedValue(undefined)} />)
+    expect(screen.getByText('Needed by users')).toBeTruthy()
+    await user.type(screen.getByLabelText('Your answer (or choose a suggestion)'), 'Include both paths')
+    await user.click(screen.getByRole('button', { name: 'Submit answer' }))
+    await waitFor(() => expect(answer).toHaveBeenCalledTimes(1))
+    expect(answer.mock.calls[0][1]).toMatchObject({
+      expected_revision: 4, decision_id: 'fixture:question:0:scope', answer: 'Include both paths',
+    })
+  })
+
+  it('shows the exact proposed plan and sends a requested revision', async () => {
+    const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
+    const user = userEvent.setup()
+    render(<RunDetails run={{
+      ...mockRun, protocol_revision: 8,
+      intake: {
+        questions: [], answers: [],
+        plans: [{ revision: 2, digest: 'fixture-digest', state: 'proposed', content: {
+          scope: 'Update README', steps: ['Edit one file'],
+          verification: ['Run fixture check'], acceptance: ['Text is visible'],
+        } }], accepted_plan: null,
+      },
+      decisions: [{ id: 'fixture:plan:2', revision: 2, kind: 'plan', plan_revision: 2, plan_digest: 'fixture-digest', candidate_revision: 1, prompt: 'Review this Devflow plan before implementation.', options: ['proceed', 'change', 'cancel'], state: 'pending' }],
+    }} onRefresh={vi.fn().mockResolvedValue(undefined)} />)
+    expect(screen.getAllByText('Update README').length).toBeGreaterThan(0)
+    await user.click(screen.getByRole('radio', { name: 'Change' }))
+    await user.type(screen.getByLabelText('What should change in the plan?'), 'Include API verification')
+    await user.click(screen.getByRole('button', { name: 'Submit plan response' }))
+    await waitFor(() => expect(answer).toHaveBeenCalledTimes(1))
+    expect(answer.mock.calls[0][1]).toMatchObject({
+      expected_revision: 8, decision_id: 'fixture:plan:2', answer: 'change', response: 'Include API verification',
+    })
   })
 })

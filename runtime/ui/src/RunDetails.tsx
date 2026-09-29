@@ -142,19 +142,25 @@ function UsageSection({ run }: { run: RunDetail }) {
 
 function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: Decision; onRefresh: () => Promise<void> }) {
   const [choice, setChoice] = useState('')
+  const [freeText, setFreeText] = useState('')
   const [commandId, setCommandId] = useState(() => crypto.randomUUID())
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [stale, setStale] = useState(false)
 
+  const plan = decision.kind === 'plan' ? run.intake?.plans.find(item => item.revision === decision.plan_revision)?.content : null
+  const answerText = decision.kind === 'question' ? freeText.trim() || choice : choice
+  const valid = Boolean(answerText) && (decision.kind !== 'plan' || choice !== 'change' || Boolean(freeText.trim()))
+
   async function answer() {
-    if (!choice || run.protocol_revision == null || decision.candidate_revision == null || busy || stale) return
+    if (!valid || run.protocol_revision == null || decision.candidate_revision == null || busy || stale) return
     setBusy(true); setError('')
     try {
       await api.answer(run.id, {
         command_id: commandId, expected_revision: run.protocol_revision,
         decision_id: decision.id, decision_revision: decision.revision,
-        candidate_revision: decision.candidate_revision, answer: choice,
+        candidate_revision: decision.candidate_revision, answer: answerText,
+        ...(decision.kind === 'plan' && choice === 'change' ? { response: freeText.trim() } : {}),
       })
       await onRefresh()
     } catch (cause) {
@@ -167,23 +173,42 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
   }
 
   return <section className="decision-card" aria-labelledby={`decision-${decision.id}`}>
-    <div className="decision-card__heading"><h2 id={`decision-${decision.id}`}>Decision needed</h2><span>Revision {decision.revision}</span></div>
+    <div className="decision-card__heading"><h2 id={`decision-${decision.id}`}>{decision.kind === 'question' ? 'Clarification needed' : decision.kind === 'plan' ? 'Review Devflow plan' : 'Decision needed'}</h2><span>Revision {decision.revision}</span></div>
     <p>{decision.prompt}</p>
+    {plan ? <div className="intake-plan"><h3>Scope</h3><p>{plan.scope}</p><h3>Steps</h3><ol>{plan.steps.map((item, index) => <li key={index}>{item}</li>)}</ol><h3>Verification</h3><ul>{plan.verification.map((item, index) => <li key={index}>{item}</li>)}</ul><h3>Acceptance</h3><ul>{plan.acceptance.map((item, index) => <li key={index}>{item}</li>)}</ul></div> : null}
     {decision.candidate_revision != null ? <p className="subtle">Candidate revision {decision.candidate_revision}</p> : null}
     <fieldset disabled={busy || stale}>
       <legend className="sr-only">Choose a response</legend>
       {decision.options.map(option => {
         const value = typeof option === 'string' ? option : option.value
-        const label = typeof option === 'string' ? titleCase(option) : option.label
+        const label = typeof option === 'string' ? decision.kind === 'question' ? option : titleCase(option) : option.label
         const consequence = typeof option === 'string' ? null : option.consequence
         return <label className="choice" key={value}>
-          <input type="radio" name={`decision-${decision.id}`} value={value} checked={choice === value} onChange={() => { setChoice(value); setCommandId(crypto.randomUUID()) }} />
+          <input type="radio" name={`decision-${decision.id}`} value={value} checked={choice === value} onChange={() => { setChoice(value); setFreeText(''); setCommandId(crypto.randomUUID()) }} />
           <span>{label}{consequence ? <small>{consequence}</small> : null}</span>
         </label>
       })}
     </fieldset>
+    {decision.kind === 'question' || (decision.kind === 'plan' && choice === 'change') ? <label className="field-wide">{decision.kind === 'question' ? 'Your answer (or choose a suggestion)' : 'What should change in the plan?'}<textarea value={freeText} onChange={event => { setFreeText(event.target.value); if (decision.kind === 'question') setChoice(''); setCommandId(crypto.randomUUID()) }} rows={3} maxLength={4000} disabled={busy || stale} /></label> : null}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
-    <button className="primary-button" type="button" disabled={!choice || busy || stale || run.protocol_revision == null || decision.candidate_revision == null} onClick={() => void answer()}>{busy ? 'Submitting…' : 'Submit decision'}</button>
+    <button className="primary-button" type="button" disabled={!valid || busy || stale || run.protocol_revision == null || decision.candidate_revision == null} onClick={() => void answer()}>{busy ? 'Submitting…' : decision.kind === 'plan' && choice === 'proceed' ? 'Accept this plan' : decision.kind === 'question' ? 'Submit answer' : decision.kind === 'plan' ? 'Submit plan response' : 'Submit decision'}</button>
+  </section>
+}
+
+function IntakeHistory({ run }: { run: RunDetail }) {
+  const intake = run.intake
+  if (!intake) return null
+  return <section className="section lower-section" aria-labelledby="intake-heading">
+    <h2 id="intake-heading">Investigation and plan</h2>
+    {intake.answers.length ? <div><h3>Clarifications</h3><dl>{intake.answers.map(answer => <div key={answer.question_id}><dt>{answer.prompt}</dt><dd>{answer.answer}</dd></div>)}</dl></div> : null}
+    {intake.plans.map(plan => <div className="intake-plan" key={plan.revision}>
+      <h3>Plan revision {plan.revision} · {titleCase(plan.state)}</h3>
+      <p>{plan.content.scope}</p>
+      <ol>{plan.content.steps.map((item, index) => <li key={index}>{item}</li>)}</ol>
+      <p><strong>Verification:</strong> {plan.content.verification.join('; ')}</p>
+      <p><strong>Acceptance:</strong> {plan.content.acceptance.join('; ')}</p>
+      {plan.change_request ? <p><strong>Requested change:</strong> {plan.change_request}</p> : null}
+    </div>)}
   </section>
 }
 
@@ -225,6 +250,7 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     {run.error ? <p className="inline-alert" role="alert">{run.error}</p> : null}
     <PhaseStrip gates={run.phase_gates} />
     {decisions.map(decision => <DecisionCard key={`${decision.id}:${decision.revision}`} run={run} decision={decision} onRefresh={onRefresh} />)}
+    <IntakeHistory run={run} />
     <Facts run={run} />
     <RoleTable roles={run.roles} />
     <Activity events={run.events} />
