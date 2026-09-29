@@ -3425,13 +3425,14 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     monkeypatch.setattr(successor, "_completed_temporal_result", lambda _id: live)
     request2 = {
         **request,
-        **({"accepted_plan": old_spec["accepted_plan"]} if raw_intake else {}),
         "command_id": "command-2",
         "run_id": "run-2",
         "branch": "feat/fixture-2",
         "supersedes_run_id": "run-1",
         "recovery_key": "finished-role",
     }
+    if raw_intake:
+        assert "accepted_plan" not in request2
     original_text = (old_broker.checkout / "README.md").read_text()
     original_stat = (old_broker.checkout / "README.md").stat()
     (old_broker.checkout / "README.md").write_text("Changed after terminal role\n")
@@ -3461,6 +3462,19 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     store.config.path.write_text(json.dumps(configuration))
     with pytest.raises(ValueError, match="changed authority"):
         successor.submit({**request2, "accepted_plan": "A different feature"})
+    if raw_intake:
+        with successor._connect() as db:
+            db.execute(
+                "UPDATE delivery_runs SET accepted_plan_text=? WHERE run_id='run-1'",
+                ("Stale predecessor plan",),
+            )
+        with pytest.raises(ValueError, match="accepted intake plan changed"):
+            successor.submit(request2)
+        with successor._connect() as db:
+            db.execute(
+                "UPDATE delivery_runs SET accepted_plan_text=? WHERE run_id='run-1'",
+                (old_spec["accepted_plan"],),
+            )
     with successor._connect() as db:
         db.execute("UPDATE delivery_runs SET cleanup='unknown' WHERE run_id='run-1'")
     with pytest.raises(ValueError, match="changed authority"):
@@ -3501,6 +3515,10 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
         )
     monkeypatch.setattr(successor, "_ensure_no_remote_pr", lambda *_args: None)
     assert successor.submit(request2)["existing"] is False
+    if raw_intake:
+        successor_spec = successor.spec("run-2")
+        assert successor_spec["accepted_plan"] == old_spec["accepted_plan"]
+        assert successor_spec["intake_required"] is False
     frozen = successor.spec("run-2")["continuation"]
     assert frozen["candidate_id"] == final["id"]
     assert frozen["session_id"] == session_id

@@ -37,6 +37,22 @@ def _private_json(path: Path, value: dict[str, Any]) -> None:
         stream.write(content)
 
 
+def _contained_role_spec(spec: dict[str, Any], role_policy: dict[str, Any]) -> dict[str, Any]:
+    """Keep the frozen request context available after container path translation."""
+
+    return {
+        "run_id": spec["run_id"],
+        "work_id": spec["work_id"],
+        "issue_url": spec["issue_url"],
+        "goal": spec["goal"],
+        "accepted_plan": spec["accepted_plan"],
+        "intake_required": spec.get("intake_required", False),
+        "provider": "codex",
+        "state_dir": "/attempt",
+        "policy": role_policy,
+    }
+
+
 class DeliverySupervisor:
     def __init__(self, store: DeliveryStore, *, capacity: int) -> None:
         self.store = store
@@ -330,15 +346,7 @@ class DeliverySupervisor:
                 "config_overrides": spec["policy"]["config_overrides"],
             }
             translated = {
-                "spec": {
-                    "run_id": spec["run_id"],
-                    "goal": spec["goal"],
-                    "accepted_plan": spec["accepted_plan"],
-                    "intake_required": spec.get("intake_required", False),
-                    "provider": "codex",
-                    "state_dir": "/attempt",
-                    "policy": role_policy,
-                },
+                "spec": _contained_role_spec(spec, role_policy),
                 "role": request["role"],
                 "iteration": request["iteration"],
                 "candidate": request["candidate"],

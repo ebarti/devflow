@@ -447,6 +447,13 @@ class DeliveryStore:
                 if prior_spec["branch"] == spec["branch"]:
                     raise ValueError("superseded run retains the owned branch; choose a new branch")
                 if attempts:
+                    if spec.get("intake_required") and (
+                        spec["policy"].get("recovery") or {}
+                    ).get("continuation"):
+                        if previous["accepted_plan_text"] is None:
+                            raise ValueError("continuation predecessor has no accepted plan")
+                        spec["accepted_plan"] = previous["accepted_plan_text"]
+                        spec["intake_required"] = False
                     spec["continuation"] = self._post_role_continuation(
                         db, spec, prior_spec, previous, attempts, temporal_result
                     )

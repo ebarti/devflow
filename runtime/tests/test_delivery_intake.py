@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import httpx
@@ -20,8 +21,10 @@ from devflow_temporal.delivery_activities import (
     delivery_project,
 )
 from devflow_temporal.delivery_api import create_app
+from devflow_temporal.delivery_control import main as delivery_main
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 from devflow_temporal.role_runner import _task
+from devflow_temporal.supervisor import _contained_role_spec
 
 
 def _git(path: Path, *args: str) -> str:
@@ -137,13 +140,43 @@ def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):
     store = create_app(path).state.delivery.store
     store.submit(request)
     spec = store.spec("run-1")
+    contained = _contained_role_spec(
+        spec, {**spec["policy"], "host_sandbox": "native-profile"}
+    )
     task = _task({
-        "spec": spec, "role": "intake", "iteration": 0,
+        "spec": contained, "role": "intake", "iteration": 0,
         "candidate": {"id": "candidate", "head": spec["base_sha"]},
-        "workspace": str(Path(spec["checkout"])),
+        "workspace": "/work",
     })
+    assert contained["work_id"] == spec["work_id"]
+    assert contained["issue_url"] == spec["issue_url"]
     assert 'Frozen work ID: "work-1"' in task.goal
     assert 'Frozen issue URL: "https://github.com/example/fixture/issues/3"' in task.goal
+
+
+def test_cli_reports_stale_answer_without_traceback(intake_fixture, tmp_path, monkeypatch, capsys):
+    path, _ = intake_fixture
+    answer_path = tmp_path / "stale-answer.json"
+    answer_path.write_text(json.dumps({"command_id": "stale-answer"}))
+
+    class Client:
+        def decision(self, _run_id, _request):
+            raise ValueError("service HTTP 409: decision changed")
+
+        def __getattr__(self, _name):
+            return lambda *_args: None
+
+    monkeypatch.setattr("devflow_temporal.delivery_control.api_client", lambda _path: Client())
+    monkeypatch.setattr(sys, "argv", [
+        "devflow-delivery", "--config", str(path), "decision",
+        "--id", "run-1", "--request", str(answer_path),
+    ])
+    with pytest.raises(SystemExit) as exit_info:
+        delivery_main()
+    assert exit_info.value.code == 1
+    output = capsys.readouterr()
+    assert "service HTTP 409: decision changed" in output.err
+    assert "Traceback" not in output.err
 
 
 @pytest.mark.asyncio

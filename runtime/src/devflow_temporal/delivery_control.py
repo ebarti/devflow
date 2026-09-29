@@ -292,21 +292,24 @@ def main() -> None:
             parser.error("--id is required for this command")
         if args.command == "evidence" and not args.evidence_id:
             parser.error("--evidence-id is required")
-        result = {
-            "submit": lambda: caller.submit(request),
-            "runs": caller.runs,
-            "run": lambda: caller.status(args.id),
-            "evidence": lambda: caller.evidence(args.id, args.evidence_id),
-            "decision": lambda: caller.decision(args.id, request),
-            "cancel": lambda: caller.cancel(args.id, request),
-            "recover-publication": lambda: caller.recover_publication(args.id, request),
-            "continue-repair": lambda: caller.continue_repair(args.id, request),
-            "retry-prelaunch": lambda: caller.retry_prelaunch(args.id, request),
-            "amend-scope": lambda: caller.amend_scope(args.id, request),
-            "recover-precheck-prelaunch": lambda: caller.recover_precheck_prelaunch(
-                args.id, request
-            ),
-        }[args.command]()
+        try:
+            result = {
+                "submit": lambda: caller.submit(request),
+                "runs": caller.runs,
+                "run": lambda: caller.status(args.id),
+                "evidence": lambda: caller.evidence(args.id, args.evidence_id),
+                "decision": lambda: caller.decision(args.id, request),
+                "cancel": lambda: caller.cancel(args.id, request),
+                "recover-publication": lambda: caller.recover_publication(args.id, request),
+                "continue-repair": lambda: caller.continue_repair(args.id, request),
+                "retry-prelaunch": lambda: caller.retry_prelaunch(args.id, request),
+                "amend-scope": lambda: caller.amend_scope(args.id, request),
+                "recover-precheck-prelaunch": lambda: caller.recover_precheck_prelaunch(
+                    args.id, request
+                ),
+            }[args.command]()
+        except ValueError as exc:
+            parser.exit(1, f"devflow-delivery: {exc}\n")
         print(json.dumps(result, sort_keys=True, indent=2))
         return
     if args.command == "start":
