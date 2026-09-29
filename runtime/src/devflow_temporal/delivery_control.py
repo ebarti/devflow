@@ -260,8 +260,17 @@ def ensure_service_running(config: DeliveryConfig) -> dict:
                     _owned(process) for process in existing["processes"].values()
                 ):
                     raise ValueError("state root has a running service for another configuration")
-                if _ready(config, existing, deadline):
-                    return {"dashboard_url": config.dashboard_url, **existing}
+                while True:
+                    if _ready(config, existing, deadline):
+                        return {"dashboard_url": config.dashboard_url, **existing}
+                    processes = existing["processes"]
+                    if set(processes) != {"temporal", "worker", "api"} or not all(
+                        _owned(process) for process in processes.values()
+                    ):
+                        break
+                    # A delayed API/DB read does not authorize interrupting live work.
+                    # At the deadline, report the uncertainty and preserve this stack.
+                    time.sleep(min(0.1, _remaining(deadline)))
                 _stop(config, existing)
                 if any(_owned(process) for process in existing["processes"].values()):
                     raise ValueError("owned service termination is pending; inspect service status")

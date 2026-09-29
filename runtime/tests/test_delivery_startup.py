@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -13,8 +15,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import uvicorn
 
 from devflow_temporal import delivery_control as control
+from devflow_temporal.delivery_api import DeliveryService, create_app
 from devflow_temporal.delivery_client import DeliveryClient, ServiceUnavailable, client
 from devflow_temporal.delivery_config import DeliveryConfig
 
@@ -157,6 +161,78 @@ def test_http_failure_never_restarts_owned_stack(config, monkeypatch, status):
     )
     with pytest.raises(ValueError, match=f"service HTTP {status}"):
         control.ensure_service_running(config)
+
+
+def test_existing_readiness_timeout_preserves_live_stack(config, monkeypatch):
+    manifest = _manifest(config)
+    monkeypatch.setattr(control, "_owned", lambda _process: True)
+
+    def unavailable(_caller, **_kwargs):
+        raise ServiceUnavailable("read timed out")
+
+    monkeypatch.setattr(DeliveryClient, "login", unavailable)
+    monkeypatch.setattr(control, "_stop", lambda *_args: pytest.fail("interrupted live stack"))
+    monkeypatch.setattr(control, "_start", lambda *_args: pytest.fail("restarted live stack"))
+    with pytest.raises(ValueError, match="timed out.*logs:"):
+        control.ensure_service_running(
+            DeliveryConfig(config.path, {**config.raw, "service_start_timeout": 0.1})
+        )
+    assert control._read_manifest(config) == manifest
+
+
+def test_database_contention_readiness_preserves_live_stack(config, monkeypatch):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    config.path.write_text(json.dumps({**config.raw, "dashboard_url": f"http://127.0.0.1:{port}"}))
+    config = DeliveryConfig.load(config.path)
+
+    async def healthy(service):
+        service.temporal_status = "connected"
+
+    monkeypatch.setattr(DeliveryService, "healthy_client", healthy)
+    app = create_app(config.path)
+    manifest = _manifest(config)
+    manifest["processes"]["api"]["pid"] = os.getpid()
+    control._write_manifest(config, manifest["processes"])
+    (config.state_root / "worker-ready.json").write_text(
+        json.dumps({"pid": 2, "identity": "fixture", "config_path": str(config.path)})
+    )
+    monkeypatch.setattr(control, "_owned", lambda _process: True)
+    monkeypatch.setattr(control, "_stop", lambda *_args: pytest.fail("interrupted live stack"))
+    monkeypatch.setattr(control, "_start", lambda *_args: pytest.fail("restarted live stack"))
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, lifespan="off", log_level="error")
+    )
+    serving = threading.Thread(target=server.run)
+    serving.start()
+    try:
+        deadline = time.monotonic() + 3
+        while not server.started:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        # The real API's store connection waits behind a normal writer for longer
+        # than _ready's two-second HTTP timeout, without losing process ownership.
+        db = sqlite3.connect(config.tracking_db, check_same_thread=False)
+        db.execute("BEGIN IMMEDIATE")
+
+        def release():
+            time.sleep(2.2)
+            db.rollback()
+            db.close()
+
+        writer = threading.Thread(target=release)
+        writer.start()
+        try:
+            result = control.ensure_service_running(config)
+        finally:
+            writer.join()
+        assert result["processes"] == manifest["processes"]
+        assert control._read_manifest(config) == manifest
+    finally:
+        server.should_exit = True
+        serving.join(timeout=3)
+        assert not serving.is_alive()
 
 
 def test_request_transport_failure_sends_mutation_once(config):
