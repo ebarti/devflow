@@ -1,0 +1,14 @@
+---
+name: devflow-local-delivery
+description: Hand a raw development goal to the local Devflow runtime for investigation, clarification, planning, and authorized delivery; read and answer its durable decisions.
+---
+
+# Devflow local delivery
+
+Use the registered `devflow-local-delivery` MCP server. Its tools call the same authenticated local service as `devflow-delivery`; the service, not this conversation, owns workflow progress, roles, gates, and tracker writes. If its tools are unavailable in this thread, check installation in a fresh Desktop thread; use the public CLI only with explicit runtime and config paths. Do not substitute native Codex agents for runtime roles or infer completion from a tool call.
+
+Submit the user's raw goal with `submit_run`. The JSON string requires `command_id`, `run_id`, `work_id`, `issue_url`, `repository_key`, `goal`, `base_ref`, `branch`, and `authorized_endpoint: "published_unmerged"`. The runtime investigates the repository, asks material questions, proposes a plan, and waits for exact-plan acceptance before implementation. An explicit `accepted_plan` remains available for legacy handoffs that already completed that process. Add `recovery_key` only for an allowlisted recovery manifest. Add `supersedes_run_id` only when the user has identified a blocked predecessor for replacement; the service validates the transfer. Read the repository key and base ref from service policy. Never supply a filesystem repository path, model choice, service credential, or broader endpoint. If required identifiers or endpoint authorization are missing, obtain them before submission.
+
+Keep `command_id`, `run_id`, and the request body stable across a retry. If a response is uncertain, inspect the run before retrying; never create a second run merely because the first receipt was lost. Report the returned run ID, phase, and dashboard URL. If `open_in_codex` is available, open a returned loopback HTTP dashboard URL in its browser panel. Never put the service token in a URL or rendered output. End the turn after the handoff; the dashboard's SSE connection updates without model polling.
+
+Use `list_runs`, `get_run`, or `read_evidence` when the user asks about status/evidence or a meaningful decision, failure, or completion needs interpretation. Do not schedule routine status calls. For a user answer, plan acceptance/change, or cancellation, read the current run first and send a new command ID with the observed protocol revision and, for a decision, its decision and candidate revisions. A clarification accepts a suggested option or the user's free text in `answer`. A plan decision accepts `proceed`, `cancel`, or `change` with the user's requested revision in `response`. Show the exact proposed plan to the user before forwarding `proceed`; do not infer acceptance from silence. Treat a stale/conflict response as a reason to refresh the decision. Never merge, release, or deploy from this skill.

@@ -1,0 +1,50 @@
+{
+  "id": "qa-run-1",
+  "phase": "blocked",
+  "outcome": "blocked",
+  "phase_gates": [
+    {
+      "id": "prepare",
+      "label": "Prepare",
+      "state": "completed"
+    },
+    {
+      "id": "prepublish",
+      "label": "Before PR checks",
+      "state": "pending"
+    },
+    {
+      "id": "publish",
+      "label": "Publish",
+      "state": "pending"
+    },
+    {
+      "id": "local_checks",
+      "label": "Local checks",
+      "state": "pending"
+    },
+    {
+      "id": "required_ci",
+      "label": "Required CI",
+      "state": "pending"
+    },
+    {
+      "id": "tracker",
+      "label": "Tracker",
+      "state": "pending"
+    }
+  ],
+  "roles": [
+    {
+      "role": "implement",
+      "iteration": 0,
+      "state": "finished",
+      "session_id": "fake:qa-run-1:implement",
+      "usage": null,
+      "summary": "deterministic fake role result",
+      "findings": [],
+      "cleanup": "confirmed"
+    }
+  ],
+  "error": "prepublication checks failed: ActivityError"
+}

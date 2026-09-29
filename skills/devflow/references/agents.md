@@ -2,14 +2,14 @@
 
 Run the main task on **Astra/xhigh** for inspection, user questions, design and planning. A skill cannot change an existing task's model; select it in the host. Candidate trials configure that default. The installer leaves normal host model settings alone.
 
-The installer links four definitions from `agents/` into `$CODEX_HOME/agents/`:
+The installer copies four regular definitions from `agents/` into `$CODEX_HOME/agents/`; Codex loads those copies as native agent types:
 
 | Responsibility | Agent type | Default model | Permission configuration |
 | --- | --- | --- | --- |
-| Execute the plan, maintain records and tracker, manage workers and authorized merges | `devflow-coordinator` | `gpt-6-sol` / high | Inherit the main task's permissions |
-| Implement, open PRs and push fixes | `devflow-implementer` | `gpt-6-sol` / xhigh | workspace-write |
-| Review code and workflow contracts | `devflow-reviewer` | `gpt-6-sol` / xhigh | read-only |
-| Exercise candidate behavior | `devflow-verifier` | `gpt-6-sol` / xhigh | workspace-write; evidence only by instruction |
+| Execute the plan, maintain records and tracker, manage workers and authorized merges | `devflow-coordinator` | `gpt-6.1-sol` / high | Inherit the main task's permissions |
+| Implement, open PRs and push fixes | `devflow-implementer` | `gpt-6.1-sol` / xhigh | workspace-write |
+| Review code and workflow contracts | `devflow-reviewer` | `gpt-6.1-sol` / xhigh | read-only |
+| Exercise candidate behavior | `devflow-verifier` | `gpt-6.1-sol` / xhigh | workspace-write; evidence only by instruction |
 
 ## One execution handoff
 

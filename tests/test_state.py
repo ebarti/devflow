@@ -62,7 +62,7 @@ class ReplayTests(StateCase):
 
 
 class MigrationTests(unittest.TestCase):
-    def test_schema_two_database_upgrades_to_four_and_keeps_rows(self):
+    def test_schema_two_database_upgrades_to_seven_and_keeps_rows(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / "workflow.sqlite3"
@@ -75,7 +75,7 @@ class MigrationTests(unittest.TestCase):
                 statement = ""
         legacy = sqlite3.connect(path)
         for text in statements:
-            if "claims" not in text and "runtime_" not in text:  # schema 2 predates both
+            if all(name not in text for name in ("claims", "runtime_", "reconcile_")):  # schema 2 predates these
                 legacy.execute(text)
         legacy.execute(f"PRAGMA application_id={state.APP_ID}")
         legacy.execute("PRAGMA user_version=2")
@@ -86,16 +86,17 @@ class MigrationTests(unittest.TestCase):
 
         db = state.connect(path)
         self.addCleanup(db.close)
-        self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertTrue({"claims", "runtime_sessions", "runtime_scopes", "runtime_events"} <= tables)
+        self.assertTrue({"claims", "runtime_sessions", "runtime_scopes", "runtime_events",
+                         "reconcile_intents", "reconcile_cursor"} <= tables)
         self.assertEqual(state.row(db, "works", "w1")["title"], "kept")
         db.execute("BEGIN IMMEDIATE")
         self.assertEqual(state.claim_work(db, "w1", "task-a")["claim"]["resource"], "work:w1")
         db.commit()
         again = state.connect(path)
         self.addCleanup(again.close)
-        self.assertEqual(again.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(again.execute("PRAGMA user_version").fetchone()[0], 7)
 
 
 if __name__ == "__main__":

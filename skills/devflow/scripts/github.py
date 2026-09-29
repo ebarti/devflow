@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.12
-"""Create or reuse an issue, assign it and update its existing GitHub Project."""
+"""Create, synchronize, and audit an owned issue and its existing GitHub Project."""
 
 import argparse
 from contextlib import closing
@@ -26,7 +26,7 @@ STATUSES = {
 
 
 def gh(*args, as_json=False):
-    result = subprocess.run(["gh", *args], text=True, capture_output=True, timeout=60)
+    result = subprocess.run([os.environ.get("DEVFLOW_GH", "gh"), *args], text=True, capture_output=True, timeout=60)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gh failed")
     return json.loads(result.stdout) if as_json else result.stdout.strip()
@@ -51,6 +51,45 @@ def details(work):
     if not isinstance(value, dict) or not isinstance(value.get("github", {}), dict):
         raise ValueError("work details and details.github must be objects")
     return value
+
+
+def action_url(url, host):
+    parsed = urlsplit(url or "")
+    parts = parsed.path.strip("/").split("/")
+    if (parsed.scheme != "https" or parsed.netloc.casefold() != host.casefold()
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or len(parts) != 5 or parts[2:4] != ["actions", "runs"]
+            or not parts[0] or not parts[1] or not parts[4].isdigit()):
+        raise ValueError("--await-url must be a full Actions run URL on the issue host")
+    return url
+
+
+def project_item(host, item_id):
+    return graphql(host, """query($item:ID!){node(id:$item){
+        ... on ProjectV2Item{project{id} fieldValueByName(name:"Status"){
+        ... on ProjectV2ItemFieldSingleSelectValue{optionId name}}}}}""", item=item_id)["node"]
+
+
+def legacy_project_item(project_url, issue_id):
+    """Observe a bounded legacy Project membership without inventing its expected Status."""
+    parsed = urlsplit(project_url)
+    parts = parsed.path.strip("/").split("/")
+    if (parsed.scheme != "https" or len(parts) != 4 or parts[0] not in {"users", "orgs"}
+            or parts[2] != "projects" or not parts[3].isdigit()):
+        raise ValueError("legacy Project URL is invalid")
+    owner_type = "user" if parts[0] == "users" else "organization"
+    selected = graphql(parsed.netloc, """query($owner:String!,$number:Int!){OWNER(login:$owner){
+        projectV2(number:$number){id}}}""".replace("OWNER", owner_type),
+        owner=parts[1], number=int(parts[3]))
+    project_id = ((selected.get(owner_type) or {}).get("projectV2") or {}).get("id")
+    if not project_id:
+        return None
+    observed = graphql(parsed.netloc, """query($issue:ID!){node(id:$issue){
+        ... on Issue{projectItems(first:100){nodes{id project{id}
+        fieldValueByName(name:"Status"){
+        ... on ProjectV2ItemFieldSingleSelectValue{optionId name}}}}}}}""", issue=issue_id)
+    items = (((observed.get("node") or {}).get("projectItems") or {}).get("nodes") or [])
+    return next((item for item in items if (item.get("project") or {}).get("id") == project_id), None)
 
 
 def project(url, status_name):
@@ -133,7 +172,26 @@ def synchronize(db, args):
             state.require_owner(db, args.work_id, args.owner)
         saved = details(work).get("github", {})
     status_name = args.project_status or saved.get("statuses", {}).get(args.status) or STATUSES[args.status][2]
+    # For an already linked issue, preserve the requested transition even if
+    # the mapping/API read fails before the normal sync path reaches GitHub.
+    if args.action == "set" and work and work["issue"] and (args.project or saved.get("project")):
+        import reconcile
+        raw_project = args.project or saved["project"]
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            current_details = details(state.row(db, "works", args.work_id))
+            current_details.setdefault("github", {})["project"] = raw_project
+            state.update(db, "work", dict(id=args.work_id, details=current_details), None)
+            reconcile.queue(db, args.work_id, "sync", dict(
+                issue=work["issue"], status=args.status, project=raw_project,
+                project_status=status_name, assignee=args.assignee, reason=args.reason,
+                release=args.release,
+                await_url=action_url(args.await_url, urlsplit(work["issue"]).netloc) if args.await_url else None,
+                follow_up=args.follow_up),
+                args.owner)
     selected = project(args.project or saved.get("project"), status_name)
+    if args.await_url:
+        action_url(args.await_url, selected["host"])
     if args.action == "create":
         issue_url = create_issue(db, args, selected["url"])
     else:
@@ -161,50 +219,119 @@ def synchronize(db, args):
         tracking.setdefault("statuses", {})[args.status] = selected["status"]
         state.update(db, "work", dict(id=args.work_id, details=saved), None)
 
-    # No database transaction spans network requests or the agent's actual work.
-    login = args.assignee
-    if login == "@me":
-        login = gh("api", "--hostname", parsed.netloc, "user", "--jq", ".login")
-    assigned = {item["login"].casefold() for item in observed["assignees"]}
-    if login.casefold() not in assigned:
-        gh("issue", "edit", issue_url, "--add-assignee", login)
-    added = graphql(selected["host"], """mutation($project:ID!,$issue:ID!){
-        addProjectV2ItemById(input:{projectId:$project,contentId:$issue}){item{id}}}""",
-        project=selected["id"], issue=observed["id"])
-    item_id = added["addProjectV2ItemById"]["item"]["id"]
-    graphql(selected["host"], """mutation($project:ID!,$item:ID!,$field:ID!,$option:String!){
-        updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,
-        value:{singleSelectOptionId:$option}}){projectV2Item{id}}}""",
-        project=selected["id"], item=item_id, field=selected["field"], option=selected["option"])
-    readback = graphql(selected["host"], """query($item:ID!){node(id:$item){
-        ... on ProjectV2Item{project{id} fieldValueByName(name:"Status"){
-            ... on ProjectV2ItemFieldSingleSelectValue{optionId}}}}}""", item=item_id)["node"]
-    verified = view(issue_url)
-    if (not readback or readback["project"]["id"] != selected["id"]
-            or (readback.get("fieldValueByName") or {}).get("optionId") != selected["option"]
-            or login.casefold() not in {item["login"].casefold() for item in verified["assignees"]}
-            or verified["state"] != observed["state"]):
-        raise RuntimeError("GitHub readback disagrees with assignment or Project Status; reconcile before retrying")
-
+    # Queue the complete desired operation before changing GitHub. The bounded worker
+    # observes remote state first, so a crashed or uncertain write can be replayed.
+    import reconcile
+    payload = dict(issue=issue_url, status=args.status, project=selected["url"],
+                   project_status=selected["status"], assignee=args.assignee,
+                   reason=args.reason, release=args.release,
+                   await_url=action_url(args.await_url, parsed.netloc) if args.await_url else None,
+                   follow_up=args.follow_up)
     with db:
         db.execute("BEGIN IMMEDIATE")
-        state.require_owner(db, args.work_id, args.owner)
-        status, stage, _ = STATUSES[args.status]
-        if args.release and status == "active":
-            status = "waiting"
-        values = dict(id=args.work_id, status=status, blocker=args.reason if status == "blocked" else None)
-        if stage:
-            values["stage"] = stage
-        state.update(db, "work", values, None)
-        state.claim_work(db, args.work_id, args.owner)
-        state.record(db, "result", dict(id=uuid.uuid4().hex, work_id=args.work_id,
-                     kind="github", status="synchronized", evidence_ref=issue_url,
-                     summary=selected["url"] + ": " + selected["status"] + "; assigned to " + login))
-        if args.release or args.status in {"paused", "done"}:
-            state.release_work(db, args.work_id, args.owner)
-        return dict(issue=issue_url, assignee=login, status=args.status, project=selected["url"],
-                    project_status=selected["status"],
-                    claim=state.claim_for(db, args.work_id))
+        queued = reconcile.queue(db, args.work_id, "sync", payload, args.owner)
+    if queued["state"] == "acknowledged":
+        report = audit(db, args.work_id)
+        if report["state"] == "consistent":
+            return dict(issue=issue_url, assignee=tracking_assignee(db, args.work_id),
+                        status=args.status, project=selected["url"],
+                        project_status=selected["status"], claim=state.claim_for(db, args.work_id))
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            queued = reconcile.queue(db, args.work_id, "sync", payload, args.owner, force=True)
+    result = reconcile.apply_one(db, queued)
+    if result["state"] != "acknowledged":
+        raise RuntimeError("GitHub reconciliation pending: " + state.encode(result))
+    return dict(issue=issue_url, assignee=result["assignee"], status=args.status,
+                project=selected["url"], project_status=result["project_status"],
+                claim=state.claim_for(db, args.work_id))
+
+
+def tracking_assignee(db, work_id):
+    return details(state.row(db, "works", work_id))["github"]["sync"]["assignee"]
+
+
+def audit(db, work_id):
+    """Read local and remote observations without claiming, syncing, or changing a work."""
+    work = state.row(db, "works", work_id)
+    if not work:
+        raise ValueError("unknown work: " + work_id)
+    tracking = details(work).get("github", {})
+    claim = state.claim_for(db, work_id)
+    claim_summary = ({key: claim[key] for key in ("resource", "owner", "claimed_at", "updated_at")}
+                     if claim else None)
+    result = dict(work_id=work_id, issue=work["issue"], local_status=work["status"],
+                  claim=claim_summary, reconciliation_required=[], unknown=[])
+    if not work["issue"]:
+        result["unknown"].append("issue_not_linked")
+    else:
+        observed = view(work["issue"])
+        result["issue_state"] = observed["state"]
+        result["assignees"] = [item["login"] for item in observed["assignees"]]
+        sync = tracking.get("sync")
+        if not isinstance(sync, dict) or not all(sync.get(k) for k in (
+                "issue_state", "assignee", "project", "project_id", "item_id", "option_id", "readback_at")):
+            result["unknown"].append("legacy_sync_expectation")
+            if tracking.get("project"):
+                result["project_observed"] = legacy_project_item(tracking["project"], observed["id"])
+                if not result["project_observed"]:
+                    result["unknown"].append("legacy_project_item_not_found_in_first_100")
+        else:
+            result["expected"] = sync
+            if observed["state"] != sync["issue_state"]:
+                result["reconciliation_required"].append("issue_state_mismatch")
+            if sync["assignee"].casefold() not in {a.casefold() for a in result["assignees"]}:
+                result["reconciliation_required"].append("assignee_mismatch")
+            selected = project_item(urlsplit(sync["project"]).netloc, sync["item_id"])
+            result["project_observed"] = selected
+            if (not selected or (selected.get("project") or {}).get("id") != sync["project_id"]
+                    or (selected.get("fieldValueByName") or {}).get("optionId") != sync["option_id"]
+                    or (selected.get("fieldValueByName") or {}).get("name") != sync["project_status"]):
+                result["reconciliation_required"].append("project_status_mismatch")
+            desired = ("in-review" if work["stage"] == "review" else "in-progress") if work["status"] == "active" else work["status"]
+            if desired in STATUSES and sync["status"] != desired:
+                result["reconciliation_required"].append("local_status_mismatch")
+        if work["status"] == "done" and observed["state"] != "CLOSED":
+            result["reconciliation_required"].append("done_issue_open")
+        if work["status"] in {"active", "blocked", "paused", "waiting"} and observed["state"] != "OPEN":
+            result["reconciliation_required"].append("unfinished_issue_closed")
+        if work["status"] == "active" and not claim:
+            result["reconciliation_required"].append("active_work_unclaimed")
+    if claim:
+        owner = db.execute("SELECT role,closed_at FROM runtime_sessions WHERE id=?", (claim["owner"],)).fetchone()
+        if owner and owner["role"] == "coordinator" and owner["closed_at"]:
+            result["reconciliation_required"].append("stopped_owner_retains_claim")
+        elif not owner:
+            result["unknown"].append("owner_runtime_unknown")
+        result["owner_runtime"] = dict(owner) if owner else None
+    external = tracking.get("external_outcome")
+    if isinstance(external, dict) and not external.get("resolved_at"):
+        result["external_outcome"] = external
+        result["unknown"].append("external_outcome_needs_semantic_decision")
+    awaited = tracking.get("await")
+    if not awaited and isinstance(details(work).get("release_run"), str):
+        awaited = dict(url=details(work)["release_run"], follow_up=None, legacy=True)
+    if awaited and not work["issue"]:
+        result["unknown"].append("awaited_run_issue_unknown")
+    elif awaited:
+        url = action_url(awaited["url"], urlsplit(work["issue"]).netloc)
+        parsed = urlsplit(url)
+        owner, repository, _, _, run_id = parsed.path.strip("/").split("/")
+        run = gh("run", "view", run_id, "--repo", f"{parsed.netloc}/{owner}/{repository}",
+                 "--json", "status,conclusion,url", as_json=True)
+        result["awaited_run"] = dict(url=url, status=run["status"], conclusion=run.get("conclusion"),
+                                      follow_up=awaited.get("follow_up"))
+        if run["status"] == "completed":
+            if run.get("conclusion") != "success" or work["status"] in {"blocked", "waiting", "active"}:
+                result["reconciliation_required"].append("awaited_run_completed")
+        else:
+            if run["status"] not in {"queued", "in_progress", "requested", "waiting", "pending"}:
+                result["unknown"].append("awaited_run_status_unknown")
+            if not awaited.get("follow_up"):
+                result["unknown"].append("awaited_run_follow_up_unknown")
+    result["state"] = ("reconciliation_required" if result["reconciliation_required"] else
+                       "unknown" if result["unknown"] else "consistent")
+    return result
 
 
 def parser():
@@ -222,6 +349,8 @@ def parser():
         command.add_argument("--source-ref", help="Private locator for the owning host task")
         command.add_argument("--reason")
         command.add_argument("--release", action="store_true")
+        command.add_argument("--await-url", help="Actions run URL for a blocked external handoff")
+        command.add_argument("--follow-up", help="Concrete owner and trigger for checking the run")
         command.add_argument("--status", choices=STATUSES, default=None if action == "set" else "in-progress",
                              required=action == "set")
         if action == "create":
@@ -230,14 +359,26 @@ def parser():
             command.add_argument("--body-file", required=True)
         if action == "start":
             command.add_argument("issue", help="Full GitHub issue URL")
+    audit_command = commands.add_parser("audit", help="Read-only audit of one linked work and live GitHub state")
+    audit_command.add_argument("--work-id", required=True)
     return root
 
 
 def main():
     args = parser().parse_args()
     try:
+        if args.action == "audit":
+            with closing(sqlite3.connect(Path(args.db).expanduser().resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                db.row_factory = sqlite3.Row
+                result = audit(db, args.work_id)
+            print(state.encode(result))
+            return 0 if result["state"] == "consistent" else 1
         if args.status == "blocked" and not args.reason:
             raise ValueError("blocked requires --reason")
+        if bool(args.await_url) != bool(args.follow_up) or (args.await_url and args.status != "blocked"):
+            raise ValueError("--await-url and --follow-up are required together with --status blocked")
+        if args.await_url and args.action == "create":
+            raise ValueError("create cannot hand off an Actions run; use set after the issue exists")
         if args.action == "create" and args.status == "done":
             raise ValueError("create starts an open issue; use start to reconcile a closed issue")
         if args.release and args.status == "in-progress":
@@ -249,6 +390,9 @@ def main():
         print(state.encode(result))
         return 0
     except (ValueError, OSError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
+        if args.action == "audit":
+            print(state.encode({"error": str(exc), "work_id": args.work_id}), file=sys.stderr)
+            return 1
         try:
             with closing(state.connect(args.db)) as db, db:
                 db.execute("BEGIN IMMEDIATE")

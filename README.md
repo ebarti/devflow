@@ -2,21 +2,34 @@
 
 Small development skills for OpenAI Codex CLI agents, with Python helpers for work ownership, GitHub issue status and metrics. The agent follows the relevant skill and uses its host tools, Git, GitHub CLI and project commands directly.
 
+An [experimental local Temporal delivery service](docs/temporal-runtime.md) is available as a separate Python package under `runtime/`. It serves a dashboard, CLI, and MCP interface for allowlisted, published-unmerged issue delivery on a single host. Real candidate execution requires the documented pinned Docker image and local boundary attestation; this package does not change the installed skills or release workflow.
+
 ## Prerequisites
 
 Devflow targets Codex CLI: skills load from its skills directory, metrics hooks use its `hooks.json` and transcript format, and delegation uses its agent tools. Other hosts that discover `SKILL.md` directories can load the role skills, but hooks, metrics, candidate trials and worker spawning are Codex-specific. Supply Python 3.12+, a POSIX shell, Git and the tools required by your projects. Execution needs native nested-agent tools, capacity for the main task plus a coordinator and at least one leaf, and access to Astra and Sol. The installer supplies four agent definitions. See the [agents reference](skills/devflow/references/agents.md) and the [implementation worker reference](skills/devflow/references/implementation-worker.md). GitHub work requires authenticated `gh` and sequential stacks use the `gh stack` extension and skill; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not install prerequisites or manage authentication. Check the tools needed for the requested action and report a missing prerequisite as a blocker rather than silently changing the workflow.
 
 ## Install
 
-Keep a release checkout at a stable location; installed skills and agent definitions are symlinks into it.
+Keep a published release checkout at a stable location; installed skills are
+symlinks into it, while agent definitions are regular file copies that Codex
+can load. Set `RELEASE_TAG` to an approved,
+published tag that contains the installer and agent definitions you intend to
+use. To get the regular-agent compatibility in this PR, that tag must be
+created after the change is approved and released; an open PR is not a release.
 
 ```sh
-git clone --branch v0.1.0 https://github.com/ebarti/devflow.git
+git clone --branch "$RELEASE_TAG" https://github.com/ebarti/devflow.git
 cd devflow
 bash scripts/install.sh
 ```
 
 The installer uses `python3.12`; set `DEVFLOW_PYTHON` to select another supported interpreter. Hooks record its resolved absolute executable path at installation, so later `PATH` changes do not switch Python. Reinstall to change the interpreter. The helpers use only the standard library; no pip dependencies are required.
+
+The installed hook keeps a checkout snapshot in Codex home. If that checkout
+changes or a linked skill disappears, the hook reports installation drift before
+loading source code. Check it directly with
+`python3.12 "$CODEX_HOME/.devflow-hook.py" --check` (use `~/.codex` when
+`CODEX_HOME` is unset), then restore the checkout or rerun installation.
 
 The defaults are `~/.agents/skills` for skills and `$CODEX_HOME` (`~/.codex` when unset) for the agent definitions in `agents/` and the metrics hooks in `hooks.json`. Supply custom locations when needed:
 
@@ -30,17 +43,26 @@ To switch an existing installation to another checkout, run this from that check
 bash scripts/install.sh --force
 ```
 
-`--force` replaces only bundled skill and agent-definition symlinks, including broken links. Regular files, directories, other agent definitions and other hooks are preserved. Without it, conflicting paths stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
+`--force` repoints bundled skill symlinks and migrates owned agent-definition symlinks to regular copies. Existing regular agent-definition files are preserved when byte-identical to this checkout's definitions. The installer records copied definitions in `$CODEX_HOME/agents/.devflow-agent-manifest.json`; on upgrade it refreshes unchanged owned copies and removes obsolete unchanged owned copies. Modified or custom copies and invalid skill destinations stop installation before any destination changes, even with `--force`; modified obsolete copies are preserved. Skill paths still require symlinks. Other files, agent definitions and hooks are preserved. Without `--force`, conflicting symlinks stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
+
+On macOS, a default-home install also starts the managed launchd issue reconciler. Its plist pins the installed Python, script, `gh` and SQLite paths; logs are private under Codex home. Custom or candidate homes receive a staged plist without launchd activation. Read the managed-record and potential-write preview before installation or upgrade:
+
+```sh
+python3.12 skills/devflow/scripts/reconcile.py --db "$HOME/.local/state/devflow/workflow.sqlite3" once --dry-run --limit 100
+```
+
+The preview opens SQLite read-only, creates no lock file and makes no GitHub writes. Its `coverage` field reports the total Project-bound records and whether the selected limit truncated the result. Pending intents report their intended remote writes and local claim action, including an explicit first synchronization before its verified baseline exists. A first-sync intent in `needs_decision` instead reports its stored next action and error; `once` cannot drain it until an explicit retry creates a new revision. Legacy records show the observed issue, assignees, Project Status and local claim while remaining unknown until a verified sync baseline and explicit mapping are recorded; the service discovers drift only for managed records but also drains durable first-sync intents. Use `python3.12 skills/devflow/scripts/reconcile.py --db PATH once` for a bounded manual pass on hosts without launchd. Use `python3.12 scripts/reconcile-service.py inspect` or `python3.12 scripts/reconcile-service.py uninstall` to inspect or remove the owned launch agent. No background path calls a model or agent. A stopped owner's claim is released only after terminal root and descendant evidence; a missing hook or hard crash stays unknown. A completed Actions run becomes an In review or concrete Blocked outcome, never an automatic issue closure or acceptance.
 
 ## Upgrade
 
-Choose a [release tag](https://github.com/ebarti/devflow/releases) and upgrade the existing checkout between tasks:
+Set `RELEASE_TAG` to the chosen [approved release tag](https://github.com/ebarti/devflow/releases)
+and upgrade the existing checkout between tasks:
 
 ```sh
-bash scripts/update.sh v0.1.0
+bash scripts/update.sh "$RELEASE_TAG"
 ```
 
-The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. Obsolete skill and agent-definition links owned by this checkout are removed; other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
+The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. If installation fails before service activation, the installer restores owned hooks, agent copies and the previous detached checkout, including upgrades begun with the older updater. The service waits for a matching activation marker written only after bootstrap succeeds; it does not open or migrate SQLite before that point. Obsolete skill links and unchanged owned agent copies are removed on success; modified copies, other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
 
 ## Candidate trials
 
@@ -50,7 +72,7 @@ From a development worktree, use a new trial directory for each candidate and a 
 python3.12 scripts/candidate.py /path/to/trial -C /path/to/project-worktree
 ```
 
-The launcher isolates skills, agent definitions, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration selects Astra/xhigh for the main task and belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit.
+The launcher isolates skills, agent definitions, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration selects Astra/xhigh for the main task and belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit. A change still in an open PR belongs only in such a frozen review/trial checkout until it has an approved release tag.
 
 Publish a new release tag after the installation smoke check and the selected product trial pass. Release tags remain fixed; normal installations advance only through an explicit upgrade.
 
