@@ -13,6 +13,10 @@ from urllib.parse import quote
 from .delivery_config import DeliveryConfig
 
 
+class ServiceUnavailable(ValueError):
+    """The local transport failed; a sent mutation must not be replayed."""
+
+
 class DeliveryClient:
     def __init__(self, config: DeliveryConfig) -> None:
         self.config = config
@@ -22,7 +26,9 @@ class DeliveryClient:
         )
         self.csrf = ""
 
-    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict:
+    def _request(
+        self, method: str, path: str, body: dict[str, Any] | None = None, *, timeout: float = 30
+    ) -> dict:
         payload = json.dumps(body).encode() if body is not None else None
         headers = {"Origin": self.config.dashboard_url.rstrip("/")}
         if payload is not None:
@@ -36,7 +42,7 @@ class DeliveryClient:
             method=method,
         )
         try:
-            with self.opener.open(request, timeout=30) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             try:
@@ -44,10 +50,14 @@ class DeliveryClient:
             except (ValueError, OSError):
                 detail = "request failed"
             raise ValueError(f"service HTTP {exc.code}: {detail}") from None
+        except (urllib.error.URLError, OSError) as exc:
+            raise ServiceUnavailable(
+                f"local service request failed: {exc}; inspect {self.config.state_root / 'api.log'}"
+            ) from None
 
-    def login(self) -> None:
+    def login(self, *, timeout: float = 30) -> None:
         token = (self.config.state_root / "service-token").read_text(encoding="utf-8").strip()
-        result = self._request("POST", "/api/session", {"token": token})
+        result = self._request("POST", "/api/session", {"token": token}, timeout=timeout)
         self.csrf = result["csrf_token"]
 
     def submit(self, payload: dict[str, Any]) -> dict:
@@ -108,6 +118,10 @@ class DeliveryClient:
 
 
 def client(config_path: Path) -> DeliveryClient:
+    # The lifecycle controller also uses DeliveryClient for authenticated readiness.
+    from .delivery_control import ensure_service_running
+
     caller = DeliveryClient(DeliveryConfig.load(config_path))
+    ensure_service_running(caller.config)
     caller.login()
     return caller

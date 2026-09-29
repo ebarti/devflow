@@ -53,6 +53,8 @@ The attestation requires an actual requested-model session, owned writes, same-s
 
 Use dedicated loopback ports that do not conflict with the target project. The runtime starts and owns a local Temporal dev server, one worker, and one dashboard/API process. It stores process identity in the private state root; status distinguishes a dead or replaced process. Build the UI before start. The Temporal dev server is for a local experiment and is not a production deployment.
 
+CLI application commands and MCP tools automatically ensure that this stack is running before authentication. Concurrent callers and explicit `start`/`stop` serialize through one private state-root OS lock. A healthy stack retains its processes; stale or partial owned stacks recover without erasing state or killing foreign listeners. Readiness requires an authenticated owned API, current Temporal health, and the owned worker's workflow and activity pollers. `status` and `stop` never start the service. Startup has a 30-second deadline, configurable with positive `service_start_timeout` up to 120 seconds, and failures include log paths. Application HTTP errors do not trigger recovery and dispatched mutations are never automatically replayed. Docker availability is a contained-execution requirement, not a prerequisite for service reads.
+
 ```sh
 uv run --frozen devflow-delivery --config /absolute/private/config.json start
 uv run --frozen devflow-delivery --config /absolute/private/config.json status

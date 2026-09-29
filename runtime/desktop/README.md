@@ -2,7 +2,7 @@
 
 This directory installs one narrow Codex skill and one stdio MCP server. The MCP server is the existing `devflow-delivery-mcp` client of the authenticated local service; it does not run or poll the workflow. The installed skill does not replace the existing general Devflow skills.
 
-Build the pinned runtime environment and dashboard before starting the service. Supply your own absolute runtime directory, service config file, and Codex home to the installer:
+Build the pinned runtime environment and dashboard before using the service. CLI and MCP operations start a stopped configured service automatically. Supply your own absolute runtime directory, service config file, and Codex home to the installer:
 
 ```sh
 python3 runtime/desktop/install.py \
@@ -19,9 +19,11 @@ With the runtime and config paths above, the service can be checked using the sa
 
 ```sh
 /absolute/path/to/runtime/.venv/bin/devflow-delivery --config /absolute/path/to/service-config.json status
-/absolute/path/to/runtime/.venv/bin/devflow-delivery --config /absolute/path/to/service-config.json start
+/absolute/path/to/runtime/.venv/bin/devflow-delivery --config /absolute/path/to/service-config.json runs
 codex mcp get devflow-local-delivery --json
 ```
+
+`status` and `stop` remain diagnostic commands and never start the stack. Explicit `start` uses the same serialized startup path as application calls. Healthy calls preserve process identities; partial owned stacks are recovered without taking over foreign ports. Authenticated API readiness, Temporal health, and worker poller registration are required before a request is sent. A delayed readiness response waits within the startup deadline and preserves a complete live stack if readiness remains unknown. Docker is required for configured contained execution, not for these service reads. Startup defaults to a 30-second deadline; `service_start_timeout` can set a positive value up to 120 seconds. Failures report the state root's service logs.
 
 The CLI also supports `submit --request <json-file>`, `runs`, `run --id <run-id>`, `evidence --id <run-id> --evidence-id <id>`, `decision --id <run-id> --request <json-file>`, and `cancel --id <run-id> --request <json-file>`. The MCP tools are `submit_run`, `list_runs`, `get_run`, `read_evidence`, `answer_decision`, and `cancel_run`; CLI and MCP use the same service API and authorization rules. A raw-goal submission returns a durable run ID and dashboard URL. The service investigates, gathers answers, and waits for plan acceptance before implementation. The Codex host may open the URL in its browser panel. Dashboard SSE supplies progress without model polling.
 
