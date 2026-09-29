@@ -451,6 +451,32 @@ class DeliveryConfig:
         if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
             raise ValueError("initial decision prompt must be a non-empty string")
         if self.raw.get("provider", "codex") == "codex":
+            attestation_path = Path(self.raw.get("sandbox_attestation_path", ""))
+            if not attestation_path.is_absolute():
+                raise ValueError(
+                    "real role policy requires an absolute path to a fresh per-run "
+                    "sandbox attestation"
+                )
+            try:
+                metadata = attestation_path.lstat()
+            except OSError as exc:
+                raise ValueError(
+                    "sandbox attestation is unavailable; prepare a fresh exact per-run "
+                    "boundary attestation before submitting"
+                ) from exc
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ValueError("sandbox attestation must be an owned private file")
+            try:
+                attestation_bytes = attestation_path.read_bytes()
+            except OSError as exc:
+                raise ValueError(
+                    "sandbox attestation is unavailable; prepare a fresh exact per-run "
+                    "boundary attestation before submitting"
+                ) from exc
             container_identity = _container_identity(policy["container"], source=source)
             if policy["config_overrides"] != ["features.plugins=false"]:
                 raise ValueError("real role configuration overrides must disable plugins")
@@ -603,32 +629,6 @@ class DeliveryConfig:
                 checkout=checkout,
                 policy=policy,
             )
-            attestation_path = Path(self.raw.get("sandbox_attestation_path", ""))
-            if not attestation_path.is_absolute():
-                raise ValueError(
-                    "real role policy requires an absolute path to a fresh per-run "
-                    "sandbox attestation"
-                )
-            try:
-                metadata = attestation_path.lstat()
-            except OSError as exc:
-                raise ValueError(
-                    "sandbox attestation is unavailable; prepare a fresh exact per-run "
-                    "boundary attestation before submitting"
-                ) from exc
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.getuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-            ):
-                raise ValueError("sandbox attestation must be an owned private file")
-            try:
-                attestation_bytes = attestation_path.read_bytes()
-            except OSError as exc:
-                raise ValueError(
-                    "sandbox attestation is unavailable; prepare a fresh exact per-run "
-                    "boundary attestation before submitting"
-                ) from exc
             attestation = json.loads(attestation_bytes)
             project_root = Path(__file__).resolve().parents[2]
             with (project_root / "pyproject.toml").open("rb") as stream:

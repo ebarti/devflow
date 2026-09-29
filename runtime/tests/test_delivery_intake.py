@@ -157,9 +157,12 @@ async def test_public_submit_reports_unavailable_per_run_attestation_before_clai
     attestation_path = tmp_path / "run-1-attestation.json"
     config["sandbox_attestation_path"] = str(attestation_path)
     path.write_text(json.dumps(config))
+    def unexpected_container_inspection(_container, *, source):
+        raise AssertionError("missing per-run proof must be reported before Docker inspection")
+
     monkeypatch.setattr(
         "devflow_temporal.delivery_config._container_identity",
-        lambda _container, *, source: {},
+        unexpected_container_inspection,
     )
     if unavailable == "unreadable":
         attestation_path.write_text("{}")
