@@ -4432,6 +4432,11 @@ class DeliveryStore:
                     claim = self.state.claim_for(db, row["work_id"])
                     if claim is not None and claim["owner"] == owner:
                         self.state.release_work(db, row["work_id"], owner)
+                        db.execute(
+                            "UPDATE runtime_sessions SET closed_at=? "
+                            "WHERE id=? AND closed_at IS NULL",
+                            (self.state.now(), owner),
+                        )
             return dict(
                 db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             )

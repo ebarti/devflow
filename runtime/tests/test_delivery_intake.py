@@ -382,6 +382,10 @@ async def test_cancellation_while_waiting_for_clarification(intake_fixture, tmp_
             assert calls == []
             with store._connect() as db:
                 assert store.state.claim_for(db, request["work_id"]) is None
+                assert db.execute(
+                    "SELECT closed_at FROM runtime_sessions WHERE id=?",
+                    ("external:devflow:run-1",),
+                ).fetchone()[0] is not None
             retry = {
                 **request, "command_id": "submit-2", "run_id": "run-2",
                 "branch": "feat/fixture-retry",
@@ -400,3 +404,7 @@ async def test_cancellation_while_waiting_for_clarification(intake_fixture, tmp_
                 assert store.state.claim_for(db, request["work_id"])["owner"] == (
                     "external:devflow:run-2"
                 )
+                assert db.execute(
+                    "SELECT closed_at FROM runtime_sessions WHERE id=?",
+                    ("external:devflow:run-2",),
+                ).fetchone()[0] is None
