@@ -137,6 +137,10 @@ async def test_fresh_native_registry_fetch_offline_install_check_and_resource_re
     frozen = fixture_inputs(source)
     subprocess.run(["git", "-C", str(source), "push", "-q", "origin", "HEAD"], check=True)
     repo["expected_base_sha"] = frozen["base_sha"]
+    protected_log = (
+        config.state_root / "runs" / request["run_id"] / "checks/0"
+        / "registry-dependent-check/native/process.log"
+    )
     checks = [
         {
             "id": "install",
@@ -158,7 +162,11 @@ async def test_fresh_native_registry_fetch_offline_install_check_and_resource_re
                 "node",
                 "-e",
                 "const a=require('node:assert');const n=require('is-number');"
-                "a.equal(n(7),true);a.equal(n('bad'),false);console.log('2 passed')",
+                "const fs=require('node:fs');fs.fstatSync(0);"
+                "a.ok(fs.fstatSync(1).isFIFO());a.ok(fs.fstatSync(2).isFIFO());"
+                + f"a.throws(()=>fs.readFileSync({json.dumps(str(protected_log))}),"
+                + "e=>['EPERM','EACCES'].includes(e.code));"
+                + "a.equal(n(7),true);a.equal(n('bad'),false);console.log('2 passed')",
             ],
             "test_count_regex": r"(\d+) passed",
             "min_tests": 2,

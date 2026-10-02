@@ -34,6 +34,9 @@ def reject_nested_controller() -> None:
 
 def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
     """One finite ceiling for native roles and their broker-owned gate resources."""
+    from .delivery_preparation import require_native_execution
+
+    require_native_execution(spec)
     reject_nested_controller()
     maximum = (
         spec["policy"].get("max_intake_rounds", 8) - 1
@@ -45,13 +48,8 @@ def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
             grants = db.execute(
                 """SELECT maximum_iteration FROM delivery_repair_grants WHERE run_id=?
                    UNION ALL SELECT maximum_iteration FROM delivery_scope_amendments WHERE run_id=?
-                   UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_extensions
-                     WHERE run_id=?
-                   UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_thirds
-                     WHERE run_id=?
-                   UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_successors
-                     WHERE run_id=?""",
-                (spec["run_id"],) * 5,
+                   """,
+                (spec["run_id"],) * 2,
             ).fetchall()
         maximum = max([maximum, *(row[0] for row in grants)])
     if (
@@ -63,7 +61,10 @@ def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
 
 
 def validate_role_ancestry(request: dict) -> None:
-    if request["spec"]["policy"].get("execution_backend") != "native-macos":
+    from .delivery_preparation import require_native_execution
+
+    require_native_execution(request["spec"])
+    if request["spec"].get("provider") != "codex":
         return
     if (
         request.get("native_authorized") is not True

@@ -1,4 +1,4 @@
-"""Normalize Docker log decoration for configured check result parsing.
+"""Normalize terminal log decoration for configured check result parsing.
 
 The original output stays in its immutable, hashed log. Only count and reject
 patterns see this text, so colored and timestamped test summaries remain visible.

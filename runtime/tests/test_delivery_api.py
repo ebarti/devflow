@@ -23,7 +23,7 @@ from devflow_temporal.delivery_activities import (
 )
 from devflow_temporal.delivery_api import DeliveryService, create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_container import ContainerUnknown
+from devflow_temporal.delivery_native_process import NativeProcessUnknown
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -78,7 +78,7 @@ async def test_idle_dispatch_reports_actual_temporal_health(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks])
-async def test_contained_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch):
+async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch):
     started = threading.Event()
     release = threading.Event()
 
@@ -107,12 +107,12 @@ async def test_contained_check_activity_keeps_temporal_loop_responsive(activity_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks, delivery_browser_qa])
-async def test_contained_effect_uncertainty_is_returned_for_durable_projection(
+async def test_native_effect_uncertainty_is_returned_for_durable_projection(
     activity_fn, monkeypatch
 ):
     class Broker:
         def run_prechecks(self, _iteration, _candidate):
-            raise ContainerUnknown("Docker inspection became unavailable")
+            raise NativeProcessUnknown("Native process inspection became unavailable")
 
         run_checks = run_prechecks
         run_browser_qa = run_prechecks
@@ -127,7 +127,7 @@ async def test_contained_effect_uncertainty_is_returned_for_durable_projection(
         "state": "unknown",
         "cleanup": "unknown",
         "candidate_id": "candidate",
-        "reason": "ContainerUnknown",
+        "reason": "NativeProcessUnknown",
     }
 
 
@@ -230,7 +230,7 @@ async def test_local_api_auth_csrf_submit_replay_and_conflict(api_fixture):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("binding_source", ["effect", "projection"])
-async def test_public_evidence_reads_contained_role_and_browser_logs(api_fixture, binding_source):
+async def test_public_evidence_reads_historical_role_and_browser_logs(api_fixture, binding_source):
     path, request = api_fixture
     app = create_app(path)
     store = app.state.delivery.store

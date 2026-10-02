@@ -17,7 +17,7 @@ from temporalio.exceptions import ApplicationError
 from .candidate import candidate_for
 from .contracts import digest
 from .delivery_broker import DeliveryBroker
-from .delivery_config import ContainerReadbackPending, DeliveryConfig
+from .delivery_config import DeliveryConfig
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
@@ -261,13 +261,10 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
             store, _ = _context(request["spec"])
             if request["recovery"].get("kind") == "scope_amendment":
                 store.scope_preflight(request["spec"], request["recovery"])
-            elif request["recovery"].get("kind") == "precheck_prelaunch_recovery":
-                store.precheck_recovery_preflight(request["spec"], request["recovery"])
             else:
                 store.repair_preflight(request["spec"], request["recovery"])
         except (
             RepairReadbackPending,
-            ContainerReadbackPending,
             subprocess.TimeoutExpired,
             sqlite3.OperationalError,
         ) as exc:

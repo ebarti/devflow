@@ -19,8 +19,9 @@ def _path(value: Path) -> str:
 
 
 def _protected_native_commands(spec: dict[str, Any]) -> tuple[Path, ...]:
-    if spec["policy"].get("execution_backend") != "native-macos":
-        return ()
+    from .delivery_preparation import require_native_execution
+
+    require_native_execution(spec)
     from .delivery_native_guard import protected_commands
 
     return protected_commands(spec["policy"]["codex_bin"])
@@ -278,11 +279,14 @@ def validate_network_domain(domain: str) -> str:
 
 
 def prepare_native_role(
-    request: dict[str, Any], attempt_dir: Path, *, containerized: bool = False
+    request: dict[str, Any], attempt_dir: Path
 ) -> tuple[str, dict[str, str]]:
     """Keep provider auth in the trusted CLI, while its commands use a native profile."""
 
     spec = request["spec"]
+    from .delivery_preparation import require_native_execution
+
+    require_native_execution(spec)
     if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
         raise ValueError("real role did not require the native profile boundary")
     workspace = Path(request["workspace"]).resolve(strict=True)
@@ -291,11 +295,9 @@ def prepare_native_role(
     if request["role"] != "implement":
         role_home /= str(request["iteration"])
     codex_home = role_home / "codex"
-    ephemeral_home = role_home
-    if spec["policy"].get("execution_backend") == "native-macos":
-        from .delivery_resources import RunResources
+    from .delivery_resources import RunResources
 
-        ephemeral_home = RunResources(spec).scratch("role", request["role"])
+    ephemeral_home = RunResources(spec).scratch("role", request["role"])
     scratch = ephemeral_home / "tmp"
     for path in (role_home, codex_home, ephemeral_home, scratch, attempt_dir):
         _private(path)
@@ -359,36 +361,18 @@ def prepare_native_role(
             raise ValueError("browser QA evidence assessed a different candidate")
     elif request["role"] == "verify" and spec["policy"].get("browser_qa"):
         raise ValueError("configured browser QA receipt is required for verification")
-    if containerized:
-        extra_read = (
-            Path("/opt/devflow-venv"),
-            Path("/opt/devflow-runtime/src"),
-            Path("/ms-playwright"),
-            *((Path("/recovery"),) if request["role"] == "implement" and recovery.is_dir() else ()),
-            *((Path("/evidence/diff.patch"),) if review_diff else ()),
-            *((Path("/qa/receipt.json"), Path("/qa/browser-qa.log")) if qa_evidence else ()),
-        )
-        profile_workspace = Path("/work")
-        profile_home = Path("/rolehome")
-        profile_codex_home = Path("/rolehome/codex")
-        profile_scratch = Path("/rolehome/tmp")
-    else:
-        extra_read = (
-            toolchain_roots
-            + ((Path(cache),) if cache else ())
-            + ((recovery,) if request["role"] == "implement" and recovery.is_dir() else ())
-            + ((diff_path,) if review_diff else ())
-            + ((Path(qa_evidence["path"]), Path(qa_evidence["log"])) if qa_evidence else ())
-            + (
-                (Path(sys.base_prefix),)
-                if spec["policy"].get("execution_backend") == "native-macos"
-                else ()
-            )
-        )
-        profile_workspace = workspace
-        profile_home = ephemeral_home
-        profile_codex_home = codex_home
-        profile_scratch = scratch
+    extra_read = (
+        toolchain_roots
+        + ((Path(cache),) if cache else ())
+        + ((recovery,) if request["role"] == "implement" and recovery.is_dir() else ())
+        + ((diff_path,) if review_diff else ())
+        + ((Path(qa_evidence["path"]), Path(qa_evidence["log"])) if qa_evidence else ())
+        + (Path(sys.base_prefix),)
+    )
+    profile_workspace = workspace
+    profile_home = ephemeral_home
+    profile_codex_home = codex_home
+    profile_scratch = scratch
     profile_name = "devflow-role"
     lines = _profile_lines(
         profile_name,
@@ -401,28 +385,9 @@ def prepare_native_role(
         protected_executables=_protected_native_commands(spec),
     )
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
-    if containerized:
-        env = {
-            "PATH": "/opt/devflow-venv/bin:/usr/local/bin:/usr/bin:/bin",
-            "HOME": "/rolehome",
-            "CODEX_HOME": "/rolehome/codex",
-            "TMPDIR": "/rolehome/tmp",
-            "XDG_CACHE_HOME": "/rolehome/.cache",
-            "PYTHONPATH": "/opt/devflow-runtime/src",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "credential.helper",
-            "GIT_CONFIG_VALUE_0": "",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_ASKPASS": "/usr/bin/false",
-            "GCM_INTERACTIVE": "never",
-        }
-    else:
-        env = _native_env(ephemeral_home, codex_home, scratch, toolchain_roots)
-        if cache:
-            env["COREPACK_HOME"] = cache
+    env = _native_env(ephemeral_home, codex_home, scratch, toolchain_roots)
+    if cache:
+        env["COREPACK_HOME"] = cache
     return profile_name, env
 
 
@@ -432,15 +397,16 @@ def prepare_native_check(
 ) -> tuple[str, dict[str, str]]:
     """Run candidate-controlled check commands in a separate credential-free profile."""
 
+    from .delivery_preparation import require_native_execution
+
+    require_native_execution(spec)
     if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
         raise ValueError("real checks require the native profile boundary")
 
-    home = evidence_dir / check["id"] / "home"
-    if spec["policy"].get("execution_backend") == "native-macos":
-        from .delivery_resources import RunResources
+    from .delivery_resources import RunResources
 
-        key = str(evidence_dir.relative_to(Path(spec["state_dir"]))) + "/" + check["id"]
-        home = RunResources(spec).scratch("checks", key)
+    key = str(evidence_dir.relative_to(Path(spec["state_dir"]))) + "/" + check["id"]
+    home = RunResources(spec).scratch("checks", key)
     codex_home = home / "codex"
     scratch = home / "tmp"
     for path in (home, codex_home, scratch):
@@ -460,11 +426,7 @@ def prepare_native_check(
             toolchain_roots
             + ((Path(cache),) if cache else ())
             + ((dependency_store,) if dependency_store else ())
-            + (
-                (Path(sys.base_prefix),)
-                if spec["policy"].get("execution_backend") == "native-macos"
-                else ()
-            )
+            + (Path(sys.base_prefix),)
         ),
         network_domains=domains,
         protected_executables=_protected_native_commands(spec),
@@ -502,6 +464,9 @@ def prepare_browser_qa(
     deterministic QA command and is inherited by its services and browser.
     """
 
+    from .delivery_preparation import require_native_execution
+
+    require_native_execution(spec)
     if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
         raise ValueError("real browser QA requires the admitted macOS boundary")
     if not Path("/usr/bin/sandbox-exec").is_file():
@@ -511,11 +476,9 @@ def prepare_browser_qa(
     scratch = scratch.resolve(strict=True)
     if scratch.parent != Path("/private/tmp") or not scratch.name.startswith("dfqa-"):
         raise ValueError("browser QA scratch is outside the owned short temp root")
-    home = evidence_dir / "home"
-    if spec["policy"].get("execution_backend") == "native-macos":
-        from .delivery_resources import RunResources
+    from .delivery_resources import RunResources
 
-        home = RunResources(spec).scratch("browser", evidence_dir.name)
+    home = RunResources(spec).scratch("browser", evidence_dir.name)
     _private(home)
     _private(scratch)
     ports = tuple(qa["ports"].values())

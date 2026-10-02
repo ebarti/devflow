@@ -109,13 +109,6 @@ class DeliveryClient:
             payload,
         )
 
-    def recover_precheck_prelaunch(self, run_id: str, payload: dict[str, Any]) -> dict:
-        return self._request(
-            "POST",
-            "/api/runs/" + quote(run_id, safe="") + "/recover-precheck-prelaunch",
-            payload,
-        )
-
 
 def client(config_path: Path) -> DeliveryClient:
     # The lifecycle controller also uses DeliveryClient for authenticated readiness.

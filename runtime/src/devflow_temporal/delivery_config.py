@@ -17,278 +17,13 @@ from urllib.parse import urlsplit
 from .contracts import RUN_ID_RE, digest
 from .delivery_native_guard import NATIVE_OVERRIDES
 from .delivery_sandbox import validate_network_domain
-from .payload import payload_digest
-from .runtime_dependencies import dependency_labels, locked_dependency_identity
+from .runtime_dependencies import locked_dependency_identity
 
 BRANCH_RE = re.compile(r"^(?:feat|fix|docs|chore)/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CHECK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-LEGACY_CODEX_VERSION = "0.157.1"
-LEGACY_KIT_REVISION = "d9ed6e186ce028d0db3b044ce959a94f409510c5"
-BOUNDARY_DENIAL_FIELDS = (
-    "copied_auth_read",
-    "host_credential_read",
-    "state_read",
-    "state_write",
-    "outside_write",
-    "slash_tmp_read",
-    "slash_tmp_write",
-    "private_tmp_read",
-    "private_tmp_write",
-    "loopback",
-)
 QA_PORT_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*_PORT$")
 QA_ENV_KEYS = {"JOBCTRL_E2E_ISOLATED", "PLAYWRIGHT_BROWSERS_PATH"}
-
-
-class ContainerReadbackPending(RuntimeError):
-    """Docker image identity could not be read while its daemon is unavailable."""
-
-
-def _boundary_probe_passed(observed: Any) -> bool:
-    if not isinstance(observed, dict) or not isinstance(observed.get("child"), dict):
-        return False
-    return (
-        observed.get("allowed_write") is True
-        and observed.get("child_returncode") == 0
-        and observed["child"].get("allowed_write") is True
-        and all(
-            result.get(field) == "PermissionError:1"
-            for result in (observed, observed["child"])
-            for field in BOUNDARY_DENIAL_FIELDS
-        )
-    )
-
-
-def _browser_qa_probe_passed(observed: Any) -> bool:
-    if not isinstance(observed, dict):
-        return False
-    denied = (
-        "host_credential_read",
-        "state_read",
-        "outside_write",
-        "slash_tmp_read",
-        "slash_tmp_write",
-        "private_tmp_read",
-        "private_tmp_write",
-        "unrelated_port_connect",
-        "unrelated_port_bind",
-        "unrelated_host_connect",
-    )
-    return (
-        observed.get("browser_api_sqlite") is True
-        and observed.get("owned_listeners") is True
-        and observed.get("cleanup") == "confirmed"
-        and observed.get("allowed_scratch_write") == "ALLOWED"
-        and type(observed.get("test_count")) is int
-        and observed["test_count"] >= 2
-        and all(observed.get(field) == "PermissionError:1" for field in denied)
-        and isinstance(observed.get("child"), dict)
-        and observed["child"].get("allowed_scratch_write") == "ALLOWED"
-        and all(observed["child"].get(field) == "PermissionError:1" for field in denied)
-    )
-
-
-def _contained_denied(value: Any) -> bool:
-    return value in {
-        "PermissionError:1",
-        "PermissionError:13",
-        "FileNotFoundError:2",
-        "OSError:101",
-    }
-
-
-def _contained_probe_passed(observed: Any, *, role: bool) -> bool:
-    if not isinstance(observed, dict) or not isinstance(observed.get("child"), dict):
-        return False
-    fields = (
-        "host_credential_read",
-        "state_read",
-        "state_write",
-        "outside_write",
-        "docker_socket_read",
-        "unrelated_host_connect",
-    )
-    if role:
-        fields += ("copied_auth_read", "loopback")
-    else:
-        fields += ("unrelated_port_bind", "unrelated_port_connect")
-    return (
-        observed.get("allowed_write") is True
-        and observed.get("child_returncode") == 0
-        and observed["child"].get("allowed_write") is True
-        and all(
-            _contained_denied(item.get(field))
-            for item in (observed, observed["child"])
-            for field in fields
-        )
-    )
-
-
-def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str, Any]:
-    """Inspect the exact image, CLI launch chain and security profile."""
-
-    required = {
-        "docker_bin",
-        "docker_bin_sha256",
-        "image_id",
-        "platform",
-        "seccomp_profile",
-        "seccomp_sha256",
-        "codex_bin",
-        "codex_bin_sha256",
-        "role_runner_sha256",
-        "runtime_payload_sha256",
-        "pnpm_lock_sha256",
-    }
-    if not isinstance(container, dict) or required - set(container):
-        raise ValueError("real delivery requires a complete container policy")
-    docker = Path(container["docker_bin"]).resolve(strict=True)
-    if not docker.is_file() or not os.access(docker, os.X_OK):
-        raise ValueError("configured Docker CLI is unavailable")
-    if hashlib.sha256(docker.read_bytes()).hexdigest() != container["docker_bin_sha256"]:
-        raise ValueError("Docker CLI changed after boundary attestation")
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", container["image_id"]):
-        raise ValueError("container image must be an immutable content ID")
-    if container["platform"] != "linux/arm64":
-        raise ValueError("container platform was not tested")
-    profile = Path(container["seccomp_profile"]).resolve(strict=True)
-    expected_profile = (
-        Path(__file__).resolve().parents[2] / "docker" / "moby-56be731-codex-bwrap-seccomp.json"
-    )
-    if profile != expected_profile.resolve(strict=True):
-        raise ValueError("container seccomp profile is not the reviewed source")
-    if hashlib.sha256(profile.read_bytes()).hexdigest() != container["seccomp_sha256"]:
-        raise ValueError("container seccomp profile changed")
-    runner = Path(__file__).with_name("role_runner.py")
-    if hashlib.sha256(runner.read_bytes()).hexdigest() != container["role_runner_sha256"]:
-        raise ValueError("role runner source changed after image build")
-    package = Path(__file__).resolve().parent
-    launcher = package.parents[1] / "docker" / "landlock_exec.py"
-    if payload_digest(package, launcher) != container["runtime_payload_sha256"]:
-        raise ValueError("trusted runner payload changed after image build")
-    lock = source / "pnpm-lock.yaml"
-    if (
-        lock.is_symlink()
-        or not lock.is_file()
-        or hashlib.sha256(lock.read_bytes()).hexdigest() != container["pnpm_lock_sha256"]
-    ):
-        raise ValueError("admitted package lock is unavailable or changed")
-    try:
-        inspected = subprocess.run(
-            [str(docker), "image", "inspect", container["image_id"]],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ContainerReadbackPending("Docker image readback is unavailable") from exc
-    if inspected.returncode:
-        try:
-            daemon = subprocess.run(
-                [str(docker), "info", "--format", "{{.ServerVersion}}"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ContainerReadbackPending("Docker daemon readback is unavailable") from exc
-        if daemon.returncode or not daemon.stdout.strip():
-            raise ContainerReadbackPending("Docker daemon readback is unavailable")
-        raise ValueError("admitted container image is unavailable")
-    try:
-        values = json.loads(inspected.stdout)
-        image = values[0]
-    except (ValueError, IndexError, KeyError, TypeError) as exc:
-        raise ValueError("container image inspection is malformed") from exc
-    labels = image.get("Config", {}).get("Labels") or {}
-    dependencies = container.get("runtime_dependencies")
-    if dependencies is not None:
-        if dependencies != locked_dependency_identity():
-            raise ValueError("runtime dependency lock changed after image build")
-        expected_dependencies = dependency_labels(dependencies)
-    else:
-        expected_dependencies = {
-            "devflow.kit_revision": LEGACY_KIT_REVISION,
-            "devflow.codex_cli_version": LEGACY_CODEX_VERSION,
-        }
-    if (
-        len(values) != 1
-        or image.get("Id") != container["image_id"]
-        or f"{image.get('Os')}/{image.get('Architecture')}" != container["platform"]
-        or labels.get("devflow.role_runner_sha256") != container["role_runner_sha256"]
-        or labels.get("devflow.runtime_payload_sha256") != container["runtime_payload_sha256"]
-        or labels.get("devflow.codex_bin_sha256") != container["codex_bin_sha256"]
-        or any(labels.get(key) != value for key, value in expected_dependencies.items())
-        or container["codex_bin"]
-        != "/opt/devflow-venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex"
-    ):
-        raise ValueError("container image or launch chain does not match the tested policy")
-    return {
-        "image_id": image["Id"],
-        "platform": container["platform"],
-        "docker_bin_sha256": container["docker_bin_sha256"],
-        "seccomp_sha256": container["seccomp_sha256"],
-        "role_runner_sha256": container["role_runner_sha256"],
-        "runtime_payload_sha256": container["runtime_payload_sha256"],
-        "codex_bin_sha256": container["codex_bin_sha256"],
-        "pnpm_lock_sha256": container["pnpm_lock_sha256"],
-        **({"runtime_dependencies": dependencies} if dependencies is not None else {}),
-    }
-
-
-def validate_preparation_inputs(container: Any) -> None:
-    """Validate service-owned launch settings without contacting Docker at admission."""
-
-    if not isinstance(container, dict) or not container.get("docker_bin"):
-        raise ValueError("real delivery requires configured local Docker launch settings")
-    binary = container["docker_bin"]
-    if not isinstance(binary, str) or not Path(binary).is_absolute():
-        raise ValueError("configured Docker CLI must be an absolute path")
-    if container.get("platform", "linux/arm64") != "linux/arm64":
-        raise ValueError("container platform was not tested")
-    image_id = container.get("image_id")
-    if image_id is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-        raise ValueError("configured container image must be an immutable content ID")
-    if not re.fullmatch(r"[1-9][0-9]*(?:m|g)", str(container.get("memory", "2g"))):
-        raise ValueError("container memory must be a bounded size")
-    if not 1 <= float(container.get("cpus", "2")) <= 16:
-        raise ValueError("container CPUs must be between 1 and 16")
-    if type(container.get("pids_limit", 256)) is not int or not 64 <= container.get(
-        "pids_limit", 256
-    ) <= 4096:
-        raise ValueError("container process limit must be between 64 and 4096")
-
-
-def security_binding(
-    *,
-    supplied: dict[str, Any],
-    repository: dict[str, Any],
-    source: Path,
-    origin: str,
-    base_sha: str,
-    state_dir: Path,
-    checkout: Path,
-    policy: dict[str, Any],
-) -> str:
-    """Bind a real boundary probe to one admitted repository and workspace layout."""
-
-    return digest(
-        {
-            "repository_key": supplied["repository_key"],
-            "run_id": supplied["run_id"],
-            "branch": supplied["branch"],
-            "source": str(source),
-            "origin": origin,
-            "base_sha": base_sha,
-            "state_dir": str(state_dir),
-            "checkout": str(checkout),
-            "repository_policy": repository,
-            "role_and_check_policy": policy,
-        }
-    )
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -368,13 +103,7 @@ class DeliveryConfig:
             "execution_backend": self.raw.get("execution_backend", "native-macos"),
         }
 
-    def admit(
-        self,
-        supplied: dict[str, Any],
-        *,
-        legacy_attestation: bool = False,
-        recorded_backend: str | None = None,
-    ) -> dict[str, Any]:
+    def admit(self, supplied: dict[str, Any]) -> dict[str, Any]:
         required = {
             "command_id",
             "run_id",
@@ -468,7 +197,6 @@ class DeliveryConfig:
             "config_overrides": self.raw.get("config_overrides", ["features.plugins=false"]),
             "toolchain_roots": self.raw.get("toolchain_roots", []),
             "package_manager_cache": self.raw.get("package_manager_cache"),
-            "container": self.raw.get("container"),
             "max_repairs": int(self.raw.get("max_repairs", 2)),
             "capacity": int(self.raw.get("capacity", 2)),
             "fake_findings": self.raw.get("fake_findings", {})
@@ -478,15 +206,12 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
-        backend = recorded_backend or self.raw.get("execution_backend", "native-macos")
-        if backend not in {"native-macos", "docker"}:
-            raise ValueError("unsupported explicit execution policy")
+        if self.raw.get("execution_backend", "native-macos") != "native-macos":
+            raise ValueError("Docker execution is retired; only native-macos is supported")
         if self.raw.get("provider", "codex") == "codex":
-            policy["execution_backend"] = "docker" if legacy_attestation else backend
-            if backend == "native-macos" and not legacy_attestation:
-                policy["container"] = None
-                policy["config_overrides"] = self.raw.get("config_overrides", NATIVE_OVERRIDES)
-                policy["max_intake_rounds"] = 8
+            policy["execution_backend"] = "native-macos"
+            policy["config_overrides"] = self.raw.get("config_overrides", NATIVE_OVERRIDES)
+            policy["max_intake_rounds"] = 8
         protected_native = (
             self.state_root,
             self.tracking_db,
@@ -521,7 +246,7 @@ class DeliveryConfig:
                 or not selected["effort"].strip()
             ):
                 raise ValueError(f"{role} model and effort must be configured")
-            if backend == "native-macos" and not legacy_attestation:
+            if self.raw.get("provider", "codex") == "codex":
                 timeout = selected.get("timeout_seconds", 7200)
                 if type(timeout) is not int or not 1 <= timeout <= 7200:
                     raise ValueError("native role deadline must be between 1 and 7200 seconds")
@@ -531,44 +256,9 @@ class DeliveryConfig:
         if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
             raise ValueError("initial decision prompt must be a non-empty string")
         if self.raw.get("provider", "codex") == "codex":
-            if legacy_attestation:
-                attestation_path = Path(self.raw.get("sandbox_attestation_path", ""))
-                if not attestation_path.is_absolute():
-                    raise ValueError(
-                        "real role policy requires an absolute path to a fresh per-run "
-                        "sandbox attestation"
-                    )
-                try:
-                    metadata = attestation_path.lstat()
-                except OSError as exc:
-                    raise ValueError(
-                        "sandbox attestation is unavailable; prepare a fresh exact per-run "
-                        "boundary attestation before submitting"
-                    ) from exc
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_uid != os.getuid()
-                    or stat.S_IMODE(metadata.st_mode) != 0o600
-                ):
-                    raise ValueError("sandbox attestation must be an owned private file")
-                try:
-                    attestation_bytes = attestation_path.read_bytes()
-                except OSError as exc:
-                    raise ValueError(
-                        "sandbox attestation is unavailable; prepare a fresh exact per-run "
-                        "boundary attestation before submitting"
-                    ) from exc
-                container_identity = _container_identity(policy["container"], source=source)
-            else:
-                if policy["execution_backend"] == "docker":
-                    validate_preparation_inputs(policy["container"])
-                policy["host_sandbox"] = "native-profile"
-                policy["runtime_dependencies"] = locked_dependency_identity()
-            expected_overrides = (
-                NATIVE_OVERRIDES
-                if policy["execution_backend"] == "native-macos"
-                else ["features.plugins=false"]
-            )
+            policy["host_sandbox"] = "native-profile"
+            policy["runtime_dependencies"] = locked_dependency_identity()
+            expected_overrides = NATIVE_OVERRIDES
             if policy["config_overrides"] != expected_overrides:
                 raise ValueError("real role configuration overrides must disable plugins")
             if (
@@ -642,20 +332,6 @@ class DeliveryConfig:
                         raise ValueError("check network domains must be exact hosts")
                     for domain in check.get("network_domains", []):
                         validate_network_domain(domain)
-                    if check.get("network_domains") and policy["execution_backend"] == "docker":
-                        raise ValueError("contained checks must run with networking disabled")
-                    if (
-                        check["id"] == "install"
-                        and policy["execution_backend"] == "docker"
-                        and (
-                            "--offline" not in check["argv"]
-                            or "--frozen-lockfile" not in check["argv"]
-                            or "--store-dir" not in check["argv"]
-                        )
-                    ):
-                        raise ValueError(
-                            "contained package installation must use the frozen offline store"
-                        )
                     if check.get("kind") == "test" and (
                         not check.get("test_count_regex") or int(check.get("min_tests", 0)) < 1
                     ):
@@ -696,8 +372,6 @@ class DeliveryConfig:
                 if env.get("JOBCTRL_E2E_ISOLATED") != "1":
                     raise ValueError("browser QA fixture isolation must be enabled")
                 read_roots = qa.get("read_roots", [])
-                if read_roots not in (None, []) and policy["execution_backend"] == "docker":
-                    raise ValueError("container browser QA cannot mount host read roots")
                 if policy["execution_backend"] == "native-macos":
                     if not isinstance(read_roots or [], list) or len(read_roots or []) > 4:
                         raise ValueError("native browser read roots must be a bounded list")
@@ -705,9 +379,6 @@ class DeliveryConfig:
                         if not isinstance(raw_root, str):
                             raise ValueError("native browser read root must be a directory")
                         native_read_root(raw_root)
-                browser_path = env.get("PLAYWRIGHT_BROWSERS_PATH")
-                if policy["execution_backend"] == "docker" and browser_path != "/ms-playwright":
-                    raise ValueError("browser executable must use the pinned image path")
                 artifact_paths = qa.get("artifact_paths", [])
                 if (
                     not isinstance(artifact_paths, list)
@@ -729,92 +400,6 @@ class DeliveryConfig:
                     or not 30 <= qa["timeout_seconds"] <= 1800
                 ):
                     raise ValueError("browser QA requires positive count and bounded timeout")
-            if legacy_attestation:
-                security_digest = security_binding(
-                    supplied=supplied,
-                    repository=repository,
-                    source=source,
-                    origin=actual_remote,
-                    base_sha=base_sha,
-                    state_dir=state_dir,
-                    checkout=checkout,
-                    policy=policy,
-                )
-                attestation = json.loads(attestation_bytes)
-                kit_revision = LEGACY_KIT_REVISION
-                package = Path(__file__).resolve().parent
-                source_hashes = {
-                    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-                    for path in sorted(package.glob("*.py"))
-                }
-                role = attestation.get("role_observed", {})
-                check = attestation.get("check_observed", {})
-                browser = attestation.get("browser_qa_observed", {})
-                evidence = attestation.get("evidence", {})
-                if not isinstance(evidence, dict) or set(evidence) != {
-                    "role",
-                    "check",
-                    "browser",
-                    "detached",
-                    "resume",
-                }:
-                    raise ValueError("container boundary evidence is incomplete")
-                for recorded in evidence.values():
-                    if not isinstance(recorded, dict):
-                        raise ValueError("container evidence reference is malformed")
-                    path = Path(recorded.get("path", ""))
-                    if not path.is_absolute():
-                        raise ValueError("container evidence reference is not absolute")
-                    info = path.lstat()
-                    if (
-                        not stat.S_ISREG(info.st_mode)
-                        or info.st_uid != os.getuid()
-                        or stat.S_IMODE(info.st_mode) != 0o600
-                        or hashlib.sha256(path.read_bytes()).hexdigest() != recorded.get("sha256")
-                    ):
-                        raise ValueError("container evidence changed after the conformance probe")
-                if (
-                    attestation.get("schema") != "devflow-container-v4"
-                    or attestation.get("effective_mode")
-                    != "Docker private PID namespace with Codex native role permissions"
-                    or attestation.get("container_identity") != container_identity
-                    or attestation.get("kit_revision") != kit_revision
-                    or attestation.get("codex_sdk_version") != LEGACY_CODEX_VERSION
-                    or attestation.get("codex_cli_version") != LEGACY_CODEX_VERSION
-                    or attestation.get("source_hashes") != source_hashes
-                    or attestation.get("security_binding_sha256") != security_digest
-                    or attestation.get("requested_model") != policy["roles"]["implement"]["model"]
-                    or attestation.get("requested_effort") != policy["roles"]["implement"]["effort"]
-                    or not isinstance(attestation.get("role_session_id"), str)
-                    or not attestation["role_session_id"]
-                    or not _contained_probe_passed(role, role=True)
-                    or not _contained_probe_passed(check, role=False)
-                    or role.get("cleanup") != "confirmed"
-                    or check.get("cleanup") != "confirmed"
-                    or attestation.get("same_session_resume") is not True
-                    or attestation.get("detached_cleanup")
-                    != {"role": True, "check": True, "browser": True}
-                    or attestation.get("install_exit_code") != 0
-                    or attestation.get("api_check_exit_code") != 0
-                    or (
-                        qa is not None
-                        and not (
-                            _contained_probe_passed(browser, role=False)
-                            and browser.get("browser_api_sqlite") is True
-                            and browser.get("owned_listeners") is True
-                            and browser.get("cleanup") == "confirmed"
-                            and type(browser.get("test_count")) is int
-                            and browser["test_count"] >= 2
-                        )
-                    )
-                ):
-                    raise ValueError(
-                        "sandbox attestation does not match this executable and boundary"
-                    )
-                policy["sandbox_attestation_sha256"] = hashlib.sha256(attestation_bytes).hexdigest()
-                policy["security_binding_sha256"] = security_digest
-                policy["kit_revision"] = kit_revision
-                policy["host_sandbox"] = "native-profile"
         return {
             **supplied,
             "accepted_plan": accepted_plan or "",
@@ -822,14 +407,12 @@ class DeliveryConfig:
             "version": 1,
             **(
                 {"preparation_version": 1}
-                if self.raw.get("provider", "codex") == "codex" and not legacy_attestation
+                if self.raw.get("provider", "codex") == "codex"
                 else {}
             ),
             **(
                 {"resource_cleanup_version": 1}
-                if backend == "native-macos"
-                and not legacy_attestation
-                and self.raw.get("provider", "codex") == "codex"
+                if self.raw.get("provider", "codex") == "codex"
                 else {}
             ),
             "provider": self.raw.get("provider", "codex"),
@@ -889,14 +472,6 @@ def scope_amendment_config(
     ):
         raise ValueError("scope amendment changed more than the named file list")
     new_repository["allowed_paths"] = old_allowed
-    if original["provider"] == "codex" and original.get("preparation_version") != 1:
-        if "sandbox_attestation_path" not in new_raw:
-            raise ValueError("scope amendment requires fresh boundary attestation")
-        new_raw["sandbox_attestation_path"] = old_raw["sandbox_attestation_path"]
-        old_container = old_raw["container"]
-        new_container = new_raw["container"]
-        for field in ("image_id", "runtime_payload_sha256"):
-            new_container[field] = old_container[field]
     if new_raw != old_raw:
         raise ValueError("scope amendment changed unrelated execution authority")
     return amended
@@ -914,15 +489,10 @@ def scope_amended_spec(
         "goal", "accepted_plan", "base_ref", "branch", "authorized_endpoint",
         "recovery_key", "supersedes_run_id",
     }
-    effective = amended.admit(
-        {key: original[key] for key in submit_keys if key in original},
-        legacy_attestation=original.get("preparation_version") != 1,
-        recorded_backend=(
-            original["policy"].get("execution_backend", "docker")
-            if original["provider"] == "codex"
-            else None
-        ),
-    )
+    from .delivery_preparation import require_native_execution
+
+    require_native_execution(original)
+    effective = amended.admit({key: original[key] for key in submit_keys if key in original})
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
@@ -935,23 +505,13 @@ def scope_amended_spec(
     if "continuation" in original:
         effective["continuation"] = original["continuation"]
     if original.get("preparation_version") == 1:
-        from .delivery_preparation import bind_prepared_spec, verify_prepared_spec
+        from .delivery_native_preparation import bind_native_spec
+        from .delivery_preparation import verify_prepared_spec
 
         verify_prepared_spec(original)
         proof_path = Path(original["preparation"]["environment"]["path"])
-        if original["policy"].get("execution_backend") == "native-macos":
-            from .delivery_native_preparation import bind_native_spec
-
-            effective = bind_native_spec(
-                effective, original["policy"]["native_identity"], proof_path, reused=True
-            )
-        else:
-            effective = bind_prepared_spec(
-                effective,
-                original["policy"]["container"],
-                proof_path,
-                json.loads(proof_path.read_bytes()),
-                reused=True,
-            )
+        effective = bind_native_spec(
+            effective, original["policy"]["native_identity"], proof_path, reused=True
+        )
         verify_prepared_spec(effective)
     return effective

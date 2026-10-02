@@ -113,7 +113,7 @@ def test_native_admission_has_no_docker_policy_and_bounds_nested_launches(
     store, request = native_store
     spec = store.submitted_spec(request["run_id"])
     assert spec["resource_cleanup_version"] == 1
-    assert spec["policy"]["container"] is None
+    assert "container" not in spec["policy"]
     assert spec["policy"]["config_overrides"] == NATIVE_OVERRIDES
     supervisor = DeliverySupervisor(store, capacity=1)
     role = {"spec": spec, "role": "intake", "iteration": 8, "candidate": {"id": "bounded"}}
@@ -129,10 +129,6 @@ def test_native_admission_has_no_docker_policy_and_bounds_nested_launches(
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS boundary required")
 def test_actual_native_preparation_cache_and_check_cleanup(native_store, monkeypatch):
     store, request = native_store
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_preparation._docker",
-        lambda *_args, **_kw: pytest.fail("native path invoked Docker"),
-    )
     submitted = store.submitted_spec(request["run_id"])
     first = prepare_authority(store, submitted)
     verify_prepared_spec(first)
@@ -709,10 +705,6 @@ main().catch(error=>{console.error(error);process.exit(1)});
     prepared = prepare_authority(store, store.submitted_spec(request["run_id"]))
     broker = DeliveryBroker(store, prepared)
     candidate = broker.prepare()["candidate"]
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_preparation._docker",
-        lambda *_args, **_kw: pytest.fail("native browser invoked Docker"),
-    )
     with pytest.raises(ValueError, match="finite turn limit"):
         broker.run_browser_qa(3, candidate)
     result = broker.run_browser_qa(iteration, candidate)

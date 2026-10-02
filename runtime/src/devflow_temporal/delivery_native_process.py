@@ -16,6 +16,10 @@ from .contracts import digest
 from .delivery_resources import RunResources, private_directory, read_private, write_private
 
 
+class NativeProcessUnknown(RuntimeError):
+    """Native launch identity or durable lifecycle evidence cannot establish authority."""
+
+
 def process_table() -> dict[int, dict]:
     result = subprocess.run(
         ["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
@@ -204,63 +208,85 @@ class NativeProcess:
             process = None
             monitoring_complete = False
             observed_ports = {}
+            pipe_eof = False
+
+            def drain_output() -> None:
+                # Candidate stdio points to a pipe, never to a protected controller
+                # file. Node/other runtimes may safely inspect inherited descriptors.
+                nonlocal pipe_eof
+                if process is None or process.stdout is None:
+                    return
+                for _ in range(16):
+                    try:
+                        data = os.read(process.stdout.fileno(), 65536)
+                    except BlockingIOError:
+                        return
+                    if not data:
+                        pipe_eof = True
+                        return
+                    while data:
+                        data = data[os.write(descriptor, data):]
+
             try:
-                with os.fdopen(descriptor, "wb") as log:
-                    process = subprocess.Popen(
-                        [
-                            sys.executable,
-                            "-I",
-                            "-m",
-                            "devflow_temporal.native_child",
-                            str(self.folder),
-                        ],
-                        cwd=self.cwd,
-                        env=self.environment,
-                        stdin=subprocess.PIPE,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        start_new_session=True,
-                    )
-                    ready_path = self.folder / "ready.json"
-                    deadline = time.monotonic() + 10
-                    while not ready_path.exists():
-                        if process.poll() is not None or time.monotonic() >= deadline:
-                            raise RuntimeError("native child never reached its durable start gate")
-                        time.sleep(0.02)
-                    ready = read_private(ready_path)
-                    entry = process_table().get(process.pid)
-                    if not entry or ready != {"pid": process.pid, "identity": entry["identity"]}:
-                        raise RuntimeError("native process identity changed before authorization")
-                    owned[process.pid] = entry
-                    journal.update(
-                        phase="authorized", owned={str(pid): value for pid, value in owned.items()}
-                    )
-                    write_private(self.journal, journal)
-                    assert process.stdin is not None
-                    process.stdin.write(b"GO\n")
-                    process.stdin.flush()
-                    process.stdin.close()
-                    deadline = time.monotonic() + self.timeout
-                    while process.poll() is None:
-                        sample(owned)
-                        journal["owned"] = {str(pid): value for pid, value in owned.items()}
-                        write_private(self.journal, journal)
-                        for port in self.ports:
-                            for pid in listeners(port):
-                                if (
-                                    pid not in owned
-                                    or process_table().get(pid, {}).get("identity")
-                                    != owned[pid]["identity"]
-                                ):
-                                    conflict = True
-                                else:
-                                    observed_ports[str(port)] = {"pid": pid, **owned[pid]}
-                        timed_out, cancelled = time.monotonic() >= deadline, self.cancelled()
-                        if timed_out or cancelled or conflict:
-                            break
-                        time.sleep(0.03)
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-m",
+                        "devflow_temporal.native_child",
+                        str(self.folder),
+                    ],
+                    cwd=self.cwd,
+                    env=self.environment,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                assert process.stdout is not None
+                os.set_blocking(process.stdout.fileno(), False)
+                ready_path = self.folder / "ready.json"
+                deadline = time.monotonic() + 10
+                while not ready_path.exists():
+                    drain_output()
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("native child never reached its durable start gate")
+                    time.sleep(0.02)
+                ready = read_private(ready_path)
+                entry = process_table().get(process.pid)
+                if not entry or ready != {"pid": process.pid, "identity": entry["identity"]}:
+                    raise RuntimeError("native process identity changed before authorization")
+                owned[process.pid] = entry
+                journal.update(
+                    phase="authorized", owned={str(pid): value for pid, value in owned.items()}
+                )
+                write_private(self.journal, journal)
+                assert process.stdin is not None
+                process.stdin.write(b"GO\n")
+                process.stdin.flush()
+                process.stdin.close()
+                deadline = time.monotonic() + self.timeout
+                while process.poll() is None:
+                    drain_output()
                     sample(owned)
-                    monitoring_complete = True
+                    journal["owned"] = {str(pid): value for pid, value in owned.items()}
+                    write_private(self.journal, journal)
+                    for port in self.ports:
+                        for pid in listeners(port):
+                            if (
+                                pid not in owned
+                                or process_table().get(pid, {}).get("identity")
+                                != owned[pid]["identity"]
+                            ):
+                                conflict = True
+                            else:
+                                observed_ports[str(port)] = {"pid": pid, **owned[pid]}
+                    timed_out, cancelled = time.monotonic() >= deadline, self.cancelled()
+                    if timed_out or cancelled or conflict:
+                        break
+                    time.sleep(0.03)
+                sample(owned)
+                monitoring_complete = True
             finally:
                 stopped = stop_observed(owned)
                 if process is not None:
@@ -272,10 +298,19 @@ class NativeProcess:
                             owned[process.pid] = entry
                             stopped = stop_observed(owned)
                     process.wait(timeout=5)
+                    drain_deadline = time.monotonic() + 1
+                    while not pipe_eof and time.monotonic() < drain_deadline:
+                        drain_output()
+                        if not pipe_eof:
+                            time.sleep(0.01)
+                    if process.stdout is not None:
+                        process.stdout.close()
+                os.fsync(descriptor)
+                os.close(descriptor)
                 ports_clear = all(not listeners(port) for port in self.ports)
                 cleanup = (
                     "observed-native-confirmed"
-                    if monitoring_complete and stopped and ports_clear
+                    if monitoring_complete and stopped and ports_clear and pipe_eof
                     else "unknown"
                 )
                 result = {
@@ -288,6 +323,7 @@ class NativeProcess:
                     "observed_listeners": observed_ports,
                     "observed_owned_pids": sorted(owned),
                     "monitoring_complete": monitoring_complete,
+                    "stdio_drained": pipe_eof,
                     "log": str(log_path),
                     "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
                     "journal": str(self.journal),

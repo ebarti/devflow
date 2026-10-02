@@ -48,11 +48,7 @@ def restart_after_measurement(output: Path, command, timeout: int, backend: str)
     deadline = time.monotonic() + timeout
     checked = 0.0
     while time.monotonic() < deadline:
-        cache = (
-            "state/preparation-native"
-            if backend == "native-macos"
-            else "state/preparation/environments"
-        )
+        cache = "state/preparation-native"
         proofs = list((output / cache).glob("*/proof.json"))
         if not proofs:
             if time.monotonic() - checked >= 1:
@@ -236,7 +232,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--restart-after-measurement", action="store_true")
     parser.add_argument(
-        "--execution-backend", choices=["native-macos", "docker"], default="native-macos"
+        "--execution-backend", choices=["native-macos"], default="native-macos"
     )
     parser.add_argument("--first-submit-via-mcp", action="store_true")
     parser.add_argument("--managed-resume-qa", action="store_true")
@@ -280,7 +276,6 @@ def main() -> None:
     run(["git", "remote", "add", "origin", str(remote)], cwd=source)
     base = run(["git", "rev-parse", "HEAD"], cwd=source)
     api, temporal, ui = ports()
-    native = args.execution_backend == "native-macos"
     runtime_python = runtime / ".venv/bin/python"
     native_binary = (
         run(
@@ -293,13 +288,11 @@ def main() -> None:
                 "'codex_cli_bin/bin/codex'))",
             ]
         )
-        if native
-        else seed["codex_bin"]
     )
     check = {
         "id": "fixture-tests",
         "argv": [
-            str(runtime_python.resolve()) if native else "/usr/bin/python3",
+            str(runtime_python.resolve()),
             "-m",
             "unittest",
             "-v",
@@ -319,18 +312,11 @@ def main() -> None:
         "codex_auth_path": seed.get("codex_auth_path"),
         "temporal_bin": seed["temporal_bin"],
         "roles": seed["roles"],
-        **(
-            {"container": {"docker_bin": seed["container"]["docker_bin"], "memory": "4g"}}
-            if not native
-            else {}
-        ),
         "config_overrides": [
             "features.plugins=false",
             "features.multi_agent=false",
             "agents.enabled=false",
-        ]
-        if native
-        else ["features.plugins=false"],
+        ],
         "capacity": 1,
         "max_repairs": 1 if args.managed_resume_qa else 0,
         "service_start_timeout": 60,
@@ -488,24 +474,23 @@ def main() -> None:
                         command("cancel", "--id", run_id, "--request", str(path))
                     terminal = wait(run_id, {"cancelled"})
                 private(output / f"terminal-{number}.json", terminal)
-                if native:
-                    cleanup = terminal["checks"]["resource_cleanup"]
-                    if cleanup["resource_cleanup"] != "confirmed":
-                        raise RuntimeError("workflow temporary resource cleanup is unknown")
-                    for root in cleanup["roots"]:
-                        if root["state"] in {"removed", "already_absent"} and os.path.lexists(
-                            root["path"]
-                        ):
-                            raise RuntimeError("workflow removal receipt disagrees with filesystem")
-                    if any(
-                        root["kind"] in {"transient", "browser-scratch", "generated"}
-                        and root["state"] not in {"removed", "already_absent"}
-                        for root in cleanup["roots"]
+                cleanup = terminal["checks"]["resource_cleanup"]
+                if cleanup["resource_cleanup"] != "confirmed":
+                    raise RuntimeError("workflow temporary resource cleanup is unknown")
+                for root in cleanup["roots"]:
+                    if root["state"] in {"removed", "already_absent"} and os.path.lexists(
+                        root["path"]
                     ):
-                        raise RuntimeError("required temporary root was retained")
+                        raise RuntimeError("workflow removal receipt disagrees with filesystem")
+                if any(
+                    root["kind"] in {"transient", "browser-scratch", "generated"}
+                    and root["state"] not in {"removed", "already_absent"}
+                    for root in cleanup["roots"]
+                ):
+                    raise RuntimeError("required temporary root was retained")
         finally:
             command("stop")
-    summary["workflow_resource_cleanup"] = "confirmed" if native else "legacy"
+    summary["workflow_resource_cleanup"] = "confirmed"
     private(output / "smoke-result.json", summary)
     print(json.dumps(summary, sort_keys=True), flush=True)
 

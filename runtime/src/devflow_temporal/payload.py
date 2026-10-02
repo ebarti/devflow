@@ -1,4 +1,4 @@
-"""Deterministic identity for every trusted Python file copied into the runner image."""
+"""Deterministic identity for every trusted native runtime Python source."""
 
 from __future__ import annotations
 
@@ -8,11 +8,10 @@ import sys
 from pathlib import Path
 
 
-def payload_digest(package: Path, launcher: Path) -> str:
+def payload_digest(package: Path) -> str:
     package = package.resolve(strict=True)
-    launcher = launcher.resolve(strict=True)
     files = sorted(package.rglob("*.py"))
-    if not files or not launcher.is_file():
+    if not files:
         raise ValueError("runner payload files are missing")
     manifest: dict[str, str] = {}
     for path in files:
@@ -20,12 +19,11 @@ def payload_digest(package: Path, launcher: Path) -> str:
             raise ValueError("runner payload contains a linked or missing source")
         relative = path.relative_to(package).as_posix()
         manifest["devflow_temporal/" + relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-    manifest["landlock_exec.py"] = hashlib.sha256(launcher.read_bytes()).hexdigest()
     canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: payload.py PACKAGE_DIR LANDLOCK_EXEC")
-    print(payload_digest(Path(sys.argv[1]), Path(sys.argv[2])))
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: payload.py PACKAGE_DIR")
+    print(payload_digest(Path(sys.argv[1])))

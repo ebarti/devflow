@@ -26,7 +26,6 @@ from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_control import main as delivery_main
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 from devflow_temporal.role_runner import _task
-from devflow_temporal.supervisor import _contained_role_spec
 
 
 def _git(path: Path, *args: str) -> str:
@@ -144,7 +143,6 @@ async def test_public_real_submit_is_durable_without_attestation_or_docker_readb
     path, request = intake_fixture
     config = json.loads(path.read_text())
     config["provider"] = "codex"
-    config["container"] = {"docker_bin": "/usr/local/bin/docker"}
     repository = config["repositories"]["fixture"]
     repository.update({
         "prepublish_checks": [{"id": "precheck", "argv": ["/usr/bin/true"]}],
@@ -155,12 +153,6 @@ async def test_public_real_submit_is_durable_without_attestation_or_docker_readb
     })
     path.write_text(json.dumps(config))
 
-    def unexpected_container_inspection(_container, *, source):
-        raise AssertionError("public admission must not wait for Docker preparation")
-
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_config._container_identity", unexpected_container_inspection
-    )
     app = create_app(path)
     store = app.state.delivery.store
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
@@ -189,16 +181,14 @@ def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):
     store = create_app(path).state.delivery.store
     store.submit(request)
     spec = store.spec("run-1")
-    contained = _contained_role_spec(
-        spec, {**spec["policy"], "host_sandbox": "native-profile"}
-    )
+    native = {**spec, "policy": {**spec["policy"], "host_sandbox": "native-profile"}}
     task = _task({
-        "spec": contained, "role": "intake", "iteration": 0,
+        "spec": native, "role": "intake", "iteration": 0,
         "candidate": {"id": "candidate", "head": spec["base_sha"]},
         "workspace": "/work",
     })
-    assert contained["work_id"] == spec["work_id"]
-    assert contained["issue_url"] == spec["issue_url"]
+    assert native["work_id"] == spec["work_id"]
+    assert native["issue_url"] == spec["issue_url"]
     assert task.permissions.filesystem == FilesystemAccess.READ_ONLY
     assert 'Frozen work ID: "work-1"' in task.goal
     assert 'Frozen issue URL: "https://github.com/example/fixture/issues/3"' in task.goal

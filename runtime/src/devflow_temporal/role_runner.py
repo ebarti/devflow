@@ -224,7 +224,7 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
     with Path(binary).open("rb") as stream:
         actual_digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if actual_digest != request["spec"]["policy"].get("codex_bin_sha256"):
-        raise ValueError("Codex executable changed after sandbox attestation")
+        raise ValueError("Codex executable changed after frozen native preparation")
 
     class PinnedConfig(CodexConfig):
         def __init__(self, *, cwd=None, config_overrides=(), env=None):
@@ -407,7 +407,7 @@ def main() -> int:
     start = Path(request["start_path"])
     output = Path(request["result_path"])
     _write_json(start, {"pid": os.getpid(), "started_at": datetime.now(UTC).isoformat()})
-    authorized = request.get("container_authorized") or request.get("native_authorized")
+    authorized = request.get("native_authorized")
     if not authorized and sys.stdin.readline().strip() != "GO":
         return 2
     try:

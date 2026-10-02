@@ -437,7 +437,6 @@ def main() -> None:
             "continue-repair",
             "retry-prelaunch",
             "amend-scope",
-            "recover-precheck-prelaunch",
         ),
     )
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
@@ -473,7 +472,6 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "continue-repair",
         "retry-prelaunch",
         "amend-scope",
-        "recover-precheck-prelaunch",
     }:
         request = json.loads(args.request.read_text(encoding="utf-8")) if args.request else None
         if args.command in {
@@ -484,7 +482,6 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "continue-repair",
             "retry-prelaunch",
             "amend-scope",
-            "recover-precheck-prelaunch",
         } and not isinstance(request, dict):
             parser.error("--request must name a JSON object file for this command")
         if (
@@ -498,7 +495,6 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "continue-repair",
                 "retry-prelaunch",
                 "amend-scope",
-                "recover-precheck-prelaunch",
             }
             and not args.id
         ):
@@ -518,9 +514,6 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "continue-repair": lambda: caller.continue_repair(args.id, request),
                 "retry-prelaunch": lambda: caller.retry_prelaunch(args.id, request),
                 "amend-scope": lambda: caller.amend_scope(args.id, request),
-                "recover-precheck-prelaunch": lambda: caller.recover_precheck_prelaunch(
-                    args.id, request
-                ),
             }[args.command]()
         except ValueError as exc:
             parser.exit(1, f"devflow-delivery: {exc}\n")

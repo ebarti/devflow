@@ -14,7 +14,6 @@ from .contracts import digest
 from .delivery_native_guard import NATIVE_OVERRIDES, protected_commands
 from .delivery_native_process import NativeProcess
 from .delivery_preparation import (
-    LAUNCHER,
     PACKAGE,
     PreparationError,
     _hash,
@@ -65,7 +64,7 @@ def native_identity(spec: dict) -> dict:
         "codex_bin_sha256": _hash(binary),
         "packages": actual,
         "runtime_dependencies": dependencies,
-        "runtime_payload_sha256": payload_digest(PACKAGE, LAUNCHER),
+        "runtime_payload_sha256": payload_digest(PACKAGE),
         "config_overrides": NATIVE_OVERRIDES,
         "toolchain_roots": spec["policy"].get("toolchain_roots", []),
         "package_manager_cache": spec["policy"].get("package_manager_cache"),
@@ -271,6 +270,8 @@ def _validate(proof: dict, identity: dict, state_root: Path) -> None:
 
 def verify_native_spec(spec: dict) -> None:
     prepared = spec.get("preparation", {})
+    if not isinstance(prepared, dict) or prepared.get("schema") != SCHEMA:
+        raise PreparationError("native execution authority has not been frozen or changed")
     identity = native_identity(spec)
     if (
         spec["policy"].get("native_identity") != identity
