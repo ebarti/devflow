@@ -30,6 +30,7 @@ export function App() {
   const [detail, setDetail] = useState<RunDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState('')
+  const [detailRetry, setDetailRetry] = useState(0)
   const [connection, setConnection] = useState<Connection>('connecting')
   const [lastGoodAt, setLastGoodAt] = useState<string | null>(null)
   const [staleSince, setStaleSince] = useState<string | null>(null)
@@ -122,17 +123,23 @@ export function App() {
       setStaleSince(current => current ?? new Date().toISOString())
     })
     return () => { alive = false; unsubscribe?.() }
-  }, [location.page, location.id, refreshRuns])
+  }, [location.page, location.id, detailRetry, refreshRuns])
 
   const refreshCurrent = useCallback(async () => {
     if (!location.id) return
+    if (connection === 'disconnected') {
+      // Re-enter the owning read/subscribe effect after an initial read failure.
+      setDetailRetry(current => current + 1)
+      await refreshRuns()
+      return
+    }
     try { await loadDetail(location.id); await refreshRuns() }
     catch (cause) {
       setDetailError(cause instanceof Error ? cause.message : 'Could not refresh the run.')
       setConnection('disconnected')
       setStaleSince(current => current ?? new Date().toISOString())
     }
-  }, [location.id, loadDetail, refreshRuns])
+  }, [location.id, connection, loadDetail, refreshRuns])
 
   const serviceConnected = location.page === 'runs' && location.id ? connection === 'connected' : !runsError && !serviceError && !runsLoading && !serviceLoading
   const serviceLabel = serviceConnected ? 'Connected' : runsLoading || serviceLoading || connection === 'connecting' ? 'Connecting' : 'Disconnected'

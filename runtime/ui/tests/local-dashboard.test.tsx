@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
+import { api } from '../src/api'
+import { subscribeRun } from '../src/stream'
 import { mockRun, mockService } from './fixtures'
 
 vi.mock('../src/stream', () => ({ subscribeRun: vi.fn(() => () => {}) }))
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); window.history.replaceState(null, '', '/') })
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); window.history.replaceState(null, '', '/') })
 
 describe('tokenless local dashboard', () => {
   it.each(['', 'devflow_session=expired'])('reads a direct run visit with cookie %j without login', async cookie => {
@@ -26,5 +29,28 @@ describe('tokenless local dashboard', () => {
     expect(screen.queryByText(/sign in|connect to devflow/i)).toBeNull()
     expect(fetchMock.mock.calls.map(([path]) => path)).not.toContain('/api/session')
     expect((screen.getByRole('button', { name: 'New run' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('restores event subscription when Retry succeeds after the first detail read failed', async () => {
+    window.history.replaceState(null, '', `/runs/${mockRun.id}`)
+    vi.spyOn(api, 'listRuns').mockResolvedValue([mockRun])
+    vi.spyOn(api, 'getService').mockResolvedValue(mockService)
+    const read = vi.spyOn(api, 'getRun').mockRejectedValueOnce(new Error('API reloading')).mockResolvedValue(mockRun)
+    const subscribe = vi.mocked(subscribeRun)
+    subscribe.mockClear()
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByText('Run unavailable')
+    expect(subscribe).not.toHaveBeenCalled()
+    await user.click(screen.getAllByRole('button', { name: 'Retry' })[0])
+    await waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1))
+    expect(read).toHaveBeenCalledTimes(2)
+    act(() => {
+      const hooks = subscribe.mock.calls[0][2]
+      hooks.onConnection('connected')
+      hooks.onSnapshot({ ...mockRun, title: 'Live update after retry', goal: 'Live update after retry' })
+    })
+    expect(screen.getByText('Connected')).toBeTruthy()
+    expect(screen.getByText('Live update after retry')).toBeTruthy()
   })
 })
