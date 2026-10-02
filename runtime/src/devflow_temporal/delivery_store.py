@@ -470,11 +470,12 @@ class DeliveryStore:
                 )
             self.state.claim_work(db, spec["work_id"], f"external:devflow:{run_id}", dashboard_url)
             timestamp = _now()
+            initial_phase = "preparing" if spec.get("preparation_version") == 1 else "accepted"
             db.execute(
                 """INSERT INTO delivery_runs
                    (run_id,request_digest,request_json,work_id,issue_url,repository_key,
                     phase,execution_state,revision,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,'accepted','queued',1,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,'queued',1,?,?)""",
                 (
                     run_id,
                     request_digest,
@@ -482,6 +483,7 @@ class DeliveryStore:
                     spec["work_id"],
                     spec["issue_url"],
                     spec["repository_key"],
+                    initial_phase,
                     timestamp,
                     timestamp,
                 ),
@@ -495,7 +497,7 @@ class DeliveryStore:
                 "run_id": run_id,
                 "dashboard_url": dashboard_url,
                 "existing": False,
-                "phase": "accepted",
+                "phase": initial_phase,
             }
             db.execute(
                 "INSERT INTO delivery_commands VALUES (?,?,?,?)",

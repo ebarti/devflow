@@ -138,14 +138,13 @@ def test_unpinned_intake_role_rejected_before_work_claim(intake_fixture):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unavailable", ["missing", "unreadable"])
-async def test_public_submit_reports_unavailable_per_run_attestation_before_claim(
-    intake_fixture, tmp_path, monkeypatch, unavailable
+async def test_public_real_submit_is_durable_without_attestation_or_docker_readback(
+    intake_fixture, monkeypatch
 ):
     path, request = intake_fixture
     config = json.loads(path.read_text())
     config["provider"] = "codex"
-    config["container"] = {}
+    config["container"] = {"docker_bin": "/usr/local/bin/docker"}
     repository = config["repositories"]["fixture"]
     repository.update({
         "prepublish_checks": [{"id": "precheck", "argv": ["/usr/bin/true"]}],
@@ -154,28 +153,14 @@ async def test_public_submit_reports_unavailable_per_run_attestation_before_clai
         "project_url": "https://github.com/orgs/example/projects/1",
         "assignee": "example",
     })
-    attestation_path = tmp_path / "run-1-attestation.json"
-    config["sandbox_attestation_path"] = str(attestation_path)
     path.write_text(json.dumps(config))
+
     def unexpected_container_inspection(_container, *, source):
-        raise AssertionError("missing per-run proof must be reported before Docker inspection")
+        raise AssertionError("public admission must not wait for Docker preparation")
 
     monkeypatch.setattr(
-        "devflow_temporal.delivery_config._container_identity",
-        unexpected_container_inspection,
+        "devflow_temporal.delivery_config._container_identity", unexpected_container_inspection
     )
-    if unavailable == "unreadable":
-        attestation_path.write_text("{}")
-        attestation_path.chmod(0o600)
-        original_read_bytes = Path.read_bytes
-
-        def unreadable_attestation(target):
-            if target == attestation_path:
-                raise PermissionError("fixture attestation read failure")
-            return original_read_bytes(target)
-
-        monkeypatch.setattr(Path, "read_bytes", unreadable_attestation)
-
     app = create_app(path)
     store = app.state.delivery.store
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
@@ -188,12 +173,15 @@ async def test_public_submit_reports_unavailable_per_run_attestation_before_clai
             "/api/runs", json=request,
             headers={**origin, "X-Devflow-CSRF": login.json()["csrf_token"]},
         )
-    assert response.status_code == 409
-    assert "prepare a fresh exact per-run boundary attestation" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["phase"] == "preparing"
+    spec = store.spec(request["run_id"])
+    assert spec["preparation_version"] == 1 and "preparation" not in spec
     with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM delivery_commands").fetchone()[0] == 0
-        assert store.state.row(db, "works", request["work_id"]) is None
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM delivery_outbox").fetchone()[0] == 1
+        assert store.state.row(db, "works", request["work_id"]) is not None
+
 
 
 def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):

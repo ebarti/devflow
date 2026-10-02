@@ -227,6 +227,29 @@ def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str,
     }
 
 
+def validate_preparation_inputs(container: Any) -> None:
+    """Validate service-owned launch settings without contacting Docker at admission."""
+
+    if not isinstance(container, dict) or not container.get("docker_bin"):
+        raise ValueError("real delivery requires configured local Docker launch settings")
+    binary = container["docker_bin"]
+    if not isinstance(binary, str) or not Path(binary).is_absolute():
+        raise ValueError("configured Docker CLI must be an absolute path")
+    if container.get("platform", "linux/arm64") != "linux/arm64":
+        raise ValueError("container platform was not tested")
+    image_id = container.get("image_id")
+    if image_id is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise ValueError("configured container image must be an immutable content ID")
+    if not re.fullmatch(r"[1-9][0-9]*(?:m|g)", str(container.get("memory", "2g"))):
+        raise ValueError("container memory must be a bounded size")
+    if not 1 <= float(container.get("cpus", "2")) <= 16:
+        raise ValueError("container CPUs must be between 1 and 16")
+    if type(container.get("pids_limit", 256)) is not int or not 64 <= container.get(
+        "pids_limit", 256
+    ) <= 4096:
+        raise ValueError("container process limit must be between 64 and 4096")
+
+
 def security_binding(
     *,
     supplied: dict[str, Any],
@@ -332,7 +355,9 @@ class DeliveryConfig:
             "intake_enabled": "intake" in self.raw["roles"],
         }
 
-    def admit(self, supplied: dict[str, Any]) -> dict[str, Any]:
+    def admit(
+        self, supplied: dict[str, Any], *, legacy_attestation: bool = False
+    ) -> dict[str, Any]:
         required = {
             "command_id",
             "run_id",
@@ -451,33 +476,36 @@ class DeliveryConfig:
         if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
             raise ValueError("initial decision prompt must be a non-empty string")
         if self.raw.get("provider", "codex") == "codex":
-            attestation_path = Path(self.raw.get("sandbox_attestation_path", ""))
-            if not attestation_path.is_absolute():
-                raise ValueError(
-                    "real role policy requires an absolute path to a fresh per-run "
-                    "sandbox attestation"
-                )
-            try:
-                metadata = attestation_path.lstat()
-            except OSError as exc:
-                raise ValueError(
-                    "sandbox attestation is unavailable; prepare a fresh exact per-run "
-                    "boundary attestation before submitting"
-                ) from exc
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.getuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-            ):
-                raise ValueError("sandbox attestation must be an owned private file")
-            try:
-                attestation_bytes = attestation_path.read_bytes()
-            except OSError as exc:
-                raise ValueError(
-                    "sandbox attestation is unavailable; prepare a fresh exact per-run "
-                    "boundary attestation before submitting"
-                ) from exc
-            container_identity = _container_identity(policy["container"], source=source)
+            if legacy_attestation:
+                attestation_path = Path(self.raw.get("sandbox_attestation_path", ""))
+                if not attestation_path.is_absolute():
+                    raise ValueError(
+                        "real role policy requires an absolute path to a fresh per-run "
+                        "sandbox attestation"
+                    )
+                try:
+                    metadata = attestation_path.lstat()
+                except OSError as exc:
+                    raise ValueError(
+                        "sandbox attestation is unavailable; prepare a fresh exact per-run "
+                        "boundary attestation before submitting"
+                    ) from exc
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                ):
+                    raise ValueError("sandbox attestation must be an owned private file")
+                try:
+                    attestation_bytes = attestation_path.read_bytes()
+                except OSError as exc:
+                    raise ValueError(
+                        "sandbox attestation is unavailable; prepare a fresh exact per-run "
+                        "boundary attestation before submitting"
+                    ) from exc
+                container_identity = _container_identity(policy["container"], source=source)
+            else:
+                validate_preparation_inputs(policy["container"])
             if policy["config_overrides"] != ["features.plugins=false"]:
                 raise ValueError("real role configuration overrides must disable plugins")
             if (
@@ -619,99 +647,104 @@ class DeliveryConfig:
                     or not 30 <= qa["timeout_seconds"] <= 1800
                 ):
                     raise ValueError("browser QA requires positive count and bounded timeout")
-            security_digest = security_binding(
-                supplied=supplied,
-                repository=repository,
-                source=source,
-                origin=actual_remote,
-                base_sha=base_sha,
-                state_dir=state_dir,
-                checkout=checkout,
-                policy=policy,
-            )
-            attestation = json.loads(attestation_bytes)
-            project_root = Path(__file__).resolve().parents[2]
-            with (project_root / "pyproject.toml").open("rb") as stream:
-                project = tomllib.load(stream)
-            kit_revision = project["tool"]["uv"]["sources"]["agent-runtime-kit"]["rev"]
-            if kit_revision != "d9ed6e186ce028d0db3b044ce959a94f409510c5":
-                raise ValueError("runtime kit source is not the tested container revision")
-            package = Path(__file__).resolve().parent
-            source_hashes = {
-                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in sorted(package.glob("*.py"))
-            }
-            role = attestation.get("role_observed", {})
-            check = attestation.get("check_observed", {})
-            browser = attestation.get("browser_qa_observed", {})
-            evidence = attestation.get("evidence", {})
-            if not isinstance(evidence, dict) or set(evidence) != {
-                "role",
-                "check",
-                "browser",
-                "detached",
-                "resume",
-            }:
-                raise ValueError("container boundary evidence is incomplete")
-            for recorded in evidence.values():
-                if not isinstance(recorded, dict):
-                    raise ValueError("container evidence reference is malformed")
-                path = Path(recorded.get("path", ""))
-                if not path.is_absolute():
-                    raise ValueError("container evidence reference is not absolute")
-                info = path.lstat()
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != os.getuid()
-                    or stat.S_IMODE(info.st_mode) != 0o600
-                    or hashlib.sha256(path.read_bytes()).hexdigest() != recorded.get("sha256")
-                ):
-                    raise ValueError("container evidence changed after the conformance probe")
-            if (
-                attestation.get("schema") != "devflow-container-v4"
-                or attestation.get("effective_mode")
-                != "Docker private PID namespace with Codex native role permissions"
-                or attestation.get("container_identity") != container_identity
-                or attestation.get("kit_revision") != kit_revision
-                or attestation.get("codex_sdk_version") != REQUIRED_CODEX_VERSION
-                or attestation.get("codex_cli_version") != REQUIRED_CODEX_VERSION
-                or attestation.get("source_hashes") != source_hashes
-                or attestation.get("security_binding_sha256") != security_digest
-                or attestation.get("requested_model") != policy["roles"]["implement"]["model"]
-                or attestation.get("requested_effort") != policy["roles"]["implement"]["effort"]
-                or not isinstance(attestation.get("role_session_id"), str)
-                or not attestation["role_session_id"]
-                or not _contained_probe_passed(role, role=True)
-                or not _contained_probe_passed(check, role=False)
-                or role.get("cleanup") != "confirmed"
-                or check.get("cleanup") != "confirmed"
-                or attestation.get("same_session_resume") is not True
-                or attestation.get("detached_cleanup")
-                != {"role": True, "check": True, "browser": True}
-                or attestation.get("install_exit_code") != 0
-                or attestation.get("api_check_exit_code") != 0
-                or (
-                    qa is not None
-                    and not (
-                        _contained_probe_passed(browser, role=False)
-                        and browser.get("browser_api_sqlite") is True
-                        and browser.get("owned_listeners") is True
-                        and browser.get("cleanup") == "confirmed"
-                        and type(browser.get("test_count")) is int
-                        and browser["test_count"] >= 2
-                    )
+            if legacy_attestation:
+                security_digest = security_binding(
+                    supplied=supplied,
+                    repository=repository,
+                    source=source,
+                    origin=actual_remote,
+                    base_sha=base_sha,
+                    state_dir=state_dir,
+                    checkout=checkout,
+                    policy=policy,
                 )
-            ):
-                raise ValueError("sandbox attestation does not match this executable and boundary")
-            policy["sandbox_attestation_sha256"] = hashlib.sha256(attestation_bytes).hexdigest()
-            policy["security_binding_sha256"] = security_digest
-            policy["kit_revision"] = kit_revision
-            policy["host_sandbox"] = "native-profile"
+                attestation = json.loads(attestation_bytes)
+                project_root = Path(__file__).resolve().parents[2]
+                with (project_root / "pyproject.toml").open("rb") as stream:
+                    project = tomllib.load(stream)
+                kit_revision = project["tool"]["uv"]["sources"]["agent-runtime-kit"]["rev"]
+                if kit_revision != "d9ed6e186ce028d0db3b044ce959a94f409510c5":
+                    raise ValueError("runtime kit source is not the tested container revision")
+                package = Path(__file__).resolve().parent
+                source_hashes = {
+                    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in sorted(package.glob("*.py"))
+                }
+                role = attestation.get("role_observed", {})
+                check = attestation.get("check_observed", {})
+                browser = attestation.get("browser_qa_observed", {})
+                evidence = attestation.get("evidence", {})
+                if not isinstance(evidence, dict) or set(evidence) != {
+                    "role",
+                    "check",
+                    "browser",
+                    "detached",
+                    "resume",
+                }:
+                    raise ValueError("container boundary evidence is incomplete")
+                for recorded in evidence.values():
+                    if not isinstance(recorded, dict):
+                        raise ValueError("container evidence reference is malformed")
+                    path = Path(recorded.get("path", ""))
+                    if not path.is_absolute():
+                        raise ValueError("container evidence reference is not absolute")
+                    info = path.lstat()
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o600
+                        or hashlib.sha256(path.read_bytes()).hexdigest() != recorded.get("sha256")
+                    ):
+                        raise ValueError("container evidence changed after the conformance probe")
+                if (
+                    attestation.get("schema") != "devflow-container-v4"
+                    or attestation.get("effective_mode")
+                    != "Docker private PID namespace with Codex native role permissions"
+                    or attestation.get("container_identity") != container_identity
+                    or attestation.get("kit_revision") != kit_revision
+                    or attestation.get("codex_sdk_version") != REQUIRED_CODEX_VERSION
+                    or attestation.get("codex_cli_version") != REQUIRED_CODEX_VERSION
+                    or attestation.get("source_hashes") != source_hashes
+                    or attestation.get("security_binding_sha256") != security_digest
+                    or attestation.get("requested_model") != policy["roles"]["implement"]["model"]
+                    or attestation.get("requested_effort") != policy["roles"]["implement"]["effort"]
+                    or not isinstance(attestation.get("role_session_id"), str)
+                    or not attestation["role_session_id"]
+                    or not _contained_probe_passed(role, role=True)
+                    or not _contained_probe_passed(check, role=False)
+                    or role.get("cleanup") != "confirmed"
+                    or check.get("cleanup") != "confirmed"
+                    or attestation.get("same_session_resume") is not True
+                    or attestation.get("detached_cleanup")
+                    != {"role": True, "check": True, "browser": True}
+                    or attestation.get("install_exit_code") != 0
+                    or attestation.get("api_check_exit_code") != 0
+                    or (
+                        qa is not None
+                        and not (
+                            _contained_probe_passed(browser, role=False)
+                            and browser.get("browser_api_sqlite") is True
+                            and browser.get("owned_listeners") is True
+                            and browser.get("cleanup") == "confirmed"
+                            and type(browser.get("test_count")) is int
+                            and browser["test_count"] >= 2
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "sandbox attestation does not match this executable and boundary"
+                    )
+                policy["sandbox_attestation_sha256"] = hashlib.sha256(attestation_bytes).hexdigest()
+                policy["security_binding_sha256"] = security_digest
+                policy["kit_revision"] = kit_revision
+                policy["host_sandbox"] = "native-profile"
         return {
             **supplied,
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
+            **({"preparation_version": 1} if self.raw.get("provider", "codex") == "codex"
+               and not legacy_attestation else {}),
             "provider": self.raw.get("provider", "codex"),
             "source_path": str(source),
             "origin_url": actual_remote,
@@ -794,7 +827,10 @@ def scope_amended_spec(
         "goal", "accepted_plan", "base_ref", "branch", "authorized_endpoint",
         "recovery_key", "supersedes_run_id",
     }
-    effective = amended.admit({key: original[key] for key in submit_keys if key in original})
+    effective = amended.admit(
+        {key: original[key] for key in submit_keys if key in original},
+        legacy_attestation=original.get("preparation_version") != 1,
+    )
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
