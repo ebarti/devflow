@@ -8,10 +8,10 @@ version = "0.1.0"
 description = "Experimental local Temporal runtime for Devflow"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-  "agent-runtime-kit[codex]==0.5.2",
+  "agent-runtime-kit[codex]>=0.5.3,<0.6",
   "fastapi==0.141.1",
   "mcp==1.30.0",
-  "openai-codex==0.157.1",
+  "openai-codex==0.160.0",
   "temporalio>=1.20,<2",
   "uvicorn==0.54.0",
 ]
@@ -32,9 +32,6 @@ required-environments = [
   "sys_platform == 'darwin' and platform_machine == 'arm64'",
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
-
-[tool.uv.sources]
-agent-runtime-kit = { git = "https://github.com/ebarti/agent-runtime-kit.git", rev = "d9ed6e186ce028d0db3b044ce959a94f409510c5" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -8,7 +8,6 @@ import os
 import re
 import stat
 import subprocess
-import tomllib
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,11 +17,13 @@ from urllib.parse import urlsplit
 from .contracts import RUN_ID_RE, digest
 from .delivery_sandbox import validate_network_domain
 from .payload import payload_digest
+from .runtime_dependencies import dependency_labels, locked_dependency_identity
 
 BRANCH_RE = re.compile(r"^(?:feat|fix|docs|chore)/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CHECK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-REQUIRED_CODEX_VERSION = "0.157.1"
+LEGACY_CODEX_VERSION = "0.157.1"
+LEGACY_KIT_REVISION = "d9ed6e186ce028d0db3b044ce959a94f409510c5"
 BOUNDARY_DENIAL_FIELDS = (
     "copied_auth_read",
     "host_credential_read",
@@ -202,6 +203,16 @@ def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str,
     except (ValueError, IndexError, KeyError, TypeError) as exc:
         raise ValueError("container image inspection is malformed") from exc
     labels = image.get("Config", {}).get("Labels") or {}
+    dependencies = container.get("runtime_dependencies")
+    if dependencies is not None:
+        if dependencies != locked_dependency_identity():
+            raise ValueError("runtime dependency lock changed after image build")
+        expected_dependencies = dependency_labels(dependencies)
+    else:
+        expected_dependencies = {
+            "devflow.kit_revision": LEGACY_KIT_REVISION,
+            "devflow.codex_cli_version": LEGACY_CODEX_VERSION,
+        }
     if (
         len(values) != 1
         or image.get("Id") != container["image_id"]
@@ -209,8 +220,7 @@ def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str,
         or labels.get("devflow.role_runner_sha256") != container["role_runner_sha256"]
         or labels.get("devflow.runtime_payload_sha256") != container["runtime_payload_sha256"]
         or labels.get("devflow.codex_bin_sha256") != container["codex_bin_sha256"]
-        or labels.get("devflow.kit_revision") != "d9ed6e186ce028d0db3b044ce959a94f409510c5"
-        or labels.get("devflow.codex_cli_version") != REQUIRED_CODEX_VERSION
+        or any(labels.get(key) != value for key, value in expected_dependencies.items())
         or container["codex_bin"]
         != "/opt/devflow-venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex"
     ):
@@ -224,6 +234,7 @@ def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str,
         "runtime_payload_sha256": container["runtime_payload_sha256"],
         "codex_bin_sha256": container["codex_bin_sha256"],
         "pnpm_lock_sha256": container["pnpm_lock_sha256"],
+        **({"runtime_dependencies": dependencies} if dependencies is not None else {}),
     }
 
 
@@ -507,7 +518,7 @@ class DeliveryConfig:
             else:
                 validate_preparation_inputs(policy["container"])
                 policy["host_sandbox"] = "native-profile"
-                policy["kit_revision"] = "d9ed6e186ce028d0db3b044ce959a94f409510c5"
+                policy["runtime_dependencies"] = locked_dependency_identity()
             if policy["config_overrides"] != ["features.plugins=false"]:
                 raise ValueError("real role configuration overrides must disable plugins")
             if (
@@ -661,12 +672,7 @@ class DeliveryConfig:
                     policy=policy,
                 )
                 attestation = json.loads(attestation_bytes)
-                project_root = Path(__file__).resolve().parents[2]
-                with (project_root / "pyproject.toml").open("rb") as stream:
-                    project = tomllib.load(stream)
-                kit_revision = project["tool"]["uv"]["sources"]["agent-runtime-kit"]["rev"]
-                if kit_revision != "d9ed6e186ce028d0db3b044ce959a94f409510c5":
-                    raise ValueError("runtime kit source is not the tested container revision")
+                kit_revision = LEGACY_KIT_REVISION
                 package = Path(__file__).resolve().parent
                 source_hashes = {
                     path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -704,8 +710,8 @@ class DeliveryConfig:
                     != "Docker private PID namespace with Codex native role permissions"
                     or attestation.get("container_identity") != container_identity
                     or attestation.get("kit_revision") != kit_revision
-                    or attestation.get("codex_sdk_version") != REQUIRED_CODEX_VERSION
-                    or attestation.get("codex_cli_version") != REQUIRED_CODEX_VERSION
+                    or attestation.get("codex_sdk_version") != LEGACY_CODEX_VERSION
+                    or attestation.get("codex_cli_version") != LEGACY_CODEX_VERSION
                     or attestation.get("source_hashes") != source_hashes
                     or attestation.get("security_binding_sha256") != security_digest
                     or attestation.get("requested_model") != policy["roles"]["implement"]["model"]

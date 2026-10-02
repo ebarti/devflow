@@ -17,7 +17,6 @@ from typing import Any
 
 from .contracts import canonical_json, digest
 from .delivery_config import (
-    REQUIRED_CODEX_VERSION,
     _contained_denied,
     _contained_probe_passed,
     _container_identity,
@@ -25,11 +24,16 @@ from .delivery_config import (
 from .delivery_container import Bind, OwnedContainer, _docker
 from .delivery_sandbox import prepare_native_role
 from .payload import payload_digest
+from .runtime_dependencies import (
+    CODEX_BINARY_SHA256,
+    dependency_build_args,
+    dependency_labels,
+    frozen_requirements,
+    locked_dependency_identity,
+)
 
 SCHEMA = "devflow-prepared-environment-v1"
-KIT_REVISION = "d9ed6e186ce028d0db3b044ce959a94f409510c5"
 CODEX_BINARY = "/opt/devflow-venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex"
-CODEX_BINARY_SHA256 = "9cbc3cdcc18ca336523ffa7d64207a1ae1f5991f823081d0a37bcb3a748de093"
 PACKAGE = Path(__file__).resolve().parent
 RUNTIME = PACKAGE.parents[1]
 SECCOMP = RUNTIME / "docker/moby-56be731-codex-bwrap-seccomp.json"
@@ -201,6 +205,9 @@ def _engine(container: dict, *, start: bool) -> dict:
 
 def _launch_policy(spec: dict) -> dict:
     configured = spec["policy"]["container"]
+    dependencies = locked_dependency_identity()
+    if spec["policy"].get("runtime_dependencies") != dependencies:
+        raise PreparationError("runtime dependency lock changed after admission")
     binary = Path(configured["docker_bin"]).resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise PreparationError("configured Docker executable is unavailable")
@@ -228,6 +235,7 @@ def _launch_policy(spec: dict) -> dict:
         "runtime_payload_sha256": payload_digest(PACKAGE, LAUNCHER),
         "codex_bin": CODEX_BINARY,
         "codex_bin_sha256": CODEX_BINARY_SHA256,
+        "runtime_dependencies": dependencies,
         "pnpm_lock_sha256": lock_sha,
         **{
             key: configured.get(key, default)
@@ -246,8 +254,7 @@ def _resolve_image(container: dict, root: Path) -> dict:
         "devflow.role_runner_sha256": container["role_runner_sha256"],
         "devflow.runtime_payload_sha256": container["runtime_payload_sha256"],
         "devflow.codex_bin_sha256": CODEX_BINARY_SHA256,
-        "devflow.kit_revision": KIT_REVISION,
-        "devflow.codex_cli_version": REQUIRED_CODEX_VERSION,
+        **dependency_labels(container["runtime_dependencies"]),
         "devflow.dockerfile_sha256": _hash(RUNTIME / "docker/Dockerfile"),
     }
     _directory(root / "images")
@@ -287,13 +294,21 @@ def _resolve_image(container: dict, root: Path) -> dict:
         if launcher.is_symlink():
             raise PreparationError("owned image launcher was replaced with a linked file")
         shutil.copyfile(LAUNCHER, launcher)
+        dependencies = container["runtime_dependencies"]
+        requirements = frozen_requirements(dependencies)
+        if any(
+            (context / "runtime" / name).is_symlink() for name in ("requirements.txt", "uv.lock")
+        ):
+            raise PreparationError("owned dependency build context was replaced with a linked file")
+        (context / "runtime/requirements.txt").write_text(requirements)
+        shutil.copyfile(RUNTIME / "uv.lock", context / "runtime/uv.lock")
         tag = "devflow-prepared:" + digest(expected)
         argv = ["build", "--platform", "linux/arm64"]
         for key, value in (
             ("ROLE_RUNNER_SHA256", container["role_runner_sha256"]),
             ("RUNTIME_PAYLOAD_SHA256", container["runtime_payload_sha256"]),
-            ("CODEX_BIN_SHA256", CODEX_BINARY_SHA256),
             ("DOCKERFILE_SHA256", expected["devflow.dockerfile_sha256"]),
+            *dependency_build_args(dependencies).items(),
         ):
             argv.extend(("--build-arg", f"{key}={value}"))
         argv.extend(("-f", str(RUNTIME / "docker/Dockerfile"), "-t", tag, str(context)))
@@ -657,7 +672,6 @@ def bind_prepared_spec(
         {
             "container": container,
             "host_sandbox": "native-profile",
-            "kit_revision": KIT_REVISION,
             "environment_proof_sha256": _hash(proof_path),
         }
     )

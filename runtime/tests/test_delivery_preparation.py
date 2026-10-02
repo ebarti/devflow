@@ -17,6 +17,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 from test_delivery_intake import intake_fixture as intake_fixture
 
+from devflow_temporal import delivery_config as configuration
 from devflow_temporal import delivery_preparation as preparation
 from devflow_temporal.delivery_activities import delivery_prepare, delivery_project
 from devflow_temporal.delivery_config import DeliveryConfig, scope_amended_spec
@@ -154,6 +155,7 @@ def measured_environment(monkeypatch):
         "profile": "b" * 64,
         "image": "sha256:" + "c" * 64,
         "engine": {"ID": "owned-engine", "version": "test"},
+        "dependencies": configuration.locked_dependency_identity(),
         "calls": [],
     }
 
@@ -163,6 +165,7 @@ def measured_environment(monkeypatch):
             "docker_bin_sha256": "d" * 64,
             "runtime_payload_sha256": state["payload"],
             "seccomp_sha256": state["profile"],
+            "runtime_dependencies": copy.deepcopy(state["dependencies"]),
             "memory": "2g",
             "cpus": "2",
             "pids_limit": 256,
@@ -173,6 +176,8 @@ def measured_environment(monkeypatch):
             raise ValueError("trusted runtime payload changed")
         if container["seccomp_sha256"] != state["profile"]:
             raise ValueError("trusted seccomp profile changed")
+        if container["runtime_dependencies"] != state["dependencies"]:
+            raise ValueError("trusted dependency lock changed")
         return dict(container)
 
     def measure(_spec, root, fingerprint, identity):
@@ -234,6 +239,9 @@ def measured_environment(monkeypatch):
         lambda container, root: {**container, "image_id": state["image"]},
     )
     monkeypatch.setattr(preparation, "measure_environment", measure)
+    monkeypatch.setattr(
+        configuration, "locked_dependency_identity", lambda: copy.deepcopy(state["dependencies"])
+    )
     return state
 
 
@@ -339,13 +347,15 @@ def test_tampered_or_stale_preparation_cannot_construct_container(
         )
 
 
-@pytest.mark.parametrize("changed", ["payload", "profile", "image", "engine"])
+@pytest.mark.parametrize("changed", ["payload", "profile", "image", "engine", "dependencies"])
 def test_changed_execution_environment_invalidates_cache(real_store, measured_environment, changed):
     store, request = real_store
     first = preparation.prepare_authority(store, _submit(store, request, 1))
     measured_environment[changed] = (
         {"ID": "new-engine", "version": "test"}
         if changed == "engine"
+        else {**measured_environment["dependencies"], "lock_sha256": "f" * 64}
+        if changed == "dependencies"
         else "sha256:" + "f" * 64
         if changed == "image"
         else "f" * 64
