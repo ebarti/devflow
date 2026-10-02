@@ -44,7 +44,7 @@ Preparation runs fixed disposable probes through the same `OwnedContainer`, nati
 
 The cache identity includes the current runtime/profile payload, pinned Dockerfile and image, Docker executable and engine/kernel identity, seccomp/CLI identities, role selections, resource limits and exact browser ports. Canonical probe container paths make it reusable across run IDs; every run separately freezes its repository, Git base, source scope, branch, checkout/state paths, checks, model policy and endpoint binding. The frozen effective spec is appended atomically without rewriting the submitted request or older run rows. Replays reuse the same frozen result. Actual role/check launches revalidate that authority and its hashed evidence. A source, profile, image or engine change cannot silently reuse stale authority. Candidate-project checks still run at their normal workflow gates.
 
-The timeline shows Docker readiness, image resolution and boundary measurement within `preparing`. Cancellation during preparation finishes that contained boundary and prevents intake from starting. Existing recorded runs continue to use their recorded legacy attestation/recovery contract; no historical run is automatically continued or re-attested.
+The timeline shows Docker readiness, image resolution and boundary measurement within `preparing`, with bounded build/probe failure diagnostics. Automatic preparation heartbeats every five seconds; a lost worker can retry up to three times within two hours and reuse a published proof or frozen result. Authority conflicts, failed probes and tampered evidence fail explicitly without retry. Cancellation during preparation finishes that contained boundary and prevents intake from starting. Existing recorded runs continue to use their recorded legacy attestation/recovery contract; no historical run is automatically continued or re-attested.
 
 All candidate-controlled execution uses one Docker lifecycle: the role, prepublication/final checks and browser QA each start in a distinct labelled container with a private PID/IPC namespace, non-root user, dropped capabilities, no privilege escalation, read-only root and the reviewed seccomp profile. The controller mounts only owned per-execution paths; controller state, host credentials and Docker socket stay outside. Container start is journalled before launch. Replay inspects the same container and receipt; disappearance or ambiguous daemon state leaves cleanup unknown in the authoritative run projection and retains the owned evidence for reconciliation. Only Docker's confirmed exited container with PID zero can produce `cleanup=confirmed`, including when a command spawned a detached child. The real provider has no native fallback that reports confirmed cleanup from a process-group sample.
 
@@ -106,13 +106,14 @@ npm test
 
 Tests cover real Temporal restart/decision and repair gates, submission/claim conflicts, cancellation races, check containment, and the local API. The dashboard suite exercises the real response shape as well as UI state changes. Live model availability, actual repository checks, GitHub effects, browser interaction against the real service, and independent review/verification require separate evidence for the **exact candidate**. A successful unit suite or fake provider run does not establish those effects. The service is local, single-host, and uses Temporal's development server and SQLite; interrupted external effects may need human reconciliation.
 
-A reproducible live smoke uses the installed public CLI, a new private Git fixture and a separate local service. It submits two raw goals with no proof/image pins, verifies real intake plus environment reuse, then cancels before plan acceptance and tracker writes. Supply an existing configured runtime and a new private evidence directory:
+A reproducible live smoke uses the installed public CLI, a new private Git fixture and a separate local service. It submits two raw goals with no proof/image pins, verifies real intake plus environment reuse, then cancels before plan acceptance and tracker writes. Supply an existing configured runtime and a new private directory that Docker Desktop can mount, such as a unique directory under `~/.local/state/devflow`:
 
 ```sh
 runtime/.venv/bin/python runtime/scripts/smoke_preparation.py \
   --runtime-dir /absolute/path/to/runtime \
   --config /absolute/private/service-config.json \
-  --output-dir /absolute/private/new-smoke-evidence
+  --output-dir /absolute/container-accessible/new-smoke-evidence \
+  --restart-after-measurement
 ```
 
-This proves the preparation/intake surface, not a full feature delivery or implementation-session resume. The latter is a separately labelled integration check.
+The restart option crashes only the disposable service's identified worker after proof publication and before freeze, restarts through the public CLI, and verifies recovery from the same proof. Successful real intake requires the configured model to be available for the runtime's account. This proves the preparation/intake surface, not a full feature delivery or implementation-session resume. The latter is a separately labelled integration check.
