@@ -157,9 +157,8 @@ async def test_public_real_submit_is_durable_without_attestation_or_docker_readb
     store = app.state.delivery.store
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url=config["dashboard_url"]) as browser:
-        token = (Path(config["state_root"]) / "service-token").read_text().strip()
         origin = {"Origin": config["dashboard_url"]}
-        login = await browser.post("/api/session", json={"token": token}, headers=origin)
+        login = await browser.get("/api/session")
         assert login.status_code == 200
         response = await browser.post(
             "/api/runs", json=request,
@@ -253,13 +252,7 @@ async def test_raw_goal_questions_revision_restart_plan_change_and_acceptance(
         async with httpx.AsyncClient(
             transport=transport, base_url="http://127.0.0.1:18770"
         ) as browser:
-            token = (
-                Path(json.loads(path.read_text())["state_root"]) / "service-token"
-            ).read_text().strip()
-            login = await browser.post(
-                "/api/session", json={"token": token},
-                headers={"Origin": "http://127.0.0.1:18770"},
-            )
+            login = await browser.get("/api/session")
             headers = {
                 "Origin": "http://127.0.0.1:18770",
                 "X-Devflow-CSRF": login.json()["csrf_token"],

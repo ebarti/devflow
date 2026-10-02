@@ -1,4 +1,4 @@
-"""One authenticated local API client for CLI and MCP callers."""
+"""One tokenless loopback API client for CLI and MCP callers."""
 
 from __future__ import annotations
 
@@ -34,6 +34,9 @@ class DeliveryClient:
         if payload is not None:
             headers["Content-Type"] = "application/json"
         if method != "GET" and path != "/api/session":
+            # Refresh CSRF state before sending, including after expiry or API reload.
+            # Never replay a dispatched mutation after a transport failure.
+            self.login(timeout=timeout)
             headers["X-Devflow-CSRF"] = self.csrf
         request = urllib.request.Request(
             self.config.dashboard_url.rstrip("/") + path,
@@ -56,8 +59,8 @@ class DeliveryClient:
             ) from None
 
     def login(self, *, timeout: float = 30) -> None:
-        token = (self.config.state_root / "service-token").read_text(encoding="utf-8").strip()
-        result = self._request("POST", "/api/session", {"token": token}, timeout=timeout)
+        """Bootstrap anonymous CSRF state; retained name for lifecycle callers."""
+        result = self._request("GET", "/api/session", timeout=timeout)
         self.csrf = result["csrf_token"]
 
     def submit(self, payload: dict[str, Any]) -> dict:
@@ -111,7 +114,7 @@ class DeliveryClient:
 
 
 def client(config_path: Path) -> DeliveryClient:
-    # The lifecycle controller also uses DeliveryClient for authenticated readiness.
+    # The lifecycle controller also uses DeliveryClient for loopback readiness.
     from .delivery_control import ensure_service_running
 
     caller = DeliveryClient(DeliveryConfig.load(config_path))

@@ -5,7 +5,6 @@ import { join, resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '../dist')
 const port = Number(process.env.DEVFLOW_FIXTURE_PORT || 5179)
-const requireLogin = process.env.DEVFLOW_FIXTURE_REQUIRE_LOGIN === '1'
 const run = {
   id: 'ui-fixture-run', work_id: 'ui-fixture-work', title: 'UI fixture · workflow detail',
   repository: 'fixture/repository', issue: '#1', issue_url: 'https://github.com/example/repository/issues/1',
@@ -56,18 +55,10 @@ function json(response, data, status = 200) {
 createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host}`)
   response.setHeader('X-Devflow-UI-Fixture', 'test-only')
-  if (url.pathname === '/api/session' && request.method === 'GET') {
-    const authenticated = !requireLogin || request.headers.cookie?.includes('fixture-session=1')
-    return json(response, authenticated ? { authenticated: true, csrf_token: 'fixture-csrf' } : { authenticated: false })
-  }
-  if (url.pathname === '/api/session' && request.method === 'POST') {
-    let body = ''
-    for await (const chunk of request) body += chunk
-    if (JSON.parse(body).token !== 'fixture-token') return json(response, { detail: 'Invalid fixture token.' }, 401)
+  if (url.pathname === '/api/session') {
     response.setHeader('Set-Cookie', 'fixture-session=1; HttpOnly; SameSite=Strict; Path=/')
     return json(response, { csrf_token: 'fixture-csrf' })
   }
-  if (url.pathname.startsWith('/api/') && requireLogin && !request.headers.cookie?.includes('fixture-session=1')) return json(response, { detail: 'Sign in required.' }, 401)
   if (url.pathname === '/api/service') return json(response, service)
   if (url.pathname === '/api/runs' && request.method === 'GET') return json(response, { runs: [run] })
   if (url.pathname === '/api/runs/ui-fixture-run') return json(response, { run, events: run.events, evidence: [] })

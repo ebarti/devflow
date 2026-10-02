@@ -8,7 +8,7 @@ export class ApiError extends Error {
   }
 }
 
-let csrfToken: string | undefined
+let pendingSession: Promise<string> | undefined
 
 type BackendTracker = Omit<NonNullable<RunDetail['tracker']>, 'observed'> & { observed?: unknown }
 type BackendRunDetail = Omit<RunDetail, 'tracker' | 'usage'> & {
@@ -66,37 +66,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return await response.json() as T
 }
 
-async function session(): Promise<boolean> {
-  const result = await request<{ authenticated: boolean; csrf_token?: string }>('/api/session')
-  csrfToken = result.authenticated && result.csrf_token ? result.csrf_token : undefined
-  return Boolean(csrfToken)
-}
-
-async function login(token: string): Promise<void> {
-  const result = await request<{ csrf_token?: string }>('/api/session', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }),
-  })
-  if (!result.csrf_token) throw new ApiError('The service did not establish a session.', 0)
-  csrfToken = result.csrf_token
+async function session(): Promise<string> {
+  // Concurrent first commands share one cookie bootstrap. Renew before each later
+  // command so an expired cookie or an API reload never requires user input.
+  if (!pendingSession) {
+    pendingSession = request<{ csrf_token?: string }>('/api/session').then(result => {
+      if (!result.csrf_token) throw new ApiError('The service did not establish CSRF protection.', 0)
+      return result.csrf_token
+    }).finally(() => { pendingSession = undefined })
+  }
+  return pendingSession
 }
 
 async function command<T>(path: string, body: object): Promise<T> {
-  if (!csrfToken && !await session()) throw new ApiError('Sign in to the local service first.', 401)
-  try {
-    return await request<T>(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Devflow-CSRF': csrfToken! },
-      body: JSON.stringify(body),
-    })
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 403) csrfToken = undefined
-    throw error
-  }
+  const csrfToken = await session()
+  return request<T>(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Devflow-CSRF': csrfToken },
+    body: JSON.stringify(body),
+  })
 }
 
 export const api = {
   session,
-  login,
   listRuns: async (): Promise<RunSummary[]> => (await request<{ runs: RunSummary[] }>('/api/runs')).runs,
   getRun: async (id: string): Promise<RunDetail> => {
     const result = await request<{ run: BackendRunDetail; events?: RunDetail['events']; evidence?: RunDetail['evidence'] }>(`/api/runs/${encodeURIComponent(id)}`)

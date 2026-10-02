@@ -772,10 +772,7 @@ async def test_public_scope_amendment_dispatches_one_original_session_temporal_r
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url=origin
             ) as browser:
-                login = await browser.post(
-                    "/api/session", json={"token": app.state.delivery.auth.secret},
-                    headers={"Origin": origin},
-                )
+                login = await browser.get("/api/session")
                 assert login.status_code == 200
                 posted = await browser.post(
                     "/api/runs/run-1/amend-scope", json=command,
@@ -885,11 +882,7 @@ async def test_public_prelaunch_retry_without_required_ci_reaches_temporal_role(
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url=origin
             ) as browser:
-                login = await browser.post(
-                    "/api/session",
-                    json={"token": app.state.delivery.auth.secret},
-                    headers={"Origin": origin},
-                )
+                login = await browser.get("/api/session")
                 assert login.status_code == 200
                 posted = await browser.post(
                     "/api/runs/run-1/retry-prelaunch",
@@ -1424,10 +1417,7 @@ async def test_long_history_projects_recent_activity_without_losing_gate_evidenc
     app = create_app(store.config.path)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        token = (Path(store.config.raw["state_root"]) / "service-token").read_text().strip()
-        login = await browser.post(
-            "/api/session", json={"token": token}, headers={"Origin": "http://127.0.0.1:18770"}
-        )
+        login = await browser.get("/api/session")
         assert login.status_code == 200
         response = await browser.get("/api/runs/run-1")
         assert response.status_code == 200
@@ -2591,11 +2581,7 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url=origin_url
             ) as browser:
-                login = await browser.post(
-                    "/api/session",
-                    json={"token": app.state.delivery.auth.secret},
-                    headers={"Origin": origin_url},
-                )
+                login = await browser.get("/api/session")
                 assert login.status_code == 200
                 command = {
                     "command_id": "explicit-repair-1",
@@ -2637,11 +2623,7 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
                     async with httpx.AsyncClient(
                         transport=httpx.ASGITransport(app=app), base_url=origin_url
                     ) as browser:
-                        login = await browser.post(
-                            "/api/session",
-                            json={"token": app.state.delivery.auth.secret},
-                            headers={"Origin": origin_url},
-                        )
+                        login = await browser.get("/api/session")
                         cancelled = await browser.post(
                             "/api/runs/run-1/cancel",
                             json={
@@ -2897,9 +2879,8 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://127.0.0.1:18770"
             ) as browser:
-                token = (service_runtime.config.state_root / "service-token").read_text().strip()
                 origin = {"Origin": "http://127.0.0.1:18770"}
-                login = await browser.post("/api/session", json={"token": token}, headers=origin)
+                login = await browser.get("/api/session")
                 headers = {**origin, "X-Devflow-CSRF": login.json()["csrf_token"]}
                 payload = {
                     "command_id": "recover-1",
@@ -3626,10 +3607,7 @@ async def test_large_public_submit_dispatches_through_real_temporal_and_safe_act
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url=origin
         ) as browser:
-            login = await browser.post(
-                "/api/session", json={"token": app.state.delivery.auth.secret},
-                headers={"Origin": origin},
-            )
+            login = await browser.get("/api/session")
             assert login.status_code == 200
             headers = {
                 "Origin": origin,

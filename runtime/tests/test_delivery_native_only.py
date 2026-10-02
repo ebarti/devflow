@@ -227,8 +227,7 @@ async def test_historical_execution_and_stale_recovery_api_cannot_mutate(api_fix
         transport=transport, base_url=store.config.dashboard_url
     ) as caller:
         origin = {"Origin": store.config.dashboard_url}
-        token = (store.config.state_root / "service-token").read_text().strip()
-        login = await caller.post("/api/session", json={"token": token}, headers=origin)
+        login = await caller.get("/api/session")
         headers = {**origin, "X-Devflow-CSRF": login.json()["csrf_token"]}
         assert (await caller.get("/api/runs/run-1")).status_code == 200
         retired = await caller.post(

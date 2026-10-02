@@ -185,26 +185,27 @@ def api_fixture(tmp_path: Path) -> tuple[Path, dict]:
 
 
 @pytest.mark.asyncio
-async def test_local_api_auth_csrf_submit_replay_and_conflict(api_fixture):
+async def test_tokenless_local_api_csrf_submit_replay_and_conflict(api_fixture):
     path, request = api_fixture
     app = create_app(path)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        assert (await browser.get("/api/session")).json() == {"authenticated": False}
-        assert (await browser.get("/api/runs")).status_code == 401
-        token = (
-            (Path(json.loads(path.read_text())["state_root"]) / "service-token").read_text().strip()
-        )
+        assert (await browser.get("/api/runs")).json() == {"runs": []}
+        token_path = Path(json.loads(path.read_text())["state_root"]) / "service-token"
+        assert not token_path.exists()
         assert (
             await browser.post(
-                "/api/session", json={"token": token}, headers={"Origin": "http://evil.local"}
+                "/api/session",
+                json={"token": "unused-legacy-token"},
+                headers={"Origin": "http://evil.local"},
             )
         ).status_code == 403
-        login = await browser.post(
-            "/api/session", json={"token": token}, headers={"Origin": "http://127.0.0.1:18770"}
-        )
-        assert login.status_code == 200
-        csrf = login.json()["csrf_token"]
+        session = await browser.get("/api/session")
+        assert session.status_code == 200
+        assert session.headers["cache-control"] == "no-store"
+        assert "HttpOnly" in session.headers["set-cookie"]
+        assert "SameSite=strict" in session.headers["set-cookie"]
+        csrf = session.json()["csrf_token"]
         assert browser.cookies.get("devflow_session")
         assert (
             await browser.post(
@@ -212,6 +213,11 @@ async def test_local_api_auth_csrf_submit_replay_and_conflict(api_fixture):
             )
         ).status_code == 403
         headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": csrf}
+        assert (
+            await browser.post(
+                "/api/runs", json=request, headers={**headers, "Origin": "http://evil.local"}
+            )
+        ).status_code == 403
         first = await browser.post("/api/runs", json=request, headers=headers)
         assert first.status_code == 200
         assert first.json()["run_id"] == "run-1"
@@ -226,6 +232,119 @@ async def test_local_api_auth_csrf_submit_replay_and_conflict(api_fixture):
         assert detail["events"][0]["type"] == "accepted"
         assert detail["evidence"] == []
         assert (await browser.get("/api/runs/run-1/evidence/not-indexed")).status_code == 404
+        assert not token_path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cookie", [None, "expired-or-invalid-cookie"])
+async def test_fresh_and_expired_browser_reads_and_events_need_no_cookie(api_fixture, cookie):
+    path, request = api_fixture
+    app = create_app(path)
+    app.state.delivery.store.submit(request)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    headers = {"Cookie": f"devflow_session={cookie}"} if cookie else {}
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://127.0.0.1:18770", headers=headers
+    ) as browser:
+        for endpoint in ("/", "/api/runs", "/api/runs/run-1"):
+            assert (await browser.get(endpoint)).status_code == 200
+        assert (await browser.get("/api/runs/run-1")).json()["run"]["phase"] == "accepted"
+        session = await browser.get("/api/session")
+        assert session.json()["csrf_token"]
+        assert app.state.delivery.session.valid(browser.cookies.get("devflow_session"))
+
+    # Stream one event through the real ASGI route, then disconnect the client.
+    disconnected = asyncio.Event()
+    messages = []
+    received = False
+
+    async def receive():
+        nonlocal received
+        if not received:
+            received = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        messages.append(message)
+        if message["type"] == "http.response.body" and message.get("body"):
+            disconnected.set()
+
+    await asyncio.wait_for(
+        app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/api/runs/run-1/events",
+                "raw_path": b"/api/runs/run-1/events",
+                "query_string": b"",
+                "root_path": "",
+                "client": ("127.0.0.1", 10001),
+                "server": ("127.0.0.1", 18770),
+                "headers": [(b"host", b"127.0.0.1:18770")]
+                + ([(b"cookie", f"devflow_session={cookie}".encode())] if cookie else []),
+            },
+            receive,
+            send,
+        ),
+        timeout=2,
+    )
+    assert messages[0]["status"] == 200
+    assert any(b"event: update" in item.get("body", b"") for item in messages)
+
+
+@pytest.mark.asyncio
+async def test_expired_csrf_renews_automatically_and_legacy_login_needs_no_token(
+    api_fixture, monkeypatch
+):
+    path, request = api_fixture
+    app = create_app(path)
+    now = [1000000]
+    monkeypatch.setattr("devflow_temporal.delivery_api.time.time", lambda: now[0])
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
+        session = await browser.get("/api/session")
+        old_cookie = browser.cookies.get("devflow_session")
+        headers = {
+            "Origin": "http://127.0.0.1:18770",
+            "X-Devflow-CSRF": session.json()["csrf_token"],
+        }
+        now[0] += 86401
+        assert (await browser.get("/api/runs")).status_code == 200
+        assert (await browser.post("/api/runs", json=request, headers=headers)).status_code == 403
+        renewed = await browser.get("/api/session")
+        assert browser.cookies.get("devflow_session") != old_cookie
+        headers["X-Devflow-CSRF"] = renewed.json()["csrf_token"]
+        assert (await browser.post("/api/runs", json=request, headers=headers)).status_code == 200
+        legacy = await browser.post(
+            "/api/session",
+            json={"token": "arbitrary-stale-token"},
+            headers={"Origin": "http://127.0.0.1:18770"},
+        )
+        assert legacy.status_code == 200
+        assert legacy.json()["csrf_token"] == renewed.json()["csrf_token"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "peer,host",
+    [
+        ("192.0.2.1", "127.0.0.1:18770"),
+        ("127.0.0.1", "foreign.invalid:18770"),
+        ("127.0.0.1", "localhost:18770"),
+    ],
+)
+async def test_tokenless_boundary_rejects_foreign_peers_and_hosts(api_fixture, peer, host):
+    path, _request = api_fixture
+    app = create_app(path)
+    transport = httpx.ASGITransport(app=app, client=(peer, 10001))
+    async with httpx.AsyncClient(transport=transport, base_url=f"http://{host}") as browser:
+        for endpoint in ("/", "/api/session", "/api/runs", "/api/service"):
+            assert (await browser.get(endpoint)).status_code == 403
 
 
 @pytest.mark.asyncio
@@ -300,14 +419,7 @@ async def test_public_evidence_reads_historical_role_and_browser_logs(api_fixtur
         )
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        token = (Path(json.loads(path.read_text())["state_root"]) / "service-token").read_text()
-        assert (
-            await browser.post(
-                "/api/session",
-                json={"token": token.strip()},
-                headers={"Origin": "http://127.0.0.1:18770"},
-            )
-        ).status_code == 200
+        assert (await browser.get("/api/session")).status_code == 200
         listed = (await browser.get("/api/runs/run-1")).json()["evidence"]
         assert {item["id"] for item in listed} == {
             "role-implement-0",
@@ -425,14 +537,7 @@ async def test_public_evidence_keeps_historical_codex_logs(api_fixture):
     (marked_qa / "browser-qa.log").write_text("forged browser fallback\n")
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        token = (Path(json.loads(path.read_text())["state_root"]) / "service-token").read_text()
-        assert (
-            await browser.post(
-                "/api/session",
-                json={"token": token.strip()},
-                headers={"Origin": "http://127.0.0.1:18770"},
-            )
-        ).status_code == 200
+        assert (await browser.get("/api/session")).status_code == 200
         listed = (await browser.get("/api/runs/run-1")).json()["evidence"]
         assert {item["id"] for item in listed} == {
             "role-implement-0",
@@ -453,12 +558,7 @@ async def test_terminal_cancel_is_conflict_without_pending_mutation(api_fixture)
     app = create_app(path)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        token = (
-            (Path(json.loads(path.read_text())["state_root"]) / "service-token").read_text().strip()
-        )
-        login = await browser.post(
-            "/api/session", json={"token": token}, headers={"Origin": "http://127.0.0.1:18770"}
-        )
+        login = await browser.get("/api/session")
         headers = {
             "Origin": "http://127.0.0.1:18770",
             "X-Devflow-CSRF": login.json()["csrf_token"],
@@ -510,13 +610,7 @@ async def test_public_supersede_requires_new_branch_and_preserves_prior_checkout
     restarted = create_app(path)
     transport = httpx.ASGITransport(app=restarted, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        token_path = Path(json.loads(path.read_text())["state_root"]) / "service-token"
-        token = token_path.read_text().strip()
-        login = await browser.post(
-            "/api/session",
-            json={"token": token},
-            headers={"Origin": "http://127.0.0.1:18770"},
-        )
+        login = await browser.get("/api/session")
         headers = {
             "Origin": "http://127.0.0.1:18770",
             "X-Devflow-CSRF": login.json()["csrf_token"],
@@ -577,12 +671,7 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
         async with httpx.AsyncClient(
             transport=transport, base_url="http://127.0.0.1:18770"
         ) as browser:
-            token = (Path(config["state_root"]) / "service-token").read_text().strip()
-            login = await browser.post(
-                "/api/session",
-                json={"token": token},
-                headers={"Origin": "http://127.0.0.1:18770"},
-            )
+            login = await browser.get("/api/session")
             headers = {
                 "Origin": "http://127.0.0.1:18770",
                 "X-Devflow-CSRF": login.json()["csrf_token"],
@@ -717,12 +806,7 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
         async with httpx.AsyncClient(
             transport=transport, base_url="http://127.0.0.1:18770"
         ) as browser:
-            token = (Path(config["state_root"]) / "service-token").read_text().strip()
-            login = await browser.post(
-                "/api/session",
-                json={"token": token},
-                headers={"Origin": "http://127.0.0.1:18770"},
-            )
+            login = await browser.get("/api/session")
             headers = {
                 "Origin": "http://127.0.0.1:18770",
                 "X-Devflow-CSRF": login.json()["csrf_token"],
