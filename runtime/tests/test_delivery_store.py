@@ -3911,10 +3911,10 @@ def test_real_admission_rejects_unattested_container_and_check_network(service, 
         }
     )
     original.config.path.write_text(json.dumps(configuration))
-    with pytest.raises(ValueError, match="complete container policy"):
+    with pytest.raises(ValueError, match="local Docker launch settings"):
         DeliveryConfig.load(original.config.path).admit(request)
 
-    configuration["container"] = {"image_id": "fixture"}
+    configuration["container"] = {"docker_bin": "/usr/local/bin/docker"}
     monkeypatch.setattr(
         "devflow_temporal.delivery_config._container_identity",
         lambda _container, *, source: {"image_id": "fixture"},

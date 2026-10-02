@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from .candidate import candidate_for
 from .contracts import digest
@@ -22,20 +23,25 @@ from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
 
 
-def _context(spec: dict[str, Any]) -> tuple[DeliveryStore, DeliveryBroker]:
+def _context(
+    spec: dict[str, Any], *, preparation_input: bool = False
+) -> tuple[DeliveryStore, DeliveryBroker]:
     config = DeliveryConfig.load(Path(spec["config_path"]))
     if digest(config.raw) != spec["config_digest"]:
         raise ValueError("service configuration changed during an active run")
     store = DeliveryStore(config)
     saved = store.effective_spec(spec["run_id"])
-    if saved != spec:
+    if saved != spec and not (
+        preparation_input and spec.get("preparation_version") == 1
+        and store.submitted_spec(spec["run_id"]) == spec
+    ):
         raise ValueError("Temporal input no longer matches the durable submitted run")
     return store, DeliveryBroker(store, spec)
 
 
 @activity.defn(name="delivery_project")
 async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
-    store, _ = _context(request["spec"])
+    store, _ = _context(request["spec"], preparation_input=True)
     result = store.project(
         request["spec"]["run_id"],
         phase=request["phase"],
@@ -61,8 +67,22 @@ async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_prepare")
 async def delivery_prepare(request: dict[str, Any]) -> dict[str, Any]:
-    _, broker = _context(request["spec"])
-    return broker.prepare()
+    def execute() -> dict[str, Any]:
+        from .delivery_preparation import prepare_authority
+
+        store, _ = _context(request["spec"], preparation_input=True)
+        effective = prepare_authority(store, request["spec"])
+        prepared = DeliveryBroker(store, effective).prepare()
+        if effective.get("preparation_version") == 1:
+            return {**prepared, "spec": effective}
+        return prepared
+
+    try:
+        return await asyncio.to_thread(execute)
+    except Exception as exc:
+        raise ApplicationError(
+            str(exc)[:600], type="RuntimePreparationFailed", non_retryable=True
+        ) from exc
 
 
 @activity.defn(name="delivery_intake")

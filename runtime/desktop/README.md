@@ -15,6 +15,8 @@ python3 runtime/desktop/install.py \
 
 The installer uses the supported `codex mcp add` command and copies `devflow-local-delivery/SKILL.md` into the specified Codex home. It reads back the registered entry. A same-name skill or MCP entry with different contents, command, or config is a conflict and is left untouched. Repeating an identical installation is safe. The inspected Codex CLI can overwrite a same-name MCP entry with `codex mcp add`, so use the guarded installer rather than an unchecked add command.
 
+For an update to an inspected, Devflow-owned skill, supply `--replace-owned-skill-sha256` with the SHA-256 of its current bytes. The installer rechecks those bytes, retains a backup, and replaces only that skill. Different MCP commands/configs and disabled entries remain conflicts. This option does not authorize replacement of unrelated skills or service state.
+
 With the runtime and config paths above, the service can be checked using the same public CLI:
 
 ```sh
@@ -26,5 +28,7 @@ codex mcp get devflow-local-delivery --json
 `status` and `stop` remain diagnostic commands and never start the stack. Explicit `start` uses the same serialized startup path as application calls. Healthy calls preserve process identities; partial owned stacks are recovered without taking over foreign ports. Authenticated API readiness, Temporal health, and worker poller registration are required before a request is sent. A delayed readiness response waits within the startup deadline and preserves a complete live stack if readiness remains unknown. Docker is required for configured contained execution, not for these service reads. Startup defaults to a 30-second deadline; `service_start_timeout` can set a positive value up to 120 seconds. Failures report the state root's service logs.
 
 The CLI also supports `submit --request <json-file>`, `runs`, `run --id <run-id>`, `evidence --id <run-id> --evidence-id <id>`, `decision --id <run-id> --request <json-file>`, and `cancel --id <run-id> --request <json-file>`. The MCP tools are `submit_run`, `list_runs`, `get_run`, `read_evidence`, `answer_decision`, and `cancel_run`; CLI and MCP use the same service API and authorization rules. A raw-goal submission returns a durable run ID and dashboard URL. The service investigates, gathers answers, and waits for plan acceptance before implementation. The Codex host may open the URL in its browser panel. Dashboard SSE supplies progress without model polling.
+
+A configured real request needs no operator-authored per-run proof. Slow Docker/image preparation runs after durable submission, inside Temporal's existing preparation activity. Its fixed native boundary and cleanup probes use a private reusable cache; every run freezes a separate binding to its configured repository and paths. The timeline reports preparation progress and actionable failures. Docker must already be installed; automatic startup applies only to the known local Docker Desktop endpoint.
 
 Registration through the CLI and a successful MCP protocol handshake do not prove that an already-open Desktop thread has discovered the new tool. Check from a fresh Desktop thread or after restart, invoke a read-only MCP tool, and open an actual returned dashboard URL before claiming live Desktop integration. No private Codex database or undocumented IPC is used.

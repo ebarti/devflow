@@ -124,6 +124,15 @@ class DeliveryStore:
                 )"""
             )
             db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_preparations (
+                    run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+                    submitted_spec_digest TEXT NOT NULL,
+                    effective_spec_digest TEXT NOT NULL,
+                    effective_spec_json TEXT NOT NULL,
+                    prepared_at TEXT NOT NULL
+                )"""
+            )
+            db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_outbox (
                     run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
                     state TEXT NOT NULL,
@@ -441,7 +450,7 @@ class DeliveryStore:
                     or previous["pr_json"] is not None
                 ):
                     raise ValueError("only a blocked unpublished run may be superseded")
-                prior_spec = json.loads(previous["request_json"])
+                prior_spec = self._prepared_original(db, json.loads(previous["request_json"]))
                 if previous["accepted_plan_text"] is not None:
                     prior_spec["accepted_plan"] = previous["accepted_plan_text"]
                 if prior_spec["branch"] == spec["branch"]:
@@ -588,7 +597,7 @@ class DeliveryStore:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
             raise ValueError("run ID not found")
-        spec = json.loads(row["request_json"])
+        spec = self.spec(run_id)
         closed = self._completed_temporal_result(run_id)
         state = closed["result"]
         candidate = state.get("candidate") if isinstance(state, dict) else None
@@ -833,7 +842,10 @@ class DeliveryStore:
             row is None
             or amendment is None
             or grant is None
-            or row["request_json"] != canonical_json(original)
+            or row["request_json"] != canonical_json(
+                self.submitted_spec(run_id)
+                if original.get("preparation_version") == 1 else original
+            )
             or row["recovery_json"] != canonical_json(recovery if queued else scope)
             or row["workflow_id"] != (
                 f"delivery-{run_id}-precheck-recovery-1" if queued
@@ -1206,7 +1218,10 @@ class DeliveryStore:
         ):
             raise ValueError("scope amendment or owned resources changed before resume")
         original = self.spec(run_id)
-        if row["request_json"] != canonical_json(original):
+        if row["request_json"] != canonical_json(
+                self.submitted_spec(run_id)
+                if original.get("preparation_version") == 1 else original
+            ):
             raise ValueError("original request changed before scope repair")
         confirmed_container_cleanup(original)
         if self._container_intent_inventory(original) != recovery["old_container_intents"]:
@@ -1313,7 +1328,7 @@ class DeliveryStore:
             raise ValueError("run ID not found")
         if granted:
             raise ValueError("this run already received its one repair grant")
-        spec = json.loads(row["request_json"])
+        spec = self.spec(run_id)
         if digest(DeliveryConfig.load(self.config.path).raw) != spec["config_digest"]:
             raise ValueError("frozen service configuration changed before repair grant")
         current_workflow_id = row["workflow_id"] or f"delivery-{run_id}"
@@ -1908,7 +1923,10 @@ class DeliveryStore:
             row is None
             or grant is None
             or amendment is None
-            or row["request_json"] != canonical_json(original)
+            or row["request_json"] != canonical_json(
+                self.submitted_spec(run_id)
+                if original.get("preparation_version") == 1 else original
+            )
             or row["recovery_json"] != canonical_json(recovery if queued else prior)
             or row["workflow_id"] != (
                 f"delivery-{run_id}-repair-continuation-2" if queued
@@ -2419,7 +2437,10 @@ class DeliveryStore:
         grant, second = rows[1], rows[2]
         if (
             row is None
-            or row["request_json"] != canonical_json(original)
+            or row["request_json"] != canonical_json(
+                self.submitted_spec(run_id)
+                if original.get("preparation_version") == 1 else original
+            )
             or row["recovery_json"] != canonical_json(recovery if queued else prior)
             or row["workflow_id"] != (
                 f"delivery-{run_id}-repair-continuation-{number}"
@@ -3193,7 +3214,7 @@ class DeliveryStore:
             ).fetchone()
         if row is None or grant is None or not row["recovery_json"]:
             raise ValueError("prelaunch retry has no original repair grant")
-        spec = json.loads(row["request_json"])
+        spec = self.spec(run_id)
         original = json.loads(row["recovery_json"])
         if (
             original.get("kind") != "repair_continuation"
@@ -3509,7 +3530,7 @@ class DeliveryStore:
             ).fetchall()
         if row is None or grant is None or amendment:
             raise ValueError("scope amendment requires one exhausted original repair grant")
-        original = json.loads(row["request_json"])
+        original = self.spec(run_id)
         if row["accepted_plan_text"] is not None:
             original["accepted_plan"] = row["accepted_plan_text"]
         prior_recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
@@ -3809,7 +3830,9 @@ class DeliveryStore:
         if (
             row is None
             or grant is None
-            or row["request_json"] != canonical_json(spec)
+            or row["request_json"] != canonical_json(
+                self.submitted_spec(run_id) if spec.get("preparation_version") == 1 else spec
+            )
             or row["workflow_id"] != expected_workflow
             or row["recovery_json"] != canonical_json(recovery)
             or row["phase"]
@@ -4107,7 +4130,103 @@ class DeliveryStore:
             ).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
+            return self._prepared_original(db, json.loads(row[0]))
+
+    def submitted_spec(self, run_id: str) -> dict[str, Any]:
+        """Read immutable admission input, including after preparation freezes."""
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT request_json FROM delivery_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("run ID not found")
             return json.loads(row[0])
+
+    @staticmethod
+    def _prepared_original(db: sqlite3.Connection, original: dict[str, Any]) -> dict[str, Any]:
+        if original.get("preparation_version") != 1:
+            return original
+        row = db.execute(
+            "SELECT * FROM delivery_preparations WHERE run_id=?", (original["run_id"],)
+        ).fetchone()
+        if row is None:
+            return original
+        effective = json.loads(row["effective_spec_json"])
+        if (
+            row["submitted_spec_digest"] != digest(original)
+            or row["effective_spec_digest"] != digest(effective)
+        ):
+            raise ValueError("durable preparation authority changed")
+        return effective
+
+    def prepared_spec(self, run_id: str) -> dict[str, Any] | None:
+        original = self.submitted_spec(run_id)
+        with self._connect() as db:
+            effective = self._prepared_original(db, original)
+        return effective if effective.get("preparation") else None
+
+    def freeze_preparation(self, submitted: dict[str, Any], effective: dict[str, Any]) -> dict:
+        """Atomically append one prepared authority without changing request/history."""
+
+        from .delivery_preparation import verify_prepared_spec
+
+        verify_prepared_spec(effective)
+        unchanged = {key: value for key, value in effective.items()
+                     if key not in {"policy", "policy_digest", "preparation"}}
+        if unchanged != {key: value for key, value in submitted.items()
+                         if key not in {"policy", "policy_digest"}}:
+            raise ValueError("preparation changed the submitted run identity")
+        measured_fields = {"container", "host_sandbox", "kit_revision",
+                           "environment_proof_sha256", "security_binding_sha256"}
+        original_authority = {
+            key: value for key, value in submitted["policy"].items() if key not in measured_fields
+        }
+        prepared_authority = {
+            key: value for key, value in effective["policy"].items() if key not in measured_fields
+        }
+        if prepared_authority != original_authority:
+            raise ValueError("preparation changed repository or execution authority")
+        configured_container = submitted["policy"]["container"]
+        prepared_container = effective["policy"]["container"]
+        for key, default in (("memory", "2g"), ("cpus", "2"), ("pids_limit", 256)):
+            if prepared_container.get(key) != configured_container.get(key, default):
+                raise ValueError("preparation changed configured container limits")
+        if prepared_container.get("docker_bin") != configured_container.get("docker_bin"):
+            raise ValueError("preparation changed the configured Docker executable")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT request_json FROM delivery_runs WHERE run_id=?", (submitted["run_id"],)
+            ).fetchone()
+            if row is None or json.loads(row[0]) != submitted:
+                raise ValueError("preparation input differs from the durable admission")
+            frozen = self._prepared_original(db, submitted)
+            if frozen.get("preparation"):
+                if frozen != effective:
+                    raise ValueError("preparation already froze a different effective result")
+                return frozen
+            db.execute(
+                "INSERT INTO delivery_preparations VALUES (?,?,?,?,?)",
+                (submitted["run_id"], digest(submitted), digest(effective),
+                 canonical_json(effective), _now()),
+            )
+        return effective
+
+    def preparation_progress(self, run_id: str, stage: str, message: str) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT revision,phase,outcome FROM delivery_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None or row["outcome"] is not None or row["phase"] != "preparing":
+                return
+            revision = row["revision"] + 1
+            db.execute(
+                "UPDATE delivery_runs SET revision=?,updated_at=? WHERE run_id=?",
+                (revision, _now(), run_id),
+            )
+            self._event(db, run_id, revision, "preparation_" + stage, message, {"stage": stage})
 
     def intake_execution_spec(self, run_id: str) -> dict[str, Any]:
         """Read the frozen request with its single accepted intake plan."""
@@ -4119,7 +4238,7 @@ class DeliveryStore:
             ).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
-            spec = json.loads(row["request_json"])
+            spec = self._prepared_original(db, json.loads(row["request_json"]))
             if row["accepted_plan_text"] is not None:
                 spec["accepted_plan"] = row["accepted_plan_text"]
             return spec
@@ -4140,7 +4259,7 @@ class DeliveryStore:
             ).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
-            original = json.loads(row["request_json"])
+            original = self._prepared_original(db, json.loads(row["request_json"]))
             if not original.get("intake_required"):
                 raise ValueError("run was submitted with an accepted plan")
             intake = json.loads(row["intake_json"]) if row["intake_json"] else None
@@ -4202,7 +4321,7 @@ class DeliveryStore:
             ).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
-            original = json.loads(row["request_json"])
+            original = self._prepared_original(db, json.loads(row["request_json"]))
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
@@ -4561,7 +4680,7 @@ class DeliveryStore:
                 )
             ]
         compact = self._compact(row)
-        spec = json.loads(row["request_json"])
+        spec = self.spec(run_id)
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         scope_recovery = self._scope_recovery(recovery)
         scope_amendment = (
@@ -4585,6 +4704,9 @@ class DeliveryStore:
                     "iteration": attempt["iteration"],
                     "state": attempt["state"],
                     "session_id": attempt["session_id"],
+                    "requested_model": result.get("requested_model"),
+                    "requested_effort": result.get("requested_effort"),
+                    "reported_model": result.get("reported_model"),
                     "usage": result.get("usage"),
                     "summary": result.get("summary"),
                     "findings": result.get("findings", []),
@@ -4700,6 +4822,7 @@ class DeliveryStore:
             else None,
             "pull_request": json.loads(row["pr_json"]) if row["pr_json"] else None,
             "scope_amendment": scope_amendment,
+            "preparation": spec.get("preparation"),
             "checks": checks,
             "tracker": tracker,
             "usage": json.loads(row["usage_json"]) if row["usage_json"] else {},

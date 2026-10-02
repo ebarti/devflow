@@ -133,11 +133,16 @@ def continuation_authority(policy: dict) -> dict:
     """Permit only new evidence/recovery and rebuilt source image identities."""
 
     authority = {key: value for key, value in policy.items() if key not in {
-        "recovery", "sandbox_attestation_sha256", "security_binding_sha256"
+        "recovery", "sandbox_attestation_sha256", "security_binding_sha256",
+        "environment_proof_sha256",
     }}
     container = authority.get("container")
     if isinstance(container, dict):
         container = dict(container)
-        for key in ("image_id", "role_runner_sha256", "runtime_payload_sha256"):
+        for key in (
+            "image_id", "role_runner_sha256", "runtime_payload_sha256", "dockerfile_sha256"
+        ):
             container.pop(key, None)
+        for key, value in (("memory", "2g"), ("cpus", "2"), ("pids_limit", 256)):
+            container.setdefault(key, value)
     return {**authority, "container": container}

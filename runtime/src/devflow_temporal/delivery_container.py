@@ -172,8 +172,10 @@ class OwnedContainer:
         timeout_seconds: int,
         volume_mounts: tuple[tuple[str, str, bool], ...] = (),
     ) -> None:
-        if spec.get("preparation_version") == 1 and not spec.get("preparation"):
-            raise ValueError("runtime preparation has not frozen this execution authority")
+        if spec.get("preparation_version") == 1:
+            from .delivery_preparation import verify_prepared_spec
+
+            verify_prepared_spec(spec)
         if network not in {"none", "bridge"} or not command or timeout_seconds < 1:
             raise ValueError("unsupported container execution settings")
         policy = spec["policy"].get("container")
@@ -456,6 +458,10 @@ class OwnedContainer:
         return container_id, inspected
 
     def run(self) -> ContainerResult:
+        if self.spec.get("preparation_version") == 1:
+            from .delivery_preparation import verify_prepared_spec
+
+            verify_prepared_spec(self.spec)
         container_id, inspected = self._ensure()
         state = inspected.get("State") or {}
         status = state.get("Status")

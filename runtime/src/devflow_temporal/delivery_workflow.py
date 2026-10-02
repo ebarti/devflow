@@ -430,10 +430,19 @@ class DeliveryWorkflow:
             "error": None,
         }
         try:
-            await self._project(spec, "preparing", "Preparing owned Git checkout")
+            await self._project(
+                spec, "preparing", "Preparing owned checkout and execution boundary"
+            )
+            if self.cancel_requested:
+                return await self._cancelled(spec)
             prepared = await self._activity("delivery_prepare", {"spec": spec})
         except Exception as exc:
-            return await self._stop(spec, f"preparation failed: {type(exc).__name__}")
+            cause = getattr(exc, "cause", None)
+            reason = str(cause)[:600] if cause else type(exc).__name__
+            return await self._stop(spec, f"preparation failed: {reason}")
+        spec = prepared.get("spec", spec)
+        if self.cancel_requested:
+            return await self._cancelled(spec)
         self.state["candidate"] = prepared["candidate"]
         self.state["candidate_revision"] += 1
         if spec.get("intake_required"):

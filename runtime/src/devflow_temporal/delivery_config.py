@@ -506,6 +506,8 @@ class DeliveryConfig:
                 container_identity = _container_identity(policy["container"], source=source)
             else:
                 validate_preparation_inputs(policy["container"])
+                policy["host_sandbox"] = "native-profile"
+                policy["kit_revision"] = "d9ed6e186ce028d0db3b044ce959a94f409510c5"
             if policy["config_overrides"] != ["features.plugins=false"]:
                 raise ValueError("real role configuration overrides must disable plugins")
             if (
@@ -802,7 +804,7 @@ def scope_amendment_config(
     ):
         raise ValueError("scope amendment changed more than the named file list")
     new_repository["allowed_paths"] = old_allowed
-    if original["provider"] == "codex":
+    if original["provider"] == "codex" and original.get("preparation_version") != 1:
         if "sandbox_attestation_path" not in new_raw:
             raise ValueError("scope amendment requires fresh boundary attestation")
         new_raw["sandbox_attestation_path"] = old_raw["sandbox_attestation_path"]
@@ -842,4 +844,14 @@ def scope_amended_spec(
     effective["request_digest"] = original["request_digest"]
     if "continuation" in original:
         effective["continuation"] = original["continuation"]
+    if original.get("preparation_version") == 1:
+        from .delivery_preparation import bind_prepared_spec, verify_prepared_spec
+
+        verify_prepared_spec(original)
+        proof_path = Path(original["preparation"]["environment"]["path"])
+        effective = bind_prepared_spec(
+            effective, original["policy"]["container"], proof_path,
+            json.loads(proof_path.read_bytes()), reused=True,
+        )
+        verify_prepared_spec(effective)
     return effective
