@@ -20,6 +20,7 @@ RUN mkdir -p /store /deps && chown 501:20 /store /deps
 
 COPY runtime/src /opt/devflow-runtime/src
 COPY runtime/docker/landlock_exec.py /opt/devflow/landlock_exec.py
+RUN chmod -R a+rX /opt/devflow-runtime/src /opt/devflow
 ARG ROLE_RUNNER_SHA256
 ARG RUNTIME_PAYLOAD_SHA256
 ARG CODEX_BIN_SHA256

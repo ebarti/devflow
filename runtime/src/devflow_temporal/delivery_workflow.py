@@ -73,11 +73,27 @@ class DeliveryWorkflow:
         self.decision_answer: str | dict[str, Any] | None = None
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
+        automatic_preparation = (
+            name == "delivery_prepare" and request["spec"].get("preparation_version") == 1
+        )
+        options = {}
+        if automatic_preparation:
+            options = {
+                "heartbeat_timeout": timedelta(seconds=30),
+                "schedule_to_close_timeout": timedelta(hours=2),
+                "retry_policy": RetryPolicy(
+                    maximum_attempts=3,
+                    initial_interval=timedelta(seconds=1),
+                    maximum_interval=timedelta(seconds=10),
+                ),
+            }
+        else:
+            options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         return await workflow.execute_activity(
             name,
             request,
             start_to_close_timeout=timedelta(hours=hours),
-            retry_policy=RetryPolicy(maximum_attempts=1),
+            **options,
         )
 
     async def _wait_repair_readback(self, delay: int) -> None:

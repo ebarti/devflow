@@ -77,12 +77,19 @@ async def delivery_prepare(request: dict[str, Any]) -> dict[str, Any]:
             return {**prepared, "spec": effective}
         return prepared
 
+    pending = asyncio.create_task(asyncio.to_thread(execute))
     try:
-        return await asyncio.to_thread(execute)
+        while not pending.done():
+            if activity.in_activity() and request["spec"].get("preparation_version") == 1:
+                activity.heartbeat({"run_id": request["spec"]["run_id"], "stage": "preparing"})
+            await asyncio.wait({pending}, timeout=5)
+        return await pending
     except Exception as exc:
         raise ApplicationError(
             str(exc)[:600], type="RuntimePreparationFailed", non_retryable=True
         ) from exc
+    finally:
+        pending.cancel()
 
 
 @activity.defn(name="delivery_intake")

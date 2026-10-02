@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import signal
 import socket
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -37,12 +40,68 @@ def ports() -> list[int]:
             lease.close()
 
 
+def restart_after_measurement(output: Path, command, timeout: int) -> dict:
+    """Crash only this fixture's worker after proof publication, before freeze."""
+
+    print(json.dumps({"restart_probe": "waiting_for_measured_proof"}), flush=True)
+    deadline = time.monotonic() + timeout
+    checked = 0.0
+    while time.monotonic() < deadline:
+        proofs = list((output / "state/preparation/environments").glob("*/proof.json"))
+        if not proofs:
+            if time.monotonic() - checked >= 1:
+                checked = time.monotonic()
+                with sqlite3.connect(f"file:{output / 'tracking.sqlite3'}?mode=ro", uri=True) as db:
+                    failure = db.execute(
+                        "SELECT error FROM delivery_runs WHERE outcome IS NOT NULL"
+                    ).fetchone()
+                if failure:
+                    private(output / "restart-failure.json", {"error": failure[0]})
+                    raise RuntimeError(f"preparation stopped before restart: {failure[0]}")
+            time.sleep(0.02)
+            continue
+        with sqlite3.connect(f"file:{output / 'tracking.sqlite3'}?mode=ro", uri=True) as db:
+            frozen = db.execute("SELECT COUNT(*) FROM delivery_preparations").fetchone()[0]
+        if frozen:
+            raise RuntimeError(
+                "missed the pre-freeze crash window; restart evidence not established"
+            )
+        manifest = json.loads((output / "state/service-processes.json").read_bytes())
+        if manifest.get("config_path") != str(output / "config.json"):
+            raise RuntimeError("restart probe does not own this service manifest")
+        worker = manifest["processes"]["worker"]
+        identity = run(["ps", "-p", str(worker["pid"]), "-o", "lstart="])
+        if identity != worker["identity"] or os.getpgid(worker["pid"]) != worker["pid"]:
+            raise RuntimeError("restart worker identity changed; refusing to interrupt it")
+        os.killpg(worker["pid"], signal.SIGKILL)
+        with sqlite3.connect(f"file:{output / 'tracking.sqlite3'}?mode=ro", uri=True) as db:
+            if db.execute("SELECT COUNT(*) FROM delivery_preparations").fetchone()[0]:
+                raise RuntimeError(
+                    "worker froze before the crash; restart evidence not established"
+                )
+        observed = {
+            "proof": str(proofs[0]),
+            "proof_sha256": hashlib.sha256(proofs[0].read_bytes()).hexdigest(),
+            "frozen_records_before_restart": 0,
+            "old_worker_pid": worker["pid"],
+        }
+        restarted = command("start")
+        observed["new_worker_pid"] = restarted["processes"]["worker"]["pid"]
+        if observed["new_worker_pid"] == worker["pid"]:
+            raise RuntimeError("public restart did not replace its crashed worker")
+        private(output / "restart-observation.json", observed)
+        print(json.dumps({"restart_probe": "owned_worker_restarted_before_freeze"}), flush=True)
+        return observed
+    raise TimeoutError("no measured proof was published before the restart deadline")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--restart-after-measurement", action="store_true")
     args = parser.parse_args()
     runtime = args.runtime_dir.resolve(strict=True)
     seed = json.loads(args.config.read_bytes())
@@ -150,6 +209,7 @@ def main() -> None:
 
     details = []
     submitted = []
+    restart = None
     try:
         for number in (1, 2):
             run_id = f"preparation-smoke-{number}"
@@ -177,6 +237,8 @@ def main() -> None:
             )
             submitted.append(run_id)
             assert receipt["phase"] == "preparing"
+            if number == 1 and args.restart_after_measurement:
+                restart = restart_after_measurement(output, command, args.timeout)
             detail = wait(run_id, {"waiting_question", "waiting_plan"})
             assert detail.get("preparation") and detail.get("intake")
             assert detail["intake"]["accepted_plan"] is None
@@ -197,6 +259,9 @@ def main() -> None:
             details[0]["preparation"]["security_binding_sha256"]
             != details[1]["preparation"]["security_binding_sha256"]
         )
+        if restart:
+            assert details[0]["preparation"]["cache_reused"] is True
+            assert details[0]["preparation"]["environment"]["sha256"] == restart["proof_sha256"]
         summary = {
             "public_raw_goals": 2,
             "requested_model": "gpt-6.1-sol",
@@ -205,6 +270,7 @@ def main() -> None:
             "second_cache_reused": True,
             "implementation_started": False,
             "tracker_mutations": False,
+            "worker_restart_before_freeze": bool(restart),
             "output_dir": str(output),
             "config_path": str(config_path),
         }

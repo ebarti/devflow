@@ -18,7 +18,7 @@ from temporalio.worker import Worker
 from test_delivery_intake import intake_fixture as intake_fixture
 
 from devflow_temporal import delivery_preparation as preparation
-from devflow_temporal.delivery_activities import delivery_project
+from devflow_temporal.delivery_activities import delivery_prepare, delivery_project
 from devflow_temporal.delivery_config import DeliveryConfig, scope_amended_spec
 from devflow_temporal.delivery_container import Bind, OwnedContainer
 from devflow_temporal.delivery_store import DeliveryStore
@@ -415,6 +415,73 @@ def test_legacy_rows_remain_readable_and_are_not_rewritten(intake_fixture):
     with store._connect() as db:
         assert dict(db.execute("SELECT * FROM delivery_runs").fetchone()) == before
         assert db.execute("SELECT COUNT(*) FROM delivery_preparations").fetchone()[0] == 0
+
+
+def test_prepared_minimal_container_preserves_post_role_successor_authority(
+    real_store, measured_environment, tmp_path, monkeypatch
+):
+    from test_delivery_store import (
+        test_post_role_continuation_carries_sealed_candidate_and_session_without_auth as exercise,
+    )
+
+    store, request = real_store
+    original_submit = DeliveryStore.submit
+
+    def submitted_and_prepared(current, value, *args, **kwargs):
+        result = original_submit(current, value, *args, **kwargs)
+        preparation.prepare_authority(current, current.submitted_spec(value["run_id"]))
+        return result
+
+    monkeypatch.setattr(DeliveryStore, "submit", submitted_and_prepared)
+    exercise(
+        (store, {**request, "accepted_plan": "Make one bounded edit and test it."}),
+        tmp_path,
+        monkeypatch,
+        False,
+    )
+    assert store.submitted_spec("run-1")["policy"]["container"] == {
+        "docker_bin": "/usr/local/bin/docker"
+    }
+    assert store.spec("run-1")["preparation"]
+    assert store.spec("run-2")["preparation"]
+
+
+@pytest.mark.asyncio
+async def test_permanent_probe_failure_is_not_retried_by_temporal(
+    real_store, measured_environment, tmp_path, monkeypatch
+):
+    store, request = real_store
+    submitted = _submit(store, request, 1)
+    calls = []
+
+    def failed_probe(*_args):
+        calls.append("measured")
+        raise preparation.PreparationError("fixture native child denial failed")
+
+    monkeypatch.setattr(preparation, "measure_environment", failed_probe)
+    async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=shutil.which("temporal"),
+        dev_server_database_filename=str(tmp_path / "preparation-failure.sqlite3"),
+    ) as environment:
+        async with Worker(
+            environment.client,
+            task_queue="preparation-failure",
+            workflows=[DeliveryWorkflow],
+            activities=[delivery_project, delivery_prepare],
+        ):
+            result = await asyncio.wait_for(
+                environment.client.execute_workflow(
+                    DeliveryWorkflow.run,
+                    submitted,
+                    id="permanent-preparation-failure",
+                    task_queue="preparation-failure",
+                ),
+                15,
+            )
+    assert result["outcome"] == "blocked"
+    assert "fixture native child denial failed" in result["error"]
+    assert calls == ["measured"]
+    assert store.prepared_spec(submitted["run_id"]) is None
 
 
 @pytest.mark.asyncio

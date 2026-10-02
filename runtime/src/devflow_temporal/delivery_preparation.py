@@ -312,7 +312,10 @@ def _resolve_image(container: dict, root: Path) -> dict:
             },
         )
         if built.returncode:
-            raise PreparationError(f"pinned runtime image build failed; evidence: {folder}")
+            excerpt = (built.stderr or built.stdout).decode(errors="replace")[-500:].strip()
+            raise PreparationError(
+                f"pinned runtime image build failed: {excerpt}; evidence: {folder}"
+            )
         image_id = _docker_json(container, "image", "inspect", tag)[0]["Id"]
     values = _docker_json(container, "image", "inspect", image_id)
     image = values[0]
@@ -494,11 +497,13 @@ def measure_environment(spec: dict, root: Path, fingerprint: str, identity: dict
         else:
             observed_path = checkout / f"{mode}.json"
         if outcome.exit_code != 0 or outcome.cleanup != "confirmed" or not observed_path.is_file():
-            raise PreparationError(f"{mode} boundary probe failed; evidence: {folder}")
+            excerpt = outcome.log.read_text(errors="replace")[-500:].strip()
+            raise PreparationError(f"{mode} boundary probe failed: {excerpt}; evidence: {folder}")
         observed = json.loads(observed_path.read_bytes())
         if not _boundary_passed(mode, observed, ports):
             raise PreparationError(
-                f"{mode} parent/child boundary denial failed; evidence: {folder}"
+                f"{mode} parent/child boundary denial failed: "
+                f"{canonical_json(observed)[:500]}; evidence: {folder}"
             )
         snapshot = folder / "observed.json"
         _write(snapshot, observed)

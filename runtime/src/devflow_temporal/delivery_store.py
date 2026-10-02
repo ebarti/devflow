@@ -3921,6 +3921,11 @@ class DeliveryStore:
         if not isinstance(control, dict) or set(control) != required:
             raise ValueError("post-role continuation requires exact private evidence")
         old_id = prior_spec["run_id"]
+        prior_authority = prior_spec["policy"]
+        if prior_spec.get("preparation_version") == 1:
+            # Admission compares configured authority; measured identities are
+            # validated again when the successor prepares its own boundary.
+            prior_authority = json.loads(previous["request_json"])["policy"]
         if (
             control["from_run_id"] != old_id
             or spec.get("supersedes_run_id") != old_id
@@ -3932,7 +3937,7 @@ class DeliveryStore:
             or Path(recovery["source_path"]).resolve(strict=True)
             != Path(prior_spec["checkout"]).resolve(strict=True)
             or continuation_authority(spec["policy"])
-            != continuation_authority(prior_spec["policy"])
+            != continuation_authority(prior_authority)
             or previous["phase"] != "blocked"
             or previous["cleanup"] != "none"
             or previous["error"] != "implementer did not establish a pass"
