@@ -1,34 +1,17 @@
-"""Broker-owned, exact-port browser/API fixture gate and immutable evidence."""
-
+"""Native owned browser/API checks with exact port and resource receipts."""
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
-import signal
 import socket
-import stat
-import subprocess
-import tempfile
-import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from .candidate import candidate_for
-from .contracts import canonical_json, digest
+from .contracts import digest
 from .delivery_output import observed_test_count, visible_output
 from .delivery_sandbox import prepare_browser_qa
-from .delivery_store import _now
-
-# The child cannot run candidate code until the broker has durably recorded its
-# process identity. EOF (including broker death before GO) exits without exec.
-_START_GATE = (
-    "import os,sys; "
-    "line=sys.stdin.buffer.readline(); "
-    "sys.exit(75) if line != b'GO\\n' else os.execvpe(sys.argv[1],sys.argv[1:],os.environ)"
-)
 
 
 def _hash(path: Path) -> str:
@@ -42,111 +25,17 @@ def _write_new(path: Path, content: bytes) -> None:
         stream.write(content)
 
 
-def _identity(pid: int) -> str | None:
-    observed = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False
-    )
-    return observed.stdout.strip() if observed.returncode == 0 else None
-
-
-def _listeners(port: int) -> set[int]:
-    observed = subprocess.run(
-        ["/usr/sbin/lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=False,
-    )
-    if observed.returncode not in {0, 1}:
-        raise RuntimeError("browser QA listener inspection failed")
-    return {int(line) for line in observed.stdout.splitlines() if line.isdecimal()}
-
-
 def _ports_free(ports: tuple[int, int]) -> None:
     for port in ports:
-        if _listeners(port):
+        from .delivery_native_process import listeners
+
+        if listeners(port):
             raise RuntimeError("browser QA port is already owned by another process")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as guard:
             try:
                 guard.bind(("127.0.0.1", port))
             except OSError as exc:
                 raise RuntimeError("browser QA port is unavailable") from exc
-
-
-def _process_table() -> dict[int, dict[str, Any]]:
-    observed = subprocess.run(
-        ["ps", "-A", "-o", "pid=,ppid=,pgid=,lstart="],
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=True,
-    )
-    table = {}
-    for line in observed.stdout.splitlines():
-        parts = line.strip().split(maxsplit=3)
-        if len(parts) == 4 and all(item.isdecimal() for item in parts[:3]):
-            table[int(parts[0])] = {
-                "ppid": int(parts[1]),
-                "pgid": int(parts[2]),
-                "identity": parts[3],
-            }
-    return table
-
-
-def _sample_owned(root_pid: int, prior: dict[int, dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    table = _process_table()
-    owned = {
-        pid: entry
-        for pid, entry in prior.items()
-        if pid in table and table[pid]["identity"] == entry["identity"]
-    }
-    if root_pid in table and root_pid not in prior:
-        owned[root_pid] = table[root_pid]
-    changed = True
-    while changed:
-        changed = False
-        for pid, entry in table.items():
-            if pid not in owned and entry["ppid"] in owned:
-                owned[pid] = entry
-                changed = True
-    return owned
-
-
-def _save_owned(path: Path, owned: dict[int, dict[str, Any]]) -> None:
-    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(canonical_json({str(pid): entry for pid, entry in owned.items()}) + "\n")
-    os.replace(temporary, path)
-
-
-def _stop_owned(owned: dict[int, dict[str, Any]]) -> bool:
-    known = dict(owned)
-    trustworthy = True
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        table = _process_table()
-        for pid, entry in known.items():
-            current = table.get(pid)
-            if current is None:
-                continue
-            if current["identity"] != entry["identity"]:
-                trustworthy = False
-                continue
-            try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                trustworthy = False
-        for _ in range(15):
-            time.sleep(0.1)
-            table = _process_table()
-            if not any(
-                table.get(pid, {}).get("identity") == entry["identity"]
-                for pid, entry in known.items()
-            ):
-                return trustworthy
-    return False
 
 
 def _artifacts(checkout: Path, configured: list[str]) -> list[dict[str, Any]]:
@@ -168,291 +57,138 @@ def _artifacts(checkout: Path, configured: list[str]) -> list[dict[str, Any]]:
     return found
 
 
-def _begin(
-    broker: Any,
-    key: str,
-    request: dict[str, Any],
-    preflight: Callable[[], tuple[Path, Path, dict[str, str]]],
-) -> tuple[dict[str, Any] | None, tuple[Path, Path, dict[str, str]] | None]:
-    with broker.store._connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        row = db.execute(
-            "SELECT kind,request_json,state,observed_json FROM delivery_effects WHERE effect_key=?",
-            (key,),
-        ).fetchone()
-        if row:
-            if row[0] != "browser_qa" or row[1] != canonical_json(request):
-                raise ValueError("browser QA effect identity changed")
-            if row[2] == "complete" and row[3]:
-                return json.loads(row[3]), None
-            return {
-                "state": "unknown",
-                "cleanup": "unknown",
-                "candidate_id": request["candidate_id"],
-            }, None
-        # The port/profile preflight performs no child execution. Keep it
-        # before the durable intent so a known-unstarted conflict can be
-        # retried under the same candidate/iteration after it is resolved.
-        launch = preflight()
-        db.execute(
-            """INSERT INTO delivery_effects
-               (effect_key,run_id,kind,request_json,state,updated_at)
-               VALUES (?,?,? ,?,'pending',?)""",
-            (key, broker.spec["run_id"], "browser_qa", canonical_json(request), _now()),
-        )
-    return None, launch
-
-
-def _reconcile_pending(
-    evidence_dir: Path, result: dict[str, Any], ports: tuple[int, int]
-) -> dict[str, Any]:
-    start = evidence_dir / "start.json"
-    if start.is_file():
-        saved = json.loads(start.read_text(encoding="utf-8"))
-        pid, identity = saved.get("pid"), saved.get("identity")
-        if type(pid) is int and isinstance(identity, str) and identity:
-            recorded = {pid: {"identity": identity}}
-            process_file = evidence_dir / "owned-processes.json"
-            if process_file.is_file():
-                recorded.update(
-                    {int(key): value for key, value in json.loads(process_file.read_text()).items()}
-                )
-            result["cleanup"] = "confirmed" if _stop_owned(recorded) else "unknown"
-    if any(_listeners(port) for port in ports):
-        result["cleanup"] = "unknown"
-    return result
-
-
-def _recover_completed_receipt(
-    broker: Any,
-    key: str,
-    request: dict[str, Any],
-    evidence_dir: Path,
-    checkout: Path,
-    qa: dict[str, Any],
-    ports: tuple[int, int],
-) -> dict[str, Any] | None:
-    """Close the receipt-written/DB-pending crash window without rerunning QA."""
-
-    receipt = evidence_dir / "receipt.json"
-    if not receipt.exists():
-        return None
-    for path in (receipt, evidence_dir / "browser-qa.log", evidence_dir / "browser-qa.sb"):
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
-            raise ValueError("browser QA recovery evidence is not a private regular file")
-        if info.st_uid != os.getuid():
-            raise ValueError("browser QA recovery evidence has a different owner")
-    saved = json.loads(receipt.read_text(encoding="utf-8"))
-    expected = {
-        "candidate_id": request["candidate_id"],
-        "iteration": request["iteration"],
-        "qa_config_sha256": request["qa_config_sha256"],
-        "argv": request["argv"],
-        "ports": qa["ports"],
-        "log": str(evidence_dir / "browser-qa.log"),
-    }
-    if (
-        not isinstance(saved, dict)
-        or any(saved.get(name) != value for name, value in expected.items())
-        or saved.get("state") not in {"passed", "failed"}
-        or saved.get("cleanup") != "confirmed"
-        or saved.get("log_sha256") != _hash(evidence_dir / "browser-qa.log")
-        or saved.get("profile_sha256") != _hash(evidence_dir / "browser-qa.sb")
-        or saved.get("start") != json.loads((evidence_dir / "start.json").read_text())
-        or saved.get("artifacts") != _artifacts(checkout, qa.get("artifact_paths", []))
-        or candidate_for(checkout)["id"] != request["candidate_id"]
-        or saved.get("source_unchanged") is not True
-    ):
-        raise ValueError("browser QA pending receipt no longer matches its candidate and evidence")
-    reconciled = _reconcile_pending(
-        evidence_dir,
-        {"state": "unknown", "cleanup": "unknown", "candidate_id": request["candidate_id"]},
-        ports,
-    )
-    if reconciled["cleanup"] != "confirmed":
-        return None
-    recovered = {**saved, "receipt": str(receipt), "receipt_sha256": _hash(receipt)}
-    broker._finish_effect(key, recovered)
-    return recovered
-
-
 def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
-    if broker.spec.get("provider") == "codex":
-        from .delivery_browser_qa_container import run_browser_qa_container
+    from .delivery_native_guard import validate_native_turn
+    from .delivery_native_process import NativeProcess, reconcile_process
+    from .delivery_preparation import verify_prepared_spec
+    from .delivery_resources import RunResources, private_directory, read_private, write_private
 
-        return run_browser_qa_container(broker, iteration, candidate)
-    return run_browser_qa_native_fixture(broker, iteration, candidate)
-
-
-def run_browser_qa_native_fixture(
-    broker: Any, iteration: int, candidate: dict[str, Any]
-) -> dict[str, Any]:
-    """Retain the historical Seatbelt fixture for comparison, never real dispatch."""
-    qa = broker.spec["policy"].get("browser_qa")
-    if not qa:
-        raise ValueError("browser QA is not configured")
-    if broker.candidate() != candidate:
-        raise ValueError("browser QA candidate changed before the gate")
+    spec = broker.spec
+    validate_native_turn(spec, "verify", iteration, broker.store)
+    verify_prepared_spec(spec)
+    qa = spec["policy"].get("browser_qa")
+    if not qa or broker.candidate() != candidate:
+        raise ValueError("native browser QA needs its admitted exact candidate and configuration")
+    key = f"browser_qa:{spec['run_id']}:{iteration}"
+    request = {
+        "iteration": iteration,
+        "candidate_id": candidate["id"],
+        "policy_digest": spec["policy_digest"],
+        "qa_config_sha256": digest(qa),
+        "ports": qa["ports"],
+        "argv": qa["argv"],
+    }
+    done = broker._effect(key, "browser_qa", request)
+    if done:
+        if _hash(Path(done["receipt"])) != done["receipt_sha256"]:
+            raise ValueError("native browser receipt changed")
+        return done
     checkout = broker.gate_checkout("verify", iteration, candidate).resolve(strict=True)
     cwd = (checkout / qa.get("cwd", ".")).resolve(strict=True)
     if checkout not in (cwd, *cwd.parents):
         raise ValueError("browser QA cwd escaped the gate checkout")
+    folder = broker.state_dir / "browser-qa" / str(iteration)
+    private_directory(folder)
+    receipt = folder / "receipt.json"
+    if receipt.exists():
+        saved = read_private(receipt)
+        if (
+            any(saved.get(name) != value for name, value in request.items())
+            or saved.get("state") not in {"passed", "failed"}
+            or saved.get("cleanup") != "confirmed"
+            or _hash(Path(saved["log"])) != saved["log_sha256"]
+            or _hash(folder / "browser-qa.sb") != saved["profile_sha256"]
+            or any(_hash(Path(item["path"])) != item["sha256"] for item in saved["artifacts"])
+        ):
+            raise ValueError("pending native browser receipt authority changed")
+        process_receipt = reconcile_process(folder / "native" / "native-process.json")
+        if process_receipt["cleanup"] == "unknown":
+            return {
+                "state": "unknown",
+                "cleanup": "unknown",
+                "candidate_id": candidate["id"],
+                "native_process": process_receipt,
+            }
+        result = {**saved, "receipt": str(receipt), "receipt_sha256": _hash(receipt)}
+        broker._finish_effect(key, result)
+        return result
     ports = tuple(qa["ports"].values())
-    key = f"browser_qa:{broker.spec['run_id']}:{iteration}"
-    request = {
-        "iteration": iteration,
-        "candidate_id": candidate["id"],
-        "policy_digest": broker.spec["policy_digest"],
-        "qa_config_sha256": digest(qa),
-        "ports": ports,
-        "argv": qa["argv"],
-    }
-    evidence_dir = broker.state_dir / "browser-qa" / str(iteration)
-
-    def preflight() -> tuple[Path, Path, dict[str, str]]:
+    if not (folder / "native" / "native-process.json").exists():
         _ports_free(ports)
-        evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        metadata = evidence_dir.lstat()
-        if stat.S_IMODE(metadata.st_mode) != 0o700 or metadata.st_uid != os.getuid():
-            raise ValueError("browser QA evidence directory is not private")
-        scratch = Path(tempfile.mkdtemp(prefix="dfqa-", dir="/private/tmp"))
-        try:
-            profile, env = prepare_browser_qa(broker.spec, checkout, evidence_dir, scratch, qa)
-        except BaseException:
-            scratch.rmdir()
-            raise
-        return scratch, profile, env
-
-    existing, launch = _begin(broker, key, request, preflight)
-    if existing:
-        if existing["state"] == "unknown":
-            recovered = _recover_completed_receipt(
-                broker, key, request, evidence_dir, checkout, qa, ports
-            )
-            if recovered is not None:
-                return recovered
-            return _reconcile_pending(evidence_dir, existing, ports)
-        if broker.candidate() != candidate:
-            raise ValueError("browser QA candidate changed after its receipt")
-        receipt = Path(existing["receipt"])
-        if _hash(receipt) != existing["receipt_sha256"]:
-            raise ValueError("browser QA receipt changed after completion")
-        return existing
-    assert launch is not None
-    scratch, profile, env = launch
-    log = evidence_dir / "browser-qa.log"
-    started = evidence_dir / "start.json"
-    process_file = evidence_dir / "owned-processes.json"
-    descriptor = os.open(log, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    process: subprocess.Popen[bytes] | None = None
-    observed: dict[int, dict[str, Any]] = {}
-    conflict = False
-    timed_out = False
-    cleanup = "unknown"
-    owned: dict[int, dict[str, Any]] = {}
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            process = subprocess.Popen(
-                [
-                    "/usr/bin/sandbox-exec",
-                    "-f",
-                    str(profile),
-                    "/usr/bin/python3",
-                    "-I",
-                    "-c",
-                    _START_GATE,
-                    *qa["argv"],
-                ],
-                cwd=cwd,
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            identity = _identity(process.pid)
-            if not identity:
-                raise RuntimeError("browser QA child has no process identity")
-            owned[process.pid] = {"identity": identity, "ppid": os.getpid(), "pgid": process.pid}
-            _write_new(
-                started,
-                (
-                    canonical_json({"pid": process.pid, "identity": identity, "pgid": process.pid})
-                    + "\n"
-                ).encode(),
-            )
-            assert process.stdin is not None
-            process.stdin.write(b"GO\n")
-            process.stdin.flush()
-            process.stdin.close()
-            deadline = time.monotonic() + qa["timeout_seconds"]
-            while process.poll() is None:
-                owned = _sample_owned(process.pid, owned)
-                _save_owned(process_file, owned)
-                for port in ports:
-                    for pid in _listeners(port):
-                        if pid not in owned or _identity(pid) != owned[pid]["identity"]:
-                            conflict = True
-                            break
-                        observed[port] = {"pid": pid, **owned[pid]}
-                if conflict or time.monotonic() >= deadline:
-                    timed_out = not conflict
-                    break
-                time.sleep(0.25)
-            cleanup = "confirmed" if _stop_owned(owned) else "unknown"
-            process.wait(timeout=5)
-    except BaseException:
-        if process is not None:
-            _stop_owned(owned)
-            process.wait(timeout=5)
-        raise
-    if any(_listeners(port) for port in ports):
-        cleanup = "unknown"
-    output = visible_output(log.read_text(encoding="utf-8", errors="replace"))
+    scratch = RunResources(spec).browser_scratch()
+    profile, environment = prepare_browser_qa(spec, checkout, folder, scratch, qa)
+    generated = broker._register_generated(checkout, qa.get("artifact_paths", []))
+    process = NativeProcess(
+        spec,
+        folder / "native",
+        argv=["/usr/bin/sandbox-exec", "-f", str(profile), *qa["argv"]],
+        cwd=cwd,
+        environment=environment,
+        timeout=qa["timeout_seconds"],
+        ports=ports,
+        cancelled=broker._native_cancelled,
+    ).run()
+    broker._record_generated(generated)
+    if process["cleanup"] == "unknown":
+        return {
+            "state": "unknown",
+            "cleanup": "unknown",
+            "candidate_id": candidate["id"],
+            "native_process": process,
+        }
+    log = folder / "browser-qa.log"
+    content = Path(process["log"]).read_bytes()
+    if log.exists():
+        if log.read_bytes() != content:
+            raise ValueError("native browser log changed across replay")
+    else:
+        _write_new(log, content)
+    output = visible_output(content.decode("utf-8", errors="replace"))
     count = observed_test_count(output, qa["test_count_regex"])
     rejected = bool(qa.get("reject_regex") and re.search(qa["reject_regex"], output))
     rejected = rejected or bool(
         re.search(r"(?m)^\s*\d+\s+(?:failed|skipped|flaky|did not run)\b", output)
     )
-    artifacts = _artifacts(checkout, qa.get("artifact_paths", []))
-    source_unchanged = candidate_for(checkout)["id"] == candidate["id"]
-    result = {
-        "state": "passed"
-        if process is not None
-        and process.returncode == 0
-        and not conflict
-        and not timed_out
-        and set(observed) == set(ports)
-        and cleanup == "confirmed"
+    artifacts = []
+    for index, item in enumerate(_artifacts(checkout, qa.get("artifact_paths", []))):
+        original = Path(item["path"])
+        destination = folder / "artifacts" / str(index) / original.name
+        private_directory(destination.parent)
+        if not destination.exists():
+            _write_new(destination, original.read_bytes())
+        if _hash(destination) != item["sha256"]:
+            raise ValueError("native browser artifact changed while preserving evidence")
+        artifacts.append({**item, "source": str(original), "path": str(destination)})
+    unchanged = candidate_for(checkout)["id"] == candidate["id"]
+    passed = (
+        process["exit_code"] == 0
+        and not process["timed_out"]
+        and not process["cancelled"]
+        and not process["listener_conflict"]
+        and set(process["observed_listeners"]) == {str(port) for port in ports}
         and count >= qa["min_tests"]
         and not rejected
-        and source_unchanged
-        else "failed",
-        "candidate_id": candidate["id"],
-        "iteration": iteration,
-        "qa_config_sha256": digest(qa),
-        "argv": qa["argv"],
+        and unchanged
+    )
+    result = {
+        **request,
+        "state": "passed" if passed else "failed",
         "cwd": str(cwd),
-        "ports": qa["ports"],
         "profile_sha256": _hash(profile),
-        "start": json.loads(started.read_text(encoding="utf-8")),
-        "listeners": {str(port): observed.get(port) for port in ports},
-        "exit_code": process.returncode if process else None,
-        "timed_out": timed_out,
-        "listener_conflict": conflict,
+        "exit_code": process["exit_code"],
         "test_count": count,
         "rejected_output": rejected,
         "log": str(log),
         "log_sha256": _hash(log),
         "artifacts": artifacts,
-        "source_unchanged": source_unchanged,
-        "cleanup": cleanup,
+        "source_unchanged": unchanged,
+        "cleanup": "confirmed",
+        "process_cleanup": process["cleanup"],
+        "native_process": process,
         "scratch": str(scratch),
+        "diagnostic": output[-2000:] if not passed else None,
     }
-    receipt = evidence_dir / "receipt.json"
-    _write_new(receipt, (canonical_json(result) + "\n").encode())
-    result["receipt"] = str(receipt)
-    result["receipt_sha256"] = _hash(receipt)
+    write_private(receipt, result)
+    result.update(receipt=str(receipt), receipt_sha256=_hash(receipt))
     broker._finish_effect(key, result)
     return result

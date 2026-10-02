@@ -32,6 +32,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3.12 -m venv /tmp/devflow-uv
       - run: /tmp/devflow-uv/bin/pip install uv==0.12.17
+      - run: echo '/tmp/devflow-uv/bin' >> "$GITHUB_PATH"
       - run: /tmp/devflow-uv/bin/uv sync --locked --python python3.12
         working-directory: runtime
       - run: /tmp/devflow-uv/bin/uv run --frozen ruff check src tests

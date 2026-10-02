@@ -9,7 +9,6 @@ import hmac
 import json
 import os
 import secrets
-import stat
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,33 +26,20 @@ from temporalio.service import RPCError, RPCStatusCode
 from .contracts import digest
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
+from .delivery_preparation import execution_retired
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
 
 
-class LocalAuth:
-    def __init__(self, state_root: Path) -> None:
-        self.path = state_root / "service-token"
-        try:
-            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            metadata = self.path.lstat()
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or metadata.st_uid != os.getuid()
-            ):
-                raise ValueError("service token file has unsafe permissions") from None
-        else:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(secrets.token_urlsafe(32) + "\n")
-        self.secret = self.path.read_text(encoding="utf-8").strip()
-        if len(self.secret) < 32:
-            raise ValueError("service token is invalid")
+class LocalSession:
+    """Anonymous, automatically renewed browser state for CSRF protection only."""
+
+    def __init__(self) -> None:
+        self.secret = secrets.token_bytes(32)
 
     def session(self) -> str:
         payload = f"{int(time.time()) + 86400}.{secrets.token_urlsafe(16)}"
-        mac = hmac.new(self.secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        mac = hmac.new(self.secret, payload.encode(), hashlib.sha256).hexdigest()
         return base64.urlsafe_b64encode(f"{payload}.{mac}".encode()).decode()
 
     def valid(self, cookie: str | None) -> bool:
@@ -63,22 +49,20 @@ class LocalAuth:
             value = base64.urlsafe_b64decode(cookie.encode()).decode()
             expiry, nonce, mac = value.split(".")
             payload = f"{expiry}.{nonce}"
-            expected = hmac.new(self.secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+            expected = hmac.new(self.secret, payload.encode(), hashlib.sha256).hexdigest()
             return int(expiry) >= int(time.time()) and hmac.compare_digest(mac, expected)
         except (ValueError, UnicodeError):
             return False
 
     def csrf(self, cookie: str) -> str:
-        return hmac.new(
-            self.secret.encode(), ("csrf:" + cookie).encode(), hashlib.sha256
-        ).hexdigest()
+        return hmac.new(self.secret, ("csrf:" + cookie).encode(), hashlib.sha256).hexdigest()
 
 
 class DeliveryService:
     def __init__(self, config_path: Path) -> None:
         self.config = DeliveryConfig.load(config_path)
         self.store = DeliveryStore(self.config)
-        self.auth = LocalAuth(self.config.state_root)
+        self.session = LocalSession()
         self.temporal_status = "disconnected"
         self._health_client: Client | None = None
         self.dispatch_task: asyncio.Task | None = None
@@ -107,13 +91,18 @@ class DeliveryService:
         return self._health_client
 
     async def dispatch_once(self) -> None:
-        client = await self.healthy_client()
         pending = self.store.pending_starts()
-        if not pending:
-            return
+        starts = []
         for item in pending:
-            recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
             spec = self.store.effective_spec(item["run_id"])
+            if not execution_retired(spec):
+                starts.append((item, spec))
+        # Retired outbox entries are historical data, including after an interrupted start.
+        if pending and not starts:
+            return
+        client = await self.healthy_client()
+        for item, spec in starts:
+            recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
             workflow_id = item["workflow_id"] or "delivery-" + spec["run_id"]
             handle = client.get_workflow_handle(workflow_id)
             try:
@@ -162,6 +151,13 @@ class DeliveryService:
             except Exception as exc:
                 self.temporal_status = "disconnected"
                 for item in self.store.pending_starts():
+                    try:
+                        spec = self.store.effective_spec(item["run_id"])
+                    except Exception:
+                        # Unknown authority cannot authorize an outbox acknowledgement.
+                        continue
+                    if execution_retired(spec):
+                        continue
                     self.store.mark_start(item["run_id"], accepted=False, error=type(exc).__name__)
             await asyncio.sleep(5)
 
@@ -194,53 +190,48 @@ def create_app(config_path: Path) -> FastAPI:
         if request.headers.get("origin") != allowed_origin:
             raise HTTPException(403, "origin does not match the dashboard")
 
-    def _session(request: Request) -> str:
-        _host(request)
-        cookie = request.cookies.get("devflow_session")
-        if not service.auth.valid(cookie):
-            raise HTTPException(401, "local session required")
-        assert cookie is not None
-        return cookie
-
     def _mutation(request: Request) -> None:
         _origin(request)
-        cookie = _session(request)
+        cookie = request.cookies.get("devflow_session")
+        if not service.session.valid(cookie):
+            raise HTTPException(403, "anonymous CSRF session is missing or expired")
+        assert cookie is not None
         supplied = request.headers.get("x-devflow-csrf")
-        if not supplied or not hmac.compare_digest(supplied, service.auth.csrf(cookie)):
+        if not supplied or not hmac.compare_digest(supplied, service.session.csrf(cookie)):
             raise HTTPException(403, "CSRF token is missing or invalid")
 
-    @app.get("/api/session")
-    async def get_session(request: Request) -> dict[str, Any]:
-        _host(request)
+    def _anonymous_session(request: Request, response: Response) -> dict[str, Any]:
         cookie = request.cookies.get("devflow_session")
-        if not service.auth.valid(cookie):
-            return {"authenticated": False}
+        if not service.session.valid(cookie):
+            cookie = service.session.session()
+            response.set_cookie(
+                "devflow_session",
+                cookie,
+                httponly=True,
+                samesite="strict",
+                secure=False,
+                max_age=86400,
+                path="/",
+            )
         assert cookie is not None
-        return {"authenticated": True, "csrf_token": service.auth.csrf(cookie)}
+        response.headers["Cache-Control"] = "no-store"
+        # Retain the old response shape for clients cached before the local upgrade.
+        return {"authenticated": True, "csrf_token": service.session.csrf(cookie)}
+
+    @app.get("/api/session")
+    async def get_session(request: Request, response: Response) -> dict[str, Any]:
+        _host(request)
+        return _anonymous_session(request, response)
 
     @app.post("/api/session")
-    async def login(request: Request, response: Response) -> dict[str, Any]:
+    async def legacy_session(request: Request, response: Response) -> dict[str, Any]:
         _origin(request)
-        body = await request.json()
-        if not isinstance(body, dict) or not isinstance(body.get("token"), str):
-            raise HTTPException(400, "service token is required")
-        if not hmac.compare_digest(body["token"], service.auth.secret):
-            raise HTTPException(401, "service token is invalid")
-        cookie = service.auth.session()
-        response.set_cookie(
-            "devflow_session",
-            cookie,
-            httponly=True,
-            samesite="strict",
-            secure=False,
-            max_age=86400,
-            path="/",
-        )
-        return {"authenticated": True, "csrf_token": service.auth.csrf(cookie)}
+        # Cached CLI/MCP callers may still POST a token; it has no authority now.
+        return _anonymous_session(request, response)
 
     @app.get("/api/service")
     async def service_info(request: Request) -> dict[str, Any]:
-        _session(request)
+        _host(request)
         try:
             await asyncio.wait_for(service.healthy_client(), timeout=2)
         except Exception:
@@ -261,7 +252,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.get("/api/runs")
     async def list_runs(request: Request) -> dict[str, Any]:
-        _session(request)
+        _host(request)
         return {"runs": service.store.list_runs()}
 
     @app.post("/api/runs")
@@ -306,25 +297,13 @@ def create_app(config_path: Path) -> FastAPI:
     async def amend_scope(request: Request, run_id: str) -> dict[str, Any]:
         _mutation(request)
         try:
-            return await asyncio.to_thread(
-                service.store.amend_scope, run_id, await request.json()
-            )
-        except (ValueError, RuntimeError, OSError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/runs/{run_id}/recover-precheck-prelaunch")
-    async def recover_precheck_prelaunch(request: Request, run_id: str) -> dict[str, Any]:
-        _mutation(request)
-        try:
-            return await asyncio.to_thread(
-                service.store.recover_precheck_prelaunch, run_id, await request.json()
-            )
+            return await asyncio.to_thread(service.store.amend_scope, run_id, await request.json())
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/runs/{run_id}")
     async def detail(request: Request, run_id: str) -> dict[str, Any]:
-        _session(request)
+        _host(request)
         try:
             value = service.store.detail(run_id)
         except ValueError as exc:
@@ -336,7 +315,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.get("/api/runs/{run_id}/evidence/{evidence_id}")
     async def evidence(request: Request, run_id: str, evidence_id: str) -> dict[str, Any]:
-        _session(request)
+        _host(request)
         try:
             return service.store.evidence(run_id, evidence_id)
         except ValueError as exc:
@@ -344,7 +323,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.get("/api/runs/{run_id}/events")
     async def events(request: Request, run_id: str, after: int = 0) -> StreamingResponse:
-        _session(request)
+        _host(request)
         service.store.spec(run_id)
         cursor = max(after, int(request.headers.get("last-event-id", "0")))
 
@@ -433,7 +412,8 @@ def create_app(config_path: Path) -> FastAPI:
     @app.get("/runs/{run_id}")
     @app.get("/new")
     @app.get("/settings")
-    async def dashboard(_request: Request, run_id: str | None = None):
+    async def dashboard(request: Request, run_id: str | None = None):
+        _host(request)
         if (dist / "index.html").is_file():
             return FileResponse(dist / "index.html")
         return HTMLResponse("<h1>Devflow delivery</h1><p>Dashboard assets are not built.</p>")

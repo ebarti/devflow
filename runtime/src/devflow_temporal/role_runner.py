@@ -224,15 +224,26 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
     with Path(binary).open("rb") as stream:
         actual_digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if actual_digest != request["spec"]["policy"].get("codex_bin_sha256"):
-        raise ValueError("Codex executable changed after sandbox attestation")
+        raise ValueError("Codex executable changed after frozen native preparation")
 
     class PinnedConfig(CodexConfig):
         def __init__(self, *, cwd=None, config_overrides=(), env=None):
             super().__init__(codex_bin=binary, cwd=cwd, config_overrides=config_overrides, env=env)
 
+    observation = None
+    observed_sdk = {}
+    if request["spec"]["policy"].get("execution_backend") == "native-macos":
+        from openai_codex import ApprovalMode, Sandbox
+
+        from .delivery_native_threads import NativeThreadObservation
+
+        observation = NativeThreadObservation(request)
+        observed_sdk = {"codex_cls": observation.codex_class(),
+                        "sandbox_cls": Sandbox, "approval_mode_cls": ApprovalMode}
     runtime = CodexAgentRuntime(
         config_cls=PinnedConfig,
         config_overrides=tuple(request["spec"]["policy"]["config_overrides"]),
+        **observed_sdk,
     )
     task = _task(request)
     support = validate_task(runtime, task)
@@ -259,6 +270,10 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
         status = parsed.get("status", "blocked")
         summary = parsed.get("summary", "")
         findings = parsed.get("findings", [])
+    observed = {"native_thread_observation": observation.reference()} if observation else {}
+    if observation and observation.data["state"] != "confirmed":
+        status, summary = "blocked", "native thread observation is incomplete or conflicted"
+        findings = ["built-in collaboration or extra provider thread must not be accepted"]
     if request["role"] == "intake":
         questions = parsed.get("questions") if isinstance(parsed, dict) else None
         plan = parsed.get("plan") if isinstance(parsed, dict) else None
@@ -303,6 +318,7 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
             "reported_model": None, "reported_effort": None,
             "host_sandbox": "native-profile",
             "tool_calls": [asdict(item) for item in result.tool_calls],
+            **observed,
         }
     if status == "pass" and (not isinstance(summary, str) or not summary.strip() or findings):
         status = "blocked"
@@ -335,6 +351,7 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
         "reported_effort": None,
         "host_sandbox": "native-profile",
         "tool_calls": [asdict(item) for item in result.tool_calls],
+        **observed,
     }
 
 
@@ -384,10 +401,14 @@ async def _run_fake(request: dict[str, Any]) -> dict[str, Any]:
 def main() -> int:
     request_path = Path(sys.argv[1])
     request = json.loads(request_path.read_text(encoding="utf-8"))
+    from .delivery_native_guard import validate_role_ancestry
+
+    validate_role_ancestry(request)
     start = Path(request["start_path"])
     output = Path(request["result_path"])
     _write_json(start, {"pid": os.getpid(), "started_at": datetime.now(UTC).isoformat()})
-    if request.get("container_authorized") is not True and sys.stdin.readline().strip() != "GO":
+    authorized = request.get("native_authorized")
+    if not authorized and sys.stdin.readline().strip() != "GO":
         return 2
     try:
         result = asyncio.run(

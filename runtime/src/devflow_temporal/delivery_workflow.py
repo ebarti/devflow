@@ -73,11 +73,33 @@ class DeliveryWorkflow:
         self.decision_answer: str | dict[str, Any] | None = None
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
+        automatic_preparation = (
+            name == "delivery_prepare" and request["spec"].get("preparation_version") == 1
+        )
+        resource_finalization = (
+            name == "delivery_finalize_resources"
+            and request["spec"].get("resource_cleanup_version") == 1
+        )
+        options = {}
+        if automatic_preparation or resource_finalization:
+            options = {
+                "heartbeat_timeout": timedelta(seconds=30),
+                "schedule_to_close_timeout": timedelta(minutes=10)
+                if resource_finalization
+                else timedelta(hours=2),
+                "retry_policy": RetryPolicy(
+                    maximum_attempts=3,
+                    initial_interval=timedelta(seconds=1),
+                    maximum_interval=timedelta(seconds=10),
+                ),
+            }
+        else:
+            options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         return await workflow.execute_activity(
             name,
             request,
             start_to_close_timeout=timedelta(hours=hours),
-            retry_policy=RetryPolicy(maximum_attempts=1),
+            **options,
         )
 
     async def _wait_repair_readback(self, delay: int) -> None:
@@ -119,13 +141,46 @@ class DeliveryWorkflow:
                 await self._project(
                     spec,
                     "repair_preflight_pending",
-                    "Waiting for owned Docker or GitHub readback before repair",
+                    "Waiting for owned native or GitHub readback before repair",
                 )
                 pending_projected = True
             await self._wait_repair_readback(delay)
             delay = min(delay * 2, 30)
 
     async def _project(self, spec: dict[str, Any], event: str, message: str) -> None:
+        # Only newly admitted resource-aware inputs add this activity. Recorded
+        # legacy histories keep their original event/activity ordering on replay.
+        if (
+            event in {"delivered", "blocked", "cancelled"}
+            and spec.get("resource_cleanup_version") == 1
+        ):
+            try:
+                receipt = await self._activity(
+                    "delivery_finalize_resources",
+                    {
+                        "spec": spec,
+                        "outcome": self.state["outcome"],
+                        "uncertain": self.state.get("cleanup") == "unknown",
+                    },
+                )
+            except Exception as exc:
+                receipt = {
+                    "state": "unknown",
+                    "process_cleanup": "unknown",
+                    "resource_cleanup": "unknown",
+                    "reason": type(exc).__name__,
+                }
+            self.state["checks"]["resource_cleanup"] = receipt
+            if receipt["state"] != "confirmed":
+                self.state["cleanup"] = "unknown"
+                if event == "delivered":
+                    self.state.update(
+                        phase="blocked",
+                        execution_state="blocked",
+                        outcome="blocked",
+                        error="resource cleanup is unknown",
+                    )
+                    event, message = "blocked", "Resource cleanup requires recovery"
         await self._activity(
             "delivery_project",
             {
@@ -249,6 +304,11 @@ class DeliveryWorkflow:
                 return None
             intake = self.state["intake"]
             turn = intake["round"]
+            if spec.get("resource_cleanup_version") == 1 and turn >= spec["policy"].get(
+                "max_intake_rounds", 8
+            ):
+                await self._stop(spec, "intake exhausted the controller-owned finite turn limit")
+                return None
             self.state["phase"] = "investigating"
             self.state["revision"] += 1
             await self._project(spec, "intake_started", "Investigating the raw request")
@@ -405,8 +465,6 @@ class DeliveryWorkflow:
         if recovery is not None:
             if recovery.get("kind") == "scope_amendment":
                 return await self._resume_scope(spec, recovery)
-            if recovery.get("kind") == "precheck_prelaunch_recovery":
-                return await self._resume_prechecks(spec, recovery)
             if recovery.get("kind") in {"repair_continuation", "repair_prelaunch_retry"}:
                 return await self._resume_repair(spec, recovery)
             return await self._resume_publication(spec, recovery)
@@ -430,10 +488,19 @@ class DeliveryWorkflow:
             "error": None,
         }
         try:
-            await self._project(spec, "preparing", "Preparing owned Git checkout")
+            await self._project(
+                spec, "preparing", "Preparing owned checkout and execution boundary"
+            )
+            if self.cancel_requested:
+                return await self._cancelled(spec)
             prepared = await self._activity("delivery_prepare", {"spec": spec})
         except Exception as exc:
-            return await self._stop(spec, f"preparation failed: {type(exc).__name__}")
+            cause = getattr(exc, "cause", None)
+            reason = str(cause)[:600] if cause else type(exc).__name__
+            return await self._stop(spec, f"preparation failed: {reason}")
+        spec = prepared.get("spec", spec)
+        if self.cancel_requested:
+            return await self._cancelled(spec)
         self.state["candidate"] = prepared["candidate"]
         self.state["candidate_revision"] += 1
         if spec.get("intake_required"):
@@ -529,11 +596,6 @@ class DeliveryWorkflow:
     ) -> dict[str, Any]:
         previous = recovery["state"]
         prelaunch_retry = recovery.get("kind") == "repair_prelaunch_retry"
-        grant_number = (
-            recovery.get("grant_number")
-            if recovery.get("kind") == "repair_continuation" else None
-        )
-        numbered = type(grant_number) is int and grant_number >= 2
         start = previous["iteration"] if prelaunch_retry else previous["iteration"] + 1
         limit = recovery["maximum_iteration"]
         roles = previous.get("roles", [])
@@ -546,26 +608,7 @@ class DeliveryWorkflow:
             None,
         )
         original = recovery.get("original_recovery") if prelaunch_retry else None
-        prior = recovery.get("prior_recovery") if numbered else None
-        earlier = prior
-        if numbered and grant_number >= 3:
-            for expected in range(grant_number - 1, 1, -1):
-                if (
-                    not isinstance(earlier, dict)
-                    or earlier.get("kind") != "repair_continuation"
-                    or earlier.get("grant_number") != expected
-                ):
-                    raise ValueError("numbered repair ancestry is incomplete")
-                earlier = earlier.get("prior_recovery")
-        scope = earlier.get("scope_recovery") if isinstance(earlier, dict) else None
-        authorized_limit = (
-            prior.get("maximum_iteration", -2) + recovery.get("additional_iterations", -1)
-            if numbered and grant_number >= 3 and isinstance(prior, dict)
-            else scope.get("maximum_iteration", -3) + 2
-            if isinstance(scope, dict) and numbered
-            else spec["policy"]["max_repairs"] + 2
-        )
-        operator_brief = recovery.get("operator_brief") if numbered and grant_number >= 3 else None
+        authorized_limit = spec["policy"]["max_repairs"] + 2
         if (
             previous.get("run_id") != spec["run_id"]
             or previous.get("phase") != "blocked"
@@ -578,41 +621,6 @@ class DeliveryWorkflow:
             or not recovery.get("findings")
         ):
             raise ValueError("repair continuation changed the bounded closed checkpoint")
-        if numbered and (
-            not isinstance(prior, dict)
-            or prior.get("kind") != (
-                "repair_continuation" if grant_number >= 3
-                else "precheck_prelaunch_recovery"
-            )
-            or (grant_number >= 3 and prior.get("grant_number") != grant_number - 1)
-            or not isinstance(scope, dict)
-            or scope.get("kind") != "scope_amendment"
-            or recovery.get("effective_spec") != spec
-            or type(recovery.get("additional_iterations")) is not int
-            or recovery["additional_iterations"] not in (
-                (2,) if grant_number in (2, 3) else (1, 2)
-            )
-            or limit != authorized_limit
-            or previous["iteration"] != (
-                prior.get("maximum_iteration") if grant_number >= 3
-                else scope.get("maximum_iteration")
-            )
-            or recovery.get("session_id") != prior.get("session_id")
-        ):
-            raise ValueError("numbered repair grant changed the amended authority")
-        if numbered and grant_number >= 3 and (
-            not isinstance(operator_brief, dict)
-            or not operator_brief.get("criteria")
-            or digest(operator_brief) != recovery.get("operator_brief_digest")
-            or (grant_number == 3 and recovery.get("prior_extension_digest") is None)
-            or (grant_number >= 4 and (
-                not isinstance(prior.get("operator_brief"), dict)
-                or operator_brief["criteria"][:len(prior["operator_brief"].get("criteria", []))]
-                != prior["operator_brief"].get("criteria")
-                or recovery.get("prior_grant_digest") is None
-            ))
-        ):
-            raise ValueError("numbered grant changed the sealed acceptance criteria")
         if prelaunch_retry:
             if (
                 not isinstance(original, dict)
@@ -713,7 +721,7 @@ class DeliveryWorkflow:
             start_iteration=start,
             prior_implementer_session=recovery["session_id"],
             repair_findings=list(recovery["findings"]),
-            operator_brief=operator_brief,
+            operator_brief=None,
             continuation=None,
             recovery=None,
             authorized_max_iteration=limit,
@@ -819,63 +827,6 @@ class DeliveryWorkflow:
             authorized_max_iteration=recovery["maximum_iteration"],
         )
 
-    async def _resume_prechecks(
-        self, spec: dict[str, Any], recovery: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Resume the broker gate after a sealed role and no check launch."""
-        previous = recovery.get("state")
-        roles = previous.get("roles") if isinstance(previous, dict) else None
-        role = roles[-1] if isinstance(roles, list) and roles else None
-        if (
-            recovery.get("effective_spec") != spec
-            or not isinstance(previous, dict)
-            or previous.get("run_id") != spec["run_id"]
-            or previous.get("phase") != "blocked"
-            or previous.get("outcome") != "blocked"
-            or previous.get("cleanup") != "unknown"
-            or previous.get("error") != "prepublication container cleanup is unknown"
-            or previous.get("candidate") != recovery.get("candidate")
-            or previous.get("iteration") != recovery.get("iteration")
-            or previous.get("pull_request") != recovery.get("pull_request")
-            or not isinstance(role, dict)
-            or role.get("role") != "implement"
-            or role.get("iteration") != recovery.get("iteration")
-            or role.get("status") != "pass"
-            or role.get("cleanup") != "confirmed"
-            or role.get("session_id") != recovery.get("session_id")
-            or role.get("candidate") != recovery.get("candidate")
-        ):
-            raise ValueError("precheck recovery changed the closed role checkpoint")
-        self.state = {
-            **previous,
-            "phase": "repair_preflight",
-            "execution_state": "running",
-            "outcome": None,
-            "error": None,
-        }
-        self.state["revision"] += 1
-        await self._project(
-            spec, "precheck_recovery_started",
-            "Proving old and amended container teardown before retrying checks",
-        )
-        if not await self._confirm_repair_preflight(spec, recovery):
-            return self.state
-        self.state["cleanup"] = "none"
-        self.state["revision"] += 1
-        await self._project(
-            spec, "precheck_recovery_confirmed",
-            "No amended check process started; sealed role and candidate retained",
-        )
-        return await self._run_iterations(
-            spec,
-            start_iteration=recovery["iteration"],
-            prior_implementer_session=recovery["session_id"],
-            repair_findings=[],
-            continuation=None,
-            recovery=None,
-            authorized_max_iteration=recovery["iteration"],
-            resume_prechecks=True,
-        )
 
     async def _run_iterations(
         self,
@@ -1012,7 +963,7 @@ class DeliveryWorkflow:
                     )
                 self.state["checks"]["prepublish"] = prechecked
                 if prechecked.get("state") == "unknown" or prechecked.get("cleanup") == "unknown":
-                    return await self._stop(spec, "prepublication container cleanup is unknown")
+                    return await self._stop(spec, "prepublication process cleanup is unknown")
                 if self.cancel_requested:
                     return await self._cancelled(spec)
                 if prechecked.get("state") != "passed":
@@ -1092,7 +1043,7 @@ class DeliveryWorkflow:
                         )
                     self.state["checks"]["local"] = checked
                     if checked.get("state") == "unknown" or checked.get("cleanup") == "unknown":
-                        return await self._stop(spec, "local check container cleanup is unknown")
+                        return await self._stop(spec, "local check process cleanup is unknown")
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                     if checked.get("state") != "passed":

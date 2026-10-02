@@ -12,30 +12,36 @@ from pathlib import Path
 from typing import Any
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from .candidate import candidate_for
 from .contracts import digest
 from .delivery_broker import DeliveryBroker
-from .delivery_config import ContainerReadbackPending, DeliveryConfig
+from .delivery_config import DeliveryConfig
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
 
 
-def _context(spec: dict[str, Any]) -> tuple[DeliveryStore, DeliveryBroker]:
+def _context(
+    spec: dict[str, Any], *, preparation_input: bool = False
+) -> tuple[DeliveryStore, DeliveryBroker]:
     config = DeliveryConfig.load(Path(spec["config_path"]))
     if digest(config.raw) != spec["config_digest"]:
         raise ValueError("service configuration changed during an active run")
     store = DeliveryStore(config)
     saved = store.effective_spec(spec["run_id"])
-    if saved != spec:
+    if saved != spec and not (
+        preparation_input and spec.get("preparation_version") == 1
+        and store.submitted_spec(spec["run_id"]) == spec
+    ):
         raise ValueError("Temporal input no longer matches the durable submitted run")
     return store, DeliveryBroker(store, spec)
 
 
 @activity.defn(name="delivery_project")
 async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
-    store, _ = _context(request["spec"])
+    store, _ = _context(request["spec"], preparation_input=True)
     result = store.project(
         request["spec"]["run_id"],
         phase=request["phase"],
@@ -61,8 +67,29 @@ async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_prepare")
 async def delivery_prepare(request: dict[str, Any]) -> dict[str, Any]:
-    _, broker = _context(request["spec"])
-    return broker.prepare()
+    def execute() -> dict[str, Any]:
+        from .delivery_preparation import prepare_authority
+
+        store, _ = _context(request["spec"], preparation_input=True)
+        effective = prepare_authority(store, request["spec"])
+        prepared = DeliveryBroker(store, effective).prepare()
+        if effective.get("preparation_version") == 1:
+            return {**prepared, "spec": effective}
+        return prepared
+
+    pending = asyncio.create_task(asyncio.to_thread(execute))
+    try:
+        while not pending.done():
+            if activity.in_activity() and request["spec"].get("preparation_version") == 1:
+                activity.heartbeat({"run_id": request["spec"]["run_id"], "stage": "preparing"})
+            await asyncio.wait({pending}, timeout=5)
+        return await pending
+    except Exception as exc:
+        raise ApplicationError(
+            str(exc)[:600], type="RuntimePreparationFailed", non_retryable=True
+        ) from exc
+    finally:
+        pending.cancel()
 
 
 @activity.defn(name="delivery_intake")
@@ -82,6 +109,37 @@ async def delivery_intake(request: dict[str, Any]) -> dict[str, Any]:
         "input_candidate_id": candidate["id"], "candidate": candidate,
         "provider": request["spec"]["provider"],
     }
+
+
+@activity.defn(name="delivery_finalize_resources")
+async def delivery_finalize_resources(request: dict[str, Any]) -> dict[str, Any]:
+    def execute() -> dict[str, Any]:
+        from .delivery_resources import RunResources
+
+        _context(request["spec"], preparation_input=True)
+        if request["spec"].get("resource_cleanup_version") != 1:
+            raise ApplicationError("run has no resource finalization contract", non_retryable=True)
+        receipt = RunResources(request["spec"]).finalize(
+            request["outcome"], uncertain=request.get("uncertain", False)
+        )
+        if receipt.get("retryable"):
+            raise ApplicationError(
+                "owned temporary resource removal needs a bounded retry",
+                type="ResourceCleanupTransient",
+            )
+        return receipt
+
+    pending = asyncio.create_task(asyncio.to_thread(execute))
+    try:
+        while not pending.done():
+            if activity.in_activity():
+                activity.heartbeat(
+                    {"run_id": request["spec"]["run_id"], "stage": "finalizing_resources"}
+                )
+            await asyncio.wait({pending}, timeout=5)
+        return await pending
+    finally:
+        pending.cancel()
 
 
 @activity.defn(name="delivery_accept_plan")
@@ -203,13 +261,10 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
             store, _ = _context(request["spec"])
             if request["recovery"].get("kind") == "scope_amendment":
                 store.scope_preflight(request["spec"], request["recovery"])
-            elif request["recovery"].get("kind") == "precheck_prelaunch_recovery":
-                store.precheck_recovery_preflight(request["spec"], request["recovery"])
             else:
                 store.repair_preflight(request["spec"], request["recovery"])
         except (
             RepairReadbackPending,
-            ContainerReadbackPending,
             subprocess.TimeoutExpired,
             sqlite3.OperationalError,
         ) as exc:
@@ -393,6 +448,7 @@ async def delivery_tracker(request: dict[str, Any]) -> dict[str, Any]:
 DELIVERY_ACTIVITIES = [
     delivery_project,
     delivery_prepare,
+    delivery_finalize_resources,
     delivery_intake,
     delivery_accept_plan,
     delivery_role,

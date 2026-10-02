@@ -130,14 +130,18 @@ def copy_session_state(
 
 
 def continuation_authority(policy: dict) -> dict:
-    """Permit only new evidence/recovery and rebuilt source image identities."""
+    """Compare configured native authority before new per-run measurement."""
 
-    authority = {key: value for key, value in policy.items() if key not in {
-        "recovery", "sandbox_attestation_sha256", "security_binding_sha256"
-    }}
-    container = authority.get("container")
-    if isinstance(container, dict):
-        container = dict(container)
-        for key in ("image_id", "role_runner_sha256", "runtime_payload_sha256"):
-            container.pop(key, None)
-    return {**authority, "container": container}
+    authority = {
+        key: value
+        for key, value in policy.items()
+        if key
+        not in {
+            "recovery",
+            "security_binding_sha256",
+            "environment_proof_sha256",
+            "native_identity",
+            "codex_bin_sha256",
+        }
+    }
+    return authority

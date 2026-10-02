@@ -26,7 +26,6 @@ from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_control import main as delivery_main
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 from devflow_temporal.role_runner import _task
-from devflow_temporal.supervisor import _contained_role_spec
 
 
 def _git(path: Path, *args: str) -> str:
@@ -138,14 +137,12 @@ def test_unpinned_intake_role_rejected_before_work_claim(intake_fixture):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unavailable", ["missing", "unreadable"])
-async def test_public_submit_reports_unavailable_per_run_attestation_before_claim(
-    intake_fixture, tmp_path, monkeypatch, unavailable
+async def test_public_real_submit_is_durable_without_attestation_or_docker_readback(
+    intake_fixture, monkeypatch
 ):
     path, request = intake_fixture
     config = json.loads(path.read_text())
     config["provider"] = "codex"
-    config["container"] = {}
     repository = config["repositories"]["fixture"]
     repository.update({
         "prepublish_checks": [{"id": "precheck", "argv": ["/usr/bin/true"]}],
@@ -154,46 +151,28 @@ async def test_public_submit_reports_unavailable_per_run_attestation_before_clai
         "project_url": "https://github.com/orgs/example/projects/1",
         "assignee": "example",
     })
-    attestation_path = tmp_path / "run-1-attestation.json"
-    config["sandbox_attestation_path"] = str(attestation_path)
     path.write_text(json.dumps(config))
-    def unexpected_container_inspection(_container, *, source):
-        raise AssertionError("missing per-run proof must be reported before Docker inspection")
-
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_config._container_identity",
-        unexpected_container_inspection,
-    )
-    if unavailable == "unreadable":
-        attestation_path.write_text("{}")
-        attestation_path.chmod(0o600)
-        original_read_bytes = Path.read_bytes
-
-        def unreadable_attestation(target):
-            if target == attestation_path:
-                raise PermissionError("fixture attestation read failure")
-            return original_read_bytes(target)
-
-        monkeypatch.setattr(Path, "read_bytes", unreadable_attestation)
 
     app = create_app(path)
     store = app.state.delivery.store
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url=config["dashboard_url"]) as browser:
-        token = (Path(config["state_root"]) / "service-token").read_text().strip()
         origin = {"Origin": config["dashboard_url"]}
-        login = await browser.post("/api/session", json={"token": token}, headers=origin)
+        login = await browser.get("/api/session")
         assert login.status_code == 200
         response = await browser.post(
             "/api/runs", json=request,
             headers={**origin, "X-Devflow-CSRF": login.json()["csrf_token"]},
         )
-    assert response.status_code == 409
-    assert "prepare a fresh exact per-run boundary attestation" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["phase"] == "preparing"
+    spec = store.spec(request["run_id"])
+    assert spec["preparation_version"] == 1 and "preparation" not in spec
     with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM delivery_commands").fetchone()[0] == 0
-        assert store.state.row(db, "works", request["work_id"]) is None
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM delivery_outbox").fetchone()[0] == 1
+        assert store.state.row(db, "works", request["work_id"]) is not None
+
 
 
 def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):
@@ -201,16 +180,14 @@ def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):
     store = create_app(path).state.delivery.store
     store.submit(request)
     spec = store.spec("run-1")
-    contained = _contained_role_spec(
-        spec, {**spec["policy"], "host_sandbox": "native-profile"}
-    )
+    native = {**spec, "policy": {**spec["policy"], "host_sandbox": "native-profile"}}
     task = _task({
-        "spec": contained, "role": "intake", "iteration": 0,
+        "spec": native, "role": "intake", "iteration": 0,
         "candidate": {"id": "candidate", "head": spec["base_sha"]},
         "workspace": "/work",
     })
-    assert contained["work_id"] == spec["work_id"]
-    assert contained["issue_url"] == spec["issue_url"]
+    assert native["work_id"] == spec["work_id"]
+    assert native["issue_url"] == spec["issue_url"]
     assert task.permissions.filesystem == FilesystemAccess.READ_ONLY
     assert 'Frozen work ID: "work-1"' in task.goal
     assert 'Frozen issue URL: "https://github.com/example/fixture/issues/3"' in task.goal
@@ -275,13 +252,7 @@ async def test_raw_goal_questions_revision_restart_plan_change_and_acceptance(
         async with httpx.AsyncClient(
             transport=transport, base_url="http://127.0.0.1:18770"
         ) as browser:
-            token = (
-                Path(json.loads(path.read_text())["state_root"]) / "service-token"
-            ).read_text().strip()
-            login = await browser.post(
-                "/api/session", json={"token": token},
-                headers={"Origin": "http://127.0.0.1:18770"},
-            )
+            login = await browser.get("/api/session")
             headers = {
                 "Origin": "http://127.0.0.1:18770",
                 "X-Devflow-CSRF": login.json()["csrf_token"],

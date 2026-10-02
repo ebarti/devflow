@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import hashlib
 import json
 import os
@@ -18,7 +17,6 @@ from typing import Any
 from .candidate import candidate_for
 from .contracts import canonical_json
 from .delivery_browser_qa import run_browser_qa as execute_browser_qa
-from .delivery_container import Bind, OwnedContainer, dependency_volume
 from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
 from .delivery_output import observed_test_count, visible_output
 from .delivery_store import DeliveryStore, _now
@@ -65,6 +63,9 @@ class BrokerReadbackUnavailable(RuntimeError):
 
 class DeliveryBroker:
     def __init__(self, store: DeliveryStore, spec: dict[str, Any]) -> None:
+        from .delivery_preparation import require_native_execution
+
+        require_native_execution(spec)
         self.store = store
         self.spec = spec
         self.source = Path(spec["source_path"])
@@ -115,6 +116,12 @@ class DeliveryBroker:
                 raise RuntimeError("prepared checkout disappeared")
             return done
         self.checkout.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        resources = None
+        if self.spec.get("resource_cleanup_version") == 1:
+            from .delivery_resources import RunResources
+
+            resources = RunResources(self.spec)
+            resources.register(self.checkout, "checkout")
         if self.checkout.exists():
             if _git(self.checkout, "rev-parse", "--show-toplevel") != str(self.checkout):
                 raise RuntimeError("owned checkout path was replaced")
@@ -144,6 +151,8 @@ class DeliveryBroker:
                 str(self.checkout),
                 self.spec["base_sha"],
             )
+        if resources:
+            resources.created(self.checkout)
         recovery = self.spec["policy"].get("recovery")
         provenance = self._recover(recovery) if recovery else None
         candidate = self.candidate()
@@ -283,13 +292,26 @@ class DeliveryBroker:
     def gate_checkout(self, role: str, iteration: int, candidate: dict[str, Any]) -> Path:
         if role not in {"review", "verify"}:
             raise ValueError("only independent gates use gate checkouts")
+        if self.spec["policy"].get("execution_backend") == "native-macos":
+            from .delivery_native_guard import validate_native_turn
+
+            validate_native_turn(self.spec, role, iteration, self.store)
         path = self.state_dir / "gates" / str(iteration) / role
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        resources = None
+        if self.spec.get("resource_cleanup_version") == 1:
+            from .delivery_resources import RunResources
+
+            resources = RunResources(self.spec)
+            resources.register(path, "gate")
         if path.exists():
             if _git(path, "rev-parse", "HEAD") != candidate["head"]:
                 raise RuntimeError("gate checkout head changed")
         else:
             path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             _git(self.source, "worktree", "add", "--detach", str(path), candidate["head"])
+        if resources:
+            resources.created(path)
         observed = candidate_for(path)
         if observed["id"] != candidate["id"]:
             raise RuntimeError("gate checkout does not match the published candidate")
@@ -355,127 +377,6 @@ class DeliveryBroker:
             "candidate_id": candidate["id"],
         }
 
-    def git_metadata(self, candidate: dict[str, Any]) -> Path:
-        """Freeze an owned Git index for contained, read-only candidate inspection."""
-
-        candidate_id = candidate["id"]
-        if not re.fullmatch(r"[a-f0-9]{64}", candidate_id):
-            raise ValueError("candidate Git metadata needs an exact digest")
-        root = self.state_dir / "git-metadata"
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        info = root.lstat()
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or stat.S_IMODE(info.st_mode) != 0o700
-            or info.st_uid != os.getuid()
-        ):
-            raise ValueError("candidate Git metadata root is not private")
-        metadata = root / f"{candidate_id}.git"
-        staging = root / f".{candidate_id}.staging"
-        lock = root / f"{candidate_id}.lock"
-        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "rb") as stream:
-            lock_info = lock.lstat()
-            if (
-                not stat.S_ISREG(lock_info.st_mode)
-                or stat.S_IMODE(lock_info.st_mode) != 0o600
-                or lock_info.st_uid != os.getuid()
-            ):
-                raise RuntimeError("candidate Git metadata lock is not private")
-            fcntl.flock(stream, fcntl.LOCK_EX)
-            if not metadata.exists() and not metadata.is_symlink():
-                # Staging is never mounted. An interruption here occurred
-                # before any check or browser command could start.
-                if staging.exists() or staging.is_symlink():
-                    stage_info = staging.lstat()
-                    if not stat.S_ISDIR(stage_info.st_mode) or stage_info.st_uid != os.getuid():
-                        raise RuntimeError("candidate Git metadata staging is not owned")
-                    shutil.rmtree(staging)
-                command = [
-                    "git",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "clone",
-                    "--bare",
-                    "--no-local",
-                    "--quiet",
-                    str(self.source),
-                    str(staging),
-                ]
-                _run(command, timeout=180)
-                _run(
-                    [
-                        "git",
-                        f"--git-dir={staging}",
-                        "fetch",
-                        "--no-tags",
-                        "--quiet",
-                        str(self.checkout),
-                        candidate["head"],
-                    ],
-                    timeout=180,
-                )
-                for key, value in (
-                    ("core.bare", "false"),
-                    ("core.worktree", "/work"),
-                    ("core.hooksPath", "/dev/null"),
-                    ("core.fsmonitor", "false"),
-                ):
-                    _run(["git", f"--git-dir={staging}", "config", key, value])
-                subprocess.run(
-                    ["git", f"--git-dir={staging}", "config", "--remove-section", "remote.origin"],
-                    capture_output=True,
-                    check=False,
-                    timeout=30,
-                )
-                _run(
-                    [
-                        "git",
-                        f"--git-dir={staging}",
-                        "update-ref",
-                        "refs/heads/devflow-candidate",
-                        candidate["head"],
-                    ]
-                )
-                _run(
-                    [
-                        "git",
-                        f"--git-dir={staging}",
-                        "symbolic-ref",
-                        "HEAD",
-                        "refs/heads/devflow-candidate",
-                    ]
-                )
-                _run(["git", f"--git-dir={staging}", "read-tree", candidate["head"]])
-                manifest = {
-                    "candidate_id": candidate_id,
-                    "head": candidate["head"],
-                    "config_sha256": _sha256(staging / "config"),
-                    "index_sha256": _sha256(staging / "index"),
-                    "head_sha256": _sha256(staging / "HEAD"),
-                }
-                receipt = staging / "devflow-manifest.json"
-                receipt_descriptor = os.open(receipt, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                with os.fdopen(receipt_descriptor, "w", encoding="utf-8") as saved:
-                    saved.write(canonical_json(manifest) + "\n")
-                os.chmod(staging, 0o700)
-                staging.rename(metadata)
-            receipt = metadata / "devflow-manifest.json"
-            if metadata.is_symlink() or not metadata.is_dir() or not receipt.is_file():
-                raise RuntimeError("candidate Git metadata preparation is incomplete")
-            recorded = json.loads(receipt.read_text(encoding="utf-8"))
-            if (
-                recorded.get("candidate_id") != candidate_id
-                or recorded.get("head") != candidate["head"]
-                or recorded.get("config_sha256") != _sha256(metadata / "config")
-                or recorded.get("index_sha256") != _sha256(metadata / "index")
-                or recorded.get("head_sha256") != _sha256(metadata / "HEAD")
-                or _run(["git", f"--git-dir={metadata}", "rev-parse", "HEAD"]) != candidate["head"]
-            ):
-                raise RuntimeError("candidate Git metadata changed after it was frozen")
-            return metadata
 
     def _run_check_list(
         self,
@@ -487,8 +388,15 @@ class DeliveryBroker:
         results: list[dict[str, Any]] = []
         checkout = checkout.resolve(strict=True)
         evidence_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-        store_volume = self._ensure_dependency_store() if self.spec["provider"] == "codex" else None
-        git_metadata = self.git_metadata(candidate) if self.spec["provider"] == "codex" else None
+        from .delivery_preparation import require_native_execution
+
+        require_native_execution(self.spec)
+        native_dependencies = (
+            self._ensure_native_dependency_store(checkout)
+            if self.spec["provider"] == "codex"
+            and any("/store" in check["argv"] for check in checks)
+            else None
+        )
         for check in checks:
             argv = check.get("argv")
             relative = check.get("cwd", ".")
@@ -500,58 +408,54 @@ class DeliveryBroker:
                 or checkout not in (cwd, *cwd.parents)
             ):
                 raise ValueError("configured check command or cwd is invalid")
+            native_result = None
             if self.spec["provider"] == "codex":
-                if check.get("network_domains"):
-                    raise ValueError("container checks cannot request host network domains")
-                container = OwnedContainer(
-                    self.spec,
-                    kind="check",
-                    identity={
-                        "candidate_id": candidate["id"],
-                        "stage": evidence_dir.parent.name,
-                        "iteration": evidence_dir.name,
-                        "check_id": check["id"],
-                    },
-                    evidence_dir=evidence_dir / check["id"] / "container",
-                    binds=(
-                        Bind(checkout, "/work"),
-                        Bind(checkout / ".git", "/work/.git", True),
-                        Bind(git_metadata, "/gitmeta", True),
+                from .delivery_native_process import NativeProcess
+                from .delivery_preparation import verify_prepared_spec
+                from .delivery_sandbox import prepare_native_check
+
+                verify_prepared_spec(self.spec)
+                profile, environment = prepare_native_check(
+                    self.spec, checkout, evidence_dir, check,
+                    dependency_store=(
+                        Path(native_dependencies["store"]) if native_dependencies else None
                     ),
-                    command=(
-                        "/usr/bin/python3",
-                        "/opt/devflow/landlock_exec.py",
-                        "--",
-                        *argv,
-                    ),
-                    cwd="/work"
-                    if cwd == checkout
-                    else "/work/" + cwd.relative_to(checkout).as_posix(),
-                    environment={
-                        "HOME": "/tmp",
-                        "PATH": "/usr/local/bin:/usr/bin:/bin",
-                        "COREPACK_HOME": "/usr/local/share/corepack",
-                        "COREPACK_ENABLE_NETWORK": "0",
-                        "PNPM_STORE_DIR": "/store",
-                        "npm_config_nodedir": "/usr",
-                        "CI": "1",
-                        "GIT_CONFIG_NOSYSTEM": "1",
-                        "GIT_CONFIG_GLOBAL": "/dev/null",
-                        "GIT_CONFIG_COUNT": "1",
-                        "GIT_CONFIG_KEY_0": "core.hooksPath",
-                        "GIT_CONFIG_VALUE_0": "/dev/null",
-                        "GIT_DIR": "/gitmeta",
-                        "GIT_WORK_TREE": "/work",
-                        "GIT_OPTIONAL_LOCKS": "0",
-                    },
-                    network="none",
-                    timeout_seconds=int(check.get("timeout_seconds", 600)),
-                    volume_mounts=((store_volume, "/store", True),),
                 )
-                outcome = container.run()
-                output = outcome.log.read_text(encoding="utf-8", errors="replace")
-                exit_code = outcome.exit_code
-                artifact = outcome.log
+                generated = self._register_generated(checkout, ["node_modules"])
+                # The same frozen lock populates an owned store before offline
+                # installation. Candidate commands may read, never mutate it.
+                command = [
+                    native_dependencies["store"] if item == "/store" else item for item in argv
+                ]
+                native_result = NativeProcess(
+                    self.spec,
+                    evidence_dir / check["id"] / "native",
+                    argv=[
+                        self.spec["policy"]["codex_bin"],
+                        "sandbox",
+                        "-P",
+                        profile,
+                        "-C",
+                        str(cwd),
+                        "--",
+                        *command,
+                    ],
+                    cwd=cwd,
+                    environment=environment,
+                    timeout=int(check.get("timeout_seconds", 600)),
+                    cancelled=self._native_cancelled,
+                ).run()
+                self._record_generated(generated)
+                if native_result["cleanup"] == "unknown":
+                    return {
+                        "state": "unknown",
+                        "cleanup": "unknown",
+                        "candidate_id": candidate["id"],
+                        "native_process": native_result,
+                    }
+                artifact = Path(native_result["log"])
+                output = artifact.read_text(encoding="utf-8", errors="replace")
+                exit_code = native_result["exit_code"]
             elif self.spec["provider"] == "fake":
                 # Explicit fixture provider only; real deliveries never take
                 # this unsandboxed path.
@@ -597,10 +501,16 @@ class DeliveryBroker:
                     "diagnostic": parsed_output[-2000:] if not passed else None,
                     "log": str(artifact),
                     "log_sha256": _sha256(artifact),
-                    "container_id": outcome.container_id
-                    if self.spec["provider"] == "codex"
-                    else None,
-                    "cleanup": outcome.cleanup if self.spec["provider"] == "codex" else "confirmed",
+                    "cleanup": "confirmed",
+                    **(
+                        {
+                            "process_cleanup": native_result["cleanup"],
+                            "native_process": native_result,
+                            "dependency_preparation": native_dependencies,
+                        }
+                        if native_result
+                        else {}
+                    ),
                 }
             )
             if not passed:
@@ -616,111 +526,111 @@ class DeliveryBroker:
             "source_unchanged": source_unchanged,
         }
 
-    def _ensure_dependency_store(self) -> str:
-        """Fetch only lockfile metadata/tarballs, without any candidate script."""
+    def _native_cancelled(self) -> bool:
+        with self.store._connect() as db:
+            row = db.execute(
+                "SELECT phase FROM delivery_runs WHERE run_id=?", (self.spec["run_id"],)
+            ).fetchone()
+        return row is not None and row["phase"] == "cancelling"
 
-        container_policy = self.spec["policy"].get("container")
-        if not isinstance(container_policy, dict):
-            raise ValueError("real check requires an admitted container policy")
-        lock = self.checkout / "pnpm-lock.yaml"
-        if (
-            lock.is_symlink()
-            or not lock.is_file()
-            or _sha256(lock) != container_policy["pnpm_lock_sha256"]
-        ):
-            raise ValueError("admitted package lock changed before dependency preparation")
-        legacy = self.state_dir / "dependency-preparation"
-        legacy_intent = legacy / "container-intent.json"
-        # The original run used one policy, so its dependency preparation had
-        # a run-wide identity. An explicit scope amendment changes the image
-        # and policy within that run. Preserve an exact legacy retry, but never
-        # reuse its evidence path or Docker name for the amended authority.
-        amended_identity = False
-        if legacy_intent.exists() or legacy_intent.is_symlink():
-            info = legacy_intent.lstat()
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o600
-            ):
-                raise ValueError("dependency preparation intent is not private")
-            try:
-                saved = json.loads(legacy_intent.read_text(encoding="utf-8"))
-            except (ValueError, OSError) as exc:
-                raise ValueError("dependency preparation intent is malformed") from exc
-            if not isinstance(saved, dict) or not isinstance(saved.get("labels"), dict):
-                raise ValueError("dependency preparation intent is malformed")
-            amended_identity = (
-                saved["labels"].get("devflow.policy") != self.spec["policy_digest"]
-                or saved.get("image_id") != container_policy["image_id"]
-            )
-        folder = (
-            self.state_dir / f"dependency-preparation-{self.spec['policy_digest']}"
-            if amended_identity
-            else legacy
+    def _register_generated(self, checkout: Path, names: list[str]) -> list[Path]:
+        from .delivery_resources import RunResources
+
+        resources = RunResources(self.spec)
+        roots = []
+        for name in names:
+            root = checkout / name
+            if _git(checkout, "ls-files", "--", name):
+                raise ValueError("configured generated directory contains tracked source")
+            if not root.parent.is_dir() or root.parent.resolve() != root.parent:
+                raise ValueError("generated directory parent is not a fixed candidate directory")
+            resources.register(root, "generated")
+            roots.append(root)
+        return roots
+
+    def _record_generated(self, roots: list[Path]) -> None:
+        from .delivery_resources import RunResources
+
+        resources = RunResources(self.spec)
+        for root in roots:
+            if os.path.lexists(root):
+                resources.created(root)
+
+    def _ensure_native_dependency_store(self, checkout: Path) -> dict[str, Any]:
+        """Fetch frozen registry data without exposing candidate setup or credentials."""
+        from .delivery_native_dependencies import REGISTRY, frozen_pnpm_inputs, write_frozen_inputs
+        from .delivery_native_process import NativeProcess
+        from .delivery_preparation import verify_prepared_spec
+        from .delivery_resources import RunResources, private_directory, read_private, write_private
+        from .delivery_sandbox import prepare_native_check
+
+        verify_prepared_spec(self.spec)
+        manager, inputs = frozen_pnpm_inputs(self.spec, checkout)
+        resources = RunResources(self.spec)
+        scratch = resources.scratch("dependencies", self.spec["policy_digest"])
+        transient = read_private(resources.manifest)["roots"][str(self.state_dir / "transient")]
+        generation = transient.get("generation", 0)
+        folder = self.state_dir / "dependency-preparation" / f"native-{generation}"
+        staging = scratch / "staging"
+        dependencies = staging / "store"
+        for path in (folder, staging, dependencies):
+            private_directory(path)
+        hashes = write_frozen_inputs(staging, inputs)
+        receipt = folder / "receipt.json"
+        identity = {"device": dependencies.stat().st_dev, "inode": dependencies.stat().st_ino}
+        request = {
+            "base_sha": self.spec["base_sha"], "policy_digest": self.spec["policy_digest"],
+            "package_manager": manager, "input_hashes": hashes, "registry": REGISTRY,
+            "store": str(dependencies), "store_identity": identity, "generation": generation,
+        }
+        if receipt.exists():
+            observed = read_private(receipt)
+            if observed["request"] != request or observed["state"] != "passed":
+                raise ValueError("native frozen dependency preparation conflicts with its receipt")
+            observed.update(receipt=str(receipt), receipt_sha256=_sha256(receipt))
+            return observed
+        profile, environment = prepare_native_check(
+            self.spec, staging, folder,
+            {"id": "pnpm-fetch", "network_domains": [REGISTRY]},
         )
-        identity = {"lock_sha256": container_policy["pnpm_lock_sha256"]}
-        if amended_identity:
-            identity["policy_digest"] = self.spec["policy_digest"]
-        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if (
-            folder.is_symlink()
-            or folder.stat().st_uid != os.getuid()
-            or stat.S_IMODE(folder.stat().st_mode) != 0o700
-        ):
-            raise ValueError("dependency preparation evidence is not private")
-        scratch = folder / "scratch"
-        scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if scratch.is_symlink() or scratch.stat().st_uid != os.getuid():
-            raise ValueError("dependency preparation scratch is not owned")
-        frozen_lock = scratch / "pnpm-lock.yaml"
-        if frozen_lock.exists() or frozen_lock.is_symlink():
-            if (
-                frozen_lock.is_symlink()
-                or not frozen_lock.is_file()
-                or frozen_lock.stat().st_uid != os.getuid()
-                or _sha256(frozen_lock) != container_policy["pnpm_lock_sha256"]
-            ):
-                raise ValueError("dependency preparation lock changed")
-        else:
-            descriptor = os.open(frozen_lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(lock.read_bytes())
-        volume = dependency_volume(self.spec, container_policy["pnpm_lock_sha256"])
-        prepared = OwnedContainer(
-            self.spec,
-            kind="dependency-preparation",
-            identity=identity,
-            evidence_dir=folder,
-            binds=(Bind(scratch, "/deps"),),
-            command=(
-                "corepack",
-                "pnpm",
-                "fetch",
-                "--frozen-lockfile",
-                "--ignore-scripts",
-                "--ignore-pnpmfile",
-                "--store-dir",
-                "/store",
-            ),
-            cwd="/deps",
-            environment={
-                "HOME": "/tmp",
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
-                "COREPACK_HOME": "/usr/local/share/corepack",
-                "COREPACK_ENABLE_NETWORK": "0",
-            },
-            network="bridge",
-            timeout_seconds=int(container_policy.get("prefetch_timeout_seconds", 1800)),
-            volume_mounts=((volume, "/store", False),),
+        environment.update({
+            "COREPACK_ENABLE_NETWORK": "0", "npm_config_registry": "https://" + REGISTRY + "/",
+        })
+        process = NativeProcess(
+            self.spec, folder / "process",
+            argv=[
+                self.spec["policy"]["codex_bin"], "sandbox", "-P", profile, "-C", str(staging),
+                "--", "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
+                "--ignore-pnpmfile", "--store-dir", str(dependencies),
+            ],
+            cwd=staging, environment=environment, timeout=1800, cancelled=self._native_cancelled,
         ).run()
-        if prepared.exit_code:
-            raise RuntimeError("credential-free lockfile dependency fetch failed")
-        if _sha256(frozen_lock) != container_policy["pnpm_lock_sha256"]:
-            raise ValueError("dependency preparation changed the admitted lock")
-        return volume
+        unchanged = hashes == write_frozen_inputs(staging, inputs)
+        passed = (
+            process["exit_code"] == 0
+            and process["cleanup"] == "observed-native-confirmed" and unchanged
+        )
+        result = {
+            **request, "request": request,
+            "state": "passed" if passed else "failed",
+            "native_process": process, "log": process["log"],
+            "log_sha256": _sha256(Path(process["log"])),
+            "candidate_setup_executed": False,
+            "network_authority": "registry.npmjs.org fetch only; candidate checks remain offline",
+        }
+        write_private(receipt, result)
+        result.update(receipt=str(receipt), receipt_sha256=_sha256(receipt))
+        if result["state"] != "passed":
+            diagnostic = visible_output(Path(process["log"]).read_text(errors="replace"))[-1200:]
+            raise RuntimeError("credential-free native frozen lockfile fetch failed: " + diagnostic)
+        return result
+
 
     def run_prechecks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
+        if self.spec["policy"].get("execution_backend") == "native-macos":
+            from .delivery_native_guard import validate_native_turn
+
+            validate_native_turn(self.spec, "implement", iteration, self.store)
         if self.candidate() != candidate:
             raise ValueError("prepublication candidate is stale")
         return self._run_check_list(

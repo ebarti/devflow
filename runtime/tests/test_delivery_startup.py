@@ -56,13 +56,12 @@ def _manifest(config):
     return {"config_path": str(config.path), "processes": processes}
 
 
-def test_shared_client_ensures_service_before_first_token_read(config, monkeypatch):
+def test_shared_client_ensures_service_without_token_file(config, monkeypatch):
     calls = []
 
     def ensure(current):
         calls.append("ensure")
         control._private_directory(current.state_root)
-        (current.state_root / "service-token").write_text("fixture-token")
 
     def request(_caller, method, path, body=None, **_kwargs):
         calls.append((method, path, body))
@@ -71,7 +70,8 @@ def test_shared_client_ensures_service_before_first_token_read(config, monkeypat
     monkeypatch.setattr(control, "ensure_service_running", ensure)
     monkeypatch.setattr(DeliveryClient, "_request", request)
     assert client(config.path).csrf == "csrf"
-    assert calls == ["ensure", ("POST", "/api/session", {"token": "fixture-token"})]
+    assert calls == ["ensure", ("GET", "/api/session", None)]
+    assert not (config.state_root / "service-token").exists()
 
 
 def test_concurrent_cold_callers_and_explicit_start_converge(config, monkeypatch):
@@ -240,8 +240,12 @@ def test_request_transport_failure_sends_mutation_once(config):
         calls = 0
 
         def open(self, request, **_kwargs):
+            if request.method == "GET":
+                assert request.full_url.endswith("/api/session")
+                return io.BytesIO(b'{"csrf_token":"anonymous-csrf"}')
             self.calls += 1
             assert request.method == "POST"
+            assert request.get_header("X-devflow-csrf") == "anonymous-csrf"
             assert json.loads(request.data) == {"command_id": "stable-command"}
             raise urllib.error.URLError("connection lost after send")
 
@@ -250,6 +254,27 @@ def test_request_transport_failure_sends_mutation_once(config):
     with pytest.raises(ServiceUnavailable, match="connection lost after send"):
         caller.submit({"command_id": "stable-command"})
     assert caller.opener.calls == 1
+
+
+def test_client_renews_anonymous_csrf_before_each_command_without_a_token_file(config):
+    class Transport:
+        sessions = 0
+        sent = []
+
+        def open(self, request, **_kwargs):
+            if request.method == "GET":
+                assert request.full_url.endswith("/api/session")
+                self.sessions += 1
+                return io.BytesIO(json.dumps({"csrf_token": f"csrf-{self.sessions}"}).encode())
+            self.sent.append(request.get_header("X-devflow-csrf"))
+            return io.BytesIO(b'{}')
+
+    caller = DeliveryClient(config)
+    caller.opener = Transport()
+    caller.submit({"command_id": "first"})
+    caller.submit({"command_id": "second"})
+    assert caller.opener.sent == ["csrf-1", "csrf-2"]
+    assert not (config.state_root / "service-token").exists()
 
 
 @pytest.mark.parametrize("status", [401, 409])
@@ -267,7 +292,7 @@ def test_request_http_failure_remains_application_error(config, status):
     assert not isinstance(error.value, ServiceUnavailable)
 
 
-def test_readiness_requires_authenticated_owned_api_and_worker_registration(config, monkeypatch):
+def test_readiness_requires_owned_api_and_worker_registration(config, monkeypatch):
     manifest = _manifest(config)
     monkeypatch.setattr(control, "_owned", lambda _process: True)
     monkeypatch.setattr(DeliveryClient, "login", lambda *_args, **_kwargs: None)

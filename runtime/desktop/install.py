@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -51,6 +52,10 @@ def main() -> None:
     parser.add_argument("--runtime-dir", required=True, type=Path)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--codex-home", required=True, type=Path)
+    parser.add_argument(
+        "--replace-owned-skill-sha256",
+        help="replace only a previously inspected Devflow skill with this exact SHA-256",
+    )
     args = parser.parse_args()
 
     runtime = args.runtime_dir.expanduser().resolve(strict=True)
@@ -80,8 +85,10 @@ def main() -> None:
         installed_skill = target / "SKILL.md"
         if installed_skill.is_symlink():
             fail(f"same-name skill differs; refusing to replace {target}")
-        if installed_skill.read_bytes() != SOURCE_SKILL.read_bytes():
-            fail(f"same-name skill differs; refusing to replace {target}")
+        installed_bytes = installed_skill.read_bytes()
+        if installed_bytes != SOURCE_SKILL.read_bytes():
+            if hashlib.sha256(installed_bytes).hexdigest() != args.replace_owned_skill_sha256:
+                fail(f"same-name skill differs; refusing to replace {target}")
 
     home.mkdir(parents=True, exist_ok=True)
     configured = codex_json(codex, home, "list", "--json")
@@ -99,6 +106,19 @@ def main() -> None:
         target.mkdir(parents=True)
         (target / "SKILL.md").write_bytes(SOURCE_SKILL.read_bytes())
         created = True
+    elif (target / "SKILL.md").read_bytes() != SOURCE_SKILL.read_bytes():
+        previous = (target / "SKILL.md").read_bytes()
+        if hashlib.sha256(previous).hexdigest() != args.replace_owned_skill_sha256:
+            fail("owned skill changed before its guarded update")
+        backup = home / "skills" / ".devflow-local-delivery-backups" / args.replace_owned_skill_sha256
+        backup.mkdir(mode=0o700, parents=True, exist_ok=True)
+        backup_file = backup / "SKILL.md"
+        if backup_file.exists() and backup_file.read_bytes() != previous:
+            fail("owned skill backup differs; refusing to update")
+        backup_file.write_bytes(previous)
+        temporary = target / ".SKILL.md.tmp"
+        temporary.write_bytes(SOURCE_SKILL.read_bytes())
+        os.replace(temporary, target / "SKILL.md")
     if existing is None:
         result = subprocess.run(
             [codex, "mcp", "add", NAME, "--", str(executable), "--config", str(config)],
