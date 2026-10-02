@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 from test_delivery_intake import intake_fixture as intake_fixture
 
+from devflow_temporal import delivery_config
 from devflow_temporal import delivery_preparation as preparation
 from devflow_temporal.delivery_activities import delivery_prepare, delivery_project
 from devflow_temporal.delivery_config import DeliveryConfig, scope_amended_spec
@@ -38,6 +40,57 @@ def test_foreign_docker_context_is_rejected_before_any_daemon_action(monkeypatch
     )
     with pytest.raises(preparation.PreparationError, match="local Docker Desktop"):
         preparation._engine({"docker_bin": "/configured/docker"}, start=True)
+
+
+def test_image_version_is_strict_for_legacy_and_current_contracts(tmp_path, monkeypatch):
+    lock = tmp_path / "pnpm-lock.yaml"
+    lock.write_text("lockfileVersion: '9.0'\n")
+    container = {
+        "docker_bin": "/usr/bin/true",
+        "docker_bin_sha256": hashlib.sha256(Path("/usr/bin/true").read_bytes()).hexdigest(),
+        "image_id": "sha256:" + "a" * 64,
+        "platform": "linux/arm64",
+        "seccomp_profile": str(preparation.SECCOMP),
+        "seccomp_sha256": preparation._hash(preparation.SECCOMP),
+        "codex_bin": preparation.CODEX_BINARY,
+        "codex_bin_sha256": preparation.CODEX_BINARY_SHA256,
+        "role_runner_sha256": preparation._hash(preparation.PACKAGE / "role_runner.py"),
+        "runtime_payload_sha256": preparation.payload_digest(
+            preparation.PACKAGE, preparation.LAUNCHER
+        ),
+        "pnpm_lock_sha256": preparation._hash(lock),
+    }
+    labels = {
+        "devflow." + key: container[key]
+        for key in ("role_runner_sha256", "runtime_payload_sha256", "codex_bin_sha256")
+    }
+    labels.update(
+        {
+            "devflow.kit_revision": preparation.KIT_REVISION,
+            "devflow.codex_cli_version": delivery_config.LEGACY_CODEX_VERSION,
+        }
+    )
+    image = {
+        "Id": container["image_id"],
+        "Os": "linux",
+        "Architecture": "arm64",
+        "Config": {"Labels": labels},
+    }
+    monkeypatch.setattr(
+        delivery_config.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, json.dumps([image]), ""),
+    )
+    assert delivery_config._container_identity(container, source=tmp_path)
+    labels["devflow.codex_cli_version"] = delivery_config.REQUIRED_CODEX_VERSION
+    with pytest.raises(ValueError, match="tested policy"):
+        delivery_config._container_identity(container, source=tmp_path)
+    container["codex_cli_version"] = delivery_config.REQUIRED_CODEX_VERSION
+    assert delivery_config._container_identity(container, source=tmp_path)
+    with pytest.raises(ValueError, match="recorded contract"):
+        delivery_config._container_identity(
+            container, source=tmp_path, required_codex_version=delivery_config.LEGACY_CODEX_VERSION
+        )
 
 
 @pytest.mark.parametrize("start", [False, True])

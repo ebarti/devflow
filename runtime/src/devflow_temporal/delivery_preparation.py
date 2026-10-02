@@ -29,7 +29,7 @@ from .payload import payload_digest
 SCHEMA = "devflow-prepared-environment-v1"
 KIT_REVISION = "d9ed6e186ce028d0db3b044ce959a94f409510c5"
 CODEX_BINARY = "/opt/devflow-venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex"
-CODEX_BINARY_SHA256 = "9cbc3cdcc18ca336523ffa7d64207a1ae1f5991f823081d0a37bcb3a748de093"
+CODEX_BINARY_SHA256 = "50b06603bdcdac39b714f5c3e68583c002b8ad8779ebfdaaf4932ff016b379c0"
 PACKAGE = Path(__file__).resolve().parent
 RUNTIME = PACKAGE.parents[1]
 SECCOMP = RUNTIME / "docker/moby-56be731-codex-bwrap-seccomp.json"
@@ -227,6 +227,7 @@ def _launch_policy(spec: dict) -> dict:
         "role_runner_sha256": _hash(PACKAGE / "role_runner.py"),
         "runtime_payload_sha256": payload_digest(PACKAGE, LAUNCHER),
         "codex_bin": CODEX_BINARY,
+        "codex_cli_version": REQUIRED_CODEX_VERSION,
         "codex_bin_sha256": CODEX_BINARY_SHA256,
         "pnpm_lock_sha256": lock_sha,
         **{
