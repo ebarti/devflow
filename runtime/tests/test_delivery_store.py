@@ -3894,6 +3894,7 @@ def test_real_admission_rejects_unattested_container_and_check_network(service, 
     original, request = service
     configuration = json.loads(original.config.path.read_text())
     configuration["provider"] = "codex"
+    configuration["execution_backend"] = "docker"
     attestation_path = original.config.path.parent / "attestation.json"
     attestation_path.write_text("{}")
     attestation_path.chmod(0o600)

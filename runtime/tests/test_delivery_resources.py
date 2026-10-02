@@ -175,7 +175,7 @@ def test_interrupted_native_monitor_does_not_relaunch_and_retains_recovery_mater
     assert scratch.exists()
 
 
-def test_dirty_blocked_and_unpushed_worktrees_are_retained_with_reason(tmp_path):
+def owned_worktree(tmp_path):
     owned = spec(tmp_path)
     source = Path(owned["source_path"])
     source.mkdir()
@@ -203,6 +203,11 @@ def test_dirty_blocked_and_unpushed_worktrees_are_retained_with_reason(tmp_path)
         capture_output=True,
     )
     resources.created(checkout)
+    return owned, resources, source, checkout
+
+
+def test_dirty_and_blocked_worktrees_are_retained_with_reason(tmp_path):
+    _owned, resources, _source, checkout = owned_worktree(tmp_path)
     (checkout / "file").write_text("dirty")
     result = resources.finalize("cancelled")
     assert result["roots"][0]["state"] == "retained"
@@ -214,3 +219,118 @@ def test_dirty_blocked_and_unpushed_worktrees_are_retained_with_reason(tmp_path)
     assert checkout.exists()
     assert resources.finalize("cancelled")["roots"][0]["state"] == "removed"
     assert not checkout.exists()
+
+
+def test_unpushed_then_published_worktree_requires_remote_and_no_live_user(tmp_path):
+    owned, resources, source, checkout = owned_worktree(tmp_path)
+    (checkout / "file").write_text("candidate")
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-am", "candidate"], check=True, capture_output=True
+    )
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(source), "remote", "add", "origin", str(remote)], check=True)
+    result = resources.finalize("delivered")
+    assert result["roots"][0]["state"] == "retained"
+    assert "unpushed" in result["roots"][0]["reason"] and checkout.exists()
+    subprocess.run(
+        ["git", "-C", str(checkout), "push", "origin", owned["branch"]],
+        check=True,
+        capture_output=True,
+    )
+    if sys.platform == "darwin":
+        import time
+
+        ready = tmp_path / "user-ready"
+        user = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import pathlib,sys,time; "
+                "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(30)",
+                str(ready),
+            ],
+            cwd=checkout,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert ready.exists()
+            result = resources.finalize("delivered")
+            assert result["roots"][0]["state"] == "retained"
+            assert "live process" in result["roots"][0]["reason"]
+            assert user.poll() is None
+        finally:
+            user.terminate()
+            user.wait(timeout=5)
+    assert resources.finalize("delivered")["roots"][0]["state"] == "removed"
+    assert not checkout.exists() and (source / "file").read_text() == "base"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="actual macOS port identity inspection")
+def test_unrelated_process_and_port_survive_owned_timeout_and_cleanup(tmp_path):
+    import socket
+
+    from devflow_temporal.delivery_native_process import stop_observed
+
+    owned = spec(tmp_path)
+    resources = RunResources(owned)
+    scratch = resources.scratch("check", "deadline")
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        table = process_table()
+        # A recycled/mismatched identity must never be signalled.
+        assert stop_observed({unrelated.pid: {**table[unrelated.pid], "identity": "different"}})
+        assert unrelated.poll() is None
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            with pytest.raises(ValueError, match="another process"):
+                NativeProcess(
+                    owned,
+                    Path(owned["state_dir"]) / "busy-port",
+                    argv=[sys.executable, "-c", "raise AssertionError('never launched')"],
+                    cwd=scratch,
+                    environment={"PATH": "/usr/bin:/bin"},
+                    timeout=1,
+                    ports=(port,),
+                )
+            result = NativeProcess(
+                owned,
+                Path(owned["state_dir"]) / "timeout",
+                argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+                cwd=scratch,
+                environment={"PATH": "/usr/bin:/bin"},
+                timeout=1,
+            ).run()
+            assert result["timed_out"] is True
+            assert result["cleanup"] == "observed-native-confirmed"
+            receipt = resources.finalize("timeout")
+            assert receipt["resource_cleanup"] == "confirmed" and not scratch.exists()
+            assert unrelated.poll() is None and listener.getsockname()[1] == port
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+
+
+def test_finite_continuation_allocates_fresh_scratch_and_preserves_session(tmp_path):
+    owned = spec(tmp_path)
+    resources = RunResources(owned)
+    original = resources.scratch("role", "implement")
+    session = Path(owned["state_dir"]) / "role-homes" / "implement" / "session.json"
+    session.parent.mkdir(parents=True)
+    session.write_text("durable prior context")
+    resources.finalize("blocked")
+    assert not original.exists()
+    resumed = resources.scratch("role", "implement")
+    assert resumed.exists() and resumed == original
+    assert session.read_text() == "durable prior context"
+    assert (
+        read_private(resources.manifest)["roots"][str(Path(owned["state_dir"]) / "transient")][
+            "generation"
+        ]
+        == 1
+    )
+    assert resources.finalize("blocked")["state"] == "confirmed"

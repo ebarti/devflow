@@ -88,6 +88,7 @@ def real_store(intake_fixture):
     path, request = intake_fixture
     configured = json.loads(path.read_text())
     configured["provider"] = "codex"
+    configured["execution_backend"] = "docker"
     configured.pop("fake_intake")
     configured["roles"] = {
         role: {"model": "gpt-6.1-sol", "effort": "max"} for role in configured["roles"]

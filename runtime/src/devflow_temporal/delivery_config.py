@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .contracts import RUN_ID_RE, digest
+from .delivery_native_guard import NATIVE_OVERRIDES
 from .delivery_sandbox import validate_network_domain
 from .payload import payload_digest
 from .runtime_dependencies import dependency_labels, locked_dependency_identity
@@ -364,10 +365,15 @@ class DeliveryConfig:
             ],
             "authorized_endpoint": "published_unmerged",
             "intake_enabled": "intake" in self.raw["roles"],
+            "execution_backend": self.raw.get("execution_backend", "native-macos"),
         }
 
     def admit(
-        self, supplied: dict[str, Any], *, legacy_attestation: bool = False
+        self,
+        supplied: dict[str, Any],
+        *,
+        legacy_attestation: bool = False,
+        recorded_backend: str | None = None,
     ) -> dict[str, Any]:
         required = {
             "command_id",
@@ -472,6 +478,40 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
+        backend = recorded_backend or self.raw.get("execution_backend", "native-macos")
+        if backend not in {"native-macos", "docker"}:
+            raise ValueError("unsupported explicit execution policy")
+        if self.raw.get("provider", "codex") == "codex":
+            policy["execution_backend"] = "docker" if legacy_attestation else backend
+            if backend == "native-macos" and not legacy_attestation:
+                policy["container"] = None
+                policy["config_overrides"] = self.raw.get("config_overrides", NATIVE_OVERRIDES)
+                policy["max_intake_rounds"] = 8
+        protected_native = (
+            self.state_root,
+            self.tracking_db,
+            self.path,
+            Path(policy["codex_auth_path"] or Path.home() / ".codex" / "auth.json"),
+            Path.home() / ".codex",
+            Path.home() / ".config" / "gh",
+            Path.home() / ".ssh",
+            Path.home() / ".aws",
+            Path.home() / ".npmrc",
+        )
+
+        def native_read_root(raw_root: str) -> None:
+            root = Path(raw_root)
+            if (
+                not root.is_absolute()
+                or not root.is_dir()
+                or root.resolve(strict=True) != root
+                or any(
+                    item.resolve().is_relative_to(root) or root.is_relative_to(item.resolve())
+                    for item in protected_native
+                )
+            ):
+                raise ValueError("native read root overlaps controller authority or credentials")
+
         for role, selected in policy["roles"].items():
             if (
                 not isinstance(selected, dict)
@@ -481,6 +521,10 @@ class DeliveryConfig:
                 or not selected["effort"].strip()
             ):
                 raise ValueError(f"{role} model and effort must be configured")
+            if backend == "native-macos" and not legacy_attestation:
+                timeout = selected.get("timeout_seconds", 7200)
+                if type(timeout) is not int or not 1 <= timeout <= 7200:
+                    raise ValueError("native role deadline must be between 1 and 7200 seconds")
         if policy["max_repairs"] < 0 or policy["max_repairs"] > 3:
             raise ValueError("max_repairs must be between 0 and 3")
         prompt = policy["initial_decision_prompt"]
@@ -516,10 +560,16 @@ class DeliveryConfig:
                     ) from exc
                 container_identity = _container_identity(policy["container"], source=source)
             else:
-                validate_preparation_inputs(policy["container"])
+                if policy["execution_backend"] == "docker":
+                    validate_preparation_inputs(policy["container"])
                 policy["host_sandbox"] = "native-profile"
                 policy["runtime_dependencies"] = locked_dependency_identity()
-            if policy["config_overrides"] != ["features.plugins=false"]:
+            expected_overrides = (
+                NATIVE_OVERRIDES
+                if policy["execution_backend"] == "native-macos"
+                else ["features.plugins=false"]
+            )
+            if policy["config_overrides"] != expected_overrides:
                 raise ValueError("real role configuration overrides must disable plugins")
             if (
                 not policy["allowed_paths"]
@@ -550,6 +600,8 @@ class DeliveryConfig:
                 root = Path(raw_root)
                 if root.is_symlink() or not root.is_dir() or not (root / "bin").is_dir():
                     raise ValueError("toolchain root is unavailable")
+                if policy["execution_backend"] == "native-macos":
+                    native_read_root(raw_root)
             cache = policy["package_manager_cache"]
             if cache is not None:
                 if not isinstance(cache, str) or not Path(cache).is_absolute():
@@ -557,6 +609,8 @@ class DeliveryConfig:
                 cache_path = Path(cache)
                 if cache_path.is_symlink() or not cache_path.is_dir():
                     raise ValueError("package manager cache is unavailable")
+                if policy["execution_backend"] == "native-macos":
+                    native_read_root(cache)
             if not policy["required_ci"]:
                 raise ValueError("real delivery requires named CI checks")
             if not repository.get("project_url") or not repository.get("assignee"):
@@ -576,6 +630,10 @@ class DeliveryConfig:
                     if check["id"] in ids:
                         raise ValueError(f"{stage} contains a duplicate check ID")
                     ids.add(check["id"])
+                    if policy["execution_backend"] == "native-macos":
+                        timeout = check.get("timeout_seconds", 600)
+                        if type(timeout) is not int or not 1 <= timeout <= 7200:
+                            raise ValueError("native check deadline must be bounded")
                     if check.get("env"):
                         raise ValueError("real check environment cannot carry arbitrary variables")
                     if not isinstance(check.get("network_domains", []), list) or any(
@@ -584,12 +642,16 @@ class DeliveryConfig:
                         raise ValueError("check network domains must be exact hosts")
                     for domain in check.get("network_domains", []):
                         validate_network_domain(domain)
-                    if check.get("network_domains"):
+                    if check.get("network_domains") and policy["execution_backend"] == "docker":
                         raise ValueError("contained checks must run with networking disabled")
-                    if check["id"] == "install" and (
-                        "--offline" not in check["argv"]
-                        or "--frozen-lockfile" not in check["argv"]
-                        or "--store-dir" not in check["argv"]
+                    if (
+                        check["id"] == "install"
+                        and policy["execution_backend"] == "docker"
+                        and (
+                            "--offline" not in check["argv"]
+                            or "--frozen-lockfile" not in check["argv"]
+                            or "--store-dir" not in check["argv"]
+                        )
                     ):
                         raise ValueError(
                             "contained package installation must use the frozen offline store"
@@ -634,10 +696,17 @@ class DeliveryConfig:
                 if env.get("JOBCTRL_E2E_ISOLATED") != "1":
                     raise ValueError("browser QA fixture isolation must be enabled")
                 read_roots = qa.get("read_roots", [])
-                if read_roots not in (None, []):
+                if read_roots not in (None, []) and policy["execution_backend"] == "docker":
                     raise ValueError("container browser QA cannot mount host read roots")
+                if policy["execution_backend"] == "native-macos":
+                    if not isinstance(read_roots or [], list) or len(read_roots or []) > 4:
+                        raise ValueError("native browser read roots must be a bounded list")
+                    for raw_root in read_roots or []:
+                        if not isinstance(raw_root, str):
+                            raise ValueError("native browser read root must be a directory")
+                        native_read_root(raw_root)
                 browser_path = env.get("PLAYWRIGHT_BROWSERS_PATH")
-                if browser_path != "/ms-playwright":
+                if policy["execution_backend"] == "docker" and browser_path != "/ms-playwright":
                     raise ValueError("browser executable must use the pinned image path")
                 artifact_paths = qa.get("artifact_paths", [])
                 if (
@@ -751,8 +820,18 @@ class DeliveryConfig:
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
-            **({"preparation_version": 1} if self.raw.get("provider", "codex") == "codex"
-               and not legacy_attestation else {}),
+            **(
+                {"preparation_version": 1}
+                if self.raw.get("provider", "codex") == "codex" and not legacy_attestation
+                else {}
+            ),
+            **(
+                {"resource_cleanup_version": 1}
+                if backend == "native-macos"
+                and not legacy_attestation
+                and self.raw.get("provider", "codex") == "codex"
+                else {}
+            ),
             "provider": self.raw.get("provider", "codex"),
             "source_path": str(source),
             "origin_url": actual_remote,
@@ -838,6 +917,11 @@ def scope_amended_spec(
     effective = amended.admit(
         {key: original[key] for key in submit_keys if key in original},
         legacy_attestation=original.get("preparation_version") != 1,
+        recorded_backend=(
+            original["policy"].get("execution_backend", "docker")
+            if original["provider"] == "codex"
+            else None
+        ),
     )
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
@@ -855,9 +939,19 @@ def scope_amended_spec(
 
         verify_prepared_spec(original)
         proof_path = Path(original["preparation"]["environment"]["path"])
-        effective = bind_prepared_spec(
-            effective, original["policy"]["container"], proof_path,
-            json.loads(proof_path.read_bytes()), reused=True,
-        )
+        if original["policy"].get("execution_backend") == "native-macos":
+            from .delivery_native_preparation import bind_native_spec
+
+            effective = bind_native_spec(
+                effective, original["policy"]["native_identity"], proof_path, reused=True
+            )
+        else:
+            effective = bind_prepared_spec(
+                effective,
+                original["policy"]["container"],
+                proof_path,
+                json.loads(proof_path.read_bytes()),
+                reused=True,
+            )
         verify_prepared_spec(effective)
     return effective

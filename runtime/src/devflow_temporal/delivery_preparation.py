@@ -690,6 +690,10 @@ def bind_prepared_spec(
 def verify_prepared_spec(spec: dict) -> None:
     if spec.get("preparation_version") != 1:
         return  # Existing recorded runs retain their original attestation contract.
+    if spec["policy"].get("execution_backend") == "native-macos":
+        from .delivery_native_preparation import verify_native_spec
+
+        return verify_native_spec(spec)
     prepared = spec.get("preparation")
     if not isinstance(prepared, dict) or prepared.get("schema") != SCHEMA:
         raise PreparationError("runtime preparation has not frozen this execution authority")
@@ -716,6 +720,10 @@ def verify_prepared_spec(spec: dict) -> None:
 def prepare_authority(store: Any, spec: dict) -> dict:
     if spec.get("preparation_version") != 1:
         return spec
+    if spec["policy"].get("execution_backend") == "native-macos":
+        from .delivery_native_preparation import prepare_native_authority
+
+        return prepare_native_authority(store, spec)
     root = Path(spec["state_dir"]).parents[1] / "preparation"
     with _lock(root):
         frozen = store.prepared_spec(spec["run_id"])

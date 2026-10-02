@@ -246,6 +246,18 @@ def confirmed_container_cleanup(spec: dict[str, Any]) -> None:
 
     if spec["provider"] != "codex":
         return
+    if spec["policy"].get("execution_backend") == "native-macos":
+        from .delivery_native_process import reconcile_process
+        from .delivery_resources import RunResources, read_private
+
+        resources = RunResources(spec)
+        manifest = read_private(resources.manifest)
+        for raw_path in manifest["processes"]:
+            if reconcile_process(Path(raw_path))["cleanup"] != "observed-native-confirmed":
+                raise ValueError("native process teardown is unknown")
+        if manifest.get("finalization", {}).get("resource_cleanup") != "confirmed":
+            raise ValueError("native temporary resource finalization is not confirmed")
+        return
     root = Path(spec["state_dir"]).resolve(strict=True)
     docker = spec["policy"]["container"]["docker_bin"]
     for path in root.rglob("container-intent.json"):

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 
 from .delivery_resources import read_private
@@ -25,9 +24,6 @@ def protected_commands(binary: str) -> tuple[Path, ...]:
         Path("/opt/homebrew/bin/codex"),
         Path("/usr/local/bin/codex"),
     }
-    located = shutil.which("codex")
-    if located:
-        paths.add(Path(located))
     return tuple(sorted(paths | {path.resolve() for path in paths}, key=str))
 
 
@@ -51,3 +47,10 @@ def validate_role_ancestry(request: dict) -> None:
     journal = read_private(folder / "native-process.json")
     if journal["phase"] != "authorized" or str(os.getpid()) not in journal["owned"]:
         raise ValueError("native role has no controller-authorized process identity")
+    from .delivery_native_process import process_table
+
+    if (
+        process_table().get(os.getpid(), {}).get("identity")
+        != journal["owned"][str(os.getpid())]["identity"]
+    ):
+        raise ValueError("native role process start identity changed")

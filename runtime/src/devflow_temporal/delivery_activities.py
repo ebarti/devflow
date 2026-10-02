@@ -111,6 +111,37 @@ async def delivery_intake(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@activity.defn(name="delivery_finalize_resources")
+async def delivery_finalize_resources(request: dict[str, Any]) -> dict[str, Any]:
+    def execute() -> dict[str, Any]:
+        from .delivery_resources import RunResources
+
+        _context(request["spec"], preparation_input=True)
+        if request["spec"].get("resource_cleanup_version") != 1:
+            raise ApplicationError("run has no resource finalization contract", non_retryable=True)
+        receipt = RunResources(request["spec"]).finalize(
+            request["outcome"], uncertain=request.get("uncertain", False)
+        )
+        if receipt.get("retryable"):
+            raise ApplicationError(
+                "owned temporary resource removal needs a bounded retry",
+                type="ResourceCleanupTransient",
+            )
+        return receipt
+
+    pending = asyncio.create_task(asyncio.to_thread(execute))
+    try:
+        while not pending.done():
+            if activity.in_activity():
+                activity.heartbeat(
+                    {"run_id": request["spec"]["run_id"], "stage": "finalizing_resources"}
+                )
+            await asyncio.wait({pending}, timeout=5)
+        return await pending
+    finally:
+        pending.cancel()
+
+
 @activity.defn(name="delivery_accept_plan")
 async def delivery_accept_plan(request: dict[str, Any]) -> dict[str, Any]:
     spec = request["spec"]
@@ -420,6 +451,7 @@ async def delivery_tracker(request: dict[str, Any]) -> dict[str, Any]:
 DELIVERY_ACTIVITIES = [
     delivery_project,
     delivery_prepare,
+    delivery_finalize_resources,
     delivery_intake,
     delivery_accept_plan,
     delivery_role,

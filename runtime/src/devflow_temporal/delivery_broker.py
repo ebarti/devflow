@@ -115,6 +115,12 @@ class DeliveryBroker:
                 raise RuntimeError("prepared checkout disappeared")
             return done
         self.checkout.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        resources = None
+        if self.spec.get("resource_cleanup_version") == 1:
+            from .delivery_resources import RunResources
+
+            resources = RunResources(self.spec)
+            resources.register(self.checkout, "checkout")
         if self.checkout.exists():
             if _git(self.checkout, "rev-parse", "--show-toplevel") != str(self.checkout):
                 raise RuntimeError("owned checkout path was replaced")
@@ -144,6 +150,8 @@ class DeliveryBroker:
                 str(self.checkout),
                 self.spec["base_sha"],
             )
+        if resources:
+            resources.created(self.checkout)
         recovery = self.spec["policy"].get("recovery")
         provenance = self._recover(recovery) if recovery else None
         candidate = self.candidate()
@@ -284,12 +292,21 @@ class DeliveryBroker:
         if role not in {"review", "verify"}:
             raise ValueError("only independent gates use gate checkouts")
         path = self.state_dir / "gates" / str(iteration) / role
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        resources = None
+        if self.spec.get("resource_cleanup_version") == 1:
+            from .delivery_resources import RunResources
+
+            resources = RunResources(self.spec)
+            resources.register(path, "gate")
         if path.exists():
             if _git(path, "rev-parse", "HEAD") != candidate["head"]:
                 raise RuntimeError("gate checkout head changed")
         else:
             path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             _git(self.source, "worktree", "add", "--detach", str(path), candidate["head"])
+        if resources:
+            resources.created(path)
         observed = candidate_for(path)
         if observed["id"] != candidate["id"]:
             raise RuntimeError("gate checkout does not match the published candidate")
@@ -487,8 +504,10 @@ class DeliveryBroker:
         results: list[dict[str, Any]] = []
         checkout = checkout.resolve(strict=True)
         evidence_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-        store_volume = self._ensure_dependency_store() if self.spec["provider"] == "codex" else None
-        git_metadata = self.git_metadata(candidate) if self.spec["provider"] == "codex" else None
+        native = self.spec["policy"].get("execution_backend") == "native-macos"
+        contained = self.spec["provider"] == "codex" and not native
+        store_volume = self._ensure_dependency_store() if contained else None
+        git_metadata = self.git_metadata(candidate) if contained else None
         for check in checks:
             argv = check.get("argv")
             relative = check.get("cwd", ".")
@@ -500,7 +519,53 @@ class DeliveryBroker:
                 or checkout not in (cwd, *cwd.parents)
             ):
                 raise ValueError("configured check command or cwd is invalid")
-            if self.spec["provider"] == "codex":
+            native_result = None
+            outcome = None
+            if self.spec["provider"] == "codex" and native:
+                from .delivery_native_process import NativeProcess
+                from .delivery_preparation import verify_prepared_spec
+                from .delivery_sandbox import prepare_native_check
+
+                verify_prepared_spec(self.spec)
+                profile, environment = prepare_native_check(
+                    self.spec, checkout, evidence_dir, check
+                )
+                dependencies = Path(environment["HOME"]) / "dependency-store"
+                dependencies.mkdir(mode=0o700, exist_ok=True)
+                generated = self._register_generated(checkout, ["node_modules"])
+                # Existing literal /store arguments name an owned native scratch
+                # directory; they never select a shared host package cache.
+                command = [str(dependencies) if item == "/store" else item for item in argv]
+                native_result = NativeProcess(
+                    self.spec,
+                    evidence_dir / check["id"] / "native",
+                    argv=[
+                        self.spec["policy"]["codex_bin"],
+                        "sandbox",
+                        "-P",
+                        profile,
+                        "-C",
+                        str(cwd),
+                        "--",
+                        *command,
+                    ],
+                    cwd=cwd,
+                    environment=environment,
+                    timeout=int(check.get("timeout_seconds", 600)),
+                    cancelled=self._native_cancelled,
+                ).run()
+                self._record_generated(generated)
+                if native_result["cleanup"] == "unknown":
+                    return {
+                        "state": "unknown",
+                        "cleanup": "unknown",
+                        "candidate_id": candidate["id"],
+                        "native_process": native_result,
+                    }
+                artifact = Path(native_result["log"])
+                output = artifact.read_text(encoding="utf-8", errors="replace")
+                exit_code = native_result["exit_code"]
+            elif contained:
                 if check.get("network_domains"):
                     raise ValueError("container checks cannot request host network domains")
                 container = OwnedContainer(
@@ -597,10 +662,16 @@ class DeliveryBroker:
                     "diagnostic": parsed_output[-2000:] if not passed else None,
                     "log": str(artifact),
                     "log_sha256": _sha256(artifact),
-                    "container_id": outcome.container_id
-                    if self.spec["provider"] == "codex"
-                    else None,
-                    "cleanup": outcome.cleanup if self.spec["provider"] == "codex" else "confirmed",
+                    "container_id": outcome.container_id if outcome else None,
+                    "cleanup": outcome.cleanup if outcome else "confirmed",
+                    **(
+                        {
+                            "process_cleanup": native_result["cleanup"],
+                            "native_process": native_result,
+                        }
+                        if native_result
+                        else {}
+                    ),
                 }
             )
             if not passed:
@@ -615,6 +686,36 @@ class DeliveryBroker:
             "candidate_id": candidate["id"],
             "source_unchanged": source_unchanged,
         }
+
+    def _native_cancelled(self) -> bool:
+        with self.store._connect() as db:
+            row = db.execute(
+                "SELECT phase FROM delivery_runs WHERE run_id=?", (self.spec["run_id"],)
+            ).fetchone()
+        return row is not None and row["phase"] == "cancelling"
+
+    def _register_generated(self, checkout: Path, names: list[str]) -> list[Path]:
+        from .delivery_resources import RunResources
+
+        resources = RunResources(self.spec)
+        roots = []
+        for name in names:
+            root = checkout / name
+            if _git(checkout, "ls-files", "--", name):
+                raise ValueError("configured generated directory contains tracked source")
+            if not root.parent.is_dir() or root.parent.resolve() != root.parent:
+                raise ValueError("generated directory parent is not a fixed candidate directory")
+            resources.register(root, "generated")
+            roots.append(root)
+        return roots
+
+    def _record_generated(self, roots: list[Path]) -> None:
+        from .delivery_resources import RunResources
+
+        resources = RunResources(self.spec)
+        for root in roots:
+            if os.path.lexists(root):
+                resources.created(root)
 
     def _ensure_dependency_store(self) -> str:
         """Fetch only lockfile metadata/tarballs, without any candidate script."""

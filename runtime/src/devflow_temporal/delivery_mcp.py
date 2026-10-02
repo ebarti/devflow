@@ -51,6 +51,9 @@ def build_server(config_path: Path) -> FastMCP:
 
 
 def main() -> None:
+    from .delivery_native_guard import reject_nested_controller
+
+    reject_nested_controller()
     parser = argparse.ArgumentParser(prog="devflow-delivery-mcp")
     parser.add_argument("--config", required=True, type=Path)
     args = parser.parse_args()

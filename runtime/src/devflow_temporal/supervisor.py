@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -59,10 +60,12 @@ class DeliverySupervisor:
         self.capacity = capacity
         self.job_locks: dict[str, asyncio.Lock] = {}
 
-    async def _acquire_capacity(self, job_key: str) -> None:
+    async def _acquire_capacity(self, job_key: str, *, cancelled=None) -> None:
         """Atomically claim one shared DB slot across config overlays and workers."""
 
         while True:
+            if cancelled is not None and cancelled():
+                raise ValueError("native role cancelled before capacity admission")
             with self.store._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 row = db.execute(
@@ -88,6 +91,37 @@ class DeliverySupervisor:
 
     def _claim(self, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         spec = request["spec"]
+        if spec["policy"].get("execution_backend") == "native-macos":
+            from .delivery_native_guard import reject_nested_controller
+
+            reject_nested_controller()
+            role, iteration = request["role"], request["iteration"]
+            maximum = (
+                spec["policy"].get("max_intake_rounds", 8) - 1
+                if role == "intake"
+                else spec["policy"].get("max_repairs", 2)
+            )
+            if role != "intake":
+                with self.store._connect() as db:
+                    grants = db.execute(
+                        """SELECT maximum_iteration FROM delivery_repair_grants WHERE run_id=?
+                           UNION ALL SELECT maximum_iteration FROM delivery_scope_amendments
+                             WHERE run_id=?
+                           UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_extensions
+                             WHERE run_id=?
+                           UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_thirds
+                             WHERE run_id=?
+                           UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_successors
+                             WHERE run_id=?""",
+                        (spec["run_id"],) * 5,
+                    ).fetchall()
+                maximum = max([maximum, *(row[0] for row in grants)])
+            if (
+                role not in spec["policy"]["roles"]
+                or type(iteration) is not int
+                or not 0 <= iteration <= maximum
+            ):
+                raise ValueError("native role exceeded the controller-owned finite turn limit")
         generation = request.get("attempt_generation", 0)
         if type(generation) is not int or generation not in (0, 1) or (
             generation and request["role"] != "implement"
@@ -169,6 +203,8 @@ class DeliverySupervisor:
         if request["spec"].get("provider") == "codex":
             lock = self.job_locks.setdefault(job_key, asyncio.Lock())
             async with lock:
+                if request["spec"]["policy"].get("execution_backend") == "native-macos":
+                    return await self._run_native(request, job_key)
                 return await self._run_contained(request, job_key)
         spec = request["spec"]
         folder = Path(spec["state_dir"]) / "attempts" / job_key
@@ -293,6 +329,128 @@ class DeliverySupervisor:
             raise
         finally:
             log.close()
+
+    async def _run_native(self, request: dict[str, Any], job_key: str) -> dict[str, Any]:
+        from .delivery_native_process import NativeProcess
+        from .delivery_preparation import verify_prepared_spec
+        from .delivery_resources import read_private, write_private
+
+        spec = request["spec"]
+        folder = Path(spec["state_dir"]) / "attempts" / job_key
+        result_path = folder / "result.json"
+        request_path = folder / "request.json"
+        native_request = {
+            **request,
+            "native_authorized": True,
+            "result_path": str(result_path),
+            "start_path": str(folder / "start.json"),
+        }
+        stopped = threading.Event()
+
+        def cancelled() -> bool:
+            if stopped.is_set():
+                return True
+            with self.store._connect() as db:
+                row = db.execute(
+                    "SELECT phase FROM delivery_runs WHERE run_id=?", (spec["run_id"],)
+                ).fetchone()
+            return row is not None and row["phase"] == "cancelling"
+
+        try:
+            verify_prepared_spec(spec)
+            with self.store._connect() as db:
+                row = db.execute(
+                    "SELECT state FROM delivery_attempts WHERE job_key=?", (job_key,)
+                ).fetchone()
+            if row["state"] == "queued":
+                await self._acquire_capacity(job_key, cancelled=cancelled)
+            elif not (folder / "native-process.json").is_file():
+                return self._mark_unknown(job_key, "native prelaunch identity gap")
+            _private_json(request_path, native_request)
+            _, environment = prepare_native_role(native_request, folder)
+            process = NativeProcess(
+                spec,
+                folder,
+                argv=[
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "devflow_temporal.role_runner",
+                    str(request_path),
+                ],
+                cwd=Path(request["workspace"]),
+                environment=environment,
+                timeout=int(spec["policy"]["roles"][request["role"]].get("timeout_seconds", 7200)),
+                cancelled=cancelled,
+            )
+            pending = asyncio.create_task(asyncio.to_thread(process.run))
+            try:
+                outcome = await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                stopped.set()
+                outcome = await asyncio.shield(pending)
+                self._mark_unknown(
+                    job_key,
+                    "native activity cancelled during provider work",
+                    cleanup="confirmed" if outcome["cleanup"] != "unknown" else "unknown",
+                )
+                raise
+            if outcome["cleanup"] == "unknown":
+                return self._mark_unknown(job_key, "native monitoring/provider outcome ambiguous")
+            if result_path.is_file():
+                result = read_private(result_path)
+            else:
+                reason = (
+                    "timeout"
+                    if outcome["timed_out"]
+                    else "cancelled"
+                    if outcome["cancelled"]
+                    else "missing_receipt"
+                )
+                result = {
+                    "status": "blocked",
+                    "summary": "native provider has no final receipt",
+                    "findings": ["provider outcome unknown; this attempt will not be repeated"],
+                    "session_id": None,
+                    "usage": None,
+                    "finish_reason": reason,
+                }
+            result.update(
+                cleanup="confirmed",
+                process_cleanup=outcome["cleanup"],
+                resource_cleanup="pending_workflow_finalization",
+                native_process=outcome,
+            )
+            journal = read_private(process.journal)
+            journal["provider_session"] = {
+                "session_id": result.get("session_id"),
+                "resumed_from": request.get("resume_session"),
+                "role": request["role"],
+                "iteration": request["iteration"],
+            }
+            write_private(process.journal, journal)
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    """UPDATE delivery_attempts SET state='finished',result_json=?,
+                       session_id=?,finished_at=?,cleanup='confirmed',pid=?,process_identity=?
+                       WHERE job_key=?""",
+                    (
+                        canonical_json(result),
+                        result.get("session_id"),
+                        _now(),
+                        next(iter(journal["owned"]), None),
+                        next(iter(journal["owned"].values()), {}).get("identity"),
+                        job_key,
+                    ),
+                )
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not (folder / "native-process.json").exists():
+                return self._mark_prelaunch_blocked(job_key, str(exc)[:300])
+            return self._mark_unknown(job_key, f"native launch failed: {type(exc).__name__}")
 
     async def _run_contained(self, request: dict[str, Any], job_key: str) -> dict[str, Any]:
         """Run one real role in a durable private PID namespace."""

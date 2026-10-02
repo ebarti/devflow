@@ -18,6 +18,7 @@ from .contracts import digest
 def private_directory(path: Path) -> None:
     if not path.parent.exists():
         private_directory(path.parent)
+    _ancestors(path)
     path.mkdir(mode=0o700, exist_ok=True)
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
@@ -30,6 +31,7 @@ def read_private(path: Path) -> dict:
         not stat.S_ISREG(info.st_mode)
         or info.st_uid != os.getuid()
         or info.st_mode & 0o777 != 0o600
+        or info.st_nlink != 1
     ):
         raise ValueError("resource evidence is not a private owned file")
     return json.loads(path.read_bytes())
@@ -117,8 +119,8 @@ class RunResources:
         self.manifest = self.root / "manifest.json"
         if not self.state.is_absolute() or self.state.name != spec["run_id"]:
             raise ValueError("resource registry is outside its run")
-        _ancestors(self.state)
         private_directory(self.root)
+        _ancestors(self.state)
 
     @contextmanager
     def locked(self):
@@ -153,6 +155,18 @@ class RunResources:
             valid = path == Path(self.spec["checkout"])
         elif kind == "gate":
             valid = path.is_relative_to(self.state / "gates") and path != self.state / "gates"
+        elif kind == "generated":
+            roots = [Path(self.spec["checkout"]), self.state / "gates" / "0" / "verify"]
+            allowed_names = {
+                "node_modules",
+                *(self.spec["policy"].get("browser_qa") or {}).get("artifact_paths", []),
+            }
+            valid = any(path == root / name for root in roots for name in allowed_names)
+            # Gate iterations are finite and owned by the configured controller.
+            for iteration in range(self.spec["policy"].get("max_repairs", 2) + 1):
+                for role in ("review", "verify"):
+                    root = self.state / "gates" / str(iteration) / role
+                    valid = valid or any(path == root / name for name in allowed_names)
         if not valid or not path.is_absolute() or ".." in path.parts:
             raise ValueError("resource root is outside its registered run boundary")
         _ancestors(path)
@@ -183,6 +197,7 @@ class RunResources:
             if entry.get("identity") not in (None, identity):
                 raise ValueError("resource identity changed after allocation")
             entry.update(identity=identity, state="created")
+            entry.pop("receipt", None)
             write_private(self.manifest, manifest)
 
     def scratch(self, kind: str, key: str) -> Path:
@@ -192,6 +207,17 @@ class RunResources:
         self.register(path, "transient")
         with self.locked() as manifest:
             entry = manifest["roots"][str(path)]
+            if not os.path.lexists(path) and entry.get("receipt", {}).get("state") in {
+                "removed",
+                "already_absent",
+            }:
+                # Separately authorized finite continuations retain sessions
+                # but allocate a fresh generation of transient scratch.
+                entry.update(
+                    identity=None, state="allocated", generation=entry.get("generation", 0) + 1
+                )
+                entry.pop("receipt", None)
+                write_private(self.manifest, manifest)
             if entry["identity"] is None:
                 path.mkdir(mode=0o700)
                 entry.update(identity=_identity(path), state="created")
@@ -230,7 +256,9 @@ class RunResources:
             manifest["finalization"] = {"outcome": outcome, "state": "running"}
             write_private(self.manifest, manifest)
             receipts = []
-            for raw_path, entry in manifest["roots"].items():
+            for raw_path, entry in sorted(
+                manifest["roots"].items(), key=lambda item: -len(Path(item[0]).parts)
+            ):
                 path = Path(raw_path)
                 receipt = {"path": raw_path, "kind": entry["kind"]}
                 try:
@@ -274,7 +302,9 @@ class RunResources:
                         receipt.update(state="removed")
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     receipt.update(
-                        state="failed_unknown", reason=f"{type(exc).__name__}: {str(exc)[:300]}"
+                        state="failed_unknown",
+                        reason=f"{type(exc).__name__}: {str(exc)[:300]}",
+                        retryable=isinstance(exc, (OSError, subprocess.TimeoutExpired)),
                     )
                 entry["receipt"] = receipt
                 write_private(self.manifest, manifest)
@@ -288,6 +318,7 @@ class RunResources:
                 "roots": receipts,
                 "processes": process_receipts,
                 "sessions_and_durable_evidence": "retained",
+                "retryable": any(item.get("retryable") for item in receipts),
             }
             manifest["finalization"] = result
             write_private(self.manifest, manifest)
@@ -311,6 +342,22 @@ class RunResources:
             return "dirty or untracked candidate source is preserved"
         if git("ls-files", "--others", "--ignored", "--exclude-standard"):
             return "ignored worktree data requires explicit preservation"
+        if Path("/usr/sbin/lsof").is_file():
+            observed = subprocess.run(
+                ["/usr/sbin/lsof", "-nP", "-F", "p", "+D", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if observed.returncode not in (0, 1):
+                raise ValueError("candidate process/open-file inspection is unavailable")
+            # macOS lsof can return 1 while reporting valid matches. Inspect
+            # its machine-readable identities, not just its exit status.
+            if any(
+                line.startswith("p") and line[1:].isdecimal()
+                for line in observed.stdout.splitlines()
+            ):
+                return "a live process still uses the candidate worktree"
         if kind == "gate":
             return None
         if outcome == "blocked":

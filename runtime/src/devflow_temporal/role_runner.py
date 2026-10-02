@@ -384,10 +384,14 @@ async def _run_fake(request: dict[str, Any]) -> dict[str, Any]:
 def main() -> int:
     request_path = Path(sys.argv[1])
     request = json.loads(request_path.read_text(encoding="utf-8"))
+    from .delivery_native_guard import validate_role_ancestry
+
+    validate_role_ancestry(request)
     start = Path(request["start_path"])
     output = Path(request["result_path"])
     _write_json(start, {"pid": os.getpid(), "started_at": datetime.now(UTC).isoformat()})
-    if request.get("container_authorized") is not True and sys.stdin.readline().strip() != "GO":
+    authorized = request.get("container_authorized") or request.get("native_authorized")
+    if not authorized and sys.stdin.readline().strip() != "GO":
         return 2
     try:
         result = asyncio.run(

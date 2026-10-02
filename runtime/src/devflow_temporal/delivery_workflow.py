@@ -76,11 +76,17 @@ class DeliveryWorkflow:
         automatic_preparation = (
             name == "delivery_prepare" and request["spec"].get("preparation_version") == 1
         )
+        resource_finalization = (
+            name == "delivery_finalize_resources"
+            and request["spec"].get("resource_cleanup_version") == 1
+        )
         options = {}
-        if automatic_preparation:
+        if automatic_preparation or resource_finalization:
             options = {
                 "heartbeat_timeout": timedelta(seconds=30),
-                "schedule_to_close_timeout": timedelta(hours=2),
+                "schedule_to_close_timeout": timedelta(minutes=10)
+                if resource_finalization
+                else timedelta(hours=2),
                 "retry_policy": RetryPolicy(
                     maximum_attempts=3,
                     initial_interval=timedelta(seconds=1),
@@ -142,6 +148,39 @@ class DeliveryWorkflow:
             delay = min(delay * 2, 30)
 
     async def _project(self, spec: dict[str, Any], event: str, message: str) -> None:
+        # Only newly admitted resource-aware inputs add this activity. Recorded
+        # legacy histories keep their original event/activity ordering on replay.
+        if (
+            event in {"delivered", "blocked", "cancelled"}
+            and spec.get("resource_cleanup_version") == 1
+        ):
+            try:
+                receipt = await self._activity(
+                    "delivery_finalize_resources",
+                    {
+                        "spec": spec,
+                        "outcome": self.state["outcome"],
+                        "uncertain": self.state.get("cleanup") == "unknown",
+                    },
+                )
+            except Exception as exc:
+                receipt = {
+                    "state": "unknown",
+                    "process_cleanup": "unknown",
+                    "resource_cleanup": "unknown",
+                    "reason": type(exc).__name__,
+                }
+            self.state["checks"]["resource_cleanup"] = receipt
+            if receipt["state"] != "confirmed":
+                self.state["cleanup"] = "unknown"
+                if event == "delivered":
+                    self.state.update(
+                        phase="blocked",
+                        execution_state="blocked",
+                        outcome="blocked",
+                        error="resource cleanup is unknown",
+                    )
+                    event, message = "blocked", "Resource cleanup requires recovery"
         await self._activity(
             "delivery_project",
             {
@@ -265,6 +304,11 @@ class DeliveryWorkflow:
                 return None
             intake = self.state["intake"]
             turn = intake["round"]
+            if spec.get("resource_cleanup_version") == 1 and turn >= spec["policy"].get(
+                "max_intake_rounds", 8
+            ):
+                await self._stop(spec, "intake exhausted the controller-owned finite turn limit")
+                return None
             self.state["phase"] = "investigating"
             self.state["revision"] += 1
             await self._project(spec, "intake_started", "Investigating the raw request")

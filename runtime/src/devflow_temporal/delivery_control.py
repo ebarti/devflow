@@ -413,6 +413,9 @@ async def worker(config: DeliveryConfig) -> None:
 
 
 def main() -> None:
+    from .delivery_native_guard import reject_nested_controller
+
+    reject_nested_controller()
     parser = argparse.ArgumentParser(prog="devflow-delivery")
     parser.add_argument("--config", required=True)
     parser.add_argument(

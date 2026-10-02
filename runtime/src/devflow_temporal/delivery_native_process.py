@@ -148,6 +148,8 @@ class NativeProcess:
         self.timeout, self.ports, self.cancelled = timeout, ports, cancelled
         private_directory(folder)
         self.journal = folder / "native-process.json"
+        if not self.journal.exists() and any(listeners(port) for port in ports):
+            raise ValueError("native fixture port belongs to another process")
         RunResources(spec).process(self.journal)
 
     def run(self) -> dict:

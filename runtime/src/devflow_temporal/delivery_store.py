@@ -4182,8 +4182,15 @@ class DeliveryStore:
         if unchanged != {key: value for key, value in submitted.items()
                          if key not in {"policy", "policy_digest"}}:
             raise ValueError("preparation changed the submitted run identity")
-        measured_fields = {"container", "host_sandbox", "kit_revision",
-                           "environment_proof_sha256", "security_binding_sha256"}
+        measured_fields = {
+            "container",
+            "host_sandbox",
+            "kit_revision",
+            "environment_proof_sha256",
+            "security_binding_sha256",
+        }
+        if submitted["policy"].get("execution_backend") == "native-macos":
+            measured_fields.update({"native_identity", "codex_bin_sha256"})
         original_authority = {
             key: value for key, value in submitted["policy"].items() if key not in measured_fields
         }
@@ -4194,11 +4201,12 @@ class DeliveryStore:
             raise ValueError("preparation changed repository or execution authority")
         configured_container = submitted["policy"]["container"]
         prepared_container = effective["policy"]["container"]
-        for key, default in (("memory", "2g"), ("cpus", "2"), ("pids_limit", 256)):
-            if prepared_container.get(key) != configured_container.get(key, default):
-                raise ValueError("preparation changed configured container limits")
-        if prepared_container.get("docker_bin") != configured_container.get("docker_bin"):
-            raise ValueError("preparation changed the configured Docker executable")
+        if submitted["policy"].get("execution_backend") != "native-macos":
+            for key, default in (("memory", "2g"), ("cpus", "2"), ("pids_limit", 256)):
+                if prepared_container.get(key) != configured_container.get(key, default):
+                    raise ValueError("preparation changed configured container limits")
+            if prepared_container.get("docker_bin") != configured_container.get("docker_bin"):
+                raise ValueError("preparation changed the configured Docker executable")
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
