@@ -363,6 +363,11 @@ def _boundary_passed(mode: str, observed: dict, ports: list[int]) -> bool:
         if role:
             if not _contained_denied(value.get("git_read")):
                 return False
+            if any(
+                not _contained_denied(value.get(key))
+                for key in ("temporary_write", "slash_tmp_write")
+            ):
+                return False
             if mode == "role-read" and not _contained_denied(value.get("workspace_write")):
                 return False
             if mode == "role-write" and value.get("workspace_write") != "ALLOWED":
@@ -478,7 +483,7 @@ def measure_environment(spec: dict, root: Path, fingerprint: str, identity: dict
         folder = state / mode / "boundary"
         _directory(folder)
         _write(folder / "protected-state", "SAFE")
-        output = "/rolehome/tmp/boundary.json" if mode.startswith("role") else f"/work/{mode}.json"
+        output = "/rolehome/boundary.json" if mode.startswith("role") else f"/work/{mode}.json"
         command = (
             "/usr/bin/python3",
             "/opt/devflow-runtime/src/devflow_temporal/preparation_probe.py",
@@ -493,7 +498,7 @@ def measure_environment(spec: dict, root: Path, fingerprint: str, identity: dict
         outcome = execution.run()
         if mode.startswith("role"):
             home = state / "role-homes" / ("intake/0" if mode == "role-read" else "implement")
-            observed_path = home / "tmp/boundary.json"
+            observed_path = home / "boundary.json"
         else:
             observed_path = checkout / f"{mode}.json"
         if outcome.exit_code != 0 or outcome.cleanup != "confirmed" or not observed_path.is_file():
@@ -521,9 +526,7 @@ def measure_environment(spec: dict, root: Path, fingerprint: str, identity: dict
     for mode in ("role-write", "check", "browser-qa"):
         folder = state / mode / "detached"
         _directory(folder)
-        heartbeat = (
-            "/rolehome/tmp/heartbeat" if mode.startswith("role") else f"/work/{mode}-heartbeat"
-        )
+        heartbeat = "/rolehome/heartbeat" if mode.startswith("role") else f"/work/{mode}-heartbeat"
         child = (
             "import pathlib,time\n"
             + f"p=pathlib.Path({heartbeat!r})\n"
@@ -538,7 +541,7 @@ def measure_environment(spec: dict, root: Path, fingerprint: str, identity: dict
         execution = _probe_container(probe, mode, folder, ("/usr/bin/python3", "-c", launcher))
         outcome = execution.run()
         heartbeat_path = (
-            state / "role-homes/implement/tmp/heartbeat"
+            state / "role-homes/implement/heartbeat"
             if mode.startswith("role")
             else checkout / f"{mode}-heartbeat"
         )

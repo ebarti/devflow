@@ -36,7 +36,7 @@ def bind(port: int) -> None:
 
 def checks(mode: str, protected: str, label: str, ports: list[int]) -> dict:
     role = mode.startswith("role")
-    allowed = Path("/rolehome/tmp") if role else Path("/work")
+    allowed = Path("/rolehome") if role else Path("/work")
     result = {
         "allowed_write": attempt(lambda: (allowed / f"allowed-{label}").write_text("SAFE"))
         == "ALLOWED",
@@ -54,6 +54,12 @@ def checks(mode: str, protected: str, label: str, ports: list[int]) -> dict:
             {
                 "copied_auth_read": attempt(lambda: open_only("/rolehome/codex/auth.json")),
                 "loopback": attempt(lambda: connect("127.0.0.1", 18931)),
+                "temporary_write": attempt(
+                    lambda: Path("/rolehome/tmp/probe-temporary").write_text("BREACH")
+                ),
+                "slash_tmp_write": attempt(
+                    lambda: Path("/tmp/probe-temporary").write_text("BREACH")
+                ),
             }
         )
     else:

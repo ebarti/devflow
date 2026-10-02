@@ -122,6 +122,8 @@ def _observed(mode, ports):
                 "copied_auth_read": "PermissionError:1",
                 "loopback": "PermissionError:1",
                 "git_read": "PermissionError:1",
+                "temporary_write": "PermissionError:1",
+                "slash_tmp_write": "PermissionError:1",
             }
         )
         if mode == "role-read":
