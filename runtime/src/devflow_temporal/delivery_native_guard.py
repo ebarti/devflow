@@ -1,0 +1,53 @@
+"""Controller-owned ancestry guard, alongside command sandbox executable denials."""
+
+from __future__ import annotations
+
+import os
+import shutil
+from pathlib import Path
+
+from .delivery_resources import read_private
+
+NATIVE_OVERRIDES = [
+    "features.plugins=false",
+    "features.multi_agent=false",
+    "agents.enabled=false",
+]
+
+
+def protected_commands(binary: str) -> tuple[Path, ...]:
+    runtime = Path(__file__).resolve().parents[2]
+    paths = {
+        Path(binary),
+        runtime / "src" / "devflow_temporal",
+        runtime / ".venv/bin/devflow-delivery",
+        runtime / ".venv/bin/devflow-delivery-mcp",
+        Path("/opt/homebrew/bin/codex"),
+        Path("/usr/local/bin/codex"),
+    }
+    located = shutil.which("codex")
+    if located:
+        paths.add(Path(located))
+    return tuple(sorted(paths | {path.resolve() for path in paths}, key=str))
+
+
+def reject_nested_controller() -> None:
+    if os.environ.get("DEVFLOW_MANAGED_DEPTH"):
+        raise ValueError("managed role children cannot create another Devflow controller or run")
+
+
+def validate_role_ancestry(request: dict) -> None:
+    if request["spec"]["policy"].get("execution_backend") != "native-macos":
+        return
+    if (
+        request.get("native_authorized") is not True
+        or os.environ.get("DEVFLOW_MANAGED_DEPTH") != "1"
+        or os.environ.get("DEVFLOW_NATIVE_PID") != str(os.getpid())
+    ):
+        raise ValueError("native role recursion or untrusted launch ancestry")
+    folder = Path(request["result_path"]).parent
+    if os.environ.get("DEVFLOW_NATIVE_JOURNAL") != str(folder / "native-process.json"):
+        raise ValueError("native role launch journal does not match its attempt")
+    journal = read_private(folder / "native-process.json")
+    if journal["phase"] != "authorized" or str(os.getpid()) not in journal["owned"]:
+        raise ValueError("native role has no controller-authorized process identity")
