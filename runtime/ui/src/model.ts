@@ -26,6 +26,7 @@ export interface RunSummary {
   issue_url?: string | null
   phase?: string | null
   execution_state?: string | null
+  execution_retired?: boolean | null
   updated_at?: string | null
   created_at?: string | null
   revision?: number | null

@@ -56,7 +56,7 @@ For browser/API QA, policy fixes one argv/cwd, two exact owned local ports, perm
 
 `recovery_key` imports only a configured manifest. `supersedes_run_id` can transfer an explicitly identified blocked unpublished predecessor to a new branch after closed Temporal result, claim, candidate, session and manifest validation. No session exists before a role. Post-role continuation carries the exact accepted plan and session data, regenerates credentials/permissions, and preserves predecessor history. A clean transient generation may be recreated for a separately authorized finite continuation while its durable session stays intact.
 
-Historical Docker run records and their evidence remain readable. Their execution and recovery paths are retired: mutation commands reject them before enqueueing work, and they are never silently resumed or migrated.
+Historical Docker run records and their evidence remain readable. Their execution and recovery paths are retired: mutation commands reject them before enqueueing work, pending or unknown historical outbox entries stay untouched, and they are never silently resumed or migrated. The dashboard labels these runs read-only and keeps saved questions and plans visible without response or cancellation controls.
 
 ## Lifecycle and public interfaces
 

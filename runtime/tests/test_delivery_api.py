@@ -73,7 +73,7 @@ async def test_idle_dispatch_reports_actual_temporal_health(monkeypatch):
         await service.dispatch_once()
     assert service.temporal_status == "disconnected"
     assert service._health_client is None
-    assert store.calls == 1
+    assert store.calls == 2
 
 
 @pytest.mark.asyncio

@@ -122,11 +122,15 @@ def run_binding(spec: dict) -> str:
     return digest({**{key: spec[key] for key in keys}, "policy": policy})
 
 
-def require_native_execution(spec: dict) -> None:
-    if (
+def execution_retired(spec: dict) -> bool:
+    return (
         spec.get("provider") == "codex"
         and spec.get("policy", {}).get("execution_backend") != "native-macos"
-    ):
+    )
+
+
+def require_native_execution(spec: dict) -> None:
+    if execution_retired(spec):
         raise PreparationError("Historical Docker execution is read-only and cannot be resumed")
 
 

@@ -12,6 +12,30 @@ import waitingDecisionProjection from './waiting-decision-projection.json'
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('dashboard commands', () => {
+  it.each(['question', 'plan'] as const)('keeps a retired nonterminal %s readable without action controls', kind => {
+    const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
+    const cancel = vi.spyOn(api, 'cancel').mockResolvedValue(undefined)
+    render(<RunDetails run={{
+      ...mockRun, execution_retired: true, outcome: null, execution_state: 'waiting',
+      decisions: [{ id: 'old-decision', revision: 1, kind, candidate_revision: 1,
+        plan_revision: 1, prompt: 'Saved historical prompt', options: ['proceed', 'cancel'], state: 'pending' }],
+      intake: { questions: [], answers: [], accepted_plan: null, plans: [
+        { revision: 1, digest: 'old-plan', state: 'proposed', content: {
+          scope: 'Saved historical plan', steps: ['Retained step'],
+          verification: ['Retained verification'], acceptance: ['Retained acceptance'],
+        } },
+      ] },
+    }} onRefresh={vi.fn()} />)
+    expect(screen.getByText('Saved historical prompt')).toBeTruthy()
+    expect(screen.getAllByText('Saved historical plan').length).toBeGreaterThan(0)
+    expect(screen.getByText('Historical run · read-only. Its execution backend is retired.')).toBeTruthy()
+    expect(screen.queryByRole('radio')).toBeNull()
+    expect(screen.queryByRole('textbox')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Submit|Accept|Cancel run|Request cancellation/ })).toBeNull()
+    expect(answer).not.toHaveBeenCalled()
+    expect(cancel).not.toHaveBeenCalled()
+  })
+
   it('submits a string option from the managed waiting-decision projection', async () => {
     // Mirrors DeliveryWorkflow's projected options and DeliveryStore.detail's public run shape.
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => waitingDecisionProjection })))

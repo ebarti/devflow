@@ -27,6 +27,7 @@ from temporalio.service import RPCError, RPCStatusCode
 from .contracts import digest
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
+from .delivery_preparation import execution_retired
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
 
@@ -107,13 +108,18 @@ class DeliveryService:
         return self._health_client
 
     async def dispatch_once(self) -> None:
-        client = await self.healthy_client()
         pending = self.store.pending_starts()
-        if not pending:
-            return
+        starts = []
         for item in pending:
-            recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
             spec = self.store.effective_spec(item["run_id"])
+            if not execution_retired(spec):
+                starts.append((item, spec))
+        # Retired outbox entries are historical data, including after an interrupted start.
+        if pending and not starts:
+            return
+        client = await self.healthy_client()
+        for item, spec in starts:
+            recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
             workflow_id = item["workflow_id"] or "delivery-" + spec["run_id"]
             handle = client.get_workflow_handle(workflow_id)
             try:
@@ -162,6 +168,13 @@ class DeliveryService:
             except Exception as exc:
                 self.temporal_status = "disconnected"
                 for item in self.store.pending_starts():
+                    try:
+                        spec = self.store.effective_spec(item["run_id"])
+                    except Exception:
+                        # Unknown authority cannot authorize an outbox acknowledgement.
+                        continue
+                    if execution_retired(spec):
+                        continue
                     self.store.mark_start(item["run_id"], accepted=False, error=type(exc).__name__)
             await asyncio.sleep(5)
 

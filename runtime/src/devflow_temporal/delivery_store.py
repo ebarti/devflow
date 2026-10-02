@@ -29,6 +29,7 @@ from .delivery_continuation import (
     selected_manifest,
     session_state_digest,
 )
+from .delivery_preparation import execution_retired
 
 
 def _now() -> str:
@@ -2612,6 +2613,14 @@ class DeliveryStore:
     @staticmethod
     def _compact(row: dict[str, Any]) -> dict[str, Any]:
         spec = json.loads(row["request_json"])
+        recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        effective = (
+            recovery.get("effective_spec", spec)
+            if isinstance(recovery, dict) and recovery.get("kind") == "scope_amendment"
+            else spec
+        )
+        if not isinstance(effective, dict):
+            effective = spec
         return {
             "id": row["run_id"],
             "run_id": row["run_id"],
@@ -2622,6 +2631,7 @@ class DeliveryStore:
             "repository": row["repository_key"],
             "phase": row["phase"],
             "execution_state": row["execution_state"],
+            "execution_retired": execution_retired(spec) or execution_retired(effective),
             "updated_at": row["updated_at"],
             # Public command revisions follow Temporal's deterministic
             # protocol. The SQLite projection has an independent sequence.

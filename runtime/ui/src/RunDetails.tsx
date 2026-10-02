@@ -153,7 +153,7 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
   const valid = Boolean(answerText) && (decision.kind !== 'plan' || choice !== 'change' || Boolean(freeText.trim()))
 
   async function answer() {
-    if (!valid || run.protocol_revision == null || decision.candidate_revision == null || busy || stale) return
+    if (run.execution_retired || !valid || run.protocol_revision == null || decision.candidate_revision == null || busy || stale) return
     setBusy(true); setError('')
     try {
       await api.answer(run.id, {
@@ -177,7 +177,7 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
     <p>{decision.prompt}</p>
     {plan ? <div className="intake-plan"><h3>Scope</h3><p>{plan.scope}</p><h3>Steps</h3><ol>{plan.steps.map((item, index) => <li key={index}>{item}</li>)}</ol><h3>Verification</h3><ul>{plan.verification.map((item, index) => <li key={index}>{item}</li>)}</ul><h3>Acceptance</h3><ul>{plan.acceptance.map((item, index) => <li key={index}>{item}</li>)}</ul></div> : null}
     {decision.candidate_revision != null ? <p className="subtle">Candidate revision {decision.candidate_revision}</p> : null}
-    <fieldset disabled={busy || stale}>
+    {run.execution_retired ? <p className="subtle">Saved decision · read-only</p> : <><fieldset disabled={busy || stale}>
       <legend className="sr-only">Choose a response</legend>
       {decision.options.map(option => {
         const value = typeof option === 'string' ? option : option.value
@@ -192,6 +192,7 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
     {decision.kind === 'question' || (decision.kind === 'plan' && choice === 'change') ? <label className="field-wide">{decision.kind === 'question' ? 'Your answer (or choose a suggestion)' : 'What should change in the plan?'}<textarea value={freeText} onChange={event => { setFreeText(event.target.value); if (decision.kind === 'question') setChoice(''); setCommandId(crypto.randomUUID()) }} rows={3} maxLength={4000} disabled={busy || stale} /></label> : null}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
     <button className="primary-button" type="button" disabled={!valid || busy || stale || run.protocol_revision == null || decision.candidate_revision == null} onClick={() => void answer()}>{busy ? 'Submitting…' : decision.kind === 'plan' && choice === 'proceed' ? 'Accept this plan' : decision.kind === 'question' ? 'Submit answer' : decision.kind === 'plan' ? 'Submit plan response' : 'Submit decision'}</button>
+    </>}
   </section>
 }
 
@@ -218,7 +219,7 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  if (run.outcome != null || ['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')) return null
+  if (run.execution_retired || run.outcome != null || ['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')) return null
   async function cancel() {
     if (!reason.trim() || run.protocol_revision == null) return
     setBusy(true); setError('')
@@ -247,6 +248,7 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
       <h1>{display(run.title || run.goal, 'Untitled run')}</h1>
       <div className="run-heading__meta"><span>{display(run.repository || run.repository_key, 'Repository unknown')}</span><span className="meta-separator" aria-hidden="true" />{issueUrl ? <a href={issueUrl} target="_blank" rel="noopener noreferrer">{display(run.issue, 'Issue')} <ExternalIcon /></a> : <span>{display(run.issue, 'Issue unknown')}</span>}<span className="meta-separator" aria-hidden="true" /><span>ID: {display(run.work_id || run.id)}</span></div>
     </header>
+    {run.execution_retired ? <p className="inline-alert">Historical run · read-only. Its execution backend is retired.</p> : null}
     {run.error ? <p className="inline-alert" role="alert">{run.error}</p> : null}
     <PhaseStrip gates={run.phase_gates} />
     {decisions.map(decision => <DecisionCard key={`${decision.id}:${decision.revision}`} run={run} decision={decision} onRefresh={onRefresh} />)}
