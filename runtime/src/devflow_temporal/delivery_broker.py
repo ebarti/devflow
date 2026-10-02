@@ -511,6 +511,12 @@ class DeliveryBroker:
         native = self.spec["policy"].get("execution_backend") == "native-macos"
         contained = self.spec["provider"] == "codex" and not native
         store_volume = self._ensure_dependency_store() if contained else None
+        native_dependencies = (
+            self._ensure_native_dependency_store(checkout)
+            if self.spec["provider"] == "codex" and native
+            and any("/store" in check["argv"] for check in checks)
+            else None
+        )
         git_metadata = self.git_metadata(candidate) if contained else None
         for check in checks:
             argv = check.get("argv")
@@ -532,14 +538,17 @@ class DeliveryBroker:
 
                 verify_prepared_spec(self.spec)
                 profile, environment = prepare_native_check(
-                    self.spec, checkout, evidence_dir, check
+                    self.spec, checkout, evidence_dir, check,
+                    dependency_store=(
+                        Path(native_dependencies["store"]) if native_dependencies else None
+                    ),
                 )
-                dependencies = Path(environment["HOME"]) / "dependency-store"
-                dependencies.mkdir(mode=0o700, exist_ok=True)
                 generated = self._register_generated(checkout, ["node_modules"])
-                # Existing literal /store arguments name an owned native scratch
-                # directory; they never select a shared host package cache.
-                command = [str(dependencies) if item == "/store" else item for item in argv]
+                # The same frozen lock populates an owned store before offline
+                # installation. Candidate commands may read, never mutate it.
+                command = [
+                    native_dependencies["store"] if item == "/store" else item for item in argv
+                ]
                 native_result = NativeProcess(
                     self.spec,
                     evidence_dir / check["id"] / "native",
@@ -672,6 +681,7 @@ class DeliveryBroker:
                         {
                             "process_cleanup": native_result["cleanup"],
                             "native_process": native_result,
+                            "dependency_preparation": native_dependencies,
                         }
                         if native_result
                         else {}
@@ -720,6 +730,75 @@ class DeliveryBroker:
         for root in roots:
             if os.path.lexists(root):
                 resources.created(root)
+
+    def _ensure_native_dependency_store(self, checkout: Path) -> dict[str, Any]:
+        """Fetch frozen registry data without exposing candidate setup or credentials."""
+        from .delivery_native_dependencies import REGISTRY, frozen_pnpm_inputs, write_frozen_inputs
+        from .delivery_native_process import NativeProcess
+        from .delivery_preparation import verify_prepared_spec
+        from .delivery_resources import RunResources, private_directory, read_private, write_private
+        from .delivery_sandbox import prepare_native_check
+
+        verify_prepared_spec(self.spec)
+        manager, inputs = frozen_pnpm_inputs(self.spec, checkout)
+        resources = RunResources(self.spec)
+        scratch = resources.scratch("dependencies", self.spec["policy_digest"])
+        transient = read_private(resources.manifest)["roots"][str(self.state_dir / "transient")]
+        generation = transient.get("generation", 0)
+        folder = self.state_dir / "dependency-preparation" / f"native-{generation}"
+        staging = scratch / "staging"
+        dependencies = staging / "store"
+        for path in (folder, staging, dependencies):
+            private_directory(path)
+        hashes = write_frozen_inputs(staging, inputs)
+        receipt = folder / "receipt.json"
+        identity = {"device": dependencies.stat().st_dev, "inode": dependencies.stat().st_ino}
+        request = {
+            "base_sha": self.spec["base_sha"], "policy_digest": self.spec["policy_digest"],
+            "package_manager": manager, "input_hashes": hashes, "registry": REGISTRY,
+            "store": str(dependencies), "store_identity": identity, "generation": generation,
+        }
+        if receipt.exists():
+            observed = read_private(receipt)
+            if observed["request"] != request or observed["state"] != "passed":
+                raise ValueError("native frozen dependency preparation conflicts with its receipt")
+            observed.update(receipt=str(receipt), receipt_sha256=_sha256(receipt))
+            return observed
+        profile, environment = prepare_native_check(
+            self.spec, staging, folder,
+            {"id": "pnpm-fetch", "network_domains": [REGISTRY]},
+        )
+        environment.update({
+            "COREPACK_ENABLE_NETWORK": "0", "npm_config_registry": "https://" + REGISTRY + "/",
+        })
+        process = NativeProcess(
+            self.spec, folder / "process",
+            argv=[
+                self.spec["policy"]["codex_bin"], "sandbox", "-P", profile, "-C", str(staging),
+                "--", "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
+                "--ignore-pnpmfile", "--store-dir", str(dependencies),
+            ],
+            cwd=staging, environment=environment, timeout=1800, cancelled=self._native_cancelled,
+        ).run()
+        unchanged = hashes == write_frozen_inputs(staging, inputs)
+        passed = (
+            process["exit_code"] == 0
+            and process["cleanup"] == "observed-native-confirmed" and unchanged
+        )
+        result = {
+            **request, "request": request,
+            "state": "passed" if passed else "failed",
+            "native_process": process, "log": process["log"],
+            "log_sha256": _sha256(Path(process["log"])),
+            "candidate_setup_executed": False,
+            "network_authority": "registry.npmjs.org fetch only; candidate checks remain offline",
+        }
+        write_private(receipt, result)
+        result.update(receipt=str(receipt), receipt_sha256=_sha256(receipt))
+        if result["state"] != "passed":
+            diagnostic = visible_output(Path(process["log"]).read_text(errors="replace"))[-1200:]
+            raise RuntimeError("credential-free native frozen lockfile fetch failed: " + diagnostic)
+        return result
 
     def _ensure_dependency_store(self) -> str:
         """Fetch only lockfile metadata/tarballs, without any candidate script."""

@@ -427,7 +427,8 @@ def prepare_native_role(
 
 
 def prepare_native_check(
-    spec: dict[str, Any], checkout: Path, evidence_dir: Path, check: dict[str, Any]
+    spec: dict[str, Any], checkout: Path, evidence_dir: Path, check: dict[str, Any],
+    *, dependency_store: Path | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Run candidate-controlled check commands in a separate credential-free profile."""
 
@@ -458,6 +459,7 @@ def prepare_native_check(
         extra_read=(
             toolchain_roots
             + ((Path(cache),) if cache else ())
+            + ((dependency_store,) if dependency_store else ())
             + (
                 (Path(sys.base_prefix),)
                 if spec["policy"].get("execution_backend") == "native-macos"
