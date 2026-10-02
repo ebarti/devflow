@@ -8,11 +8,10 @@ version = "0.1.0"
 description = "Experimental local Temporal runtime for Devflow"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-  "agent-runtime-kit==0.5.2",
+  "agent-runtime-kit[codex]==0.5.2",
   "fastapi==0.141.1",
   "mcp==1.30.0",
-  "openai-codex==0.160.0",
-  "openai-codex-cli-bin==0.160.0",
+  "openai-codex==0.157.1",
   "temporalio>=1.20,<2",
   "uvicorn==0.54.0",
 ]

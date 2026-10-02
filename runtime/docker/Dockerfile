@@ -13,9 +13,9 @@ RUN mkdir -p "$COREPACK_HOME" \
     && chmod -R a+rX "$COREPACK_HOME"
 RUN python3 -m venv /opt/devflow-venv \
     && /opt/devflow-venv/bin/pip install --no-cache-dir \
-      'agent-runtime-kit @ git+https://github.com/ebarti/agent-runtime-kit.git@d9ed6e186ce028d0db3b044ce959a94f409510c5' \
-      'openai-codex==0.160.0' \
-      'openai-codex-cli-bin==0.160.0'
+      'agent-runtime-kit[codex] @ git+https://github.com/ebarti/agent-runtime-kit.git@d9ed6e186ce028d0db3b044ce959a94f409510c5' \
+      'openai-codex==0.157.1' \
+      'openai-codex-cli-bin==0.157.1'
 RUN mkdir -p /store /deps && chown 501:20 /store /deps
 
 COPY runtime/src /opt/devflow-runtime/src
@@ -34,4 +34,4 @@ LABEL devflow.role_runner_sha256="$ROLE_RUNNER_SHA256" \
       devflow.codex_bin_sha256="$CODEX_BIN_SHA256" \
       devflow.dockerfile_sha256="$DOCKERFILE_SHA256" \
       devflow.kit_revision="d9ed6e186ce028d0db3b044ce959a94f409510c5" \
-      devflow.codex_cli_version="0.160.0"
+      devflow.codex_cli_version="0.157.1"

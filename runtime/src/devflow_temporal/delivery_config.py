@@ -22,8 +22,7 @@ from .payload import payload_digest
 BRANCH_RE = re.compile(r"^(?:feat|fix|docs|chore)/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CHECK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-LEGACY_CODEX_VERSION = "0.157.1"
-REQUIRED_CODEX_VERSION = "0.160.0"
+REQUIRED_CODEX_VERSION = "0.157.1"
 BOUNDARY_DENIAL_FIELDS = (
     "copied_auth_read",
     "host_credential_read",
@@ -124,9 +123,7 @@ def _contained_probe_passed(observed: Any, *, role: bool) -> bool:
     )
 
 
-def _container_identity(
-    container: dict[str, Any], *, source: Path, required_codex_version: str | None = None
-) -> dict[str, Any]:
+def _container_identity(container: dict[str, Any], *, source: Path) -> dict[str, Any]:
     """Inspect the exact image, CLI launch chain and security profile."""
 
     required = {
@@ -205,11 +202,6 @@ def _container_identity(
     except (ValueError, IndexError, KeyError, TypeError) as exc:
         raise ValueError("container image inspection is malformed") from exc
     labels = image.get("Config", {}).get("Labels") or {}
-    version = required_codex_version or container.get("codex_cli_version", LEGACY_CODEX_VERSION)
-    if version not in {LEGACY_CODEX_VERSION, REQUIRED_CODEX_VERSION} or (
-        "codex_cli_version" in container and container["codex_cli_version"] != version
-    ):
-        raise ValueError("container Codex version differs from its recorded contract")
     if (
         len(values) != 1
         or image.get("Id") != container["image_id"]
@@ -218,7 +210,7 @@ def _container_identity(
         or labels.get("devflow.runtime_payload_sha256") != container["runtime_payload_sha256"]
         or labels.get("devflow.codex_bin_sha256") != container["codex_bin_sha256"]
         or labels.get("devflow.kit_revision") != "d9ed6e186ce028d0db3b044ce959a94f409510c5"
-        or labels.get("devflow.codex_cli_version") != version
+        or labels.get("devflow.codex_cli_version") != REQUIRED_CODEX_VERSION
         or container["codex_bin"]
         != "/opt/devflow-venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex"
     ):
@@ -511,9 +503,7 @@ class DeliveryConfig:
                         "sandbox attestation is unavailable; prepare a fresh exact per-run "
                         "boundary attestation before submitting"
                     ) from exc
-                container_identity = _container_identity(
-                    policy["container"], source=source, required_codex_version=LEGACY_CODEX_VERSION
-                )
+                container_identity = _container_identity(policy["container"], source=source)
             else:
                 validate_preparation_inputs(policy["container"])
                 policy["host_sandbox"] = "native-profile"
@@ -714,8 +704,8 @@ class DeliveryConfig:
                     != "Docker private PID namespace with Codex native role permissions"
                     or attestation.get("container_identity") != container_identity
                     or attestation.get("kit_revision") != kit_revision
-                    or attestation.get("codex_sdk_version") != LEGACY_CODEX_VERSION
-                    or attestation.get("codex_cli_version") != LEGACY_CODEX_VERSION
+                    or attestation.get("codex_sdk_version") != REQUIRED_CODEX_VERSION
+                    or attestation.get("codex_cli_version") != REQUIRED_CODEX_VERSION
                     or attestation.get("source_hashes") != source_hashes
                     or attestation.get("security_binding_sha256") != security_digest
                     or attestation.get("requested_model") != policy["roles"]["implement"]["model"]
