@@ -97,7 +97,7 @@ def main() -> None:
         print(json.dumps(observed, sort_keys=True))
         return
     child = subprocess.run(
-        [sys.executable, "-m", "devflow_temporal.preparation_probe", *sys.argv[1:], "--child"],
+        [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--child"],
         capture_output=True,
         text=True,
         check=False,

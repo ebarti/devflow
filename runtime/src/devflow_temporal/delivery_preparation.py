@@ -478,8 +478,7 @@ def measure_environment(spec: dict, root: Path, fingerprint: str, identity: dict
         output = "/rolehome/tmp/boundary.json" if mode.startswith("role") else f"/work/{mode}.json"
         command = (
             "/usr/bin/python3",
-            "-m",
-            "devflow_temporal.preparation_probe",
+            "/opt/devflow-runtime/src/devflow_temporal/preparation_probe.py",
             mode,
             "--protected",
             str(protected),
