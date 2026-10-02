@@ -268,6 +268,7 @@ def main() -> None:
         ["git", "init", "-q"],
         ["git", "config", "user.name", "Fixture"],
         ["git", "config", "user.email", "fixture@example.invalid"],
+        ["git", "config", "commit.gpgSign", "false"],
         ["git", "add", "."],
         ["git", "commit", "-qm", "Disposable fixture"],
     ):
