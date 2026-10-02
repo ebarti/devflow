@@ -140,6 +140,13 @@ def _observed(mode, ports):
     return {**parent, "child": dict(parent), "child_returncode": 0}
 
 
+def test_read_only_bind_denial_does_not_count_as_a_writable_role_positive():
+    observed = _observed("role-read", [18931, 18932])
+    observed["workspace_write"] = observed["child"]["workspace_write"] = "OSError:30"
+    assert preparation._boundary_passed("role-read", observed, [18931, 18932])
+    assert not preparation._boundary_passed("role-write", observed, [18931, 18932])
+
+
 @pytest.fixture
 def measured_environment(monkeypatch):
     state = {

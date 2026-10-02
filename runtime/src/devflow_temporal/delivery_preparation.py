@@ -368,7 +368,10 @@ def _boundary_passed(mode: str, observed: dict, ports: list[int]) -> bool:
                 for key in ("temporary_write", "slash_tmp_write")
             ):
                 return False
-            if mode == "role-read" and not _contained_denied(value.get("workspace_write")):
+            if mode == "role-read" and not (
+                _contained_denied(value.get("workspace_write"))
+                or value.get("workspace_write") == "OSError:30"
+            ):
                 return False
             if mode == "role-write" and value.get("workspace_write") != "ALLOWED":
                 return False
