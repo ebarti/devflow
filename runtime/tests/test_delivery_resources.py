@@ -334,3 +334,44 @@ def test_finite_continuation_allocates_fresh_scratch_and_preserves_session(tmp_p
         == 1
     )
     assert resources.finalize("blocked")["state"] == "confirmed"
+
+
+def test_removed_generated_gate_retry_and_reallocation_reject_symlink_ancestor(tmp_path):
+    owned, resources, source, checkout = owned_worktree(tmp_path)
+    owned["policy"].update(max_repairs=1, browser_qa={"artifact_paths": ["qa-artifacts"]})
+    gate = Path(owned["state_dir"]) / "gates/2/verify"
+    gate.parent.mkdir(parents=True)
+
+    def create_gate():
+        resources.register(gate, "gate")
+        subprocess.run(
+            ["git", "-C", str(source), "worktree", "add", "--detach", str(gate)],
+            check=True,
+            capture_output=True,
+        )
+        resources.created(gate)
+        for name in ("node_modules", "qa-artifacts"):
+            path = gate / name
+            resources.register(path, "generated")
+            path.mkdir()
+            path.joinpath("temporary").write_text("owned")
+            resources.created(path)
+
+    create_gate()
+    first = resources.finalize("blocked")
+    assert first["state"] == "confirmed" and checkout.exists() and not gate.exists()
+    retry = resources.finalize("blocked")
+    assert retry["state"] == "confirmed"
+    assert all(
+        item["state"] == "already_absent" for item in retry["roots"] if item["kind"] != "checkout"
+    )
+    create_gate()  # a new authorized generation uses the registered owned path
+    assert read_private(resources.manifest)["roots"][str(gate)]["generation"] == 1
+    assert resources.finalize("blocked")["state"] == "confirmed" and not gate.exists()
+    sentinel = tmp_path / "unrelated-sentinel"
+    sentinel.mkdir()
+    sentinel.joinpath("precious").write_text("SAFE")
+    gate.parent.rmdir()
+    gate.parent.symlink_to(sentinel, target_is_directory=True)
+    assert resources.finalize("blocked")["state"] == "unknown"
+    assert sentinel.joinpath("precious").read_text() == "SAFE"

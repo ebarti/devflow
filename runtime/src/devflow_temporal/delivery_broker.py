@@ -291,6 +291,10 @@ class DeliveryBroker:
     def gate_checkout(self, role: str, iteration: int, candidate: dict[str, Any]) -> Path:
         if role not in {"review", "verify"}:
             raise ValueError("only independent gates use gate checkouts")
+        if self.spec["policy"].get("execution_backend") == "native-macos":
+            from .delivery_native_guard import validate_native_turn
+
+            validate_native_turn(self.spec, role, iteration, self.store)
         path = self.state_dir / "gates" / str(iteration) / role
         path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         resources = None
@@ -822,6 +826,10 @@ class DeliveryBroker:
         return volume
 
     def run_prechecks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
+        if self.spec["policy"].get("execution_backend") == "native-macos":
+            from .delivery_native_guard import validate_native_turn
+
+            validate_native_turn(self.spec, "implement", iteration, self.store)
         if self.candidate() != candidate:
             raise ValueError("prepublication candidate is stale")
         return self._run_check_list(

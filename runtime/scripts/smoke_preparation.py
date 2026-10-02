@@ -162,8 +162,7 @@ async def managed_resume_qa(config_path: Path, output: Path) -> dict:
     ):
         raise RuntimeError("managed kit initial native turn failed")
     tool_names = [str(call.get("tool_name", "")) for call in first.get("tool_calls", [])]
-    if any("spawn" in name or "agent" in name for name in tool_names):
-        raise RuntimeError("built-in agent recursion was not disabled")
+    observation = first.get("native_thread_observation", {})
     duplicate = await supervisor.run(request)
     if duplicate != first:
         raise RuntimeError("duplicate managed request changed its completed receipt")
@@ -186,6 +185,14 @@ async def managed_resume_qa(config_path: Path, output: Path) -> dict:
     ):
         raise RuntimeError("managed same-session native resume did not preserve context/source")
     for result in (first, second):
+        threads = result.get("native_thread_observation", {})
+        if (
+            threads.get("state") != "confirmed"
+            or threads.get("raw_turn_items") is None
+            or threads.get("collaboration_items") != []
+            or threads.get("new_child_thread_ids") != []
+        ):
+            raise RuntimeError("complete native SDK collaboration/thread observation is required")
         if (
             result.get("requested_model") != "gpt-6.1-sol"
             or result.get("requested_effort") != "max"
@@ -201,7 +208,10 @@ async def managed_resume_qa(config_path: Path, output: Path) -> dict:
         "builtin_spawn_attempt_requested": True,
         "builtin_spawn_summary": first["summary"],
         "vendor_observed_tool_names": tool_names,
-        "builtin_spawn_calls": 0,
+        "builtin_collaboration_items": len(observation["collaboration_items"]),
+        "new_child_provider_threads": observation["new_child_thread_ids"],
+        "native_thread_observation": observation,
+        "resumed_native_thread_observation": second["native_thread_observation"],
         "requested_model": "gpt-6.1-sol",
         "requested_effort": "max",
         "reported_model": None,

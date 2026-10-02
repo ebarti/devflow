@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import time
 from importlib.metadata import distribution
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from temporalio import activity, workflow
@@ -25,8 +27,9 @@ from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_guard import NATIVE_OVERRIDES
 from devflow_temporal.delivery_native_preparation import _measure, native_identity
+from devflow_temporal.delivery_native_threads import NativeThreadObservation
 from devflow_temporal.delivery_preparation import prepare_authority, verify_prepared_spec
-from devflow_temporal.delivery_resources import RunResources
+from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 from devflow_temporal.runtime_dependencies import locked_dependency_identity
@@ -166,6 +169,146 @@ def test_actual_native_preparation_cache_and_check_cleanup(native_store, monkeyp
     verify_prepared_spec(second)  # shared proof references retained durable evidence
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="actual native grant/check boundary required")
+def test_authorized_gate_beyond_original_budget_runs_check_then_retries_cleanup(
+    native_configuration,
+):
+    config, request = native_configuration
+    repo = config.raw["repositories"]["fixture"]
+    source = Path(repo["source_path"])
+    source.joinpath(".gitignore").write_text("node_modules/\n")
+    subprocess.run(["git", "-C", str(source), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-qm", "owned dependency fixture"], check=True
+    )
+    repo["expected_base_sha"] = subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    for stage in ("checks", "prepublish_checks"):
+        repo[stage][0]["argv"][-1] = (
+            "import pathlib; pathlib.Path('node_modules').mkdir(); "
+            "pathlib.Path('node_modules/temporary').write_text('owned'); print('2 passed')"
+        )
+    config.path.write_text(json.dumps(config.raw))
+    store = DeliveryStore(config)
+    store.submit(request)
+    prepared = prepare_authority(store, store.submitted_spec(request["run_id"]))
+    broker = DeliveryBroker(store, prepared)
+    candidate = broker.prepare()["candidate"]
+    role = {"spec": prepared, "role": "implement", "iteration": 2, "candidate": candidate}
+    with pytest.raises(ValueError, match="finite turn limit"):
+        DeliverySupervisor(store, capacity=1)._claim(role)
+    with pytest.raises(ValueError, match="finite turn limit"):
+        broker.run_checks(2, candidate)
+    gate = Path(prepared["state_dir"]) / "gates/2/verify"
+    assert not gate.exists()
+    with store._connect() as db:
+        db.execute(
+            """INSERT INTO delivery_repair_grants VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                request["run_id"],
+                "controlled-native-grant",
+                "fixture",
+                "fixture",
+                "0" * 64,
+                1,
+                2,
+                "2026-10-02T00:00:00Z",
+            ),
+        )
+    result = broker.run_checks(2, candidate)
+    assert result["state"] == "passed" and (gate / "node_modules/temporary").is_file()
+    resources = RunResources(prepared)
+    assert resources.finalize("delivered")["state"] == "confirmed"
+    assert not gate.exists() and not Path(prepared["checkout"]).exists()
+    assert resources.finalize("delivered")["state"] == "confirmed"
+    assert Path(result["results"][0]["log"]).is_file()
+
+
+@pytest.mark.asyncio
+async def test_native_observer_detects_sdk_spawn_item_dropped_by_kit_audit(tmp_path):
+    from agent_runtime_kit.adapters.codex import _tool_audits
+    from openai_codex.generated.v2_all import CollabAgentToolCallThreadItem, ThreadItem
+
+    folder = tmp_path / "attempt"
+    folder.mkdir()
+    write_private(
+        folder / "native-process.json",
+        {"owned": {str(os.getpid()): {"identity": "controlled identity"}}},
+    )
+    observation = NativeThreadObservation(
+        {
+            "result_path": str(folder / "result.json"),
+            "spec": {"run_id": "fixture"},
+            "role": "implement",
+            "iteration": 0,
+        }
+    )
+    calls = []
+    inventory = []
+
+    class Client:
+        async def thread_list(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                data=[SimpleNamespace(id=name) for name in inventory], next_cursor=None
+            )
+
+    client = Client()
+    await observation.begin(client)
+    observation.started("parent")
+    assert read_private(observation.path)["parent_thread_id"] == "parent"
+    item = ThreadItem(
+        CollabAgentToolCallThreadItem(
+            agentsStates={},
+            id="spawn-event",
+            receiverThreadIds=["child"],
+            senderThreadId="parent",
+            status="completed",
+            tool="spawnAgent",
+            type="collabAgentToolCall",
+        )
+    )
+    assert _tool_audits([item]) == []  # original filtered-audit false-negative trigger
+    inventory.extend(["parent", "child"])
+    await observation.completed(client, SimpleNamespace(items=[item]))
+    assert observation.reference()["state"] == "blocked"
+    assert observation.data["new_child_thread_ids"] == ["child"]
+    assert observation.data["collaboration_items"][0]["tool"] == "spawnAgent"
+    assert all(
+        any(kind.value == "subAgentThreadSpawn" for kind in call["source_kinds"]) for call in calls
+    )
+    assert {call["archived"] for call in calls} == {True, False}
+
+
+@pytest.mark.asyncio
+async def test_native_observer_incomplete_inventory_cannot_claim_zero_children(tmp_path):
+    folder = tmp_path / "attempt"
+    folder.mkdir()
+    write_private(
+        folder / "native-process.json",
+        {"owned": {str(os.getpid()): {"identity": "controlled identity"}}},
+    )
+    observation = NativeThreadObservation(
+        {
+            "result_path": str(folder / "result.json"),
+            "spec": {"run_id": "fixture"},
+            "role": "implement",
+            "iteration": 0,
+        }
+    )
+
+    class Client:
+        async def thread_list(self, **_kwargs):
+            return SimpleNamespace(data=[], next_cursor="more")
+
+    with pytest.raises(ValueError, match="bounded observation"):
+        await observation.begin(Client())
+    assert read_private(observation.path)["state"] == "unknown"
+    assert observation.data["new_child_thread_ids"] is None
+
+
 @activity.defn(name="delivery_intake")
 async def blocked_intake(request):
     return {
@@ -265,22 +408,29 @@ async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(nati
     async def questions(request):
         calls.append(request["iteration"])
         return {
-            "status": "questions", "summary": "controlled repeated question fixture",
+            "status": "questions",
+            "summary": "controlled repeated question fixture",
             "questions": [{"id": "fixture", "prompt": "Controlled question", "options": []}],
-            "findings": [], "session_id": None, "usage": None, "cleanup": "confirmed",
+            "findings": [],
+            "session_id": None,
+            "usage": None,
+            "cleanup": "confirmed",
         }
 
     async with await WorkflowEnvironment.start_local(
         dev_server_existing_path=shutil.which("temporal"),
     ) as environment:
         async with Worker(
-            environment.client, task_queue="native-turn-exhaustion",
+            environment.client,
+            task_queue="native-turn-exhaustion",
             workflows=[DeliveryWorkflow],
             activities=[delivery_prepare, delivery_project, delivery_finalize_resources, questions],
         ):
             handle = await environment.client.start_workflow(
-                DeliveryWorkflow.run, store.submitted_spec(request["run_id"]),
-                id="native-turn-exhaustion", task_queue="native-turn-exhaustion",
+                DeliveryWorkflow.run,
+                store.submitted_spec(request["run_id"]),
+                id="native-turn-exhaustion",
+                task_queue="native-turn-exhaustion",
             )
             for turn in range(8):
                 deadline = time.monotonic() + 20
@@ -291,12 +441,17 @@ async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(nati
                         break
                     assert time.monotonic() < deadline, state
                     await asyncio.sleep(0.03)
-                await handle.execute_update("decision", {
-                    "command_id": f"controlled-answer-{turn}",
-                    "expected_revision": state["revision"], "decision_id": pending["id"],
-                    "decision_revision": pending["revision"],
-                    "candidate_revision": pending["candidate_revision"], "answer": "fixture",
-                })
+                await handle.execute_update(
+                    "decision",
+                    {
+                        "command_id": f"controlled-answer-{turn}",
+                        "expected_revision": state["revision"],
+                        "decision_id": pending["id"],
+                        "decision_revision": pending["revision"],
+                        "candidate_revision": pending["candidate_revision"],
+                        "answer": "fixture",
+                    },
+                )
             result = await asyncio.wait_for(handle.result(), 15)
     assert calls == list(range(8)) and "finite turn limit" in result["error"]
     assert result["outcome"] == "blocked"
@@ -325,12 +480,15 @@ async def test_early_preparation_error_finalizes_registered_temporary_resources(
         dev_server_existing_path=shutil.which("temporal"),
     ) as environment:
         async with Worker(
-            environment.client, task_queue="native-early-preparation-error",
+            environment.client,
+            task_queue="native-early-preparation-error",
             workflows=[DeliveryWorkflow],
             activities=[delivery_prepare, delivery_project, delivery_finalize_resources],
         ):
             result = await environment.client.execute_workflow(
-                DeliveryWorkflow.run, submitted, id="native-early-preparation-error",
+                DeliveryWorkflow.run,
+                submitted,
+                id="native-early-preparation-error",
                 task_queue="native-early-preparation-error",
             )
     assert result["outcome"] == "blocked" and "same bundled executable" in result["error"]
@@ -443,8 +601,9 @@ asyncio.run(main())
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS browser fixture")
+@pytest.mark.parametrize("iteration", [0, 2])
 def test_native_browser_api_playwright_ports_children_and_directory_cleanup(
-    native_configuration, monkeypatch
+    native_configuration, monkeypatch, iteration
 ):
     node_root = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/node"
     node = node_root / "bin/node"
@@ -532,6 +691,21 @@ main().catch(error=>{console.error(error);process.exit(1)});
     config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
     store.submit(request)
+    if iteration == 2:
+        with store._connect() as db:
+            db.execute(
+                """INSERT INTO delivery_repair_grants VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    request["run_id"],
+                    "controlled-browser-grant",
+                    "fixture",
+                    "fixture",
+                    "0" * 64,
+                    1,
+                    2,
+                    "2026-10-02T00:00:00Z",
+                ),
+            )
     prepared = prepare_authority(store, store.submitted_spec(request["run_id"]))
     broker = DeliveryBroker(store, prepared)
     candidate = broker.prepare()["candidate"]
@@ -539,17 +713,19 @@ main().catch(error=>{console.error(error);process.exit(1)});
         "devflow_temporal.delivery_preparation._docker",
         lambda *_args, **_kw: pytest.fail("native browser invoked Docker"),
     )
-    result = broker.run_browser_qa(0, candidate)
+    with pytest.raises(ValueError, match="finite turn limit"):
+        broker.run_browser_qa(3, candidate)
+    result = broker.run_browser_qa(iteration, candidate)
     assert result["state"] == "passed", result.get("diagnostic")
     assert result["test_count"] == 2 and result["process_cleanup"] == "observed-native-confirmed"
     assert len(result["native_process"]["observed_owned_pids"]) >= 3
     assert set(result["native_process"]["observed_listeners"]) == {str(port) for port in ports}
-    assert broker.run_browser_qa(0, candidate) == result
+    assert broker.run_browser_qa(iteration, candidate) == result
     receipt = RunResources(prepared).finalize("cancelled")
     assert receipt["resource_cleanup"] == "confirmed"
     assert not (Path(prepared["state_dir"]) / "transient").exists()
     assert not Path(result["scratch"]).exists()
-    assert not (Path(prepared["state_dir"]) / "gates/0/verify").exists()
+    assert not (Path(prepared["state_dir"]) / "gates" / str(iteration) / "verify").exists()
     assert Path(result["log"]).is_file() and Path(result["artifacts"][0]["path"]).is_file()
     for port in ports:
         with socket.socket() as lease:

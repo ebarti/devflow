@@ -288,11 +288,13 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
 
 
 def run_browser_qa_native(broker: Any, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
+    from .delivery_native_guard import validate_native_turn
     from .delivery_native_process import NativeProcess, reconcile_process
     from .delivery_preparation import verify_prepared_spec
     from .delivery_resources import RunResources, private_directory, read_private, write_private
 
     spec = broker.spec
+    validate_native_turn(spec, "verify", iteration, broker.store)
     verify_prepared_spec(spec)
     qa = spec["policy"].get("browser_qa")
     if not qa or broker.candidate() != candidate:

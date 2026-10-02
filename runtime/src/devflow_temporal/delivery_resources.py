@@ -67,10 +67,12 @@ def _identity(path: Path) -> dict[str, int]:
     return {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid}
 
 
-def _ancestors(path: Path) -> None:
+def _ancestors(path: Path, *, allow_missing: bool = False) -> None:
     for parent in reversed(path.parents):
-        if parent.is_symlink() or not parent.is_dir():
+        if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
             raise ValueError("resource ancestor was replaced")
+        if not allow_missing and not parent.exists():
+            raise ValueError("resource ancestor is absent")
 
 
 def _remove_contents(fd: int) -> None:
@@ -148,28 +150,41 @@ class RunResources:
         finally:
             os.close(descriptor)
 
-    def _allowed(self, path: Path, kind: str) -> None:
+    def _allowed(self, path: Path, kind: str, *, finalizing: bool = False) -> None:
         short = Path("/private/tmp") / ("dfqa-" + digest(str(self.state))[:20])
         valid = path == self.state / "transient" or path == short
         if kind == "checkout":
             valid = path == Path(self.spec["checkout"])
         elif kind == "gate":
-            valid = path.is_relative_to(self.state / "gates") and path != self.state / "gates"
+            relative = path.relative_to(self.state / "gates")
+            valid = (
+                len(relative.parts) == 2
+                and relative.parts[0].isdecimal()
+                and relative.parts[1] in {"review", "verify"}
+            )
         elif kind == "generated":
-            roots = [Path(self.spec["checkout"]), self.state / "gates" / "0" / "verify"]
             allowed_names = {
                 "node_modules",
                 *(self.spec["policy"].get("browser_qa") or {}).get("artifact_paths", []),
             }
-            valid = any(path == root / name for root in roots for name in allowed_names)
-            # Gate iterations are finite and owned by the configured controller.
-            for iteration in range(self.spec["policy"].get("max_repairs", 2) + 1):
-                for role in ("review", "verify"):
-                    root = self.state / "gates" / str(iteration) / role
-                    valid = valid or any(path == root / name for name in allowed_names)
+            ownership = read_private(self.manifest)["roots"] if self.manifest.exists() else {}
+            valid = False
+            # Broker admission bounds each gate against durable operator grants
+            # before registering it. Finalization uses that recorded ownership,
+            # including a removed parent, rather than the original repair budget.
+            for raw_root, entry in ownership.items():
+                root = Path(raw_root)
+                if entry["kind"] not in {"checkout", "gate"}:
+                    continue
+                if not any(path == root / name for name in allowed_names):
+                    continue
+                self._allowed(root, entry["kind"], finalizing=finalizing)
+                if os.path.lexists(root) and _identity(root) != entry["identity"]:
+                    raise ValueError("generated resource parent was replaced")
+                valid = True
         if not valid or not path.is_absolute() or ".." in path.parts:
             raise ValueError("resource root is outside its registered run boundary")
-        _ancestors(path)
+        _ancestors(path, allow_missing=finalizing)
 
     def register(self, path: Path, kind: str) -> None:
         self._allowed(path, kind)
@@ -184,6 +199,16 @@ class RunResources:
                     and _identity(path) != old["identity"]
                 ):
                     raise ValueError("registered resource root was replaced")
+                if (
+                    kind != "checkout"
+                    and not os.path.lexists(path)
+                    and old.get("receipt", {}).get("state") in {"removed", "already_absent"}
+                ):
+                    old.update(
+                        identity=None, state="allocated", generation=old.get("generation", 0) + 1
+                    )
+                    old.pop("receipt", None)
+                    write_private(self.manifest, manifest)
                 return
             if os.path.lexists(path):
                 raise ValueError("cannot adopt an existing unregistered resource")
@@ -207,17 +232,6 @@ class RunResources:
         self.register(path, "transient")
         with self.locked() as manifest:
             entry = manifest["roots"][str(path)]
-            if not os.path.lexists(path) and entry.get("receipt", {}).get("state") in {
-                "removed",
-                "already_absent",
-            }:
-                # Separately authorized finite continuations retain sessions
-                # but allocate a fresh generation of transient scratch.
-                entry.update(
-                    identity=None, state="allocated", generation=entry.get("generation", 0) + 1
-                )
-                entry.pop("receipt", None)
-                write_private(self.manifest, manifest)
             if entry["identity"] is None:
                 path.mkdir(mode=0o700)
                 entry.update(identity=_identity(path), state="created")
@@ -262,7 +276,7 @@ class RunResources:
                 path = Path(raw_path)
                 receipt = {"path": raw_path, "kind": entry["kind"]}
                 try:
-                    self._allowed(path, entry["kind"])
+                    self._allowed(path, entry["kind"], finalizing=True)
                     if not os.path.lexists(path):
                         receipt.update(state="already_absent")
                     elif uncertain:

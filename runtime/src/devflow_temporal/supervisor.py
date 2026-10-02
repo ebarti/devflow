@@ -92,36 +92,9 @@ class DeliverySupervisor:
     def _claim(self, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         spec = request["spec"]
         if spec["policy"].get("execution_backend") == "native-macos":
-            from .delivery_native_guard import reject_nested_controller
+            from .delivery_native_guard import validate_native_turn
 
-            reject_nested_controller()
-            role, iteration = request["role"], request["iteration"]
-            maximum = (
-                spec["policy"].get("max_intake_rounds", 8) - 1
-                if role == "intake"
-                else spec["policy"].get("max_repairs", 2)
-            )
-            if role != "intake":
-                with self.store._connect() as db:
-                    grants = db.execute(
-                        """SELECT maximum_iteration FROM delivery_repair_grants WHERE run_id=?
-                           UNION ALL SELECT maximum_iteration FROM delivery_scope_amendments
-                             WHERE run_id=?
-                           UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_extensions
-                             WHERE run_id=?
-                           UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_thirds
-                             WHERE run_id=?
-                           UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_successors
-                             WHERE run_id=?""",
-                        (spec["run_id"],) * 5,
-                    ).fetchall()
-                maximum = max([maximum, *(row[0] for row in grants)])
-            if (
-                role not in spec["policy"]["roles"]
-                or type(iteration) is not int
-                or not 0 <= iteration <= maximum
-            ):
-                raise ValueError("native role exceeded the controller-owned finite turn limit")
+            validate_native_turn(spec, request["role"], request["iteration"], self.store)
         generation = request.get("attempt_generation", 0)
         if type(generation) is not int or generation not in (0, 1) or (
             generation and request["role"] != "implement"

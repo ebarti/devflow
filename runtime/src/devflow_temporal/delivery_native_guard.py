@@ -32,6 +32,36 @@ def reject_nested_controller() -> None:
         raise ValueError("managed role children cannot create another Devflow controller or run")
 
 
+def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
+    """One finite ceiling for native roles and their broker-owned gate resources."""
+    reject_nested_controller()
+    maximum = (
+        spec["policy"].get("max_intake_rounds", 8) - 1
+        if role == "intake"
+        else spec["policy"].get("max_repairs", 2)
+    )
+    if role != "intake":
+        with store._connect() as db:
+            grants = db.execute(
+                """SELECT maximum_iteration FROM delivery_repair_grants WHERE run_id=?
+                   UNION ALL SELECT maximum_iteration FROM delivery_scope_amendments WHERE run_id=?
+                   UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_extensions
+                     WHERE run_id=?
+                   UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_thirds
+                     WHERE run_id=?
+                   UNION ALL SELECT maximum_iteration FROM delivery_repair_grant_successors
+                     WHERE run_id=?""",
+                (spec["run_id"],) * 5,
+            ).fetchall()
+        maximum = max([maximum, *(row[0] for row in grants)])
+    if (
+        role not in spec["policy"]["roles"]
+        or type(iteration) is not int
+        or not 0 <= iteration <= maximum
+    ):
+        raise ValueError("native role exceeded the controller-owned finite turn limit")
+
+
 def validate_role_ancestry(request: dict) -> None:
     if request["spec"]["policy"].get("execution_backend") != "native-macos":
         return
