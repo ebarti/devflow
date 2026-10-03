@@ -149,6 +149,7 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
   const [stale, setStale] = useState(false)
 
   const plan = decision.kind === 'plan' ? run.intake?.plans.find(item => item.revision === decision.plan_revision)?.content : null
+  const notification = run.question_notifications?.find(item => item.decision_id === decision.id && item.decision_revision === decision.revision)
   const answerText = decision.kind === 'question' ? freeText.trim() || choice : choice
   const valid = Boolean(answerText) && (decision.kind !== 'plan' || choice !== 'change' || Boolean(freeText.trim()))
 
@@ -175,6 +176,8 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
   return <section className="decision-card" aria-labelledby={`decision-${decision.id}`}>
     <div className="decision-card__heading"><h2 id={`decision-${decision.id}`}>{decision.kind === 'question' ? 'Clarification needed' : decision.kind === 'plan' ? 'Review Devflow plan' : 'Decision needed'}</h2><span>Revision {decision.revision}</span></div>
     <p>{decision.prompt}</p>
+    {decision.blocker ? <div className="intake-plan"><h3>Why input is needed</h3><p>{decision.blocker.unknown}</p><p>{decision.blocker.why_no_safe_default}</p><h3>Evidence checked</h3><ul>{decision.blocker.evidence_checked.map((item, index) => <li key={index}>{item}</li>)}</ul></div> : null}
+    {notification ? <p className="subtle">Question callback: {titleCase(notification.state)}. {notification.state === 'queued' ? 'The native queue acknowledged the message; display and an answer are not confirmed.' : notification.state === 'unavailable' ? 'No originating thread is bound. Answer here.' : notification.state === 'unknown' ? 'The queue effect is uncertain and will not be retried automatically.' : notification.receipt?.reason ?? ''}</p> : null}
     {plan ? <div className="intake-plan"><h3>Scope</h3><p>{plan.scope}</p><h3>Steps</h3><ol>{plan.steps.map((item, index) => <li key={index}>{item}</li>)}</ol><h3>Verification</h3><ul>{plan.verification.map((item, index) => <li key={index}>{item}</li>)}</ul><h3>Acceptance</h3><ul>{plan.acceptance.map((item, index) => <li key={index}>{item}</li>)}</ul></div> : null}
     {decision.candidate_revision != null ? <p className="subtle">Candidate revision {decision.candidate_revision}</p> : null}
     {run.execution_retired ? <p className="subtle">Saved decision · read-only</p> : <><fieldset disabled={busy || stale}>

@@ -117,7 +117,8 @@ class DeliveryConfig:
             "authorized_endpoint",
         }
         optional = {
-            "accepted_plan", "recovery_key", "supersedes_run_id", "plan_approval", "origin_thread_id"
+            "accepted_plan", "recovery_key", "supersedes_run_id",
+            "plan_approval", "origin_thread_id"
         }
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
@@ -501,6 +502,7 @@ def scope_amended_spec(
         "goal", "accepted_plan", "base_ref", "branch", "authorized_endpoint",
         "recovery_key", "supersedes_run_id",
         "plan_approval",
+        "origin_thread_id",
     }
     from .delivery_preparation import require_native_execution
 
@@ -516,6 +518,8 @@ def scope_amended_spec(
         effective["plan_approval"] = original["plan_approval"]
     else:
         effective.pop("plan_approval")
+    if "blocking_questions_version" not in original:
+        effective.pop("blocking_questions_version")
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
@@ -524,6 +528,8 @@ def scope_amended_spec(
     ):
         if effective[key] != original[key]:
             raise ValueError("scope amendment changed the admitted run identity")
+    if effective.get("origin_thread_id") != original.get("origin_thread_id"):
+        raise ValueError("scope amendment changed the originating thread")
     effective["request_digest"] = original["request_digest"]
     if "continuation" in original:
         effective["continuation"] = original["continuation"]

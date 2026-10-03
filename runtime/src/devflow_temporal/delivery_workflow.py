@@ -11,6 +11,7 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
 from .contracts import digest
+from .delivery_questions import valid_blocking_questions
 
 
 def _broker_findings(stage: str, result: dict[str, Any], *, iteration: int) -> list[str]:
@@ -347,6 +348,11 @@ class DeliveryWorkflow:
                 if not isinstance(questions, list) or not questions:
                     await self._stop(spec, "intake returned no material questions")
                     return None
+                if spec.get("blocking_questions_version") == 1 and not valid_blocking_questions(
+                    questions
+                ):
+                    await self._stop(spec, "intake did not justify a blocking ambiguity")
+                    return None
                 for item in questions:
                     if self.cancel_requested:
                         await self._cancelled(spec)
@@ -355,6 +361,8 @@ class DeliveryWorkflow:
                         "id": f"{turn}:{item['id']}", "revision": turn + 1,
                         "prompt": item["prompt"], "options": item["options"],
                         "state": "pending",
+                        **({"blocker": item["blocker"]}
+                           if spec.get("blocking_questions_version") == 1 else {}),
                     }
                     intake["questions"].append(question)
                     self.state["phase"] = "waiting_question"
@@ -367,6 +375,8 @@ class DeliveryWorkflow:
                         "question_id": question["id"], "prompt": question["prompt"],
                         "options": question["options"], "allow_free_text": True,
                         "state": "pending",
+                        **({"blocker": question["blocker"]}
+                           if spec.get("blocking_questions_version") == 1 else {}),
                     }
                     await self._project(spec, "question_pending", "Clarification needed")
                     await workflow.wait_condition(

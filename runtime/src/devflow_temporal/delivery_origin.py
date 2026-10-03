@@ -26,7 +26,9 @@ def bind_origin(supplied: dict, observed: str | None) -> dict:
         observed = thread_uuid(observed)
     if explicit is not None and observed is not None and explicit != observed:
         raise ValueError("origin_thread_id disagrees with the originating thread")
-    return {**supplied, **({"origin_thread_id": explicit or observed} if explicit or observed else {})}
+    return {
+        **supplied, **({"origin_thread_id": explicit or observed} if explicit or observed else {})
+    }
 
 
 def metadata_origin(metadata: dict[str, Any] | None) -> str | None:

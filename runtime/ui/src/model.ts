@@ -75,6 +75,7 @@ export interface Decision {
   prompt: string
   options: Array<string | { value: string; label: string; consequence?: string | null }>
   state?: string | null
+  blocker?: { unknown: string; evidence_checked: string[]; why_no_safe_default: string } | null
 }
 
 export interface IntakePlan {
@@ -151,6 +152,7 @@ export interface RunDetail extends RunSummary {
   } | null
   usage?: Usage | null
   decisions?: Decision[] | null
+  question_notifications?: Array<{ decision_id: string; decision_revision: number; state: string; receipt?: { reason?: string } | null }> | null
   intake?: IntakeState | null
   events?: ActivityEvent[] | null
   evidence?: Evidence[] | null

@@ -179,9 +179,14 @@ describe('dashboard commands', () => {
         answers: [{ question_id: 'older', question_revision: 1, prompt: 'Why?', answer: 'Needed by users' }],
         plans: [], accepted_plan: null,
       },
-      decisions: [{ id: 'fixture:question:0:scope', revision: 1, kind: 'question', candidate_revision: 1, prompt: 'Which scope?', options: ['Small'], state: 'pending' }],
+      decisions: [{ id: 'fixture:question:0:scope', revision: 1, kind: 'question', candidate_revision: 1, prompt: 'Which scope?', options: ['Small'], state: 'pending', blocker: { unknown: 'Required consumer contract is missing', evidence_checked: ['README and tests checked'], why_no_safe_default: 'Guessing could break the required consumer' } }],
+      question_notifications: [{ decision_id: 'fixture:question:0:scope', decision_revision: 1, state: 'queued' }],
     }} onRefresh={vi.fn().mockResolvedValue(undefined)} />)
     expect(screen.getByText('Needed by users')).toBeTruthy()
+    expect(screen.getByText('Required consumer contract is missing')).toBeTruthy()
+    expect(screen.getByText('README and tests checked')).toBeTruthy()
+    expect(screen.getByText(/native queue acknowledged the message; display and an answer are not confirmed/)).toBeTruthy()
+    expect(answer).not.toHaveBeenCalled()
     await user.type(screen.getByLabelText('Your answer (or choose a suggestion)'), 'Include both paths')
     await user.click(screen.getByRole('button', { name: 'Submit answer' }))
     await waitFor(() => expect(answer).toHaveBeenCalledTimes(1))

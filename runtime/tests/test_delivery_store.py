@@ -1581,6 +1581,7 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     service, tmp_path, monkeypatch, raw_intake
 ):
     store, request = service
+    request = {**request, "origin_thread_id": "01a0c8be-e849-7ef2-ad81-78ccdb4b4275"}
     if raw_intake:
         configuration = json.loads(store.config.path.read_text())
         configuration["roles"]["intake"] = {"model": "fixture", "effort": "low"}
@@ -1776,6 +1777,9 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     }
     if raw_intake:
         assert "accepted_plan" not in request2
+    request2.pop("origin_thread_id")  # Successor inherits its original caller.
+    with pytest.raises(ValueError, match="changed the originating thread"):
+        successor.submit({**request2, "origin_thread_id": "01a100ac-efd3-7dd2-9f25-504381f0dcd9"})
     original_text = (old_broker.checkout / "README.md").read_text()
     original_stat = (old_broker.checkout / "README.md").stat()
     (old_broker.checkout / "README.md").write_text("Changed after terminal role\n")
@@ -1859,6 +1863,7 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
         )
     monkeypatch.setattr(successor, "_ensure_no_remote_pr", lambda *_args: None)
     assert successor.submit(request2)["existing"] is False
+    assert successor.spec("run-2")["origin_thread_id"] == old_spec["origin_thread_id"]
     if raw_intake:
         successor_spec = successor.spec("run-2")
         assert successor_spec["accepted_plan"] == old_spec["accepted_plan"]
