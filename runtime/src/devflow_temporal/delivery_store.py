@@ -2352,6 +2352,8 @@ class DeliveryStore:
     @staticmethod
     def _scope_recovery(recovery: dict[str, Any] | None) -> dict[str, Any] | None:
         """Read the sole native scope amendment without restoring retired execution."""
+        while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+            recovery = recovery["original_recovery"]
         if isinstance(recovery, dict) and recovery.get("kind") == "scope_amendment":
             return recovery
         return None
@@ -2861,6 +2863,8 @@ class DeliveryStore:
     def _compact(row: dict[str, Any]) -> dict[str, Any]:
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+            recovery = recovery["original_recovery"]
         effective = (
             recovery.get("effective_spec", spec)
             if isinstance(recovery, dict)
@@ -2909,6 +2913,11 @@ class DeliveryStore:
         compact = self._compact(row)
         spec = self.effective_spec(run_id)
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        terminal_recovery = (
+            recovery if recovery and recovery.get("kind") == "terminal_tracker_recovery" else None
+        )
+        while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+            recovery = recovery["original_recovery"]
         scope_recovery = self._scope_recovery(recovery)
         scope_amendment = (
             {
@@ -3049,6 +3058,16 @@ class DeliveryStore:
             else None,
             "pull_request": json.loads(row["pr_json"]) if row["pr_json"] else None,
             "scope_amendment": scope_amendment,
+            "terminal_tracker_recovery": {
+                "reconciliation_only": True,
+                "command_id": terminal_recovery["command_id"],
+                "predecessor_workflow_id": terminal_recovery["closed"]["workflow_id"],
+                "predecessor_execution_run_id": terminal_recovery["closed"]["execution_run_id"],
+                "predecessor_status": terminal_recovery["closed"]["status"],
+                "closed_history_sha256": terminal_recovery["closed"]["history_sha256"],
+                "spec_sha256": terminal_recovery["spec_sha256"],
+                "seal": terminal_recovery["seal"],
+            } if terminal_recovery else None,
             "execution_policy_recovery": {
                 "precheck_sha256": recovery["seal"]["precheck_sha256"],
                 "original_mode": "native-profile", "effective_mode": "trusted-local",

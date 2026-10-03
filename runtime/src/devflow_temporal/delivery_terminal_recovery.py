@@ -10,7 +10,7 @@ from temporalio.client import WorkflowExecutionStatus
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_codec import DELIVERY_DATA_CONVERTER
-from .delivery_policy_recovery import _rows, _stopped_cleanup
+from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 
 
 async def closed_tail(store, run_id, client):
@@ -91,6 +91,7 @@ def snapshot(store, spec):
     row, attempts, effects, claim = _rows(store, spec['run_id'])
     with store._connect() as db:
         work = store.state.row(db, 'works', spec['work_id'])
+        binding = work_binding(store, spec, db)
     if (store.state.issue_resource(work['issue']) != store.state.issue_resource(spec['issue_url'])
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
             or any(e['state'] != 'complete' for e in effects)
@@ -101,11 +102,15 @@ def snapshot(store, spec):
     if checks.get('resource_cleanup', {}).get('receipt_sha256') != cleanup['receipt_sha256']:
         raise ValueError('terminal cleanup proof differs from the frozen gate')
     published = None
+    candidate = json.loads(row['candidate_json'] or 'null')
     if checks.get('terminal_tracker_checkpoint', {}).get('outcome') == 'delivered':
-        published = published_readback(store, spec, json.loads(row['candidate_json'] or 'null'),
+        published = published_readback(store, spec, candidate,
                                       json.loads(row['pr_json'] or 'null'))
+    elif candidate is not None and DeliveryBroker(store, spec).candidate() != candidate:
+        raise ValueError('terminal preserved candidate source changed')
     return row, {'attempts_sha256': digest(attempts), 'effects_sha256': digest(effects),
-                 'claim_sha256': digest(claim), 'cleanup': cleanup, 'published': published}
+                 'claim_sha256': digest(claim), 'cleanup': cleanup, 'published': published,
+                 'candidate_sha256': digest(candidate), 'work_binding': binding}
 
 
 def _grant(store, run_id, payload, closed):
@@ -117,11 +122,15 @@ def _grant(store, run_id, payload, closed):
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     tail = closed['projection']
     checkpoint = tail.get('checks', {}).get('terminal_tracker_checkpoint', {})
+    # Native preparation and automatic plan acceptance transform the immutable
+    # initial input. Bind authentic start input to its durable admission stage,
+    # while the completed tail remains bound to the final effective authority.
+    starts = [spec] if previous else [store.submitted_spec(run_id), store.spec(run_id), spec]
     if row['protocol_revision'] != payload['expected_revision']:
         raise ValueError('stale run revision')
     if (spec.get('terminal_tracker_version') != 1 or tail.get('spec') != spec
             or closed['workflow_id'] != (row['workflow_id'] or f'delivery-{run_id}')
-            or closed['input_spec'] != spec
+            or closed['input_spec'] not in starts
             or closed['input_recovery_sha256'] != (digest(previous) if previous else None)
             or closed['request_digest'] != row['request_digest']
             or closed['recovery_digest'] != (digest(previous) if previous else None)

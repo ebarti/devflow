@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sys
 from datetime import timedelta
 
 import httpx
@@ -17,7 +18,13 @@ from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 
 from devflow_temporal.contracts import canonical_json, digest
-from devflow_temporal.delivery_activities import delivery_project, delivery_terminal_preflight
+from devflow_temporal.delivery_activities import (
+    delivery_accept_plan,
+    delivery_finalize_resources,
+    delivery_prepare,
+    delivery_project,
+    delivery_terminal_preflight,
+)
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_resources import RunResources
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -256,7 +263,7 @@ async def test_authentic_closed_tail_queues_only_tracker_successor(
                     service.store.state.update(db, 'work', {'id': spec['work_id'],
                         'issue': spec['issue_url'].rsplit('/', 1)[0] + '/999'}, None)
                 refused = await browser.post(endpoint, json=payload, headers=headers)
-                assert refused.status_code == 409 and 'terminal issue' in refused.text
+                assert refused.status_code == 409 and 'frozen authority' in refused.text
                 assert service.store.pending_starts()[0]['workflow_id'] is None
                 with service.store._connect() as db:
                     service.store.state.update(db, 'work', {'id': spec['work_id'],
@@ -269,6 +276,12 @@ async def test_authentic_closed_tail_queues_only_tracker_successor(
                 assert sealed['state']['roles'] == [historical]
                 assert sealed['closed']['status'] == ('TIMED_OUT' if timed_out else 'COMPLETED')
                 assert sealed['closed']['history_sha256']
+                public = (await browser.get(f"/api/runs/{request['run_id']}")).json()['run']
+                proof = public['terminal_tracker_recovery']
+                assert proof['reconciliation_only']
+                assert proof['closed_history_sha256'] == sealed['closed']['history_sha256']
+                assert proof['seal'] == sealed['seal']
+                assert proof['predecessor_execution_run_id'] == (await handle.describe()).run_id
                 repeated = await browser.post(endpoint, json=payload, headers=headers)
                 assert repeated.json() == receipt.json()
                 if timed_out:
@@ -313,3 +326,97 @@ async def test_authentic_closed_tail_queues_only_tracker_successor(
                 replay = await browser.post(endpoint, json=payload, headers=headers)
                 assert replay.json() == receipt.json()
                 assert len(service.store.detail(request['run_id'])['roles']) == 1
+
+
+@workflow.defn(name='DevflowDeliveryWorkflow')
+class PreparedIntakeTerminalFixture(ClosedTerminalFixture):
+    @workflow.run
+    async def run(self, spec, recovery=None):
+        return await DeliveryWorkflow.run(self, spec, recovery)
+
+    async def _run_iterations(self, spec, **_kwargs):
+        return await self._stop(spec, 'Controlled post-intake gate failure')
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='actual native preparation required')
+@pytest.mark.asyncio
+async def test_closed_recovery_binds_real_preparation_and_automatic_intake_evolution(
+    native_configuration, monkeypatch,
+):
+    config, request = native_configuration
+    config.raw['execution_mode'] = 'trusted-local'
+    config.path.write_text(json.dumps(config.raw))
+    app = create_app(config.path)
+    service = app.state.delivery
+    service.store.submit(request)
+    submitted = service.store.submitted_spec(request['run_id'])
+    calls = []
+
+    @activity.defn(name='delivery_intake')
+    async def plan(_payload):
+        calls.append('intake')
+        return {'status': 'plan', 'cleanup': 'confirmed', 'plan': {
+            'scope': 'Controlled original README scope', 'steps': ['Inspect owned README'],
+            'verification': ['Controlled owning gate'], 'acceptance': ['Owned README checked'],
+        }}
+
+    @activity.defn(name='delivery_tracker_start')
+    async def started(_payload):
+        return {'state': 'consistent'}
+
+    @activity.defn(name='delivery_terminal_tracker')
+    async def tracker(_payload):
+        calls.append('tracker')
+        consistent = calls.count('tracker') > 3
+        if consistent:
+            with service.store._connect() as db:
+                service.store.state.release_work(db, submitted['work_id'],
+                    f"external:devflow:{submitted['run_id']}")
+        return {'state': 'consistent' if consistent else 'pending', 'pending': not consistent}
+
+    async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=shutil.which('temporal'),
+    ) as environment:
+        async def client():
+            return environment.client
+
+        monkeypatch.setattr(service, 'client', client)
+        monkeypatch.setattr(service, 'healthy_client', client)
+        async with Worker(environment.client, task_queue=config.queue,
+                          workflows=[PreparedIntakeTerminalFixture],
+                          workflow_runner=UnsandboxedWorkflowRunner(),
+                          activities=[delivery_prepare, delivery_project, delivery_accept_plan,
+                                      delivery_finalize_resources, delivery_terminal_preflight,
+                                      plan, started, tracker]):
+            # Dispatch the original raw admission through the actual service.
+            await service.dispatch_once()
+            original = environment.client.get_workflow_handle(f"delivery-{request['run_id']}")
+            result = await asyncio.wait_for(original.result(), 30)
+            assert result['outcome'] is None
+            effective = service.store.effective_spec(request['run_id'])
+            assert effective != submitted and effective['accepted_plan']
+            assert effective['policy']['native_identity']
+            transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
+            async with httpx.AsyncClient(transport=transport,
+                                        base_url='http://127.0.0.1:18770') as browser:
+                session = await browser.get('/api/session')
+                receipt = await browser.post(f"/api/runs/{request['run_id']}/reconcile-tracker",
+                    json={'command_id': 'after-real-intake',
+                          'expected_revision': result['revision']},
+                    headers={'Origin': 'http://127.0.0.1:18770',
+                             'X-Devflow-CSRF': session.json()['csrf_token']})
+                assert receipt.status_code == 200, receipt.text
+                recovery = json.loads(service.store.pending_starts()[0]['recovery_json'])
+                assert recovery['closed']['input_spec'] == submitted
+                assert recovery['closed']['projection']['spec'] == effective
+                await service.dispatch_once()
+                successor = environment.client.get_workflow_handle(receipt.json()['workflow_id'])
+                final = await asyncio.wait_for(successor.result(), 15)
+                assert final['outcome'] == 'blocked'
+                assert calls == ['intake', 'tracker', 'tracker', 'tracker', 'tracker']
+                history = await successor.fetch_history()
+                names = {e.activity_task_scheduled_event_attributes.activity_type.name
+                         for e in history.events if e.HasField(
+                             'activity_task_scheduled_event_attributes')}
+                assert names == {'delivery_terminal_preflight', 'delivery_terminal_tracker',
+                                 'delivery_project'}

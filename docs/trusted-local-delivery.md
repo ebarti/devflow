@@ -73,8 +73,11 @@ remains safely recoverable through the public readback command.
 If the execution is completed or timed out before confirmation, the same public
 command admits a reconciliation-only successor. Admission reads the authentic
 Temporal execution, memo and completed pending-projection activity from its
-closed history; no caller-supplied checkpoint can authorize it. The durable grant
-binds that history hash, the exact projected candidate/PR and checks, every
+closed history; no caller-supplied checkpoint can authorize it. Admission
+binds the authentic initial input to its immutable submitted/prepared admission
+stage and the terminal projection to the effective prepared/accepted plan. A raw
+automatic-planning submission need not equal its later accepted specification.
+The durable grant binds that history hash, the exact projected candidate/PR and checks, every
 finished attempt/effect, cleanup receipt, stopped process identities/ports and
 current ownership. Delivered targets also revalidate the published remote head.
 An identical command returns its existing receipt, including across an uncertain
@@ -84,6 +87,10 @@ candidate edits, preparation, gates, publication or cleanup again. Missing or
 changed evidence leaves a recoverable conflict checkpoint. It can only confirm
 the existing terminal transition. Each explicit continuation has the same finite
 readback deadline.
+The public run response exposes `terminal_tracker_recovery` with the predecessor
+workflow/execution/status, closed-history/spec hashes and stopped-evidence seal.
+It keeps the original policy/scope recovery summary and session/failure provenance
+visible alongside that reconciliation-only record.
 
 The dashboard hides cancellation once a terminal checkpoint is frozen and offers
 `Reconcile tracker` only for an exhausted or closed checkpoint. Its retry keeps
@@ -110,6 +117,11 @@ of the branch/PR on the remote and original issue evidence. Any changed or
 unavailable readback rejects admission. It observes PID/start identities and
 ports; it never kills a process to manufacture stopped evidence. An unknown or
 pending external effect cannot be retried through this operation.
+Canonical work issue/repository and claim resource are bound to the frozen issue
+before preparation, inside the atomic claim grant, during resume preflight and
+before/after tracker-start effects and readback. Supported reassignment of a
+released work item conflicts; it cannot redirect recovery to another issue. This
+uses the existing owning helper contract without modifying installed helpers.
 
 Create a private, owned configuration under the existing service state root by
 copying the original JSON and changing only `execution_mode` to `trusted-local`.

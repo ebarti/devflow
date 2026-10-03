@@ -33,6 +33,21 @@ def _rows(store, run_id):
     return dict(row), attempts, effects, claim
 
 
+def work_binding(store, spec, db):
+    """Canonical source authority; status changes never authorize issue reassignment."""
+    work = store.state.row(db, 'works', spec['work_id'])
+    resource = store.state.issue_resource(spec['issue_url'])
+    repository = 'github.com/' + spec['github_repo'].casefold()
+    claim = store.state.claim_for(db, spec['work_id'])
+    if (not work or store.state.issue_resource(work['issue']) != resource
+            or work['repository'].rstrip('/').casefold() != repository
+            or (claim is not None and (
+                claim['resource'] != resource or claim['work_id'] != spec['work_id']
+                or claim['owner'] != f"external:devflow:{spec['run_id']}"))):
+        raise ValueError('work issue/repository or claim resource differs from frozen authority')
+    return {'issue_resource': resource, 'repository': repository}
+
+
 def _stopped_cleanup(spec):
     """Observe only: preflight must never kill a process to manufacture stopped evidence."""
     resources = RunResources(spec)
@@ -100,6 +115,8 @@ def precheck(store, run_id):
             or original['policy'].get('host_sandbox') != 'native-profile'):
         raise ValueError('policy recovery requires an original constrained native run')
     row, attempts, effects, claim = _rows(store, run_id)
+    with store._connect() as db:
+        binding = work_binding(store, original, db)
     closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
     state = closed['result']
     previous_recovery = json.loads(row['recovery_json']) if row['recovery_json'] else None
@@ -159,6 +176,7 @@ def precheck(store, run_id):
         'candidate': candidate, 'cleanup': cleanup, 'claim_digest': digest(claim),
         'remote_digest': digest(remote), 'attempts_digest': digest(attempts),
         'effects_digest': digest(effects), 'session_id': session_id,
+        'work_binding': binding,
         'session_state_digest': session_digest, 'issue_evidence': _issue(original),
     }
     return {**seal, 'precheck_sha256': digest(seal)}, row, state, original
@@ -353,6 +371,8 @@ def _recover_locked(store, run_id, supplied):
         effects = [dict(e) for e in db.execute(
             'SELECT * FROM delivery_effects WHERE run_id=? ORDER BY effect_key', (run_id,),
         )]
+        if work_binding(store, original, db) != seal['work_binding']:
+            raise ValueError('policy recovery lost its frozen work authority')
         if (dict(current) != row or digest(attempts) != seal['attempts_digest']
                 or digest(effects) != seal['effects_digest']
                 or store.state.claim_for(db, original['work_id']) is not None
@@ -361,6 +381,7 @@ def _recover_locked(store, run_id, supplied):
             raise ValueError('policy recovery lost its sealed run or released ownership')
         store.state.claim_work(db, original['work_id'], f'external:devflow:{run_id}',
                                response['dashboard_url'])
+        work_binding(store, original, db)
         db.execute('INSERT INTO delivery_policy_recoveries VALUES (?,?,?,?,?)',
                    (run_id, supplied['command_id'], digest(original), digest(recovery),
                     recovery['maximum_iteration']))
@@ -395,6 +416,9 @@ def effective_spec(store, original, recovery, grant):
 def resume_preflight(store, spec, recovery):
     row, attempts, effects, claim = _rows(store, spec['run_id'])
     seal = recovery['seal']
+    with store._connect() as db:
+        if work_binding(store, spec, db) != seal['work_binding']:
+            raise ValueError('policy recovery frozen work authority changed')
     if (row['recovery_json'] != canonical_json(recovery)
             or store.effective_spec(spec['run_id']) != spec
             or row['execution_state'] not in {'queued', 'running'}

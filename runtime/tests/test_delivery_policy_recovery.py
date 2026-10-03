@@ -129,6 +129,107 @@ def test_policy_recovery_preserves_candidate_session_failures_and_repeat_effects
     assert detail['execution_policy_recovery']['preserved_checks'] == state['checks']
 
 
+def test_public_policy_provenance_survives_terminal_only_wrapper(preserved):
+    store, original, payload, _state = preserved
+    run_id = original['run_id']
+    store.recover_execution(run_id, payload)
+    before = store.detail(run_id)['execution_policy_recovery']
+    effective = store.effective_spec(run_id)
+    with store._connect() as db:
+        row = db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
+                         (run_id,)).fetchone()
+        original_recovery = json.loads(row[0])
+        # Projection-only fixture. Real authenticated terminal admission and
+        # dispatch are exercised through HTTP/Temporal in the terminal tests.
+        wrapper = {'kind': 'terminal_tracker_recovery',
+                   'original_recovery': original_recovery, 'command_id': 'terminal-only',
+                   'spec_sha256': digest(effective), 'seal': {'cleanup': 'retained-seal'},
+                   'closed': {'workflow_id': 'original-policy-workflow',
+                              'execution_run_id': 'closed-policy-execution',
+                              'status': 'TIMED_OUT', 'history_sha256': 'sealed-history'}}
+        db.execute('UPDATE delivery_runs SET recovery_json=? WHERE run_id=?',
+                   (canonical_json(wrapper), run_id))
+    detail = store.detail(run_id)
+    assert store.effective_spec(run_id) == effective
+    assert detail['execution_policy_recovery'] == before
+    assert detail['terminal_tracker_recovery']['closed_history_sha256'] == 'sealed-history'
+    assert detail['terminal_tracker_recovery']['seal'] == wrapper['seal']
+    assert store.list_runs()[0]['execution_retired'] is False
+    amendment = {'kind': 'scope_amendment', 'added_paths': ['owning.py']}
+    assert store._scope_recovery({'kind': 'terminal_tracker_recovery',
+                                  'original_recovery': amendment}) == amendment
+
+
+@pytest.mark.parametrize('field', ['issue', 'repository'])
+def test_policy_recovery_rejects_supported_reassignment_before_claim_or_probe(preserved, field):
+    store, original, payload, _state = preserved
+    receipt = Path(original['state_dir']) / 'resources/finalization.json'
+    before = receipt.read_bytes()
+    replacement = ('https://github.com/example/fixture/issues/999' if field == 'issue'
+                   else 'github.com/example/replacement')
+    with store._connect() as db:
+        store.state.update(db, 'work', {'id': original['work_id'], field: replacement}, None)
+    with pytest.raises(ValueError, match='frozen authority'):
+        store.policy_recovery_precheck(original['run_id'])
+    with pytest.raises(ValueError, match='frozen authority'):
+        store.recover_execution(original['run_id'], payload)
+    with store._connect() as db:
+        assert store.state.claim_for(db, original['work_id']) is None
+        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
+    assert receipt.read_bytes() == before
+    assert not (Path(original['state_dir']) / 'policy-recovery/intent.json').exists()
+
+
+def test_policy_atomic_grant_rechecks_reassignment_after_local_preparation(preserved, monkeypatch):
+    import devflow_temporal.delivery_policy_recovery as module
+
+    store, original, payload, _state = preserved
+    prepare = module._prepare
+
+    def reassigned(*args):
+        result = prepare(*args)
+        with store._connect() as db:
+            store.state.update(db, 'work', {'id': original['work_id'],
+                'issue': 'https://github.com/example/fixture/issues/999'}, None)
+        return result
+
+    monkeypatch.setattr(module, '_prepare', reassigned)
+    with pytest.raises(ValueError, match='frozen authority'):
+        store.recover_execution(original['run_id'], payload)
+    with store._connect() as db:
+        assert store.state.claim_for(db, original['work_id']) is None
+        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
+
+
+def test_policy_resume_and_tracker_start_refuse_a_reclaimed_reassigned_issue(
+    preserved, monkeypatch,
+):
+    from devflow_temporal.delivery_activities import _tracker_sync
+
+    store, original, payload, _state = preserved
+    store.recover_execution(original['run_id'], payload)
+    effective = store.effective_spec(original['run_id'])
+    with store._connect() as db:
+        row = db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
+                         (original['run_id'],)).fetchone()
+        recovery = json.loads(row[0])
+        owner = f"external:devflow:{original['run_id']}"
+        store.state.release_work(db, original['work_id'], owner)
+        store.state.update(db, 'work', {'id': original['work_id'],
+            'issue': 'https://github.com/example/fixture/issues/999'}, None)
+        store.state.claim_work(db, original['work_id'], owner)
+    with pytest.raises(ValueError, match='frozen authority'):
+        resume_preflight(store, effective, recovery)
+    monkeypatch.setattr('devflow_temporal.delivery_activities._context',
+                        lambda _spec: (store, None))
+    calls = []
+    monkeypatch.setattr('devflow_temporal.delivery_activities.subprocess.run',
+                        lambda *args, **_kwargs: calls.append(args))
+    with pytest.raises(ValueError, match='frozen authority'):
+        _tracker_sync(effective, 'in-progress', release=False)
+    assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_uncertain_policy_workflow_start_reads_memo_without_duplicate_start(preserved,
                                                                                 monkeypatch):

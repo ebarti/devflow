@@ -352,6 +352,13 @@ def _terminal_receipt(store, spec, status, release, project, assignee, desired):
         intent = db.execute("SELECT * FROM reconcile_intents WHERE work_id=?",
                             (spec["work_id"],)).fetchone()
         claim = store.state.claim_for(db, spec["work_id"])
+        from .delivery_policy_recovery import work_binding
+
+        try:
+            work_binding(store, spec, db)
+        except ValueError as exc:
+            return {"state": "pending", "pending": True, "desired": desired,
+                    "reason": str(exc), "readback_at": _now()}
     owner = f"external:devflow:{spec['run_id']}"
     issue = spec["issue_url"]
     if (not work or store.state.issue_resource(work["issue"])
@@ -394,6 +401,12 @@ def _terminal_receipt(store, spec, status, release, project, assignee, desired):
 def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
                   terminal: bool = False, reason: str | None = None) -> dict[str, Any]:
     store, _ = _context(spec)
+    guarded = spec.get("terminal_tracker_version") == 1
+    if guarded and not terminal:
+        from .delivery_policy_recovery import work_binding
+
+        with store._connect() as db:
+            work_binding(store, spec, db)
     repository = store.config.raw["repositories"][spec["repository_key"]]
     project = repository.get("project_url")
     assignee = repository.get("assignee")
@@ -456,6 +469,11 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
     if release:
         command.append("--release")
     result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=120)
+    if guarded:
+        from .delivery_policy_recovery import work_binding
+
+        with store._connect() as db:
+            work_binding(store, spec, db)
     if result.returncode:
         return {
             "state": "pending",
@@ -500,6 +518,13 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
             "reason": (audit.stderr or audit.stdout).strip()[:500],
         }
     observed = json.loads(audit.stdout)
+    if guarded:
+        with store._connect() as db:
+            work_binding(store, spec, db)
+        if store.state.issue_resource(observed.get("issue", "")) != (
+            store.state.issue_resource(spec["issue_url"])
+        ):
+            raise ValueError("tracker audit differs from frozen issue authority")
     expected_claim = not release
     if observed.get("state") != "consistent" or bool(observed.get("claim")) != expected_claim:
         return {

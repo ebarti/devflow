@@ -1,6 +1,6 @@
 # Local Desktop entry point
 
-For the portable plugin and additive local marketplace, see the [plugin guide](../../docs/local-delivery-plugin.md). `package_plugin.py` packages this same canonical skill and MCP executable without registering or changing the host. The direct installer below remains an alternative; disable matching direct components manually before switching to the plugin.
+For the portable plugin and additive local marketplace, see the [plugin guide](../../docs/local-delivery-plugin.md). `package_plugin.py` packages this same canonical skill and MCP executable without registering or changing the host. The direct installer below remains an alternative; the guarded primary-plugin switch removes its duplicate host registration and archives its skill for rollback.
 
 This directory installs one narrow Codex skill and one stdio MCP server. The MCP server is the existing `devflow-delivery-mcp` client of the authenticated local service; it does not run or poll the workflow. The installed skill does not replace the existing general Devflow skills.
 
@@ -76,6 +76,61 @@ it can select the old service policy. When using the plugin instead, package
 and register its new resources with the same new config; inspect existing public
 plugin registrations first and preserve any earlier package for rollback. The
 direct pointer updater does not rewrite or remove plugin installations.
+
+To make the plugin primary after that pointer update, package a fresh immutable
+`devflow-local` marketplace under the service state root. Read back the public
+MCP entry, `codex plugin list --json`, and `codex plugin marketplace list`. The
+installed CLI reports an empty marketplace as `No plugin marketplaces in scope.`;
+otherwise it reports a `MARKETPLACE ROOT` table. Create a private 0600 request:
+
+```json
+{
+  "command_id": "stable-owned-primary-plugin-switch",
+  "marketplace_root": "/absolute/private/state/fresh-marketplace",
+  "expected_registration_sha256": "SHA256_OF_CURRENT_CANONICAL_PUBLIC_GET_JSON",
+  "expected_config_sha256": "SHA256_OF_TRUSTED_CONFIG_BYTES",
+  "expected_skill_sha256": "SHA256_OF_CURRENT_DIRECT_SKILL_BYTES",
+  "expected_plugin_inventory_sha256": "SHA256_OF_CANONICAL_PLUGIN_LIST_JSON",
+  "expected_marketplace_inventory_sha256": "SHA256_OF_CANONICAL_NAME_TO_ROOT_OBJECT"
+}
+```
+
+All inventory hashes use sorted, compact JSON. The marketplace hash binds the
+parsed name-to-root object, including `{}` for an empty inventory. The helper
+`owned_plugin.snapshot(codex, codex_home)` returns these exact seals without
+changing the host. A same-name plugin, marketplace or cached package already
+present is a conflict. The package, installed cache, direct skill and selected
+configuration must be owned regular files with the inspected bytes.
+
+```sh
+/absolute/runtime/.venv/bin/python runtime/desktop/install.py \
+  --runtime-dir /absolute/runtime --config /absolute/private/state/trusted-local.json \
+  --codex-home /absolute/codex-home \
+  --activate-owned-plugin-request /absolute/private/state/primary-plugin.json
+```
+
+The installer journals its private intent before effects, registers the fresh
+marketplace and enables `devflow@devflow-local` using public CLI commands, checks
+the installed cache, removes only the exact direct MCP entry, and moves the exact
+direct skill outside discovery into the returned manifest's `direct-skill`
+archive. Unrelated host settings, models, agents, MCP entries and plugins are
+checked before and after. Interrupted or uncertain commands retain their intent;
+an identical request observes each completed effect before continuing. Changed
+owned inputs conflict. To restore the inspected direct entry and skill:
+
+```sh
+/absolute/runtime/.venv/bin/python runtime/desktop/install.py \
+  --runtime-dir /absolute/runtime --config /absolute/private/state/trusted-local.json \
+  --codex-home /absolute/codex-home \
+  --rollback-owned-plugin-manifest /absolute/codex-home/.devflow-local-delivery-upgrades/COMMAND_ID/manifest.json
+```
+
+Rollback uses public plugin/marketplace removal and MCP registration, then
+restores the archived skill and verifies the original inventory. It rejects
+modified owned bytes. A rolled-back command ID stays rolled back on replay.
+Standalone CLI, direct stdio MCP invocation and the authenticated service API
+remain available; this switch selects the global plugin as the host entry point.
+Fresh host discovery must establish that entry point and its configuration.
 
 With the runtime and config paths above, the service can be checked using the same public CLI:
 
