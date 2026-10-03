@@ -12,6 +12,7 @@ import secrets
 import subprocess
 import time
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -19,7 +20,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from temporalio.client import Client, WorkflowUpdateFailedError
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
 from temporalio.common import RetryPolicy, WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
@@ -133,6 +134,11 @@ class DeliveryService:
                     id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
                     id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
                     retry_policy=RetryPolicy(maximum_attempts=1),
+                    **({"execution_timeout": timedelta(hours=72),
+                        "run_timeout": timedelta(minutes=14)
+                        if recovery and recovery.get("kind") == "terminal_tracker_recovery"
+                        else timedelta(hours=72)}
+                       if spec.get("terminal_tracker_version") == 1 else {}),
                     memo={
                         "request_digest": item["request_digest"],
                         **({"recovery_digest": digest(recovery)} if recovery else {}),
@@ -418,9 +424,34 @@ def create_app(config_path: Path) -> FastAPI:
             return prior
         try:
             client = await service.client()
-            result = await client.get_workflow_handle(
+            handle = client.get_workflow_handle(
                 service.store.active_workflow_id(run_id)
-            ).execute_update(name, payload, id=command_id)
+            )
+            if name == "reconcile_tracker":
+                from .delivery_terminal_recovery import receipt, recover
+
+                saved = receipt(service.store, run_id, payload)
+                if saved is not None:
+                    service.store.finish_mutation(command_id, saved)
+                    return saved
+                description = await handle.describe()
+                if description.status != WorkflowExecutionStatus.RUNNING:
+                    # A lost acknowledged update and a fresh closed-tail command
+                    # are different cases. Observe the existing update first.
+                    try:
+                        result = await handle.get_update_handle(command_id).result(
+                            rpc_timeout=timedelta(seconds=2),
+                        )
+                    except RPCError as exc:
+                        if exc.status != RPCStatusCode.NOT_FOUND:
+                            raise
+                        response = await recover(service.store, run_id, payload, client)
+                        service.store.finish_mutation(command_id, response)
+                        return response
+                else:
+                    result = await handle.execute_update(name, payload, id=command_id)
+            else:
+                result = await handle.execute_update(name, payload, id=command_id)
         except WorkflowUpdateFailedError as exc:
             reason = str(exc.__cause__ or exc)
             service.store.reject_mutation(command_id, reason)
@@ -428,6 +459,12 @@ def create_app(config_path: Path) -> FastAPI:
         except RPCError as exc:
             service.store.mark_mutation_unknown(command_id)
             raise HTTPException(503, type(exc).__name__) from exc
+        except (ValueError, RuntimeError) as exc:
+            if name == "reconcile_tracker":
+                service.store.mark_mutation_unknown(command_id)
+            else:
+                service.store.reject_mutation(command_id, str(exc))
+            raise HTTPException(409, str(exc)) from exc
         response = {"run_id": run_id, "phase": result["phase"], "revision": result["revision"]}
         service.store.finish_mutation(command_id, response)
         if name == "cancel":

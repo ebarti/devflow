@@ -42,7 +42,11 @@ during `tracker_started` still wins before the terminal transition is frozen.
 Terminal reconciliation stays inside the original live Temporal workflow. It
 makes three attempts, each with a three-minute activity bound and finite durable
 backoff timers, then exposes an exhausted `waiting_tracker` checkpoint without
-closing the execution. Its terminal outcome/status/release request is frozen;
+closing the execution immediately. The checkpoint has a ten-minute overall
+deadline. On expiry it closes with the pending projection and no successful
+outcome. Newly dispatched runs also have a finite 72-hour Temporal execution
+timeout; a reconciliation-only successor has a fourteen-minute run timeout.
+Its terminal outcome/status/release request is frozen;
 new cancellation cannot change a transition that may already have released its
 claim. A public `reconcile-tracker` update resumes one more three-attempt readback
 cycle and grants no role, source edit, gate, model or capacity authority:
@@ -60,8 +64,33 @@ command ID. On each retry the activity first inspects the owning acknowledged
 intent and claim. If the helper already released the claim, only a fresh
 read-only audit is allowed; it never repeats `set` without ownership. Confirmed
 readback restores the frozen terminal outcome and refreshes the final projection,
-including clearing the pending error. Background helper success therefore
+clearing the pending error and restoring any original blocked failure. The work,
+acknowledged intent and live audit must all bind the frozen issue URL before any
+helper mutation/audit and after readback. Reassignment conflicts rather than
+following another issue. Background helper success therefore
 remains safely recoverable through the public readback command.
+
+If the execution is completed or timed out before confirmation, the same public
+command admits a reconciliation-only successor. Admission reads the authentic
+Temporal execution, memo and completed pending-projection activity from its
+closed history; no caller-supplied checkpoint can authorize it. The durable grant
+binds that history hash, the exact projected candidate/PR and checks, every
+finished attempt/effect, cleanup receipt, stopped process identities/ports and
+current ownership. Delivered targets also revalidate the published remote head.
+An identical command returns its existing receipt, including across an uncertain
+response and dispatch restart. The successor rechecks the seal before the first
+tracker effect, preserves original role/session results and never runs roles,
+candidate edits, preparation, gates, publication or cleanup again. Missing or
+changed evidence leaves a recoverable conflict checkpoint. It can only confirm
+the existing terminal transition. Each explicit continuation has the same finite
+readback deadline.
+
+The dashboard hides cancellation once a terminal checkpoint is frozen and offers
+`Reconcile tracker` only for an exhausted or closed checkpoint. Its retry keeps
+the exact command ID and revision across streaming cycle updates until the API
+acknowledges it. Authorized development continuations instead remove the active
+terminal checkpoint before their first live projection, while retaining the
+predecessor history; cancellation can then stop the newly authorized work.
 
 ## Preserved-candidate execution recovery
 

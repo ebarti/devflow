@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,12 @@ from devflow_temporal.delivery_sandbox import native_check_argv
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 from devflow_temporal.role_runner import _task
+
+
+@pytest.fixture(autouse=True)
+def terminal_unit_clock(monkeypatch):
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.now',
+                        lambda: datetime(2026, 10, 3, tzinfo=UTC))
 
 
 def test_trusted_mode_uses_supported_noninteractive_sdk_contract(native_configuration):
@@ -249,6 +256,24 @@ def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, 
     assert observed['readback_at'] >= result['readback_at']
     assert ['set' if 'set' in call else 'audit' for call in calls] == ['set', 'audit', 'audit']
 
+    def wrong_issue_audit(command, **kwargs):
+        result = owning_cli(command, **kwargs)
+        data = json.loads(result.stdout)
+        data['issue'] = spec['issue_url'].rsplit('/', 1)[0] + '/999'
+        return subprocess.CompletedProcess(command, result.returncode,
+                                           json.dumps(data), result.stderr)
+
+    monkeypatch.setattr('devflow_temporal.delivery_activities.subprocess.run', wrong_issue_audit)
+    assert _tracker_sync(spec, status, release=True, terminal=True)['state'] == 'pending'
+    monkeypatch.setattr('devflow_temporal.delivery_activities.subprocess.run', owning_cli)
+    count = len(calls)
+    with store._connect() as db:
+        store.state.update(db, 'work', {'id': spec['work_id'],
+                          'issue': spec['issue_url'].rsplit('/', 1)[0] + '/999'}, None)
+    conflicted = _tracker_sync(spec, status, release=True, terminal=True)
+    assert conflicted['state'] == 'pending' and 'frozen authority' in conflicted['reason']
+    assert len(calls) == count  # No set/audit can follow the replacement issue.
+
 
 def test_real_pytest_numbered_fixture_artifacts_survive_navigation_links(tmp_path):
     import subprocess
@@ -374,7 +399,7 @@ async def test_exhausted_tracker_checkpoint_stays_open_and_explicitly_resumes(mo
     async def no_wait(_duration):
         return None
 
-    async def condition(predicate):
+    async def condition(predicate, **_kwargs):
         while not predicate():
             await asyncio.sleep(0.001)
 
@@ -404,3 +429,36 @@ async def test_exhausted_tracker_checkpoint_stays_open_and_explicitly_resumes(mo
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_authorized_repair_discards_only_active_terminal_checkpoint(monkeypatch):
+    controller = DeliveryWorkflow()
+    checkpoint = {'state': 'confirmed', 'outcome': 'blocked'}
+    candidate = {'id': 'same-candidate'}
+    previous = {'run_id': 'same-run', 'phase': 'blocked', 'outcome': 'blocked',
+                'iteration': 2, 'revision': 13, 'cleanup': 'none',
+                'candidate': candidate,
+                'roles': [{'role': 'implement', 'session_id': 'same-session'}],
+                'checks': {'terminal_tracker_checkpoint': checkpoint, 'local': {'state': 'failed'}}}
+    recovery = {'state': previous, 'candidate': candidate, 'session_id': 'same-session',
+                'findings': ['Owning gate failure'], 'maximum_iteration': 3,
+                'additional_iterations': 1}
+
+    async def condition(predicate, **_kwargs):
+        assert predicate()
+
+    async def project(_spec, event, _message):
+        if event == 'repair_preflight_started':
+            assert 'terminal_tracker_checkpoint' not in controller.state['checks']
+            await controller.cancel({'expected_revision': controller.state['revision'],
+                                     'reason': 'Cancel the newly authorized repair'})
+
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.wait_condition', condition)
+    controller._project = project
+    result = await controller._resume_repair({'run_id': 'same-run', 'policy': {'max_repairs': 2}},
+                                           recovery)
+    assert result['outcome'] == 'cancelled' and controller.cancel_requested
+    assert previous['checks']['terminal_tracker_checkpoint'] == checkpoint
+    assert previous['checks']['local']['state'] == 'failed'
+    assert previous['roles'][0]['session_id'] == 'same-session'

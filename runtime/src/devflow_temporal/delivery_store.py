@@ -2371,6 +2371,8 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+                recovery = recovery["original_recovery"]
             if isinstance(recovery, dict) and recovery.get("kind") == "execution_policy_recovery":
                 from .delivery_policy_recovery import effective_spec
 
@@ -2447,6 +2449,7 @@ class DeliveryStore:
                 "repair_continuation_queued",
                 "repair_prelaunch_retry_queued",
                 "scope_amendment_queued",
+                "terminal_tracker_recovery_queued",
             }:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
@@ -2458,7 +2461,9 @@ class DeliveryStore:
                     )
                 return
             new_phase = (
-                "publishing"
+                "waiting_tracker"
+                if row[1] == "terminal_tracker_recovery_queued" and accepted
+                else "publishing"
                 if row[1] == "publication_recovery_queued" and accepted
                 else "repair"
                 if row[1] in {
@@ -2470,7 +2475,9 @@ class DeliveryStore:
                 if accepted
                 else row[1]
             )
-            new_state = "running" if accepted else "pending_temporal"
+            new_state = "waiting_tracker" if accepted and new_phase == "waiting_tracker" else (
+                "running" if accepted else "pending_temporal"
+            )
             revision = row[0] + 1
             db.execute(
                 """UPDATE delivery_runs SET phase=?,execution_state=?,revision=?,updated_at=?

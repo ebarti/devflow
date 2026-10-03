@@ -223,7 +223,7 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  if (run.execution_retired || run.outcome != null || ['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')) return null
+  if (run.execution_retired || run.outcome != null || run.checks?.terminal_tracker_checkpoint || ['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')) return null
   async function cancel() {
     if (!reason.trim() || run.protocol_revision == null) return
     setBusy(true); setError('')
@@ -242,6 +242,38 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
     </div> : <button type="button" className="text-button" onClick={() => setOpen(true)} disabled={run.protocol_revision == null}>Cancel run</button>}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
   </div>
+}
+
+function TrackerRecovery({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
+  const [body, setBody] = useState<{ command_id: string; expected_revision: number } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const checkpoint = run.checks?.terminal_tracker_checkpoint
+  if (!checkpoint || run.execution_retired || run.outcome != null) return null
+  const available = run.phase === 'waiting_tracker' && (checkpoint.waiting || checkpoint.closed)
+
+  async function reconcile() {
+    if (busy || run.protocol_revision == null || (!body && !available)) return
+    const request = body ?? { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision }
+    setBody(request); setBusy(true); setError('')
+    try {
+      await api.reconcileTracker(run.id, request)
+      await onRefresh()
+      setBody(null)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Tracker readback could not be confirmed.')
+      await onRefresh()
+      if (cause instanceof ApiError && cause.status === 409 && cause.message.includes('stale run revision')) setBody(null)
+    } finally { setBusy(false) }
+  }
+
+  return <section className="section" aria-labelledby="tracker-recovery-heading">
+    <h2 id="tracker-recovery-heading">Confirm terminal tracker</h2>
+    <p>The terminal transition is fixed. Reconciliation confirms the issue, assignee and Project readback without rerunning development.</p>
+    <p className="subtle">{available ? 'Readback is waiting for explicit reconciliation.' : 'The current bounded reconciliation is running or queued.'}</p>
+    <button type="button" className="primary-button" disabled={busy || run.protocol_revision == null || (!body && !available)} onClick={() => void reconcile()}>{busy ? 'Reconciling…' : error && body ? 'Retry same reconciliation' : 'Reconcile tracker'}</button>
+    {error ? <p className="form-error" role="alert">{error} {body ? 'The request identity is retained while its response is unconfirmed.' : 'Review the refreshed run before reconciling again.'}</p> : null}
+  </section>
 }
 
 export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
@@ -265,6 +297,7 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     <GateDetails gates={run.phase_gates} />
     <Operations run={run} />
     <UsageSection run={run} />
+    <TrackerRecovery key={run.id} run={run} onRefresh={onRefresh} />
     <CancelRun run={run} onRefresh={onRefresh} />
   </div>
 }

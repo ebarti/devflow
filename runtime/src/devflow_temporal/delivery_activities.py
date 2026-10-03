@@ -348,18 +348,30 @@ def _terminal_receipt(store, spec, status, release, project, assignee, desired):
     with store._connect() as db:
         db.execute("BEGIN")
         work = store.state.row(db, "works", spec["work_id"])
-        sync = json.loads(work["details"] or "{}").get("github", {}).get("sync", {})
+        sync = json.loads(work["details"] or "{}").get("github", {}).get("sync", {}) if work else {}
         intent = db.execute("SELECT * FROM reconcile_intents WHERE work_id=?",
                             (spec["work_id"],)).fetchone()
         claim = store.state.claim_for(db, spec["work_id"])
     owner = f"external:devflow:{spec['run_id']}"
+    issue = spec["issue_url"]
+    if (not work or store.state.issue_resource(work["issue"])
+            != store.state.issue_resource(issue)):
+        return {"state": "pending", "pending": True, "desired": desired,
+                "reason": "terminal work issue differs from frozen authority",
+                "readback_at": _now()}
+    payload = json.loads(intent["payload"]) if intent else {}
+    if intent and store.state.issue_resource(payload.get("issue", "")) != (
+        store.state.issue_resource(issue)
+    ):
+        return {"state": "pending", "pending": True, "desired": desired,
+                "reason": "terminal intent issue differs from frozen authority",
+                "readback_at": _now()}
     if not intent or intent["state"] != "acknowledged":
         if claim is not None and claim["owner"] == owner:
             return None  # The owning helper can resume its observed pending intent.
         return {"state": "pending", "pending": True, "desired": desired,
                 "reason": "terminal ownership or acknowledgement is unavailable",
                 "readback_at": _now()}
-    payload = json.loads(intent["payload"])
     if (intent["owner"] != owner or payload.get("status") != status
             or bool(payload.get("release")) != release or sync.get("status") != status
             or sync.get("issue_state") != "OPEN" or sync.get("project") != project
@@ -414,6 +426,8 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
             observed = json.loads(audit.stdout) if audit.returncode == 0 else {}
             current = _terminal_receipt(store, spec, status, release, project, assignee, desired)
             if (audit.returncode or observed.get("state") != "consistent"
+                    or store.state.issue_resource(observed.get("issue", ""))
+                    != store.state.issue_resource(spec["issue_url"])
                     or current != prior or observed.get("expected") != prior["observed"]["expected"]
                     or bool(observed.get("claim")) != (not release)):
                 return {"state": "pending", "pending": True, "desired": desired,
@@ -527,6 +541,12 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
     if request["spec"]["provider"] == "fake":
         return {"state": "consistent", "pending": False, "observed": {"fixture": True}}
     try:
+        if request["status"] == "in-review" and request.get("pull_request") is not None:
+            from .delivery_terminal_recovery import published_readback
+
+            store, _ = _context(request["spec"])
+            await asyncio.to_thread(published_readback, store, request["spec"],
+                                    request.get("candidate"), request["pull_request"])
         return await asyncio.to_thread(
             _tracker_sync, request["spec"], request["status"], release=request["release"],
             terminal=True, reason=request.get("reason"),
@@ -540,7 +560,20 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+@activity.defn(name="delivery_terminal_preflight")
+async def delivery_terminal_preflight(request):
+    def execute():
+        from .delivery_terminal_recovery import preflight
+
+        store, _ = _context(request["spec"])
+        preflight(store, request["spec"], request["recovery"])
+        return {"state": "confirmed"}
+
+    return await asyncio.to_thread(execute)
+
+
 DELIVERY_ACTIVITIES = [
+    delivery_terminal_preflight,
     delivery_terminal_tracker,
     delivery_project,
     delivery_prepare,

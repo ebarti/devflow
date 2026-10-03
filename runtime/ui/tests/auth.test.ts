@@ -3,6 +3,24 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 afterEach(() => vi.unstubAllGlobals())
 
 describe('anonymous local CSRF state', () => {
+  it('uses the public tracker-only contract and preserves an uncertain command identity', async () => {
+    const fetchMock = vi.fn(async (path: string) => ({
+      ok: true, status: 200, json: async () => path === '/api/session'
+        ? { csrf_token: 'terminal-csrf' }
+        : { run_id: 'run-1', phase: 'terminal_tracker_recovery_queued', reconciliation_only: true },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.resetModules()
+    const { api } = await import('../src/api')
+    const body = { command_id: 'same-readback', expected_revision: 19 }
+    await api.reconcileTracker('run-1', body)
+    const [path, init] = fetchMock.mock.calls[1] as unknown as [string, RequestInit]
+    expect(path).toBe('/api/runs/run-1/reconcile-tracker')
+    expect(init.headers).toMatchObject({ 'X-Devflow-CSRF': 'terminal-csrf' })
+    expect(JSON.parse(String(init.body))).toEqual(body)
+    expect(init.method).toBe('POST')
+  })
+
   it('automatically bootstraps and renews before commands without a credential', async () => {
     const responses = [{ csrf_token: 'first-csrf' }, {}, { csrf_token: 'renewed-csrf' }, {}]
     const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => responses.shift() }))
