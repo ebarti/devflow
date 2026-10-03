@@ -104,7 +104,9 @@ The owned 0600 request has exactly these fields (all paths are absolute):
 The authority reference is the existing main task installation decision, with
 `decision_owner`, `authority_source` and `new_user_approval: false`; its exact
 bytes are bound, rather than inventing an approval. Preserve earlier decisions
-and rejection evidence. Every reference is an owned regular 0600 file. Snapshot
+and rejection evidence. Requests, journal and private snapshots require owned
+regular 0600 files. Hash-bound public authority/content indexes may also be 0644;
+links, foreign ownership and group/world writes reject. Snapshot
 JSON has exactly `settings`, `other_mcp`, `plugins` and `marketplaces` keys.
 `owned_drift.foreign_snapshot(codex, home)` reads the current public inventory and
 TOML without the owned MCP entry. Construct the prior snapshot from retained
@@ -138,6 +140,19 @@ including rollback and reapply. Any later setting, inventory, content, metadata
 or owned-authority change refuses before further effects. Interrupted effects
 remain observable through the same original command. A subsequent primary-plugin
 request captures fresh then-current inventory normally.
+
+Each effect guard rereads the live owned MCP pointer, configuration hashes and
+skill identity/bytes after the slower foreign inventory reads. It permits only
+the original before/after states and requires the expected pointer/skill state
+after each effect. An unrecognized concurrent owned change refuses without
+overwriting it, including during unknown-command replay and rollback.
+
+The optional actual constrained-profile regressions use `DEVFLOW_CODEX_BIN` and
+a real Python interpreter resolved inside the profile's existing `/opt/homebrew`
+or `/usr/local` toolchain reads. `DEVFLOW_PROFILE_PYTHON` can select an exact such
+interpreter. They execute the original sentinel/child/diff assertions; unavailable
+interpreters fail an explicit opt-in rather than treating Apple SDK bootstrap
+failure as denial evidence. Production profile permissions remain unchanged.
 
 Installation does not restart the service or refresh cached host clients. Stop
 the owned service separately, apply the reviewed runtime/config/pointer change,

@@ -308,3 +308,87 @@ def test_creation_refuses_false_prior_seal_without_receipt(ambient):
     _private(request, inputs)
     assert _run(fixture, "--acknowledge-owned-drift-request", str(request)).returncode != 0
     assert not (manifest.parent / drift.SIDECAR).exists()
+
+
+def test_public_authority_index_references_are_hash_bound_owned_readonly_evidence(ambient):
+    module, drift, fixture, args, manifest, request, root = ambient
+    inputs = json.loads(request.read_text())
+    authority = Path(inputs["authority"]["path"])
+    content = Path(inputs["content_indexes"][0]["path"])
+    authority.chmod(0o644)
+    content.chmod(0o644)
+    receipt = _ack(ambient)
+    frozen = (receipt.read_bytes(), manifest.read_bytes())
+    authority.chmod(0o664)
+    assert _run(fixture, "--repoint-owned-request", str(fixture["request"])).returncode != 0
+    assert (receipt.read_bytes(), manifest.read_bytes()) == frozen
+
+
+@pytest.mark.parametrize("operation", ["upgrade", "rollback"])
+@pytest.mark.parametrize("target", ["skill", "pointer"])
+def test_live_owned_authority_changed_during_public_guard_is_never_overwritten(
+    ambient,
+    monkeypatch,
+    operation,
+    target,
+):
+    module, drift, fixture, args, manifest, request, root = ambient
+    _ack(ambient)
+    if operation == "rollback":
+        module.upgrade(*args)
+    original = json.loads(manifest.read_text())
+    saved_skill = fixture["skill"].read_bytes()
+    public = drift.foreign_snapshot
+    calls = 0
+
+    def concurrent_owned_change(*values):
+        nonlocal calls
+        observed = public(*values)
+        calls += 1
+        if calls == (2 if operation == "upgrade" else 4):
+            if target == "skill":
+                fixture["skill"].write_text("Unrecognized concurrent owned skill bytes\n")
+            else:
+                registry = json.loads(fixture["registry"].read_text())
+                registry["entries"]["devflow-local-delivery"]["transport"]["args"] = [
+                    "unrecognized"
+                ]
+                _private(fixture["registry"], registry)
+        return observed
+
+    monkeypatch.setattr(drift, "foreign_snapshot", concurrent_owned_change)
+    with pytest.raises(ValueError, match="live owned installation changed"):
+        if operation == "upgrade":
+            module.upgrade(*args)
+        else:
+            module.rollback(args[0], fixture["home"], manifest)
+    if target == "skill":
+        assert fixture["skill"].read_text() == "Unrecognized concurrent owned skill bytes\n"
+    else:
+        assert fixture["skill"].read_bytes() == saved_skill
+        registry = json.loads(fixture["registry"].read_text())
+        assert registry["entries"]["devflow-local-delivery"]["transport"]["args"] == [
+            "unrecognized"
+        ]
+    assert {k: v for k, v in json.loads(manifest.read_text()).items() if k != "state"} == {
+        k: v for k, v in original.items() if k != "state"
+    }
+
+
+def test_acknowledged_foreign_mcp_enabled_change_refuses_before_effects(ambient):
+    module, drift, fixture, args, manifest, request, root = ambient
+    _ack(ambient)
+    registry = json.loads(fixture["registry"].read_text())
+    registry["entries"]["unrelated"]["enabled"] = False
+    _private(fixture["registry"], registry)
+    frozen = (
+        manifest.read_bytes(),
+        fixture["skill"].read_bytes(),
+        fixture["registry"].read_bytes(),
+    )
+    assert _run(fixture, "--repoint-owned-request", str(fixture["request"])).returncode != 0
+    assert frozen == (
+        manifest.read_bytes(),
+        fixture["skill"].read_bytes(),
+        fixture["registry"].read_bytes(),
+    )

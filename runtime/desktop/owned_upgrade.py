@@ -169,7 +169,10 @@ def _rollback(codex, home, manifest_path):
     if (not manifest_path.resolve().is_relative_to(expected_root.resolve())
             or manifest['codex_home'] != str(home)):
         raise ValueError('rollback receipt belongs to another host installation')
-    expected = guard(codex, home, manifest_path, manifest)
+    try:
+        expected = guard(codex, home, manifest_path, manifest)
+    except ValueError as exc:
+        raise ValueError('owned installation changed; rollback refused: ' + str(exc)) from exc
     current, unrelated = snapshot(codex, home, expected)
     old, new = manifest['before'], manifest['after']
     target = home / 'skills' / NAME / 'SKILL.md'
@@ -181,14 +184,15 @@ def _rollback(codex, home, manifest_path):
     if current != old:
         guard(codex, home, manifest_path, manifest)
         install_pointer(codex, home, old['transport']['command'], manifest['old_config_path'])
-        guard(codex, home, manifest_path, manifest)
+        guard(codex, home, manifest_path, manifest, pointer=old)
     backup = manifest_path.parent / 'previous-SKILL.md'
     previous = private(backup)
     if sha(previous) != manifest['old_skill_sha256']:
         raise ValueError('owned skill rollback bytes changed')
-    guard(codex, home, manifest_path, manifest)
+    guard(codex, home, manifest_path, manifest, pointer=old)
     write(target, previous)
-    guard(codex, home, manifest_path, manifest)
+    guard(codex, home, manifest_path, manifest, pointer=old,
+          skill_sha256=manifest['old_skill_sha256'])
     verified, unrelated_after = snapshot(codex, home, expected)
     if verified != old or unrelated_after != unrelated:
         raise ValueError('public rollback readback disagrees')
@@ -282,10 +286,11 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
         if current != manifest['after']:
             guard(codex, home, manifest_path, manifest)
             install_pointer(codex, home, executable, config)
-            guard(codex, home, manifest_path, manifest)
-        guard(codex, home, manifest_path, manifest)
+            guard(codex, home, manifest_path, manifest, pointer=manifest['after'])
+        guard(codex, home, manifest_path, manifest, pointer=manifest['after'])
         write(target, new_skill)
-        guard(codex, home, manifest_path, manifest)
+        guard(codex, home, manifest_path, manifest, pointer=manifest['after'],
+              skill_sha256=manifest['new_skill_sha256'])
         verified, unrelated_after = snapshot(codex, home, expected)
         if verified != manifest['after'] or unrelated_after != unrelated:
             raise ValueError('public update readback disagrees or unrelated host settings changed')

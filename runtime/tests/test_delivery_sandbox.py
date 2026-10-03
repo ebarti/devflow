@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -22,8 +23,25 @@ def slash_tmp_path():
         yield Path(path)
 
 
+@pytest.fixture
+def native_profile_python():
+    """Execute a real interpreter under existing toolchain reads, without an SDK shim."""
+    roots = (Path('/opt/homebrew').resolve(), Path('/usr/local').resolve())
+    configured = os.environ.get('DEVFLOW_PROFILE_PYTHON')
+    candidates = ((configured,) if configured else
+                  (sys.executable, '/opt/homebrew/bin/python3', '/usr/local/bin/python3'))
+    for value in candidates:
+        interpreter = Path(value).resolve()
+        if (interpreter.is_file() and os.access(interpreter, os.X_OK)
+                and any(interpreter.is_relative_to(root) for root in roots)):
+            return str(interpreter)
+    pytest.fail('constrained probe requires real Python within existing toolchain reads')
+
+
 @pytest.mark.skipif(not os.environ.get("DEVFLOW_CODEX_BIN"), reason="real Codex CLI path required")
-def test_native_profile_restricts_sibling_tmp_paths_and_alias(slash_tmp_path: Path):
+def test_native_profile_restricts_sibling_tmp_paths_and_alias(
+    slash_tmp_path: Path, native_profile_python: str,
+):
     """A real Codex sandbox must not inherit broad /tmp access from its cwd."""
 
     binary = os.environ["DEVFLOW_CODEX_BIN"]
@@ -85,7 +103,7 @@ def test_native_profile_restricts_sibling_tmp_paths_and_alias(slash_tmp_path: Pa
             "devflow-role",
             "-C",
             str(workspace),
-            "/usr/bin/python3",
+            native_profile_python,
             str(probe),
         ],
         env=env,
@@ -104,7 +122,9 @@ def test_native_profile_restricts_sibling_tmp_paths_and_alias(slash_tmp_path: Pa
 
 
 @pytest.mark.skipif(not os.environ.get("DEVFLOW_CODEX_BIN"), reason="real Codex CLI path required")
-def test_independent_profile_reads_only_bound_diff_not_git_or_controller(slash_tmp_path: Path):
+def test_independent_profile_reads_only_bound_diff_not_git_or_controller(
+    slash_tmp_path: Path, native_profile_python: str,
+):
     binary = os.environ["DEVFLOW_CODEX_BIN"]
     root = slash_tmp_path
     workspace = root / "review-checkout"
@@ -151,7 +171,7 @@ def test_independent_profile_reads_only_bound_diff_not_git_or_controller(slash_t
             "devflow-role",
             "-C",
             str(workspace),
-            "/usr/bin/python3",
+            native_profile_python,
             "-c",
             probe,
             str(patch),

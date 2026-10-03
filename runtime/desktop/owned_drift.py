@@ -174,7 +174,25 @@ def _referenced(request, name):
     path = Path(reference["path"])
     if path.stat().st_size > 1024 * 1024:
         raise ValueError("ambient acknowledgement evidence exceeds its bound")
-    content = private(path)
+    if name in {"authority", "index"}:
+        if any(parent.is_symlink() for parent in path.parents):
+            raise ValueError("public ambient evidence reference is linked")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) not in {0o600, 0o644}
+                or info.st_size > 1024 * 1024
+            ):
+                raise ValueError(
+                    "public ambient evidence must be an owned regular immutable reference"
+                )
+            content = stream.read(1024 * 1024 + 1)
+    else:
+        content = private(path)
     if sha(content) != reference["sha256"]:
         raise ValueError("ambient acknowledgement referenced evidence changed")
     return json.loads(content)
@@ -248,6 +266,13 @@ def _material(request, manifest, codex, home):
             )
             if root not in roots:
                 raise ValueError("changed installed plugin lacks complete current content evidence")
+    return unrelated_seal({k: after[k] for k in ("settings", "other_mcp")})
+
+
+def _live_owned(codex, home, manifest, expected, pointer=None, skill_sha256=None):
+    from owned_upgrade import snapshot
+
+    current, unrelated = snapshot(codex, home, expected)
     for prefix in ("old", "new"):
         if (
             sha(private(Path(manifest[f"{prefix}_config_path"])))
@@ -257,13 +282,36 @@ def _material(request, manifest, codex, home):
     source = Path(__file__).parent / NAME / "SKILL.md"
     if sha(source.read_bytes()) != manifest["new_skill_sha256"]:
         raise ValueError("frozen owned skill source changed")
-    return unrelated_seal({k: after[k] for k in ("settings", "other_mcp")})
+    target = home / "skills" / NAME / "SKILL.md"
+    if any(path.is_symlink() for path in (target, *target.parents)):
+        raise ValueError("live owned skill path is linked")
+    descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or info.st_size > 1024 * 1024
+        ):
+            raise ValueError("live owned skill identity changed")
+        content = stream.read(1024 * 1024 + 1)
+    pointers = (pointer,) if pointer is not None else (manifest["before"], manifest["after"])
+    skills = (
+        (skill_sha256,)
+        if skill_sha256 is not None
+        else (manifest["old_skill_sha256"], manifest["new_skill_sha256"])
+    )
+    if unrelated != expected or current not in pointers or sha(content) not in skills:
+        raise ValueError("public update readback disagrees or live owned installation changed")
 
 
-def guard(codex, home, manifest_path, manifest):
+def guard(codex, home, manifest_path, manifest, *, pointer=None, skill_sha256=None):
     path = manifest_path.parent / SIDECAR
     if not path.exists():
-        return manifest["unrelated_sha256"]
+        expected = manifest["unrelated_sha256"]
+        _live_owned(codex, home, manifest, expected, pointer, skill_sha256)
+        return expected
     acknowledgement = json.loads(private(path))
     raw = private(Path(acknowledgement["request_path"]))
     if sha(raw) != acknowledgement["request_sha256"]:
@@ -279,13 +327,15 @@ def guard(codex, home, manifest_path, manifest):
         != {k: v for k, v in original.items() if k != "state"}
     ):
         raise ValueError("original owned journal changed after ambient acknowledgement")
-    return _material(request, original, codex, home)
+    expected = _material(request, original, codex, home)
+    _live_owned(codex, home, original, expected, pointer, skill_sha256)
+    return expected
 
 
 def acknowledge(codex, home, executable, config, source_skill, request_path):
     with locked(home):
         if not request_path.is_absolute() or request_path.stat().st_size > 64 * 1024:
-            raise ValueError('ambient acknowledgement request must be absolute and bounded')
+            raise ValueError("ambient acknowledgement request must be absolute and bounded")
         raw = private(request_path)
         request = json.loads(raw)
         required = {
