@@ -55,6 +55,8 @@ def native_identity(spec: dict) -> dict:
     if spec["policy"]["config_overrides"] != NATIVE_OVERRIDES:
         raise PreparationError("native roles must disable built-in agents and plugins")
     return {
+        **({"execution_mode": "trusted-local"}
+           if spec["policy"].get("host_sandbox") == "trusted-local" else {}),
         "platform": "native-macos",
         "os_version": platform.mac_ver()[0],
         "architecture": platform.machine(),
@@ -74,6 +76,8 @@ def native_identity(spec: dict) -> dict:
 
 
 def _measure(spec: dict, identity: dict) -> dict:
+    if identity.get("execution_mode") == "trusted-local":
+        return _measure_trusted(spec, identity)
     root = RunResources(spec).scratch("preparation", "boundary")
     workspace, home, codex_home = root / "workspace", root / "home", root / "private-codex"
     scratch = home / "tmp"
@@ -220,7 +224,56 @@ def _measure(spec: dict, identity: dict) -> dict:
     }
 
 
-def _validate_observed(observed: dict) -> None:
+def _measure_trusted(spec: dict, identity: dict) -> dict:
+    """Measure the actual full-host launcher without asserting hostile-code isolation."""
+    root = RunResources(spec).scratch("preparation", "trusted-local")
+    workspace, home, codex_home = root / "workspace", root / "home", root / "codex"
+    scratch = home / "tmp"
+    evidence = Path(spec["state_dir"]) / "native-preparation"
+    for path in (workspace, home, codex_home, scratch, evidence):
+        private_directory(path)
+    environment = _native_env(home, codex_home, scratch)
+    control = NativeProcess(
+        spec, evidence / "path-control", argv=[identity["codex_bin"], "--version"],
+        cwd=workspace, environment=environment, timeout=10,
+    ).run()
+    probe = NativeProcess(
+        spec, evidence / "trusted-local", cwd=workspace, environment=environment, timeout=30,
+        argv=[sys.executable, "-I", "-c",
+              "import json,os,pathlib; "
+              "from devflow_temporal.delivery_native_guard import reject_nested_controller; "
+              "pathlib.Path(os.environ['TMPDIR'],'probe').write_text('OK'); "
+              "print(json.dumps({'mode':'trusted-local','host_read':pathlib.Path('/etc/hosts')"
+              ".is_file(),'owned_tmp_write':True,"
+              "'managed_depth':os.getenv('DEVFLOW_MANAGED_DEPTH')})); "
+              "\ntry: reject_nested_controller()\nexcept ValueError: pass\n"
+              "else: raise RuntimeError('nested controller accepted')"],
+    ).run()
+    if control["exit_code"] != 0 or probe["exit_code"] != 0:
+        raise PreparationError("trusted-local launch measurement failed")
+    observed = json.loads(Path(probe["log"]).read_text())
+    _validate_observed(observed, trusted=True)
+    observed_path = evidence / "observed.json"
+    write_private(observed_path, observed)
+    proof = {
+        "schema": SCHEMA, "identity": identity, "fingerprint": digest(identity),
+        "measurement": {
+            "path_control": _reference(Path(control["log"])),
+            "observed": _reference(observed_path), "log": _reference(Path(probe["log"])),
+            "process_cleanup": probe["cleanup"], "exit_code": probe["exit_code"],
+            "native_teardown_scope": probe["native_teardown_scope"],
+        },
+    }
+    _validate(proof, identity, Path(spec["state_dir"]).parents[1])
+    return proof
+
+
+def _validate_observed(observed: dict, *, trusted: bool = False) -> None:
+    if trusted:
+        if observed != {"mode": "trusted-local", "host_read": True,
+                        "owned_tmp_write": True, "managed_depth": "1"}:
+            raise PreparationError("trusted-local launch or ancestry measurement did not pass")
+        return
     for item in (observed, observed.get("child", {})):
         if any(
             item.get(key) != "denied"
@@ -261,7 +314,8 @@ def _validate(proof: dict, identity: dict, state_root: Path) -> None:
         if hashlib.sha256(content).hexdigest() != reference["sha256"]:
             raise PreparationError("native measured evidence changed")
         if key == "observed":
-            _validate_observed(json.loads(content))
+            _validate_observed(json.loads(content),
+                               trusted=identity.get("execution_mode") == "trusted-local")
         if key == "path_control" and content.decode().strip() != (
             "codex-cli " + identity["runtime_dependencies"]["codex_cli_version"]
         ):

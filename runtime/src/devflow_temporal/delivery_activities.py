@@ -445,7 +445,25 @@ async def delivery_tracker(request: dict[str, Any]) -> dict[str, Any]:
     return _tracker_sync(request["spec"], "in-review", release=True)
 
 
+@activity.defn(name="delivery_terminal_tracker")
+async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
+    if request["spec"]["provider"] == "fake":
+        return {"state": "consistent", "pending": False, "observed": {"fixture": True}}
+    try:
+        return await asyncio.to_thread(
+            _tracker_sync, request["spec"], request["status"], release=request["release"],
+        )
+    except Exception as exc:
+        return {
+            "state": "pending", "pending": True, "reason": type(exc).__name__,
+            "desired": f"{request['status']}; claim "
+                       + ("released" if request["release"] else "retained pending cleanup"),
+            "readback_at": _now(),
+        }
+
+
 DELIVERY_ACTIVITIES = [
+    delivery_terminal_tracker,
     delivery_project,
     delivery_prepare,
     delivery_finalize_resources,

@@ -412,7 +412,7 @@ class DeliveryBroker:
             if self.spec["provider"] == "codex":
                 from .delivery_native_process import NativeProcess
                 from .delivery_preparation import verify_prepared_spec
-                from .delivery_sandbox import prepare_native_check
+                from .delivery_sandbox import native_check_argv, prepare_native_check
 
                 verify_prepared_spec(self.spec)
                 profile, environment = prepare_native_check(
@@ -430,16 +430,7 @@ class DeliveryBroker:
                 native_result = NativeProcess(
                     self.spec,
                     evidence_dir / check["id"] / "native",
-                    argv=[
-                        self.spec["policy"]["codex_bin"],
-                        "sandbox",
-                        "-P",
-                        profile,
-                        "-C",
-                        str(cwd),
-                        "--",
-                        *command,
-                    ],
+                    argv=native_check_argv(self.spec, profile, cwd, command),
                     cwd=cwd,
                     environment=environment,
                     timeout=int(check.get("timeout_seconds", 600)),
@@ -562,7 +553,7 @@ class DeliveryBroker:
         from .delivery_native_process import NativeProcess
         from .delivery_preparation import verify_prepared_spec
         from .delivery_resources import RunResources, private_directory, read_private, write_private
-        from .delivery_sandbox import prepare_native_check
+        from .delivery_sandbox import native_check_argv, prepare_native_check
 
         verify_prepared_spec(self.spec)
         manager, inputs = frozen_pnpm_inputs(self.spec, checkout)
@@ -598,11 +589,10 @@ class DeliveryBroker:
         })
         process = NativeProcess(
             self.spec, folder / "process",
-            argv=[
-                self.spec["policy"]["codex_bin"], "sandbox", "-P", profile, "-C", str(staging),
-                "--", "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
+            argv=native_check_argv(self.spec, profile, staging, [
+                "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
                 "--ignore-pnpmfile", "--store-dir", str(dependencies),
-            ],
+            ]),
             cwd=staging, environment=environment, timeout=1800, cancelled=self._native_cancelled,
         ).run()
         unchanged = hashes == write_frozen_inputs(staging, inputs)
@@ -616,7 +606,11 @@ class DeliveryBroker:
             "native_process": process, "log": process["log"],
             "log_sha256": _sha256(Path(process["log"])),
             "candidate_setup_executed": False,
-            "network_authority": "registry.npmjs.org fetch only; candidate checks remain offline",
+            "network_authority": ("trusted-local full host network"
+                                  if self.spec["policy"].get("host_sandbox") == "trusted-local"
+                                  else "registry.npmjs.org fetch only; "
+                                       "candidate checks remain offline"
+                                  ),
         }
         write_private(receipt, result)
         result.update(receipt=str(receipt), receipt_sha256=_sha256(receipt))

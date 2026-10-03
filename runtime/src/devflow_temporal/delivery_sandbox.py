@@ -260,6 +260,29 @@ def _profile_lines(
     return lines
 
 
+def trusted_local(spec: dict[str, Any]) -> bool:
+    return spec["policy"].get("host_sandbox") == "trusted-local"
+
+
+def _trusted_lines(workspace: Path) -> list[str]:
+    # The SDK supplies full_access and deny_all. Checks run directly on the host.
+    # These controls prevent ordinary nested tools, not hostile-code escape.
+    return [
+        'approval_policy = "never"', 'sandbox_mode = "danger-full-access"',
+        'web_search = "disabled"', '[features]', 'plugins = false',
+        'multi_agent = false', '[agents]', 'enabled = false',
+        f"[projects.{_path(workspace)}]", 'trust_level = "trusted"',
+    ]
+
+
+def native_check_argv(
+    spec: dict[str, Any], profile: str, cwd: Path, argv: list[str],
+) -> list[str]:
+    if trusted_local(spec):
+        return list(argv)
+    return [spec["policy"]["codex_bin"], "sandbox", "-P", profile, "-C", str(cwd), "--", *argv]
+
+
 def validate_network_domain(domain: str) -> str:
     normalized = domain.lower()
     try:
@@ -287,7 +310,9 @@ def prepare_native_role(
     from .delivery_preparation import require_native_execution
 
     require_native_execution(spec)
-    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
+    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") not in {
+        "native-profile", "trusted-local",
+    }:
         raise ValueError("real role did not require the native profile boundary")
     workspace = Path(request["workspace"]).resolve(strict=True)
     _remove_generated_project_directory(workspace)
@@ -384,6 +409,8 @@ def prepare_native_role(
         extra_read=extra_read,
         protected_executables=_protected_native_commands(spec),
     )
+    if trusted_local(spec):
+        lines = _trusted_lines(workspace)
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
     env = _native_env(ephemeral_home, codex_home, scratch, toolchain_roots)
     if cache:
@@ -400,7 +427,9 @@ def prepare_native_check(
     from .delivery_preparation import require_native_execution
 
     require_native_execution(spec)
-    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
+    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") not in {
+        "native-profile", "trusted-local",
+    }:
         raise ValueError("real checks require the native profile boundary")
 
     from .delivery_resources import RunResources
@@ -431,6 +460,8 @@ def prepare_native_check(
         network_domains=domains,
         protected_executables=_protected_native_commands(spec),
     )
+    if trusted_local(spec):
+        lines = _trusted_lines(checkout)
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
     env = _native_env(home, codex_home, scratch, toolchain_roots)
     env.update(
@@ -467,7 +498,9 @@ def prepare_browser_qa(
     from .delivery_preparation import require_native_execution
 
     require_native_execution(spec)
-    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
+    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") not in {
+        "native-profile", "trusted-local",
+    }:
         raise ValueError("real browser QA requires the admitted macOS boundary")
     if not Path("/usr/bin/sandbox-exec").is_file():
         raise ValueError("required macOS sandbox-exec is unavailable")
@@ -544,6 +577,8 @@ def prepare_browser_qa(
         )
     )
     profile = evidence_dir / "browser-qa.sb"
+    if trusted_local(spec):
+        lines = ["(version 1)", "(allow default)"]
     _write_once(profile, ("\n".join(lines) + "\n").encode())
     env = _native_env(
         home,

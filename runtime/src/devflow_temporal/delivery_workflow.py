@@ -192,6 +192,26 @@ class DeliveryWorkflow:
                         error="resource cleanup is unknown",
                     )
                     event, message = "blocked", "Resource cleanup requires recovery"
+        if (event in {"delivered", "blocked", "cancelled"}
+                and spec.get("terminal_tracker_version") == 1):
+            receipt = self.state["checks"].get("resource_cleanup", {})
+            release = receipt.get("state") == "confirmed" and (
+                receipt.get("process_cleanup") == "observed-native-confirmed"
+                and receipt.get("resource_cleanup") == "confirmed"
+            )
+            try:
+                self.state["tracker"] = await self._activity(
+                    "delivery_terminal_tracker",
+                    {"spec": spec, "status": "in-review" if event == "delivered" else "blocked",
+                     "release": release},
+                )
+            except Exception as exc:
+                self.state["tracker"] = {"state": "pending", "pending": True,
+                                         "reason": type(exc).__name__}
+            if event == "delivered" and self.state["tracker"].get("state") != "consistent":
+                self.state.update(phase="blocked", execution_state="blocked", outcome="blocked",
+                                  error="terminal tracker readback is pending")
+                event, message = "blocked", "Terminal tracker reconciliation requires recovery"
         await self._activity(
             "delivery_project",
             {
@@ -1214,17 +1234,20 @@ class DeliveryWorkflow:
             self.state["phase"] = "tracker"
             self.state["revision"] += 1
             await self._project(spec, "tracker_started", "Reconciling issue and claim")
-            try:
-                tracker = await self._activity("delivery_tracker", {"spec": spec, "pr": published})
-            except Exception as exc:
-                return await self._stop(
-                    spec, f"tracker synchronization pending: {type(exc).__name__}"
-                )
-            self.state["tracker"] = tracker
-            if self.cancel_requested:
-                return await self._cancelled(spec)
-            if tracker.get("state") != "consistent":
-                return await self._stop(spec, "tracker readback remains pending or conflicting")
+            if spec.get("terminal_tracker_version") != 1:
+                try:
+                    tracker = await self._activity(
+                        "delivery_tracker", {"spec": spec, "pr": published}
+                    )
+                except Exception as exc:
+                    return await self._stop(
+                        spec, f"tracker synchronization pending: {type(exc).__name__}"
+                    )
+                self.state["tracker"] = tracker
+                if self.cancel_requested:
+                    return await self._cancelled(spec)
+                if tracker.get("state") != "consistent":
+                    return await self._stop(spec, "tracker readback remains pending or conflicting")
             self.state["phase"] = "delivered"
             self.state["execution_state"] = "terminal"
             self.state["outcome"] = "delivered"
