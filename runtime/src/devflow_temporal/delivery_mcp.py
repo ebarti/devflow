@@ -6,21 +6,24 @@ import argparse
 import json
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from .delivery_client import client
+from .delivery_origin import bind_origin, metadata_origin
 
 
 def build_server(config_path: Path) -> FastMCP:
     server = FastMCP("Devflow local delivery")
 
     @server.tool()
-    def submit_run(request_json: str) -> dict:
+    def submit_run(request_json: str, ctx: Context) -> dict:
         """Submit a raw goal; plan_approval=required opts into human plan review."""
         value = json.loads(request_json)
         if not isinstance(value, dict):
             raise ValueError("submit request must be a JSON object")
-        return client(config_path).submit(value)
+        meta = ctx.request_context.meta
+        metadata = meta.model_dump(by_alias=True) if meta is not None else None
+        return client(config_path).submit(bind_origin(value, metadata_origin(metadata)))
 
     @server.tool()
     def list_runs() -> dict:

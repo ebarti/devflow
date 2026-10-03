@@ -502,6 +502,10 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         if args.command == "evidence" and not args.evidence_id:
             parser.error("--evidence-id is required")
         try:
+            if args.command == "submit":
+                from .delivery_origin import bind_origin
+
+                request = bind_origin(request, os.environ.get("CODEX_THREAD_ID"))
             caller = api_client(config.path)
             result = {
                 "submit": lambda: caller.submit(request),

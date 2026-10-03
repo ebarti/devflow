@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from .contracts import RUN_ID_RE, digest
 from .delivery_native_guard import NATIVE_OVERRIDES
+from .delivery_origin import thread_uuid
 from .delivery_sandbox import validate_network_domain
 from .runtime_dependencies import locked_dependency_identity
 
@@ -115,12 +116,16 @@ class DeliveryConfig:
             "branch",
             "authorized_endpoint",
         }
-        optional = {"accepted_plan", "recovery_key", "supersedes_run_id", "plan_approval"}
+        optional = {
+            "accepted_plan", "recovery_key", "supersedes_run_id", "plan_approval", "origin_thread_id"
+        }
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
             raise ValueError("required submit fields must be non-empty strings")
         accepted_plan = supplied.get("accepted_plan")
+        if "origin_thread_id" in supplied:
+            thread_uuid(supplied["origin_thread_id"])
         plan_approval = supplied.get("plan_approval", "automatic")
         if not isinstance(plan_approval, str) or plan_approval not in {"automatic", "required"}:
             raise ValueError("plan_approval must be automatic or required")
@@ -408,6 +413,7 @@ class DeliveryConfig:
         return {
             **supplied,
             "plan_approval": plan_approval,
+            "blocking_questions_version": 1,
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
