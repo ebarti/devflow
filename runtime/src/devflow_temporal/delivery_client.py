@@ -66,6 +66,9 @@ class DeliveryClient:
     def submit(self, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs", payload)
 
+    def service(self) -> dict:
+        return self._request("GET", "/api/service")
+
     def runs(self) -> dict:
         return self._request("GET", "/api/runs")
 
