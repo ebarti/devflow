@@ -29,7 +29,8 @@ def unrelated_seal(value, expected=None):
     """Only evidenced public-CLI defaults with unchanged effective state are equivalent."""
     canonical = deepcopy(value)
     alternatives = []
-    public = canonical.get('other_mcp', [])
+    inventories = [canonical[key] for key in ('other_mcp', 'mcp') if key in canonical]
+    public = inventories[0] if len(inventories) == 1 and isinstance(inventories[0], list) else []
     for name, entry in canonical.get('settings', {}).get('mcp_servers', {}).items():
         if not isinstance(entry, dict):
             continue

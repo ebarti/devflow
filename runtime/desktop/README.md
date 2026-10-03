@@ -48,8 +48,9 @@ Unrelated-state seals normalize only the public CLI's evidenced TOML
 representations: stdio absent versus empty `args`, and finite integral
 `startup_timeout_sec` integer/float values that represent exactly the same
 seconds; MCP `enabled=true` versus absent only when one matching public inventory
-entry confirms exact effective `enabled: true`. The full public inventory stays
-sealed. Explicit false, non-boolean values, missing/ambiguous confirmation,
+entry confirms exact effective `enabled: true`. Both the direct/ambient
+`other_mcp` and primary-plugin `mcp` snapshot shapes retain their original sealed
+keys and full public inventory. Explicit false, non-boolean values, missing/ambiguous confirmation,
 boolean/non-finite timeouts, changed values and every other field remain
 conflicts. This enablement default is documented in the [MCP configuration
 contract](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) and reproduced by

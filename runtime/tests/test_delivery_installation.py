@@ -285,13 +285,14 @@ def test_only_stdio_toml_defaults_have_bounded_legacy_equivalence(monkeypatch):
 
 
 @pytest.mark.parametrize('transport', [{'command': '/bin/true'}, {'url': 'https://example.invalid/mcp'}])
+@pytest.mark.parametrize('inventory_key', ['other_mcp', 'mcp'])
 def test_mcp_enabled_true_default_requires_unchanged_public_effective_inventory(
-    monkeypatch, transport,
+    monkeypatch, transport, inventory_key,
 ):
     monkeypatch.syspath_prepend(str(ROOT / 'runtime/desktop'))
     module = importlib.import_module('owned_upgrade')
     absent = {'settings': {'mcp_servers': {'foreign': transport}},
-              'other_mcp': [{'name': 'foreign', 'enabled': True}]}
+              inventory_key: [{'name': 'foreign', 'enabled': True}]}
     explicit = deepcopy(absent)
     explicit['settings']['mcp_servers']['foreign']['enabled'] = True
     assert module.unrelated_seal(explicit) == module.unrelated_seal(absent)
@@ -302,12 +303,13 @@ def test_mcp_enabled_true_default_requires_unchanged_public_effective_inventory(
         changed['settings']['mcp_servers']['foreign']['enabled'] = value
         assert module.unrelated_seal(changed) != module.unrelated_seal(absent)
     for confirmation in ([], [{'name': 'foreign', 'enabled': False}],
+                         [{'name': 'different-server', 'enabled': True}],
                          [{'name': 'foreign', 'enabled': 'true'}],
                          [{'name': 'foreign', 'enabled': 1}],
                          [{'name': 'foreign', 'enabled': True}] * 2):
         before, after = deepcopy(explicit), deepcopy(absent)
-        before['other_mcp'] = after['other_mcp'] = confirmation
+        before[inventory_key] = after[inventory_key] = confirmation
         assert module.unrelated_seal(before) != module.unrelated_seal(after)
     public_change = deepcopy(absent)
-    public_change['other_mcp'][0]['enabled'] = False
+    public_change[inventory_key][0]['enabled'] = False
     assert module.unrelated_seal(public_change) != module.unrelated_seal(explicit)

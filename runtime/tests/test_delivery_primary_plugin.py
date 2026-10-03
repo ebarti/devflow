@@ -177,3 +177,63 @@ def test_primary_unknown_uses_same_narrow_stdio_default_compatibility(primary, m
     assert sum(effect[:2] == ('plugin', 'add') for effect in state['effects']) == 1
     assert json.loads(manifest.read_text())['last_error'] == unknown['last_error']
     assert module.rollback('codex', fixture['home'], manifest)['state'] == 'rolled_back'
+
+
+def _primary_enabled_serialization(primary, monkeypatch):
+    module, fixture, runtime, config, request, state = primary
+    host = fixture['home'] / 'config.toml'
+    host.write_text(host.read_text() + '[mcp_servers.unrelated]\n'
+                    'command="/bin/true"\nenabled=true\n')
+    original = module.command
+
+    def canonicalizing_command(*args):
+        result = original(*args)
+        if args[2:4] == ('mcp', 'remove'):
+            host.write_text(host.read_text().replace('enabled=true\n', ''))
+        return result
+
+    monkeypatch.setattr(module, 'command', canonicalizing_command)
+    return host
+
+
+def test_primary_enabled_default_serialization_activation_replay_and_rollback(primary, monkeypatch):
+    module, fixture, runtime, config, request, state = primary
+    host = _primary_enabled_serialization(primary, monkeypatch)
+    before = module.snapshot('codex', fixture['home'])
+    first = module.activate('codex', fixture['home'], runtime, config, request)
+    manifest = Path(first['rollback_manifest'])
+    assert first['state'] == 'applied' and 'enabled=true' not in host.read_text()
+    assert module.activate('codex', fixture['home'], runtime, config, request)['existing']
+    # The inverse representation also has the same effective public inventory.
+    host.write_text(host.read_text().replace('[mcp_servers.unrelated]\n',
+                                             '[mcp_servers.unrelated]\nenabled=true\n'))
+    assert module.rollback('codex', fixture['home'], manifest)['state'] == 'rolled_back'
+    assert module.snapshot('codex', fixture['home']) == before
+    assert state['mcp']['unrelated']['enabled'] is True
+    assert fixture['skill'].exists()
+
+
+@pytest.mark.parametrize('change', [
+    'false', 'string', 'integer', 'public-disabled', 'entry-mismatch',
+])
+def test_primary_enabled_default_rejects_effective_type_and_confirmation_drift(
+    primary, monkeypatch, change,
+):
+    module, fixture, runtime, config, request, state = primary
+    host = _primary_enabled_serialization(primary, monkeypatch)
+    first = module.activate('codex', fixture['home'], runtime, config, request)
+    manifest = Path(first['rollback_manifest'])
+    if change == 'public-disabled':
+        state['mcp']['unrelated']['enabled'] = False
+    elif change == 'entry-mismatch':
+        state['mcp']['unrelated']['name'] = 'different-server'
+    else:
+        literal = {'false': 'false', 'string': '"true"', 'integer': '1'}[change]
+        replacement = '[mcp_servers.unrelated]\nenabled=' + literal + '\n'
+        host.write_text(host.read_text().replace('[mcp_servers.unrelated]\n', replacement))
+    frozen = (manifest.read_bytes(), list(state['effects']), host.read_bytes())
+    with pytest.raises(ValueError):
+        module.activate('codex', fixture['home'], runtime, config, request)
+    with pytest.raises(ValueError):
+        module.rollback('codex', fixture['home'], manifest)
+    assert frozen == (manifest.read_bytes(), state['effects'], host.read_bytes())
