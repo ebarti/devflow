@@ -196,6 +196,26 @@ class DeliveryStore:
                     response_json TEXT
                 )"""
             )
+            mutation_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(delivery_mutations)")
+            }
+            for name, kind in (("decision_id", "TEXT"), ("decision_revision", "INTEGER")):
+                if name not in mutation_columns:
+                    db.execute(f"ALTER TABLE delivery_mutations ADD COLUMN {name} {kind}")
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_question_notifications (
+                    notification_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
+                    decision_id TEXT NOT NULL,
+                    decision_revision INTEGER NOT NULL,
+                    thread_id TEXT,
+                    question_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    receipt_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (run_id,decision_id,decision_revision)
+                )"""
+            )
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_repair_grants (
                     run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
@@ -455,6 +475,10 @@ class DeliveryStore:
                 ):
                     raise ValueError("only a blocked unpublished run may be superseded")
                 prior_spec = self._prepared_original(db, json.loads(previous["request_json"]))
+                if "origin_thread_id" not in supplied and prior_spec.get("origin_thread_id"):
+                    spec["origin_thread_id"] = prior_spec["origin_thread_id"]
+                if spec.get("origin_thread_id") != prior_spec.get("origin_thread_id"):
+                    raise ValueError("continuation changed the originating thread")
                 if previous["accepted_plan_text"] is not None:
                     prior_spec["accepted_plan"] = previous["accepted_plan_text"]
                 if prior_spec["branch"] == spec["branch"]:
@@ -2529,6 +2553,33 @@ class DeliveryStore:
                     "candidate_id": candidate["id"] if candidate else None,
                 },
             )
+            if event_type == "question_pending" and json.loads(row["request_json"]).get(
+                "blocking_questions_version"
+            ) == 1:
+                from .delivery_questions import valid_blocker
+
+                if not decision or decision.get("kind") != "question" or not valid_blocker(
+                    decision.get("blocker")
+                ):
+                    raise ValueError("question notification requires a justified blocking decision")
+                thread = json.loads(row["request_json"]).get("origin_thread_id")
+                notification_id = digest({"run_id": run_id, "decision_id": decision["id"],
+                                          "decision_revision": decision["revision"]})
+                db.execute(
+                    """INSERT OR IGNORE INTO delivery_question_notifications
+                       VALUES (?,?,?,?,?,?,?,NULL,?)""",
+                    (notification_id, run_id, decision["id"], decision["revision"], thread,
+                     canonical_json(decision), "pending" if thread else "unavailable", _now()),
+                )
+                saved = db.execute(
+                    "SELECT question_json,thread_id FROM delivery_question_notifications "
+                    "WHERE notification_id=?", (notification_id,),
+                ).fetchone()
+                if (
+                    saved["question_json"] != canonical_json(decision)
+                    or saved["thread_id"] != thread
+                ):
+                    raise ValueError("blocking question notification identity changed")
             if (
                 event_type == "cancelled"
                 and outcome == "cancelled"
@@ -2609,11 +2660,133 @@ class DeliveryStore:
                 raise ValueError("run is already terminal")
             db.execute(
                 """INSERT INTO delivery_mutations
-                   (command_id,run_id,kind,request_digest,state)
-                   VALUES (?,?,?,?,'pending')""",
-                (command_id, run_id, kind, request_digest),
+                   (command_id,run_id,kind,request_digest,state,decision_id,decision_revision)
+                   VALUES (?,?,?,?,'pending',?,?)""",
+                (command_id, run_id, kind, request_digest,
+                 payload.get("decision_id"), payload.get("decision_revision")),
             )
             return None
+
+    @staticmethod
+    def _question_is_current(db: sqlite3.Connection, item: dict) -> bool:
+        run = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (item["run_id"],)).fetchone()
+        spec = json.loads(run["request_json"]) if run else {}
+        question = json.loads(item["question_json"])
+        pending = json.loads(run["decision_json"] or "null") if run else None
+        answered = db.execute(
+            """SELECT 1 FROM delivery_mutations WHERE run_id=? AND state='complete'
+               AND (kind='cancel' OR (kind='decision'
+                    AND decision_id=? AND decision_revision=?))""",
+            (item["run_id"], item["decision_id"], item["decision_revision"]),
+        ).fetchone()
+        return bool(
+            run and run["outcome"] is None and run["phase"] == "waiting_question"
+            and run["execution_state"] == "waiting" and pending == question
+            and spec.get("blocking_questions_version") == 1
+            and spec.get("origin_thread_id") == item["thread_id"]
+            and not answered
+        )
+
+    @staticmethod
+    def _question_command_inflight(db: sqlite3.Connection, item: dict) -> bool:
+        return db.execute(
+            """SELECT 1 FROM delivery_mutations WHERE run_id=? AND state IN ('pending','unknown')
+               AND (kind='cancel' OR (kind='decision'
+                    AND decision_id=? AND decision_revision=?))""",
+            (item["run_id"], item["decision_id"], item["decision_revision"]),
+        ).fetchone() is not None
+
+    def _owns_question_notification(self, db: sqlite3.Connection, item: dict) -> bool:
+        row = db.execute("SELECT request_json FROM delivery_runs WHERE run_id=?",
+                         (item["run_id"],)).fetchone()
+        spec = json.loads(row[0]) if row else {}
+        return (
+            spec.get("config_path") == str(self.config.path)
+            and spec.get("state_dir") == str(self.config.state_root / "runs" / item["run_id"])
+        )
+
+    def _question_notification_state(
+        self, db: sqlite3.Connection, notification_id: str, state: str, receipt: dict | None = None
+    ) -> None:
+        row = db.execute("SELECT run_id,state FROM delivery_question_notifications "
+                         "WHERE notification_id=?", (notification_id,)).fetchone()
+        if row is None or row["state"] == state:
+            return
+        db.execute("UPDATE delivery_question_notifications SET state=?,receipt_json=?,updated_at=? "
+                   "WHERE notification_id=?", (state, canonical_json(receipt) if receipt else None,
+                                              _now(), notification_id))
+        db.execute("UPDATE delivery_runs SET revision=revision+1,updated_at=? WHERE run_id=?",
+                   (_now(), row["run_id"]))
+        revision = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                              (row["run_id"],)).fetchone()[0]
+        self._event(db, row["run_id"], revision, "question_notification",
+                    f"Blocking question callback {state}",
+                    {"notification_id": notification_id, "state": state})
+
+    def abandon_question_notifications(self) -> None:
+        """Called only under exclusive sender ownership; abandoned sends are uncertain."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for row in db.execute("SELECT notification_id,run_id "
+                                  "FROM delivery_question_notifications "
+                                  "WHERE state='dispatching'").fetchall():
+                if not self._owns_question_notification(db, dict(row)):
+                    continue
+                self._question_notification_state(
+                    db, row[0], "unknown",
+                    {"reason": "sender stopped before acknowledgement was recorded"},
+                )
+
+    def claim_question_notification(self) -> dict | None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for row in db.execute(
+                "SELECT * FROM delivery_question_notifications WHERE state='pending' "
+                "ORDER BY updated_at,notification_id"
+            ).fetchall():
+                item = dict(row)
+                if not self._owns_question_notification(db, item):
+                    continue
+                if self._question_command_inflight(db, item):
+                    continue
+                if not self._question_is_current(db, item):
+                    self._question_notification_state(db, item["notification_id"], "suppressed")
+                    continue
+                self._question_notification_state(db, item["notification_id"], "dispatching")
+                return item
+        return None
+
+    def question_notification_current(self, item: dict) -> bool:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT state FROM delivery_question_notifications "
+                             "WHERE notification_id=?", (item["notification_id"],)).fetchone()
+            if row is None or row[0] != "dispatching":
+                return False
+            if self._question_command_inflight(db, item):
+                self._question_notification_state(db, item["notification_id"], "pending")
+                return False
+            if self._question_is_current(db, item):
+                return True
+            self._question_notification_state(db, item["notification_id"], "suppressed")
+            return False
+
+    def finish_question_notification(self, notification_id: str, state: str, receipt: dict) -> None:
+        if state not in {"queued", "failed", "unknown"}:
+            raise ValueError("invalid question notification result")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT state FROM delivery_question_notifications "
+                             "WHERE notification_id=?", (notification_id,)).fetchone()
+            if row is not None and row[0] == "dispatching":
+                self._question_notification_state(db, notification_id, state, receipt)
+
+    def question_notifications(self, run_id: str) -> list[dict]:
+        with self._connect() as db:
+            return [{**dict(row), "receipt": json.loads(row["receipt_json"] or "null")}
+                    for row in db.execute("SELECT * FROM delivery_question_notifications "
+                                          "WHERE run_id=? ORDER BY updated_at,notification_id",
+                                          (run_id,))]
 
     def finish_mutation(self, command_id: str, response: dict[str, Any]) -> None:
         with self._connect() as db:
@@ -2847,6 +3020,7 @@ class DeliveryStore:
             if row["decision_json"] and json.loads(row["decision_json"]) is not None
             else [],
             "intake": json.loads(row["intake_json"]) if row["intake_json"] else None,
+            "question_notifications": self.question_notifications(run_id),
             "events": events,
             "error": row["error"],
         }

@@ -122,6 +122,8 @@ def run_binding(spec: dict) -> str:
     return digest({
         **{key: spec[key] for key in keys}, "policy": policy,
         **({"plan_approval": spec["plan_approval"]} if "plan_approval" in spec else {}),
+        **{key: spec[key] for key in ("origin_thread_id", "blocking_questions_version")
+           if key in spec},
     })
 
 

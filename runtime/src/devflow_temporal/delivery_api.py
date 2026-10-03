@@ -159,7 +159,20 @@ class DeliveryService:
                     if execution_retired(spec):
                         continue
                     self.store.mark_start(item["run_id"], accepted=False, error=type(exc).__name__)
+            try:
+                await self.dispatch_questions_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Any interrupted dispatching record becomes visible unknown on
+                # the next exclusive pump, without repeating its external effect.
+                pass
             await asyncio.sleep(5)
+
+    async def dispatch_questions_once(self) -> None:
+        from .delivery_question_sender import pump_blocking_questions
+
+        await asyncio.to_thread(pump_blocking_questions, self.store)
 
 
 def create_app(config_path: Path) -> FastAPI:

@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from .contracts import RUN_ID_RE, digest
 from .delivery_native_guard import NATIVE_OVERRIDES
+from .delivery_origin import thread_uuid
 from .delivery_sandbox import validate_network_domain
 from .runtime_dependencies import locked_dependency_identity
 
@@ -115,12 +116,17 @@ class DeliveryConfig:
             "branch",
             "authorized_endpoint",
         }
-        optional = {"accepted_plan", "recovery_key", "supersedes_run_id", "plan_approval"}
+        optional = {
+            "accepted_plan", "recovery_key", "supersedes_run_id",
+            "plan_approval", "origin_thread_id"
+        }
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
             raise ValueError("required submit fields must be non-empty strings")
         accepted_plan = supplied.get("accepted_plan")
+        if "origin_thread_id" in supplied:
+            thread_uuid(supplied["origin_thread_id"])
         plan_approval = supplied.get("plan_approval", "automatic")
         if not isinstance(plan_approval, str) or plan_approval not in {"automatic", "required"}:
             raise ValueError("plan_approval must be automatic or required")
@@ -408,6 +414,7 @@ class DeliveryConfig:
         return {
             **supplied,
             "plan_approval": plan_approval,
+            "blocking_questions_version": 1,
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
@@ -495,6 +502,7 @@ def scope_amended_spec(
         "goal", "accepted_plan", "base_ref", "branch", "authorized_endpoint",
         "recovery_key", "supersedes_run_id",
         "plan_approval",
+        "origin_thread_id",
     }
     from .delivery_preparation import require_native_execution
 
@@ -510,6 +518,8 @@ def scope_amended_spec(
         effective["plan_approval"] = original["plan_approval"]
     else:
         effective.pop("plan_approval")
+    if "blocking_questions_version" not in original:
+        effective.pop("blocking_questions_version")
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
@@ -518,6 +528,8 @@ def scope_amended_spec(
     ):
         if effective[key] != original[key]:
             raise ValueError("scope amendment changed the admitted run identity")
+    if effective.get("origin_thread_id") != original.get("origin_thread_id"):
+        raise ValueError("scope amendment changed the originating thread")
     effective["request_digest"] = original["request_digest"]
     if "continuation" in original:
         effective["continuation"] = original["continuation"]

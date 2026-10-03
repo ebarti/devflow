@@ -413,7 +413,12 @@ async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(nati
         return {
             "status": "questions",
             "summary": "controlled repeated question fixture",
-            "questions": [{"id": "fixture", "prompt": "Controlled question", "options": []}],
+            "questions": [{"id": "fixture", "prompt": "Controlled question", "options": [],
+                           "blocker": {
+                               "unknown": f"External requirement {request['iteration']} is absent",
+                               "evidence_checked": ["Repository has no external consumer contract"],
+                               "why_no_safe_default": "Guessing cannot establish compatibility",
+                           }}],
             "findings": [],
             "session_id": None,
             "usage": None,

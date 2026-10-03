@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import traceback
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,6 +27,7 @@ from agent_runtime_kit.adapters import CodexAgentRuntime
 from openai_codex import CodexConfig
 
 from .bridge import ASSESSMENT_SCHEMA
+from .delivery_questions import BLOCKER_SCHEMA, valid_blocking_questions
 
 INTAKE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -60,6 +62,10 @@ INTAKE_SCHEMA: dict[str, Any] = {
     "required": ["status", "summary", "questions", "plan"],
     "additionalProperties": False,
 }
+BLOCKING_INTAKE_SCHEMA = deepcopy(INTAKE_SCHEMA)
+_question_schema = BLOCKING_INTAKE_SCHEMA["properties"]["questions"]["items"]
+_question_schema["properties"]["blocker"] = BLOCKER_SCHEMA
+_question_schema["required"].append("blocker")
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -123,6 +129,17 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "Do not push, open a PR, or change GitHub tracking."
         ),
     }[role]
+    if role == "intake" and spec.get("blocking_questions_version") == 1:
+        instructions += (
+            " Proceed autonomously with reasonable reversible assumptions; record them "
+            "in the plan. Ask only a truly blocking unresolved ambiguity: the missing "
+            "fact materially changes the outcome and no reasonable safe default "
+            "satisfies the authorized goal. For every question include blocker.unknown, "
+            "blocker.evidence_checked (concrete repository evidence investigated), and "
+            "blocker.why_no_safe_default (the consequence of guessing). Preferences "
+            "such as naming, formatting or routine implementation choices are not "
+            "blockers. Never choose a callback thread or destination."
+        )
     recovery = spec["policy"].get("recovery")
     recovery_path = request.get("recovery_path") or (
         spec["state_dir"] + "/recovery" if recovery and role == "implement" else ""
@@ -193,7 +210,9 @@ def _task(request: dict[str, Any]) -> AgentTask:
         else FilesystemAccess.WORKSPACE_WRITE
     )
     prior = request.get("resume_session")
-    schema = INTAKE_SCHEMA if role == "intake" else ASSESSMENT_SCHEMA
+    schema = (
+        BLOCKING_INTAKE_SCHEMA if spec.get("blocking_questions_version") == 1 else INTAKE_SCHEMA
+    ) if role == "intake" else ASSESSMENT_SCHEMA
     if qa_evidence and role == "verify":
         schema = {
             **ASSESSMENT_SCHEMA,
@@ -313,6 +332,10 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
             status = "blocked"
         if status == "blocked":
             findings = ["intake role did not provide valid questions or a concrete plan"]
+        if status == "questions" and request["spec"].get("blocking_questions_version") == 1 and (
+            not valid_blocking_questions(questions)
+        ):
+            status, findings = "blocked", ["intake did not justify a blocking ambiguity"]
         return {
             "status": status, "summary": summary, "findings": findings,
             "questions": questions if status == "questions" else [],
@@ -374,6 +397,10 @@ async def _run_fake(request: dict[str, Any]) -> dict[str, Any]:
                 "acceptance": ["The requested behavior is observable"],
             },
         }
+        if result.get("status") == "questions" and request["spec"].get(
+            "blocking_questions_version"
+        ) == 1 and not valid_blocking_questions(result.get("questions")):
+            result = {"status": "blocked", "summary": "intake did not justify a blocking ambiguity"}
         return {
             **result, "session_id": f"fake:{request['spec']['run_id']}:intake:{turn}",
             "usage": None, "finish_reason": "fake", "requested_model": None,

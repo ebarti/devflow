@@ -89,10 +89,19 @@ def intake_fixture(tmp_path: Path) -> tuple[Path, dict]:
         },
         "fake_intake": [
             {"status": "questions", "summary": "Needs scope", "plan": {}, "questions": [
-                {"id": "wording", "prompt": "Which wording?", "options": ["A", "B"]}
+                {"id": "wording", "prompt": "Which wording?", "options": ["A", "B"], "blocker": {
+                    "unknown": "The required exact legal wording is absent",
+                    "evidence_checked": ["README and the frozen goal specify no exact wording"],
+                    "why_no_safe_default": "Invented wording cannot satisfy the exact requirement",
+                }}
             ]},
             {"status": "questions", "summary": "Needs format", "plan": {}, "questions": [
-                {"id": "format", "prompt": "Which format?", "options": ["Plain", "Markdown"]}
+                {"id": "format", "prompt": "Which format?", "options": ["Plain", "Markdown"],
+                 "blocker": {
+                     "unknown": "The downstream consumer's required input format is unspecified",
+                     "evidence_checked": ["No consumer schema or sample exists in the fixture"],
+                     "why_no_safe_default": "Choosing incorrectly breaks the required consumer",
+                 }}
             ]},
             plan("First proposal"),
             plan("Revised proposal"),
@@ -227,6 +236,17 @@ def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):
     assert 'Frozen issue URL: "https://github.com/example/fixture/issues/3"' in task.goal
     assert 'Frozen plan approval: "automatic"' in task.goal
     assert "routine implementation choices do not need another user approval" in task.goal
+    assert "reasonable reversible assumptions" in task.goal
+    assert "no reasonable safe default" in task.goal
+    assert "Never choose a callback thread or destination" in task.goal
+    question_schema = task.output_schema["properties"]["questions"]["items"]
+    assert "blocker" in question_schema["required"]
+    historical = {key: value for key, value in native.items()
+                  if key != "blocking_questions_version"}
+    old_task = _task({"spec": historical, "role": "intake", "iteration": 0,
+                      "candidate": {"id": "candidate", "head": spec["base_sha"]},
+                      "workspace": "/work"})
+    assert "blocker" not in old_task.output_schema["properties"]["questions"]["items"]["required"]
 
 
 def test_cli_reports_stale_answer_without_traceback(intake_fixture, tmp_path, monkeypatch, capsys):
@@ -703,13 +723,15 @@ def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
 ):
     path, request = intake_fixture
     if approval is not None:
-        request = {**request, "plan_approval": approval}
+        request = {**request, "plan_approval": approval,
+                   "origin_thread_id": "01a0c8be-e849-7ef2-ad81-78ccdb4b4275"}
     store = create_app(path).state.delivery.store
     store.submit(request)
     spec = store.spec("run-1")
     if approval is None:
         # Historical durable input, not a new public submission.
         spec.pop("plan_approval")
+        spec.pop("blocking_questions_version")
         with store._connect() as db:
             db.execute("UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'",
                        (json.dumps(spec),))
@@ -729,6 +751,9 @@ def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
                                    ["tests/fixture.py"])
     assert effective.get("plan_approval") == original.get("plan_approval")
     assert ("plan_approval" in effective) == ("plan_approval" in original)
+    assert effective.get("origin_thread_id") == original.get("origin_thread_id")
+    assert effective.get("blocking_questions_version") == original.get("blocking_questions_version")
+    assert ("blocking_questions_version" in effective) == ("blocking_questions_version" in original)
     assert effective["accepted_plan"] == original["accepted_plan"]
     assert effective["intake_required"] is True
     assert effective["request_digest"] == original["request_digest"]
@@ -736,6 +761,8 @@ def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
     assert store.detail("run-1")["intake"] == before
     assert store.spec("run-1") == spec
     if approval is not None:
+        changed_origin = {**spec, "origin_thread_id": "01a100ac-efd3-7dd2-9f25-504381f0dcd9"}
+        assert run_binding(changed_origin) != run_binding(spec)
         assert run_binding({**spec, "plan_approval": "required"}) != run_binding(
             {**spec, "plan_approval": "automatic"}
         )
