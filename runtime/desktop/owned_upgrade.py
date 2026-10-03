@@ -26,11 +26,19 @@ def seal(value):
 
 
 def unrelated_seal(value, expected=None):
-    """Only evidenced public-CLI stdio defaults are representation-equivalent."""
+    """Only evidenced public-CLI defaults with unchanged effective state are equivalent."""
     canonical = deepcopy(value)
     alternatives = []
-    for entry in canonical.get('settings', {}).get('mcp_servers', {}).values():
-        if not isinstance(entry, dict) or not isinstance(entry.get('command'), str):
+    public = canonical.get('other_mcp', [])
+    for name, entry in canonical.get('settings', {}).get('mcp_servers', {}).items():
+        if not isinstance(entry, dict):
+            continue
+        matches = [item for item in public if isinstance(item, dict) and item.get('name') == name]
+        if (len(matches) == 1 and matches[0].get('enabled') is True
+                and ('enabled' not in entry or entry['enabled'] is True)):
+            entry.pop('enabled', None)
+            alternatives.append((entry, 'enabled', True))
+        if not isinstance(entry.get('command'), str):
             continue
         if 'args' not in entry or entry['args'] == []:
             entry.pop('args', None)
@@ -59,7 +67,7 @@ def unrelated_seal(value, expected=None):
     if len(alternatives) <= 12:
         for mask in range(1 << len(alternatives)):
             for index, (entry, key, alternate) in enumerate(alternatives):
-                if key == 'args':
+                if key in {'args', 'enabled'}:
                     entry.pop(key, None)
                 else:
                     entry[key] = int(alternate)

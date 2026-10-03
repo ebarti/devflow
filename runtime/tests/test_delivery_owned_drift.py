@@ -392,3 +392,77 @@ def test_acknowledged_foreign_mcp_enabled_change_refuses_before_effects(ambient)
         fixture["skill"].read_bytes(),
         fixture["registry"].read_bytes(),
     )
+
+
+def _freeze_current_mcp_enabled(ambient, explicit):
+    module, drift, fixture, args, manifest, request, root = ambient
+    config = fixture['home'] / 'config.toml'
+    config.write_text(config.read_text() + '[mcp_servers.unrelated]\ncommand="/bin/true"\n'
+                      + ('enabled=true\n' if explicit else ''))
+    inputs = json.loads(request.read_text())
+    current = Path(inputs['current_snapshot']['path'])
+    observed = drift.foreign_snapshot(args[0], fixture['home'])
+    _private(current, observed)
+    inputs['current_snapshot']['sha256'] = module.sha(current.read_bytes())
+    prior = json.loads(Path(inputs['prior_snapshot']['path']).read_text())
+    inputs['delta_sha256'] = module.seal(drift.delta(prior, observed))
+    _private(request, inputs)
+
+
+@pytest.mark.parametrize('explicit', [True, False])
+def test_same_acknowledged_command_rollback_survives_enabled_default_serialization(
+    ambient, explicit,
+):
+    module, drift, fixture, args, manifest, request, root = ambient
+    _freeze_current_mcp_enabled(ambient, explicit)
+    receipt = _ack(ambient)
+    module.upgrade(*args)
+    immutable = (receipt.read_bytes(), request.read_bytes(), drift.content_index(root))
+    original = json.loads(manifest.read_text())
+    fake = Path(args[0])
+    effect = (' c=pathlib.Path(os.environ["CODEX_HOME"])/"config.toml"\n'
+              ' c.write_text(c.read_text().replace("enabled=true\\n", ""))\n')
+    if not explicit:
+        effect = (' c=pathlib.Path(os.environ["CODEX_HOME"])/"config.toml"\n'
+                  ' if "enabled=true\\n" not in c.read_text():\n'
+                  '  c.write_text(c.read_text().replace("[mcp_servers.unrelated]\\n", '
+                  '"[mcp_servers.unrelated]\\nenabled=true\\n"))\n')
+    fake.write_text(fake.read_text().replace(' crash=d.pop(', effect + ' crash=d.pop('))
+    assert module.rollback(args[0], fixture['home'], manifest)['state'] == 'rolled_back'
+    assert fixture['skill'].read_text() == 'Inspected previous owned skill\n'
+    assert module.rollback(args[0], fixture['home'], manifest)['state'] == 'rolled_back'
+    assert module.upgrade(*args)['state'] == 'applied'
+    assert module.upgrade(*args)['existing']
+    assert immutable == (receipt.read_bytes(), request.read_bytes(), drift.content_index(root))
+    assert {k: v for k, v in json.loads(manifest.read_text()).items() if k != 'state'} == {
+        k: v for k, v in original.items() if k != 'state'
+    }
+
+
+@pytest.mark.parametrize('change', [
+    'disabled', 'public-disabled', 'string', 'integer', 'other-setting',
+])
+def test_acknowledged_enabled_default_guard_rejects_semantic_or_type_drift(ambient, change):
+    module, drift, fixture, args, manifest, request, root = ambient
+    _freeze_current_mcp_enabled(ambient, True)
+    _ack(ambient)
+    module.upgrade(*args)
+    config = fixture['home'] / 'config.toml'
+    if change == 'public-disabled':
+        registry = json.loads(fixture['registry'].read_text())
+        registry['entries']['unrelated']['enabled'] = False
+        _private(fixture['registry'], registry)
+    elif change == 'other-setting':
+        config.write_text(config.read_text().replace(
+            'foreign_setting="priority"', 'foreign_setting="default"'))
+    else:
+        value = {'disabled': 'false', 'string': '"true"', 'integer': '1'}[change]
+        config.write_text(config.read_text().replace('enabled=true', 'enabled=' + value))
+    frozen = (manifest.read_bytes(), fixture['skill'].read_bytes(),
+              fixture['registry'].read_bytes(), config.read_bytes())
+    with pytest.raises(ValueError):
+        module.rollback(args[0], fixture['home'], manifest)
+    with pytest.raises(ValueError):
+        module.upgrade(*args)
+    assert frozen == (manifest.read_bytes(), fixture['skill'].read_bytes(),
+                      fixture['registry'].read_bytes(), config.read_bytes())

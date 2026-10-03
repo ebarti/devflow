@@ -44,11 +44,16 @@ through the supported public CLI and the one local-delivery skill, checking all
 other MCP entries and host configuration semantics before and after. It does
 not edit configuration TOML directly or change agents/models/plugins.
 
-Unrelated-state seals normalize only the public CLI's evidenced stdio TOML
-representations: absent versus empty `args`, and finite integral
+Unrelated-state seals normalize only the public CLI's evidenced TOML
+representations: stdio absent versus empty `args`, and finite integral
 `startup_timeout_sec` integer/float values that represent exactly the same
-seconds. Boolean/non-finite timeouts, changed values and every other field remain
-conflicts. Older journals retain their original raw digest; stable replay and
+seconds; MCP `enabled=true` versus absent only when one matching public inventory
+entry confirms exact effective `enabled: true`. The full public inventory stays
+sealed. Explicit false, non-boolean values, missing/ambiguous confirmation,
+boolean/non-finite timeouts, changed values and every other field remain
+conflicts. This enablement default is documented in the [MCP configuration
+contract](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) and reproduced by
+the installed public CLI. Older journals retain their original raw digest; stable replay and
 rollback reconstruct only those equivalent representations and must match that
 exact digest. Compatibility search is bounded to twelve such fields; new
 canonical journals need no search. No new baseline or private manifest rewrite
@@ -77,6 +82,13 @@ python3 runtime/desktop/install.py \
   --codex-home /absolute/codex-home \
   --rollback-owned-manifest /absolute/codex-home/.devflow-local-delivery-upgrades/COMMAND_ID/manifest.json
 ```
+
+An interrupted rollback may retain the original pointer with the newer skill.
+After authenticating those original permitted states, repeat the same explicit
+rollback manifest to finish restoring the old skill, then use the same original
+update request to reapply. Preserve the original receipt, snapshots, sidecar and
+errors; no replacement request or acknowledgement is needed for proven default
+serialization. Unknown owned bytes or any effective foreign drift still refuse.
 
 An interrupted `unknown` update can encounter actual ambient host changes. One
 explicit `--acknowledge-owned-drift-request` operation records a separate immutable
