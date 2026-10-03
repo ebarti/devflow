@@ -1,0 +1,18 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "devflow",
+  "version": "0.1.0",
+  "description": "Submit development goals to a configured local Devflow service and answer its blocking decisions.",
+  "repository": "https://github.com/ebarti/devflow",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Devflow Local Delivery",
+        "shortDescription": "Local development goals through an unmerged PR",
+        "longDescription": "Uses your existing macOS Temporal and agent-runtime-kit service for investigation, automatic planning, implementation, status, evidence and blocking questions.",
+        "developerName": "Devflow",
+        "capabilities": ["Read", "Write"]
+      }
+    }
+  }
+}
