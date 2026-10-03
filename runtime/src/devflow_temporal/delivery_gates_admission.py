@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from pathlib import Path
 
 from .contracts import canonical_json, digest
@@ -13,8 +14,73 @@ from .delivery_broker import DeliveryBroker, _git
 from .delivery_continuation import session_state_digest
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
-from .delivery_preparation import _lock, _private_bytes
+from .delivery_preparation import _lock
 from .delivery_resources import private_directory
+
+
+def _native_result_bytes(spec, attempt):
+    """Read only the frozen attempt's receipt; never create or chmod ancestry."""
+    root = Path(spec["state_dir"])
+    job = attempt["job_key"]
+    if not isinstance(job, str) or job in {"", ".", ".."} or Path(job).name != job:
+        raise ValueError("native result attempt identity is invalid")
+    expected = root / "attempts" / job / "result.json"
+    if (not root.is_absolute() or root.resolve(strict=True) != root
+            or Path(attempt["result_path"]) != expected):
+        raise ValueError("native result left its exact frozen attempt")
+    descriptors = []
+    try:
+        for path, modes in ((root, {0o700}), (Path("attempts"), {0o700, 0o755}),
+                            (Path(job), {0o700})):
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         **({"dir_fd": descriptors[-1]} if descriptors else {}))
+            descriptors.append(fd)
+            info = os.fstat(fd)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) not in modes):
+                raise ValueError("native result directory custody changed")
+        fd = os.open("result.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptors[-1])
+        descriptors.append(fd)
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+                or before.st_size > 4 * 1024 * 1024):
+            raise ValueError("native result is not a bounded private owned receipt")
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            raw = stream.read(4 * 1024 * 1024 + 1)
+        after = os.fstat(fd)
+        identity = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size",
+                    "st_mtime_ns", "st_ctime_ns")
+        if (len(raw) != before.st_size
+                or any(getattr(before, key) != getattr(after, key) for key in identity)):
+            raise ValueError("native result changed during custody readback")
+        return raw
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def _assessment_receipt(spec, attempt, raw):
+    observed, saved = json.loads(raw), json.loads(attempt["result_json"])
+    enriched = {"cleanup", "process_cleanup", "resource_cleanup", "native_process"}
+    if not isinstance(observed, dict) or not isinstance(saved, dict):
+        raise ValueError("native result assessment is invalid")
+    if spec["provider"] == "codex" and (
+        saved.get("cleanup") != "confirmed"
+        or saved.get("process_cleanup") != "observed-native-confirmed"
+        or saved.get("resource_cleanup") != "pending_workflow_finalization"
+        or not isinstance(saved.get("native_process"), dict)
+        or saved["native_process"].get("state") != "finished"
+        or saved["native_process"].get("monitoring_complete") is not True
+        or saved["native_process"].get("cleanup") != "observed-native-confirmed"
+        or saved["native_process"].get("journal")
+        != str(Path(attempt["result_path"]).with_name("native-process.json"))
+    ):
+        raise ValueError("native result lacks its confirmed controller enrichment")
+    if canonical_json(observed) != canonical_json(
+        {key: value for key, value in saved.items() if key not in enriched}
+    ):
+        raise ValueError("native result receipt disagrees with frozen assessment")
 
 
 def _reference(path, expected):
@@ -165,10 +231,8 @@ def preflight(store, run_id):
         raise ValueError(
             "gates-only admission lost authentic after-candidate/base/scope/remote proof"
         )
-    result_path = Path(latest["result_path"])
-    raw = _private_bytes(result_path, Path(spec["state_dir"]))
-    if canonical_json(json.loads(raw)) != canonical_json(json.loads(latest["result_json"])):
-        raise ValueError("gates-only native result receipt disagrees with frozen attempt")
+    raw = _native_result_bytes(spec, latest)
+    _assessment_receipt(spec, latest, raw)
     with store._connect() as db:
         binding = work_binding(store, spec, db)
     seal = {
@@ -209,7 +273,9 @@ def admit(store, run_id, payload):
     }
     if (
         not isinstance(payload, dict)
-        or set(payload) != fields
+        or set(payload) not in (fields, fields | {
+            'preparation_authority_path', 'preparation_authority_sha256',
+        })
         or not isinstance(payload.get("command_id"), str)
         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", payload["command_id"])
         or any(
@@ -241,15 +307,30 @@ def admit(store, run_id, payload):
             raise ValueError("gates-only preflight changed")
         seal = observed["seal"]
         authority, semantic = authority_readback(spec, seal, payload)
+        from .delivery_native_renewal import renew
+
+        execution_spec, renewal = renew(spec, payload, command_digest)
+        if preflight(store, run_id)['precheck_sha256'] != observed['precheck_sha256']:
+            raise ValueError('gates-only original custody changed during native renewal')
+        after = DeliveryBroker(store, execution_spec).candidate()
+        if any(canonical_json(after[k]) != canonical_json(seal['candidate'][k])
+               for k in ('id', 'head', 'content_sha256', 'base_sha', 'environment_digest')):
+            raise ValueError('gates-only native renewal changed feature source custody')
         recovery = {
             "kind": "investigation_gates_only",
             "command": payload,
             "seal": seal,
             "state": seal["closed"]["result"],
-            "candidate": seal["candidate"],
+            "candidate": after,
             "original_recovery": seal["original_recovery"],
             "authority": authority,
             "semantic": semantic,
+            'execution_spec': execution_spec,
+            'original_spec': spec,
+            'native_preparation_renewal': renewal,
+            'source_lineage': {'before': seal['candidate'], 'after': after,
+                               'native_preparation_renewal': renewal,
+                               'same_feature_source': True},
         }
         _immutable(root / "admission.json", recovery)
         preserve_resources(root, spec)
@@ -315,11 +396,16 @@ def readback(store, spec, recovery):
     broker = DeliveryBroker(store, spec)
     seal = recovery["seal"]
     if (
-        digest(spec) != seal["spec_digest"]
-        or canonical_json(broker.candidate()) != canonical_json(seal["candidate"])
+        digest(recovery.get('original_spec', spec)) != seal['spec_digest']
+        or canonical_json(spec) != canonical_json(recovery.get('execution_spec', spec))
+        or canonical_json(broker.candidate()) != canonical_json(recovery['candidate'])
         or canonical_json(_stopped_cleanup(spec)) != canonical_json(seal["cleanup"])
     ):
         raise ValueError("gates-only stopped candidate or cleanup changed")
+    if recovery.get('native_preparation_renewal'):
+        from .delivery_native_renewal import verify_generation
+
+        verify_generation(recovery['original_spec'], recovery['native_preparation_renewal'], spec)
     _reference(recovery["command"]["authority_path"], recovery["command"]["authority_sha256"])
     _reference(recovery["command"]["semantic_path"], recovery["command"]["semantic_sha256"])
     _accepted_plan(recovery["semantic"], spec)
@@ -333,7 +419,8 @@ def readback(store, spec, recovery):
         for a in seal["attempts"]
         if a["role"] == "implement" and a["iteration"] == seal["iteration"]
     )
-    raw = _private_bytes(Path(latest["result_path"]), Path(spec["state_dir"]))
+    raw = _native_result_bytes(spec, latest)
+    _assessment_receipt(spec, latest, raw)
     if (
         canonical_json(attempts) != canonical_json(seal["attempts"])
         or canonical_json(effects) != canonical_json(seal["effects"])
@@ -364,4 +451,4 @@ def readback(store, spec, recovery):
         ).fetchone()
         if not granted or granted[0] != canonical_json(recovery):
             raise ValueError("gates-only durable admission changed")
-    return {"candidate": seal["candidate"], "implementation_authority": False}
+    return {"candidate": recovery["candidate"], "implementation_authority": False}

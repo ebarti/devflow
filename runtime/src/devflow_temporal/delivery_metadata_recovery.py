@@ -127,7 +127,7 @@ def _identity(broker):
     return name, committer
 
 
-def _range(broker, state, effects, signer, committer):
+def _range(broker, state, effects, signer, committer, recovery=None):
     base = broker.spec["base_sha"]
     commits = _git(broker.checkout, "rev-list", "--reverse", base + "..HEAD").splitlines()
     if not 1 <= len(commits) <= 16:
@@ -147,6 +147,27 @@ def _range(broker, state, effects, signer, committer):
             ),
             None,
         )
+        if role is None and isinstance(recovery, dict) and (
+            recovery.get("kind") == "execution_policy_recovery"
+            and type(request.get("iteration")) is int
+            and type(recovery.get("start_iteration")) is int
+            and request["iteration"] == recovery.get("start_iteration")
+            and type(recovery.get("state", {}).get("iteration")) is int
+            and recovery["state"]["iteration"] + 1 == request["iteration"]
+            and recovery.get("candidate", {}).get("id") == request.get("input_candidate_id")
+        ):
+            predecessor = next((r for r in reversed(recovery["state"]["roles"])
+                                if r.get("role") == "implement"
+                                and canonical_json(r.get("iteration"))
+                                == canonical_json(recovery["state"]["iteration"])), None)
+            if predecessor and any(canonical_json(r) == canonical_json(predecessor)
+                                   for r in state["roles"]):
+                frozen = predecessor.get("candidate", {})
+                retained = recovery["candidate"]
+                if all(canonical_json(frozen.get(k)) == canonical_json(retained.get(k))
+                       for k in ("id", "head", "content_sha256", "base_sha",
+                                 "environment_digest")):
+                    role = predecessor
         candidate = receipt.get("candidate", {})
         if (
             not role
@@ -271,7 +292,7 @@ def _snapshot(store, run_id, payload):
     cleanup = _stopped_cleanup(spec) if spec["provider"] == "codex" else {"provider": "fake"}
     with store._connect() as db:
         binding = work_binding(store, spec, db)
-    mapping = _range(broker, state, effects, signer, committer)
+    mapping = _range(broker, state, effects, signer, committer, previous)
     found = broker._existing_pr(validate_metadata=False)
     if found is None:
         raise ValueError("metadata recovery has no owned open PR")
@@ -315,6 +336,21 @@ def _guard(store, grant):
     spec = grant["spec"]
     _authority(grant["command"], spec)
     broker = DeliveryBroker(store, spec)
+    if spec['provider'] == 'codex':
+        from .delivery_config import DeliveryConfig
+        from .delivery_native_renewal import verify_generation
+
+        if digest(DeliveryConfig.load(Path(spec['config_path'])).raw) != spec['config_digest']:
+            raise ValueError('metadata effect frozen configuration changed')
+        generation = Path(spec['state_dir']) / 'native-preparation-renewal/generation.json'
+        if generation.exists():
+            observed = read_private(generation)
+            if observed.get('command_digest') != digest({'run_id': spec['run_id'],
+                                                        **grant['command']}):
+                raise ValueError('metadata effect native generation command changed')
+            verify_generation(spec, {'path': str(generation),
+                                     'sha256': hashlib.sha256(generation.read_bytes()).hexdigest()},
+                              observed['effective_spec'])
     candidate = broker.candidate()
     if (
         candidate["head"] not in {grant["old_head"], grant["new_head"]}
@@ -389,7 +425,9 @@ def reconcile(store, run_id, payload, *, preflight=False):
     }
     if (
         not isinstance(payload, dict)
-        or set(payload) != fields
+        or set(payload) not in (fields, fields | {
+            'preparation_authority_path', 'preparation_authority_sha256',
+        })
         or any(
             not isinstance(payload[key], str)
             for key in fields - {"expected_revision", "expected_pr_number"}
@@ -453,6 +491,10 @@ def reconcile(store, run_id, payload, *, preflight=False):
             grant = _snapshot(store, run_id, payload)
         _immutable(root / "intent.json", grant)
         preserve_resources(root, grant["spec"])
+        from .delivery_native_renewal import renew
+
+        execution_spec, renewal = renew(grant['spec'], payload, command_digest)
+        _guard(store, grant)
         if saved is None:
             with store._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
@@ -555,7 +597,14 @@ def reconcile(store, run_id, payload, *, preflight=False):
         ):
             raise ValueError("metadata publication readback remains pending; replay SAME request")
         broker._validate_publication_commits()
-        candidate = broker.candidate()
+        execution_broker = DeliveryBroker(store, execution_spec)
+        candidate = execution_broker.candidate()
+        if (candidate['head'] != grant['new_head']
+                or candidate['policy_digest'] != execution_spec['policy_digest']
+                or any(canonical_json(candidate[key])
+                       != canonical_json(grant['state']['candidate'][key])
+                       for key in ('content_sha256', 'base_sha', 'environment_digest'))):
+            raise ValueError('metadata successor changed identical feature source custody')
         publication = {
             "number": found["number"],
             "url": found["url"],
@@ -577,6 +626,12 @@ def reconcile(store, run_id, payload, *, preflight=False):
             "candidate": candidate,
             "publication": publication,
             "grant_digest": digest(grant),
+            'execution_spec': execution_spec,
+            'native_preparation_renewal': renewal,
+            'source_lineage': {'before': grant['state']['candidate'], 'after': candidate,
+                               'metadata_mapping_sha256': digest(grant['mapping']),
+                               'native_preparation_renewal': renewal,
+                               'same_feature_source': True},
         }
         workflow_id = f"delivery-{run_id}-metadata-1"
         response = {
@@ -627,6 +682,10 @@ def reconcile(store, run_id, payload, *, preflight=False):
 
 
 def validation_readback(store, spec, recovery):
+    if recovery.get('native_preparation_renewal'):
+        from .delivery_native_renewal import verify_generation
+
+        verify_generation(recovery['spec'], recovery['native_preparation_renewal'], spec)
     broker = DeliveryBroker(store, spec)
     if canonical_json(broker.candidate()) != canonical_json(recovery["candidate"]):
         raise ValueError("metadata validation candidate changed")

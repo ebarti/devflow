@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -197,6 +198,67 @@ def test_gates_only_preserves_rejected_result_input_after_custody_and_has_no_ext
         store.admit_gates_only("run-1", {**command, "command_id": "gates-2"})
     with pytest.raises(ValueError, match="different inputs"):
         store.admit_gates_only("run-1", {**command, "precheck_sha256": "0" * 64})
+
+
+def test_historical_native_attempt_container_and_controller_enrichment_are_read_only(stopped):
+    store, broker, _closed, _command = stopped
+    container = broker.state_dir / 'attempts'
+    container.chmod(0o755)  # Supervisor.mkdir(parents=True) historical container contract.
+    with store._connect() as db:
+        attempt = dict(db.execute('SELECT * FROM delivery_attempts').fetchone())
+        raw = json.loads(Path(attempt['result_path']).read_bytes())
+        saved = {**raw, 'cleanup': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+                 'resource_cleanup': 'pending_workflow_finalization', 'native_process': {
+                     'state': 'finished', 'monitoring_complete': True,
+                     'cleanup': 'observed-native-confirmed', 'exit_code': 0,
+                     'journal': str(Path(attempt['result_path']).with_name('native-process.json')),
+                 }}
+        db.execute('UPDATE delivery_attempts SET result_json=?', (canonical_json(saved),))
+    path = Path(attempt['result_path'])
+    before = path.read_bytes()
+    assert gates.preflight(store, 'run-1')['iteration'] == 4
+    gates._assessment_receipt({**broker.spec, 'provider': 'codex'},
+                             {**attempt, 'result_json': canonical_json(saved)}, before)
+    assert path.read_bytes() == before and container.stat().st_mode & 0o777 == 0o755
+    for changed in ({**saved, 'summary': 'Changed assessment'},
+                    {**saved, 'process_cleanup': 'unknown'},
+                    {**saved, 'native_process': {
+                        **saved['native_process'], 'monitoring_complete': 1}},
+                    {**saved, 'unrecognized': True}):
+        with pytest.raises(ValueError):
+            gates._assessment_receipt({**broker.spec, 'provider': 'codex'},
+                                     {**attempt, 'result_json': canonical_json(changed)}, before)
+
+
+@pytest.mark.parametrize('change', ['container-write', 'leaf-public', 'result-public',
+                                    'hardlink', 'symlink', 'wrong-path', 'missing-leaf'])
+def test_historical_native_receipt_reader_rejects_unrecognized_custody_without_creation(
+    stopped, change,
+):
+    store, broker, _closed, _command = stopped
+    with store._connect() as db:
+        attempt = dict(db.execute('SELECT * FROM delivery_attempts').fetchone())
+    path = Path(attempt['result_path'])
+    if change == 'container-write':
+        path.parent.parent.chmod(0o775)
+    elif change == 'leaf-public':
+        path.parent.chmod(0o755)
+    elif change == 'result-public':
+        path.chmod(0o644)
+    elif change == 'hardlink':
+        os.link(path, path.with_name('foreign-link.json'))
+    elif change == 'symlink':
+        moved = path.with_name('retained.json')
+        path.rename(moved)
+        path.symlink_to(moved.name)
+    elif change == 'wrong-path':
+        attempt['result_path'] = str(path.with_name('retained.json'))
+    else:
+        attempt['job_key'] = 'absent-leaf'
+        attempt['result_path'] = str(broker.state_dir / 'attempts/absent-leaf/result.json')
+    with pytest.raises((ValueError, OSError)):
+        gates._native_result_bytes(broker.spec, attempt)
+    assert not (broker.state_dir / 'attempts/absent-leaf').exists()
 
 
 @pytest.mark.parametrize(

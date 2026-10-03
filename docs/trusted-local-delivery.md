@@ -236,7 +236,11 @@ assigned operational verification. This repair does not merge or deploy.
 Stopped published metadata has a separate bounded reconciliation. The public
 `metadata-preflight --id RUN --request REQUEST.json` command authenticates the
 closed workflow, exact clean local/remote/PR head, controller publication range,
-source scope, configured existing signer and resource cleanup. The same request
+source scope, configured existing signer and resource cleanup. A gates-first
+publication binds the exact retained implementation through its durable policy
+recovery, controller-held input candidate and copied closed role envelope; it
+does not require an implementation at that publication iteration or infer one
+from proximity. The same request
 is used by `reconcile-published-metadata`. Its fields are `command_id`,
 `expected_revision`, `expected_candidate_id`, `expected_head`,
 `expected_pr_number`, `expected_signer`, `authority_path`, and
@@ -264,13 +268,46 @@ cleanup, work/claim and remote custody. It preserves the rejected historical
 assessment and runs all mandatory gates at the same existing iteration, without
 an implementation turn or larger repair budget. Any implementation-needed
 failure stops blocked. Identical request replay is idempotent; another command
-or changed preflight is refused.
+or changed preflight is refused. Historical native receipts may have the owning
+read-only `attempts` container at 0755, while their run/attempt leaf remains
+0700 and receipt remains owned 0600 with one link. Symlinks, writable containers,
+public leaves and receipts, and changed receipt identity are rejected without
+creating or changing permissions. Raw assessment bytes must match the frozen
+assessment exactly except for the four documented supervisor additions:
+`cleanup`, `process_cleanup`, `resource_cleanup` and `native_process`. The role
+resource value is `pending_workflow_finalization`, distinct from the separately
+confirmed terminal resource receipt. No assessment field is rewritten.
 
 The semantic receipt's hash-bound accepted-plan readback must match the frozen
 effective plan. `authority_readback(spec, seal, request)` authenticates those
 receipt, plan and custody references without an admission effect. The new
 successors retry custody readback at most three times within five minutes;
 unknown custody stops the workflow before any provider turn.
+
+A reviewed installed runtime payload change requires an explicit preparation
+step in either stopped admission request: add `preparation_authority_path` and
+`preparation_authority_sha256`. The hash-bound deciding receipt admits at most
+two original runs and one immutable preparation generation per run, with zero
+provider turns and no implementation or repair grant. Read-only preflight never
+renews preparation. Admission authenticates the old proof, requires clean
+installed Git source and freezes its revision/import path, then measures the
+new payload through the same native launcher. Only `runtime_payload_sha256`
+may differ: protected installed command paths, dependencies, binaries, mode,
+configuration, checks, plan, source, session and iteration authority stay exact.
+The new specification must pass strict native bind/verify before execution.
+
+The original proof and specification remain unchanged. Private immutable
+authority/generation receipts and the bounded preparation journal are available
+through public evidence. Measurement-copy JSON records encode the exact
+original bytes as base64 with their original path/hash, including when a current
+shared proof is reused; they do not claim a new measurement. Owned failed probe
+logs and journals remain separately indexed. At most two owned probe attempts belong to that one
+generation; an interrupted probe must first prove cleanup and retains its failed
+logs. Stable command replay resumes the generation; a different command or
+further identity change conflicts. The successor records explicit old-to-new
+candidate/policy/proof lineage with identical feature source, including the
+separate metadata commit mapping when applicable. Historical role inputs and
+after-candidates remain historical.
 
 These continuations retain original cleanup bytes and use distinct durable
 check/browser evidence namespaces. Resource roots stay under their original
@@ -301,8 +338,9 @@ must precede this source correction. No generic old failed run gains this
 released-claim or effective-policy exception.
 
 Public terminal cleanup now derives confirmation from the exact hashed owning
-finalization receipt, with process and resource confirmation and no active
-attempt. `cleanup_recorded` exposes the historical stored value separately.
+finalization receipt, with process and resource confirmation and no unfinished
+or unknown-cleanup attempt belonging to that run. Foreign active runs affect
+global capacity, not the stopped run’s cleanup proof. `cleanup_recorded` exposes the historical stored value separately.
 Old `none` is never broadly treated as confirmed or privately migrated; missing,
 changed or unknown proof remains unconfirmed. Native failed gate feedback keeps
 bounded structured regex matches and owned full-log provenance independently

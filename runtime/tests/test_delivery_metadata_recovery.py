@@ -218,6 +218,48 @@ def test_public_metadata_reconciliation_preserves_each_tree_author_and_original_
     assert metadata.validation_readback(store, broker.spec, recovery)["head"] == response["head"]
 
 
+@pytest.mark.parametrize('change', [None, 'missing-recovery', 'missing-role', 'wrong-candidate',
+                                    'changed-role', 'wrong-start', 'typed-start'])
+def test_published_range_binds_exact_gates_first_retained_implementation(published, change):
+    from copy import deepcopy
+
+    store, broker, state, _closed, _command, _title = published
+    with store._connect() as db:
+        effects = [dict(row) for row in db.execute(
+            "SELECT * FROM delivery_effects WHERE kind='publish' ORDER BY effect_key")]
+    request = json.loads(effects[0]['request_json'])
+    request['iteration'] = 1
+    effects[0]['request_json'] = canonical_json(request)
+    # No IMPLEMENT1 for this first publication: reuse exact IMPLEMENT0 custody.
+    state = deepcopy(state)
+    state['roles'][1]['iteration'] = 2
+    second = json.loads(effects[1]['request_json'])
+    second['iteration'] = 2
+    effects[1]['request_json'] = canonical_json(second)
+    retained = deepcopy(state['roles'][0])
+    recovery = {'kind': 'execution_policy_recovery', 'start_iteration': 1,
+                'state': {'iteration': 0, 'roles': [retained]},
+                'candidate': deepcopy(retained['candidate'])}
+    if change == 'missing-recovery':
+        recovery = None
+    elif change == 'missing-role':
+        state['roles'].pop(0)
+    elif change == 'wrong-candidate':
+        recovery['candidate']['content_sha256'] = '0' * 64
+    elif change == 'changed-role':
+        recovery['state']['roles'][0]['summary'] = 'Changed custody'
+    elif change == 'wrong-start':
+        recovery['start_iteration'] = 2
+    elif change == 'typed-start':
+        recovery['start_iteration'] = True
+    signer, committer = metadata._identity(broker)
+    if change:
+        with pytest.raises(ValueError, match='authentic controller candidate'):
+            metadata._range(broker, state, effects, signer, committer, recovery)
+    else:
+        assert len(metadata._range(broker, state, effects, signer, committer, recovery)) == 2
+
+
 @pytest.mark.parametrize("window", ["objects", "local", "push", "title", "receipt"])
 def test_same_command_resumes_known_interrupted_metadata_effects(published, monkeypatch, window):
     store, broker, state, _closed, command, title = published
@@ -493,3 +535,30 @@ async def test_real_temporal_metadata_successor_uses_production_activities_and_z
     with store._connect() as db:
         assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == before
     assert store.detail("run-1")["metadata_reconciliation"]["provider_turns"] == 0
+
+
+@pytest.mark.parametrize('change', ['head', 'content_sha256'])
+def test_metadata_successor_refuses_late_changed_source_instead_of_adopting_it(
+    published, monkeypatch, change,
+):
+    from devflow_temporal import delivery_native_renewal
+
+    store, broker, _state, _closed, command, _title = published
+    original = DeliveryBroker.candidate
+    monkeypatch.setattr(delivery_native_renewal, 'renew',
+                        lambda spec, *_args: ({**spec, 'controlled_successor': True}, None))
+
+    def observed(self):
+        value = original(self)
+        if self.spec.get('controlled_successor'):
+            value[change] = '0' * len(value[change])
+        return value
+
+    monkeypatch.setattr(DeliveryBroker, 'candidate', observed)
+    with pytest.raises(ValueError, match='identical feature source custody'):
+        store.reconcile_published_metadata('run-1', command)
+    with store._connect() as db:
+        row = db.execute('SELECT phase FROM delivery_runs WHERE run_id="run-1"').fetchone()
+        assert row['phase'] == 'blocked'
+        assert db.execute('SELECT COUNT(*) FROM delivery_repair_grants').fetchone()[0] == 0
+    assert (broker.state_dir / 'metadata-reconciliation/intent.json').is_file()

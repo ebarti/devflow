@@ -44,7 +44,8 @@ def prepare(store, spec, state, previous, supplied, session):
         or previous.get("kind") != "published_metadata_recovery"
         or previous.get("old_head") != scope.get("known_old_head")
         or canonical_json(previous.get("candidate")) != canonical_json(state["candidate"])
-        or canonical_json(previous.get("spec")) != canonical_json(spec)
+        or canonical_json(previous.get("execution_spec", previous.get("spec")))
+        != canonical_json(spec)
         or canonical_json(state.get("roles")) != canonical_json(previous["state"]["roles"])
     ):
         raise ValueError("title repair does not bind its one authorized effective metadata lineage")

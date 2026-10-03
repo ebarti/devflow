@@ -2462,10 +2462,21 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            renewal = None
+
+            def renewed(spec):
+                if not renewal:
+                    return spec
+                from .delivery_native_renewal import effective_spec as renewed_spec
+
+                return renewed_spec(spec, renewal)
+
             while recovery and recovery.get("kind") in {
                 "terminal_tracker_recovery", "published_metadata_recovery",
                 "investigation_gates_only",
             }:
+                if recovery.get('native_preparation_renewal'):
+                    renewal = recovery
                 recovery = recovery["original_recovery"]
             if (recovery and recovery.get("kind") == "repair_continuation"
                     and recovery.get("title_constraint")):
@@ -2474,6 +2485,8 @@ class DeliveryStore:
                     "terminal_tracker_recovery", "published_metadata_recovery",
                     "investigation_gates_only",
                 }:
+                    if recovery.get('native_preparation_renewal'):
+                        renewal = recovery
                     recovery = recovery["original_recovery"]
             if isinstance(recovery, dict) and recovery.get("kind") == "execution_policy_recovery":
                 from .delivery_policy_recovery import effective_spec
@@ -2481,14 +2494,14 @@ class DeliveryStore:
                 grant = db.execute(
                     "SELECT * FROM delivery_policy_recoveries WHERE run_id=?", (run_id,),
                 ).fetchone()
-                return effective_spec(self, original, recovery, grant)
+                return renewed(effective_spec(self, original, recovery, grant))
             scope = self._scope_recovery(recovery)
             historical = (
                 original.get("provider") == "codex"
                 and original["policy"].get("execution_backend") != "native-macos"
             )
             if scope is None or historical:
-                return original
+                return renewed(original)
             amendment = db.execute(
                 "SELECT * FROM delivery_scope_amendments WHERE run_id=?", (run_id,)
             ).fetchone()
@@ -2516,7 +2529,7 @@ class DeliveryStore:
             != amended.raw["repositories"][original["repository_key"]]["allowed_paths"]
         ):
             raise ValueError("scope amendment effective authority changed")
-        return effective
+        return renewed(effective)
 
     def active_workflow_id(self, run_id: str) -> str:
         with self._connect() as db:
@@ -3102,6 +3115,10 @@ class DeliveryStore:
                 """SELECT COUNT(*) FROM delivery_attempts
                    WHERE state IN ('starting','running','unknown')"""
             ).fetchone()[0]
+            own_unconfirmed = db.execute(
+                "SELECT COUNT(*) FROM delivery_attempts WHERE run_id=? "
+                "AND (state!='finished' OR cleanup='unknown')", (run_id,),
+            ).fetchone()[0]
             # events() pages oldest-first for SSE replay; detail shows the newest activity.
             recent_event_rows = db.execute(
                 """SELECT sequence,timestamp,type,message,run_revision,payload_json
@@ -3170,7 +3187,8 @@ class DeliveryStore:
         from .delivery_resources import projected_cleanup
 
         cleanup = projected_cleanup(
-            spec, checks, row["cleanup"], terminal=(not active and row["execution_state"] in {
+            spec, checks, row["cleanup"], terminal=(not own_unconfirmed
+                                                 and row["execution_state"] in {
                 "terminal", "blocked", "cancelled", "waiting_tracker",
             }),
         )
@@ -3250,6 +3268,10 @@ class DeliveryStore:
             ("metadata-reconciliation", ("intent.json", "original-ref.json", "rewritten-ref.json",
                                           "publication.json")),
             ("gates-admission", ("admission.json",)),
+            ("native-preparation-renewal", ("authority.json", "preparation.json",
+                                             "generation.json", "proof.json",
+                                             "measurement-path_control.json",
+                                             "measurement-observed.json", "measurement-log.json")),
         ):
             for name in names:
                 path = root / namespace / name
@@ -3263,6 +3285,27 @@ class DeliveryStore:
                     indexed.append({"id": namespace + "-predecessor-" + name,
                                     "label": namespace + " original cleanup " + name,
                                     "path": path, "limit": 4 * 1024 * 1024})
+        renewal_intent = root / "native-preparation-renewal" / "preparation.json"
+        if renewal_intent.is_file() and not renewal_intent.is_symlink():
+            from .delivery_resources import read_private
+
+            observed = read_private(renewal_intent)
+            for index, attempt in enumerate(observed.get("preparation_attempts", [])[:2]):
+                probe = root / "native-preparation-renewal/probes" / str(index) / run_id
+                if attempt.get("spec", {}).get("state_dir") != str(probe):
+                    raise ValueError("native renewal evidence left its owned generation")
+                for relative in ("resources/manifest.json", "resources/finalization.json",
+                                 "native-preparation/trusted-local/observed.json",
+                                 "native-preparation/trusted-local/path-control/process.log",
+                                 "native-preparation/trusted-local/path-control/native-process.json",
+                                 "native-preparation/trusted-local/trusted-local/process.log",
+                                 "native-preparation/trusted-local/trusted-local/native-process.json"):
+                    path = probe / relative
+                    if path.is_file() and not path.is_symlink():
+                        indexed.append({"id": "native-renewal-probe-" + str(index) + "-"
+                                        + relative.replace("/", "-"),
+                                        "label": "Native renewal probe " + str(index) + ": "
+                                        + relative, "path": path, "limit": 4 * 1024 * 1024})
         policy_intent = root / "policy-recovery" / "intent.json"
         if policy_intent.is_file() and not policy_intent.is_symlink():
             indexed.append({"id": "execution-policy-recovery-intent",
