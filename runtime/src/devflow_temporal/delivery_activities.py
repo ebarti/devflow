@@ -156,7 +156,7 @@ async def delivery_accept_plan(request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("intake authority changed before acceptance")
     return store.accept_intake_plan(
         request["spec"]["run_id"], request["plan_revision"],
-        request["plan_digest"], request["plan"],
+        request["plan_digest"], request["plan"], authorization=request.get("authorization"),
     )
 
 

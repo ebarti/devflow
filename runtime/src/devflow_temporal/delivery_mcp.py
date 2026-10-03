@@ -16,7 +16,7 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool()
     def submit_run(request_json: str) -> dict:
-        """Submit a raw goal and authorized endpoint; Devflow investigates and plans."""
+        """Submit a raw goal; plan_approval=required opts into human plan review."""
         value = json.loads(request_json)
         if not isinstance(value, dict):
             raise ValueError("submit request must be a JSON object")

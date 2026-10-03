@@ -383,6 +383,7 @@ def main() -> None:
                     "replacement greeting before planning the change."
                 ),
                 "authorized_endpoint": "published_unmerged",
+                "plan_approval": "required",
             }
             request_path = output / f"submit-{number}.json"
             private(request_path, request)

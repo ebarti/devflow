@@ -655,6 +655,7 @@ def test_scope_amendment_seals_only_two_paths_and_preserves_request_and_grant(
     assert recovery["source_candidate"] != state["candidate"]
     assert effective["policy"]["allowed_paths"] == ["README.md", *command["added_paths"]]
     assert effective["request_digest"] == original["request_digest"]
+    assert effective["plan_approval"] == original["plan_approval"]
     assert effective["policy_digest"] != original["policy_digest"]
     store.scope_preflight(effective, recovery)
     with pytest.raises(ValueError, match="scope amendment"):
@@ -1575,7 +1576,7 @@ def test_blocked_pre_role_run_can_transfer_claim_to_explicit_successor(service):
     assert store.detail("run-1")["outcome"] == "blocked"
 
 
-@pytest.mark.parametrize("raw_intake", [False, True])
+@pytest.mark.parametrize("raw_intake", [False, "automatic", "required"])
 def test_post_role_continuation_carries_sealed_candidate_and_session_without_auth(
     service, tmp_path, monkeypatch, raw_intake
 ):
@@ -1586,6 +1587,7 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
         store.config.path.write_text(json.dumps(configuration))
         store = DeliveryStore(DeliveryConfig.load(store.config.path))
         request = {key: value for key, value in request.items() if key != "accepted_plan"}
+        request["plan_approval"] = raw_intake
     store.submit(request)
     intake_role = None
     if raw_intake:
@@ -1603,7 +1605,25 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
                 "answers": [], "questions": [], "round": 0,
             },
         )
-        store.accept_intake_plan("run-1", 1, digest(plan), plan)
+        if raw_intake == "automatic":
+            spec = store.spec("run-1")
+            authorization = {
+                "source": "run_authorization", "command_id": spec["command_id"],
+                "request_digest": spec["request_digest"], "policy_digest": spec["policy_digest"],
+                "authorized_endpoint": spec["authorized_endpoint"],
+            }
+            store.project(
+                "run-1", phase="investigating", execution_state="running",
+                event_type="plan_recorded", message="fixture authorized plan recorded",
+                intake={
+                    "plans": [{"revision": 1, "digest": digest(plan), "content": plan,
+                               "authorization": authorization}],
+                    "answers": [], "questions": [], "round": 0,
+                },
+            )
+            store.accept_intake_plan("run-1", 1, digest(plan), plan, authorization=authorization)
+        else:
+            store.accept_intake_plan("run-1", 1, digest(plan), plan)
     old_spec = store.intake_execution_spec("run-1")
     old_broker = DeliveryBroker(store, old_spec)
     initial = old_broker.prepare()["candidate"]
@@ -1784,7 +1804,8 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
         changed_store.submit(request2)
     store.config.path.write_text(json.dumps(configuration))
     with pytest.raises(ValueError, match="changed authority"):
-        successor.submit({**request2, "accepted_plan": "A different feature"})
+        successor.submit({**request2, "accepted_plan": "A different feature",
+                          "plan_approval": "automatic"})
     if raw_intake:
         with successor._connect() as db:
             db.execute(
@@ -1843,6 +1864,8 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
         assert successor_spec["accepted_plan"] == old_spec["accepted_plan"]
         assert successor_spec["intake_required"] is False
     frozen = successor.spec("run-2")["continuation"]
+    if raw_intake == "automatic":
+        assert frozen["accepted_intake_plan"] == store.detail("run-1")["intake"]["accepted_plan"]
     assert frozen["candidate_id"] == final["id"]
     assert frozen["session_id"] == session_id
     assert successor.submit(request2)["existing"] is False  # identical command receipt

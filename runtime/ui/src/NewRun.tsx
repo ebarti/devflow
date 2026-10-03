@@ -47,7 +47,7 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
   }
 
   return <div className="form-page">
-    <div className="form-page__heading"><h1>New run</h1><p>{intakeEnabled ? 'Devflow investigates your goal, asks for needed clarification, and proposes a plan before implementation.' : 'Submit a goal with its already accepted plan.'}</p></div>
+    <div className="form-page__heading"><h1>New run</h1><p>{intakeEnabled ? 'Devflow investigates your goal, asks for needed clarification, and records a plan before continuing implementation automatically.' : 'Submit a goal with its already accepted plan.'}</p></div>
     {repositories.length ? <form onSubmit={event => void submit(event)} className="run-form">
       <div className="field-grid">
         <label>Run ID<input value={fields.run_id} onChange={event => set('run_id', event.target.value)} pattern="[A-Za-z0-9][A-Za-z0-9._-]*" maxLength={128} required autoComplete="off" /></label>

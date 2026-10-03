@@ -494,11 +494,22 @@ def scope_amended_spec(
         "command_id", "run_id", "work_id", "issue_url", "repository_key",
         "goal", "accepted_plan", "base_ref", "branch", "authorized_endpoint",
         "recovery_key", "supersedes_run_id",
+        "plan_approval",
     }
     from .delivery_preparation import require_native_execution
 
     require_native_execution(original)
-    effective = amended.admit({key: original[key] for key in submit_keys if key in original})
+    supplied = {key: original[key] for key in submit_keys if key in original}
+    if original.get("intake_required") or original.get("plan_approval") == "required":
+        # Re-admit the original raw goal; its separately bound plan is immutable.
+        supplied.pop("accepted_plan", None)
+        supplied["plan_approval"] = original.get("plan_approval", "required")
+    effective = amended.admit(supplied)
+    effective["accepted_plan"] = original["accepted_plan"]
+    if "plan_approval" in original:
+        effective["plan_approval"] = original["plan_approval"]
+    else:
+        effective.pop("plan_approval")
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",

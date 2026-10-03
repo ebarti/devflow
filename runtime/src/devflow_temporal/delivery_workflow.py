@@ -93,6 +93,16 @@ class DeliveryWorkflow:
                     maximum_interval=timedelta(seconds=10),
                 ),
             }
+        elif name == "delivery_accept_plan" and request["spec"].get("plan_approval") == "automatic":
+            # New automatic acceptance is an idempotent store binding. Recover
+            # a lost completion after persistence without changing legacy retries.
+            options = {
+                "retry_policy": RetryPolicy(
+                    maximum_attempts=3,
+                    initial_interval=timedelta(seconds=1),
+                    maximum_interval=timedelta(seconds=10),
+                )
+            }
         else:
             options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         return await workflow.execute_activity(
@@ -396,6 +406,45 @@ class DeliveryWorkflow:
                     "content": plan, "state": "proposed",
                 }
                 intake["plans"].append(plan_record)
+                # This frozen field exists only on new admissions. Missing fields
+                # retain the recorded legacy decision/activity ordering on replay.
+                if spec.get("plan_approval", "required") == "automatic":
+                    authorization = {
+                        "source": "run_authorization", "command_id": spec["command_id"],
+                        "request_digest": spec["request_digest"],
+                        "policy_digest": spec["policy_digest"],
+                        "authorized_endpoint": spec["authorized_endpoint"],
+                    }
+                    plan_record["authorization"] = authorization
+                    self.state["decision"] = None
+                    self.state["revision"] += 1
+                    await self._project(spec, "plan_recorded", "Exact plan recorded for execution")
+                    if self.cancel_requested:
+                        await self._cancelled(spec)
+                        return None
+                    try:
+                        accepted_spec = await self._activity(
+                            "delivery_accept_plan",
+                            {"spec": spec, "plan_revision": revision,
+                             "plan_digest": plan_record["digest"], "plan": plan,
+                             "authorization": authorization},
+                        )
+                    except Exception as exc:
+                        await self._stop(spec, f"plan acceptance failed: {type(exc).__name__}")
+                        return None
+                    plan_record["state"] = "accepted"
+                    intake["accepted_plan"] = {
+                        "revision": revision, "digest": plan_record["digest"], "content": plan,
+                        "authorization": authorization,
+                    }
+                    self.state["revision"] += 1
+                    await self._project(
+                        accepted_spec, "plan_accepted", "Exact plan accepted by run authorization"
+                    )
+                    if self.cancel_requested:
+                        await self._cancelled(accepted_spec)
+                        return None
+                    return accepted_spec
                 self.state["phase"] = "waiting_plan"
                 self.state["execution_state"] = "waiting"
                 self.state["revision"] += 1

@@ -28,7 +28,11 @@ from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_guard import NATIVE_OVERRIDES
 from devflow_temporal.delivery_native_preparation import _measure, native_identity
 from devflow_temporal.delivery_native_threads import NativeThreadObservation
-from devflow_temporal.delivery_preparation import prepare_authority, verify_prepared_spec
+from devflow_temporal.delivery_preparation import (
+    PreparationError,
+    prepare_authority,
+    verify_prepared_spec,
+)
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -132,6 +136,9 @@ def test_actual_native_preparation_cache_and_check_cleanup(native_store, monkeyp
     submitted = store.submitted_spec(request["run_id"])
     first = prepare_authority(store, submitted)
     verify_prepared_spec(first)
+    assert first["plan_approval"] == submitted["plan_approval"] == "automatic"
+    with pytest.raises(PreparationError, match="run binding changed"):
+        verify_prepared_spec({**first, "plan_approval": "required"})
     assert first["preparation"]["cache_reused"] is False
     second_request = {
         **request,
