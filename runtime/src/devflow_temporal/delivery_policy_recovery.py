@@ -156,9 +156,20 @@ def precheck(store, run_id):
         raise ValueError('preserved original implementer session is unconfirmed')
     latest = max(implementations, key=lambda a: a['iteration'])
     result = json.loads(latest['result_json'])
+    latest_roles = [r for r in roles if r['role'] == 'implement'
+                    and r['iteration'] == latest['iteration']
+                    and r.get('session_id') == latest['session_id']]
     broker = DeliveryBroker(store, original)
     candidate = broker.candidate()
-    if (candidate != result.get('candidate')
+    # The supervisor persists the native result before delivery_role adds its
+    # controller-owned candidate envelope. Authenticate that frozen Temporal
+    # output; never manufacture or rewrite a candidate in the raw result.
+    if (not isinstance(result, dict)
+            or len(latest_roles) != 1
+            or candidate != state.get('candidate')
+            or candidate != latest_roles[0].get('candidate')
+            or latest_roles[0].get('input_candidate_id') != latest['candidate_id']
+            or ('candidate' in result and candidate != result['candidate'])
             or not broker._changed_paths()
             or broker._changed_paths() - set(original['policy']['allowed_paths'])
             or candidate['head'] != original['base_sha']):

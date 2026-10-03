@@ -46,9 +46,9 @@ def preserved(native_configuration, monkeypatch):
         for iteration in range(3):
             role = {'role': 'implement', 'iteration': iteration, 'status': 'findings',
                     'summary': 'Frozen host check unavailable', 'findings': ['Historical failure'],
-                    'cleanup': 'confirmed', 'session_id': session, 'candidate': candidate,
-                    'finish_reason': 'done'}
-            roles.append(role)
+                    'cleanup': 'confirmed', 'session_id': session, 'finish_reason': 'done'}
+            roles.append({**role, 'role': 'implement', 'iteration': iteration,
+                          'input_candidate_id': candidate['id'], 'candidate': candidate})
             db.execute(
                 'INSERT INTO delivery_attempts '
                 '(job_key,run_id,role,iteration,candidate_id,state,session_id,result_json,cleanup) '
@@ -88,6 +88,64 @@ def preserved(native_configuration, monkeypatch):
                'config_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
                'additional_iterations': 2}
     return store, spec, payload, state
+
+
+
+def test_native_raw_results_are_preserved_without_a_candidate_field(preserved):
+    store, original, _payload, state = preserved
+    run_id = original['run_id']
+    with store._connect() as db:
+        before = [dict(row) for row in db.execute(
+            'SELECT * FROM delivery_attempts ORDER BY job_key')]
+    assert all('candidate' not in json.loads(a['result_json']) for a in before)
+    assert store.policy_recovery_precheck(run_id)['candidate'] == state['candidate']
+    with store._connect() as db:
+        assert before == [dict(row) for row in db.execute(
+            'SELECT * FROM delivery_attempts ORDER BY job_key')]
+        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('change', [
+    'raw-null', 'raw-wrong', 'raw-type', 'closed-role-missing', 'closed-role-wrong',
+    'closed-input', 'closed-candidate-missing', 'closed-candidate-wrong',
+])
+def test_native_result_compatibility_requires_frozen_controller_provenance(preserved, change):
+    store, original, _payload, state = preserved
+    if change.startswith('raw-'):
+        with store._connect() as db:
+            raw = json.loads(db.execute(
+                "SELECT result_json FROM delivery_attempts WHERE iteration=2").fetchone()[0])
+            raw['candidate'] = (None if change == 'raw-null' else 'invalid'
+                                if change == 'raw-type' else
+                                {**state['candidate'], 'content_sha256': 'f' * 64})
+            db.execute('UPDATE delivery_attempts SET result_json=? WHERE iteration=2',
+                       (canonical_json(raw),))
+    elif change == 'closed-role-missing':
+        state['roles'][-1].pop('candidate')
+    elif change == 'closed-role-wrong':
+        state['roles'][-1]['candidate'] = {**state['candidate'], 'content_sha256': 'f' * 64}
+    elif change == 'closed-input':
+        state['roles'][-1]['input_candidate_id'] = 'unrelated-input'
+    elif change == 'closed-candidate-missing':
+        state.pop('candidate')
+    else:
+        state['candidate'] = {**state['candidate'], 'content_sha256': 'f' * 64}
+    with pytest.raises(ValueError):
+        store.policy_recovery_precheck(original['run_id'])
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
+        assert store.state.claim_for(db, original['work_id']) is None
+
+
+def test_present_matching_raw_candidate_remains_supported(preserved):
+    store, original, _payload, state = preserved
+    with store._connect() as db:
+        raw = json.loads(db.execute(
+            "SELECT result_json FROM delivery_attempts WHERE iteration=2").fetchone()[0])
+        raw['candidate'] = state['candidate']
+        db.execute('UPDATE delivery_attempts SET result_json=? WHERE iteration=2',
+                   (canonical_json(raw),))
+    assert store.policy_recovery_precheck(original['run_id'])['candidate'] == state['candidate']
 
 
 def test_policy_recovery_preserves_candidate_session_failures_and_repeat_effects(preserved):

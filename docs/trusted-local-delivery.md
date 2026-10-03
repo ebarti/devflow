@@ -112,6 +112,11 @@ budget. This supports multiple completed attempts with one original implementer
 session. It retains the same work ID, run ID, branch, source bytes and provider
 session. The original accepted plan, submitted configuration, closed Temporal
 tail, attempt results, process logs and cleanup evidence remain unchanged.
+Native attempt results are recorded before the role activity adds its controller
+candidate envelope. Recovery authenticates the retained source against both the
+frozen controller projection and that closed role envelope, including its input
+candidate and session identity. A missing raw-result candidate is supported;
+a present conflicting candidate or missing controller evidence is rejected.
 Current GitHub issue requirements are read, hashed and supplied as requirements
 data to the managed roles; they are not accepted results or new authority.
 
