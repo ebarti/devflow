@@ -7,15 +7,35 @@ import json
 from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 
 from .delivery_client import client
 from .delivery_origin import bind_origin, metadata_origin
 
 
 def build_server(config_path: Path) -> FastMCP:
-    server = FastMCP("Devflow local delivery")
+    server = FastMCP(
+        "Devflow local delivery",
+        instructions=(
+            "Discover configured repository keys and base refs with get_service before submission. "
+            "The local service owns roles, planning and authorized GitHub delivery through an "
+            "unmerged PR. Use status/evidence on request; dashboard SSE supplies progress. "
+            "Keep mutation IDs stable after uncertain responses; inspect the run before retrying."
+        ),
+    )
+    read = ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    )
+    write = ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    )
 
-    @server.tool()
+    @server.tool(annotations=read)
+    def get_service() -> dict:
+        """Read local service health and public repository/role policy; starts it if stopped."""
+        return client(config_path).service()
+
+    @server.tool(annotations=write)
     def submit_run(request_json: str, ctx: Context) -> dict:
         """Submit a raw goal; plan_approval=required opts into human plan review."""
         value = json.loads(request_json)
@@ -25,27 +45,29 @@ def build_server(config_path: Path) -> FastMCP:
         metadata = meta.model_dump(by_alias=True) if meta is not None else None
         return client(config_path).submit(bind_origin(value, metadata_origin(metadata)))
 
-    @server.tool()
+    @server.tool(annotations=read)
     def list_runs() -> dict:
         """List compact, factual status for recent local delivery runs."""
         return client(config_path).runs()
 
-    @server.tool()
+    @server.tool(annotations=read)
     def get_run(run_id: str) -> dict:
         """Read a run's current state, evidence index, and durable event timeline."""
         return client(config_path).status(run_id)
 
-    @server.tool()
+    @server.tool(annotations=read)
     def read_evidence(run_id: str, evidence_id: str) -> dict:
         """Read one indexed, contained evidence artifact for a run."""
         return client(config_path).evidence(run_id, evidence_id)
 
-    @server.tool()
+    @server.tool(annotations=write)
     def answer_decision(run_id: str, request_json: str) -> dict:
         """Answer a question or accept/change a plan with command ID and revisions."""
         return client(config_path).decision(run_id, json.loads(request_json))
 
-    @server.tool()
+    @server.tool(annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
+    ))
     def cancel_run(run_id: str, request_json: str) -> dict:
         """Request a role-boundary cancellation with command ID and expected revision."""
         return client(config_path).cancel(run_id, json.loads(request_json))
