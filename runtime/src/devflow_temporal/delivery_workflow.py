@@ -203,25 +203,17 @@ class DeliveryWorkflow:
                 self.state["tracker"] = await self._activity(
                     "delivery_terminal_tracker",
                     {"spec": spec, "status": "in-review" if event == "delivered" else "blocked",
-                     "release": release},
+                     "release": release,
+                     "reason": self.state.get("error") or message},
                 )
             except Exception as exc:
                 self.state["tracker"] = {"state": "pending", "pending": True,
                                          "reason": type(exc).__name__}
             if event == "delivered" and self.state["tracker"].get("state") != "consistent":
-                self.state.update(phase="blocked", execution_state="blocked", outcome="blocked",
+                self.state.update(phase="waiting_tracker", execution_state="waiting_tracker",
+                                  outcome=None,
                                   error="terminal tracker readback is pending")
-                event, message = "blocked", "Terminal tracker reconciliation requires recovery"
-                try:
-                    self.state["tracker"] = await self._activity(
-                        "delivery_terminal_tracker",
-                        {"spec": spec, "status": "blocked", "release": release},
-                    )
-                except Exception as exc:
-                    self.state["tracker"] = {
-                        "state": "pending", "pending": True, "reason": type(exc).__name__,
-                        "desired": "blocked; claim " + ("released" if release else "retained"),
-                    }
+                event, message = "tracker_pending", "Terminal tracker reconciliation is pending"
         await self._activity(
             "delivery_project",
             {

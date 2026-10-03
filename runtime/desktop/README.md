@@ -19,6 +19,64 @@ The installer uses the supported `codex mcp add` command and copies `devflow-loc
 
 For an update to an inspected, Devflow-owned skill, supply `--replace-owned-skill-sha256` with the SHA-256 of its current bytes. The installer rechecks those bytes, retains a backup, and replaces only that skill. Different MCP commands/configs and disabled entries remain conflicts. This option does not authorize replacement of unrelated skills or service state.
 
+For the explicit [trusted-local policy transition](../../docs/trusted-local-delivery.md),
+the owned direct MCP entry must point to the new private configuration. Keep the
+original frozen file unchanged and put the mode-only copy under the existing
+service state root. Inspect the current entry using `codex mcp get
+devflow-local-delivery --json`, then create an owned 0600 request containing:
+
+```json
+{
+  "command_id": "stable-owned-trusted-upgrade",
+  "expected_registration_sha256": "SHA256_OF_CANONICAL_PUBLIC_GET_JSON",
+  "expected_config_path": "/absolute/original/frozen-service.json",
+  "expected_config_sha256": "SHA256_OF_ORIGINAL_CONFIG_BYTES",
+  "expected_skill_sha256": "SHA256_OF_INSPECTED_INSTALLED_LOCAL_DELIVERY_SKILL"
+}
+```
+
+Canonical registration JSON uses sorted keys and compact `,` / `:` separators.
+The guarded installer requires an enabled same-name stdio entry with the exact
+runtime executable, original config argument and no transport environment/CWD
+overrides. It rejects changed owned inputs, disabled/foreign entries, altered
+models/capacity/scope, and linked inputs. It updates only the owned MCP pointer
+through the supported public CLI and the one local-delivery skill, checking all
+other MCP entries and host configuration semantics before and after. It does
+not edit configuration TOML directly or change agents/models/plugins.
+
+```sh
+python3 runtime/desktop/install.py \
+  --runtime-dir /absolute/stable/runtime \
+  --config /absolute/private/state/trusted-local.json \
+  --codex-home /absolute/codex-home \
+  --repoint-owned-request /absolute/private/owned-upgrade.json
+```
+
+The JSON response includes a private `rollback_manifest` under the selected
+Codex home's `.devflow-local-delivery-upgrades/COMMAND_ID/`. This intent and the
+original skill backup are durable before the pointer changes. Repeating identical
+inputs reads back the owned state; an interrupted successful pointer write is
+observed instead of blindly repeated. A failed readback restores the owned old
+pointer and skill when their identities still match; uncertain rollback remains
+visible in the manifest. To explicitly restore:
+
+```sh
+python3 runtime/desktop/install.py \
+  --runtime-dir /absolute/stable/runtime \
+  --config /absolute/private/state/trusted-local.json \
+  --codex-home /absolute/codex-home \
+  --rollback-owned-manifest /absolute/codex-home/.devflow-local-delivery-upgrades/COMMAND_ID/manifest.json
+```
+
+Installation does not restart the service or refresh cached host clients. Stop
+the owned service separately, apply the reviewed runtime/config/pointer change,
+start through the new config, and verify discovery from a fresh client. An old
+cached MCP client with the frozen config path must be refreshed before use or
+it can select the old service policy. When using the plugin instead, package
+and register its new resources with the same new config; inspect existing public
+plugin registrations first and preserve any earlier package for rollback. The
+direct pointer updater does not rewrite or remove plugin installations.
+
 With the runtime and config paths above, the service can be checked using the same public CLI:
 
 ```sh

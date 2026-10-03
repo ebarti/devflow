@@ -181,7 +181,7 @@ def amended_config(original, path, expected_hash):
     return config
 
 
-def _prepare(original, config):
+def _prepare(original, config, intent, intent_path):
     from .delivery_native_preparation import _measure, _validate, bind_native_spec, native_identity
 
     effective = deepcopy(original)
@@ -194,19 +194,65 @@ def _prepare(original, config):
     effective.update(config_path=str(config.path), config_digest=digest(config.raw),
                      terminal_tracker_version=1, role_home_generation='policy-1')
     root = Path(effective['state_dir']).parents[1]
+    # Preparation has its own finite, journalled resource generations. It cannot
+    # recreate or rewrite the predecessor's finalized transient roots/manifest.
+    for attempt in intent['preparation_attempts']:
+        if attempt['state'] == 'started':
+            receipt = RunResources(attempt['spec']).finalize('blocked')
+            attempt.update(state='interrupted', cleanup=receipt)
+            write_private(intent_path, intent)
+            if receipt['state'] != 'confirmed':
+                raise ValueError('interrupted policy preparation cleanup is unknown')
+        if attempt.get('cleanup', {}).get('state') != 'confirmed':
+            raise ValueError('policy preparation still has uncertain owned cleanup')
+    if intent.get('effective_spec'):
+        from .delivery_native_preparation import verify_native_spec
+
+        verify_native_spec(intent['effective_spec'])
+        return intent['effective_spec']
     with _lock(root / 'preparation-native'):
         identity = native_identity(effective)
         path = root / 'preparation-native' / digest(identity) / 'proof.json'
         reused = path.exists()
-        proof = (json.loads(_private_bytes(path, root / 'preparation-native')) if reused
-                 else _measure(effective, identity))
+        if reused:
+            proof = json.loads(_private_bytes(path, root / 'preparation-native'))
+        else:
+            if len(intent['preparation_attempts']) >= 2:
+                raise ValueError('finite policy preparation attempt budget exhausted')
+            probe = deepcopy(effective)
+            probe['state_dir'] = str(intent_path.parent / 'probes'
+                                    / str(len(intent['preparation_attempts'])) / original['run_id'])
+            attempt = {'spec': probe, 'state': 'started', 'cleanup': None}
+            intent['preparation_attempts'].append(attempt)
+            intent['state'] = 'preparing'
+            write_private(intent_path, intent)
+            try:
+                proof = _measure(probe, identity, state_root=root)
+            except Exception as exc:
+                attempt['error'] = str(exc)[:500]
+                raise
+            finally:
+                receipt = RunResources(probe).finalize('blocked')
+                attempt.update(state='stopped', cleanup=receipt)
+                write_private(intent_path, intent)
+            if receipt['state'] != 'confirmed':
+                raise ValueError('policy preparation cleanup is unknown')
         _validate(proof, identity, root)
         if not reused:
             _write(path, proof)
-        return bind_native_spec(effective, identity, path, reused=reused)
+        prepared = bind_native_spec(effective, identity, path, reused=reused)
+        intent.update(state='prepared', effective_spec=prepared)
+        write_private(intent_path, intent)
+        return prepared
 
 
 def recover(store, run_id, supplied):
+    original = store.intake_execution_spec(run_id)
+    with _lock(Path(original['state_dir']) / 'policy-recovery'):
+        return _recover_locked(store, run_id, supplied)
+
+
+def _recover_locked(store, run_id, supplied):
     required = {'command_id', 'expected_precheck_sha256', 'config_path', 'config_sha256',
                 'additional_iterations'}
     if (not isinstance(supplied, dict) or set(supplied) != required
@@ -234,6 +280,16 @@ def recover(store, run_id, supplied):
     if seal['precheck_sha256'] != supplied['expected_precheck_sha256']:
         raise ValueError('policy recovery precheck changed; inspect a fresh preflight')
     config = amended_config(original, Path(supplied['config_path']), supplied['config_sha256'])
+    intent_path = Path(original['state_dir']) / 'policy-recovery' / 'intent.json'
+    if intent_path.exists():
+        intent = read_private(intent_path)
+        if (intent['command_digest'] != command_digest or intent['seal'] != seal):
+            raise ValueError('accepted policy recovery intent or sealed inputs changed')
+    else:
+        intent = {'command_id': supplied['command_id'], 'command_digest': command_digest,
+                  'seal': seal, 'state': 'accepted', 'preparation_attempts': [],
+                  'effective_spec': None, 'last_error': None}
+        write_private(intent_path, intent)
     # Keep the old finalization bytes before the resource manifest starts a new generation.
     archive = Path(original['state_dir']) / 'policy-recovery' / 'predecessor'
     for name in ('manifest.json', 'finalization.json'):
@@ -244,20 +300,32 @@ def recover(store, run_id, supplied):
                 raise ValueError('predecessor cleanup archive conflicts')
         else:
             write_private(target, read_private(source))
-    effective = _prepare(original, config)
+    try:
+        effective = _prepare(original, config, intent, intent_path)
+    except Exception as exc:
+        intent['last_error'] = str(exc)[:500]
+        write_private(intent_path, intent)
+        raise
     source_home = Path(original['state_dir']) / 'role-homes' / 'implement'
     copy_session_state(source_home, source_home.with_name('implement-policy-1'),
                        seal['session_id'], seal['session_state_digest'])
     broker = DeliveryBroker(store, effective)
     candidate = broker.candidate()
-    if any(candidate[k] != seal['candidate'][k] for k in (
-        'head', 'id', 'content_sha256', 'base_sha', 'environment_digest',
-    )) or digest(_remote(broker)) != seal['remote_digest']:
-        raise ValueError('preserved candidate or remote changed during preparation')
+    try:
+        if any(candidate[k] != seal['candidate'][k] for k in (
+            'head', 'id', 'content_sha256', 'base_sha', 'environment_digest',
+        )) or digest(_remote(broker)) != seal['remote_digest']:
+            raise ValueError('preserved candidate or remote changed during preparation')
+    except Exception as exc:
+        intent['last_error'] = str(exc)[:500]
+        write_private(intent_path, intent)
+        raise
     recovery = {
         'kind': 'execution_policy_recovery', 'state': state, 'seal': seal,
         'issue_evidence': seal['issue_evidence'],
         'effective_spec': effective, 'candidate': candidate, 'session_id': seal['session_id'],
+        'preparation_history': deepcopy(intent['preparation_attempts']),
+        'preparation_intent_digest': digest(intent),
         'config_sha256': supplied['config_sha256'], 'original_spec_digest': digest(original),
         'maximum_iteration': seal['iteration'] + supplied['additional_iterations'],
         'start_iteration': seal['iteration'] + 1,
@@ -307,6 +375,8 @@ def recover(store, run_id, supplied):
                      {'precheck_sha256': seal['precheck_sha256'], 'candidate_id': candidate['id']})
         db.execute('INSERT INTO delivery_commands VALUES (?,?,?,?)',
                    (supplied['command_id'], run_id, command_digest, canonical_json(response)))
+    intent.update(state='queued', last_error=None)
+    write_private(intent_path, intent)
     return response
 
 

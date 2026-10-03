@@ -134,7 +134,7 @@ def test_trusted_preparation_and_broker_check_compile_with_discovered_sdk(
 
 
 @pytest.mark.asyncio
-async def test_failed_final_readback_requests_blocked_reconciliation():
+async def test_failed_final_readback_preserves_coherent_pending_transition():
     controller = DeliveryWorkflow()
     controller.state = {'phase': 'delivered', 'execution_state': 'terminal', 'outcome': 'delivered',
                         'iteration': 0, 'revision': 1, 'cleanup': 'none', 'checks': {}}
@@ -147,15 +147,119 @@ async def test_failed_final_readback_requests_blocked_reconciliation():
         if name == 'delivery_terminal_tracker':
             requested.append(request['status'])
             return {'state': 'pending', 'pending': True, 'desired': request['status']}
-        assert request['outcome'] == 'blocked'
-        assert request['tracker']['desired'] == 'blocked'
+        assert request['outcome'] is None
+        assert request['phase'] == 'waiting_tracker'
+        assert request['tracker']['desired'] == 'in-review'
         return {}
 
     controller._activity = execute
     await controller._project({'resource_cleanup_version': 1, 'terminal_tracker_version': 1},
                               'delivered', 'final')
-    assert requested == ['in-review', 'blocked']
-    assert controller.state['outcome'] == 'blocked'
+    assert requested == ['in-review']
+    assert controller.state['outcome'] is None
+
+
+@pytest.mark.parametrize('status', ['blocked', 'in-review'])
+def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, monkeypatch,
+                                                              status):
+    import contextlib
+    import importlib.util
+    import io
+    import json
+    import subprocess
+    import sys
+
+    from devflow_temporal.delivery_activities import _tracker_sync
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    path, request = intake_fixture
+    config = DeliveryConfig.load(path)
+    repository = config.raw['repositories']['fixture']
+    repository.update(project_url='https://github.com/users/example/projects/1',
+                      assignee='example')
+    store = DeliveryStore(config)
+    store.submit(request)
+    spec = store.spec(request['run_id'])
+    monkeypatch.setattr('devflow_temporal.delivery_activities._context',
+                        lambda _spec: (store, None))
+    monkeypatch.setitem(sys.modules, 'state', store.state)
+    helper_spec = importlib.util.spec_from_file_location('github', config.helpers_dir / 'github.py')
+    helper = importlib.util.module_from_spec(helper_spec)
+    monkeypatch.setitem(sys.modules, 'github', helper)
+    helper_spec.loader.exec_module(helper)
+    reconciliation = importlib.util.spec_from_file_location('reconcile',
+                                                          config.helpers_dir / 'reconcile.py')
+    module = importlib.util.module_from_spec(reconciliation)
+    monkeypatch.setitem(sys.modules, 'reconcile', module)
+    reconciliation.loader.exec_module(module)
+    selected = {'host': 'github.com', 'url': repository['project_url'], 'id': 'project',
+                'field': 'field', 'option': 'option',
+                'status': 'Blocked' if status == 'blocked' else 'In review'}
+    item = {'id': 'item', 'project': {'id': 'project'},
+            'fieldValueByName': {'optionId': 'option', 'name': selected['status']}}
+    monkeypatch.setattr(helper, 'project', lambda *_args: selected)
+    monkeypatch.setattr(helper, 'view', lambda issue: {
+        'id': 'issue', 'url': issue, 'title': 'Fixture', 'state': 'OPEN',
+        'assignees': [{'login': 'example'}],
+    })
+    monkeypatch.setattr(helper, 'project_item', lambda *_args: item)
+    monkeypatch.setattr(helper, 'legacy_project_item', lambda *_args: item)
+    calls = []
+
+    def owning_cli(command, **_kwargs):
+        calls.append(command)
+        if 'audit' in command:
+            raise subprocess.TimeoutExpired(command, 120)
+        output, error = io.StringIO(), io.StringIO()
+        monkeypatch.setattr(sys, 'argv', command[1:])
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            code = helper.main()
+        return subprocess.CompletedProcess(command, code, output.getvalue(),
+                                           error.getvalue())
+
+    monkeypatch.setattr('devflow_temporal.delivery_activities.subprocess.run', owning_cli)
+    result = _tracker_sync(spec, status, release=True, terminal=True,
+                           reason='Observed gate failure')
+    assert result['state'] == 'consistent', result
+    assert len(calls) == 1 and '--release' in calls[0]
+    if status == 'blocked':
+        assert '--reason' in calls[0]
+    with store._connect() as db:
+        assert store.state.claim_for(db, spec['work_id']) is None
+        intent = db.execute('SELECT * FROM reconcile_intents').fetchone()
+        assert intent['state'] == 'acknowledged'
+        assert json.loads(intent['payload'])['status'] == status
+        work = store.state.row(db, 'works', spec['work_id'])
+        assert json.loads(work['details'])['github']['sync']['status'] == status
+
+
+def test_real_pytest_numbered_fixture_artifacts_survive_navigation_links(tmp_path):
+    import subprocess
+    import sys
+
+    from devflow_temporal.delivery_check_evidence import retain_artifacts, verify_manifest
+
+    script = tmp_path / 'test_real_artifacts.py'
+    script.write_text(
+        'import pytest\n@pytest.mark.parametrize("case",range(8))\n'
+        'def test_case(case,tmp_path,tmp_path_factory):\n'
+        ' root=tmp_path_factory.mktemp("pagination-boundaries")\n'
+        ' for index in range(6):\n'
+        '  (root/f"{index}.pdf").write_bytes(b"synthetic PDF")\n'
+        '  (tmp_path/f"{index}.png").write_bytes(b"synthetic page PNG")\n'
+        ' (root/"measurements.json").write_text("{}")\n'
+    )
+    folder = tmp_path / 'check'
+    folder.mkdir()
+    subprocess.run([sys.executable, '-m', 'pytest', str(script), '-q',
+                    '--basetemp', str(folder / 'pytest-artifacts')],
+                   check=True, capture_output=True)
+    assert any(path.is_symlink() for path in (folder / 'pytest-artifacts').rglob('*'))
+    ref = retain_artifacts(folder, {'id': 'candidate'})
+    manifest = verify_manifest(ref, 'candidate', tmp_path)
+    assert manifest['count'] == 104
+    assert sum(item['relative_path'].endswith('.pdf') for item in manifest['artifacts']) == 48
+    assert sum(item['relative_path'].endswith('.png') for item in manifest['artifacts']) == 48
 
 
 def test_retained_artifact_manifest_rejects_mutation_and_links(tmp_path):

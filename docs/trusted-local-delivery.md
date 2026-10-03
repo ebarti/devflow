@@ -28,13 +28,14 @@ New terminal runs synchronize tracker status and read back assignment, Project
 and claim through the existing tracker helper. Blocked/cancelled outcomes select
 Blocked; delivered outcomes select In review. Claims release only after proven
 process and resource cleanup. Pending/failed readback replaces earlier tracker
-success in the projection, and a pending delivered tracker cannot establish
+success in the projection, and a pending final tracker cannot establish
 successful delivery. Older inputs without `terminal_tracker_version` retain
 legacy replay behavior.
 
-The terminal tracker activity uses the owning `_tracker_sync` helper. A failed
-final In review readback cannot leave a Blocked outcome with In review desired
-state: the controller records and reads back Blocked instead. Its latest pending
+The terminal tracker activity uses the owning `_tracker_sync` helper. Its terminal mode validates the owning helper's live issue/assignee/Project readback and atomically acknowledged intent before
+claim release, rather than adding a release-breaking remote audit afterward.
+A genuinely uncertain final In review result remains `waiting_tracker` with no
+successful outcome; its desired transition stays In review. Its latest pending
 readback replaces any earlier `consistent` projection. A cancellation accepted
 during the final tracker transition still wins before delivery is assigned.
 
@@ -94,6 +95,15 @@ independent verification, required CI and terminal reconciliation. It does not
 blindly call implementation or turn historical failures into a pass. The
 endpoint remains `published_unmerged`.
 
+A private command/preparation intent is durable before any new probe. Preparation
+uses at most two separately owned resource generations, finalized independently
+of the predecessor; neither a failed cache-miss probe nor unavailable subsequent
+remote readback can rewrite its cleanup manifest or recreate its transient root.
+A stable-ID retry observes interrupted probe ownership/cleanup before any new
+probe, preserves failed logs, and reuses the new proof when already established.
+Unknown probe cleanup blocks additional execution. The intent/failures are
+publicly indexed, and prepared history is frozen in the eventual grant.
+
 Admission atomically seals one durable grant, reacquires the released claim for
 the same managed owner, and queues a new Temporal execution for the same run.
 The original failure remains in the event timeline and recovery summary. A
@@ -121,8 +131,9 @@ contract must fail the gate and be corrected by the managed source repair.
 
 Before final cleanup, the broker retains owned regular PDF, PNG, HTML, JSON,
 XML and TXT outputs and writes a candidate-bound SHA-256 manifest. Limits are
-4096 files, 50 MiB per file and 1 GiB per check; links and foreign or unsupported
-file identities reject retention. Failed checks also retain their outputs.
+4096 files, 50 MiB per file and 1 GiB per check; linked files and foreign or unsupported
+file identities reject retention. Directory links, including pytest's numbered-fixture navigation links, are pruned without following them; owned
+numbered directories and all their regular artifacts are visited directly. Failed checks also retain their outputs.
 Independent verification receives these checked manifest references and must
 inspect the required physical pages and measurements. Test exit status alone
 does not establish visual QA.

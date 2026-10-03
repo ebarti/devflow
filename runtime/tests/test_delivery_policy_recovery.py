@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 @pytest.fixture
 def preserved(native_configuration, monkeypatch):
+    if sys.platform != 'darwin':
+        pytest.skip('actual native macOS preparation and stopped-process evidence required')
     config, request = native_configuration
     config.raw['max_repairs'] = 2
     config.path.write_text(json.dumps(config.raw))
@@ -256,6 +259,54 @@ def test_policy_config_change_is_only_explicit_trust_mode(preserved):
     with pytest.raises(ValueError, match='only execution_mode'):
         amended_config(original, Path(payload['config_path']),
                        hashlib.sha256(Path(payload['config_path']).read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize('failure', ['prepare', 'remote'])
+def test_policy_preparation_failure_preserves_predecessor_and_same_command_retry(
+    preserved, monkeypatch, failure,
+):
+    from devflow_temporal import delivery_native_preparation, delivery_policy_recovery
+
+    store, original, payload, _ = preserved
+    resources = RunResources(original)
+    before = {name: (resources.root / name).read_bytes()
+              for name in ('manifest.json', 'finalization.json')}
+    measure, remote = delivery_native_preparation._measure, delivery_policy_recovery._remote
+    calls = {'prepare': 0, 'remote': 0}
+
+    def measured(*args, **kwargs):
+        calls['prepare'] += 1
+        proof = measure(*args, **kwargs)
+        if failure == 'prepare' and calls['prepare'] == 1:
+            raise RuntimeError('interrupted before trusted proof persistence')
+        return proof
+
+    def readback(broker):
+        calls['remote'] += 1
+        if failure == 'remote' and calls['remote'] == 2:
+            raise RuntimeError('post-preparation GitHub readback temporarily unavailable')
+        return remote(broker)
+
+    monkeypatch.setattr(delivery_native_preparation, '_measure', measured)
+    monkeypatch.setattr(delivery_policy_recovery, '_remote', readback)
+    with pytest.raises(RuntimeError):
+        store.recover_execution(original['run_id'], payload)
+    intent_path = Path(original['state_dir']) / 'policy-recovery' / 'intent.json'
+    intent = read_private(intent_path)
+    assert intent['command_id'] == payload['command_id']
+    assert intent['last_error']
+    assert intent['preparation_attempts'][0]['cleanup']['state'] == 'confirmed'
+    assert all((resources.root / name).read_bytes() == value for name, value in before.items())
+    assert not (Path(original['state_dir']) / 'transient').exists()
+    assert 'execution-policy-recovery-intent' in {
+        item['id'] for item in store.evidence_index(original['run_id'])}
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
+        assert store.state.claim_for(db, original['work_id']) is None
+    queued = store.recover_execution(original['run_id'], payload)
+    assert store.recover_execution(original['run_id'], payload) == queued
+    assert calls['prepare'] == (2 if failure == 'prepare' else 1)
+    assert all((resources.root / name).read_bytes() == value for name, value in before.items())
 
 
 @pytest.mark.asyncio

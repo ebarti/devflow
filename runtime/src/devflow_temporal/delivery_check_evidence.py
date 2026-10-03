@@ -17,8 +17,10 @@ def retain_artifacts(folder: Path, candidate: dict) -> dict:
     files = []
     total = 0
     for base, dirs, names in os.walk(source, followlinks=False):
-        if any(Path(base, name).is_symlink() for name in dirs):
-            raise ValueError('synthetic check artifact directory is linked')
+        # pytest creates <prefix>current directory links beside its numbered
+        # fixture roots. Prune links without following them; their owned target
+        # directories are visited directly and their regular outputs retained.
+        dirs[:] = [name for name in dirs if not Path(base, name).is_symlink()]
         for name in sorted(names):
             path = Path(base, name)
             if path.suffix.lower() not in EXTENSIONS:

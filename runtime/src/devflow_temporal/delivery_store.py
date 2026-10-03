@@ -3049,6 +3049,7 @@ class DeliveryStore:
                 "authorized_through_iteration": recovery["maximum_iteration"],
                 "preserved_checks": recovery["state"]["checks"],
                 "preserved_error": recovery["state"]["error"],
+                "preparation_history": recovery.get("preparation_history", []),
             } if recovery and recovery.get("kind") == "execution_policy_recovery" else None,
             "preparation": spec.get("preparation"),
             "checks": checks,
@@ -3067,6 +3068,11 @@ class DeliveryStore:
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
+        policy_intent = root / "policy-recovery" / "intent.json"
+        if policy_intent.is_file() and not policy_intent.is_symlink():
+            indexed.append({"id": "execution-policy-recovery-intent",
+                            "label": "Policy recovery preparation intent and retained failures",
+                            "path": policy_intent, "limit": 2 * 1024 * 1024})
         with self._connect() as db:
             attempts = db.execute(
                 """SELECT job_key,role,iteration,process_identity,result_json

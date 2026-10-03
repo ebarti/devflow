@@ -78,9 +78,9 @@ def native_identity(spec: dict) -> dict:
     }
 
 
-def _measure(spec: dict, identity: dict) -> dict:
+def _measure(spec: dict, identity: dict, *, state_root: Path | None = None) -> dict:
     if identity.get("execution_mode") == "trusted-local":
-        return _measure_trusted(spec, identity)
+        return _measure_trusted(spec, identity, state_root=state_root)
     root = RunResources(spec).scratch("preparation", "boundary")
     workspace, home, codex_home = root / "workspace", root / "home", root / "private-codex"
     scratch = home / "tmp"
@@ -227,7 +227,7 @@ def _measure(spec: dict, identity: dict) -> dict:
     }
 
 
-def _measure_trusted(spec: dict, identity: dict) -> dict:
+def _measure_trusted(spec: dict, identity: dict, *, state_root: Path | None = None) -> dict:
     """Measure the actual full-host launcher without asserting hostile-code isolation."""
     root = RunResources(spec).scratch("preparation", "trusted-local")
     workspace, home, codex_home = root / "workspace", root / "home", root / "codex"
@@ -267,7 +267,7 @@ def _measure_trusted(spec: dict, identity: dict) -> dict:
             "native_teardown_scope": probe["native_teardown_scope"],
         },
     }
-    _validate(proof, identity, Path(spec["state_dir"]).parents[1])
+    _validate(proof, identity, state_root or Path(spec["state_dir"]).parents[1])
     return proof
 
 

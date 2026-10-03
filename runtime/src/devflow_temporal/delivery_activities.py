@@ -344,7 +344,8 @@ async def delivery_ci(request: dict[str, Any]) -> dict[str, Any]:
     return await broker.checks(request["pull_request"])
 
 
-def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[str, Any]:
+def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
+                  terminal: bool = False, reason: str | None = None) -> dict[str, Any]:
     store, _ = _context(spec)
     repository = store.config.raw["repositories"][spec["repository_key"]]
     project = repository.get("project_url")
@@ -380,6 +381,8 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
         "--status",
         status,
     ]
+    if status == "blocked":
+        command.extend(["--reason", reason or "Managed delivery stopped at a terminal boundary"])
     if release:
         command.append("--release")
     result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=120)
@@ -390,6 +393,33 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
             "pending": True,
             "reason": (result.stderr or result.stdout).strip()[:500],
         }
+    if terminal:
+        # The owning helper already performs live issue/assignee/Project readback
+        # and acknowledges that exact intent atomically before releasing ownership.
+        # A second remote audit after release cannot safely change the transition.
+        acknowledged = json.loads(result.stdout)
+        with store._connect() as db:
+            work = store.state.row(db, "works", spec["work_id"])
+            sync = json.loads(work["details"] or "{}").get("github", {}).get("sync", {})
+            intent = db.execute("SELECT * FROM reconcile_intents WHERE work_id=?",
+                                (spec["work_id"],)).fetchone()
+            claim = store.state.claim_for(db, spec["work_id"])
+        payload = json.loads(intent["payload"]) if intent else {}
+        if (not intent or intent["state"] != "acknowledged" or intent["owner"] != owner
+                or payload.get("status") != status or bool(payload.get("release")) != release
+                or sync.get("status") != status or sync.get("issue_state") != "OPEN"
+                or sync.get("project") != project or not sync.get("readback_at")
+                or acknowledged.get("status") != status
+                or acknowledged.get("assignee") != sync.get("assignee")
+                or acknowledged.get("project_status") != sync.get("project_status")
+                or bool(claim) != (not release)
+                or (claim is not None and claim["owner"] != owner)):
+            return {"state": "pending", "pending": True, "desired": desired,
+                    "reason": "terminal helper acknowledgement changed", "readback_at": _now()}
+        return {"state": "consistent", "pending": False, "desired": desired,
+                "observed": {"state": "consistent", "claim": claim, "expected": sync,
+                             "source": "owning helper live readback and acknowledged intent"},
+                "readback_at": sync["readback_at"]}
     audit = subprocess.run(
         [
             sys.executable,
@@ -456,6 +486,7 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
     try:
         return await asyncio.to_thread(
             _tracker_sync, request["spec"], request["status"], release=request["release"],
+            terminal=True, reason=request.get("reason"),
         )
     except Exception as exc:
         return {
