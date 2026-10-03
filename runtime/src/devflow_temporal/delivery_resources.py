@@ -279,6 +279,8 @@ class RunResources:
                     self._allowed(path, entry["kind"], finalizing=True)
                     if not os.path.lexists(path):
                         receipt.update(state="already_absent")
+                        if entry.get("clean_base_removal"):
+                            receipt["clean_base_removal"] = entry["clean_base_removal"]
                     elif uncertain:
                         receipt.update(
                             state="retained",
@@ -291,6 +293,18 @@ class RunResources:
                         if reason:
                             receipt.update(state="retained", reason=reason)
                         else:
+                            if entry["kind"] == "checkout" and outcome == "cancelled":
+                                from .candidate import candidate_for
+
+                                candidate = candidate_for(path)
+                                if candidate["head"] != self.spec["base_sha"]:
+                                    raise ValueError("cancelled removable source is not the base")
+                                # Persist before removal, so a lost completion can
+                                # authenticate the absent clean source on retry.
+                                proof = {"candidate": candidate, "base_sha": self.spec["base_sha"],
+                                         "outcome": outcome}
+                                entry["clean_base_removal"] = proof
+                                receipt["clean_base_removal"] = proof
                             entry["state"] = "removing"
                             write_private(self.manifest, manifest)
                             subprocess.run(

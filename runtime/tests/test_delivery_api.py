@@ -77,6 +77,50 @@ async def test_idle_dispatch_reports_actual_temporal_health(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_public_policy_recovery_requires_csrf_and_reports_unavailable_readback(
+    api_fixture, monkeypatch,
+):
+    path, _ = api_fixture
+    app = create_app(path)
+    store = app.state.delivery.store
+    calls = []
+
+    def preflight(run_id):
+        calls.append(('read', run_id))
+        return {'precheck_sha256': 'a' * 64}
+
+    def recover(run_id, payload):
+        calls.append(('write', run_id, payload))
+        return {'phase': 'execution_policy_recovery_queued'}
+
+    monkeypatch.setattr(store, 'policy_recovery_precheck', preflight)
+    monkeypatch.setattr(store, 'recover_execution', recover)
+    transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
+    async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1:18770') as browser:
+        assert (await browser.get('/api/runs/stopped/recovery-preflight')).json() == {
+            'precheck_sha256': 'a' * 64,
+        }
+        payload = {'command_id': 'same-grant'}
+        assert (await browser.post('/api/runs/stopped/recover-execution', json=payload,
+                                  headers={'Origin': 'http://127.0.0.1:18770'})).status_code == 403
+        assert calls == [('read', 'stopped')]
+        session = await browser.get('/api/session')
+        headers = {'Origin': 'http://127.0.0.1:18770',
+                   'X-Devflow-CSRF': session.json()['csrf_token']}
+        response = await browser.post('/api/runs/stopped/recover-execution',
+                                      json=payload, headers=headers)
+        assert response.json()['phase'] == 'execution_policy_recovery_queued'
+        assert calls[-1] == ('write', 'stopped', payload)
+
+        def unavailable(_run_id):
+            raise subprocess.TimeoutExpired(['git', 'ls-remote'], 30)
+
+        monkeypatch.setattr(store, 'policy_recovery_precheck', unavailable)
+        assert (await browser.get('/api/runs/stopped/recovery-preflight')).status_code == 409
+        assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks])
 async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch):
     started = threading.Event()

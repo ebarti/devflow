@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import importlib.util
 import json
@@ -217,6 +218,15 @@ class DeliveryStore:
                 )"""
             )
             db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_policy_recoveries (
+                    run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+                    command_id TEXT NOT NULL UNIQUE,
+                    original_spec_digest TEXT NOT NULL,
+                    recovery_digest TEXT NOT NULL,
+                    maximum_iteration INTEGER NOT NULL
+                )"""
+            )
+            db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_repair_grants (
                     run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
                     command_id TEXT NOT NULL UNIQUE,
@@ -332,6 +342,16 @@ class DeliveryStore:
                     authorized_at TEXT NOT NULL
                 )"""
             )
+
+    def policy_recovery_precheck(self, run_id: str) -> dict:
+        from .delivery_policy_recovery import precheck
+
+        return precheck(self, run_id)[0]
+
+    def recover_execution(self, run_id: str, supplied: dict) -> dict:
+        from .delivery_policy_recovery import recover
+
+        return recover(self, run_id, supplied)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -2332,6 +2352,8 @@ class DeliveryStore:
     @staticmethod
     def _scope_recovery(recovery: dict[str, Any] | None) -> dict[str, Any] | None:
         """Read the sole native scope amendment without restoring retired execution."""
+        while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+            recovery = recovery["original_recovery"]
         if isinstance(recovery, dict) and recovery.get("kind") == "scope_amendment":
             return recovery
         return None
@@ -2351,6 +2373,15 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+                recovery = recovery["original_recovery"]
+            if isinstance(recovery, dict) and recovery.get("kind") == "execution_policy_recovery":
+                from .delivery_policy_recovery import effective_spec
+
+                grant = db.execute(
+                    "SELECT * FROM delivery_policy_recoveries WHERE run_id=?", (run_id,),
+                ).fetchone()
+                return effective_spec(self, original, recovery, grant)
             scope = self._scope_recovery(recovery)
             historical = (
                 original.get("provider") == "codex"
@@ -2420,6 +2451,7 @@ class DeliveryStore:
                 "repair_continuation_queued",
                 "repair_prelaunch_retry_queued",
                 "scope_amendment_queued",
+                "terminal_tracker_recovery_queued",
             }:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
@@ -2431,7 +2463,9 @@ class DeliveryStore:
                     )
                 return
             new_phase = (
-                "publishing"
+                "waiting_tracker"
+                if row[1] == "terminal_tracker_recovery_queued" and accepted
+                else "publishing"
                 if row[1] == "publication_recovery_queued" and accepted
                 else "repair"
                 if row[1] in {
@@ -2443,7 +2477,9 @@ class DeliveryStore:
                 if accepted
                 else row[1]
             )
-            new_state = "running" if accepted else "pending_temporal"
+            new_state = "waiting_tracker" if accepted and new_phase == "waiting_tracker" else (
+                "running" if accepted else "pending_temporal"
+            )
             revision = row[0] + 1
             db.execute(
                 """UPDATE delivery_runs SET phase=?,execution_state=?,revision=?,updated_at=?
@@ -2533,7 +2569,9 @@ class DeliveryStore:
                 if intake is not None else row["intake_json"],
                 "outcome": outcome if outcome is not None else row["outcome"],
                 "cleanup": cleanup if cleanup is not None else row["cleanup"],
-                "error": error if error is not None else row["error"],
+                "error": error if error is not None or event_type == "delivered"
+                or (checks or {}).get("terminal_tracker_checkpoint", {}).get("state") == "confirmed"
+                else row["error"],
                 "updated_at": _now(),
             }
             assignments = ",".join(f"{field}=?" for field in values)
@@ -2825,9 +2863,12 @@ class DeliveryStore:
     def _compact(row: dict[str, Any]) -> dict[str, Any]:
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+            recovery = recovery["original_recovery"]
         effective = (
             recovery.get("effective_spec", spec)
-            if isinstance(recovery, dict) and recovery.get("kind") == "scope_amendment"
+            if isinstance(recovery, dict)
+            and recovery.get("kind") in {"scope_amendment", "execution_policy_recovery"}
             else spec
         )
         if not isinstance(effective, dict):
@@ -2870,8 +2911,13 @@ class DeliveryStore:
                 )
             ]
         compact = self._compact(row)
-        spec = self.spec(run_id)
+        spec = self.effective_spec(run_id)
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        terminal_recovery = (
+            recovery if recovery and recovery.get("kind") == "terminal_tracker_recovery" else None
+        )
+        while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+            recovery = recovery["original_recovery"]
         scope_recovery = self._scope_recovery(recovery)
         scope_amendment = (
             {
@@ -3012,6 +3058,27 @@ class DeliveryStore:
             else None,
             "pull_request": json.loads(row["pr_json"]) if row["pr_json"] else None,
             "scope_amendment": scope_amendment,
+            "terminal_tracker_recovery": {
+                "reconciliation_only": True,
+                "command_id": terminal_recovery["command_id"],
+                "predecessor_workflow_id": terminal_recovery["closed"]["workflow_id"],
+                "predecessor_execution_run_id": terminal_recovery["closed"]["execution_run_id"],
+                "predecessor_status": terminal_recovery["closed"]["status"],
+                "closed_history_sha256": terminal_recovery["closed"]["history_sha256"],
+                "spec_sha256": terminal_recovery["spec_sha256"],
+                "seal": terminal_recovery["seal"],
+            } if terminal_recovery else None,
+            "execution_policy_recovery": {
+                "precheck_sha256": recovery["seal"]["precheck_sha256"],
+                "original_mode": "native-profile", "effective_mode": "trusted-local",
+                "predecessor_workflow_id": recovery["predecessor_workflow_id"],
+                "predecessor_execution_run_id": recovery["predecessor_execution_run_id"],
+                "session_id": recovery["session_id"],
+                "authorized_through_iteration": recovery["maximum_iteration"],
+                "preserved_checks": recovery["state"]["checks"],
+                "preserved_error": recovery["state"]["error"],
+                "preparation_history": recovery.get("preparation_history", []),
+            } if recovery and recovery.get("kind") == "execution_policy_recovery" else None,
             "preparation": spec.get("preparation"),
             "checks": checks,
             "tracker": tracker,
@@ -3029,6 +3096,11 @@ class DeliveryStore:
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
+        policy_intent = root / "policy-recovery" / "intent.json"
+        if policy_intent.is_file() and not policy_intent.is_symlink():
+            indexed.append({"id": "execution-policy-recovery-intent",
+                            "label": "Policy recovery preparation intent and retained failures",
+                            "path": policy_intent, "limit": 2 * 1024 * 1024})
         with self._connect() as db:
             attempts = db.execute(
                 """SELECT job_key,role,iteration,process_identity,result_json
@@ -3081,6 +3153,25 @@ class DeliveryStore:
                     "limit": 20 * 1024 * 1024 if path.name == "container.log" else 1024 * 1024,
                 }
             )
+        for stage in ("local", "prepublish"):
+            for result in details.get("checks", {}).get(stage, {}).get("results", []):
+                artifact = result.get("artifacts")
+                if isinstance(artifact, dict):
+                    from .delivery_check_evidence import verify_manifest
+
+                    manifest = verify_manifest(artifact, artifact["candidate_id"], root)
+                    for index, item in enumerate(manifest["artifacts"]):
+                        indexed.append({
+                            "id": f"artifact-{stage}-{details['iteration']}-{result['id']}-{index}",
+                            "label": item["relative_path"], "path": Path(item["path"]),
+                            "expected_sha256": item["sha256"], "limit": 50 * 1024 * 1024,
+                        })
+                    indexed.append({
+                        "id": f"artifacts-{stage}-{details['iteration']}-{result['id']}",
+                        "label": f"Synthetic artifacts: {result['id']}",
+                        "path": Path(artifact["path"]),
+                        "expected_sha256": artifact["sha256"], "limit": 4 * 1024 * 1024,
+                    })
         for folder in sorted((root / "browser-qa").glob("[0-9]*")):
             if not folder.name.isdecimal():
                 continue
@@ -3202,5 +3293,11 @@ class DeliveryStore:
             "id": evidence_id,
             "sha256": observed_sha256,
             "bytes": len(data),
-            "text": data.decode("utf-8", errors="replace"),
+            "text": data.decode("utf-8", errors="replace")
+            if path.suffix not in {".png", ".pdf"}
+            else "Binary synthetic artifact; use content_url",
+            **({"base64": base64.b64encode(data).decode(),
+                "media_type": "image/png" if path.suffix == ".png" else "application/pdf"}
+               if path.suffix in {".png", ".pdf"} else {}),
+            "content_url": f"/api/runs/{run_id}/evidence/{evidence_id}/content",
         }

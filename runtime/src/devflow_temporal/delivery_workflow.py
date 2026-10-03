@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from copy import deepcopy
+from datetime import datetime, timedelta
 from typing import Any
 
 from temporalio import workflow
@@ -72,6 +73,8 @@ class DeliveryWorkflow:
         self.state: dict[str, Any] = {}
         self.cancel_requested = False
         self.decision_answer: str | dict[str, Any] | None = None
+        self.tracker_retry_requested = False
+        self.terminal_reconciliation_only = False
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
         automatic_preparation = (
@@ -106,10 +109,14 @@ class DeliveryWorkflow:
             }
         else:
             options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
+        timeout = timedelta(hours=hours)
+        if name in {"delivery_terminal_tracker", "delivery_terminal_preflight"}:
+            timeout = timedelta(seconds=min(request.get("timeout_seconds", 180), 180))
+            options["schedule_to_close_timeout"] = timeout
         return await workflow.execute_activity(
             name,
             request,
-            start_to_close_timeout=timedelta(hours=hours),
+            start_to_close_timeout=timeout,
             **options,
         )
 
@@ -164,6 +171,7 @@ class DeliveryWorkflow:
         if (
             event in {"delivered", "blocked", "cancelled"}
             and spec.get("resource_cleanup_version") == 1
+            and not self.terminal_reconciliation_only
         ):
             try:
                 receipt = await self._activity(
@@ -192,6 +200,26 @@ class DeliveryWorkflow:
                         error="resource cleanup is unknown",
                     )
                     event, message = "blocked", "Resource cleanup requires recovery"
+        if (event in {"delivered", "blocked", "cancelled"}
+                and spec.get("terminal_tracker_version") == 1
+                and not self.terminal_reconciliation_only):
+            receipt = self.state["checks"].get("resource_cleanup", {})
+            release = receipt.get("state") == "confirmed" and (
+                receipt.get("process_cleanup") == "observed-native-confirmed"
+                and receipt.get("resource_cleanup") == "confirmed"
+            )
+            checkpoint = {
+                "event": event, "message": message, "phase": self.state["phase"],
+                "execution_state": self.state["execution_state"],
+                "outcome": self.state["outcome"], "error": self.state.get("error"),
+                "status": "in-review" if event == "delivered" else "blocked",
+                "release": release, "reason": self.state.get("error") or message,
+                "cycles": 0, "attempts": 0, "waiting": False,
+                "deadline": (workflow.now() + timedelta(minutes=10)).isoformat(),
+            }
+            self.state["checks"]["terminal_tracker_checkpoint"] = checkpoint
+            if not await self._finish_terminal_tracker(spec, checkpoint):
+                event, message = "tracker_deadline", "Terminal readback deadline requires recovery"
         await self._activity(
             "delivery_project",
             {
@@ -215,6 +243,55 @@ class DeliveryWorkflow:
                 "key": f"{event}:{self.state['iteration']}:{self.state['revision']}",
             },
         )
+
+    async def _finish_terminal_tracker(self, spec: dict[str, Any], checkpoint: dict) -> bool:
+        """Keep the original execution open; each reconciliation cycle is finite."""
+        while True:
+            checkpoint["cycles"] += 1
+            for attempt in range(3):
+                remaining = datetime.fromisoformat(checkpoint["deadline"]) - workflow.now()
+                if remaining.total_seconds() <= 0:
+                    checkpoint.update(state="pending", waiting=False, closed=True)
+                    return False
+                checkpoint.update(attempts=checkpoint["attempts"] + 1, waiting=False)
+                try:
+                    self.state["tracker"] = await self._activity(
+                        "delivery_terminal_tracker",
+                        {"spec": spec, "status": checkpoint["status"],
+                         "release": checkpoint["release"], "reason": checkpoint["reason"],
+                         "candidate": self.state.get("candidate"),
+                         "pull_request": self.state.get("pull_request"),
+                         "timeout_seconds": max(1, int(remaining.total_seconds()))},
+                    )
+                except Exception as exc:
+                    self.state["tracker"] = {"state": "pending", "pending": True,
+                                             "reason": type(exc).__name__}
+                if self.state["tracker"].get("state") == "consistent":
+                    checkpoint["state"] = "confirmed"
+                    self.state.update({key: checkpoint[key] for key in (
+                        "phase", "execution_state", "outcome", "error",
+                    )})
+                    self.state["revision"] += 1
+                    return True
+                self.state.update(phase="waiting_tracker", execution_state="waiting_tracker",
+                                  outcome=None, error="terminal tracker readback is pending")
+                self.state["revision"] += 1
+                await self._project(spec, "tracker_pending",
+                                    "Terminal tracker reconciliation is pending")
+                if attempt < 2:
+                    await workflow.sleep(timedelta(seconds=2 ** (attempt + 1)))
+            checkpoint.update(state="pending", waiting=True)
+            self.state["revision"] += 1
+            await self._project(spec, "tracker_retry_required",
+                                "Tracker readback exhausted; reconcile-tracker can resume it")
+            remaining = datetime.fromisoformat(checkpoint["deadline"]) - workflow.now()
+            try:
+                await workflow.wait_condition(lambda: self.tracker_retry_requested,
+                                              timeout=max(remaining, timedelta()))
+            except TimeoutError:
+                checkpoint.update(state="pending", waiting=False, closed=True)
+                return False
+            self.tracker_retry_requested = False
 
     async def _stop(self, spec: dict[str, Any], reason: str) -> dict[str, Any]:
         if any(
@@ -522,6 +599,10 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if recovery is not None:
+            if recovery.get("kind") == "terminal_tracker_recovery":
+                return await self._resume_terminal_tracker(spec, recovery)
+            if recovery.get("kind") == "execution_policy_recovery":
+                return await self._resume_policy(spec, recovery)
             if recovery.get("kind") == "scope_amendment":
                 return await self._resume_scope(spec, recovery)
             if recovery.get("kind") in {"repair_continuation", "repair_prelaunch_retry"}:
@@ -613,6 +694,34 @@ class DeliveryWorkflow:
             recovery=None,
         )
 
+    async def _resume_terminal_tracker(self, spec, recovery):
+        self.terminal_reconciliation_only = True
+        self.state = deepcopy(recovery["state"])
+        self.state.update(phase="waiting_tracker", execution_state="waiting_tracker",
+                          outcome=None, error="terminal tracker readback is pending")
+        self.state["checks"]["terminal_tracker_checkpoint"]["waiting"] = False
+        try:
+            await self._activity("delivery_terminal_preflight",
+                                 {"spec": spec, "recovery": recovery})
+        except Exception as exc:
+            self.state["error"] = "terminal recovery preflight conflicted: " + type(exc).__name__
+            self.state["checks"]["terminal_tracker_checkpoint"]["closed"] = True
+            self.state["revision"] += 1
+            await self._project(spec, "terminal_recovery_conflict", self.state["error"])
+            return self.state
+        checkpoint = self.state["checks"]["terminal_tracker_checkpoint"]
+        checkpoint.update(deadline=(workflow.now() + timedelta(minutes=10)).isoformat(),
+                          waiting=False, closed=False)
+        self.state["revision"] += 1
+        await self._project(spec, "terminal_recovery_started",
+                            "Resuming only frozen terminal readback")
+        confirmed = await self._finish_terminal_tracker(spec, checkpoint)
+        self.state["revision"] += 1
+        await self._project(spec, checkpoint["event"] if confirmed else "tracker_deadline",
+                            checkpoint["message"] if confirmed
+                            else "Terminal readback deadline expired")
+        return self.state
+
     async def _resume_publication(
         self, spec: dict[str, Any], recovery: dict[str, Any]
     ) -> dict[str, Any]:
@@ -628,13 +737,14 @@ class DeliveryWorkflow:
         ):
             raise ValueError("publication checkpoint is not a finished implementer")
         self.state = {
-            **previous,
+            **deepcopy(previous),
             "phase": "publishing",
             "execution_state": "running",
             "outcome": None,
             "error": None,
             "cleanup": "none",
         }
+        self.state.get("checks", {}).pop("terminal_tracker_checkpoint", None)
         self.state["revision"] += 1
         await self._project(
             spec,
@@ -716,13 +826,14 @@ class DeliveryWorkflow:
         ):
             raise ValueError("repair continuation changed the original grant")
         self.state = {
-            **previous,
+            **deepcopy(previous),
             "phase": "repair_preflight",
             "execution_state": "running",
             "outcome": None,
             "error": None,
             "cleanup": "none",
         }
+        self.state.get("checks", {}).pop("terminal_tracker_checkpoint", None)
         self.state["revision"] += 1
         await self._project(
             spec,
@@ -787,6 +898,44 @@ class DeliveryWorkflow:
             attempt_generation=1 if prelaunch_retry else 0,
         )
 
+    async def _resume_policy(
+        self, spec: dict[str, Any], recovery: dict[str, Any],
+    ) -> dict[str, Any]:
+        previous = recovery["state"]
+        if (recovery.get("effective_spec") != spec
+                or previous.get("run_id") != spec["run_id"]
+                or previous.get("outcome") != "blocked"
+                or recovery["start_iteration"] != previous["iteration"] + 1
+                or not recovery["start_iteration"] <= recovery["maximum_iteration"]
+                <= previous["iteration"] + 2):
+            raise ValueError("policy recovery changed its bounded closed checkpoint")
+        self.state = {**previous, "candidate": recovery["candidate"], "checks": {},
+                      "tracker": {}, "phase": "repair_preflight", "execution_state": "running",
+                      "outcome": None, "error": None, "cleanup": "none"}
+        self.state["revision"] += 1
+        await self._project(
+            spec, "policy_recovery_started", "Revalidating preserved candidate authority"
+        )
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        tracker = await self._activity("delivery_tracker_start", {"spec": spec,
+                                                                "repair_continuation": True})
+        self.state["tracker"] = tracker
+        if self.cancel_requested:
+            return await self._cancelled(spec)
+        if tracker.get("state") != "consistent":
+            return await self._stop(
+                spec, "policy recovery tracker readback is pending or conflicting"
+            )
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        return await self._run_iterations(
+            spec, start_iteration=recovery["start_iteration"],
+            prior_implementer_session=recovery["session_id"], repair_findings=[],
+            operator_brief=recovery["issue_evidence"], continuation=None, recovery=None,
+            authorized_max_iteration=recovery["maximum_iteration"], resume_prechecks=True,
+        )
+
     async def _resume_scope(
         self, spec: dict[str, Any], recovery: dict[str, Any]
     ) -> dict[str, Any]:
@@ -831,7 +980,7 @@ class DeliveryWorkflow:
         ):
             raise ValueError("scope amendment changed the closed implementation authority")
         self.state = {
-            **previous,
+            **deepcopy(previous),
             "candidate": amended,
             "candidate_revision": previous["candidate_revision"] + 1,
             "phase": "repair_preflight",
@@ -840,6 +989,7 @@ class DeliveryWorkflow:
             "error": None,
             "cleanup": "none",
         }
+        self.state.get("checks", {}).pop("terminal_tracker_checkpoint", None)
         self.state["revision"] += 1
         await self._project(
             spec, "scope_amendment_started",
@@ -1167,6 +1317,9 @@ class DeliveryWorkflow:
                             "findings": [acceptance_note] if acceptance_note else [],
                             "resume_session": None,
                             "qa_evidence": qa_evidence if role == "verify" else None,
+                            **({"check_evidence": self.state["checks"].get("local")}
+                               if role == "verify"
+                               and spec["policy"].get("host_sandbox") == "trusted-local" else {}),
                         },
                     )
                 except Exception as exc:
@@ -1214,17 +1367,22 @@ class DeliveryWorkflow:
             self.state["phase"] = "tracker"
             self.state["revision"] += 1
             await self._project(spec, "tracker_started", "Reconciling issue and claim")
-            try:
-                tracker = await self._activity("delivery_tracker", {"spec": spec, "pr": published})
-            except Exception as exc:
-                return await self._stop(
-                    spec, f"tracker synchronization pending: {type(exc).__name__}"
-                )
-            self.state["tracker"] = tracker
+            if spec.get("terminal_tracker_version") != 1:
+                try:
+                    tracker = await self._activity(
+                        "delivery_tracker", {"spec": spec, "pr": published}
+                    )
+                except Exception as exc:
+                    return await self._stop(
+                        spec, f"tracker synchronization pending: {type(exc).__name__}"
+                    )
+                self.state["tracker"] = tracker
+                if self.cancel_requested:
+                    return await self._cancelled(spec)
+                if tracker.get("state") != "consistent":
+                    return await self._stop(spec, "tracker readback remains pending or conflicting")
             if self.cancel_requested:
                 return await self._cancelled(spec)
-            if tracker.get("state") != "consistent":
-                return await self._stop(spec, "tracker readback remains pending or conflicting")
             self.state["phase"] = "delivered"
             self.state["execution_state"] = "terminal"
             self.state["outcome"] = "delivered"
@@ -1242,6 +1400,9 @@ class DeliveryWorkflow:
         await workflow.wait_condition(lambda: bool(self.state))
         if self.state.get("outcome") is not None:
             raise ApplicationError("run is already terminal", non_retryable=True)
+        if self.state.get("checks", {}).get("terminal_tracker_checkpoint"):
+            raise ApplicationError("terminal transition is frozen; reconcile its readback",
+                                   non_retryable=True)
         if request.get("expected_revision") != self.state["revision"]:
             raise ApplicationError("stale run revision", non_retryable=True)
         if not isinstance(request.get("reason"), str) or not request["reason"].strip():
@@ -1250,6 +1411,21 @@ class DeliveryWorkflow:
         self.state["phase"] = "cancelling"
         self.state["execution_state"] = "cancelling"
         self.state["cleanup"] = "pending_role_completion"
+        self.state["revision"] += 1
+        return self.state
+
+    @workflow.update(name="reconcile_tracker")
+    async def reconcile_tracker(self, request: dict[str, Any]) -> dict[str, Any]:
+        await workflow.wait_condition(lambda: bool(self.state))
+        checkpoint = self.state.get("checks", {}).get("terminal_tracker_checkpoint", {})
+        if (self.state.get("phase") != "waiting_tracker" or not checkpoint.get("waiting")
+                or self.tracker_retry_requested or self.state.get("outcome") is not None
+                or datetime.fromisoformat(checkpoint["deadline"]) <= workflow.now()):
+            raise ApplicationError("no exhausted terminal tracker checkpoint is pending",
+                                   non_retryable=True)
+        if request.get("expected_revision") != self.state["revision"]:
+            raise ApplicationError("stale run revision", non_retryable=True)
+        self.tracker_retry_requested = True
         self.state["revision"] += 1
         return self.state
 

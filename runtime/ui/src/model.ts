@@ -141,7 +141,8 @@ export interface RunDetail extends RunSummary {
     url?: string | null
     state?: string | null
   } | null
-  checks?: { review?: CheckState | null; qa?: CheckState | null; local?: CheckState | null; ci?: CheckState | null } | null
+  checks?: { review?: CheckState | null; qa?: CheckState | null; local?: CheckState | null; ci?: CheckState | null;
+    terminal_tracker_checkpoint?: { waiting?: boolean; closed?: boolean; state?: string; deadline?: string; cycles?: number; attempts?: number } | null } | null
   tracker?: {
     state?: string | null
     desired?: string | null

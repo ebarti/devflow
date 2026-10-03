@@ -72,6 +72,21 @@ def build_server(config_path: Path) -> FastMCP:
         """Request a role-boundary cancellation with command ID and expected revision."""
         return client(config_path).cancel(run_id, json.loads(request_json))
 
+    @server.tool(annotations=read)
+    def recovery_preflight(run_id: str) -> dict:
+        """Inspect a stopped unpublished candidate and seal its policy recovery preconditions."""
+        return client(config_path).recovery_preflight(run_id)
+
+    @server.tool(annotations=write)
+    def recover_execution(run_id: str, request_json: str) -> dict:
+        """Grant one bounded trusted-local recovery using an explicit fresh preflight hash."""
+        return client(config_path).recover_execution(run_id, json.loads(request_json))
+
+    @server.tool(annotations=write)
+    def reconcile_tracker(run_id: str, request_json: str) -> dict:
+        """Resume three terminal readback attempts; no candidate or model authority changes."""
+        return client(config_path).reconcile_tracker(run_id, json.loads(request_json))
+
     return server
 
 

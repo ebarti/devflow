@@ -347,6 +347,12 @@ class ControlledNativeTerminalFixture:
         return controller.state
 
 
+@activity.defn(name="delivery_terminal_tracker")
+async def controlled_terminal_tracker(request):
+    return {"state": "consistent", "pending": False, "desired": request["status"],
+            "release": request["release"], "observed": {"fixture": True}}
+
+
 @pytest.mark.parametrize(
     "outcome,uncertain",
     [
@@ -376,7 +382,7 @@ async def test_real_terminal_workflow_removes_owned_temps_before_projection(
             task_queue="controlled-native-terminal",
             workflows=[ControlledNativeTerminalFixture],
             workflow_runner=UnsandboxedWorkflowRunner(),
-            activities=[delivery_project, delivery_finalize_resources],
+            activities=[delivery_project, delivery_finalize_resources, controlled_terminal_tracker],
         ):
             result = await environment.client.execute_workflow(
                 ControlledNativeTerminalFixture.run,
@@ -432,7 +438,8 @@ async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(nati
             environment.client,
             task_queue="native-turn-exhaustion",
             workflows=[DeliveryWorkflow],
-            activities=[delivery_prepare, delivery_project, delivery_finalize_resources, questions],
+            activities=[delivery_prepare, delivery_project, delivery_finalize_resources, questions,
+                        controlled_terminal_tracker],
         ):
             handle = await environment.client.start_workflow(
                 DeliveryWorkflow.run,
@@ -491,7 +498,8 @@ async def test_early_preparation_error_finalizes_registered_temporary_resources(
             environment.client,
             task_queue="native-early-preparation-error",
             workflows=[DeliveryWorkflow],
-            activities=[delivery_prepare, delivery_project, delivery_finalize_resources],
+            activities=[delivery_prepare, delivery_project, delivery_finalize_resources,
+                        controlled_terminal_tracker],
         ):
             result = await environment.client.execute_workflow(
                 DeliveryWorkflow.run,
@@ -543,11 +551,16 @@ async def intake(request):
     return {'status':'blocked','summary':'controlled terminal cleanup fixture',
             'findings':[],'session_id':None,'usage':None,'cleanup':'confirmed'}
 
+@activity.defn(name='delivery_terminal_tracker')
+async def tracker(request):
+    return {'state':'consistent','pending':False,'desired':request['status'],
+            'release':request['release'],'observed':{'fixture':True}}
+
 async def main():
     client = await Client.connect(sys.argv[1])
     async with Worker(client, task_queue='native-finalize-restart',
                       workflows=[DeliveryWorkflow],
-                      activities=[delivery_prepare,delivery_project,intake,finalization]):
+                      activities=[delivery_prepare,delivery_project,intake,finalization,tracker]):
         await asyncio.Event().wait()
 asyncio.run(main())
 """)
@@ -591,6 +604,7 @@ asyncio.run(main())
                     delivery_project,
                     blocked_intake,
                     delivery_finalize_resources,
+                    controlled_terminal_tracker,
                 ],
             ):
                 result = await asyncio.wait_for(handle.result(), 60)

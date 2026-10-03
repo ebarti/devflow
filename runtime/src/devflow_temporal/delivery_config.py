@@ -60,6 +60,8 @@ class DeliveryConfig:
             raise ValueError("service role policy has missing or unknown roles")
         if value.get("provider", "codex") not in {"codex", "fake"}:
             raise ValueError("unsupported configured role provider")
+        if value.get("execution_mode", "native-profile") not in {"native-profile", "trusted-local"}:
+            raise ValueError("unsupported local execution mode")
         return cls(path=path.resolve(), raw=value)
 
     @property
@@ -102,6 +104,7 @@ class DeliveryConfig:
             "authorized_endpoint": "published_unmerged",
             "intake_enabled": "intake" in self.raw["roles"],
             "execution_backend": self.raw.get("execution_backend", "native-macos"),
+            "execution_mode": self.raw.get("execution_mode", "native-profile"),
         }
 
     def admit(self, supplied: dict[str, Any]) -> dict[str, Any]:
@@ -267,7 +270,7 @@ class DeliveryConfig:
         if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
             raise ValueError("initial decision prompt must be a non-empty string")
         if self.raw.get("provider", "codex") == "codex":
-            policy["host_sandbox"] = "native-profile"
+            policy["host_sandbox"] = self.raw.get("execution_mode", "native-profile")
             policy["runtime_dependencies"] = locked_dependency_identity()
             expected_overrides = NATIVE_OVERRIDES
             if policy["config_overrides"] != expected_overrides:
@@ -428,6 +431,8 @@ class DeliveryConfig:
                 if self.raw.get("provider", "codex") == "codex"
                 else {}
             ),
+            **({"terminal_tracker_version": 1} if self.raw.get("provider", "codex") == "codex"
+               else {}),
             "provider": self.raw.get("provider", "codex"),
             "source_path": str(source),
             "origin_url": actual_remote,

@@ -1,6 +1,6 @@
 # Local Desktop entry point
 
-For the portable plugin and additive local marketplace, see the [plugin guide](../../docs/local-delivery-plugin.md). `package_plugin.py` packages this same canonical skill and MCP executable without registering or changing the host. The direct installer below remains an alternative; disable matching direct components manually before switching to the plugin.
+For the portable plugin and additive local marketplace, see the [plugin guide](../../docs/local-delivery-plugin.md). `package_plugin.py` packages this same canonical skill and MCP executable without registering or changing the host. The direct installer below remains an alternative; the guarded primary-plugin switch removes its duplicate host registration and archives its skill for rollback.
 
 This directory installs one narrow Codex skill and one stdio MCP server. The MCP server is the existing `devflow-delivery-mcp` client of the authenticated local service; it does not run or poll the workflow. The installed skill does not replace the existing general Devflow skills.
 
@@ -19,6 +19,129 @@ The installer uses the supported `codex mcp add` command and copies `devflow-loc
 
 For an update to an inspected, Devflow-owned skill, supply `--replace-owned-skill-sha256` with the SHA-256 of its current bytes. The installer rechecks those bytes, retains a backup, and replaces only that skill. Different MCP commands/configs and disabled entries remain conflicts. This option does not authorize replacement of unrelated skills or service state.
 
+For the explicit [trusted-local policy transition](../../docs/trusted-local-delivery.md),
+the owned direct MCP entry must point to the new private configuration. Keep the
+original frozen file unchanged and put the mode-only copy under the existing
+service state root. Inspect the current entry using `codex mcp get
+devflow-local-delivery --json`, then create an owned 0600 request containing:
+
+```json
+{
+  "command_id": "stable-owned-trusted-upgrade",
+  "expected_registration_sha256": "SHA256_OF_CANONICAL_PUBLIC_GET_JSON",
+  "expected_config_path": "/absolute/original/frozen-service.json",
+  "expected_config_sha256": "SHA256_OF_ORIGINAL_CONFIG_BYTES",
+  "expected_skill_sha256": "SHA256_OF_INSPECTED_INSTALLED_LOCAL_DELIVERY_SKILL"
+}
+```
+
+Canonical registration JSON uses sorted keys and compact `,` / `:` separators.
+The guarded installer requires an enabled same-name stdio entry with the exact
+runtime executable, original config argument and no transport environment/CWD
+overrides. It rejects changed owned inputs, disabled/foreign entries, altered
+models/capacity/scope, and linked inputs. It updates only the owned MCP pointer
+through the supported public CLI and the one local-delivery skill, checking all
+other MCP entries and host configuration semantics before and after. It does
+not edit configuration TOML directly or change agents/models/plugins.
+
+Unrelated-state seals normalize only the public CLI's evidenced stdio TOML
+representations: absent versus empty `args`, and finite integral
+`startup_timeout_sec` integer/float values that represent exactly the same
+seconds. Boolean/non-finite timeouts, changed values and every other field remain
+conflicts. Older journals retain their original raw digest; stable replay and
+rollback reconstruct only those equivalent representations and must match that
+exact digest. Compatibility search is bounded to twelve such fields; new
+canonical journals need no search. No new baseline or private manifest rewrite
+is accepted. Original rejection/rollback errors remain in a recovered journal.
+
+```sh
+python3 runtime/desktop/install.py \
+  --runtime-dir /absolute/stable/runtime \
+  --config /absolute/private/state/trusted-local.json \
+  --codex-home /absolute/codex-home \
+  --repoint-owned-request /absolute/private/owned-upgrade.json
+```
+
+The JSON response includes a private `rollback_manifest` under the selected
+Codex home's `.devflow-local-delivery-upgrades/COMMAND_ID/`. This intent and the
+original skill backup are durable before the pointer changes. Repeating identical
+inputs reads back the owned state; an interrupted successful pointer write is
+observed instead of blindly repeated. A failed readback restores the owned old
+pointer and skill when their identities still match; uncertain rollback remains
+visible in the manifest. To explicitly restore:
+
+```sh
+python3 runtime/desktop/install.py \
+  --runtime-dir /absolute/stable/runtime \
+  --config /absolute/private/state/trusted-local.json \
+  --codex-home /absolute/codex-home \
+  --rollback-owned-manifest /absolute/codex-home/.devflow-local-delivery-upgrades/COMMAND_ID/manifest.json
+```
+
+Installation does not restart the service or refresh cached host clients. Stop
+the owned service separately, apply the reviewed runtime/config/pointer change,
+start through the new config, and verify discovery from a fresh client. An old
+cached MCP client with the frozen config path must be refreshed before use or
+it can select the old service policy. When using the plugin instead, package
+and register its new resources with the same new config; inspect existing public
+plugin registrations first and preserve any earlier package for rollback. The
+direct pointer updater does not rewrite or remove plugin installations.
+
+To make the plugin primary after that pointer update, package a fresh immutable
+`devflow-local` marketplace under the service state root. Read back the public
+MCP entry, `codex plugin list --json`, and `codex plugin marketplace list`. The
+installed CLI reports an empty marketplace as `No plugin marketplaces in scope.`;
+otherwise it reports a `MARKETPLACE ROOT` table. Create a private 0600 request:
+
+```json
+{
+  "command_id": "stable-owned-primary-plugin-switch",
+  "marketplace_root": "/absolute/private/state/fresh-marketplace",
+  "expected_registration_sha256": "SHA256_OF_CURRENT_CANONICAL_PUBLIC_GET_JSON",
+  "expected_config_sha256": "SHA256_OF_TRUSTED_CONFIG_BYTES",
+  "expected_skill_sha256": "SHA256_OF_CURRENT_DIRECT_SKILL_BYTES",
+  "expected_plugin_inventory_sha256": "SHA256_OF_CANONICAL_PLUGIN_LIST_JSON",
+  "expected_marketplace_inventory_sha256": "SHA256_OF_CANONICAL_NAME_TO_ROOT_OBJECT"
+}
+```
+
+All inventory hashes use sorted, compact JSON. The marketplace hash binds the
+parsed name-to-root object, including `{}` for an empty inventory. The helper
+`owned_plugin.snapshot(codex, codex_home)` returns these exact seals without
+changing the host. A same-name plugin, marketplace or cached package already
+present is a conflict. The package, installed cache, direct skill and selected
+configuration must be owned regular files with the inspected bytes.
+
+```sh
+/absolute/runtime/.venv/bin/python runtime/desktop/install.py \
+  --runtime-dir /absolute/runtime --config /absolute/private/state/trusted-local.json \
+  --codex-home /absolute/codex-home \
+  --activate-owned-plugin-request /absolute/private/state/primary-plugin.json
+```
+
+The installer journals its private intent before effects, registers the fresh
+marketplace and enables `devflow@devflow-local` using public CLI commands, checks
+the installed cache, removes only the exact direct MCP entry, and moves the exact
+direct skill outside discovery into the returned manifest's `direct-skill`
+archive. Unrelated host settings, models, agents, MCP entries and plugins are
+checked before and after. Interrupted or uncertain commands retain their intent;
+an identical request observes each completed effect before continuing. Changed
+owned inputs conflict. To restore the inspected direct entry and skill:
+
+```sh
+/absolute/runtime/.venv/bin/python runtime/desktop/install.py \
+  --runtime-dir /absolute/runtime --config /absolute/private/state/trusted-local.json \
+  --codex-home /absolute/codex-home \
+  --rollback-owned-plugin-manifest /absolute/codex-home/.devflow-local-delivery-upgrades/COMMAND_ID/manifest.json
+```
+
+Rollback uses public plugin/marketplace removal and MCP registration, then
+restores the archived skill and verifies the original inventory. It rejects
+modified owned bytes. A rolled-back command ID stays rolled back on replay.
+Standalone CLI, direct stdio MCP invocation and the authenticated service API
+remain available; this switch selects the global plugin as the host entry point.
+Fresh host discovery must establish that entry point and its configuration.
+
 With the runtime and config paths above, the service can be checked using the same public CLI:
 
 ```sh
@@ -36,3 +159,5 @@ MCP submission binds the originating UUID from each call’s native top-level `t
 A configured real request needs no operator-authored per-run proof. Native runtime/command-boundary preparation runs after durable submission inside the existing Temporal activity. Its measured evidence uses a private reusable cache; each run freezes a separate binding to configured repository and paths. Terminal workflow finalization removes registered temporary roots and preserves durable sessions/evidence and necessary candidate recovery data. Process monitoring uncertainty and directory removal failures remain visible. Historical Docker runs remain readable and cannot resume.
 
 Registration through the CLI and a successful MCP protocol handshake do not prove that an already-open Desktop thread has discovered the new tool. Check from a fresh Desktop thread or after restart, invoke a read-only MCP tool, and open an actual returned dashboard URL before claiming live Desktop integration. No private Codex database or undocumented IPC is used.
+
+For an exhausted `waiting_tracker` terminal checkpoint, the public CLI `reconcile-tracker --id RUN_ID --request PRIVATE_JSON` and MCP `reconcile_tracker` accept exactly a stable `command_id` and current `expected_revision`. They resume only three bounded tracker readback attempts in the original open workflow, preserving the candidate, gates and role budgets. A released owning intent is audited without another set; confirmed readback completes and refreshes the final projection. See the [terminal recovery contract](../../docs/trusted-local-delivery.md).

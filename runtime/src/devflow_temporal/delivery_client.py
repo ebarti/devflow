@@ -87,11 +87,27 @@ class DeliveryClient:
     def cancel(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/cancel", payload)
 
+    def reconcile_tracker(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/reconcile-tracker", payload,
+        )
+
     def recover_publication(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request(
             "POST",
             "/api/runs/" + quote(run_id, safe="") + "/recover-publication",
             payload,
+        )
+
+    def recovery_preflight(self, run_id: str) -> dict:
+        return self._request(
+            "GET", "/api/runs/" + quote(run_id, safe="") + "/recovery-preflight", timeout=120,
+        )
+
+    def recover_execution(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/recover-execution", payload,
+            timeout=180,
         )
 
     def continue_repair(self, run_id: str, payload: dict[str, Any]) -> dict:

@@ -259,7 +259,11 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
         try:
             store, _ = _context(request["spec"])
-            if request["recovery"].get("kind") == "scope_amendment":
+            if request["recovery"].get("kind") == "execution_policy_recovery":
+                from .delivery_policy_recovery import resume_preflight
+
+                resume_preflight(store, request["spec"], request["recovery"])
+            elif request["recovery"].get("kind") == "scope_amendment":
                 store.scope_preflight(request["spec"], request["recovery"])
             else:
                 store.repair_preflight(request["spec"], request["recovery"])
@@ -340,8 +344,69 @@ async def delivery_ci(request: dict[str, Any]) -> dict[str, Any]:
     return await broker.checks(request["pull_request"])
 
 
-def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[str, Any]:
+def _terminal_receipt(store, spec, status, release, project, assignee, desired):
+    with store._connect() as db:
+        db.execute("BEGIN")
+        work = store.state.row(db, "works", spec["work_id"])
+        sync = json.loads(work["details"] or "{}").get("github", {}).get("sync", {}) if work else {}
+        intent = db.execute("SELECT * FROM reconcile_intents WHERE work_id=?",
+                            (spec["work_id"],)).fetchone()
+        claim = store.state.claim_for(db, spec["work_id"])
+        from .delivery_policy_recovery import work_binding
+
+        try:
+            work_binding(store, spec, db)
+        except ValueError as exc:
+            return {"state": "pending", "pending": True, "desired": desired,
+                    "reason": str(exc), "readback_at": _now()}
+    owner = f"external:devflow:{spec['run_id']}"
+    issue = spec["issue_url"]
+    if (not work or store.state.issue_resource(work["issue"])
+            != store.state.issue_resource(issue)):
+        return {"state": "pending", "pending": True, "desired": desired,
+                "reason": "terminal work issue differs from frozen authority",
+                "readback_at": _now()}
+    payload = json.loads(intent["payload"]) if intent else {}
+    if intent and store.state.issue_resource(payload.get("issue", "")) != (
+        store.state.issue_resource(issue)
+    ):
+        return {"state": "pending", "pending": True, "desired": desired,
+                "reason": "terminal intent issue differs from frozen authority",
+                "readback_at": _now()}
+    if not intent or intent["state"] != "acknowledged":
+        if claim is not None and claim["owner"] == owner:
+            return None  # The owning helper can resume its observed pending intent.
+        return {"state": "pending", "pending": True, "desired": desired,
+                "reason": "terminal ownership or acknowledgement is unavailable",
+                "readback_at": _now()}
+    if (intent["owner"] != owner or payload.get("status") != status
+            or bool(payload.get("release")) != release or sync.get("status") != status
+            or sync.get("issue_state") != "OPEN" or sync.get("project") != project
+            or payload.get("assignee") != assignee or payload.get("project") != project
+            or (assignee != "@me"
+                and sync.get("assignee", "").casefold() != assignee.lstrip("@").casefold())
+            or not sync.get("readback_at") or bool(claim) != (not release)
+            or (claim is not None and claim["owner"] != owner)):
+        if claim is not None and claim["owner"] == owner:
+            return None  # The preceding owned transition is not this terminal intent.
+        return {"state": "pending", "pending": True, "desired": desired,
+                "reason": "released terminal helper acknowledgement conflicts",
+                "readback_at": _now()}
+    return {"state": "consistent", "pending": False, "desired": desired,
+            "observed": {"state": "consistent", "claim": claim, "expected": sync,
+                         "source": "owning helper live readback and acknowledged intent"},
+            "readback_at": sync["readback_at"]}
+
+
+def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
+                  terminal: bool = False, reason: str | None = None) -> dict[str, Any]:
     store, _ = _context(spec)
+    guarded = spec.get("terminal_tracker_version") == 1
+    if guarded and not terminal:
+        from .delivery_policy_recovery import work_binding
+
+        with store._connect() as db:
+            work_binding(store, spec, db)
     repository = store.config.raw["repositories"][spec["repository_key"]]
     project = repository.get("project_url")
     assignee = repository.get("assignee")
@@ -359,6 +424,29 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
         }
     script = store.config.helpers_dir / "github.py"
     owner = f"external:devflow:{spec['run_id']}"
+    if terminal:
+        prior = _terminal_receipt(store, spec, status, release, project, assignee, desired)
+        if prior is not None:
+            if prior["state"] != "consistent":
+                return prior
+            # A lost activity/helper completion may already have released the claim.
+            # Observe its acknowledged intent and current remote state; never set again.
+            audit = subprocess.run(
+                [sys.executable, str(script), "--db", str(store.config.tracking_db),
+                 "audit", "--work-id", spec["work_id"]],
+                text=True, capture_output=True, check=False, timeout=120,
+            )
+            observed = json.loads(audit.stdout) if audit.returncode == 0 else {}
+            current = _terminal_receipt(store, spec, status, release, project, assignee, desired)
+            if (audit.returncode or observed.get("state") != "consistent"
+                    or store.state.issue_resource(observed.get("issue", ""))
+                    != store.state.issue_resource(spec["issue_url"])
+                    or current != prior or observed.get("expected") != prior["observed"]["expected"]
+                    or bool(observed.get("claim")) != (not release)):
+                return {"state": "pending", "pending": True, "desired": desired,
+                        "observed": observed, "reason": "acknowledged terminal readback is pending",
+                        "readback_at": _now()}
+            return {**prior, "observed": observed, "readback_at": _now()}
     command = [
         sys.executable,
         str(script),
@@ -376,9 +464,16 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
         "--status",
         status,
     ]
+    if status == "blocked":
+        command.extend(["--reason", reason or "Managed delivery stopped at a terminal boundary"])
     if release:
         command.append("--release")
     result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=120)
+    if guarded:
+        from .delivery_policy_recovery import work_binding
+
+        with store._connect() as db:
+            work_binding(store, spec, db)
     if result.returncode:
         return {
             "state": "pending",
@@ -386,6 +481,20 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
             "pending": True,
             "reason": (result.stderr or result.stdout).strip()[:500],
         }
+    if terminal:
+        # The owning helper already performs live issue/assignee/Project readback
+        # and acknowledges that exact intent atomically before releasing ownership.
+        # A second remote audit after release cannot safely change the transition.
+        acknowledged = json.loads(result.stdout)
+        receipt = _terminal_receipt(store, spec, status, release, project, assignee, desired)
+        sync = receipt.get("observed", {}).get("expected", {}) if receipt else {}
+        if (not receipt or receipt["state"] != "consistent"
+                or acknowledged.get("status") != status
+                or acknowledged.get("assignee") != sync.get("assignee")
+                or acknowledged.get("project_status") != sync.get("project_status")):
+            return {"state": "pending", "pending": True, "desired": desired,
+                    "reason": "terminal helper acknowledgement changed", "readback_at": _now()}
+        return receipt
     audit = subprocess.run(
         [
             sys.executable,
@@ -409,6 +518,13 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool) -> dict[s
             "reason": (audit.stderr or audit.stdout).strip()[:500],
         }
     observed = json.loads(audit.stdout)
+    if guarded:
+        with store._connect() as db:
+            work_binding(store, spec, db)
+        if store.state.issue_resource(observed.get("issue", "")) != (
+            store.state.issue_resource(spec["issue_url"])
+        ):
+            raise ValueError("tracker audit differs from frozen issue authority")
     expected_claim = not release
     if observed.get("state") != "consistent" or bool(observed.get("claim")) != expected_claim:
         return {
@@ -445,7 +561,45 @@ async def delivery_tracker(request: dict[str, Any]) -> dict[str, Any]:
     return _tracker_sync(request["spec"], "in-review", release=True)
 
 
+@activity.defn(name="delivery_terminal_tracker")
+async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
+    if request["spec"]["provider"] == "fake":
+        return {"state": "consistent", "pending": False, "observed": {"fixture": True}}
+    try:
+        if request["status"] == "in-review" and request.get("pull_request") is not None:
+            from .delivery_terminal_recovery import published_readback
+
+            store, _ = _context(request["spec"])
+            await asyncio.to_thread(published_readback, store, request["spec"],
+                                    request.get("candidate"), request["pull_request"])
+        return await asyncio.to_thread(
+            _tracker_sync, request["spec"], request["status"], release=request["release"],
+            terminal=True, reason=request.get("reason"),
+        )
+    except Exception as exc:
+        return {
+            "state": "pending", "pending": True, "reason": type(exc).__name__,
+            "desired": f"{request['status']}; claim "
+                       + ("released" if request["release"] else "retained pending cleanup"),
+            "readback_at": _now(),
+        }
+
+
+@activity.defn(name="delivery_terminal_preflight")
+async def delivery_terminal_preflight(request):
+    def execute():
+        from .delivery_terminal_recovery import preflight
+
+        store, _ = _context(request["spec"])
+        preflight(store, request["spec"], request["recovery"])
+        return {"state": "confirmed"}
+
+    return await asyncio.to_thread(execute)
+
+
 DELIVERY_ACTIVITIES = [
+    delivery_terminal_preflight,
+    delivery_terminal_tracker,
     delivery_project,
     delivery_prepare,
     delivery_finalize_resources,

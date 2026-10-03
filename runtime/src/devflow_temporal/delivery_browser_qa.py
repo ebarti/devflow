@@ -11,7 +11,7 @@ from typing import Any
 from .candidate import candidate_for
 from .contracts import digest
 from .delivery_output import observed_test_count, visible_output
-from .delivery_sandbox import prepare_browser_qa
+from .delivery_sandbox import prepare_browser_qa, trusted_local
 
 
 def _hash(path: Path) -> str:
@@ -121,7 +121,8 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     process = NativeProcess(
         spec,
         folder / "native",
-        argv=["/usr/bin/sandbox-exec", "-f", str(profile), *qa["argv"]],
+        argv=(list(qa["argv"]) if trusted_local(spec)
+              else ["/usr/bin/sandbox-exec", "-f", str(profile), *qa["argv"]]),
         cwd=cwd,
         environment=environment,
         timeout=qa["timeout_seconds"],
@@ -175,6 +176,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "state": "passed" if passed else "failed",
         "cwd": str(cwd),
         "profile_sha256": _hash(profile),
+        "execution_mode": spec["policy"].get("host_sandbox", "native-profile"),
         "exit_code": process["exit_code"],
         "test_count": count,
         "rejected_output": rejected,

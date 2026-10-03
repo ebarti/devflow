@@ -56,6 +56,15 @@ def main() -> None:
         "--replace-owned-skill-sha256",
         help="replace only a previously inspected Devflow skill with this exact SHA-256",
     )
+    owned = parser.add_mutually_exclusive_group()
+    owned.add_argument('--repoint-owned-request', type=Path,
+                       help='private sealed request for an inspected mode-only MCP/skill update')
+    owned.add_argument('--rollback-owned-manifest', type=Path,
+                       help='private pointer-update receipt to restore through the public CLI')
+    owned.add_argument('--activate-owned-plugin-request', type=Path,
+                       help='private inspected inventory request to make the plugin primary')
+    owned.add_argument('--rollback-owned-plugin-manifest', type=Path,
+                       help='private primary-plugin receipt to restore the direct entry/skill')
     args = parser.parse_args()
 
     runtime = args.runtime_dir.expanduser().resolve(strict=True)
@@ -74,6 +83,29 @@ def main() -> None:
     codex = shutil.which("codex")
     if codex is None:
         fail("Codex CLI is required to register the MCP server")
+    if args.activate_owned_plugin_request or args.rollback_owned_plugin_manifest:
+        from owned_plugin import activate, rollback
+
+        try:
+            result = (rollback(codex, home, args.rollback_owned_plugin_manifest)
+                      if args.rollback_owned_plugin_manifest else
+                      activate(codex, home, runtime, config, args.activate_owned_plugin_request))
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            fail(str(exc))
+        print(json.dumps(result, sort_keys=True))
+        return
+    if args.repoint_owned_request or args.rollback_owned_manifest:
+        from owned_upgrade import rollback, upgrade
+
+        try:
+            result = (rollback(codex, home, args.rollback_owned_manifest)
+                      if args.rollback_owned_manifest else
+                      upgrade(codex, home, executable, config, SOURCE_SKILL,
+                              args.repoint_owned_request))
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            fail(str(exc))
+        print(json.dumps(result, sort_keys=True))
+        return
 
     target = home / "skills" / NAME
     if target.is_symlink():
@@ -110,7 +142,8 @@ def main() -> None:
         previous = (target / "SKILL.md").read_bytes()
         if hashlib.sha256(previous).hexdigest() != args.replace_owned_skill_sha256:
             fail("owned skill changed before its guarded update")
-        backup = home / "skills" / ".devflow-local-delivery-backups" / args.replace_owned_skill_sha256
+        backup = (home / "skills" / ".devflow-local-delivery-backups"
+                  / args.replace_owned_skill_sha256)
         backup.mkdir(mode=0o700, parents=True, exist_ok=True)
         backup_file = backup / "SKILL.md"
         if backup_file.exists() and backup_file.read_bytes() != previous:
