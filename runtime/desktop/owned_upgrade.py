@@ -134,7 +134,7 @@ def snapshot(codex, home, expected_unrelated=None):
 
 def registration(entry, executable, config):
     transport = entry.get('transport', {})
-    return (entry.get('name') == NAME and entry.get('enabled', True)
+    return (entry.get('name') == NAME and entry.get('enabled', True) is True
             and transport.get('type') == 'stdio' and transport.get('command') == str(executable)
             and transport.get('args') == ['--config', str(config)]
             and transport.get('env') in (None, {}) and transport.get('env_vars') in (None, [])
@@ -185,12 +185,12 @@ def _rollback(codex, home, manifest_path):
     current, unrelated = snapshot(codex, home, expected)
     old, new = manifest['before'], manifest['after']
     target = home / 'skills' / NAME / 'SKILL.md'
-    if (unrelated != expected or current not in (old, new)
+    if (unrelated != expected or seal(current) not in (seal(old), seal(new))
             or sha(target.read_bytes()) not in (manifest['old_skill_sha256'],
                                                manifest['new_skill_sha256'])
             or sha(private(Path(manifest['old_config_path']))) != manifest['old_config_sha256']):
         raise ValueError('owned installation or unrelated host settings changed; rollback refused')
-    if current != old:
+    if seal(current) != seal(old):
         guard(codex, home, manifest_path, manifest)
         install_pointer(codex, home, old['transport']['command'], manifest['old_config_path'])
         guard(codex, home, manifest_path, manifest, pointer=old)
@@ -203,7 +203,7 @@ def _rollback(codex, home, manifest_path):
     guard(codex, home, manifest_path, manifest, pointer=old,
           skill_sha256=manifest['old_skill_sha256'])
     verified, unrelated_after = snapshot(codex, home, expected)
-    if verified != old or unrelated_after != unrelated:
+    if seal(verified) != seal(old) or unrelated_after != unrelated:
         raise ValueError('public rollback readback disagrees')
     manifest['state'] = 'rolled_back'
     save(manifest_path, manifest)
@@ -240,7 +240,7 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
         raise ValueError('trusted config must remain within the existing private state root')
     if (before_config.pop('execution_mode', 'native-profile') != 'native-profile'
             or after_config.pop('execution_mode', None) != 'trusted-local'
-            or before_config != after_config):
+            or seal(before_config) != seal(after_config)):
         raise ValueError('owned pointer update permits only the trusted execution mode delta')
     target = home / 'skills' / NAME / 'SKILL.md'
     if target.is_symlink() or target.parent.is_symlink() or home.is_symlink():
@@ -263,12 +263,12 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
                 or not registration(manifest['after'], executable, config)):
             raise ValueError('owned pointer update receipt changed')
         if (unrelated != expected
-                or current not in (manifest['before'], manifest['after'])
+                or seal(current) not in (seal(manifest['before']), seal(manifest['after']))
                 or sha(target.read_bytes()) not in (
                     request['expected_skill_sha256'], sha(new_skill))):
             raise ValueError('owned installation changed after its sealed update')
         if manifest['state'] == 'applied':
-            if current != manifest['after'] or sha(target.read_bytes()) != sha(new_skill):
+            if seal(current) != seal(manifest['after']) or sha(target.read_bytes()) != sha(new_skill):
                 raise ValueError('applied owned installation changed before replay')
             return {'state': 'applied', 'existing': True, 'rollback_manifest': str(manifest_path)}
     else:
@@ -292,7 +292,7 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
         write(backup, target.read_bytes())
         save(manifest_path, manifest)
     try:
-        if current != manifest['after']:
+        if seal(current) != seal(manifest['after']):
             guard(codex, home, manifest_path, manifest)
             install_pointer(codex, home, executable, config)
             guard(codex, home, manifest_path, manifest, pointer=manifest['after'])
@@ -301,7 +301,7 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
         guard(codex, home, manifest_path, manifest, pointer=manifest['after'],
               skill_sha256=manifest['new_skill_sha256'])
         verified, unrelated_after = snapshot(codex, home, expected)
-        if verified != manifest['after'] or unrelated_after != unrelated:
+        if seal(verified) != seal(manifest['after']) or unrelated_after != unrelated:
             raise ValueError('public update readback disagrees or unrelated host settings changed')
         manifest['state'] = 'applied'
         save(manifest_path, manifest)

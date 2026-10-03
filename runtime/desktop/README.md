@@ -190,7 +190,10 @@ historical evidence bytes/hashes, then checks the latest acknowledged current
 foreign state and live owned authority around each effect. Historical content
 proofs remain authenticated without requiring obsolete plugin caches to exist.
 An identical successor replay is idempotent even after authorized pointer state
-changes; a historical acknowledgement replay observes the current chain.
+changes or a lost response; a historical acknowledgement replay observes the current
+chain. If interruption leaves the exclusive append's private temporary hardlink,
+replay removes only that matching temporary inode and preserves the published
+receipt bytes. Unrecognized receipt links refuse.
 Wrong/missing predecessors, changed history/proof, unknown owned state, stale or
 inconsistent current capture, further foreign drift and exhaustion refuse.
 Responses include `chain_length` and `max_acknowledgements`. A rejected later
@@ -201,7 +204,11 @@ Each effect guard rereads the live owned MCP pointer, configuration hashes and
 skill identity/bytes after the slower foreign inventory reads. It permits only
 the original before/after states and requires the expected pointer/skill state
 after each effect. An unrecognized concurrent owned change refuses without
-overwriting it, including during unknown-command replay and rollback.
+overwriting it, including during unknown-command replay and rollback. Owning
+journal nonstate fields, pointer readbacks and the mode-only configuration delta
+use canonical typed seals: `true`, `1` and `1.0` remain distinct. Legitimate
+journal state progression is allowed; foreign MCP default equivalence never
+applies to owning history or authority.
 
 The optional actual constrained-profile regressions use `DEVFLOW_CODEX_BIN` and
 a real Python interpreter resolved inside the profile's existing `/opt/homebrew`

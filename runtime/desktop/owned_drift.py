@@ -316,7 +316,11 @@ def _live_owned(codex, home, manifest, expected, pointer=None, skill_sha256=None
         if skill_sha256 is not None
         else (manifest["old_skill_sha256"], manifest["new_skill_sha256"])
     )
-    if unrelated != expected or current not in pointers or sha(content) not in skills:
+    if (
+        unrelated != expected
+        or seal(current) not in {seal(p) for p in pointers}
+        or sha(content) not in skills
+    ):
         raise ValueError("public update readback disagrees or live owned installation changed")
 
 
@@ -337,9 +341,9 @@ def _request(path):
 
 
 def _same_journal(original, current):
-    if current.get("state") not in STATES or {k: v for k, v in current.items() if k != "state"} != {
-        k: v for k, v in original.items() if k != "state"
-    }:
+    if current.get("state") not in STATES or seal(
+        {k: v for k, v in current.items() if k != "state"}
+    ) != seal({k: v for k, v in original.items() if k != "state"}):
         raise ValueError("original owned journal changed after ambient acknowledgement")
 
 
@@ -347,6 +351,32 @@ def _receipt_path(directory, sequence):
     return directory / (
         SIDECAR if sequence == 1 else f"ambient-drift-acknowledgement-{sequence}.json"
     )
+
+
+def _finish_append_link(path):
+    """Recover only our fsynced exclusive append's remaining temporary hardlink."""
+    info = path.lstat()
+    if info.st_nlink != 2:
+        return
+    matches = []
+    for temporary in path.parent.iterdir():
+        if not re.fullmatch(r"\.ambient-append-[0-9]+\.tmp", temporary.name):
+            continue
+        candidate = temporary.lstat()
+        if (candidate.st_dev, candidate.st_ino) == (info.st_dev, info.st_ino):
+            matches.append(temporary)
+    if (
+        len(matches) != 1
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_size > 256 * 1024
+        or any(parent.is_symlink() for parent in path.parents)
+    ):
+        raise ValueError("ambient append has an unrecognized linked receipt")
+    # Unlink only the matching temporary inode. The published receipt and all
+    # history bytes remain intact; ordinary or external hardlinks still refuse.
+    matches[0].unlink()
 
 
 def _chain(codex, home, manifest_path, manifest):
@@ -361,6 +391,7 @@ def _chain(codex, home, manifest_path, manifest):
         path = _receipt_path(directory, sequence)
         if path.stat().st_size > 256 * 1024:
             raise ValueError("ambient acknowledgement receipt exceeds its bound")
+        _finish_append_link(path)
         receipt_raw = private(path)
         receipt = json.loads(receipt_raw)
         if receipt_raw != (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode():
@@ -398,7 +429,10 @@ def _chain(codex, home, manifest_path, manifest):
                 or sha(admitted_text.encode()) != request["expected_manifest_sha256"]
                 or admitted["state"] != request["expected_manifest_state"]
                 or request["prior_snapshot"] != prior["request"]["current_snapshot"]
-                or request["authority"]["sha256"] == prior["request"]["authority"]["sha256"]
+                or any(
+                    request["authority"]["sha256"] == entry["request"]["authority"]["sha256"]
+                    for entry in chain
+                )
                 or any(
                     request[key] != chain[0]["request"][key]
                     for key in (
@@ -513,7 +547,10 @@ def acknowledge(codex, home, executable, config, source_skill, request_path):
                 or request["expected_manifest_sha256"] != sha(manifest_raw)
                 or request["expected_manifest_state"] != manifest["state"]
                 or request["prior_snapshot"] != prior["request"]["current_snapshot"]
-                or request["authority"]["sha256"] == prior["request"]["authority"]["sha256"]
+                or any(
+                    request["authority"]["sha256"] == entry["request"]["authority"]["sha256"]
+                    for entry in chain
+                )
                 or any(
                     request[key] != chain[0]["request"][key]
                     for key in (

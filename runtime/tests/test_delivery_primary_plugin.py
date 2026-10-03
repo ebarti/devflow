@@ -237,3 +237,18 @@ def test_primary_enabled_default_rejects_effective_type_and_confirmation_drift(
     with pytest.raises(ValueError):
         module.rollback('codex', fixture['home'], manifest)
     assert frozen == (manifest.read_bytes(), state['effects'], host.read_bytes())
+
+
+def test_primary_live_owned_pointer_boolean_integer_change_rejects_before_effects(primary):
+    module, fixture, runtime, config, request, state = primary
+    first = module.activate('codex', fixture['home'], runtime, config, request)
+    manifest = Path(first['rollback_manifest'])
+    module.rollback('codex', fixture['home'], manifest)
+    state['mcp'][module.NAME]['enabled'] = 1
+    effects = list(state['effects'])
+    retained = manifest.read_bytes()
+    with pytest.raises(ValueError, match='changed'):
+        module.activate('codex', fixture['home'], runtime, config, request)
+    with pytest.raises(ValueError, match='changed'):
+        module.rollback('codex', fixture['home'], manifest)
+    assert state['effects'] == effects and manifest.read_bytes() == retained

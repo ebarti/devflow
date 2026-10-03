@@ -673,6 +673,7 @@ def test_successor_rejects_bad_admission_before_receipt_or_effect(ambient, chang
         "old-snapshot",
         "old-index",
         "second-receipt",
+        "receipt-hardlink",
         "hole",
         "extra",
         "latest-setting",
@@ -697,6 +698,10 @@ def test_all_history_and_latest_material_are_guarded_after_successor(ambient, ch
             ref = old[{"old-authority": "authority", "old-snapshot": "current_snapshot"}[change]]
         path = Path(ref["path"])
         path.write_bytes(path.read_bytes() + b" ")
+    elif change == "receipt-hardlink":
+        import os
+
+        os.link(second, second.with_name("unrecognized-link"))
     elif change == "hole":
         first.unlink()
     elif change == "extra":
@@ -734,3 +739,188 @@ def test_acknowledgements_have_a_finite_explicit_bound_without_renewal(ambient):
     assert rejected.returncode != 0 and "exhausted" in rejected.stderr
     assert not (manifest.parent / "ambient-drift-acknowledgement-5.json").exists()
     assert all(path.read_bytes() == content for path, content in history.items())
+
+
+def test_successor_double_capture_rejects_changed_snapshot_without_receipt(ambient, monkeypatch):
+    module, drift, fixture, args, manifest, first_request, root = ambient
+    first = _ack(ambient)
+    request = _successor(ambient, first)
+    snapshot = drift.foreign_snapshot
+    reads = 0
+
+    def concurrent_change(codex, home):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            host = home / "config.toml"
+            host.write_text(host.read_text() + 'during_capture="changed"\n')
+        return snapshot(codex, home)
+
+    monkeypatch.setattr(drift, "foreign_snapshot", concurrent_change)
+    frozen = manifest.read_bytes(), first.read_bytes(), fixture["skill"].read_bytes()
+    with pytest.raises(ValueError, match="current public snapshot changed"):
+        drift.acknowledge(args[0], fixture["home"], args[2], fixture["trusted"], args[4], request)
+    assert reads == 2
+    assert not (manifest.parent / "ambient-drift-acknowledgement-2.json").exists()
+    assert frozen == (manifest.read_bytes(), first.read_bytes(), fixture["skill"].read_bytes())
+
+
+def test_successor_authenticates_old_proofs_after_deliberate_plugin_cache_replacement(ambient):
+    module, drift, fixture, args, manifest, first_request, root = ambient
+    first = _ack(ambient)
+    request = _successor(ambient, first)
+    old_index = Path(json.loads(first_request.read_text())["content_indexes"][0]["path"])
+    history = first.read_bytes(), first_request.read_bytes(), old_index.read_bytes()
+    replacement = root.with_name("3")
+    root.rename(replacement)
+    (replacement / ".codex-plugin/plugin.json").write_text('{"name":"foreign","version":"3"}')
+    registry = json.loads(fixture["registry"].read_text())
+    registry["plugins"]["installed"][0]["version"] = "3"
+    _private(fixture["registry"], registry)
+    value = json.loads(request.read_text())
+    current_path = Path(value["current_snapshot"]["path"])
+    current = drift.foreign_snapshot(args[0], fixture["home"])
+    _private(current_path, current)
+    index_path = Path(value["content_indexes"][0]["path"])
+    _private(index_path, drift.content_index(replacement))
+    value["current_snapshot"]["sha256"] = module.sha(current_path.read_bytes())
+    value["content_indexes"][0]["sha256"] = module.sha(index_path.read_bytes())
+    prior = json.loads(Path(value["prior_snapshot"]["path"]).read_text())
+    value["delta_sha256"] = module.seal(drift.delta(prior, current))
+    _private(request, value)
+    result = _run(fixture, "--acknowledge-owned-drift-request", str(request))
+    assert result.returncode == 0, result.stderr
+    assert _run(fixture, "--repoint-owned-request", str(fixture["request"])).returncode == 0
+    assert _run(fixture, "--rollback-owned-manifest", str(manifest)).returncode == 0
+    assert not root.exists()
+    assert history == (first.read_bytes(), first_request.read_bytes(), old_index.read_bytes())
+    assert drift.foreign_snapshot(args[0], fixture["home"]) == current
+
+
+@pytest.mark.parametrize("point", ["lost-response", "append-hardlink"])
+def test_successor_interrupted_acknowledgement_replays_without_new_authority(
+    ambient, monkeypatch, point
+):
+    module, drift, fixture, args, manifest, first_request, root = ambient
+    first = _ack(ambient)
+    request = _successor(ambient, first)
+    append, unlink = drift._append, Path.unlink
+
+    def interrupted(path, value):
+        append(path, value)
+        raise SystemExit("lost client acknowledgement")
+
+    def interrupted_cleanup(path, *args, **kwargs):
+        if path.name.startswith(".ambient-append-"):
+            raise SystemExit("lost client acknowledgement during production temporary cleanup")
+        return unlink(path, *args, **kwargs)
+
+    if point == "append-hardlink":
+        monkeypatch.setattr(Path, "unlink", interrupted_cleanup)
+    else:
+        monkeypatch.setattr(drift, "_append", interrupted)
+    frozen = manifest.read_bytes(), first.read_bytes()
+    with pytest.raises(SystemExit, match="lost client acknowledgement"):
+        drift.acknowledge(args[0], fixture["home"], args[2], args[3], args[4], request)
+    second = manifest.parent / "ambient-drift-acknowledgement-2.json"
+    retained = second.read_bytes()
+    if point == "append-hardlink":
+        assert second.stat().st_nlink == 2
+    monkeypatch.setattr(drift, "_append", append)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    repeated = _run(fixture, "--acknowledge-owned-drift-request", str(request))
+    assert repeated.returncode == 0, repeated.stderr
+    assert json.loads(repeated.stdout)["existing"]
+    assert second.read_bytes() == retained and second.stat().st_nlink == 1
+    assert not list(manifest.parent.glob(".ambient-append-*.tmp"))
+    assert frozen == (manifest.read_bytes(), first.read_bytes())
+    assert _run(fixture, "--repoint-owned-request", str(fixture["request"])).returncode == 0
+
+
+@pytest.mark.parametrize("stage", ["absent", "lookalike", "different-inode"])
+def test_external_receipt_hardlinks_do_not_authorize_stage_cleanup(ambient, stage):
+    import os
+
+    module, drift, fixture, args, manifest, request, root = ambient
+    first = _ack(ambient)
+    external = manifest.parent / "unrecognized-receipt-link"
+    os.link(first, external)
+    temporary = manifest.parent / (
+        ".ambient-append-not-a-pid.tmp" if stage == "lookalike" else ".ambient-append-12345.tmp"
+    )
+    if stage == "lookalike":
+        external.unlink()
+        os.link(first, temporary)
+    elif stage == "different-inode":
+        _private(temporary, json.loads(first.read_text()))
+    original = manifest.read_bytes(), first.read_bytes(), fixture["registry"].read_bytes()
+    assert _run(fixture, "--acknowledge-owned-drift-request", str(request)).returncode != 0
+    assert _run(fixture, "--repoint-owned-request", str(fixture["request"])).returncode != 0
+    assert first.stat().st_nlink == 2
+    if stage != "absent":
+        assert temporary.exists()
+    assert original == (manifest.read_bytes(), first.read_bytes(), fixture["registry"].read_bytes())
+
+
+@pytest.mark.parametrize("target", ["journal-before", "journal-after", "live-before", "live-after"])
+def test_owning_boolean_integer_history_and_pointer_changes_reject_without_effects(ambient, target):
+    module, drift, fixture, args, manifest, first_request, root = ambient
+    first = _ack(ambient)
+    successor = _successor(ambient, first)
+    admitted = _run(fixture, "--acknowledge-owned-drift-request", str(successor))
+    assert admitted.returncode == 0, admitted.stderr
+    if target.startswith("journal"):
+        value = json.loads(manifest.read_text())
+        value[target.split("-")[1]]["enabled"] = 1
+        _private(manifest, value)
+    else:
+        registry = json.loads(fixture["registry"].read_text())
+        entry = registry["entries"][module.NAME]
+        entry["transport"]["args"] = [
+            "--config",
+            str(fixture["original"] if target == "live-before" else fixture["trusted"]),
+        ]
+        entry["enabled"] = 1
+        _private(fixture["registry"], registry)
+    retained = (
+        manifest.read_bytes(),
+        first.read_bytes(),
+        fixture["registry"].read_bytes(),
+        fixture["skill"].read_bytes(),
+    )
+    for flag, path in [
+        ("--acknowledge-owned-drift-request", successor),
+        ("--repoint-owned-request", fixture["request"]),
+        ("--rollback-owned-manifest", manifest),
+    ]:
+        assert _run(fixture, flag, str(path)).returncode != 0
+    assert retained == (
+        manifest.read_bytes(),
+        first.read_bytes(),
+        fixture["registry"].read_bytes(),
+        fixture["skill"].read_bytes(),
+    )
+
+
+@pytest.mark.parametrize("before,after", [(True, 1), (1, 1.0)])
+def test_journal_comparison_is_typed_but_allows_only_state_progression(ambient, before, after):
+    module, drift, fixture, args, manifest, first_request, root = ambient
+    original = {"state": "unknown", "owning": {"value": before}}
+    drift._same_journal(original, {**original, "state": "applied"})
+    with pytest.raises(ValueError, match="original owned journal changed"):
+        drift._same_journal(original, {"state": "applied", "owning": {"value": after}})
+
+
+def test_successor_cannot_reuse_an_earlier_authority_receipt(ambient):
+    module, drift, fixture, args, manifest, request, root = ambient
+    first = _ack(ambient)
+    second_request = _successor(ambient, first)
+    result = _run(fixture, "--acknowledge-owned-drift-request", str(second_request))
+    assert result.returncode == 0, result.stderr
+    second = Path(json.loads(result.stdout)["acknowledgement"])
+    third_request = _successor(ambient, second, 3)
+    body = json.loads(third_request.read_text())
+    body["authority"] = json.loads(request.read_text())["authority"]
+    _private(third_request, body)
+    assert _run(fixture, "--acknowledge-owned-drift-request", str(third_request)).returncode != 0
+    assert not (manifest.parent / "ambient-drift-acknowledgement-3.json").exists()

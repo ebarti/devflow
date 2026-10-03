@@ -313,3 +313,18 @@ def test_mcp_enabled_true_default_requires_unchanged_public_effective_inventory(
     public_change = deepcopy(absent)
     public_change[inventory_key][0]['enabled'] = False
     assert module.unrelated_seal(public_change) != module.unrelated_seal(explicit)
+
+
+def test_mode_only_upgrade_rejects_numerically_equal_config_type_change_before_effects(
+    installation,
+):
+    fixture = installation
+    trusted = json.loads(fixture['trusted'].read_text())
+    trusted['capacity'] = 2.0
+    _private(fixture['trusted'], trusted)
+    current = fixture['registry'].read_bytes()
+    result = _run(fixture, '--repoint-owned-request', str(fixture['request']))
+    assert result.returncode != 0 and 'only the trusted execution mode delta' in result.stderr
+    assert fixture['registry'].read_bytes() == current
+    assert not (fixture['home'] / '.devflow-local-delivery-upgrades'
+                / 'owned-trust-upgrade' / 'manifest.json').exists()

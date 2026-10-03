@@ -119,7 +119,7 @@ def owned_tree(root):
 
 def owned_state(home, current, manifest, files):
     if (current['unrelated_sha256'] != manifest['before']['unrelated_sha256']
-            or current['direct'] not in (None, manifest['before']['direct'])
+            or seal(current['direct']) not in (seal(None), seal(manifest['before']['direct']))
             or current['marketplace'] not in (None, manifest['marketplace_root'])):
         raise ValueError('owned installation or unrelated host settings changed')
     plugin = current['plugin']
@@ -185,7 +185,7 @@ def activate(codex, home, runtime, config, request_path):
             if manifest['command_digest'] != binding:
                 raise ValueError('activation command ID already binds different inputs')
             if manifest['state'] == 'rolled_back':
-                if current != manifest['before']:
+                if seal(current) != seal(manifest['before']):
                     raise ValueError('rolled-back installation changed before replay')
                 return {'state': 'rolled_back', 'existing': True, 'rollback_manifest': str(path)}
         else:
@@ -266,7 +266,8 @@ def rollback(codex, home, path):
         if archive.exists():
             skill(archive, manifest['skill_sha256'])
             archive.rename(home / 'skills' / NAME)
-        if snapshot(codex, home, manifest['before']['unrelated_sha256']) != manifest['before']:
+        if (seal(snapshot(codex, home, manifest['before']['unrelated_sha256']))
+                != seal(manifest['before'])):
             raise ValueError('primary-plugin rollback readback disagrees')
         manifest['state'] = 'rolled_back'
         save(path, manifest)
