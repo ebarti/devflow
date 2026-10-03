@@ -61,6 +61,8 @@ def main() -> None:
                        help='private sealed request for an inspected mode-only MCP/skill update')
     owned.add_argument('--rollback-owned-manifest', type=Path,
                        help='private pointer-update receipt to restore through the public CLI')
+    owned.add_argument('--acknowledge-owned-drift-request', type=Path,
+                       help='separate immutable ambient-state receipt for an unknown owned update')
     owned.add_argument('--activate-owned-plugin-request', type=Path,
                        help='private inspected inventory request to make the plugin primary')
     owned.add_argument('--rollback-owned-plugin-manifest', type=Path,
@@ -83,6 +85,16 @@ def main() -> None:
     codex = shutil.which("codex")
     if codex is None:
         fail("Codex CLI is required to register the MCP server")
+    if args.acknowledge_owned_drift_request:
+        from owned_drift import acknowledge
+
+        try:
+            result = acknowledge(codex, home, executable, config, SOURCE_SKILL,
+                                 args.acknowledge_owned_drift_request)
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            fail(str(exc))
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.activate_owned_plugin_request or args.rollback_owned_plugin_manifest:
         from owned_plugin import activate, rollback
 

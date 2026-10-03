@@ -162,27 +162,34 @@ def rollback(codex, home, manifest_path):
 
 
 def _rollback(codex, home, manifest_path):
+    from owned_drift import guard
+
     manifest = json.loads(private(manifest_path))
     expected_root = home / '.devflow-local-delivery-upgrades'
     if (not manifest_path.resolve().is_relative_to(expected_root.resolve())
             or manifest['codex_home'] != str(home)):
         raise ValueError('rollback receipt belongs to another host installation')
-    current, unrelated = snapshot(codex, home, manifest['unrelated_sha256'])
+    expected = guard(codex, home, manifest_path, manifest)
+    current, unrelated = snapshot(codex, home, expected)
     old, new = manifest['before'], manifest['after']
     target = home / 'skills' / NAME / 'SKILL.md'
-    if (unrelated != manifest['unrelated_sha256'] or current not in (old, new)
+    if (unrelated != expected or current not in (old, new)
             or sha(target.read_bytes()) not in (manifest['old_skill_sha256'],
                                                manifest['new_skill_sha256'])
             or sha(private(Path(manifest['old_config_path']))) != manifest['old_config_sha256']):
         raise ValueError('owned installation or unrelated host settings changed; rollback refused')
     if current != old:
+        guard(codex, home, manifest_path, manifest)
         install_pointer(codex, home, old['transport']['command'], manifest['old_config_path'])
+        guard(codex, home, manifest_path, manifest)
     backup = manifest_path.parent / 'previous-SKILL.md'
     previous = private(backup)
     if sha(previous) != manifest['old_skill_sha256']:
         raise ValueError('owned skill rollback bytes changed')
+    guard(codex, home, manifest_path, manifest)
     write(target, previous)
-    verified, unrelated_after = snapshot(codex, home, manifest['unrelated_sha256'])
+    guard(codex, home, manifest_path, manifest)
+    verified, unrelated_after = snapshot(codex, home, expected)
     if verified != old or unrelated_after != unrelated:
         raise ValueError('public rollback readback disagrees')
     manifest['state'] = 'rolled_back'
@@ -196,6 +203,8 @@ def upgrade(codex, home, executable, config, source_skill, request_path):
 
 
 def _upgrade(codex, home, executable, config, source_skill, request_path):
+    from owned_drift import guard
+
     request = json.loads(private(request_path))
     required = {'command_id', 'expected_registration_sha256', 'expected_config_path',
                 'expected_config_sha256', 'expected_skill_sha256'}
@@ -232,14 +241,15 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
     manifest_path = (home / '.devflow-local-delivery-upgrades'
                      / request['command_id'] / 'manifest.json')
     manifest = json.loads(private(manifest_path)) if manifest_path.exists() else None
-    current, unrelated = snapshot(codex, home, manifest['unrelated_sha256'] if manifest else None)
+    expected = guard(codex, home, manifest_path, manifest) if manifest else None
+    current, unrelated = snapshot(codex, home, expected)
     if manifest is not None:
         if manifest['command_digest'] != seal(binding):
             raise ValueError('upgrade command ID already binds different inputs')
         if (seal(manifest['before']) != request['expected_registration_sha256']
                 or not registration(manifest['after'], executable, config)):
             raise ValueError('owned pointer update receipt changed')
-        if (unrelated != manifest['unrelated_sha256']
+        if (unrelated != expected
                 or current not in (manifest['before'], manifest['after'])
                 or sha(target.read_bytes()) not in (
                     request['expected_skill_sha256'], sha(new_skill))):
@@ -270,20 +280,25 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
         save(manifest_path, manifest)
     try:
         if current != manifest['after']:
+            guard(codex, home, manifest_path, manifest)
             install_pointer(codex, home, executable, config)
+            guard(codex, home, manifest_path, manifest)
+        guard(codex, home, manifest_path, manifest)
         write(target, new_skill)
-        verified, unrelated_after = snapshot(codex, home, manifest['unrelated_sha256'])
+        guard(codex, home, manifest_path, manifest)
+        verified, unrelated_after = snapshot(codex, home, expected)
         if verified != manifest['after'] or unrelated_after != unrelated:
             raise ValueError('public update readback disagrees or unrelated host settings changed')
         manifest['state'] = 'applied'
         save(manifest_path, manifest)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
-        manifest['last_error'] = str(exc)[:500]
+        manifest.setdefault('last_error', str(exc)[:500])
         save(manifest_path, manifest)
         try:
             _rollback(codex, home, manifest_path)
         except (ValueError, OSError, subprocess.SubprocessError) as restore_error:
-            manifest.update(state='unknown', rollback_error=str(restore_error)[:500])
+            manifest['state'] = 'unknown'
+            manifest.setdefault('rollback_error', str(restore_error)[:500])
             save(manifest_path, manifest)
         raise
     return {'state': 'applied', 'existing': False, 'rollback_manifest': str(manifest_path)}

@@ -78,6 +78,67 @@ python3 runtime/desktop/install.py \
   --rollback-owned-manifest /absolute/codex-home/.devflow-local-delivery-upgrades/COMMAND_ID/manifest.json
 ```
 
+An interrupted `unknown` update can encounter actual ambient host changes. One
+explicit `--acknowledge-owned-drift-request` operation records a separate immutable
+receipt under that original command. It preserves current foreign state; it does
+not normalize versions/settings, replace the historical seal, edit foreign files,
+attribute their changes or claim a new human approval. Without that receipt, the
+original unrelated-state checks still reject drift.
+
+The owned 0600 request has exactly these fields (all paths are absolute):
+
+```json
+{
+  "command_id": "ORIGINAL_OWNED_COMMAND_ID",
+  "original_request": {"path": "/private/original-request.json", "sha256": "BYTE_SHA256"},
+  "original_manifest_sha256": "ORIGINAL_UNKNOWN_JOURNAL_BYTE_SHA256",
+  "original_unrelated_sha256": "ORIGINAL_HISTORICAL_SEAL",
+  "authority": {"path": "/private/existing-installation-decision.json", "sha256": "BYTE_SHA256"},
+  "prior_snapshot": {"path": "/private/retained-prior-snapshot.json", "sha256": "BYTE_SHA256"},
+  "current_snapshot": {"path": "/private/fresh-current-snapshot.json", "sha256": "BYTE_SHA256"},
+  "delta_sha256": "SHA256_OF_TYPED_DELTA_JSON",
+  "content_indexes": [{"path": "/private/retained-content-index.json", "sha256": "BYTE_SHA256"}]
+}
+```
+
+The authority reference is the existing main task installation decision, with
+`decision_owner`, `authority_source` and `new_user_approval: false`; its exact
+bytes are bound, rather than inventing an approval. Preserve earlier decisions
+and rejection evidence. Every reference is an owned regular 0600 file. Snapshot
+JSON has exactly `settings`, `other_mcp`, `plugins` and `marketplaces` keys.
+`owned_drift.foreign_snapshot(codex, home)` reads the current public inventory and
+TOML without the owned MCP entry. Construct the prior snapshot from retained
+original evidence: its settings/MCP component must authenticate the original
+historical seal. `seal(owned_drift.delta(prior, current))` binds the complete
+typed delta, including presence/absence. Neither an obsolete observation nor a
+caller-supplied new baseline may replace the original journal.
+
+`owned_drift.content_index(cache_root)` produces the complete retained file and
+directory index, including content hashes, size, modes and ownership. Every
+changed installed plugin requires its current cache index. Roots must belong to
+currently observed foreign plugins in this Codex home's cache. Bounds are eight
+indexes, 512 files/16 MiB per index, 8 MiB per file, 1024 directories, 1 MiB per
+referenced JSON and 128 delta entries. Linked/special/foreign files reject.
+
+```sh
+python3 runtime/desktop/install.py \
+  --runtime-dir /absolute/stable/runtime --config /absolute/private/state/trusted-local.json \
+  --codex-home /absolute/codex-home \
+  --acknowledge-owned-drift-request /absolute/private/ambient-acknowledgement.json
+```
+
+The response names `ambient-drift-acknowledgement.json`, separate from the original
+pointer manifest/request. Its creation changes no pointer, skill or host setting.
+Identical replay observes that same receipt; a different request conflicts. The
+original pointer commands need no new ID or changed input: they automatically
+validate the acknowledgement and every referenced original/authority/snapshot
+and content proof. They preserve original errors/seal while checking the exact
+acknowledged current foreign state before and after each pointer/skill effect,
+including rollback and reapply. Any later setting, inventory, content, metadata
+or owned-authority change refuses before further effects. Interrupted effects
+remain observable through the same original command. A subsequent primary-plugin
+request captures fresh then-current inventory normally.
+
 Installation does not restart the service or refresh cached host clients. Stop
 the owned service separately, apply the reviewed runtime/config/pointer change,
 start through the new config, and verify discovery from a fresh client. An old
