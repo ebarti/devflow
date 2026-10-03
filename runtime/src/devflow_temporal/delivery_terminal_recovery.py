@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from copy import deepcopy
+from pathlib import Path
 
 from temporalio.client import WorkflowExecutionStatus
 
@@ -11,6 +12,7 @@ from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
+from .delivery_resources import RunResources, read_private
 
 
 async def closed_tail(store, run_id, client):
@@ -106,8 +108,28 @@ def snapshot(store, spec):
     if checks.get('terminal_tracker_checkpoint', {}).get('outcome') == 'delivered':
         published = published_readback(store, spec, candidate,
                                       json.loads(row['pr_json'] or 'null'))
-    elif candidate is not None and DeliveryBroker(store, spec).candidate() != candidate:
-        raise ValueError('terminal preserved candidate source changed')
+    elif candidate is not None:
+        if Path(spec['checkout']).exists():
+            if DeliveryBroker(store, spec).candidate() != candidate:
+                raise ValueError('terminal preserved candidate source changed')
+        else:
+            resources = RunResources(spec)
+            manifest = read_private(resources.manifest)
+            receipt = read_private(resources.root / 'finalization.json')
+            entry = manifest['roots'].get(spec['checkout'], {})
+            removed = next((r for r in receipt['roots'] if r['path'] == spec['checkout']), {})
+            expected = {'candidate': {k: candidate.get(k) for k in (
+                'head', 'content_sha256', 'id')}, 'base_sha': spec['base_sha'],
+                'outcome': 'cancelled'}
+            if (checks.get('terminal_tracker_checkpoint', {}).get('outcome') != 'cancelled'
+                    or candidate.get('head') != spec['base_sha']
+                    or candidate.get('base_sha') != spec['base_sha']
+                    or entry.get('kind') != 'checkout' or removed.get('kind') != 'checkout'
+                    or removed.get('state') not in {'removed', 'already_absent'}
+                    or receipt.get('outcome') != 'cancelled'
+                    or entry.get('clean_base_removal') != expected
+                    or removed.get('clean_base_removal') != expected):
+                raise ValueError('absent terminal source has no owning clean cancelled base proof')
     return row, {'attempts_sha256': digest(attempts), 'effects_sha256': digest(effects),
                  'claim_sha256': digest(claim), 'cleanup': cleanup, 'published': published,
                  'candidate_sha256': digest(candidate), 'work_binding': binding}

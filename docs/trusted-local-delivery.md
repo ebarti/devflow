@@ -80,6 +80,11 @@ automatic-planning submission need not equal its later accepted specification.
 The durable grant binds that history hash, the exact projected candidate/PR and checks, every
 finished attempt/effect, cleanup receipt, stopped process identities/ports and
 current ownership. Delivered targets also revalidate the published remote head.
+Retained source is rehashed against the frozen candidate. When cancellation
+deliberately removed a clean base checkout, the owning cleanup intent and receipt
+must carry the matching pre-removal content/head/base proof. Recovery authenticates
+that proof and the removed root without recreating a checkout. Missing proof or
+changed retained dirty source conflicts; no source authority is added.
 An identical command returns its existing receipt, including across an uncertain
 response and dispatch restart. The successor rechecks the seal before the first
 tracker effect, preserves original role/session results and never runs roles,

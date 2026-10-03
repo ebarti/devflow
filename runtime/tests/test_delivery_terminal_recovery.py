@@ -26,6 +26,7 @@ from devflow_temporal.delivery_activities import (
     delivery_terminal_preflight,
 )
 from devflow_temporal.delivery_api import create_app
+from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_resources import RunResources
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
@@ -336,6 +337,168 @@ class PreparedIntakeTerminalFixture(ClosedTerminalFixture):
 
     async def _run_iterations(self, spec, **_kwargs):
         return await self._stop(spec, 'Controlled post-intake gate failure')
+
+
+@workflow.defn(name='DevflowDeliveryWorkflow')
+class CancelledBeforeImplementationFixture(ClosedTerminalFixture):
+    @workflow.run
+    async def run(self, spec, recovery=None):
+        if recovery:
+            return await DeliveryWorkflow.run(self, spec, recovery)
+        candidate = await self._activity('fixture_candidate', {'spec': spec})
+        self.state = {'run_id': spec['run_id'], 'phase': 'waiting_decision',
+                      'execution_state': 'waiting_decision', 'outcome': None,
+                      'iteration': 0, 'revision': 0, 'cleanup': 'none', 'checks': {},
+                      'candidate': candidate, 'roles': [], 'error': None}
+        await self._project(spec, 'decision_required', 'Controlled initial decision')
+        await workflow.wait_condition(lambda: self.cancel_requested)
+        self.state['outcome'] = 'cancelled'
+        await self._project(spec, 'cancelled', 'Cancelled before implementation')
+        return self.state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dirty', [False, True])
+async def test_closed_cancelled_recovery_preserves_cleanup_source_contract(
+    native_configuration, monkeypatch, dirty,
+):
+    config, request = native_configuration
+    app = create_app(config.path)
+    service = app.state.delivery
+    service.store.submit(request)
+    spec = service.store.spec(request['run_id'])
+    broker = DeliveryBroker(service.store, spec)
+    broker.prepare()
+    if dirty:
+        (broker.checkout / 'preserved.txt').write_text('Preserved cancelled candidate\n')
+    candidate = broker.candidate()
+    calls = []
+
+    @activity.defn(name='fixture_candidate')
+    async def candidate_readback(_payload):
+        return candidate
+
+    @activity.defn(name='delivery_terminal_tracker')
+    async def tracker(payload):
+        calls.append('tracker')
+        pending = len(calls) <= 3
+        if not pending:
+            with service.store._connect() as db:
+                service.store.state.release_work(db, spec['work_id'],
+                                                 f"external:devflow:{spec['run_id']}")
+        return {'state': 'pending' if pending else 'consistent', 'pending': pending,
+                'desired': payload['status'], 'readback_at': 'fresh'}
+
+    async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=shutil.which('temporal'),
+    ) as environment:
+        async def client():
+            return environment.client
+
+        monkeypatch.setattr(service, 'client', client)
+        monkeypatch.setattr(service, 'healthy_client', client)
+        async with Worker(environment.client, task_queue=config.queue,
+                          workflows=[CancelledBeforeImplementationFixture],
+                          workflow_runner=UnsandboxedWorkflowRunner(),
+                          activities=[candidate_readback, delivery_project,
+                                      delivery_finalize_resources, tracker,
+                                      delivery_terminal_preflight]):
+            handle = await environment.client.start_workflow(
+                CancelledBeforeImplementationFixture.run, args=[spec, None],
+                id=f"delivery-{spec['run_id']}", task_queue=config.queue,
+                memo={'request_digest': spec['request_digest']},
+            )
+            async with asyncio.timeout(10):
+                while service.store.detail(spec['run_id'])['phase'] != 'waiting_decision':
+                    await asyncio.sleep(0.05)
+            transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
+            async with httpx.AsyncClient(transport=transport,
+                                        base_url='http://127.0.0.1:18770') as browser:
+                session = await browser.get('/api/session')
+                headers = {'Origin': 'http://127.0.0.1:18770',
+                           'X-Devflow-CSRF': session.json()['csrf_token']}
+                endpoint = f"/api/runs/{spec['run_id']}"
+                revision = service.store.detail(spec['run_id'])['protocol_revision']
+                cancel = await browser.post(endpoint + '/cancel', headers=headers, json={
+                    'command_id': 'cancel-before-implementation',
+                    'expected_revision': revision, 'reason': 'Controlled initial cancellation'})
+                assert cancel.status_code == 200, cancel.text
+                stopped = await asyncio.wait_for(handle.result(), 15)
+                assert stopped['outcome'] is None and stopped['phase'] == 'waiting_tracker'
+                assert broker.checkout.exists() == dirty
+                resources = RunResources(spec)
+                cleanup = (resources.root / 'finalization.json').read_bytes()
+                manifest = resources.manifest.read_bytes()
+                receipt = json.loads(cleanup)
+                entry = next(r for r in receipt['roots'] if r['kind'] == 'checkout')
+                assert entry['state'] == ('retained' if dirty else 'removed')
+                if not dirty:
+                    assert entry['clean_base_removal']['candidate'] == {
+                        k: candidate[k] for k in ('head', 'id', 'content_sha256')}
+                elif dirty:
+                    # A retained dirty source is still live-hashed, even for
+                    # cancellation. Changing it cannot authorize tracker recovery.
+                    changed = broker.checkout / 'preserved.txt'
+                    changed.write_text('Changed after cleanup\n')
+                    refused = await browser.post(endpoint + '/reconcile-tracker',
+                        headers=headers, json={'command_id': 'cancelled-terminal-readback',
+                        'expected_revision': stopped['revision']})
+                    assert refused.status_code == 409 and 'candidate source' in refused.text
+                    changed.write_text('Preserved cancelled candidate\n')
+                payload = {'command_id': 'cancelled-terminal-readback',
+                           'expected_revision': stopped['revision']}
+                accepted = await browser.post(endpoint + '/reconcile-tracker',
+                                              headers=headers, json=payload)
+                assert accepted.status_code == 200, accepted.text
+                await service.dispatch_once()
+                successor = environment.client.get_workflow_handle(accepted.json()['workflow_id'])
+                final = await asyncio.wait_for(successor.result(), 10)
+                assert final['outcome'] == 'cancelled' and final['candidate'] == candidate
+                assert final['roles'] == [] and len(calls) == 4
+                assert broker.checkout.exists() == dirty
+                assert (resources.root / 'finalization.json').read_bytes() == cleanup
+                assert resources.manifest.read_bytes() == manifest
+                assert (await browser.post(endpoint + '/reconcile-tracker',
+                                           headers=headers, json=payload)).json() == accepted.json()
+                assert service.store.detail(spec['run_id'])['tracker']['state'] == 'consistent'
+
+
+def test_clean_cancelled_removal_proof_survives_lost_git_completion(
+    native_configuration, monkeypatch,
+):
+    import subprocess
+
+    from devflow_temporal.delivery_store import DeliveryStore
+
+    config, request = native_configuration
+    store = DeliveryStore(config)
+    store.submit(request)
+    spec = store.spec(request['run_id'])
+    broker = DeliveryBroker(store, spec)
+    broker.prepare()
+    candidate = broker.candidate()
+    resources = RunResources(spec)
+    original = subprocess.run
+    lost = True
+
+    def remove_then_lose_receipt(argv, **kwargs):
+        nonlocal lost
+        result = original(argv, **kwargs)
+        if lost and argv[0] == 'git' and argv[3:5] == ['worktree', 'remove']:
+            lost = False
+            raise subprocess.TimeoutExpired(argv, 30)
+        return result
+
+    monkeypatch.setattr('devflow_temporal.delivery_resources.subprocess.run',
+                        remove_then_lose_receipt)
+    first = resources.finalize('cancelled')
+    assert first['state'] == 'unknown' and not broker.checkout.exists()
+    final = resources.finalize('cancelled')
+    assert final['state'] == 'confirmed'
+    entry = next(r for r in final['roots'] if r['kind'] == 'checkout')
+    assert entry['state'] == 'already_absent'
+    assert entry['clean_base_removal']['candidate'] == {
+        k: candidate[k] for k in ('head', 'id', 'content_sha256')}
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='actual native preparation required')
