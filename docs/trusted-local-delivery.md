@@ -32,6 +32,106 @@ success in the projection, and a pending delivered tracker cannot establish
 successful delivery. Older inputs without `terminal_tracker_version` retain
 legacy replay behavior.
 
-Bounded preserved-candidate policy-change recovery is being implemented in this
-repair. Installation, service restart, managed recovery, merging and deployment
-require the separately assigned operational verification.
+The terminal tracker activity uses the owning `_tracker_sync` helper. A failed
+final In review readback cannot leave a Blocked outcome with In review desired
+state: the controller records and reads back Blocked instead. Its latest pending
+readback replaces any earlier `consistent` projection. A cancellation accepted
+during the final tracker transition still wins before delivery is assigned.
+
+## Preserved-candidate execution recovery
+
+An operator can grant one explicit recovery for a stopped, unpublished native
+run whose constrained implementation or prepublication gates exhausted their
+budget. This supports multiple completed attempts with one original implementer
+session. It retains the same work ID, run ID, branch, source bytes and provider
+session. The original accepted plan, submitted configuration, closed Temporal
+tail, attempt results, process logs and cleanup evidence remain unchanged.
+Current GitHub issue requirements are read, hashed and supplied as requirements
+data to the managed roles; they are not accepted results or new authority.
+
+The public preflight binds the original specification, authentic closed Temporal
+result/execution, every stopped attempt, current candidate, same-session state,
+confirmed process/resource cleanup, released claim, completed effects, absence
+of the branch/PR on the remote and original issue evidence. Any changed or
+unavailable readback rejects admission. It observes PID/start identities and
+ports; it never kills a process to manufacture stopped evidence. An unknown or
+pending external effect cannot be retried through this operation.
+
+Create a private, owned configuration under the existing service state root by
+copying the original JSON and changing only `execution_mode` to `trusted-local`.
+The original file stays untouched. Model, effort, capacity, source scope, checks,
+deadlines and all other raw configuration must match exactly. The new preparation
+proof binds the actual installed trusted runtime/SDK/CLI and has a separate
+identity; it cannot reuse the constrained proof. The same implementation
+session's conversation/database state is copied into a new isolated role-home
+generation; credentials and permission files are regenerated.
+
+After separately authorized installation and chosen-mode verification:
+
+```sh
+devflow-delivery --config /private/state/trusted-local.json recovery-preflight --id RUN_ID
+devflow-delivery --config /private/state/trusted-local.json recover-execution --id RUN_ID --request /private/state/recovery.json
+devflow-delivery --config /private/state/trusted-local.json run --id RUN_ID
+```
+
+`recovery.json` is a private JSON object with exactly these fields:
+
+```json
+{
+  "command_id": "stable-operator-command-id",
+  "expected_precheck_sha256": "SHA256_FROM_THE_FRESH_PUBLIC_PREFLIGHT",
+  "config_path": "/private/state/trusted-local.json",
+  "config_sha256": "SHA256_OF_EXACT_PRIVATE_CONFIG_BYTES",
+  "additional_iterations": 2
+}
+```
+
+`additional_iterations: 1` authorizes only the preserved candidate's gates;
+`2` also permits one same-session implementation repair after a newly observed
+gate failure. The controller runs original prepublication checks first, then
+normal publication, independent review, checks, browser QA when configured,
+independent verification, required CI and terminal reconciliation. It does not
+blindly call implementation or turn historical failures into a pass. The
+endpoint remains `published_unmerged`.
+
+Admission atomically seals one durable grant, reacquires the released claim for
+the same managed owner, and queues a new Temporal execution for the same run.
+The original failure remains in the event timeline and recovery summary. A
+repeat of identical command bytes returns the recorded receipt; changed bytes
+under that ID or a second grant conflict. After an uncertain transport response,
+read the run/receipt with the same command ID. Outbox dispatch inspects the exact
+request/recovery memo before acknowledging an already started execution, without
+starting a duplicate. No private database mutation or model-capacity retry is
+part of this recovery.
+
+HTTP exposes `GET /api/runs/{id}/recovery-preflight` and same-origin,
+CSRF-protected `POST /api/runs/{id}/recover-execution`. The official MCP server
+exposes `recovery_preflight` and `recover_execution` over that same client. The
+dashboard status/evidence and existing plugin discovery, submission, status and
+decision tools continue to read the shared service.
+
+## Durable synthetic check evidence
+
+Trusted test checks preserve their frozen argv and environment assignments. The
+controller adds an owned `PYTEST_ADDOPTS=--basetemp=.../pytest-artifacts` so pytest
+fixtures emit declared synthetic outputs within the run's durable evidence
+directory, outside transient check TMPDIR. This does not enable an opt-in test
+flag or relax executed/skipped/deselected acceptance. A mismatched source opt-in
+contract must fail the gate and be corrected by the managed source repair.
+
+Before final cleanup, the broker retains owned regular PDF, PNG, HTML, JSON,
+XML and TXT outputs and writes a candidate-bound SHA-256 manifest. Limits are
+4096 files, 50 MiB per file and 1 GiB per check; links and foreign or unsupported
+file identities reject retention. Failed checks also retain their outputs.
+Independent verification receives these checked manifest references and must
+inspect the required physical pages and measurements. Test exit status alone
+does not establish visual QA.
+
+The public evidence index includes each retained artifact after cleanup.
+`GET /api/runs/{id}/evidence/{evidence_id}` returns its hash and text or
+base64 bytes. The `/content` suffix returns hash-verified PDF/PNG bytes for
+viewing; HTML is served as plain text, never executed. No global temporary
+directory scan, manual copying race or shared cache cleanup is required.
+
+Installation, service restart and managed recovery require the separately
+assigned operational verification. This repair does not merge or deploy.

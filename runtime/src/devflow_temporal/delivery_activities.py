@@ -259,7 +259,11 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
         try:
             store, _ = _context(request["spec"])
-            if request["recovery"].get("kind") == "scope_amendment":
+            if request["recovery"].get("kind") == "execution_policy_recovery":
+                from .delivery_policy_recovery import resume_preflight
+
+                resume_preflight(store, request["spec"], request["recovery"])
+            elif request["recovery"].get("kind") == "scope_amendment":
                 store.scope_preflight(request["spec"], request["recovery"])
             else:
                 store.repair_preflight(request["spec"], request["recovery"])

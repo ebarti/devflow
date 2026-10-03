@@ -212,6 +212,16 @@ class DeliveryWorkflow:
                 self.state.update(phase="blocked", execution_state="blocked", outcome="blocked",
                                   error="terminal tracker readback is pending")
                 event, message = "blocked", "Terminal tracker reconciliation requires recovery"
+                try:
+                    self.state["tracker"] = await self._activity(
+                        "delivery_terminal_tracker",
+                        {"spec": spec, "status": "blocked", "release": release},
+                    )
+                except Exception as exc:
+                    self.state["tracker"] = {
+                        "state": "pending", "pending": True, "reason": type(exc).__name__,
+                        "desired": "blocked; claim " + ("released" if release else "retained"),
+                    }
         await self._activity(
             "delivery_project",
             {
@@ -542,6 +552,8 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if recovery is not None:
+            if recovery.get("kind") == "execution_policy_recovery":
+                return await self._resume_policy(spec, recovery)
             if recovery.get("kind") == "scope_amendment":
                 return await self._resume_scope(spec, recovery)
             if recovery.get("kind") in {"repair_continuation", "repair_prelaunch_retry"}:
@@ -805,6 +817,44 @@ class DeliveryWorkflow:
             recovery=None,
             authorized_max_iteration=limit,
             attempt_generation=1 if prelaunch_retry else 0,
+        )
+
+    async def _resume_policy(
+        self, spec: dict[str, Any], recovery: dict[str, Any],
+    ) -> dict[str, Any]:
+        previous = recovery["state"]
+        if (recovery.get("effective_spec") != spec
+                or previous.get("run_id") != spec["run_id"]
+                or previous.get("outcome") != "blocked"
+                or recovery["start_iteration"] != previous["iteration"] + 1
+                or not recovery["start_iteration"] <= recovery["maximum_iteration"]
+                <= previous["iteration"] + 2):
+            raise ValueError("policy recovery changed its bounded closed checkpoint")
+        self.state = {**previous, "candidate": recovery["candidate"], "checks": {},
+                      "tracker": {}, "phase": "repair_preflight", "execution_state": "running",
+                      "outcome": None, "error": None, "cleanup": "none"}
+        self.state["revision"] += 1
+        await self._project(
+            spec, "policy_recovery_started", "Revalidating preserved candidate authority"
+        )
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        tracker = await self._activity("delivery_tracker_start", {"spec": spec,
+                                                                "repair_continuation": True})
+        self.state["tracker"] = tracker
+        if self.cancel_requested:
+            return await self._cancelled(spec)
+        if tracker.get("state") != "consistent":
+            return await self._stop(
+                spec, "policy recovery tracker readback is pending or conflicting"
+            )
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        return await self._run_iterations(
+            spec, start_iteration=recovery["start_iteration"],
+            prior_implementer_session=recovery["session_id"], repair_findings=[],
+            operator_brief=recovery["issue_evidence"], continuation=None, recovery=None,
+            authorized_max_iteration=recovery["maximum_iteration"], resume_prechecks=True,
         )
 
     async def _resume_scope(
@@ -1187,6 +1237,9 @@ class DeliveryWorkflow:
                             "findings": [acceptance_note] if acceptance_note else [],
                             "resume_session": None,
                             "qa_evidence": qa_evidence if role == "verify" else None,
+                            **({"check_evidence": self.state["checks"].get("local")}
+                               if role == "verify"
+                               and spec["policy"].get("host_sandbox") == "trusted-local" else {}),
                         },
                     )
                 except Exception as exc:
@@ -1248,6 +1301,8 @@ class DeliveryWorkflow:
                     return await self._cancelled(spec)
                 if tracker.get("state") != "consistent":
                     return await self._stop(spec, "tracker readback remains pending or conflicting")
+            if self.cancel_requested:
+                return await self._cancelled(spec)
             self.state["phase"] = "delivered"
             self.state["execution_state"] = "terminal"
             self.state["outcome"] = "delivered"

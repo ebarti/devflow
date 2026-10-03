@@ -32,7 +32,10 @@ SCHEMA = "devflow-native-macos-environment-v1"
 
 
 def native_identity(spec: dict) -> dict:
-    if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+    if sys.platform != "darwin" or (
+        spec["policy"].get("host_sandbox") != "trusted-local"
+        and not Path("/usr/bin/sandbox-exec").is_file()
+    ):
         raise PreparationError("native-macos execution requires macOS and its command sandbox")
     binary = Path(spec["policy"]["codex_bin"]).resolve(strict=True)
     bundled = Path(
@@ -229,7 +232,7 @@ def _measure_trusted(spec: dict, identity: dict) -> dict:
     root = RunResources(spec).scratch("preparation", "trusted-local")
     workspace, home, codex_home = root / "workspace", root / "home", root / "codex"
     scratch = home / "tmp"
-    evidence = Path(spec["state_dir"]) / "native-preparation"
+    evidence = Path(spec["state_dir"]) / "native-preparation" / "trusted-local"
     for path in (workspace, home, codex_home, scratch, evidence):
         private_directory(path)
     environment = _native_env(home, codex_home, scratch)

@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import secrets
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -286,6 +287,24 @@ def create_app(config_path: Path) -> FastAPI:
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.get("/api/runs/{run_id}/recovery-preflight")
+    async def recovery_preflight(request: Request, run_id: str) -> dict[str, Any]:
+        _host(request)
+        try:
+            return await asyncio.to_thread(service.store.policy_recovery_precheck, run_id)
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/recover-execution")
+    async def recover_execution(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        try:
+            return await asyncio.to_thread(
+                service.store.recover_execution, run_id, await request.json(),
+            )
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.post("/api/runs/{run_id}/continue-repair")
     async def continue_repair(request: Request, run_id: str) -> dict[str, Any]:
         _mutation(request)
@@ -333,6 +352,19 @@ def create_app(config_path: Path) -> FastAPI:
             return service.store.evidence(run_id, evidence_id)
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/runs/{run_id}/evidence/{evidence_id}/content")
+    async def evidence_content(request: Request, run_id: str, evidence_id: str):
+        _host(request)
+        try:
+            value = service.store.evidence(run_id, evidence_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        from fastapi.responses import Response
+
+        content = base64.b64decode(value["base64"]) if "base64" in value else value["text"]
+        return Response(content, media_type=value.get("media_type", "text/plain"),
+                        headers={"X-Content-Type-Options": "nosniff"})
 
     @app.get("/api/runs/{run_id}/events")
     async def events(request: Request, run_id: str, after: int = 0) -> StreamingResponse:

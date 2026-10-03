@@ -48,8 +48,9 @@ def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
             grants = db.execute(
                 """SELECT maximum_iteration FROM delivery_repair_grants WHERE run_id=?
                    UNION ALL SELECT maximum_iteration FROM delivery_scope_amendments WHERE run_id=?
+                   UNION ALL SELECT maximum_iteration FROM delivery_policy_recoveries WHERE run_id=?
                    """,
-                (spec["run_id"],) * 2,
+                (spec["run_id"],) * 3,
             ).fetchall()
         maximum = max([maximum, *(row[0] for row in grants)])
     if (

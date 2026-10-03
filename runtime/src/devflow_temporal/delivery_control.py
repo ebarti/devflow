@@ -435,6 +435,8 @@ def main() -> None:
             "cancel",
             "recover-publication",
             "continue-repair",
+            "recover-execution",
+            "recovery-preflight",
             "retry-prelaunch",
             "amend-scope",
         ),
@@ -470,6 +472,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "cancel",
         "recover-publication",
         "continue-repair",
+        "recover-execution",
+        "recovery-preflight",
         "retry-prelaunch",
         "amend-scope",
     }:
@@ -480,6 +484,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "cancel",
             "recover-publication",
             "continue-repair",
+            "recover-execution",
             "retry-prelaunch",
             "amend-scope",
         } and not isinstance(request, dict):
@@ -493,6 +498,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "cancel",
                 "recover-publication",
                 "continue-repair",
+                "recover-execution",
+                "recovery-preflight",
                 "retry-prelaunch",
                 "amend-scope",
             }
@@ -516,6 +523,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "cancel": lambda: caller.cancel(args.id, request),
                 "recover-publication": lambda: caller.recover_publication(args.id, request),
                 "continue-repair": lambda: caller.continue_repair(args.id, request),
+                "recover-execution": lambda: caller.recover_execution(args.id, request),
+                "recovery-preflight": lambda: caller.recovery_preflight(args.id),
                 "retry-prelaunch": lambda: caller.retry_prelaunch(args.id, request),
                 "amend-scope": lambda: caller.amend_scope(args.id, request),
             }[args.command]()

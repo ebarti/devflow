@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 import tempfile
@@ -316,7 +317,10 @@ def prepare_native_role(
         raise ValueError("real role did not require the native profile boundary")
     workspace = Path(request["workspace"]).resolve(strict=True)
     _remove_generated_project_directory(workspace)
-    role_home = Path(spec["state_dir"]) / "role-homes" / request["role"]
+    role_home = Path(spec["state_dir"]) / "role-homes" / (
+        request["role"] + ("-" + spec["role_home_generation"]
+                           if spec.get("role_home_generation") else "")
+    )
     if request["role"] != "implement":
         role_home /= str(request["iteration"])
     codex_home = role_home / "codex"
@@ -474,6 +478,10 @@ def prepare_native_check(
             "npm_config_build_from_source": "true",
         }
     )
+    if trusted_local(spec) and check.get("kind") == "test":
+        artifacts = evidence_dir / check["id"] / "pytest-artifacts"
+        _private(artifacts)
+        env["PYTEST_ADDOPTS"] = "--basetemp=" + shlex.quote(str(artifacts))
     if toolchain_roots:
         env["npm_config_nodedir"] = str(toolchain_roots[0])
     if cache:
@@ -502,7 +510,7 @@ def prepare_browser_qa(
         "native-profile", "trusted-local",
     }:
         raise ValueError("real browser QA requires the admitted macOS boundary")
-    if not Path("/usr/bin/sandbox-exec").is_file():
+    if not trusted_local(spec) and not Path("/usr/bin/sandbox-exec").is_file():
         raise ValueError("required macOS sandbox-exec is unavailable")
     checkout = checkout.resolve(strict=True)
     state_root = Path(spec["state_dir"]).parent.parent.resolve(strict=True)

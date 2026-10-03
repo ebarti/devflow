@@ -409,6 +409,7 @@ class DeliveryBroker:
             ):
                 raise ValueError("configured check command or cwd is invalid")
             native_result = None
+            check_evidence = None
             if self.spec["provider"] == "codex":
                 from .delivery_native_process import NativeProcess
                 from .delivery_preparation import verify_prepared_spec
@@ -468,6 +469,15 @@ class DeliveryBroker:
                 os.chmod(artifact, 0o600)
             else:
                 raise ValueError("unknown delivery provider")
+            evidence_failure = None
+            if (self.spec["policy"].get("host_sandbox") == "trusted-local"
+                    and check.get("kind") == "test"):
+                from .delivery_check_evidence import retain_artifacts
+
+                try:
+                    check_evidence = retain_artifacts(evidence_dir / check["id"], candidate)
+                except (ValueError, OSError) as exc:
+                    evidence_failure = str(exc)
             parsed_output = visible_output(output)
             count = None
             if check.get("test_count_regex"):
@@ -477,6 +487,7 @@ class DeliveryBroker:
                 rejected_output = re.search(check["reject_regex"], parsed_output) is not None
             passed = (
                 exit_code == 0
+                and evidence_failure is None
                 and (count is None or count >= int(check.get("min_tests", 1)))
                 and not rejected_output
             )
@@ -492,6 +503,8 @@ class DeliveryBroker:
                     "diagnostic": parsed_output[-2000:] if not passed else None,
                     "log": str(artifact),
                     "log_sha256": _sha256(artifact),
+                    **({"artifacts": check_evidence} if check_evidence else {}),
+                    **({"evidence_failure": evidence_failure} if evidence_failure else {}),
                     "cleanup": "confirmed",
                     **(
                         {

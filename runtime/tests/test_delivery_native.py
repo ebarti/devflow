@@ -347,6 +347,12 @@ class ControlledNativeTerminalFixture:
         return controller.state
 
 
+@activity.defn(name="delivery_terminal_tracker")
+async def controlled_terminal_tracker(request):
+    return {"state": "consistent", "pending": False, "desired": request["status"],
+            "release": request["release"], "observed": {"fixture": True}}
+
+
 @pytest.mark.parametrize(
     "outcome,uncertain",
     [
@@ -376,7 +382,7 @@ async def test_real_terminal_workflow_removes_owned_temps_before_projection(
             task_queue="controlled-native-terminal",
             workflows=[ControlledNativeTerminalFixture],
             workflow_runner=UnsandboxedWorkflowRunner(),
-            activities=[delivery_project, delivery_finalize_resources],
+            activities=[delivery_project, delivery_finalize_resources, controlled_terminal_tracker],
         ):
             result = await environment.client.execute_workflow(
                 ControlledNativeTerminalFixture.run,

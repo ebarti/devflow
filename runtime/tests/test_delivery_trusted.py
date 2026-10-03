@@ -131,3 +131,95 @@ def test_trusted_preparation_and_broker_check_compile_with_discovered_sdk(
     finally:
         receipt = RunResources(spec).finalize('cancelled')
     assert receipt['resource_cleanup'] == 'confirmed'
+
+
+@pytest.mark.asyncio
+async def test_failed_final_readback_requests_blocked_reconciliation():
+    controller = DeliveryWorkflow()
+    controller.state = {'phase': 'delivered', 'execution_state': 'terminal', 'outcome': 'delivered',
+                        'iteration': 0, 'revision': 1, 'cleanup': 'none', 'checks': {}}
+    requested = []
+
+    async def execute(name, request, **_kwargs):
+        if name == 'delivery_finalize_resources':
+            return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+                    'resource_cleanup': 'confirmed'}
+        if name == 'delivery_terminal_tracker':
+            requested.append(request['status'])
+            return {'state': 'pending', 'pending': True, 'desired': request['status']}
+        assert request['outcome'] == 'blocked'
+        assert request['tracker']['desired'] == 'blocked'
+        return {}
+
+    controller._activity = execute
+    await controller._project({'resource_cleanup_version': 1, 'terminal_tracker_version': 1},
+                              'delivered', 'final')
+    assert requested == ['in-review', 'blocked']
+    assert controller.state['outcome'] == 'blocked'
+
+
+def test_retained_artifact_manifest_rejects_mutation_and_links(tmp_path):
+    from devflow_temporal.delivery_check_evidence import retain_artifacts, verify_manifest
+
+    source = tmp_path / 'pytest-artifacts' / 'trial'
+    source.mkdir(parents=True)
+    (source / 'case.pdf').write_bytes(b'%PDF-1.7 synthetic output')
+    (source / 'page.png').write_bytes(b'controlled PNG bytes')
+    ref = retain_artifacts(tmp_path, {'id': 'candidate'})
+    manifest = verify_manifest(ref, 'candidate', tmp_path)
+    assert manifest['count'] == 2
+    assert {Path(item['path']).suffix for item in manifest['artifacts']} == {'.pdf', '.png'}
+    Path(manifest['artifacts'][0]['path']).write_bytes(b'altered')
+    with pytest.raises(ValueError, match='changed'):
+        verify_manifest(ref, 'candidate', tmp_path)
+    (source / '00-leak.png').symlink_to('/etc/hosts')
+    with pytest.raises(ValueError, match='regular file'):
+        retain_artifacts(tmp_path, {'id': 'candidate'})
+
+
+@pytest.mark.skipif(__import__('sys').platform != 'darwin', reason='actual macOS host required')
+def test_actual_broker_preserves_binary_evidence_after_resource_finalization(native_configuration):
+    import base64
+    import hashlib
+    import json
+    import sys
+
+    from devflow_temporal.delivery_broker import DeliveryBroker
+    from devflow_temporal.delivery_preparation import prepare_authority
+    from devflow_temporal.delivery_resources import RunResources
+
+    config, request = native_configuration
+    config.raw['execution_mode'] = 'trusted-local'
+    check = {**config.raw['repositories']['fixture']['checks'][0], 'kind': 'test', 'argv': [
+        str(Path(sys.executable).resolve()), '-c',
+        "import os,pathlib,shlex; p=pathlib.Path(shlex.split(os.environ['PYTEST_ADDOPTS'])[0]"
+        ".split('=',1)[1]); p.mkdir(exist_ok=True); "
+        "(p/'trial.pdf').write_bytes(b'%PDF-1.7 Synthetic'); "
+        "(p/'page.png').write_bytes(b'controlled png'); print('2 passed')",
+    ]}
+    config.raw['repositories']['fixture']['checks'] = [check]
+    config.path.write_text(json.dumps(config.raw))
+    store = DeliveryStore(config)
+    store.submit(request)
+    spec = prepare_authority(store, store.spec(request['run_id']))
+    broker = DeliveryBroker(store, spec)
+    candidate = broker.prepare()['candidate']
+    result = broker.run_checks(0, candidate)
+    assert result['state'] == 'passed'
+    reference = result['results'][0]['artifacts']
+    assert reference['count'] == 2
+    store.project(spec['run_id'], phase='blocked', execution_state='blocked', event_type='blocked',
+                  message='controlled evidence fixture', checks={'local': result},
+                  iteration=0, outcome='blocked', cleanup='none')
+    finalized = RunResources(spec).finalize('blocked')
+    assert finalized['resource_cleanup'] == 'confirmed'
+    manifest = json.loads(Path(reference['path']).read_bytes())
+    assert manifest['count'] == 2
+    assert all(Path(item['path']).exists() for item in manifest['artifacts'])
+    indexed = store.evidence_index(spec['run_id'])
+    pdf = next(item for item in indexed if item['label'] == 'trial.pdf')
+    value = store.evidence(spec['run_id'], pdf['id'])
+    assert base64.b64decode(value['base64']) == b'%PDF-1.7 Synthetic'
+    assert value['sha256'] == hashlib.sha256(b'%PDF-1.7 Synthetic').hexdigest()
+    assert value['media_type'] == 'application/pdf'
+    assert value['content_url'].endswith('/content')

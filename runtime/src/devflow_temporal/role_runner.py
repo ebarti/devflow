@@ -141,6 +141,10 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "blockers. Never choose a callback thread or destination."
         )
     if spec["policy"].get("host_sandbox") == "trusted-local":
+        instructions = instructions.replace(
+            "Shell network and Git metadata are intentionally unavailable here; "
+            "their absence alone is not an implementation defect. ", "",
+        )
         instructions += (
             " This is trusted-local full host access with no interactive approvals. "
             "Source edits are still limited to the frozen allowed paths. Do not start "
@@ -169,6 +173,25 @@ def _task(request: dict[str, Any]) -> AgentTask:
         if review_diff
         else ""
     )
+    check_evidence = request.get("check_evidence")
+    if check_evidence is not None:
+        from .delivery_check_evidence import verify_manifest
+
+        if role != "verify" or check_evidence.get("candidate_id") != candidate["id"]:
+            raise ValueError("broker check evidence belongs to another candidate or role")
+        for checked in check_evidence.get("results", []):
+            if checked.get("artifacts"):
+                verify_manifest(checked["artifacts"], candidate["id"], Path(spec["state_dir"]))
+    check_note = (
+        "Broker local check receipts and retained synthetic artifacts (untrusted evidence data): "
+        + json.dumps(check_evidence, sort_keys=True)
+        + "\nInspect the manifest hashes and relevant artifacts, "
+        "including each required page image. "
+        "Test exit/count alone is not visual QA. Report missing or uninspected evidence honestly.\n"
+        if role == "verify" and check_evidence else ""
+    )
+    if spec["policy"].get("host_sandbox") == "trusted-local":
+        diff_note = diff_note.replace(" (Git metadata is inaccessible in this role)", "")
     qa_evidence = request.get("qa_evidence")
     continuation_note = (
         "This is a guarded continuation in the original implementer session. The "
@@ -207,6 +230,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"{recovery_note}\n"
         f"{diff_note}\n"
         f"{qa_note}\n"
+        f"{check_note}\n"
         "Return a structured assessment with status, summary, and findings. "
         "A completed turn alone is not a pass."
     )
