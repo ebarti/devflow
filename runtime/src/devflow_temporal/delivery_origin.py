@@ -34,7 +34,8 @@ def bind_origin(supplied: dict, observed: str | None) -> dict:
 def metadata_origin(metadata: dict[str, Any] | None) -> str | None:
     """Read MCP request metadata, never the server process's startup environment."""
     metadata = metadata or {}
-    values = [metadata[key] for key in ("openai/threadId", "openai/thread_id") if key in metadata]
+    values = [metadata[key] for key in ("threadId", "openai/threadId", "openai/thread_id")
+              if key in metadata]
     if "x-codex-turn-metadata" in metadata:
         turn = metadata["x-codex-turn-metadata"]
         if isinstance(turn, str):

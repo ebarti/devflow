@@ -2696,6 +2696,15 @@ class DeliveryStore:
             (item["run_id"], item["decision_id"], item["decision_revision"]),
         ).fetchone() is not None
 
+    def _owns_question_notification(self, db: sqlite3.Connection, item: dict) -> bool:
+        row = db.execute("SELECT request_json FROM delivery_runs WHERE run_id=?",
+                         (item["run_id"],)).fetchone()
+        spec = json.loads(row[0]) if row else {}
+        return (
+            spec.get("config_path") == str(self.config.path)
+            and spec.get("state_dir") == str(self.config.state_root / "runs" / item["run_id"])
+        )
+
     def _question_notification_state(
         self, db: sqlite3.Connection, notification_id: str, state: str, receipt: dict | None = None
     ) -> None:
@@ -2718,8 +2727,11 @@ class DeliveryStore:
         """Called only under exclusive sender ownership; abandoned sends are uncertain."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            for row in db.execute("SELECT notification_id FROM delivery_question_notifications "
+            for row in db.execute("SELECT notification_id,run_id "
+                                  "FROM delivery_question_notifications "
                                   "WHERE state='dispatching'").fetchall():
+                if not self._owns_question_notification(db, dict(row)):
+                    continue
                 self._question_notification_state(
                     db, row[0], "unknown",
                     {"reason": "sender stopped before acknowledgement was recorded"},
@@ -2733,6 +2745,8 @@ class DeliveryStore:
                 "ORDER BY updated_at,notification_id"
             ).fetchall():
                 item = dict(row)
+                if not self._owns_question_notification(db, item):
+                    continue
                 if self._question_command_inflight(db, item):
                     continue
                 if not self._question_is_current(db, item):

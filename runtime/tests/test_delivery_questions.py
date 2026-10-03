@@ -15,6 +15,7 @@ import pytest
 from mcp.server.fastmcp import Context
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.context import RequestContext
+from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import RequestParams
 from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
@@ -81,6 +82,7 @@ def test_origin_is_optional_immutable_and_not_captured_from_service_env(
     {"x-codex-turn-metadata": {"thread_id": THREAD}},
     {"x-codex-turn-metadata": json.dumps({"thread_id": THREAD})},
     {"openai/threadId": THREAD}, {"openai/thread_id": THREAD},
+    {"threadId": THREAD},
 ])
 def test_metadata_origin_aliases(metadata):
     assert metadata_origin(metadata) == THREAD
@@ -343,9 +345,13 @@ pump_blocking_questions(DeliveryStore(DeliveryConfig.load(Path(sys.argv[1]))),Cr
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("justified", [True, False])
+@pytest.mark.parametrize("justified,racing", [
+    pytest.param(True, False, id="blocking"),
+    pytest.param(False, False, id="unjustified"),
+    pytest.param(True, True, id="receiver-race"),
+])
 async def test_public_blocking_question_callback_and_actual_user_answer_resume_temporal(
-    intake_fixture, tmp_path, justified
+    intake_fixture, tmp_path, justified, racing
 ):
     path, request = intake_fixture
     binary, log = _queue_binary(tmp_path)
@@ -354,7 +360,8 @@ async def test_public_blocking_question_callback_and_actual_user_answer_resume_t
     question = config["fake_intake"][0]
     if not justified:
         question["questions"][0].pop("blocker")
-    config["fake_intake"] = [question, config["fake_intake"][2]]
+    config["fake_intake"] = [question, *([config["fake_intake"][1]] if racing else []),
+                             config["fake_intake"][2]]
     path.write_text(json.dumps(config))
     app = create_app(path)
     service = app.state.delivery
@@ -414,6 +421,8 @@ async def test_public_blocking_question_callback_and_actual_user_answer_resume_t
                     await service.dispatch_questions_once()
                     assert service.store.question_notifications("run-1")[0]["state"] == "queued"
                     assert not implemented  # A callback cannot answer or grant authority.
+                    presented = (detail["id"], decision["id"], decision["revision"],
+                                 decision["candidate_revision"], detail["candidate"]["id"])
             if justified:
                 # Restart both service sender and Temporal worker while waiting.
                 restarted = DeliveryService(path)
@@ -429,6 +438,44 @@ async def test_public_blocking_question_callback_and_actual_user_answer_resume_t
                               "decision_revision": decision["revision"],
                               "candidate_revision": decision["candidate_revision"],
                               "answer": "User's exact required wording"}
+                    if racing:
+                        # Another dashboard client answers Q1 while the callback's
+                        # human is still composing an answer to the presented Q1.
+                        dashboard_answer = {**answer, "command_id": "dashboard-answer",
+                                            "answer": "Dashboard supplied Q1 wording"}
+                        response = await browser.post("/api/runs/run-1/decision", headers=headers,
+                                                      json=dashboard_answer)
+                        assert response.status_code == 200, response.text
+                        for _ in range(200):
+                            current = (await browser.get("/api/runs/run-1")).json()["run"]
+                            if (current["decisions"]
+                                and current["decisions"][0]["id"] != presented[1]):
+                                break
+                            await asyncio.sleep(.05)
+                        q2 = current["decisions"][0]
+                        refreshed = (current["id"], q2["id"], q2["revision"],
+                                     q2["candidate_revision"], current["candidate"]["id"])
+                        assert refreshed != presented and q2["prompt"] == "Which format?"
+                        assert not implemented
+                        # Refreshing only the protocol revision does not authorize
+                        # rebinding Q1's old answer to Q2. Frozen IDs fail closed.
+                        delayed = {**answer, "command_id": "delayed-q1-answer",
+                                   "expected_revision": current["protocol_revision"]}
+                        refused = await browser.post("/api/runs/run-1/decision", headers=headers,
+                                                     json=delayed)
+                        assert refused.status_code == 409, refused.text
+                        unchanged = (await browser.get("/api/runs/run-1")).json()["run"]
+                        assert unchanged["decisions"][0] == q2
+                        assert [item["answer"] for item in unchanged["intake"]["answers"]] == [
+                            dashboard_answer["answer"]
+                        ]
+                        # The changed identity requires a separately presented Q2
+                        # and a fresh actual user's answer, never delayed Q1 text.
+                        answer = {"command_id": "fresh-q2-answer",
+                                  "expected_revision": unchanged["protocol_revision"],
+                                  "decision_id": q2["id"], "decision_revision": q2["revision"],
+                                  "candidate_revision": q2["candidate_revision"],
+                                  "answer": "User's separately requested Markdown format"}
                     response = await browser.post("/api/runs/run-1/decision", headers=headers,
                                                   json=answer)
                     assert response.status_code == 200, response.text
@@ -441,7 +488,10 @@ async def test_public_blocking_question_callback_and_actual_user_answer_resume_t
                 assert implemented[0]["origin_thread_id"] == THREAD
                 assert implemented[0]["authorized_endpoint"] == request["authorized_endpoint"]
                 assert implemented[0]["policy"]["allowed_paths"] == ["README.md"]
-                assert final["intake"]["answers"][0]["answer"] == answer["answer"]
+                assert final["intake"]["answers"][-1]["answer"] == answer["answer"]
+                if racing:
+                    assert not any(item["answer"] == delayed["answer"]
+                                   for item in final["intake"]["answers"])
                 assert final["intake"]["accepted_plan"]["authorization"]["source"] == (
                     "run_authorization"
                 )
@@ -454,6 +504,7 @@ async def test_public_blocking_question_callback_and_actual_user_answer_resume_t
 @pytest.mark.parametrize("metadata", [
     {"x-codex-turn-metadata": "bad json"}, {"x-codex-turn-metadata": []},
     {"x-codex-turn-metadata": {"thread_id": None}}, {"openai/threadId": "wrong"},
+    {"threadId": None},
 ])
 def test_malformed_caller_metadata_is_never_an_unbound_fallback(metadata):
     with pytest.raises(ValueError):
@@ -475,3 +526,78 @@ def test_question_projection_and_frozen_callback_are_one_transaction(intake_fixt
                               event_type="question_pending", message="unjustified question",
                               decision={**decision, "blocker": {}}, key="unjustified")
     assert service.store.detail("run-1") == before
+
+
+@pytest.mark.asyncio
+async def test_raw_mcp_session_native_thread_id_is_the_submission_origin(
+    intake_fixture, monkeypatch
+):
+    path, request = intake_fixture
+    store = create_app(path).state.delivery.store
+    monkeypatch.setenv("CODEX_THREAD_ID", OTHER)
+    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", lambda _path: SimpleNamespace(
+        submit=store.submit
+    ))
+    async with create_connected_server_and_client_session(build_server(path)) as session:
+        result = await session.call_tool("submit_run", {"request_json": json.dumps(request)},
+                                         meta={"threadId": THREAD})
+        assert not result.isError
+        assert store.spec("run-1")["origin_thread_id"] == THREAD
+        second = {**request, "command_id": "submit-2", "run_id": "run-2", "work_id": "work-2",
+                  "branch": "feat/fixture-2", "issue_url": request["issue_url"].replace("/3", "/4")}
+        result = await session.call_tool("submit_run", {"request_json": json.dumps(second)},
+                                         meta={"sessionId": OTHER})
+        assert not result.isError
+        assert "origin_thread_id" not in store.spec("run-2")
+        for metadata, body in (
+            ({"threadId": THREAD, "openai/threadId": OTHER}, second),
+            ({"threadId": THREAD}, {**second, "origin_thread_id": OTHER}),
+        ):
+            rejected = await session.call_tool("submit_run", {"request_json": json.dumps(body)},
+                                               meta=metadata)
+            assert rejected.isError and "disagrees" in rejected.content[0].text
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("active_owner", [False, True])
+def test_shared_database_sender_cannot_consume_or_abandon_another_service_question(
+    intake_fixture, tmp_path, active_owner
+):
+    owner, log = _store_with_queue(intake_fixture, tmp_path)
+    _question(owner.store)
+    other_config = {**owner.config.raw, "state_root": str(tmp_path / "other-state"),
+                    "dashboard_url": "http://127.0.0.1:18771"}
+    other_path = tmp_path / "other-service.json"
+    other_path.write_text(json.dumps(other_config))
+    other = DeliveryService(other_path)
+    assert other.store.spec("run-1") == owner.store.spec("run-1")
+    if active_owner:
+        class PumpOtherService(CodexQuestionQueue):
+            def send(self, *args, **kwargs):
+                pump_blocking_questions(other.store)
+                assert owner.store.question_notifications("run-1")[0]["state"] == "dispatching"
+                return super().send(*args, **kwargs)
+        pump_blocking_questions(owner.store, PumpOtherService())
+    else:
+        before = owner.store.detail("run-1")
+        pump_blocking_questions(other.store)
+        assert owner.store.detail("run-1") == before
+        assert owner.store.question_notifications("run-1")[0]["state"] == "pending"
+        assert not log.exists()
+        pump_blocking_questions(owner.store)
+    assert owner.store.question_notifications("run-1")[0]["state"] == "queued"
+    assert len(log.read_text().splitlines()) == 1
+
+
+def test_receiving_skill_freezes_presented_question_across_human_wait():
+    skill = (Path(__file__).resolve().parents[1] / "desktop" /
+             "devflow-local-delivery" / "SKILL.md").read_text()
+    freeze = skill.index("presented_identity = (run.id, decision.id, decision.revision, "
+                         "decision.candidate_revision, run.candidate.id)")
+    human_wait = skill.index("wait for their answer", freeze)
+    recheck = skill.index("exactly the same `presented_identity`", human_wait)
+    discard = skill.index("discard the delayed answer", recheck)
+    assert freeze < human_wait < recheck < discard
+    assert "Never rebind an old answer to new decision or candidate IDs" in skill
+    assert "refreshed `protocol_revision` and the frozen decision ID" in skill
