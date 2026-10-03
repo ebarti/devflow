@@ -146,3 +146,34 @@ def test_applied_switch_conflict_never_overwrites_changed_cache(primary):
     with pytest.raises(ValueError, match='differs|changed'):
         module.rollback('codex', fixture['home'], Path(first['rollback_manifest']))
     assert cache.read_text() == 'User changed installed plugin' and state['effects'] == effects
+
+
+def test_primary_unknown_uses_same_narrow_stdio_default_compatibility(primary, monkeypatch):
+    module, fixture, runtime, config, request, state = primary
+    host_config = fixture['home'] / 'config.toml'
+    host_config.write_text(host_config.read_text() +
+        '[mcp_servers.node_repl]\ncommand="/usr/bin/true"\n'
+        'args=[]\nstartup_timeout_sec=10\n')
+    original = module.command
+
+    def canonicalizing_command(*args):
+        result = original(*args)
+        if args[2:4] == ('plugin', 'add'):
+            host_config.write_text(host_config.read_text().replace('args=[]\n', '').replace(
+                'startup_timeout_sec=10\n', 'startup_timeout_sec=10.0\n'))
+        return result
+
+    monkeypatch.setattr(module, 'command', canonicalizing_command)
+    semantic = module.unrelated_seal
+    monkeypatch.setattr(module, 'unrelated_seal', lambda value, expected=None: module.seal(value))
+    with pytest.raises(ValueError, match='host settings changed'):
+        module.activate('codex', fixture['home'], runtime, config, request)
+    manifest = fixture['home'] / '.devflow-local-delivery-upgrades/primary-switch/manifest.json'
+    unknown = json.loads(manifest.read_text())
+    assert unknown['state'] == 'unknown'
+    monkeypatch.setattr(module, 'unrelated_seal', semantic)
+    accepted = module.activate('codex', fixture['home'], runtime, config, request)
+    assert accepted['state'] == 'applied'
+    assert sum(effect[:2] == ('plugin', 'add') for effect in state['effects']) == 1
+    assert json.loads(manifest.read_text())['last_error'] == unknown['last_error']
+    assert module.rollback('codex', fixture['home'], manifest)['state'] == 'rolled_back'

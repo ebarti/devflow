@@ -4,12 +4,14 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat
 import subprocess
 import tomllib
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 
 NAME = 'devflow-local-delivery'
@@ -21,6 +23,51 @@ def sha(content):
 
 def seal(value):
     return sha(json.dumps(value, sort_keys=True, separators=(',', ':'), default=str).encode())
+
+
+def unrelated_seal(value, expected=None):
+    """Only evidenced public-CLI stdio defaults are representation-equivalent."""
+    canonical = deepcopy(value)
+    alternatives = []
+    for entry in canonical.get('settings', {}).get('mcp_servers', {}).values():
+        if not isinstance(entry, dict) or not isinstance(entry.get('command'), str):
+            continue
+        if 'args' not in entry or entry['args'] == []:
+            entry.pop('args', None)
+            alternatives.append((entry, 'args', []))
+        if 'startup_timeout_sec' in entry:
+            seconds = entry['startup_timeout_sec']
+            if (type(seconds) not in (int, float)
+                    or (isinstance(seconds, float) and not math.isfinite(seconds))):
+                raise ValueError('stdio startup timeout must be finite numeric seconds')
+            if isinstance(seconds, int) or seconds.is_integer():
+                entry['startup_timeout_sec'] = int(seconds)
+                try:
+                    floating = float(seconds)
+                except OverflowError:
+                    continue
+                if math.isfinite(floating) and floating == int(seconds):
+                    alternatives.append((entry, 'startup_timeout_sec', floating))
+    result = seal(canonical)
+    if expected is None or result == expected:
+        return result
+    if seal(value) == expected:
+        return expected
+    # Legacy journals stored only a raw digest. Reconstruct exclusively these
+    # equivalent representations, never adopt a fresh baseline. Limit work on
+    # old receipts; new canonical receipts need no compatibility search.
+    if len(alternatives) <= 12:
+        for mask in range(1 << len(alternatives)):
+            for index, (entry, key, alternate) in enumerate(alternatives):
+                if key == 'args':
+                    entry.pop(key, None)
+                else:
+                    entry[key] = int(alternate)
+                if mask & (1 << index):
+                    entry[key] = alternate
+            if seal(canonical) == expected:
+                return expected
+    return result
 
 
 def private(path):
@@ -63,7 +110,7 @@ def cli(codex, home, *args):
     return json.loads(result.stdout) if args[-1] == '--json' else None
 
 
-def snapshot(codex, home):
+def snapshot(codex, home, expected_unrelated=None):
     entries = cli(codex, home, 'list', '--json')
     if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
         raise ValueError('unexpected public MCP inventory')
@@ -71,9 +118,9 @@ def snapshot(codex, home):
     config = home / 'config.toml'
     settings = tomllib.loads(config.read_text()) if config.exists() else {}
     settings.get('mcp_servers', {}).pop(NAME, None)
-    return entry, seal({'settings': settings,
+    return entry, unrelated_seal({'settings': settings,
                         'other_mcp': sorted((e for e in entries if e['name'] != NAME),
-                                            key=lambda e: e['name'])})
+                                            key=lambda e: e['name'])}, expected_unrelated)
 
 
 def registration(entry, executable, config):
@@ -120,7 +167,7 @@ def _rollback(codex, home, manifest_path):
     if (not manifest_path.resolve().is_relative_to(expected_root.resolve())
             or manifest['codex_home'] != str(home)):
         raise ValueError('rollback receipt belongs to another host installation')
-    current, unrelated = snapshot(codex, home)
+    current, unrelated = snapshot(codex, home, manifest['unrelated_sha256'])
     old, new = manifest['before'], manifest['after']
     target = home / 'skills' / NAME / 'SKILL.md'
     if (unrelated != manifest['unrelated_sha256'] or current not in (old, new)
@@ -135,7 +182,7 @@ def _rollback(codex, home, manifest_path):
     if sha(previous) != manifest['old_skill_sha256']:
         raise ValueError('owned skill rollback bytes changed')
     write(target, previous)
-    verified, unrelated_after = snapshot(codex, home)
+    verified, unrelated_after = snapshot(codex, home, manifest['unrelated_sha256'])
     if verified != old or unrelated_after != unrelated:
         raise ValueError('public rollback readback disagrees')
     manifest['state'] = 'rolled_back'
@@ -173,7 +220,6 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
             or after_config.pop('execution_mode', None) != 'trusted-local'
             or before_config != after_config):
         raise ValueError('owned pointer update permits only the trusted execution mode delta')
-    current, unrelated = snapshot(codex, home)
     target = home / 'skills' / NAME / 'SKILL.md'
     if target.is_symlink() or target.parent.is_symlink() or home.is_symlink():
         raise ValueError('owned skill/home is linked')
@@ -185,8 +231,9 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
                'config_sha256': sha(private(config)), 'new_skill_sha256': sha(new_skill)}
     manifest_path = (home / '.devflow-local-delivery-upgrades'
                      / request['command_id'] / 'manifest.json')
-    if manifest_path.exists():
-        manifest = json.loads(private(manifest_path))
+    manifest = json.loads(private(manifest_path)) if manifest_path.exists() else None
+    current, unrelated = snapshot(codex, home, manifest['unrelated_sha256'] if manifest else None)
+    if manifest is not None:
         if manifest['command_digest'] != seal(binding):
             raise ValueError('upgrade command ID already binds different inputs')
         if (seal(manifest['before']) != request['expected_registration_sha256']
@@ -225,7 +272,7 @@ def _upgrade(codex, home, executable, config, source_skill, request_path):
         if current != manifest['after']:
             install_pointer(codex, home, executable, config)
         write(target, new_skill)
-        verified, unrelated_after = snapshot(codex, home)
+        verified, unrelated_after = snapshot(codex, home, manifest['unrelated_sha256'])
         if verified != manifest['after'] or unrelated_after != unrelated:
             raise ValueError('public update readback disagrees or unrelated host settings changed')
         manifest['state'] = 'applied'

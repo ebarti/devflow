@@ -44,6 +44,16 @@ through the supported public CLI and the one local-delivery skill, checking all
 other MCP entries and host configuration semantics before and after. It does
 not edit configuration TOML directly or change agents/models/plugins.
 
+Unrelated-state seals normalize only the public CLI's evidenced stdio TOML
+representations: absent versus empty `args`, and finite integral
+`startup_timeout_sec` integer/float values that represent exactly the same
+seconds. Boolean/non-finite timeouts, changed values and every other field remain
+conflicts. Older journals retain their original raw digest; stable replay and
+rollback reconstruct only those equivalent representations and must match that
+exact digest. Compatibility search is bounded to twelve such fields; new
+canonical journals need no search. No new baseline or private manifest rewrite
+is accepted. Original rejection/rollback errors remain in a recovered journal.
+
 ```sh
 python3 runtime/desktop/install.py \
   --runtime-dir /absolute/stable/runtime \

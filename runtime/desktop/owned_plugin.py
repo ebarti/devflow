@@ -9,7 +9,17 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from owned_upgrade import NAME, install_pointer, locked, private, registration, save, seal, sha
+from owned_upgrade import (
+    NAME,
+    install_pointer,
+    locked,
+    private,
+    registration,
+    save,
+    seal,
+    sha,
+    unrelated_seal,
+)
 from package_plugin import ENTRY, SOURCE, check_path, check_plugin, json_bytes
 
 PLUGIN = 'devflow@devflow-local'
@@ -24,7 +34,7 @@ def command(codex, home, *args):
     return json.loads(result.stdout) if args[-1] == '--json' else result.stdout
 
 
-def snapshot(codex, home):
+def snapshot(codex, home, expected_unrelated=None):
     mcp = command(codex, home, 'mcp', 'list', '--json')
     plugins = command(codex, home, 'plugin', 'list', '--json')
     text = command(codex, home, 'plugin', 'marketplace', 'list')
@@ -55,11 +65,12 @@ def snapshot(codex, home):
     return {'direct': direct, 'plugin': own[0] if own else None,
             'marketplace': marketplaces.get(MARKET),
             'plugins_sha256': seal(plugins), 'marketplaces_sha256': seal(marketplaces),
-            'unrelated_sha256': seal({'settings': settings,
+            'unrelated_sha256': unrelated_seal({'settings': settings,
                 'mcp': sorted((e for e in mcp if e.get('name') != NAME), key=lambda e: e['name']),
                 'plugins': {**plugins, 'installed': [e for e in plugins['installed']
                                                     if e.get('pluginId') != PLUGIN]},
-                'marketplaces': {k: v for k, v in marketplaces.items() if k != MARKET}})}
+                'marketplaces': {k: v for k, v in marketplaces.items() if k != MARKET}},
+                                               expected_unrelated)}
 
 
 def package_files(runtime, config):
@@ -167,9 +178,10 @@ def activate(codex, home, runtime, config, request_path):
         binding = seal({'request': request, 'runtime': str(runtime), 'config': str(config),
                         'home': str(home), 'package': {k: sha(v) for k, v in files.items()}})
         path = home / '.devflow-local-delivery-upgrades' / request['command_id'] / 'manifest.json'
-        current = snapshot(codex, home)
-        if path.exists():
-            manifest = json.loads(private(path))
+        manifest = json.loads(private(path)) if path.exists() else None
+        current = snapshot(codex, home,
+                           manifest['before']['unrelated_sha256'] if manifest else None)
+        if manifest is not None:
             if manifest['command_digest'] != binding:
                 raise ValueError('activation command ID already binds different inputs')
             if manifest['state'] == 'rolled_back':
@@ -203,11 +215,11 @@ def activate(codex, home, runtime, config, request_path):
         try:
             if current['marketplace'] is None:
                 command(codex, home, 'plugin', 'marketplace', 'add', str(root))
-            current = snapshot(codex, home)
+            current = snapshot(codex, home, manifest['before']['unrelated_sha256'])
             owned_state(home, current, manifest, files)
             if current['plugin'] is None:
                 command(codex, home, 'plugin', 'add', PLUGIN, '--json')
-            current = snapshot(codex, home)
+            current = snapshot(codex, home, manifest['before']['unrelated_sha256'])
             owned_state(home, current, manifest, files)
             if not current['plugin']:
                 raise ValueError('public plugin activation was not confirmed')
@@ -217,7 +229,7 @@ def activate(codex, home, runtime, config, request_path):
             if live.exists():
                 skill(live, manifest['skill_sha256'])
                 live.rename(Path(manifest['archive']))
-            current = snapshot(codex, home)
+            current = snapshot(codex, home, manifest['before']['unrelated_sha256'])
             owned_state(home, current, manifest, files)
             if current['direct'] or not current['plugin'] or live.exists():
                 raise ValueError('primary-plugin readback disagrees')
@@ -241,7 +253,7 @@ def rollback(codex, home, path):
             raise ValueError('owned primary-plugin config changed before rollback')
         files = package_files(runtime, config)
         package_check(Path(manifest['marketplace_root']), files)
-        current = snapshot(codex, home)
+        current = snapshot(codex, home, manifest['before']['unrelated_sha256'])
         owned_state(home, current, manifest, files)
         if current['plugin']:
             command(codex, home, 'plugin', 'remove', PLUGIN, '--json')
@@ -254,7 +266,7 @@ def rollback(codex, home, path):
         if archive.exists():
             skill(archive, manifest['skill_sha256'])
             archive.rename(home / 'skills' / NAME)
-        if snapshot(codex, home) != manifest['before']:
+        if snapshot(codex, home, manifest['before']['unrelated_sha256']) != manifest['before']:
             raise ValueError('primary-plugin rollback readback disagrees')
         manifest['state'] = 'rolled_back'
         save(path, manifest)

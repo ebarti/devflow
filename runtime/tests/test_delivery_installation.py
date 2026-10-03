@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -173,3 +175,110 @@ def test_pointer_upgrade_rejects_changed_inspected_inputs(installation, change):
     result = _run(fixture, '--repoint-owned-request', str(fixture['request']))
     assert result.returncode != 0
     assert json.loads(fixture['registry'].read_bytes())['adds'] == []
+
+
+@pytest.fixture
+def canonicalized_unknown(installation, monkeypatch):
+    fixture = installation
+    monkeypatch.syspath_prepend(str(ROOT / 'runtime/desktop'))
+    module = importlib.import_module('owned_upgrade')
+    host_config = fixture['home'] / 'config.toml'
+    host_config.write_text(host_config.read_text() +
+        '[mcp_servers.node_repl]\ncommand="/usr/bin/true"\n'
+        'args=[]\nstartup_timeout_sec=10\n')
+    fake = Path(fixture['env']['PATH'].split(os.pathsep)[0]) / 'codex'
+    text = fake.read_text().replace(
+        ' d["adds"].append(args[start+2:])\n',
+        ' d["adds"].append(args[start+2:])\n'
+        ' c=pathlib.Path(os.environ["CODEX_HOME"])/"config.toml"\n'
+        ' c.write_text(c.read_text().replace("args=[]\\n", "")'
+        '.replace("startup_timeout_sec=10\\n", "startup_timeout_sec=10.0\\n"))\n')
+    fake.write_text(text)
+    semantic = module.unrelated_seal
+    monkeypatch.setattr(module, 'unrelated_seal', lambda value, expected=None: module.seal(value))
+    args = (str(fake), fixture['home'], Path(fixture['entry']['transport']['command']),
+            fixture['trusted'], ROOT / 'runtime/desktop/devflow-local-delivery/SKILL.md',
+            fixture['request'])
+    with pytest.raises(ValueError, match='public update readback'):
+        module.upgrade(*args)
+    manifest = (fixture['home']
+                / '.devflow-local-delivery-upgrades/owned-trust-upgrade/manifest.json')
+    failed = json.loads(manifest.read_text())
+    assert failed['state'] == 'unknown' and 'rollback refused' in failed['rollback_error']
+    monkeypatch.setattr(module, 'unrelated_seal', semantic)
+    return module, fixture, args, manifest, failed
+
+
+def test_legacy_unknown_default_canonicalization_replays_without_new_pointer_effect(
+    canonicalized_unknown,
+):
+    module, fixture, args, manifest, failed = canonicalized_unknown
+    registry = json.loads(fixture['registry'].read_text())
+    assert len(registry['adds']) == 1
+    accepted = module.upgrade(*args)
+    assert accepted['state'] == 'applied'
+    current = json.loads(manifest.read_text())
+    assert {k: v for k, v in current.items() if k != 'state'} == {
+        k: v for k, v in failed.items() if k != 'state'}
+    assert module.upgrade(*args)['existing']
+    assert json.loads(fixture['registry'].read_text()) == registry
+    assert module.rollback(args[0], fixture['home'], manifest)['state'] == 'rolled_back'
+    restored = json.loads(fixture['registry'].read_text())
+    assert restored['entries'][NAME] == fixture['entry']
+    assert fixture['skill'].read_text() == 'Inspected previous owned skill\n'
+    assert fixture['agents'].read_text() == 'preserved agent bytes\n'
+
+
+@pytest.mark.parametrize('change', ['args', 'timeout', 'boolean', 'infinite', 'command',
+                                  'model', 'public-inventory'])
+def test_legacy_unknown_canonicalization_refuses_meaningful_unrelated_drift(
+    canonicalized_unknown, change,
+):
+    module, fixture, args, manifest, _failed = canonicalized_unknown
+    host_config = fixture['home'] / 'config.toml'
+    text = host_config.read_text()
+    if change == 'args':
+        text += 'args=["changed"]\n'
+    elif change in {'timeout', 'boolean', 'infinite'}:
+        value = {'timeout': '20.0', 'boolean': 'true', 'infinite': 'inf'}[change]
+        text = text.replace('startup_timeout_sec=10.0', 'startup_timeout_sec=' + value)
+    elif change == 'command':
+        text = text.replace('/usr/bin/true', '/usr/bin/false')
+    elif change == 'model':
+        text = text.replace('gpt-6.1-sol', 'user-selected-model')
+    else:
+        registry = json.loads(fixture['registry'].read_text())
+        registry['entries']['unrelated']['transport']['args'] = ['changed']
+        _private(fixture['registry'], registry)
+    host_config.write_text(text)
+    before = (manifest.read_bytes(), fixture['registry'].read_bytes(), host_config.read_bytes())
+    with pytest.raises(ValueError):
+        module.upgrade(*args)
+    with pytest.raises(ValueError):
+        module.rollback(args[0], fixture['home'], manifest)
+    assert before == (manifest.read_bytes(), fixture['registry'].read_bytes(),
+                      host_config.read_bytes())
+
+
+def test_only_stdio_toml_defaults_have_bounded_legacy_equivalence(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'runtime/desktop'))
+    module = importlib.import_module('owned_upgrade')
+    original = {'settings': {'mcp_servers': {'node_repl': {
+        'command': '/usr/bin/true', 'args': [], 'startup_timeout_sec': 10}}},
+        'other_mcp': [{'transport': {'type': 'stdio', 'args': []}}]}
+    after = deepcopy(original)
+    entry = after['settings']['mcp_servers']['node_repl']
+    entry.pop('args')
+    entry['startup_timeout_sec'] = 10.0
+    legacy = module.seal(original)
+    assert module.unrelated_seal(after) == module.unrelated_seal(original)
+    assert module.unrelated_seal(after, legacy) == legacy
+    after['other_mcp'][0]['transport'].pop('args')
+    assert module.unrelated_seal(after, legacy) != legacy
+    many = {'settings': {'mcp_servers': {str(n): {'command': '/usr/bin/true', 'args': [],
+            'startup_timeout_sec': 10.0} for n in range(7)}}}
+    canonical = deepcopy(many)
+    for item in canonical['settings']['mcp_servers'].values():
+        item.pop('args')
+    assert module.unrelated_seal(canonical, module.seal(many)) != module.seal(many)
+    assert module.unrelated_seal(canonical) == module.unrelated_seal(many)
