@@ -24,6 +24,17 @@ deadlines, owned process/port cleanup, synthetic fixture QA and the
 separate mode-bound proof and confirms the launcher and ancestry guard; it does
 not claim constrained sandbox denials.
 
+Publication keeps a conventional goal subject, or prefixes a plain goal with
+`chore:`, for both the commit and new PR title. The controller uses `git commit
+--signoff` with the existing configured Git identity; it requires the author and
+sign-off identity to agree. Before staging, pushing or accepting a publication
+receipt it checks every commit after the frozen base for a Conventional Commit
+subject and the author's DCO trailer. A signed head cannot mask an unsigned
+ancestor. GPG signing and a skipped owner-exempt DCO CI job do not satisfy this
+controller check. Existing PR titles must also be conventional. Invalid already
+published history is refused; the read-only publication recovery command cannot
+rewrite it or reuse gate evidence for a different head.
+
 New terminal runs synchronize tracker status and read back assignment, Project
 and claim through the existing tracker helper. Blocked/cancelled outcomes select
 Blocked; delivered outcomes select In review. Claims release only after proven

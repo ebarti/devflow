@@ -2770,7 +2770,7 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
                 {"iteration": 0, "input_candidate_id": payload["candidate"]["id"]},
             )
             _git(broker.checkout, "add", "devflow-fake-change.txt")
-            _git(broker.checkout, "commit", "-qm", "first candidate")
+            _git(broker.checkout, "commit", "--signoff", "-qm", "feat: first candidate")
             _git(broker.checkout, "push", "origin", "HEAD:refs/heads/feat/fixture")
             first_head["value"] = _git(broker.checkout, "rev-parse", "HEAD")
             result = {

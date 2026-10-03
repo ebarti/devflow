@@ -57,6 +57,20 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def conventional_subject(goal: str) -> str:
+    """Keep an admitted conventional subject, otherwise use a neutral type."""
+    subject = goal.splitlines()[0].strip()
+    if not subject or any(ord(character) < 32 for character in subject):
+        raise ValueError("publication subject is empty or contains control characters")
+    if not _conventional_subject(subject):
+        subject = "chore: " + subject
+    return subject
+
+
+def _conventional_subject(subject: str) -> bool:
+    return bool(re.fullmatch(r"[a-z][a-z0-9-]*(?:\([^()\r\n]+\))?!?: \S.*", subject))
+
+
 class BrokerReadbackUnavailable(RuntimeError):
     """A remote PR query failed before its authority could be inspected."""
 
@@ -673,7 +687,7 @@ class DeliveryBroker:
                     "--head",
                     self.spec["branch"],
                     "--json",
-                    "number,url,state,isDraft,baseRefName,headRefName,headRefOid",
+                    "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title",
                 ],
                 timeout=60,
             )
@@ -692,9 +706,30 @@ class DeliveryBroker:
             or found["state"] != "OPEN"
         ):
             raise RuntimeError("owned branch PR is not the authorized open regular PR")
+        if not _conventional_subject(found.get("title", "")):
+            raise ValueError("owned PR title does not satisfy Conventional Commits")
         return found
 
+    def _validate_publication_commits(self) -> None:
+        """Check every owned commit; a valid head cannot mask invalid ancestors."""
+        _git(self.checkout, "merge-base", "--is-ancestor", self.spec["base_sha"], "HEAD")
+        commits = _git(
+            self.checkout, "rev-list", "--reverse", self.spec["base_sha"] + "..HEAD"
+        ).splitlines()
+        for commit in commits:
+            subject = _git(self.checkout, "show", "-s", "--format=%s", commit)
+            if not _conventional_subject(subject):
+                raise ValueError("owned commit is not a Conventional Commit: " + commit)
+            author = _git(self.checkout, "show", "-s", "--format=%an <%ae>", commit)
+            signers = _git(
+                self.checkout, "show", "-s",
+                "--format=%(trailers:key=Signed-off-by,valueonly)", commit,
+            ).splitlines()
+            if author not in signers:
+                raise ValueError("owned commit lacks its author Signed-off-by trailer: " + commit)
+
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        self._validate_publication_commits()
         key = f"publish:{self.spec['run_id']}:{iteration}"
         before = self.candidate()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
@@ -714,6 +749,10 @@ class DeliveryBroker:
             )
         existing = self._existing_pr()
         if changed:
+            author = _git(self.checkout, "var", "GIT_AUTHOR_IDENT").rsplit(" ", 2)[0]
+            committer = _git(self.checkout, "var", "GIT_COMMITTER_IDENT").rsplit(" ", 2)[0]
+            if author != committer:
+                raise ValueError("publication author and configured sign-off identity disagree")
             for relative in sorted(changed):
                 attribute = _git(self.checkout, "check-attr", "filter", "--", relative)
                 if not attribute.endswith(": filter: unspecified") and not attribute.endswith(
@@ -727,9 +766,11 @@ class DeliveryBroker:
                     "-c",
                     "core.hooksPath=/dev/null",
                     "commit",
+                    "--signoff",
                     "-m",
-                    f"Implement {self.spec['goal'].splitlines()[0][:65]}",
+                    conventional_subject(self.spec["goal"]),
                 )
+        self._validate_publication_commits()
         head = _git(self.checkout, "rev-parse", "HEAD")
         if head == self.spec["base_sha"]:
             raise ValueError("no meaningful commit is available for publication")
@@ -755,7 +796,7 @@ class DeliveryBroker:
                     raise RuntimeError("remote feature branch diverged")
             _git(self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}")
         if existing is None:
-            title = self.spec["goal"].splitlines()[0][:100]
+            title = conventional_subject(self.spec["goal"])
             body = self.state_dir / "pull-request.md"
             body.write_text(
                 self.spec["policy"].get("pr_body")
@@ -823,6 +864,7 @@ class DeliveryBroker:
         successful push followed by a stale GitHub PR projection.
         """
         key = f"publish:{self.spec['run_id']}:{iteration}"
+        self._validate_publication_commits()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
         with self.store._connect() as db:
             saved = db.execute(
