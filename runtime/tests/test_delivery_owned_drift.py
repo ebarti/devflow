@@ -396,22 +396,26 @@ def test_acknowledged_foreign_mcp_enabled_change_refuses_before_effects(ambient)
 
 def _freeze_current_mcp_enabled(ambient, explicit):
     module, drift, fixture, args, manifest, request, root = ambient
-    config = fixture['home'] / 'config.toml'
-    config.write_text(config.read_text() + '[mcp_servers.unrelated]\ncommand="/bin/true"\n'
-                      + ('enabled=true\n' if explicit else ''))
+    config = fixture["home"] / "config.toml"
+    config.write_text(
+        config.read_text()
+        + '[mcp_servers.unrelated]\ncommand="/bin/true"\n'
+        + ("enabled=true\n" if explicit else "")
+    )
     inputs = json.loads(request.read_text())
-    current = Path(inputs['current_snapshot']['path'])
-    observed = drift.foreign_snapshot(args[0], fixture['home'])
+    current = Path(inputs["current_snapshot"]["path"])
+    observed = drift.foreign_snapshot(args[0], fixture["home"])
     _private(current, observed)
-    inputs['current_snapshot']['sha256'] = module.sha(current.read_bytes())
-    prior = json.loads(Path(inputs['prior_snapshot']['path']).read_text())
-    inputs['delta_sha256'] = module.seal(drift.delta(prior, observed))
+    inputs["current_snapshot"]["sha256"] = module.sha(current.read_bytes())
+    prior = json.loads(Path(inputs["prior_snapshot"]["path"]).read_text())
+    inputs["delta_sha256"] = module.seal(drift.delta(prior, observed))
     _private(request, inputs)
 
 
-@pytest.mark.parametrize('explicit', [True, False])
+@pytest.mark.parametrize("explicit", [True, False])
 def test_same_acknowledged_command_rollback_survives_enabled_default_serialization(
-    ambient, explicit,
+    ambient,
+    explicit,
 ):
     module, drift, fixture, args, manifest, request, root = ambient
     _freeze_current_mcp_enabled(ambient, explicit)
@@ -420,49 +424,313 @@ def test_same_acknowledged_command_rollback_survives_enabled_default_serializati
     immutable = (receipt.read_bytes(), request.read_bytes(), drift.content_index(root))
     original = json.loads(manifest.read_text())
     fake = Path(args[0])
-    effect = (' c=pathlib.Path(os.environ["CODEX_HOME"])/"config.toml"\n'
-              ' c.write_text(c.read_text().replace("enabled=true\\n", ""))\n')
+    effect = (
+        ' c=pathlib.Path(os.environ["CODEX_HOME"])/"config.toml"\n'
+        ' c.write_text(c.read_text().replace("enabled=true\\n", ""))\n'
+    )
     if not explicit:
-        effect = (' c=pathlib.Path(os.environ["CODEX_HOME"])/"config.toml"\n'
-                  ' if "enabled=true\\n" not in c.read_text():\n'
-                  '  c.write_text(c.read_text().replace("[mcp_servers.unrelated]\\n", '
-                  '"[mcp_servers.unrelated]\\nenabled=true\\n"))\n')
-    fake.write_text(fake.read_text().replace(' crash=d.pop(', effect + ' crash=d.pop('))
-    assert module.rollback(args[0], fixture['home'], manifest)['state'] == 'rolled_back'
-    assert fixture['skill'].read_text() == 'Inspected previous owned skill\n'
-    assert module.rollback(args[0], fixture['home'], manifest)['state'] == 'rolled_back'
-    assert module.upgrade(*args)['state'] == 'applied'
-    assert module.upgrade(*args)['existing']
+        effect = (
+            ' c=pathlib.Path(os.environ["CODEX_HOME"])/"config.toml"\n'
+            ' if "enabled=true\\n" not in c.read_text():\n'
+            '  c.write_text(c.read_text().replace("[mcp_servers.unrelated]\\n", '
+            '"[mcp_servers.unrelated]\\nenabled=true\\n"))\n'
+        )
+    fake.write_text(fake.read_text().replace(" crash=d.pop(", effect + " crash=d.pop("))
+    assert module.rollback(args[0], fixture["home"], manifest)["state"] == "rolled_back"
+    assert fixture["skill"].read_text() == "Inspected previous owned skill\n"
+    assert module.rollback(args[0], fixture["home"], manifest)["state"] == "rolled_back"
+    assert module.upgrade(*args)["state"] == "applied"
+    assert module.upgrade(*args)["existing"]
     assert immutable == (receipt.read_bytes(), request.read_bytes(), drift.content_index(root))
-    assert {k: v for k, v in json.loads(manifest.read_text()).items() if k != 'state'} == {
-        k: v for k, v in original.items() if k != 'state'
+    assert {k: v for k, v in json.loads(manifest.read_text()).items() if k != "state"} == {
+        k: v for k, v in original.items() if k != "state"
     }
 
 
-@pytest.mark.parametrize('change', [
-    'disabled', 'public-disabled', 'string', 'integer', 'other-setting',
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "disabled",
+        "public-disabled",
+        "string",
+        "integer",
+        "other-setting",
+    ],
+)
 def test_acknowledged_enabled_default_guard_rejects_semantic_or_type_drift(ambient, change):
     module, drift, fixture, args, manifest, request, root = ambient
     _freeze_current_mcp_enabled(ambient, True)
     _ack(ambient)
     module.upgrade(*args)
-    config = fixture['home'] / 'config.toml'
-    if change == 'public-disabled':
-        registry = json.loads(fixture['registry'].read_text())
-        registry['entries']['unrelated']['enabled'] = False
-        _private(fixture['registry'], registry)
-    elif change == 'other-setting':
-        config.write_text(config.read_text().replace(
-            'foreign_setting="priority"', 'foreign_setting="default"'))
+    config = fixture["home"] / "config.toml"
+    if change == "public-disabled":
+        registry = json.loads(fixture["registry"].read_text())
+        registry["entries"]["unrelated"]["enabled"] = False
+        _private(fixture["registry"], registry)
+    elif change == "other-setting":
+        config.write_text(
+            config.read_text().replace('foreign_setting="priority"', 'foreign_setting="default"')
+        )
     else:
-        value = {'disabled': 'false', 'string': '"true"', 'integer': '1'}[change]
-        config.write_text(config.read_text().replace('enabled=true', 'enabled=' + value))
-    frozen = (manifest.read_bytes(), fixture['skill'].read_bytes(),
-              fixture['registry'].read_bytes(), config.read_bytes())
+        value = {"disabled": "false", "string": '"true"', "integer": "1"}[change]
+        config.write_text(config.read_text().replace("enabled=true", "enabled=" + value))
+    frozen = (
+        manifest.read_bytes(),
+        fixture["skill"].read_bytes(),
+        fixture["registry"].read_bytes(),
+        config.read_bytes(),
+    )
     with pytest.raises(ValueError):
-        module.rollback(args[0], fixture['home'], manifest)
+        module.rollback(args[0], fixture["home"], manifest)
     with pytest.raises(ValueError):
         module.upgrade(*args)
-    assert frozen == (manifest.read_bytes(), fixture['skill'].read_bytes(),
-                      fixture['registry'].read_bytes(), config.read_bytes())
+    assert frozen == (
+        manifest.read_bytes(),
+        fixture["skill"].read_bytes(),
+        fixture["registry"].read_bytes(),
+        config.read_bytes(),
+    )
+
+
+def _successor(ambient, predecessor, number=2):
+    module, drift, fixture, args, manifest, first_request, root = ambient
+    previous = json.loads(Path(json.loads(predecessor.read_text())["request_path"]).read_text())
+    before = json.loads(Path(previous["current_snapshot"]["path"]).read_text())
+    host = fixture["home"] / "config.toml"
+    host.write_text(
+        host.read_text().replace('foreign_setting="priority"', 'foreign_setting="default"')
+        if number == 2
+        else host.read_text() + f'foreign_{number}="observed"\n'
+    )
+    evidence = first_request.parent / f"successor-{number}"
+    authority, current, index = [
+        evidence / name for name in ("authority.json", "current.json", "content.json")
+    ]
+    _private(
+        authority,
+        {
+            "decision_owner": "main task",
+            "new_user_approval": False,
+            "authority_source": f"Existing installation authority continuation {number}",
+        },
+    )
+    after = drift.foreign_snapshot(args[0], fixture["home"])
+    _private(current, after)
+    _private(index, drift.content_index(root))
+
+    def reference(path):
+        return {"path": str(path), "sha256": module.sha(path.read_bytes())}
+
+    first = json.loads(first_request.read_text())
+    request = evidence / "request.json"
+    _private(
+        request,
+        {
+            **first,
+            "authority": reference(authority),
+            "prior_snapshot": previous["current_snapshot"],
+            "current_snapshot": reference(current),
+            "delta_sha256": module.seal(drift.delta(before, after)),
+            "content_indexes": [reference(index)],
+            "predecessor_sha256": module.sha(predecessor.read_bytes()),
+            "expected_manifest_sha256": module.sha(manifest.read_bytes()),
+            "expected_manifest_state": json.loads(manifest.read_text())["state"],
+        },
+    )
+    return request
+
+
+def test_explicit_successor_preserves_history_and_same_command_partial_rollback_reapply(ambient):
+    module, drift, fixture, args, manifest, request, root = ambient
+    first = _ack(ambient)
+    assert _run(fixture, "--repoint-owned-request", str(fixture["request"])).returncode == 0
+    # Proven interrupted rollback state: old pointer, new skill, applied journal.
+    registry = json.loads(fixture["registry"].read_text())
+    registry["entries"][module.NAME] = fixture["entry"]
+    _private(fixture["registry"], registry)
+    original = (
+        first.read_bytes(),
+        request.read_bytes(),
+        fixture["request"].read_bytes(),
+        manifest.read_bytes(),
+    )
+    successor = _successor(ambient, first)
+    assert _run(fixture, "--rollback-owned-manifest", str(manifest)).returncode != 0
+    admitted = _run(fixture, "--acknowledge-owned-drift-request", str(successor))
+    assert admitted.returncode == 0, admitted.stderr
+    response = json.loads(admitted.stdout)
+    assert response["chain_length"] == 2 and response["max_acknowledgements"] == 4
+    second = Path(response["acknowledgement"])
+    assert json.loads(second.read_text())["predecessor_sha256"] == module.sha(first.read_bytes())
+    assert original == (
+        first.read_bytes(),
+        request.read_bytes(),
+        fixture["request"].read_bytes(),
+        manifest.read_bytes(),
+    )
+    frozen = (
+        drift.foreign_snapshot(args[0], fixture["home"]),
+        drift.content_index(root),
+        second.read_bytes(),
+    )
+    assert json.loads(_run(fixture, "--acknowledge-owned-drift-request", str(successor)).stdout)[
+        "existing"
+    ]
+    assert _run(fixture, "--rollback-owned-manifest", str(manifest)).returncode == 0
+    assert _run(fixture, "--repoint-owned-request", str(fixture["request"])).returncode == 0
+    assert json.loads(_run(fixture, "--acknowledge-owned-drift-request", str(successor)).stdout)[
+        "existing"
+    ]
+    # A historical request replay observes the latest acknowledged state.
+    assert (
+        json.loads(_run(fixture, "--acknowledge-owned-drift-request", str(request)).stdout)[
+            "chain_length"
+        ]
+        == 2
+    )
+    assert frozen == (
+        drift.foreign_snapshot(args[0], fixture["home"]),
+        drift.content_index(root),
+        second.read_bytes(),
+    )
+    assert {k: v for k, v in json.loads(manifest.read_text()).items() if k != "state"} == {
+        k: v for k, v in json.loads(original[-1]).items() if k != "state"
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing-predecessor",
+        "wrong-predecessor",
+        "journal-hash",
+        "journal-state",
+        "prior",
+        "authority",
+        "original-request",
+        "owned-pointer",
+        "owned-skill",
+        "later-setting",
+        "later-content",
+    ],
+)
+def test_successor_rejects_bad_admission_before_receipt_or_effect(ambient, change):
+    module, drift, fixture, args, manifest, first_request, root = ambient
+    first = _ack(ambient)
+    request = _successor(ambient, first)
+    value = json.loads(request.read_text())
+    if change == "missing-predecessor":
+        value.pop("predecessor_sha256")
+    elif change == "wrong-predecessor":
+        value["predecessor_sha256"] = "0" * 64
+    elif change == "journal-hash":
+        value["expected_manifest_sha256"] = "0" * 64
+    elif change == "journal-state":
+        value["expected_manifest_state"] = "applied"
+    elif change == "prior":
+        value["prior_snapshot"] = value["current_snapshot"]
+    elif change == "authority":
+        value["authority"] = json.loads(first_request.read_text())["authority"]
+    elif change == "original-request":
+        value["original_request"]["sha256"] = "0" * 64
+    elif change == "owned-pointer":
+        registry = json.loads(fixture["registry"].read_text())
+        registry["entries"][module.NAME]["transport"]["args"] = ["unexpected"]
+        _private(fixture["registry"], registry)
+    elif change == "owned-skill":
+        fixture["skill"].write_text("unrecognized live owned update")
+    elif change == "later-setting":
+        host = fixture["home"] / "config.toml"
+        host.write_text(
+            host.read_text().replace('foreign_setting="default"', 'foreign_setting="priority"')
+        )
+    else:
+        (root / "artifact-000.txt").write_text("unacknowledged current content")
+    _private(request, value)
+    frozen = (
+        manifest.read_bytes(),
+        first.read_bytes(),
+        fixture["registry"].read_bytes(),
+        fixture["skill"].read_bytes(),
+    )
+    rejected = _run(fixture, "--acknowledge-owned-drift-request", str(request))
+    assert rejected.returncode != 0
+    assert not (manifest.parent / "ambient-drift-acknowledgement-2.json").exists()
+    assert frozen == (
+        manifest.read_bytes(),
+        first.read_bytes(),
+        fixture["registry"].read_bytes(),
+        fixture["skill"].read_bytes(),
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "first-receipt",
+        "first-request",
+        "old-authority",
+        "old-snapshot",
+        "old-index",
+        "second-receipt",
+        "hole",
+        "extra",
+        "latest-setting",
+        "latest-content",
+    ],
+)
+def test_all_history_and_latest_material_are_guarded_after_successor(ambient, change):
+    module, drift, fixture, args, manifest, request, root = ambient
+    first = _ack(ambient)
+    successor = _successor(ambient, first)
+    admitted = _run(fixture, "--acknowledge-owned-drift-request", str(successor))
+    assert admitted.returncode == 0, admitted.stderr
+    second = Path(json.loads(admitted.stdout)["acknowledgement"])
+    if change in {"first-receipt", "first-request", "second-receipt"}:
+        path = {"first-receipt": first, "first-request": request, "second-receipt": second}[change]
+        path.write_bytes(path.read_bytes() + b" ")
+    elif change in {"old-authority", "old-snapshot", "old-index"}:
+        old = json.loads(request.read_text())
+        if change == "old-index":
+            ref = old["content_indexes"][0]
+        else:
+            ref = old[{"old-authority": "authority", "old-snapshot": "current_snapshot"}[change]]
+        path = Path(ref["path"])
+        path.write_bytes(path.read_bytes() + b" ")
+    elif change == "hole":
+        first.unlink()
+    elif change == "extra":
+        _private(manifest.parent / "ambient-drift-acknowledgement-5.json", {})
+    elif change == "latest-setting":
+        host = fixture["home"] / "config.toml"
+        host.write_text(host.read_text() + 'later="change"\n')
+    else:
+        (root / "artifact-000.txt").write_text("new content")
+    frozen = manifest.read_bytes(), fixture["registry"].read_bytes(), fixture["skill"].read_bytes()
+    assert _run(fixture, "--repoint-owned-request", str(fixture["request"])).returncode != 0
+    assert _run(fixture, "--rollback-owned-manifest", str(manifest)).returncode != 0
+    assert frozen == (
+        manifest.read_bytes(),
+        fixture["registry"].read_bytes(),
+        fixture["skill"].read_bytes(),
+    )
+
+
+def test_acknowledgements_have_a_finite_explicit_bound_without_renewal(ambient):
+    module, drift, fixture, args, manifest, request, root = ambient
+    prior = _ack(ambient)
+    history = {prior: prior.read_bytes()}
+    for number in range(2, drift.MAX_ACKNOWLEDGEMENTS + 1):
+        successor = _successor(ambient, prior, number)
+        admitted = _run(fixture, "--acknowledge-owned-drift-request", str(successor))
+        assert admitted.returncode == 0, admitted.stderr
+        prior = Path(json.loads(admitted.stdout)["acknowledgement"])
+        history[prior] = prior.read_bytes()
+    assert json.loads(_run(fixture, "--acknowledge-owned-drift-request", str(successor)).stdout)[
+        "existing"
+    ]
+    exhausted = _successor(ambient, prior, drift.MAX_ACKNOWLEDGEMENTS + 1)
+    rejected = _run(fixture, "--acknowledge-owned-drift-request", str(exhausted))
+    assert rejected.returncode != 0 and "exhausted" in rejected.stderr
+    assert not (manifest.parent / "ambient-drift-acknowledgement-5.json").exists()
+    assert all(path.read_bytes() == content for path, content in history.items())

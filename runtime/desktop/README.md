@@ -91,7 +91,7 @@ update request to reapply. Preserve the original receipt, snapshots, sidecar and
 errors; no replacement request or acknowledgement is needed for proven default
 serialization. Unknown owned bytes or any effective foreign drift still refuse.
 
-An interrupted `unknown` update can encounter actual ambient host changes. One
+An interrupted `unknown` update can encounter actual ambient host changes. An
 explicit `--acknowledge-owned-drift-request` operation records a separate immutable
 receipt under that original command. It preserves current foreign state; it does
 not normalize versions/settings, replace the historical seal, edit foreign files,
@@ -144,8 +144,8 @@ python3 runtime/desktop/install.py \
 
 The response names `ambient-drift-acknowledgement.json`, separate from the original
 pointer manifest/request. Its creation changes no pointer, skill or host setting.
-Identical replay observes that same receipt; a different request conflicts. The
-original pointer commands need no new ID or changed input: they automatically
+Identical replay observes that same receipt; a different initial request conflicts.
+The original pointer commands need no new ID or changed input: they automatically
 validate the acknowledgement and every referenced original/authority/snapshot
 and content proof. They preserve original errors/seal while checking the exact
 acknowledged current foreign state before and after each pointer/skill effect,
@@ -153,6 +153,49 @@ including rollback and reapply. Any later setting, inventory, content, metadata
 or owned-authority change refuses before further effects. Interrupted effects
 remain observable through the same original command. A subsequent primary-plugin
 request captures fresh then-current inventory normally.
+
+If foreign state changes between separately authorized operations, the same flag
+admits an **explicit successor**, with at most **four acknowledgements total**
+(the first plus three successors). There is no automatic capture, retry loop or
+renewal after exhaustion. Preserve the first receipt and every predecessor; a
+successor appends `ambient-drift-acknowledgement-2.json` (then `-3`, `-4`) without
+changing the original journal/request, historical seal or errors.
+
+A successor retains `command_id`, `original_request`,
+`original_manifest_sha256` and `original_unrelated_sha256` exactly from the first
+request. It adds these fields to the same request shape:
+
+```json
+{
+  "predecessor_sha256": "IMMEDIATE_PREDECESSOR_RECEIPT_BYTE_SHA256",
+  "expected_manifest_sha256": "CURRENT_ORIGINAL_JOURNAL_BYTE_SHA256",
+  "expected_manifest_state": "applied"
+}
+```
+
+Its `prior_snapshot` must be the immediate predecessor request's exact
+`current_snapshot` reference. Bind a new deciding existing-installation authority
+receipt, a fresh complete current public snapshot, the full typed delta from the
+predecessor snapshot, and fresh current content indexes. Retain indexes for every
+previously indexed plugin still installed, as well as every newly changed
+installed plugin. The operator freezes actual current state; no historical
+setting value is inserted or presumed equivalent. Admission checks the complete
+current snapshot/content twice, then rereads recognized live owned
+pointer/skill/configuration/source and the exact current journal before appending.
+Its immutable receipt retains the admitted journal bytes/state and immediate
+predecessor hash. The original first authority remains authenticated in history.
+
+Every replay, rollback or reapply validates the entire bounded chain and all
+historical evidence bytes/hashes, then checks the latest acknowledged current
+foreign state and live owned authority around each effect. Historical content
+proofs remain authenticated without requiring obsolete plugin caches to exist.
+An identical successor replay is idempotent even after authorized pointer state
+changes; a historical acknowledgement replay observes the current chain.
+Wrong/missing predecessors, changed history/proof, unknown owned state, stale or
+inconsistent current capture, further foreign drift and exhaustion refuse.
+Responses include `chain_length` and `max_acknowledgements`. A rejected later
+change requires a separate concrete authorization and explicit successor within
+the bound; it is never silently adopted.
 
 Each effect guard rereads the live owned MCP pointer, configuration hashes and
 skill identity/bytes after the slower foreign inventory reads. It permits only
