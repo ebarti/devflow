@@ -396,6 +396,7 @@ def create_app(config_path: Path) -> FastAPI:
         expected = (
             {"command_id", "expected_revision", "reason"}
             if name == "cancel"
+            else {"command_id", "expected_revision"} if name == "reconcile_tracker"
             else {
                 "command_id",
                 "expected_revision",
@@ -448,6 +449,10 @@ def create_app(config_path: Path) -> FastAPI:
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel(request: Request, run_id: str) -> dict[str, Any]:
         return await _update(request, run_id, "cancel")
+
+    @app.post("/api/runs/{run_id}/reconcile-tracker")
+    async def reconcile_tracker(request: Request, run_id: str) -> dict[str, Any]:
+        return await _update(request, run_id, "reconcile_tracker")
 
     dist = Path(__file__).resolve().parents[2] / "ui" / "dist"
     if (dist / "assets").is_dir():

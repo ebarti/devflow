@@ -37,7 +37,31 @@ claim release, rather than adding a release-breaking remote audit afterward.
 A genuinely uncertain final In review result remains `waiting_tracker` with no
 successful outcome; its desired transition stays In review. Its latest pending
 readback replaces any earlier `consistent` projection. A cancellation accepted
-during the final tracker transition still wins before delivery is assigned.
+during `tracker_started` still wins before the terminal transition is frozen.
+
+Terminal reconciliation stays inside the original live Temporal workflow. It
+makes three attempts, each with a three-minute activity bound and finite durable
+backoff timers, then exposes an exhausted `waiting_tracker` checkpoint without
+closing the execution. Its terminal outcome/status/release request is frozen;
+new cancellation cannot change a transition that may already have released its
+claim. A public `reconcile-tracker` update resumes one more three-attempt readback
+cycle and grants no role, source edit, gate, model or capacity authority:
+
+```sh
+devflow-delivery --config /private/state/trusted-local.json reconcile-tracker --id RUN_ID --request /private/state/tracker-retry.json
+```
+
+The request contains exactly `command_id` and the current `expected_revision`.
+HTTP uses same-origin, CSRF-protected
+`POST /api/runs/{id}/reconcile-tracker`; MCP exposes `reconcile_tracker` through
+that same client. Stable command replay returns the existing update receipt;
+changed bytes conflict. An uncertain response requires inspection with the same
+command ID. On each retry the activity first inspects the owning acknowledged
+intent and claim. If the helper already released the claim, only a fresh
+read-only audit is allowed; it never repeats `set` without ownership. Confirmed
+readback restores the frozen terminal outcome and refreshes the final projection,
+including clearing the pending error. Background helper success therefore
+remains safely recoverable through the public readback command.
 
 ## Preserved-candidate execution recovery
 

@@ -87,6 +87,11 @@ class DeliveryClient:
     def cancel(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/cancel", payload)
 
+    def reconcile_tracker(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/reconcile-tracker", payload,
+        )
+
     def recover_publication(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request(
             "POST",

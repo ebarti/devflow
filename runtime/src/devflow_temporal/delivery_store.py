@@ -2560,7 +2560,9 @@ class DeliveryStore:
                 if intake is not None else row["intake_json"],
                 "outcome": outcome if outcome is not None else row["outcome"],
                 "cleanup": cleanup if cleanup is not None else row["cleanup"],
-                "error": error if error is not None else row["error"],
+                "error": error if error is not None or event_type == "delivered"
+                or (checks or {}).get("terminal_tracker_checkpoint", {}).get("state") == "confirmed"
+                else row["error"],
                 "updated_at": _now(),
             }
             assignments = ",".join(f"{field}=?" for field in values)

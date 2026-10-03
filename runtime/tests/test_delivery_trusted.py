@@ -134,11 +134,17 @@ def test_trusted_preparation_and_broker_check_compile_with_discovered_sdk(
 
 
 @pytest.mark.asyncio
-async def test_failed_final_readback_preserves_coherent_pending_transition():
+async def test_transient_final_readback_finishes_original_transition(monkeypatch):
     controller = DeliveryWorkflow()
     controller.state = {'phase': 'delivered', 'execution_state': 'terminal', 'outcome': 'delivered',
                         'iteration': 0, 'revision': 1, 'cleanup': 'none', 'checks': {}}
     requested = []
+    projections = []
+
+    async def no_wait(_duration):
+        return None
+
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.sleep', no_wait)
 
     async def execute(name, request, **_kwargs):
         if name == 'delivery_finalize_resources':
@@ -146,17 +152,19 @@ async def test_failed_final_readback_preserves_coherent_pending_transition():
                     'resource_cleanup': 'confirmed'}
         if name == 'delivery_terminal_tracker':
             requested.append(request['status'])
-            return {'state': 'pending', 'pending': True, 'desired': request['status']}
-        assert request['outcome'] is None
-        assert request['phase'] == 'waiting_tracker'
-        assert request['tracker']['desired'] == 'in-review'
+            return {'state': 'pending' if len(requested) == 1 else 'consistent',
+                    'pending': len(requested) == 1, 'desired': request['status']}
+        projections.append(request)
         return {}
 
     controller._activity = execute
     await controller._project({'resource_cleanup_version': 1, 'terminal_tracker_version': 1},
                               'delivered', 'final')
-    assert requested == ['in-review']
-    assert controller.state['outcome'] is None
+    assert requested == ['in-review', 'in-review']
+    assert projections[0]['outcome'] is None
+    assert projections[0]['phase'] == 'waiting_tracker'
+    assert projections[-1]['outcome'] == 'delivered'
+    assert projections[-1]['error'] is None
 
 
 @pytest.mark.parametrize('status', ['blocked', 'in-review'])
@@ -205,10 +213,13 @@ def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, 
     monkeypatch.setattr(helper, 'project_item', lambda *_args: item)
     monkeypatch.setattr(helper, 'legacy_project_item', lambda *_args: item)
     calls = []
+    fail_audit = True
 
     def owning_cli(command, **_kwargs):
+        nonlocal fail_audit
         calls.append(command)
-        if 'audit' in command:
+        if 'audit' in command and fail_audit:
+            fail_audit = False
             raise subprocess.TimeoutExpired(command, 120)
         output, error = io.StringIO(), io.StringIO()
         monkeypatch.setattr(sys, 'argv', command[1:])
@@ -231,6 +242,12 @@ def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, 
         assert json.loads(intent['payload'])['status'] == status
         work = store.state.row(db, 'works', spec['work_id'])
         assert json.loads(work['details'])['github']['sync']['status'] == status
+    with pytest.raises(subprocess.TimeoutExpired):
+        _tracker_sync(spec, status, release=True, terminal=True)
+    observed = _tracker_sync(spec, status, release=True, terminal=True)
+    assert observed['state'] == 'consistent'
+    assert observed['readback_at'] >= result['readback_at']
+    assert ['set' if 'set' in call else 'audit' for call in calls] == ['set', 'audit', 'audit']
 
 
 def test_real_pytest_numbered_fixture_artifacts_survive_navigation_links(tmp_path):
@@ -327,3 +344,63 @@ def test_actual_broker_preserves_binary_evidence_after_resource_finalization(nat
     assert value['sha256'] == hashlib.sha256(b'%PDF-1.7 Synthetic').hexdigest()
     assert value['media_type'] == 'application/pdf'
     assert value['content_url'].endswith('/content')
+
+
+@pytest.mark.asyncio
+async def test_exhausted_tracker_checkpoint_stays_open_and_explicitly_resumes(monkeypatch):
+    import asyncio
+
+    from temporalio.exceptions import ApplicationError
+
+    controller = DeliveryWorkflow()
+    controller.state = {'phase': 'delivered', 'execution_state': 'terminal', 'outcome': 'delivered',
+                        'iteration': 2, 'revision': 13, 'cleanup': 'none', 'checks': {}}
+    calls = []
+    exhausted = asyncio.Event()
+
+    async def execute(name, request, **_kwargs):
+        calls.append(name)
+        if name == 'delivery_finalize_resources':
+            return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+                    'resource_cleanup': 'confirmed'}
+        if name == 'delivery_terminal_tracker':
+            count = calls.count(name)
+            return {'state': 'pending' if count <= 3 else 'consistent',
+                    'pending': count <= 3, 'desired': request['status']}
+        if request['event_type'] == 'tracker_retry_required':
+            exhausted.set()
+        return {}
+
+    async def no_wait(_duration):
+        return None
+
+    async def condition(predicate):
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+    controller._activity = execute
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.sleep', no_wait)
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.wait_condition', condition)
+    task = asyncio.create_task(controller._project(
+        {'resource_cleanup_version': 1, 'terminal_tracker_version': 1}, 'delivered', 'final',
+    ))
+    try:
+        await asyncio.wait_for(exhausted.wait(), 2)
+        assert not task.done() and controller.state['outcome'] is None
+        assert controller.state['phase'] == 'waiting_tracker'
+        assert calls.count('delivery_terminal_tracker') == 3
+        revision = controller.state['revision']
+        with pytest.raises(ApplicationError, match='stale'):
+            await controller.reconcile_tracker({'expected_revision': revision - 1})
+        with pytest.raises(ApplicationError, match='frozen'):
+            await controller.cancel({'expected_revision': revision, 'reason': 'Late cancellation'})
+        await controller.reconcile_tracker({'expected_revision': revision})
+        await asyncio.wait_for(task, 2)
+        assert controller.state['outcome'] == 'delivered'
+        assert controller.state['checks']['terminal_tracker_checkpoint']['cycles'] == 2
+        assert calls.count('delivery_terminal_tracker') == 4
+        assert calls.count('delivery_finalize_resources') == 1
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

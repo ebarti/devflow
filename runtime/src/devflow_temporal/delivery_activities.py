@@ -344,6 +344,41 @@ async def delivery_ci(request: dict[str, Any]) -> dict[str, Any]:
     return await broker.checks(request["pull_request"])
 
 
+def _terminal_receipt(store, spec, status, release, project, assignee, desired):
+    with store._connect() as db:
+        db.execute("BEGIN")
+        work = store.state.row(db, "works", spec["work_id"])
+        sync = json.loads(work["details"] or "{}").get("github", {}).get("sync", {})
+        intent = db.execute("SELECT * FROM reconcile_intents WHERE work_id=?",
+                            (spec["work_id"],)).fetchone()
+        claim = store.state.claim_for(db, spec["work_id"])
+    owner = f"external:devflow:{spec['run_id']}"
+    if not intent or intent["state"] != "acknowledged":
+        if claim is not None and claim["owner"] == owner:
+            return None  # The owning helper can resume its observed pending intent.
+        return {"state": "pending", "pending": True, "desired": desired,
+                "reason": "terminal ownership or acknowledgement is unavailable",
+                "readback_at": _now()}
+    payload = json.loads(intent["payload"])
+    if (intent["owner"] != owner or payload.get("status") != status
+            or bool(payload.get("release")) != release or sync.get("status") != status
+            or sync.get("issue_state") != "OPEN" or sync.get("project") != project
+            or payload.get("assignee") != assignee or payload.get("project") != project
+            or (assignee != "@me"
+                and sync.get("assignee", "").casefold() != assignee.lstrip("@").casefold())
+            or not sync.get("readback_at") or bool(claim) != (not release)
+            or (claim is not None and claim["owner"] != owner)):
+        if claim is not None and claim["owner"] == owner:
+            return None  # The preceding owned transition is not this terminal intent.
+        return {"state": "pending", "pending": True, "desired": desired,
+                "reason": "released terminal helper acknowledgement conflicts",
+                "readback_at": _now()}
+    return {"state": "consistent", "pending": False, "desired": desired,
+            "observed": {"state": "consistent", "claim": claim, "expected": sync,
+                         "source": "owning helper live readback and acknowledged intent"},
+            "readback_at": sync["readback_at"]}
+
+
 def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
                   terminal: bool = False, reason: str | None = None) -> dict[str, Any]:
     store, _ = _context(spec)
@@ -364,6 +399,27 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
         }
     script = store.config.helpers_dir / "github.py"
     owner = f"external:devflow:{spec['run_id']}"
+    if terminal:
+        prior = _terminal_receipt(store, spec, status, release, project, assignee, desired)
+        if prior is not None:
+            if prior["state"] != "consistent":
+                return prior
+            # A lost activity/helper completion may already have released the claim.
+            # Observe its acknowledged intent and current remote state; never set again.
+            audit = subprocess.run(
+                [sys.executable, str(script), "--db", str(store.config.tracking_db),
+                 "audit", "--work-id", spec["work_id"]],
+                text=True, capture_output=True, check=False, timeout=120,
+            )
+            observed = json.loads(audit.stdout) if audit.returncode == 0 else {}
+            current = _terminal_receipt(store, spec, status, release, project, assignee, desired)
+            if (audit.returncode or observed.get("state") != "consistent"
+                    or current != prior or observed.get("expected") != prior["observed"]["expected"]
+                    or bool(observed.get("claim")) != (not release)):
+                return {"state": "pending", "pending": True, "desired": desired,
+                        "observed": observed, "reason": "acknowledged terminal readback is pending",
+                        "readback_at": _now()}
+            return {**prior, "observed": observed, "readback_at": _now()}
     command = [
         sys.executable,
         str(script),
@@ -398,28 +454,15 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
         # and acknowledges that exact intent atomically before releasing ownership.
         # A second remote audit after release cannot safely change the transition.
         acknowledged = json.loads(result.stdout)
-        with store._connect() as db:
-            work = store.state.row(db, "works", spec["work_id"])
-            sync = json.loads(work["details"] or "{}").get("github", {}).get("sync", {})
-            intent = db.execute("SELECT * FROM reconcile_intents WHERE work_id=?",
-                                (spec["work_id"],)).fetchone()
-            claim = store.state.claim_for(db, spec["work_id"])
-        payload = json.loads(intent["payload"]) if intent else {}
-        if (not intent or intent["state"] != "acknowledged" or intent["owner"] != owner
-                or payload.get("status") != status or bool(payload.get("release")) != release
-                or sync.get("status") != status or sync.get("issue_state") != "OPEN"
-                or sync.get("project") != project or not sync.get("readback_at")
+        receipt = _terminal_receipt(store, spec, status, release, project, assignee, desired)
+        sync = receipt.get("observed", {}).get("expected", {}) if receipt else {}
+        if (not receipt or receipt["state"] != "consistent"
                 or acknowledged.get("status") != status
                 or acknowledged.get("assignee") != sync.get("assignee")
-                or acknowledged.get("project_status") != sync.get("project_status")
-                or bool(claim) != (not release)
-                or (claim is not None and claim["owner"] != owner)):
+                or acknowledged.get("project_status") != sync.get("project_status")):
             return {"state": "pending", "pending": True, "desired": desired,
                     "reason": "terminal helper acknowledgement changed", "readback_at": _now()}
-        return {"state": "consistent", "pending": False, "desired": desired,
-                "observed": {"state": "consistent", "claim": claim, "expected": sync,
-                             "source": "owning helper live readback and acknowledged intent"},
-                "readback_at": sync["readback_at"]}
+        return receipt
     audit = subprocess.run(
         [
             sys.executable,

@@ -82,6 +82,11 @@ def build_server(config_path: Path) -> FastMCP:
         """Grant one bounded trusted-local recovery using an explicit fresh preflight hash."""
         return client(config_path).recover_execution(run_id, json.loads(request_json))
 
+    @server.tool(annotations=write)
+    def reconcile_tracker(run_id: str, request_json: str) -> dict:
+        """Resume three terminal readback attempts; no candidate or model authority changes."""
+        return client(config_path).reconcile_tracker(run_id, json.loads(request_json))
+
     return server
 
 
