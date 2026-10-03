@@ -115,12 +115,17 @@ class DeliveryConfig:
             "branch",
             "authorized_endpoint",
         }
-        optional = {"accepted_plan", "recovery_key", "supersedes_run_id"}
+        optional = {"accepted_plan", "recovery_key", "supersedes_run_id", "plan_approval"}
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
             raise ValueError("required submit fields must be non-empty strings")
         accepted_plan = supplied.get("accepted_plan")
+        plan_approval = supplied.get("plan_approval", "automatic")
+        if not isinstance(plan_approval, str) or plan_approval not in {"automatic", "required"}:
+            raise ValueError("plan_approval must be automatic or required")
+        if accepted_plan is not None and plan_approval == "required":
+            raise ValueError("plan_approval required contradicts a supplied accepted_plan")
         if accepted_plan is not None and (
             not isinstance(accepted_plan, str) or not accepted_plan.strip()
         ):
@@ -402,6 +407,7 @@ class DeliveryConfig:
                     raise ValueError("browser QA requires positive count and bounded timeout")
         return {
             **supplied,
+            "plan_approval": plan_approval,
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,

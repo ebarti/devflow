@@ -110,6 +110,7 @@ def test_raw_goal_admission_and_legacy_plan(intake_fixture):
     accepted = store.submit(request)
     assert accepted["phase"] == "accepted"
     assert store.spec("run-1")["intake_required"] is True
+    assert store.spec("run-1")["plan_approval"] == "automatic"
     assert store.effective_spec("run-1")["accepted_plan"] == ""
     assert store.submit(request) == accepted
     with pytest.raises(ValueError, match="different inputs"):
@@ -121,6 +122,32 @@ def test_raw_goal_admission_and_legacy_plan(intake_fixture):
     }
     store.submit(legacy)
     assert store.spec("run-legacy")["intake_required"] is False
+
+
+@pytest.mark.parametrize("policy", [None, False, 1, {}, [], "", "AUTO", "sometimes"])
+def test_invalid_plan_approval_rejected_before_claim(intake_fixture, policy):
+    path, request = intake_fixture
+    store = create_app(path).state.delivery.store
+    with pytest.raises(ValueError, match="plan_approval"):
+        store.submit({**request, "plan_approval": policy})
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 0
+        assert store.state.row(db, "works", request["work_id"]) is None
+
+
+def test_required_plan_approval_is_explicit_and_conflicts_with_accepted_plan(intake_fixture):
+    path, request = intake_fixture
+    store = create_app(path).state.delivery.store
+    with pytest.raises(ValueError, match="contradicts"):
+        store.submit({**request, "plan_approval": "required", "accepted_plan": "Existing plan"})
+    with store._connect() as db:
+        assert store.state.row(db, "works", request["work_id"]) is None
+    required = {**request, "plan_approval": "required"}
+    receipt = store.submit(required)
+    assert store.spec("run-1")["plan_approval"] == "required"
+    assert store.submit(required) == receipt
+    with pytest.raises(ValueError, match="different inputs"):
+        store.submit({**required, "plan_approval": "automatic"})
 
 
 def test_unpinned_intake_role_rejected_before_work_claim(intake_fixture):
