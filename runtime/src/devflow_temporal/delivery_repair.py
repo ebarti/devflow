@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from .contracts import canonical_json, digest
 from .delivery_broker import BrokerReadbackUnavailable, DeliveryBroker, _git
-from .delivery_output import visible_output
+from .delivery_output import rejection_causes, visible_output
 from .delivery_workflow import _broker_findings
 
 
@@ -55,6 +55,8 @@ def failed_gate_diagnostics(state: dict[str, Any], spec: dict[str, Any]) -> list
         for stage, key in (("browser_qa", "browser_qa"), ("local_checks", "local")):
             result = checks.get(key)
             if isinstance(result, dict) and result.get("state") == "failed":
+                if key == "browser_qa" and result.get("rejected_output"):
+                    result = _historical_browser_rejection(result, spec)
                 return _broker_findings(stage, result, iteration=iteration)
         raise ValueError("terminal repair finding has no current failed gate")
     if error == "required CI did not confirm this PR head":
@@ -63,6 +65,31 @@ def failed_gate_diagnostics(state: dict[str, Any], spec: dict[str, Any]) -> list
             raise ValueError("required CI failure is not sealed")
         return _ci_diagnostics(result, spec, state.get("pull_request"))
     raise ValueError("terminal reason does not authorize another repair iteration")
+
+
+def _historical_browser_rejection(result, spec):
+    """Enrich a sealed historical failure from its unchanged owned full log."""
+    from .delivery_preparation import _private_bytes
+
+    path = Path(result.get("log", ""))
+    root = Path(spec["state_dir"]).resolve()
+    if not path.is_absolute() or not path.resolve().is_relative_to(root):
+        raise ValueError("historical browser rejection log escapes its owned run")
+    if path.stat().st_size > 8 * 1024 * 1024:
+        raise ValueError("historical browser rejection log exceeds bounded evidence")
+    raw = _private_bytes(path, root)
+    if hashlib.sha256(raw).hexdigest() != result.get("log_sha256"):
+        raise ValueError("historical browser rejection log changed")
+    policy = spec["policy"].get("browser_qa", {})
+    causes = rejection_causes(visible_output(raw.decode("utf-8", errors="replace")), [
+        *([policy["reject_regex"]] if policy.get("reject_regex") else []),
+        r"(?m)^\s*\d+\s+(?:failed|skipped|flaky|did not run)\b",
+    ])
+    if not causes:
+        raise ValueError("historical browser rejection lacks its frozen matching cause")
+    if result.get("rejection_causes") and result["rejection_causes"] != causes:
+        raise ValueError("historical browser rejection cause changed")
+    return {**result, "rejection_causes": causes}
 
 
 def _ci_diagnostics(

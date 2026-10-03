@@ -3712,3 +3712,25 @@ async def test_large_public_submit_dispatches_through_real_temporal_and_safe_act
     finally:
         server.terminate()
         await server.wait()
+
+
+def test_public_legacy_cleanup_readback_keeps_original_none_and_authenticates_receipt(service):
+    from devflow_temporal.delivery_resources import RunResources
+
+    store, request = service
+    store.submit(request)
+    spec = store.spec('run-1')
+    resources = RunResources(spec)
+    resources.scratch('check', 'terminal')
+    receipt = resources.finalize('blocked')
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message='original terminal history', checks={'resource_cleanup': receipt},
+                  outcome='blocked', cleanup='none')
+    assert store.detail('run-1')['run']['cleanup'] == 'confirmed'
+    assert store.list_runs()[0]['cleanup_recorded'] == 'none'
+    detail = store.detail('run-1')
+    assert detail['cleanup'] == 'confirmed' and detail['cleanup_recorded'] == 'none'
+    with store._connect() as db:
+        assert db.execute('SELECT cleanup FROM delivery_runs').fetchone()[0] == 'none'
+    Path(receipt['receipt']).write_text('{}')
+    assert store.detail('run-1')['cleanup'] == 'unknown'

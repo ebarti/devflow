@@ -90,7 +90,7 @@ skill and unrelated host inventory. Preserve the old package/request/manifest;
 generate a fresh selected package and new activation request against the same
 service config. The guarded activation archives the duplicate direct skill and
 removes only its owned direct entry. A fresh SDK `skills/list` and full
-`mcpServerStatus/list` must recognize the canonical skill and all ten tools;
+`mcpServerStatus/list` must recognize the canonical skill and the complete current tool inventory;
 then `get_service` must agree with the standalone client. An old cached/manual
 stdio client does not establish automatic plugin discovery.
 The public CLI's MCP inventory aggregates direct and plugin-provided servers, so

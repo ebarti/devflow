@@ -23,6 +23,7 @@ from devflow_temporal.role_runner import _task
 def terminal_unit_clock(monkeypatch):
     monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.now',
                         lambda: datetime(2026, 10, 3, tzinfo=UTC))
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _name: True)
 
 
 def test_trusted_mode_uses_supported_noninteractive_sdk_contract(native_configuration):
@@ -85,6 +86,32 @@ async def test_terminal_sync_replaces_stale_tracker_after_cleanup(outcome, confi
     assert tracker['release'] == confirmed
     expected = 'in-review' if outcome == 'delivered' and confirmed else 'blocked'
     assert tracker['desired'] == expected
+    assert calls[-1][1]['cleanup'] == ('confirmed' if confirmed else 'unknown')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('new_history', [False, True])
+async def test_cleanup_patch_keeps_legacy_activity_order_and_updates_only_new_projection(
+    monkeypatch, new_history,
+):
+    controller = DeliveryWorkflow()
+    controller.state = {'phase': 'blocked', 'execution_state': 'blocked', 'outcome': 'blocked',
+                        'iteration': 0, 'revision': 1, 'cleanup': 'none', 'checks': {}}
+    calls = []
+
+    async def execute(name, request, **_kwargs):
+        calls.append(name)
+        if name == 'delivery_finalize_resources':
+            return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+                    'resource_cleanup': 'confirmed'}
+        assert request['cleanup'] == ('confirmed' if new_history else 'none')
+        return {}
+
+    controller._activity = execute
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched',
+                        lambda _name: new_history)
+    await controller._project({'resource_cleanup_version': 1}, 'blocked', 'final')
+    assert calls == ['delivery_finalize_resources', 'delivery_project']
 
 
 @pytest.mark.asyncio
@@ -289,6 +316,8 @@ def test_real_pytest_numbered_fixture_artifacts_survive_navigation_links(tmp_pat
         ' for index in range(6):\n'
         '  (root/f"{index}.pdf").write_bytes(b"synthetic PDF")\n'
         '  (tmp_path/f"{index}.png").write_bytes(b"synthetic page PNG")\n'
+        '  (root/f"{index}.html").write_text("<p>synthetic source</p>")\n'
+        '  (root/f"{index}-bbox.html").write_text("<p>synthetic bbox</p>")\n'
         ' (root/"measurements.json").write_text("{}")\n'
     )
     folder = tmp_path / 'check'
@@ -299,9 +328,18 @@ def test_real_pytest_numbered_fixture_artifacts_survive_navigation_links(tmp_pat
     assert any(path.is_symlink() for path in (folder / 'pytest-artifacts').rglob('*'))
     ref = retain_artifacts(folder, {'id': 'candidate'})
     manifest = verify_manifest(ref, 'candidate', tmp_path)
-    assert manifest['count'] == 104
+    assert manifest['count'] == 200
     assert sum(item['relative_path'].endswith('.pdf') for item in manifest['artifacts']) == 48
     assert sum(item['relative_path'].endswith('.png') for item in manifest['artifacts']) == 48
+    assert sum(item['relative_path'].endswith('-bbox.html') for item in manifest['artifacts']) == 48
+    assert sum(item['relative_path'].endswith('.html') for item in manifest['artifacts']) == 96
+    assert sum(
+        item['relative_path'].endswith('measurements.json') for item in manifest['artifacts']
+    ) == 8
+    import shutil
+
+    shutil.rmtree(folder / 'pytest-artifacts')  # Only this disposable fixture's transient outputs.
+    assert verify_manifest(ref, 'candidate', tmp_path) == manifest
 
 
 def test_retained_artifact_manifest_rejects_mutation_and_links(tmp_path):

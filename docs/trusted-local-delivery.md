@@ -232,3 +232,78 @@ directory scan, manual copying race or shared cache cleanup is required.
 
 Installation, service restart and managed recovery require the separately
 assigned operational verification. This repair does not merge or deploy.
+
+Stopped published metadata has a separate bounded reconciliation. The public
+`metadata-preflight --id RUN --request REQUEST.json` command authenticates the
+closed workflow, exact clean local/remote/PR head, controller publication range,
+source scope, configured existing signer and resource cleanup. The same request
+is used by `reconcile-published-metadata`. Its fields are `command_id`,
+`expected_revision`, `expected_candidate_id`, `expected_head`,
+`expected_pr_number`, `expected_signer`, `authority_path`, and
+`authority_sha256`. The authority receipt permits one command per admitted
+original run and at most two admitted run IDs. The controller retains every old
+commit object and preservation ref, each tree/author/author date, the original
+receipts and an immutable old-to-new mapping. It changes commit subjects and
+actual author sign-off, with an exact remote force-with-lease; a changed remote,
+foreign commit, source edit, merged PR or unknown identity is refused. Replay
+uses the same command and request after a known interrupted effect.
+
+Metadata validation runs no implementation, review or QA provider turn. It runs
+fresh native gates and retains explicit source-identical applicability for a
+prior genuine independent PASS. A missing QA assessment remains incomplete.
+A failed gate remains blocked with its fresh evidence. Neither an old CI result
+nor an old head assessment is presented as a new head rerun.
+
+A stopped investigation can use the separate `gates-only-preflight --id RUN`
+and `admit-gates-only --id RUN --request REQUEST.json` commands only with an
+explicit cause-specific authority and semantic receipt. The request contains
+`command_id`, `precheck_sha256`, `authority_path`, `authority_sha256`,
+`semantic_path`, and `semantic_sha256`. Admission authenticates both the frozen
+input and the actual closed role after-candidate, raw result, session, source,
+cleanup, work/claim and remote custody. It preserves the rejected historical
+assessment and runs all mandatory gates at the same existing iteration, without
+an implementation turn or larger repair budget. Any implementation-needed
+failure stops blocked. Identical request replay is idempotent; another command
+or changed preflight is refused.
+
+The semantic receipt's hash-bound accepted-plan readback must match the frozen
+effective plan. `authority_readback(spec, seal, request)` authenticates those
+receipt, plan and custody references without an admission effect. The new
+successors retry custody readback at most three times within five minutes;
+unknown custody stops the workflow before any provider turn.
+
+These continuations retain original cleanup bytes and use distinct durable
+check/browser evidence namespaces. Resource roots stay under their original
+registered ownership. For trusted pytest checks, the unchanged frozen argv runs
+with controller-owned `PYTEST_ADDOPTS=--basetemp=<evidence>/<check-id>/pytest-artifacts`.
+The controller retains PDF, PNG, HTML, JSON, XML and text files before transient
+cleanup, with a candidate-bound hash manifest: at most 4096 files, 50 MiB per
+file and 1 GiB total. A hash manifest establishes retained file integrity;
+independent QA must still establish required case/render counts and inspect
+every physical page. The pagination fixture's eight cases each produce six
+PDFs, six source HTML files, six bbox HTML files, measurements and every page
+image. Calibration PDFs are additional evidence. The expected new page count
+comes from the actual rerun rather than a historical removed-file count.
+
+The existing `continue-repair` command accepts its original seven fields. A
+cause-specific title correction additionally requires `authority_path` and
+`authority_sha256`, and can be inspected with `repair-admission-preflight` using
+the same request. This narrow route requires the authenticated effective policy,
+completed metadata reconciliation and a fresh failed browser receipt whose
+frozen regex matches the exact title. It atomically reacquires a released claim
+with grant/outbox persistence, rolling back acquisition on admission failure.
+The admitted original session receives the bounded exact match, pattern and
+owned log/hash provenance. The controller permits one title literal change
+only; every surrounding byte, all five cases/assertions and other source files
+must remain identical. This grant admits exactly iteration5 under an existing
+max_repairs3 ceiling, with no iteration6 or automatic renewal. Metadata repair
+must precede this source correction. No generic old failed run gains this
+released-claim or effective-policy exception.
+
+Public terminal cleanup now derives confirmation from the exact hashed owning
+finalization receipt, with process and resource confirmation and no active
+attempt. `cleanup_recorded` exposes the historical stored value separately.
+Old `none` is never broadly treated as confirmed or privately migrated; missing,
+changed or unknown proof remains unconfirmed. Native failed gate feedback keeps
+bounded structured regex matches and owned full-log provenance independently
+of diagnostic truncation, while retaining the original log and reject policy.

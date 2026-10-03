@@ -302,6 +302,22 @@ class DeliveryStore:
                 )"""
             )
             db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_metadata_recoveries (
+                    run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+                    command_id TEXT NOT NULL UNIQUE,
+                    command_digest TEXT NOT NULL,
+                    grant_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('pending','queued'))
+                )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_gate_admissions (
+                    run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+                    command_id TEXT NOT NULL UNIQUE,
+                    recovery_json TEXT NOT NULL
+                )"""
+            )
+            db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_repair_grant_successors (
                     run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
                     grant_number INTEGER NOT NULL CHECK (grant_number >= 4),
@@ -822,6 +838,29 @@ class DeliveryStore:
             )
         return response
 
+    def metadata_preflight(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+        from .delivery_metadata_recovery import reconcile
+
+        return reconcile(self, run_id, supplied, preflight=True)
+
+    def repair_admission_preflight(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+        return self.continue_repair(run_id, supplied, preflight=True)
+
+    def reconcile_published_metadata(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+        from .delivery_metadata_recovery import reconcile
+
+        return reconcile(self, run_id, supplied)
+
+    def gates_only_preflight(self, run_id: str) -> dict[str, Any]:
+        from .delivery_gates_admission import preflight
+
+        return preflight(self, run_id)
+
+    def admit_gates_only(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+        from .delivery_gates_admission import admit
+
+        return admit(self, run_id, supplied)
+
 
     def scope_preflight(self, spec: dict[str, Any], recovery: dict[str, Any]) -> None:
         """Recheck the sealed amendment before the sole enlarged-scope role."""
@@ -922,7 +961,9 @@ class DeliveryStore:
         if DeliveryBroker(self, spec).candidate() != recovery["amended_candidate"]:
             raise ValueError("amended candidate changed before repair")
 
-    def continue_repair(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+    def continue_repair(
+        self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
+    ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
         from .delivery_preparation import require_native_execution
 
@@ -943,7 +984,10 @@ class DeliveryStore:
             "expected_pr_head",
             "additional_iterations",
         }
-        if not isinstance(supplied, dict) or set(supplied) != required:
+        cause_specific = isinstance(supplied, dict) and set(supplied) == required | {
+            "authority_path", "authority_sha256",
+        }
+        if not isinstance(supplied, dict) or (set(supplied) != required and not cause_specific):
             raise ValueError("repair continuation fields do not match the contract")
         command_id = supplied["command_id"]
         if (
@@ -986,7 +1030,7 @@ class DeliveryStore:
             raise ValueError("run ID not found")
         if granted:
             raise ValueError("this run already received its one repair grant")
-        spec = self.spec(run_id)
+        spec = self.effective_spec(run_id) if cause_specific else self.spec(run_id)
         if digest(DeliveryConfig.load(self.config.path).raw) != spec["config_digest"]:
             raise ValueError("frozen service configuration changed before repair grant")
         current_workflow_id = row["workflow_id"] or f"delivery-{run_id}"
@@ -1009,7 +1053,7 @@ class DeliveryStore:
             or state.get("phase") != "blocked"
             or state.get("outcome") != "blocked"
             or state.get("execution_state") != "blocked"
-            or state.get("cleanup") != "none"
+            or state.get("cleanup") not in ({"none", "confirmed"} if cause_specific else {"none"})
             or state.get("revision") != supplied["expected_revision"]
             or type(iteration) is not int
             or iteration != supplied["expected_iteration"]
@@ -1069,7 +1113,14 @@ class DeliveryStore:
             raise ValueError("failed gate supplied no repair diagnostics")
         broker = DeliveryBroker(self, spec)
         observed_pr = published_identity(broker, candidate, pr)
-        confirmed_native_cleanup(spec)
+        cleanup_digest = confirmed_native_cleanup(spec)
+        title_constraint = None
+        if cause_specific:
+            from .delivery_title_repair import prepare
+
+            title_constraint = prepare(
+                self, spec, state, previous_recovery, supplied, implementation["session_id"],
+            )
         workflow_id = f"delivery-{run_id}-repair-continuation-1"
         recovery = {
             "kind": "repair_continuation",
@@ -1085,6 +1136,9 @@ class DeliveryStore:
             "additional_iterations": supplied["additional_iterations"],
             "maximum_iteration": iteration + supplied["additional_iterations"],
         }
+        if cause_specific:
+            recovery.update(original_recovery=previous_recovery, effective_spec=spec,
+                            title_constraint=title_constraint, cleanup_digest=cleanup_digest)
         response = {
             "run_id": run_id,
             "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
@@ -1093,6 +1147,19 @@ class DeliveryStore:
             "authorized_through_iteration": recovery["maximum_iteration"],
             "existing": False,
         }
+        if preflight:
+            from .delivery_policy_recovery import work_binding
+
+            with self._connect() as db:
+                work_binding(self, spec, db)
+                claim = self.state.claim_for(db, spec["work_id"])
+                if (claim is not None if cause_specific else
+                        claim is None or claim["owner"] != f"external:devflow:{run_id}"):
+                    raise ValueError("repair preflight claim authority changed")
+            return {**response, "preflight": True, "diagnostics": findings,
+                    "title_constraint_sha256": (
+                        digest(title_constraint) if title_constraint else None
+                    )}
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             prior = db.execute(
@@ -1122,7 +1189,9 @@ class DeliveryStore:
                 or current["phase"] != "blocked"
                 or current["outcome"] != "blocked"
                 or current["execution_state"] != "blocked"
-                or current["cleanup"] != "none"
+                or current["cleanup"] not in (
+                    {"none", "confirmed"} if cause_specific else {"none"}
+                )
                 or current["error"] != state["error"]
                 or current["protocol_revision"] != state["revision"]
                 or current["iteration"] != iteration
@@ -1132,8 +1201,8 @@ class DeliveryStore:
                 or db.execute(
                     "SELECT 1 FROM delivery_repair_grants WHERE run_id=?", (run_id,)
                 ).fetchone()
-                or claim is None
-                or claim["owner"] != f"external:devflow:{run_id}"
+                or (claim is not None if cause_specific else
+                    claim is None or claim["owner"] != f"external:devflow:{run_id}")
                 or len(attempts) != len(roles)
                 or any(
                     item["state"] != "finished" or item["cleanup"] != "confirmed"
@@ -1154,6 +1223,13 @@ class DeliveryStore:
                 )
             ):
                 raise ValueError("repair continuation lost its frozen run or ownership")
+            if cause_specific:
+                from .delivery_policy_recovery import work_binding
+
+                work_binding(self, spec, db)
+                self.state.claim_work(db, spec["work_id"], f"external:devflow:{run_id}",
+                                      self.config.dashboard_url)
+                work_binding(self, spec, db)
             revision = current["revision"] + 1
             db.execute(
                 """INSERT INTO delivery_repair_grants VALUES (?,?,?,?,?,?,?,?)""",
@@ -1886,6 +1962,17 @@ class DeliveryStore:
             or any(item["state"] != "complete" for item in effects)
         ):
             raise ValueError("repair grant or owned resources changed before resume")
+        if original.get("title_constraint"):
+            from .delivery_policy_recovery import work_binding
+            from .delivery_title_repair import validate_source
+
+            if (canonical_json(self.effective_spec(run_id)) != canonical_json(spec)
+                    or canonical_json(original["effective_spec"]) != canonical_json(spec)
+                    or confirmed_native_cleanup(spec) != original["cleanup_digest"]):
+                raise ValueError("title repair effective or resource authority changed")
+            with self._connect() as db:
+                work_binding(self, spec, db)
+            validate_source(spec, original["title_constraint"], completed=False)
         if retry:
             folder = Path(spec["state_dir"]) / "attempts" / recovery["failed_job_key"]
             try:
@@ -2352,7 +2439,9 @@ class DeliveryStore:
     @staticmethod
     def _scope_recovery(recovery: dict[str, Any] | None) -> dict[str, Any] | None:
         """Read the sole native scope amendment without restoring retired execution."""
-        while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+        while recovery and recovery.get("kind") in {
+            "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
+        }:
             recovery = recovery["original_recovery"]
         if isinstance(recovery, dict) and recovery.get("kind") == "scope_amendment":
             return recovery
@@ -2373,8 +2462,19 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-            while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+            while recovery and recovery.get("kind") in {
+                "terminal_tracker_recovery", "published_metadata_recovery",
+                "investigation_gates_only",
+            }:
                 recovery = recovery["original_recovery"]
+            if (recovery and recovery.get("kind") == "repair_continuation"
+                    and recovery.get("title_constraint")):
+                recovery = recovery["original_recovery"]
+                while recovery and recovery.get("kind") in {
+                    "terminal_tracker_recovery", "published_metadata_recovery",
+                    "investigation_gates_only",
+                }:
+                    recovery = recovery["original_recovery"]
             if isinstance(recovery, dict) and recovery.get("kind") == "execution_policy_recovery":
                 from .delivery_policy_recovery import effective_spec
 
@@ -2452,6 +2552,8 @@ class DeliveryStore:
                 "repair_prelaunch_retry_queued",
                 "scope_amendment_queued",
                 "terminal_tracker_recovery_queued",
+                "metadata_validation_queued",
+                "gates_only_queued",
             }:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
@@ -2465,6 +2567,10 @@ class DeliveryStore:
             new_phase = (
                 "waiting_tracker"
                 if row[1] == "terminal_tracker_recovery_queued" and accepted
+                else "metadata_validation"
+                if row[1] == "metadata_validation_queued" and accepted
+                else "gates_only"
+                if row[1] == "gates_only_queued" and accepted
                 else "publishing"
                 if row[1] == "publication_recovery_queued" and accepted
                 else "repair"
@@ -2859,11 +2965,12 @@ class DeliveryStore:
             ).fetchall()
             return [self._compact(dict(row)) for row in rows]
 
-    @staticmethod
-    def _compact(row: dict[str, Any]) -> dict[str, Any]:
+    def _compact(self, row: dict[str, Any]) -> dict[str, Any]:
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-        while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+        while recovery and recovery.get("kind") in {
+            "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
+        }:
             recovery = recovery["original_recovery"]
         effective = (
             recovery.get("effective_spec", spec)
@@ -2873,6 +2980,19 @@ class DeliveryStore:
         )
         if not isinstance(effective, dict):
             effective = spec
+        from .delivery_resources import projected_cleanup
+
+        with self._connect() as db:
+            active = db.execute(
+                "SELECT COUNT(*) FROM delivery_attempts WHERE run_id=? "
+                "AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
+            ).fetchone()[0]
+        cleanup = projected_cleanup(
+            effective, json.loads(row["checks_json"] or "{}"), row["cleanup"],
+            terminal=(not active and row["execution_state"] in {
+                "terminal", "blocked", "cancelled", "waiting_tracker",
+            }),
+        )
         return {
             "id": row["run_id"],
             "run_id": row["run_id"],
@@ -2893,7 +3013,8 @@ class DeliveryStore:
             "iteration": row["iteration"],
             "authorized_endpoint": spec["authorized_endpoint"],
             "outcome": row["outcome"],
-            "cleanup": row["cleanup"],
+            "cleanup": cleanup,
+            "cleanup_recorded": row["cleanup"],
         }
 
     def detail(self, run_id: str) -> dict[str, Any]:
@@ -2916,7 +3037,15 @@ class DeliveryStore:
         terminal_recovery = (
             recovery if recovery and recovery.get("kind") == "terminal_tracker_recovery" else None
         )
-        while recovery and recovery.get("kind") == "terminal_tracker_recovery":
+        metadata_recovery = recovery if recovery and recovery.get("kind") == (
+            "published_metadata_recovery"
+        ) else None
+        gates_admission = recovery if recovery and recovery.get("kind") == (
+            "investigation_gates_only"
+        ) else None
+        while recovery and recovery.get("kind") in {
+            "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
+        }:
             recovery = recovery["original_recovery"]
         scope_recovery = self._scope_recovery(recovery)
         scope_amendment = (
@@ -3038,16 +3167,37 @@ class DeliveryStore:
             }
             for name, label, completion in gate_specs
         ]
+        from .delivery_resources import projected_cleanup
+
+        cleanup = projected_cleanup(
+            spec, checks, row["cleanup"], terminal=(not active and row["execution_state"] in {
+                "terminal", "blocked", "cancelled", "waiting_tracker",
+            }),
+        )
         return {
             **compact,
             "run": compact,
             "phase_gates": gates,
             "roles": roles,
             "capacity": {"limit": self.config.raw.get("capacity", 2), "active": active},
+            "metadata_reconciliation": {
+                "old_head": metadata_recovery["old_head"],
+                "new_head": metadata_recovery["new_head"],
+                "mapping_sha256": digest(metadata_recovery["mapping"]),
+                "provider_turns": 0,
+            } if metadata_recovery else None,
+            "gates_only_admission": {
+                "input_candidate_id": gates_admission["seal"]["input_candidate_id"],
+                "after_candidate_id": gates_admission["candidate"]["id"],
+                "iteration": gates_admission["seal"]["iteration"],
+                "precheck_sha256": digest(gates_admission["seal"]),
+                "implementation_authority": False,
+            } if gates_admission else None,
             "queued": row["execution_state"] == "queued",
             "cleanup": "unknown"
             if row["cleanup"] == "unknown" or any(a["cleanup"] == "unknown" for a in attempts)
-            else row["cleanup"],
+            else cleanup,
+            "cleanup_recorded": row["cleanup"],
             "candidate": {
                 **candidate,
                 "revision": row["candidate_revision"],
@@ -3096,6 +3246,23 @@ class DeliveryStore:
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
+        for namespace, names in (
+            ("metadata-reconciliation", ("intent.json", "original-ref.json", "rewritten-ref.json",
+                                          "publication.json")),
+            ("gates-admission", ("admission.json",)),
+        ):
+            for name in names:
+                path = root / namespace / name
+                if path.is_file() and not path.is_symlink():
+                    indexed.append({"id": namespace + "-" + name.removesuffix(".json"),
+                                    "label": namespace + ": " + name,
+                                    "path": path, "limit": 20 * 1024 * 1024})
+            for name in ("manifest.json", "finalization.json"):
+                path = root / namespace / "predecessor-resources" / name
+                if path.is_file() and not path.is_symlink():
+                    indexed.append({"id": namespace + "-predecessor-" + name,
+                                    "label": namespace + " original cleanup " + name,
+                                    "path": path, "limit": 4 * 1024 * 1024})
         policy_intent = root / "policy-recovery" / "intent.json"
         if policy_intent.is_file() and not policy_intent.is_symlink():
             indexed.append({"id": "execution-policy-recovery-intent",
@@ -3237,6 +3404,17 @@ class DeliveryStore:
                         "limit": 20 * 1024 * 1024 if path == contained_log else 1024 * 1024,
                     }
                 )
+        current_browser = details.get("checks", {}).get("browser_qa", {})
+        if isinstance(current_browser, dict):
+            for field, label in (("receipt", "receipt"), ("log", "log")):
+                path = Path(current_browser[field]) if current_browser.get(field) else None
+                if (path is not None and current_browser.get(field + "_sha256")
+                        and not any(item["path"] == path for item in indexed)):
+                    indexed.append({"id": "current-browser-" + label,
+                                    "label": "Current browser QA " + label,
+                                    "path": path,
+                                    "expected_sha256": current_browser[field + "_sha256"],
+                                    "limit": 20 * 1024 * 1024})
         recovery = root / "recovery" / "provenance.json"
         if recovery.is_file():
             indexed.append(

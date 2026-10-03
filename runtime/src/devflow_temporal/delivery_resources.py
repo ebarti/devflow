@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .contracts import digest
+from .contracts import canonical_json, digest
 
 
 def private_directory(path: Path) -> None:
@@ -111,6 +111,33 @@ def remove_directory(path: Path, identity: dict) -> None:
         os.close(parent)
     if os.path.lexists(path):
         raise ValueError("temporary root is still present after removal")
+
+
+def projected_cleanup(spec: dict, checks: dict, recorded: str, *, terminal: bool) -> str:
+    """Read legacy terminal success only from the exact owning finalization proof."""
+    if recorded == "unknown" or not terminal:
+        return recorded
+    receipt = checks.get("resource_cleanup", {})
+    if not isinstance(receipt, dict):
+        return recorded
+    try:
+        path = Path(spec["state_dir"]) / "resources/finalization.json"
+        if receipt.get("receipt") != str(path):
+            return recorded
+        observed = read_private(path)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != receipt.get("receipt_sha256"):
+            return "unknown"
+        expected = {key: value for key, value in receipt.items()
+                    if key not in {"receipt", "receipt_sha256"}}
+        if canonical_json(observed) != canonical_json(expected):
+            return "unknown"
+        if (observed.get("state") == "confirmed"
+                and observed.get("process_cleanup") == "observed-native-confirmed"
+                and observed.get("resource_cleanup") == "confirmed"):
+            return "confirmed"
+        return "unknown"
+    except (OSError, ValueError, KeyError):
+        return "unknown"
 
 
 class RunResources:

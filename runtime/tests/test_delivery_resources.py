@@ -375,3 +375,34 @@ def test_removed_generated_gate_retry_and_reallocation_reject_symlink_ancestor(t
     gate.parent.symlink_to(sentinel, target_is_directory=True)
     assert resources.finalize("blocked")["state"] == "unknown"
     assert sentinel.joinpath("precious").read_text() == "SAFE"
+
+
+def test_public_terminal_cleanup_derives_only_exact_finalization_and_keeps_recorded_history(
+    tmp_path,
+):
+    import hashlib
+
+    from devflow_temporal.delivery_resources import projected_cleanup
+
+    owned = spec(tmp_path)
+    resources = RunResources(owned)
+    resources.scratch("check", "finite")
+    receipt = resources.finalize("blocked")
+    checks = {"resource_cleanup": receipt}
+    assert projected_cleanup(owned, checks, "none", terminal=True) == "confirmed"
+    assert projected_cleanup(owned, checks, "none", terminal=False) == "none"
+    assert projected_cleanup(owned, checks, "unknown", terminal=True) == "unknown"
+    assert projected_cleanup(owned, {}, "none", terminal=True) == "none"
+    changed = {**receipt, "resource_cleanup": "unknown"}
+    assert (
+        projected_cleanup(owned, {"resource_cleanup": changed}, "none", terminal=True) == "unknown"
+    )
+    path = Path(receipt["receipt"])
+    original = path.read_bytes()
+    path.write_bytes(original + b" ")
+    assert projected_cleanup(owned, checks, "none", terminal=True) == "unknown"
+    checks["resource_cleanup"] = {
+        **receipt,
+        "receipt_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    assert projected_cleanup(owned, checks, "none", terminal=True) == "confirmed"

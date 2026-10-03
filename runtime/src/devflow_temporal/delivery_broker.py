@@ -18,7 +18,7 @@ from .candidate import candidate_for
 from .contracts import canonical_json
 from .delivery_browser_qa import run_browser_qa as execute_browser_qa
 from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
-from .delivery_output import observed_test_count, visible_output
+from .delivery_output import observed_test_count, rejection_causes, visible_output
 from .delivery_store import DeliveryStore, _now
 
 
@@ -85,6 +85,8 @@ class DeliveryBroker:
         self.source = Path(spec["source_path"])
         self.checkout = Path(spec["checkout"])
         self.state_dir = Path(spec["state_dir"])
+        self.evidence_dir = self.state_dir
+        self.effect_namespace = ""
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -360,7 +362,7 @@ class DeliveryBroker:
         result = subprocess.run(command, capture_output=True, check=False, timeout=120)
         if result.returncode or not result.stdout:
             raise RuntimeError("controller could not produce a nonempty bound candidate diff")
-        folder = self.state_dir / "gate-evidence" / str(iteration) / role
+        folder = self.evidence_dir / "gate-evidence" / str(iteration) / role
         folder.mkdir(parents=True, mode=0o700, exist_ok=True)
         folder_info = folder.lstat()
         if (
@@ -496,9 +498,10 @@ class DeliveryBroker:
             count = None
             if check.get("test_count_regex"):
                 count = observed_test_count(output, check["test_count_regex"])
-            rejected_output = False
-            if check.get("reject_regex"):
-                rejected_output = re.search(check["reject_regex"], parsed_output) is not None
+            rejected_causes = rejection_causes(
+                parsed_output, [check["reject_regex"]] if check.get("reject_regex") else []
+            )
+            rejected_output = bool(rejected_causes)
             passed = (
                 exit_code == 0
                 and evidence_failure is None
@@ -513,6 +516,7 @@ class DeliveryBroker:
                     "exit_code": exit_code,
                     "test_count": count,
                     "rejected_output": rejected_output,
+                    "rejection_causes": rejected_causes,
                     "passed": passed,
                     "diagnostic": parsed_output[-2000:] if not passed else None,
                     "log": str(artifact),
@@ -588,7 +592,7 @@ class DeliveryBroker:
         scratch = resources.scratch("dependencies", self.spec["policy_digest"])
         transient = read_private(resources.manifest)["roots"][str(self.state_dir / "transient")]
         generation = transient.get("generation", 0)
-        folder = self.state_dir / "dependency-preparation" / f"native-{generation}"
+        folder = self.evidence_dir / "dependency-preparation" / f"native-{generation}"
         staging = scratch / "staging"
         dependencies = staging / "store"
         for path in (folder, staging, dependencies):
@@ -657,7 +661,7 @@ class DeliveryBroker:
         return self._run_check_list(
             self.checkout,
             self.spec["policy"].get("prepublish_checks", []),
-            self.state_dir / "prechecks" / str(iteration),
+            self.evidence_dir / "prechecks" / str(iteration),
             candidate,
         )
 
@@ -666,14 +670,14 @@ class DeliveryBroker:
         return self._run_check_list(
             checkout,
             self.spec["policy"].get("checks", []),
-            self.state_dir / "checks" / str(iteration),
+            self.evidence_dir / "checks" / str(iteration),
             candidate,
         )
 
     def run_browser_qa(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         return execute_browser_qa(self, iteration, candidate)
 
-    def _existing_pr(self) -> dict[str, Any] | None:
+    def _existing_pr(self, *, validate_metadata: bool = True) -> dict[str, Any] | None:
         try:
             output = _run(
                 [
@@ -706,7 +710,7 @@ class DeliveryBroker:
             or found["state"] != "OPEN"
         ):
             raise RuntimeError("owned branch PR is not the authorized open regular PR")
-        if not _conventional_subject(found.get("title", "")):
+        if validate_metadata and not _conventional_subject(found.get("title", "")):
             raise ValueError("owned PR title does not satisfy Conventional Commits")
         return found
 

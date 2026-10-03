@@ -218,6 +218,14 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"Frozen plan approval: {json.dumps(spec.get('plan_approval', 'required'))}\n"
         if role == "intake" else ""
     )
+    constraint = request.get("title_constraint")
+    title_note = (
+        "ONE authorized correction: change only the misleading first test title literal "
+        f"in {constraint['path']}: {json.dumps(constraint['title'])}. Preserve every other "
+        "file byte, all five test cases and every failure/conflict assertion. The controller "
+        "will reject any other source edit. Do not edit checks, regex or policy.\n"
+        if constraint and role == "implement" else ""
+    )
     prompt = (
         f"{instructions}\n\n"
         f"{intake_context}"
@@ -227,6 +235,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"Allowed feature paths: {json.dumps(spec['policy']['allowed_paths'])}\n"
         f"Previous findings to repair: {json.dumps(findings)}\n"
         f"{continuation_note}\n"
+        f"{title_note}\n"
         f"{recovery_note}\n"
         f"{diff_note}\n"
         f"{qa_note}\n"

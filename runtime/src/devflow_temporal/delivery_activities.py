@@ -36,7 +36,22 @@ def _context(
         and store.submitted_spec(spec["run_id"]) == spec
     ):
         raise ValueError("Temporal input no longer matches the durable submitted run")
-    return store, DeliveryBroker(store, spec)
+    broker = DeliveryBroker(store, spec)
+    with store._connect() as db:
+        row = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                         (spec["run_id"],)).fetchone()
+    recovery = json.loads(row[0]) if row and row[0] else None
+    if recovery and recovery.get("kind") in {
+        "published_metadata_recovery", "investigation_gates_only",
+    }:
+        namespace = ("metadata-reconciliation" if recovery["kind"] == "published_metadata_recovery"
+                     else "gates-admission")
+        broker.evidence_dir = broker.state_dir / namespace / "evidence"
+        from .delivery_resources import private_directory
+
+        private_directory(broker.evidence_dir)
+        broker.effect_namespace = ":" + namespace
+    return store, broker
 
 
 @activity.defn(name="delivery_project")
@@ -176,9 +191,29 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
         review_diff = broker.gate_diff(role, iteration, candidate)
     else:
         raise ValueError("unknown delivery role")
+    constraint = request.get("title_constraint")
+    if constraint:
+        from .delivery_title_repair import validate_source
+
+        with store._connect() as db:
+            saved = json.loads(db.execute(
+                "SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                (request["spec"]["run_id"],),
+            ).fetchone()[0])
+        if (role != "implement" or iteration != 5
+                or digest(saved.get("title_constraint")) != digest(constraint)
+                or request.get("resume_session") != saved["session_id"]):
+            raise ValueError("title repair role does not match its sealed single turn")
+        validate_source(request["spec"], constraint, completed=False)
     result = await get_supervisor(store).run(
         {**request, "workspace": str(workspace), "review_diff": review_diff}
     )
+    if constraint:
+        try:
+            validate_source(request["spec"], constraint, completed=True)
+        except (ValueError, OSError, UnicodeError) as exc:
+            result["status"] = "blocked"
+            result.setdefault("findings", []).append(str(exc))
     if role == "implement":
         after = broker.candidate()
         if result.get("status") == "pass":
@@ -250,6 +285,28 @@ async def delivery_reconcile_publish(request: dict[str, Any]) -> dict[str, Any]:
             expected_head=request.get("expected_head"),
             expected_pr_number=request.get("expected_pr_number"),
         )
+
+    return await asyncio.to_thread(execute)
+
+
+@activity.defn(name="delivery_metadata_readback")
+async def delivery_metadata_readback(request: dict[str, Any]) -> dict[str, Any]:
+    def execute():
+        from .delivery_metadata_recovery import validation_readback
+
+        store, _ = _context(request["spec"])
+        return validation_readback(store, request["spec"], request["recovery"])
+
+    return await asyncio.to_thread(execute)
+
+
+@activity.defn(name="delivery_gates_readback")
+async def delivery_gates_readback(request: dict[str, Any]) -> dict[str, Any]:
+    def execute():
+        from .delivery_gates_admission import readback
+
+        store, _ = _context(request["spec"])
+        return readback(store, request["spec"], request["recovery"])
 
     return await asyncio.to_thread(execute)
 
@@ -608,6 +665,8 @@ DELIVERY_ACTIVITIES = [
     delivery_role,
     delivery_publish,
     delivery_reconcile_publish,
+    delivery_metadata_readback,
+    delivery_gates_readback,
     delivery_repair_preflight,
     delivery_checks,
     delivery_browser_qa,
