@@ -81,6 +81,10 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "Investigate this raw request using the repository evidence available in this "
             "read-only checkout. Inspect relevant code, tests and instructions first. "
             "Ask only material questions that the available context cannot resolve. "
+            "Planning within the frozen goal, paths, checks and endpoint is delegated; "
+            "routine implementation choices do not need another user approval. "
+            "If the goal requires broader authority, ask a material question or report "
+            "blocked; a user answer cannot expand the frozen authority. "
             "If questions remain, return status=questions with stable short IDs, clear "
             "prompts and useful suggested options; the user may also answer freely. "
             "For questions, set plan.scope to an empty string and its lists to empty "
@@ -163,6 +167,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
     intake_context = (
         f"Frozen work ID: {json.dumps(spec['work_id'])}\n"
         f"Frozen issue URL: {json.dumps(spec['issue_url'])}\n"
+        f"Frozen plan approval: {json.dumps(spec.get('plan_approval', 'required'))}\n"
         if role == "intake" else ""
     )
     prompt = (

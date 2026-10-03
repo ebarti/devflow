@@ -1913,6 +1913,11 @@ class DeliveryStore:
             or spec.get("supersedes_run_id") != old_id
             or spec["goal"] != prior_spec["goal"]
             or spec["accepted_plan"] != prior_spec["accepted_plan"]
+            or (
+                prior_spec.get("intake_required")
+                and spec.get("plan_approval", "required")
+                != prior_spec.get("plan_approval", "required")
+            )
             or spec["authorized_endpoint"] != prior_spec["authorized_endpoint"]
             or spec["base_sha"] != prior_spec["base_sha"]
             or spec["source_path"] != prior_spec["source_path"]
@@ -2010,6 +2015,7 @@ class DeliveryStore:
                 or any(intake_role.get(key) != value for key, value in saved.items())
             ):
                 raise ValueError("continuation intake history differs from its receipt")
+        accepted_intake_plan = None
         if prior_spec.get("intake_required"):
             intake_row = db.execute(
                 "SELECT intake_json FROM delivery_runs WHERE run_id=?", (old_id,)
@@ -2024,6 +2030,15 @@ class DeliveryStore:
                 or prior_spec["accepted_plan"] != previous["accepted_plan_text"]
             ):
                 raise ValueError("continuation accepted intake plan changed")
+            if prior_spec.get("plan_approval") == "automatic":
+                if accepted.get("authorization") != {
+                    "source": "run_authorization", "command_id": prior_spec["command_id"],
+                    "request_digest": prior_spec["request_digest"],
+                    "policy_digest": prior_spec["policy_digest"],
+                    "authorized_endpoint": prior_spec["authorized_endpoint"],
+                }:
+                    raise ValueError("continuation accepted intake plan authorization changed")
+                accepted_intake_plan = accepted
         if (
             history.get("workflow_id") != f"delivery-{old_id}"
             or history.get("run_id") != old_id
@@ -2084,6 +2099,7 @@ class DeliveryStore:
             "workflow_execution_run_id": live["execution_run_id"],
             "workflow_closed_at": live["closed_at"],
             "findings": role.get("findings", []),
+            **({"accepted_intake_plan": accepted_intake_plan} if accepted_intake_plan else {}),
         }
 
     @staticmethod
@@ -2226,9 +2242,10 @@ class DeliveryStore:
             return spec
 
     def accept_intake_plan(
-        self, run_id: str, revision: int, plan_digest: str, plan: dict[str, Any]
+        self, run_id: str, revision: int, plan_digest: str, plan: dict[str, Any],
+        *, authorization: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Bind exactly the reviewed plan without changing repository authority."""
+        """Bind the exact plan under human review or frozen run authorization."""
 
         if digest(plan) != plan_digest or type(revision) is not int:
             raise ValueError("accepted plan does not match the reviewed revision")
@@ -2244,6 +2261,15 @@ class DeliveryStore:
             original = self._prepared_original(db, json.loads(row["request_json"]))
             if not original.get("intake_required"):
                 raise ValueError("run was submitted with an accepted plan")
+            automatic = original.get("plan_approval", "required") == "automatic"
+            expected_authorization = {
+                "source": "run_authorization", "command_id": original["command_id"],
+                "request_digest": original["request_digest"],
+                "policy_digest": original["policy_digest"],
+                "authorized_endpoint": original["authorized_endpoint"],
+            } if automatic else None
+            if authorization != expected_authorization:
+                raise ValueError("plan acceptance does not match frozen run authorization")
             intake = json.loads(row["intake_json"]) if row["intake_json"] else None
             if (
                 not isinstance(intake, dict)
@@ -2253,14 +2279,26 @@ class DeliveryStore:
                 or intake["plans"][-1].get("content") != plan
             ):
                 raise ValueError("plan changed before acceptance")
+            if automatic and (
+                intake["plans"][-1].get("authorization") != authorization
+                or any(
+                    question.get("state") != "answered" for question in intake.get("questions", [])
+                )
+            ):
+                raise ValueError("plan authorization changed or clarification remains pending")
+            acceptance = {"revision": revision, "digest": plan_digest, "content": plan}
+            if automatic:
+                acceptance["authorization"] = authorization
             accepted = json.dumps(plan, sort_keys=True, indent=2)
             if row["accepted_plan_text"] is not None:
-                if row["accepted_plan_text"] != accepted:
+                if row["accepted_plan_text"] != accepted or (
+                    automatic and intake.get("accepted_plan") != acceptance
+                ):
                     raise ValueError("another plan was already accepted")
             else:
-                intake["accepted_plan"] = {
-                    "revision": revision, "digest": plan_digest, "content": plan
-                }
+                intake["accepted_plan"] = acceptance
+                if automatic:
+                    intake["plans"][-1]["state"] = "accepted"
                 db.execute(
                     "UPDATE delivery_runs SET accepted_plan_text=?,intake_json=? WHERE run_id=?",
                     (accepted, canonical_json(intake), run_id),

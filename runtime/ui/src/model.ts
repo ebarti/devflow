@@ -88,7 +88,7 @@ export interface IntakeState {
   questions: Array<{ id: string; revision: number; prompt: string; options: string[]; state: string }>
   answers: Array<{ question_id: string; question_revision: number; prompt: string; answer: string }>
   plans: Array<{ revision: number; digest: string; content: IntakePlan; state: string; change_request?: string }>
-  accepted_plan?: { revision: number; digest: string; content: IntakePlan } | null
+  accepted_plan?: { revision: number; digest: string; content: IntakePlan; authorization?: { source: 'run_authorization'; command_id: string; request_digest: string; policy_digest: string; authorized_endpoint: string } } | null
   change_requests?: Array<{ plan_revision: number; response: string }>
 }
 

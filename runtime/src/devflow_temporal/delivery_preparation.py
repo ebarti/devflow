@@ -119,7 +119,10 @@ def run_binding(spec: dict) -> str:
         "authorized_endpoint",
         "config_digest",
     )
-    return digest({**{key: spec[key] for key in keys}, "policy": policy})
+    return digest({
+        **{key: spec[key] for key in keys}, "policy": policy,
+        **({"plan_approval": spec["plan_approval"]} if "plan_approval" in spec else {}),
+    })
 
 
 def execution_retired(spec: dict) -> bool:

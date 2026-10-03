@@ -204,6 +204,7 @@ function IntakeHistory({ run }: { run: RunDetail }) {
     {intake.answers.length ? <div><h3>Clarifications</h3><dl>{intake.answers.map(answer => <div key={answer.question_id}><dt>{answer.prompt}</dt><dd>{answer.answer}</dd></div>)}</dl></div> : null}
     {intake.plans.map(plan => <div className="intake-plan" key={plan.revision}>
       <h3>Plan revision {plan.revision} · {titleCase(plan.state)}</h3>
+      {intake.accepted_plan?.revision === plan.revision && intake.accepted_plan.authorization?.source === 'run_authorization' ? <p>Accepted automatically under this run’s authorization.</p> : null}
       <p>{plan.content.scope}</p>
       <ol>{plan.content.steps.map((item, index) => <li key={index}>{item}</li>)}</ol>
       <p><strong>Verification:</strong> {plan.content.verification.join('; ')}</p>

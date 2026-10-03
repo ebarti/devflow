@@ -115,12 +115,17 @@ class DeliveryConfig:
             "branch",
             "authorized_endpoint",
         }
-        optional = {"accepted_plan", "recovery_key", "supersedes_run_id"}
+        optional = {"accepted_plan", "recovery_key", "supersedes_run_id", "plan_approval"}
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
             raise ValueError("required submit fields must be non-empty strings")
         accepted_plan = supplied.get("accepted_plan")
+        plan_approval = supplied.get("plan_approval", "automatic")
+        if not isinstance(plan_approval, str) or plan_approval not in {"automatic", "required"}:
+            raise ValueError("plan_approval must be automatic or required")
+        if accepted_plan is not None and plan_approval == "required":
+            raise ValueError("plan_approval required contradicts a supplied accepted_plan")
         if accepted_plan is not None and (
             not isinstance(accepted_plan, str) or not accepted_plan.strip()
         ):
@@ -402,6 +407,7 @@ class DeliveryConfig:
                     raise ValueError("browser QA requires positive count and bounded timeout")
         return {
             **supplied,
+            "plan_approval": plan_approval,
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
@@ -488,11 +494,22 @@ def scope_amended_spec(
         "command_id", "run_id", "work_id", "issue_url", "repository_key",
         "goal", "accepted_plan", "base_ref", "branch", "authorized_endpoint",
         "recovery_key", "supersedes_run_id",
+        "plan_approval",
     }
     from .delivery_preparation import require_native_execution
 
     require_native_execution(original)
-    effective = amended.admit({key: original[key] for key in submit_keys if key in original})
+    supplied = {key: original[key] for key in submit_keys if key in original}
+    if original.get("intake_required") or original.get("plan_approval") == "required":
+        # Re-admit the original raw goal; its separately bound plan is immutable.
+        supplied.pop("accepted_plan", None)
+        supplied["plan_approval"] = original.get("plan_approval", "required")
+    effective = amended.admit(supplied)
+    effective["accepted_plan"] = original["accepted_plan"]
+    if "plan_approval" in original:
+        effective["plan_approval"] = original["plan_approval"]
+    else:
+        effective.pop("plan_approval")
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
