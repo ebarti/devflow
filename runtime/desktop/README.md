@@ -235,6 +235,7 @@ otherwise it reports a `MARKETPLACE ROOT` table. Create a private 0600 request:
 ```json
 {
   "command_id": "stable-owned-primary-plugin-switch",
+  "package_format": "codex",
   "marketplace_root": "/absolute/private/state/fresh-marketplace",
   "expected_registration_sha256": "SHA256_OF_CURRENT_CANONICAL_PUBLIC_GET_JSON",
   "expected_config_sha256": "SHA256_OF_TRUSTED_CONFIG_BYTES",
@@ -250,6 +251,16 @@ parsed name-to-root object, including `{}` for an empty inventory. The helper
 changing the host. A same-name plugin, marketplace or cached package already
 present is a conflict. The package, installed cache, direct skill and selected
 configuration must be owned regular files with the inspected bytes.
+For the pinned SDK CLI 0.160.0, generate that fresh package with
+`package_plugin.py --format codex`; its declared compatibility manifest enables
+automatic MCP discovery. The default portable package contract remains available,
+but adding an overlay beside its root manifest does not establish MCP discovery
+on this pinned host. The request's `package_format` binds exact selected bytes and
+is retained for rollback. Legacy requests/manifests without the field continue to
+mean `portable`. A wrong layout or altered cache conflicts before effects.
+Rollback an older activated package with its original source before advancing
+installed source/layout, preserving its package and immutable receipts. Then
+activate a fresh selected package/request using the same service configuration.
 
 ```sh
 /absolute/runtime/.venv/bin/python runtime/desktop/install.py \

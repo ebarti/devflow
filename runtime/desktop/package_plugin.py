@@ -19,6 +19,7 @@ ENTRY = {
     "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
     "category": "Productivity",
 }
+FORMATS = ("portable", "codex")
 
 
 def json_bytes(value: dict) -> bytes:
@@ -55,7 +56,33 @@ def check_plugin(target: Path, files: dict[str, bytes]) -> bool:
     return True
 
 
-def package(marketplace_root: Path, runtime_dir: Path, config_path: Path) -> Path:
+def package_files(runtime: Path, config: Path,
+                  package_format: str = "portable") -> dict[str, bytes]:
+    if package_format not in FORMATS:
+        raise ValueError("unsupported plugin package format")
+    executable = (runtime / ".venv/bin/devflow-delivery-mcp").resolve(strict=True)
+    mcp = {"mcpServers": {SKILL: {
+        "type": "stdio", "command": str(executable), "args": ["--config", str(config)],
+    }}}
+    files = {f"skills/{SKILL}/SKILL.md": (SOURCE / SKILL / "SKILL.md").read_bytes()}
+    manifest = (SOURCE / "plugin.json").read_bytes()
+    if package_format == "portable":
+        files.update({"plugin.json": manifest, "mcp.json": json_bytes({
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json", **mcp,
+        })})
+    else:
+        portable = json.loads(manifest)
+        compatibility = {key: value for key, value in portable.items()
+                         if key not in {"$schema", "extensions"}}
+        compatibility.update(skills="./skills/", mcpServers="./.mcp.json",
+                             interface=portable["extensions"]["com.openai"]["interface"])
+        files.update({".codex-plugin/plugin.json": json_bytes(compatibility),
+                      ".mcp.json": json_bytes(mcp)})
+    return files
+
+
+def package(marketplace_root: Path, runtime_dir: Path, config_path: Path,
+            *, package_format: str = "portable") -> Path:
     runtime = runtime_dir.expanduser().resolve(strict=True)
     config = config_path.expanduser().resolve(strict=True)
     executable = runtime / ".venv" / "bin" / "devflow-delivery-mcp"
@@ -70,17 +97,7 @@ def package(marketplace_root: Path, runtime_dir: Path, config_path: Path) -> Pat
     catalog_path = root / ".agents" / "plugins" / "marketplace.json"
     check_path(root)
     check_path(catalog_path)
-    files = {
-        "plugin.json": (SOURCE / "plugin.json").read_bytes(),
-        "mcp.json": json_bytes({
-            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
-            "mcpServers": {SKILL: {
-                "type": "stdio", "command": str(executable.resolve(strict=True)),
-                "args": ["--config", str(config)],
-            }},
-        }),
-        f"skills/{SKILL}/SKILL.md": (SOURCE / SKILL / "SKILL.md").read_bytes(),
-    }
+    files = package_files(runtime, config, package_format)
     installed = check_plugin(target, files)
     previous = catalog_path.read_bytes() if catalog_path.exists() else None
     catalog = json.loads(previous) if previous is not None else {
@@ -137,9 +154,11 @@ def main() -> None:
     parser.add_argument("--marketplace-root", required=True, type=Path)
     parser.add_argument("--runtime-dir", required=True, type=Path)
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--format", choices=FORMATS, default="portable", dest="package_format")
     args = parser.parse_args()
     try:
-        target = package(args.marketplace_root, args.runtime_dir, args.config)
+        target = package(args.marketplace_root, args.runtime_dir, args.config,
+                         package_format=args.package_format)
     except (ValueError, OSError) as exc:
         parser.exit(1, f"Packaging failed: {exc}\n")
     print(f"Packaged {target}; no host registration or service changes performed")

@@ -20,7 +20,7 @@ from owned_upgrade import (
     sha,
     unrelated_seal,
 )
-from package_plugin import ENTRY, SOURCE, check_path, check_plugin, json_bytes
+from package_plugin import ENTRY, FORMATS, check_path, check_plugin, json_bytes, package_files
 
 PLUGIN = 'devflow@devflow-local'
 MARKET = 'devflow-local'
@@ -58,11 +58,20 @@ def snapshot(codex, home, expected_unrelated=None):
     config = home / 'config.toml'
     check_path(config)
     settings = tomllib.loads(config.read_text()) if config.exists() else {}
+    if NAME in settings.get('mcp_servers', {}) and direct is None:
+        raise ValueError('raw owned MCP entry is missing from public inventory')
+    # Public MCP inventory includes automatically imported plugin servers. A
+    # name match becomes plugin-provided only after the raw direct table is
+    # absent; owned_state still authenticates the plugin/cache and transport.
+    plugin_mcp = None
+    if own and NAME not in settings.get('mcp_servers', {}):
+        plugin_mcp, direct = direct, None
     for group, key in [('mcp_servers', NAME), ('plugins', PLUGIN), ('marketplaces', MARKET)]:
         settings.get(group, {}).pop(key, None)
         if not settings.get(group):
             settings.pop(group, None)
     return {'direct': direct, 'plugin': own[0] if own else None,
+            **({'plugin_mcp': plugin_mcp} if plugin_mcp is not None else {}),
             'marketplace': marketplaces.get(MARKET),
             'plugins_sha256': seal(plugins), 'marketplaces_sha256': seal(marketplaces),
             'unrelated_sha256': unrelated_seal({'settings': settings,
@@ -71,17 +80,6 @@ def snapshot(codex, home, expected_unrelated=None):
                                                     if e.get('pluginId') != PLUGIN]},
                 'marketplaces': {k: v for k, v in marketplaces.items() if k != MARKET}},
                                                expected_unrelated)}
-
-
-def package_files(runtime, config):
-    executable = (runtime / '.venv/bin/devflow-delivery-mcp').resolve(strict=True)
-    return {'plugin.json': (SOURCE / 'plugin.json').read_bytes(),
-            'mcp.json': json_bytes({'$schema':
-                'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
-                'mcpServers': {NAME: {'type': 'stdio',
-                    'command': str(executable),
-                    'args': ['--config', str(config)]}}}),
-            f'skills/{NAME}/SKILL.md': (SOURCE / NAME / 'SKILL.md').read_bytes()}
 
 
 def skill(path, expected):
@@ -123,8 +121,12 @@ def owned_state(home, current, manifest, files):
             or current['marketplace'] not in (None, manifest['marketplace_root'])):
         raise ValueError('owned installation or unrelated host settings changed')
     plugin = current['plugin']
+    if manifest['state'] == 'applied' and plugin and current['direct'] is not None:
+        raise ValueError('applied primary plugin has a raw direct duplicate')
     cache = home / 'plugins/cache/devflow-local/devflow'
-    version = json.loads(files['plugin.json'])['version']
+    manifest_file = ('.codex-plugin/plugin.json'
+                     if manifest.get('package_format', 'portable') == 'codex' else 'plugin.json')
+    version = json.loads(files[manifest_file])['version']
     if plugin:
         if (plugin.get('enabled') is not True or plugin.get('installed') is not True
                 or plugin.get('name') != 'devflow' or plugin.get('version') != version
@@ -142,6 +144,12 @@ def owned_state(home, current, manifest, files):
             raise ValueError('owned installed plugin cache changed')
     if plugin and not cache.exists():
         raise ValueError('owned installed plugin cache is missing')
+    if current.get('plugin_mcp') is not None or (
+        plugin and current['direct'] is None and manifest.get('package_format') == 'codex'
+    ):
+        if (not plugin or current['direct'] is not None
+                or seal(current.get('plugin_mcp')) != seal(manifest['before']['direct'])):
+            raise ValueError('owned plugin MCP transport or enabled state changed')
     live = home / 'skills' / NAME
     archive = Path(manifest['archive'])
     if live.exists() == archive.exists():
@@ -155,7 +163,9 @@ def activate(codex, home, runtime, config, request_path):
         required = {'command_id', 'marketplace_root', 'expected_registration_sha256',
                     'expected_config_sha256', 'expected_skill_sha256',
                     'expected_plugin_inventory_sha256', 'expected_marketplace_inventory_sha256'}
-        if (not isinstance(request, dict) or set(request) != required
+        if (not isinstance(request, dict)
+                or set(request) not in (required, required | {'package_format'})
+                or request.get('package_format', 'portable') not in FORMATS
                 or not isinstance(request['command_id'], str)
                 or not isinstance(request['marketplace_root'], str)
                 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', request['command_id'])
@@ -173,7 +183,8 @@ def activate(codex, home, runtime, config, request_path):
                 or not root.is_relative_to(Path(raw['state_root']).resolve(strict=True))
                 or sha(private(config)) != request['expected_config_sha256']):
             raise ValueError('inspected trusted config/package destination changed')
-        files = package_files(runtime, config)
+        package_format = request.get('package_format', 'portable')
+        files = package_files(runtime, config, package_format)
         package_check(root, files)
         binding = seal({'request': request, 'runtime': str(runtime), 'config': str(config),
                         'home': str(home), 'package': {k: sha(v) for k, v in files.items()}})
@@ -182,7 +193,8 @@ def activate(codex, home, runtime, config, request_path):
         current = snapshot(codex, home,
                            manifest['before']['unrelated_sha256'] if manifest else None)
         if manifest is not None:
-            if manifest['command_digest'] != binding:
+            if (manifest['command_digest'] != binding
+                    or manifest.get('package_format', 'portable') != package_format):
                 raise ValueError('activation command ID already binds different inputs')
             if manifest['state'] == 'rolled_back':
                 if seal(current) != seal(manifest['before']):
@@ -205,6 +217,8 @@ def activate(codex, home, runtime, config, request_path):
                         'config_sha256': request['expected_config_sha256'],
                         'skill_sha256': request['expected_skill_sha256'],
                         'archive': str(path.parent / 'direct-skill')}
+            if package_format != 'portable':
+                manifest['package_format'] = package_format
             save(path, manifest)
         owned_state(home, current, manifest, files)
         if manifest['state'] == 'applied':
@@ -251,7 +265,7 @@ def rollback(codex, home, path):
         config, runtime = Path(manifest['config']), Path(manifest['runtime'])
         if sha(private(config)) != manifest['config_sha256']:
             raise ValueError('owned primary-plugin config changed before rollback')
-        files = package_files(runtime, config)
+        files = package_files(runtime, config, manifest.get('package_format', 'portable'))
         package_check(Path(manifest['marketplace_root']), files)
         current = snapshot(codex, home, manifest['before']['unrelated_sha256'])
         owned_state(home, current, manifest, files)
