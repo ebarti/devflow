@@ -67,6 +67,21 @@ def test_trusted_mode_uses_supported_noninteractive_sdk_contract(native_configur
     ]
 
 
+@pytest.mark.parametrize('iteration', [0, 2])
+def test_implementation_and_repair_leave_commits_to_publisher(native_configuration, iteration):
+    config, request = native_configuration
+    config.raw['execution_mode'] = 'trusted-local'
+    store = DeliveryStore(config)
+    store.submit(request)
+    spec = store.spec(request['run_id'])
+    task = _task({'spec': spec, 'role': 'implement', 'iteration': iteration,
+                  'candidate': {'id': '0' * 64, 'head': '0' * 40},
+                  'workspace': spec['checkout']})
+    assert 'Leave source changes uncommitted' in task.goal
+    assert 'author-signed Conventional Commit during publication' in task.goal
+    assert 'Do not run git commit' in task.goal
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('outcome', ['blocked', 'cancelled', 'delivered'])
 @pytest.mark.parametrize('confirmed', [True, False])

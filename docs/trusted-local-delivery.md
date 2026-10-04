@@ -431,3 +431,5 @@ Old `none` is never broadly treated as confirmed or privately migrated; missing,
 changed or unknown proof remains unconfirmed. Native failed gate feedback keeps
 bounded structured regex matches and owned full-log provenance independently
 of diagnostic truncation, while retaining the original log and reject policy.
+
+Implementation and repair roles leave source changes uncommitted. The controller owns commit creation and validates author sign-off and Conventional Commit metadata before publication.
