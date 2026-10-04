@@ -621,7 +621,7 @@ p.write_text(json.dumps(s))
         subprocess.run(["git", "-C", str(origin), "commit", "-qm", "old release"], check=True)
         subprocess.run(["git", "-C", str(origin), "tag", "v1"], check=True)
         tracked = subprocess.check_output(["git", "-C", str(ROOT), "ls-files", "-z"]).decode().split("\0")
-        for name in set(filter(None, tracked)) | {"scripts/install-rollback.py"}:
+        for name in set(filter(None, tracked)) | {"scripts/install-rollback.py", "scripts/install-service-entry.py"}:
             target = origin / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, target)
@@ -695,8 +695,8 @@ p.write_text(json.dumps(s))
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
         self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(),
                          prior_head)
-        self.assertEqual(json.loads(launch_state.read_text())["observed"], "waiting_for_activation",
-                         failed.stdout + failed.stderr)
+        self.assertIsNone(json.loads(launch_state.read_text())["observed"],
+                          "Legacy registrations must refuse before daemon activation")
         self.assertEqual(list(temporary.glob("devflow-install-rollback-*")), [])
         for name, expected in before.items():
             actual = (codex / name).read_bytes()
@@ -721,35 +721,21 @@ p.write_text(json.dumps(s))
             command = hooks["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
             self.assertEqual(Path(shlex.split(command)[-2]).resolve(),
                              (checkout / "skills/devflow/scripts/telemetry.py").resolve())
-        activated = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"],
-                                   env=dict(env, FAKE_BOOTSTRAP_OK="1"), text=True, capture_output=True, timeout=90)
-        self.assertEqual(activated.returncode, 0, activated.stdout + activated.stderr)
+        # Service migration requires explicit retirement of old registrations;
+        # a legacy updater must refuse and restore, even when bootstrap could succeed.
+        rejected_again = subprocess.run(
+            ["sh", str(checkout / "scripts/update.sh"), "v2"],
+            env=dict(env, FAKE_BOOTSTRAP_OK="1"), text=True, capture_output=True, timeout=90)
+        self.assertEqual(rejected_again.returncode, 1, rejected_again.stdout + rejected_again.stderr)
+        self.assertIn("retire inspected", rejected_again.stderr)
+        self.assertEqual(subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(), prior_head)
         self.assertEqual(list(temporary.glob("devflow-install-rollback-*")), [])
-        installed_guard = codex / ".devflow-hook.py"
-        guard = subprocess.run([sys.executable, "-B", str(installed_guard), "--check"],
-                               env=env, text=True, capture_output=True, timeout=15)
-        self.assertEqual(guard.returncode, 0, guard.stdout + guard.stderr)
-        service = plistlib.loads((home / "Library/LaunchAgents/com.ebarti.devflow.reconcile.plist").read_bytes())
-        marker = json.loads((codex / ".devflow-reconcile-active.json").read_text())
-        self.assertEqual(marker["token"], service["DevflowToken"])
-        with sqlite3.connect(database) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
-        child = subprocess.Popen(service["ProgramArguments"], env=env, text=True,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            ready, _, _ = select.select([child.stdout], [], [], 5)
-            self.assertTrue(ready)
-            self.assertEqual(json.loads(child.stdout.readline())["state"], "completed")
-        finally:
-            child.terminate()
-            child.communicate(timeout=5)
-        with sqlite3.connect(database) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
 
-    def test_first_upgrade_from_legacy_updater_rollback_then_activation(self):
+    def test_legacy_updater_refuses_service_migration_and_restores_checkout(self):
         self.exercise_full_upgrade("e966cf89e057abc9a2629faf957a2ec175599b53")
 
-    def test_upgrade_from_installed_lifecycle_checkout_rollback_then_activation(self):
+    def test_lifecycle_updater_refuses_service_migration_and_restores_checkout(self):
         self.exercise_full_upgrade("60de52a37c9774f188376904517fb6318246adf9")
 
 

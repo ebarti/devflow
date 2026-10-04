@@ -180,15 +180,17 @@ def readiness(spec, payload):
             'config_sha256': hashlib.sha256(config.path.read_bytes()).hexdigest()}
 
 
-def renew(spec, payload, command_digest, *, technical=None):
+def renew(spec, payload, command_digest, *, technical=None, supplemental=None):
     """Effectful only after complete read-only readiness, never public inspection."""
-    observed = technical['readiness'] if technical else readiness(spec, payload)
+    continuation = supplemental or technical
+    observed = continuation['readiness'] if continuation else readiness(spec, payload)
     if not observed or not observed['required']:
         return spec, None
     identity, before, authority = (observed[key] for key in ('identity', 'before', 'authority'))
     source, revision = observed['source'], observed['source_revision']
     config = DeliveryConfig.load(Path(spec['config_path']))
     root = Path(spec['state_dir']) / (
+        'resource-closure/native-generation' if supplemental else
         'technical-successor/native-generation' if technical else 'native-preparation-renewal'
     )
     from .delivery_metadata_recovery import _immutable
@@ -204,6 +206,8 @@ def renew(spec, payload, command_digest, *, technical=None):
                    'authority': authority,
                    'authority_path': payload['preparation_authority_path'],
                    'authority_sha256': payload['preparation_authority_sha256']}
+        if supplemental:
+            binding['supplemental_predecessor'] = supplemental['predecessor']
         if technical:
             binding['technical_predecessor'] = technical['predecessor']
         _immutable(root / 'authority.json', binding)
@@ -256,12 +260,13 @@ def renew(spec, payload, command_digest, *, technical=None):
         return effective, reference
 
 
-def effective_spec(original, recovery, *, technical=False):
+def effective_spec(original, recovery, *, technical=False, supplemental=False):
     """Read immutable lineage without treating a historical proof as current execution."""
     reference = recovery.get('native_preparation_renewal')
     if not reference:
         return original
     path = Path(original['state_dir']) / (
+        'resource-closure/native-generation/generation.json' if supplemental else
         'technical-successor/native-generation/generation.json'
         if technical else 'native-preparation-renewal/generation.json'
     )
@@ -275,6 +280,10 @@ def effective_spec(original, recovery, *, technical=False):
             != canonical_json(recovery.get('execution_spec'))):
         raise ValueError("native renewal immutable generation changed")
     _same_execution(original, receipt['effective_spec'])
+    if supplemental:
+        if canonical_json(receipt.get('supplemental_predecessor')) != canonical_json(
+                recovery.get('parent')):
+            raise ValueError('supplemental native generation immediate parent changed')
     if technical:
         from .delivery_technical_continuation import native_predecessor
 

@@ -101,11 +101,25 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
             if row is None or row[0] != spec['request_digest']:
                 raise ValueError('gate namespace has no durable original run')
             recovery = json.loads(row[1]) if row[1] else None
+            first = True
             while recovery and recovery.get('kind') in {
                 'terminal_tracker_recovery', 'repair_continuation',
+                'investigation_assessment_adjudication', 'stopped_resource_closure',
             }:
+                if recovery.get('kind') == 'stopped_resource_closure':
+                    from .delivery_resource_closure import custody
+
+                    custody(db, recovery)
+                    if canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                        raise ValueError('resource closure current execution authority changed')
+                    namespace = 'resource-closure'
+                    roots.add(state / namespace / 'evidence')
+                    first = False
+                if recovery.get('kind') == 'investigation_assessment_adjudication':
+                    from .delivery_investigation_adjudication import custody
+
+                    custody(db, recovery)
                 recovery = recovery.get('original_recovery')
-            first = True
             while recovery and recovery.get('kind') in {
                 'published_metadata_recovery', 'investigation_gates_only',
                 'accepted_technical_successor',

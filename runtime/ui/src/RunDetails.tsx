@@ -75,6 +75,7 @@ function QualityRow({ label, value }: { label: string; value: CheckState | null 
 }
 
 function EvidenceAndQuality({ run }: { run: RunDetail }) {
+  const adjudication = run.investigation_adjudication
   return <section className="section lower-section" aria-labelledby="quality-heading">
     <h2 id="quality-heading">Quality and evidence</h2>
     <div className="quality-list">
@@ -83,6 +84,13 @@ function EvidenceAndQuality({ run }: { run: RunDetail }) {
       <QualityRow label="Local checks" value={run.checks?.local} />
       <QualityRow label="CI" value={run.checks?.ci} />
     </div>
+    {adjudication ? <div aria-label="Independent investigation disposition">
+      <h3>Independent investigation disposition</h3>
+      <p>Raw QA status: {adjudication.raw_status}. {adjudication.disposition.accepted_baseline_medium} accepted baseline Medium findings; {adjudication.disposition.remaining_blocker_high} remaining Blocker or High findings.</p>
+      <ol><li>{adjudication.disposition.finding1}</li><li>{adjudication.disposition.finding2}</li><li>{adjudication.disposition.finding3}</li></ol>
+      <h4>Retained raw findings</h4><ul>{adjudication.raw_findings.map((finding, index) => <li key={index}>{finding}</li>)}</ul>
+      <p className="subtle">Completed gates apply to unchanged source. No additional native execution was performed.</p>
+    </div> : null}
     {run.evidence?.length ? <ul className="evidence-list">{run.evidence.map(item => {
       const url = safeWebUrl(item.url)
       return <li key={item.id}>{url ? <a href={url} target="_blank" rel="noopener noreferrer">{display(item.label, item.id)} <ExternalIcon /></a> : display(item.label, item.id)} <small>{titleCase(item.state)}</small></li>

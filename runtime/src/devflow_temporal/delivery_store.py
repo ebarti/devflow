@@ -126,6 +126,15 @@ class DeliveryStore:
                 )"""
             )
             db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_resource_closures (
+                    run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+                    command_id TEXT UNIQUE NOT NULL,
+                    intent_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    response_json TEXT
+                )"""
+            )
+            db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_technical_successors (
                     run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
                     command_id TEXT UNIQUE NOT NULL,
@@ -974,6 +983,16 @@ class DeliveryStore:
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
+        if (isinstance(supplied, dict)
+                and supplied.get('continuation_kind') == 'stopped_resource_closure'):
+            from .delivery_resource_closure import admit
+
+            return admit(self, run_id, supplied, preflight=preflight)
+        if (isinstance(supplied, dict)
+                and supplied.get('continuation_kind') == 'investigation_assessment_adjudication'):
+            from .delivery_investigation_adjudication import admit
+
+            return admit(self, run_id, supplied, preflight=preflight)
         if isinstance(supplied, dict) and 'continuation_kind' in supplied:
             from .delivery_technical_continuation import continue_technical
 
@@ -2454,7 +2473,8 @@ class DeliveryStore:
         """Read the sole native scope amendment without restoring retired execution."""
         while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
-            "accepted_technical_successor",
+            "accepted_technical_successor", "investigation_assessment_adjudication",
+            "stopped_resource_closure",
         } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
             recovery = recovery["original_recovery"]
         if isinstance(recovery, dict) and recovery.get("kind") == "scope_amendment":
@@ -2482,7 +2502,11 @@ class DeliveryStore:
                 from .delivery_native_renewal import effective_spec as renewed_spec
 
                 for renewal in reversed(renewals):
-                    if renewal.get('kind') == 'accepted_technical_successor':
+                    if renewal.get('kind') == 'stopped_resource_closure':
+                        from .delivery_resource_closure import effective_spec as closure_spec
+
+                        spec = closure_spec(self, spec, renewal)
+                    elif renewal.get('kind') == 'accepted_technical_successor':
                         from .delivery_technical_continuation import (
                             effective_spec as technical_spec,
                         )
@@ -2495,7 +2519,16 @@ class DeliveryStore:
             while recovery and recovery.get("kind") in {
                 "terminal_tracker_recovery", "published_metadata_recovery",
                 "investigation_gates_only", "accepted_technical_successor",
+                "investigation_assessment_adjudication", "stopped_resource_closure",
             }:
+                if recovery.get('kind') == 'stopped_resource_closure':
+                    from .delivery_resource_closure import custody
+
+                    custody(db, recovery)
+                if recovery.get('kind') == 'investigation_assessment_adjudication':
+                    from .delivery_investigation_adjudication import custody
+
+                    custody(db, recovery)
                 if recovery.get('native_preparation_renewal'):
                     renewals.append(recovery)
                 recovery = recovery["original_recovery"]
@@ -2505,7 +2538,16 @@ class DeliveryStore:
                 while recovery and recovery.get("kind") in {
                     "terminal_tracker_recovery", "published_metadata_recovery",
                     "investigation_gates_only", "accepted_technical_successor",
+                    "investigation_assessment_adjudication", "stopped_resource_closure",
                 }:
+                    if recovery.get('kind') == 'stopped_resource_closure':
+                        from .delivery_resource_closure import custody
+
+                        custody(db, recovery)
+                    if recovery.get('kind') == 'investigation_assessment_adjudication':
+                        from .delivery_investigation_adjudication import custody
+
+                        custody(db, recovery)
                     if recovery.get('native_preparation_renewal'):
                         renewals.append(recovery)
                     recovery = recovery["original_recovery"]
@@ -2589,6 +2631,8 @@ class DeliveryStore:
                 "metadata_validation_queued",
                 "gates_only_queued",
                 "technical_successor_queued",
+                "investigation_adjudication_queued",
+                "resource_closure_queued",
             }:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
@@ -2606,6 +2650,10 @@ class DeliveryStore:
                 if row[1] == "metadata_validation_queued" and accepted
                 else "gates_only"
                 if row[1] == "gates_only_queued" and accepted
+                else "resource_closure_preflight"
+                if row[1] == "resource_closure_queued" and accepted
+                else "adjudication_preflight"
+                if row[1] == "investigation_adjudication_queued" and accepted
                 else "technical_preflight"
                 if row[1] == "technical_successor_queued" and accepted
                 else "publishing"
@@ -3008,7 +3056,8 @@ class DeliveryStore:
         technical = False
         while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
-            "accepted_technical_successor",
+            "accepted_technical_successor", "investigation_assessment_adjudication",
+            "stopped_resource_closure",
         } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
             technical = technical or recovery.get("kind") == "accepted_technical_successor"
             recovery = recovery["original_recovery"]
@@ -3076,6 +3125,8 @@ class DeliveryStore:
         compact = self._compact(row)
         spec = self.effective_spec(run_id)
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        adjudication = (recovery if recovery and recovery.get("kind")
+                        == "investigation_assessment_adjudication" else None)
         terminal_recovery = (
             recovery if recovery and recovery.get("kind") == "terminal_tracker_recovery" else None
         )
@@ -3088,7 +3139,8 @@ class DeliveryStore:
         technical_successor = None
         while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
-            "accepted_technical_successor",
+            "accepted_technical_successor", "investigation_assessment_adjudication",
+            "stopped_resource_closure",
         } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
             if recovery.get("kind") == "accepted_technical_successor":
                 technical_successor = recovery
@@ -3259,6 +3311,15 @@ class DeliveryStore:
             else None,
             "pull_request": json.loads(row["pr_json"]) if row["pr_json"] else None,
             "scope_amendment": scope_amendment,
+            "investigation_adjudication": ({
+                "raw_status": "findings",
+                "raw_findings": adjudication["authority"]["raw_qa"]["findings"],
+                "disposition": adjudication["authority"]["accepted_disposition"],
+                "authority_sha256": adjudication["command"]["authority_sha256"],
+                "historical_runtime": adjudication["authority"]["original_runtime_sha"],
+                "controller_source": adjudication["controller"]["source_revision"],
+                "additional_native_execution": False,
+            } if adjudication else None),
             "technical_successor": ({
                 'intent_sha256': technical_successor['intent_sha256'],
                 'resume_stage': technical_successor['resume_stage'],

@@ -12,6 +12,19 @@ import waitingDecisionProjection from './waiting-decision-projection.json'
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('dashboard commands', () => {
+  it('shows semantic adjudication separately while retaining failed QA and all raw findings', () => {
+    const raw = ['Medium dependency provenance', 'Medium baseline layout', 'Medium baseline orphans']
+    render(<RunDetails run={{ ...mockRun, decisions: [], checks: { qa: { state: 'failed' } },
+      investigation_adjudication: { raw_status: 'findings', raw_findings: raw,
+        disposition: { finding1: 'Receipt staging semantics reproduced', finding2: 'Accepted layout baseline', finding3: 'Accepted heading baseline', accepted_baseline_medium: 2, remaining_blocker_high: 0 },
+        historical_runtime: 'old-runtime', controller_source: 'current-controller', additional_native_execution: false },
+    }} onRefresh={vi.fn()} />)
+    expect(screen.getByText(/Raw QA status: findings/).textContent).toContain('2 accepted baseline Medium')
+    expect(screen.getByText('Failed')).toBeTruthy()
+    for (const finding of raw) expect(screen.getByText(finding)).toBeTruthy()
+    expect(screen.getByText(/No additional native execution/)).toBeTruthy()
+  })
+
   it.each([false, true])('offers tracker reconciliation with frozen cancellation (closed=%s)', async closed => {
     const reconcile = vi.spyOn(api, 'reconcileTracker')
       .mockRejectedValueOnce(new ApiError('receipt unavailable', 503))

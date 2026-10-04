@@ -515,7 +515,8 @@ class DeliveryBroker:
             if check.get("test_count_regex"):
                 count = observed_test_count(output, check["test_count_regex"])
             rejected_causes = rejection_causes(
-                parsed_output, [check["reject_regex"]] if check.get("reject_regex") else []
+                parsed_output, [check["reject_regex"]] if check.get("reject_regex") else [],
+                test_results=check.get("kind") == "test",
             )
             rejected_output = bool(rejected_causes)
             passed = (

@@ -500,3 +500,17 @@ async def test_authorized_repair_discards_only_active_terminal_checkpoint(monkey
     assert previous['checks']['terminal_tracker_checkpoint'] == checkpoint
     assert previous['checks']['local']['state'] == 'failed'
     assert previous['roles'][0]['session_id'] == 'same-session'
+
+
+def test_controller_selected_qa_effort_does_not_rewrite_historical_policy(native_configuration):
+    config, request = native_configuration
+    store = DeliveryStore(config)
+    store.submit(request)
+    spec = store.spec(request['run_id'])
+    frozen = deepcopy(spec)
+    task = _task({'spec': spec, 'role': 'verify', 'iteration': 4,
+                  'candidate': {'id': '0' * 64, 'head': '0' * 40},
+                  'workspace': spec['checkout'],
+                  'execution_role_policy': {'model': 'gpt-6.1-sol', 'effort': 'high'}})
+    assert task.model == 'gpt-6.1-sol' and task.reasoning_effort == 'high'
+    assert spec == frozen and spec['policy']['roles']['verify']['effort'] == 'max'

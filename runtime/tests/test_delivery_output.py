@@ -50,6 +50,31 @@ def test_playwright_notice_does_not_inflate_the_single_runner_test_count():
     assert observed_test_count(actual_one_with_misleading_notice, r"(?m)(\d+) passed") < 2
 
 
+def test_passing_test_titles_are_not_failure_outcomes_but_real_outcomes_still_reject():
+    pattern = r"(?m)\b(?:skipped|flaky|failed)\b"
+    title = "  ✓  2 [chromium] › test.ts:189:1 › failed requests leave edits available (1.5s)\n"
+    output = title + "  5 passed (14.0s)\n"
+    # Historical diagnostics retain the original rejected match.
+    assert rejection_causes(output, [pattern])[0]["match"] == "failed"
+    assert rejection_causes(output, [pattern], test_results=True) == []
+    for outcome in ("failed", "skipped", "flaky"):
+        log = output + f"  1 {outcome}\n"
+        cause = rejection_causes(log, [pattern], test_results=True)[0]
+        assert cause["match"] == outcome
+        assert cause["span"][0] >= len(output)
+    # Explicit non-outcome prohibitions must still reject a passing title.
+    assert rejection_causes(output, ["requests"], test_results=True)
+
+
+def test_other_test_reporters_and_failed_test_lines_keep_honest_outcomes():
+    pattern = r"(?m)\b(?:skipped|flaky|failed)\b"
+    for prefix in ("✓ ", "✔ ", "√ ", "ok 12 - "):
+        assert rejection_causes(prefix + "handles skipped and flaky requests\n", [pattern],
+                                test_results=True) == []
+    for prefix in ("✘ ", "not ok 12 - ", "WARNING: "):
+        assert rejection_causes(prefix + "failed requests\n", [pattern], test_results=True)
+
+
 def test_passing_title_rejection_at_original_offset_survives_repair_prompt_truncation():
     title = "✓ required-bullet coaching handles failed requests with bounded feedback"
     output = "x" * 1021 + title + "\n5 passed (6.4s)\n"
