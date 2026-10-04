@@ -19,13 +19,14 @@ from .delivery_resources import _ancestors, private_directory, read_private
 from .delivery_technical_integration import reference
 
 KIND = "stopped_resource_closure"
+ABANDON = "abandon_pending_resource_closure"
 LIMITS = {
     "iteration6": False,
     "native_generations_907": 0,
     "new_implementation_turns": 0,
     "new_resource_closure_transactions": 1,
     "probe_attempts_within_generation": 2,
-    "supplemental_native_generations_1005": 1,
+    "supplemental_native_generations_1005": 2,
     "total_original1005_iteration_cap": 4,
 }
 
@@ -340,6 +341,87 @@ def readback(store, spec, recovery):
     }
 
 
+def _renewed_candidate(store, original, renewed):
+    # The new namespace is not durable until admission commits. Source identity
+    # is read through the existing admitted namespace; renewal changes only policy.
+    from .delivery_native_renewal import _same_execution
+
+    if original != renewed:
+        _same_execution(original, renewed)
+    return {**DeliveryBroker(store, original).candidate(),
+            "policy_digest": renewed["policy_digest"]}
+
+
+def abandon_pending(store, run_id, payload, *, preflight=False):
+    """Retire one unqueued admission after a controller install; retain all bytes."""
+    _request({**payload, "continuation_kind": KIND})
+    if payload.get("continuation_kind") != ABANDON:
+        raise ValueError("pending abandonment requires its explicit discriminator")
+    from .delivery_native_guard import reject_nested_controller
+    from .delivery_preparation import _lock
+
+    reject_nested_controller()
+    command_digest = digest({"run_id": run_id, **payload})
+    with store._connect() as db:
+        command = db.execute("SELECT * FROM delivery_commands WHERE command_id=?",
+                             (payload["command_id"],)).fetchone()
+        prior = db.execute("SELECT * FROM delivery_resource_closures WHERE run_id=?",
+                           (run_id,)).fetchone()
+    if command:
+        if command["request_digest"] != command_digest:
+            raise ValueError("pending abandonment command belongs to different inputs")
+        return {**json.loads(command["response_json"]), "existing": True}
+    if not prior or prior["state"] != "pending":
+        raise ValueError("only an unqueued pending resource closure can be abandoned")
+    old = json.loads(prior["intent_json"])
+    fresh, _ = _snapshot(store, run_id, {**payload, "continuation_kind": KIND})
+    if any(fresh[k] != old[k] for k in (
+        "spec", "original_row", "original_recovery", "closed", "state", "attempts",
+        "effects", "claim", "parent", "resources",
+    )):
+        raise ValueError("pending abandonment changed the original stopped checkpoint")
+    if fresh["controller"]["source_revision"] == old["controller"]["source_revision"]:
+        raise ValueError("pending abandonment requires a different reviewed controller install")
+    root = Path(old["spec"]["state_dir"]) / "resource-closure"
+    archive = root.with_name("resource-closure-abandoned-" + digest(old))
+    if any(p != archive for p in root.parent.glob("resource-closure-abandoned-*")):
+        raise ValueError("this run already exhausted its one pending abandonment")
+    source = archive if archive.exists() else root
+    if read_private(source / "intent.json") != old:
+        raise ValueError("pending abandonment lost immutable original admission")
+    response = {"run_id": run_id, "phase": "pending_resource_closure_abandoned",
+                "archive": str(archive), "original_checkpoint_unchanged": True,
+                "additional_iterations": 0, "existing": False}
+    if preflight:
+        return {**response, "preflight": True}
+    with _lock(root.parent / "resource-closure-abandon.lock"):
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT * FROM delivery_resource_closures WHERE run_id=?",
+                                 (run_id,)).fetchone()
+            original = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                                  (run_id,)).fetchone()
+            if (dict(current) != dict(prior) or dict(original) != old["original_row"]
+                    or store.state.claim_for(db, old["spec"]["work_id"]) != old["claim"]):
+                raise ValueError("pending abandonment checkpoint changed before effects")
+            # A crash after rename can retry using the exact archived intent.
+            if not archive.exists():
+                root.rename(archive)
+            elif root.exists():
+                raise ValueError("pending admission and archive both exist")
+            _immutable(archive / "abandonment.json", {
+                "command": payload, "command_digest": command_digest,
+                "old_intent_sha256": digest(old), "new_controller": fresh["controller"],
+                "original_root": str(root), "archive": str(archive),
+                "historical_native_generation_is_not_current_execution": True,
+            })
+            db.execute("UPDATE delivery_resource_closures SET state='abandoned',response_json=? "
+                       "WHERE run_id=?", (canonical_json(response), run_id))
+            db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                       (payload["command_id"], run_id, command_digest, canonical_json(response)))
+    return response
+
+
 def admit(store, run_id, payload, *, preflight=False):
     _request(payload)
     from .delivery_native_guard import reject_nested_controller
@@ -355,7 +437,7 @@ def admit(store, run_id, payload, *, preflight=False):
         ).fetchone()
     if command and command["request_digest"] != command_digest:
         raise ValueError("resource closure command belongs to different inputs")
-    if prior:
+    if prior and prior["state"] != "abandoned":
         seal = json.loads(prior["intent_json"])
         if seal["command"] != payload:
             raise ValueError("this original already received its one resource closure")
@@ -411,6 +493,12 @@ def admit(store, run_id, payload, *, preflight=False):
                     "VALUES (?,?,?,'pending')",
                     (run_id, payload["command_id"], canonical_json(seal)),
                 )
+            else:
+                db.execute(
+                    "UPDATE delivery_resource_closures SET command_id=?,intent_json=?,"
+                    "state='pending',response_json=NULL WHERE run_id=? AND state='abandoned'",
+                    (payload["command_id"], canonical_json(seal), run_id),
+                )
         private_directory(root / "predecessor-resources")
         for name, key in (
             ("manifest.json", "manifest_sha256"),
@@ -431,7 +519,7 @@ def admit(store, run_id, payload, *, preflight=False):
             command_digest,
             supplemental={"readiness": readiness, "predecessor": seal["parent"]},
         )
-        candidate = DeliveryBroker(store, new_spec).candidate()
+        candidate = _renewed_candidate(store, seal["spec"], new_spec)
         before = seal["state"]["candidate"]
         if any(
             candidate[k] != before[k]
