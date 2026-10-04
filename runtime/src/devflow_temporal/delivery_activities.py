@@ -37,21 +37,24 @@ def _context(
     ):
         raise ValueError("Temporal input no longer matches the durable submitted run")
     broker = DeliveryBroker(store, spec)
-    with store._connect() as db:
-        row = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
-                         (spec["run_id"],)).fetchone()
-    recovery = json.loads(row[0]) if row and row[0] else None
-    if recovery and recovery.get("kind") in {
-        "published_metadata_recovery", "investigation_gates_only",
-    }:
-        namespace = ("metadata-reconciliation" if recovery["kind"] == "published_metadata_recovery"
-                     else "gates-admission")
-        broker.evidence_dir = broker.state_dir / namespace / "evidence"
+    if broker.evidence_dir != broker.state_dir:
+        namespace = str(broker.evidence_dir.relative_to(broker.state_dir).parent)
         from .delivery_resources import private_directory
 
         private_directory(broker.evidence_dir)
         broker.effect_namespace = ":" + namespace
     return store, broker
+
+
+@activity.defn(name="delivery_technical_readback")
+async def delivery_technical_readback(request: dict[str, Any]) -> dict[str, Any]:
+    def execute():
+        from .delivery_technical_continuation import readback
+
+        store, _ = _context(request['spec'])
+        return readback(store, request['spec'], request['recovery'])
+
+    return await asyncio.to_thread(execute)
 
 
 @activity.defn(name="delivery_project")
@@ -667,6 +670,7 @@ DELIVERY_ACTIVITIES = [
     delivery_reconcile_publish,
     delivery_metadata_readback,
     delivery_gates_readback,
+    delivery_technical_readback,
     delivery_repair_preflight,
     delivery_checks,
     delivery_browser_qa,

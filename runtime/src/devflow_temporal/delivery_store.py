@@ -126,6 +126,15 @@ class DeliveryStore:
                 )"""
             )
             db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_technical_successors (
+                    run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+                    command_id TEXT UNIQUE NOT NULL,
+                    intent_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    response_json TEXT
+                )"""
+            )
+            db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_preparations (
                     run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
                     submitted_spec_digest TEXT NOT NULL,
@@ -965,6 +974,10 @@ class DeliveryStore:
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
+        if isinstance(supplied, dict) and 'continuation_kind' in supplied:
+            from .delivery_technical_continuation import continue_technical
+
+            return continue_technical(self, run_id, supplied, preflight=preflight)
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))
@@ -2439,9 +2452,10 @@ class DeliveryStore:
     @staticmethod
     def _scope_recovery(recovery: dict[str, Any] | None) -> dict[str, Any] | None:
         """Read the sole native scope amendment without restoring retired execution."""
-        while recovery and recovery.get("kind") in {
+        while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
-        }:
+            "accepted_technical_successor",
+        } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
             recovery = recovery["original_recovery"]
         if isinstance(recovery, dict) and recovery.get("kind") == "scope_amendment":
             return recovery
@@ -2462,31 +2476,38 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-            renewal = None
+            renewals = []
 
             def renewed(spec):
-                if not renewal:
-                    return spec
                 from .delivery_native_renewal import effective_spec as renewed_spec
 
-                return renewed_spec(spec, renewal)
+                for renewal in reversed(renewals):
+                    if renewal.get('kind') == 'accepted_technical_successor':
+                        from .delivery_technical_continuation import (
+                            effective_spec as technical_spec,
+                        )
+
+                        spec = technical_spec(self, spec, renewal)
+                    else:
+                        spec = renewed_spec(spec, renewal)
+                return spec
 
             while recovery and recovery.get("kind") in {
                 "terminal_tracker_recovery", "published_metadata_recovery",
-                "investigation_gates_only",
+                "investigation_gates_only", "accepted_technical_successor",
             }:
                 if recovery.get('native_preparation_renewal'):
-                    renewal = recovery
+                    renewals.append(recovery)
                 recovery = recovery["original_recovery"]
             if (recovery and recovery.get("kind") == "repair_continuation"
                     and recovery.get("title_constraint")):
                 recovery = recovery["original_recovery"]
                 while recovery and recovery.get("kind") in {
                     "terminal_tracker_recovery", "published_metadata_recovery",
-                    "investigation_gates_only",
+                    "investigation_gates_only", "accepted_technical_successor",
                 }:
                     if recovery.get('native_preparation_renewal'):
-                        renewal = recovery
+                        renewals.append(recovery)
                     recovery = recovery["original_recovery"]
             if isinstance(recovery, dict) and recovery.get("kind") == "execution_policy_recovery":
                 from .delivery_policy_recovery import effective_spec
@@ -2567,6 +2588,7 @@ class DeliveryStore:
                 "terminal_tracker_recovery_queued",
                 "metadata_validation_queued",
                 "gates_only_queued",
+                "technical_successor_queued",
             }:
                 if accepted:
                     # The worker may project a phase before the dispatcher has
@@ -2584,6 +2606,8 @@ class DeliveryStore:
                 if row[1] == "metadata_validation_queued" and accepted
                 else "gates_only"
                 if row[1] == "gates_only_queued" and accepted
+                else "technical_preflight"
+                if row[1] == "technical_successor_queued" and accepted
                 else "publishing"
                 if row[1] == "publication_recovery_queued" and accepted
                 else "repair"
@@ -2981,9 +3005,12 @@ class DeliveryStore:
     def _compact(self, row: dict[str, Any]) -> dict[str, Any]:
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-        while recovery and recovery.get("kind") in {
+        technical = False
+        while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
-        }:
+            "accepted_technical_successor",
+        } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
+            technical = technical or recovery.get("kind") == "accepted_technical_successor"
             recovery = recovery["original_recovery"]
         effective = (
             recovery.get("effective_spec", spec)
@@ -2993,6 +3020,8 @@ class DeliveryStore:
         )
         if not isinstance(effective, dict):
             effective = spec
+        if technical:
+            effective = self.effective_spec(row["run_id"])
         from .delivery_resources import projected_cleanup
 
         with self._connect() as db:
@@ -3056,9 +3085,13 @@ class DeliveryStore:
         gates_admission = recovery if recovery and recovery.get("kind") == (
             "investigation_gates_only"
         ) else None
-        while recovery and recovery.get("kind") in {
+        technical_successor = None
+        while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
-        }:
+            "accepted_technical_successor",
+        } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
+            if recovery.get("kind") == "accepted_technical_successor":
+                technical_successor = recovery
             recovery = recovery["original_recovery"]
         scope_recovery = self._scope_recovery(recovery)
         scope_amendment = (
@@ -3226,6 +3259,14 @@ class DeliveryStore:
             else None,
             "pull_request": json.loads(row["pr_json"]) if row["pr_json"] else None,
             "scope_amendment": scope_amendment,
+            "technical_successor": ({
+                'intent_sha256': technical_successor['intent_sha256'],
+                'resume_stage': technical_successor['resume_stage'],
+                'maximum_iteration': technical_successor['maximum_iteration'],
+                'additional_implementation_turns': 0,
+                'native_preparation_renewal': technical_successor['native_preparation_renewal'],
+                'integration': technical_successor['integration'],
+            } if technical_successor else None),
             "terminal_tracker_recovery": {
                 "reconciliation_only": True,
                 "command_id": terminal_recovery["command_id"],
@@ -3268,6 +3309,15 @@ class DeliveryStore:
             ("metadata-reconciliation", ("intent.json", "original-ref.json", "rewritten-ref.json",
                                           "publication.json")),
             ("gates-admission", ("admission.json",)),
+            ("technical-successor", ("intent.json", "closure-intent.json",
+                                      "closure-finalization.json", "closure.json",
+                                      "integration.json",
+                                      "admission.json")),
+            ("technical-successor/native-generation", (
+                "authority.json", "preparation.json", "generation.json", "proof.json",
+                "measurement-path_control.json", "measurement-observed.json",
+                "measurement-log.json",
+            )),
             ("native-preparation-renewal", ("authority.json", "preparation.json",
                                              "generation.json", "proof.json",
                                              "measurement-path_control.json",
@@ -3285,13 +3335,15 @@ class DeliveryStore:
                     indexed.append({"id": namespace + "-predecessor-" + name,
                                     "label": namespace + " original cleanup " + name,
                                     "path": path, "limit": 4 * 1024 * 1024})
-        renewal_intent = root / "native-preparation-renewal" / "preparation.json"
-        if renewal_intent.is_file() and not renewal_intent.is_symlink():
+        for generation in ("native-preparation-renewal", "technical-successor/native-generation"):
+            renewal_intent = root / generation / "preparation.json"
+            if not renewal_intent.is_file() or renewal_intent.is_symlink():
+                continue
             from .delivery_resources import read_private
 
             observed = read_private(renewal_intent)
             for index, attempt in enumerate(observed.get("preparation_attempts", [])[:2]):
-                probe = root / "native-preparation-renewal/probes" / str(index) / run_id
+                probe = root / generation / "probes" / str(index) / run_id
                 if attempt.get("spec", {}).get("state_dir") != str(probe):
                     raise ValueError("native renewal evidence left its owned generation")
                 for relative in ("resources/manifest.json", "resources/finalization.json",
@@ -3302,7 +3354,9 @@ class DeliveryStore:
                                  "native-preparation/trusted-local/trusted-local/native-process.json"):
                     path = probe / relative
                     if path.is_file() and not path.is_symlink():
-                        indexed.append({"id": "native-renewal-probe-" + str(index) + "-"
+                        prefix = ("native-renewal" if generation == "native-preparation-renewal"
+                                  else "technical-native")
+                        indexed.append({"id": prefix + "-probe-" + str(index) + "-"
                                         + relative.replace("/", "-"),
                                         "label": "Native renewal probe " + str(index) + ": "
                                         + relative, "path": path, "limit": 4 * 1024 * 1024})

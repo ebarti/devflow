@@ -316,7 +316,57 @@ separate metadata commit mapping when applicable. Historical role inputs and
 after-candidates remain historical.
 
 These continuations retain original cleanup bytes and use distinct durable
-check/browser evidence namespaces. Resource roots stay under their original
+check/browser evidence namespaces. Gate checkout allocation, controller diff and
+browser receipt readback share the namespace authenticated by the durable
+admission, sealed receipt and exact frozen execution specification. The default
+run namespace remains valid for original gates; new continuation gates preserve
+older checkouts and artifacts even when metadata changes the commit head at the
+same iteration. Independent-role homes use that same authenticated namespace,
+preserving retained workspace-bound configuration and original implementer homes.
+Caller roots and symlink aliases refuse before allocation or
+read-scope expansion. Generated-child cleanup and gate finalization use the same
+owned namespace. Native process and lease roots remain in the original run.
+
+An already admitted original that stops at an authenticated controller boundary
+can use the existing `repair-admission-preflight` and `continue-repair` JSON
+surfaces with `continuation_kind: "accepted_technical_successor"` and
+`additional_iterations: 0`. The complete request includes `command_id`,
+`expected_revision` (the closed protocol revision), `expected_iteration`,
+`expected_candidate_id`, `expected_pr_number`, `expected_pr_head`,
+`expected_source_revision`, and the main-task `authority_path`/`authority_sha256`.
+The explicitly authorized integration also supplies
+`prospective_path`/`prospective_sha256`. Public preflight validates the whole
+authority, exact closed failure, consumed admission and immediate native
+generation, clean installed source/configuration, stopped actor/port/lease/root
+inventory and owning claim before an immutable intent or preparation effect.
+Missing, changed, aliased, foreign or stale inputs refuse first.
+
+This technical successor spends no feature grant or implementation iteration.
+It retains consumed admissions and generation journals, archives the original
+resource bytes (including UNKNOWN), and appends a fresh observation and supported
+cleanup closure. Its one child native generation has a separate journal and a
+two-attempt ceiling. Only the installed runtime payload may change in native
+identity. A failed borrowing of a released claim rolls back that owning claim;
+a previously retained original claim stays bound. Exact request replay checks
+actual partial effects and resumes their journals.
+
+The review launch boundary resumes review and QA of the unchanged published
+candidate at iteration 4. It preserves prior source-applicable checks and never
+repeats publication. The separately authorized integration computes the entire
+prospective tree read-only from the frozen base, owned head and exact current
+main. All six overlap outputs and every remaining entry must match; the sole
+conflict preserves the coaching insertion bytes and accepts the main inventory
+title/counts. The one signed merge preserves both parents and old history and
+checks the exact owned remote before pushing. Its explicit base, candidate,
+accepted-plan and preparation-input mapping is separate from native payload
+renewal. Nested worker preparation inputs are compared as typed TOML alongside
+all package manifests and locks. Fresh checks, browser QA, independent review
+and current CI run at existing iteration 4. The existing title-only iteration 5
+remains a separate admission after its fresh exact browser rejection; there is
+no iteration 6. None of these source contracts authorizes an installation or
+public continuation before independent review and current CI pass.
+
+Resource roots stay under their original
 registered ownership. For trusted pytest checks, the unchanged frozen argv runs
 with controller-owned `PYTEST_ADDOPTS=--basetemp=<evidence>/<check-id>/pytest-artifacts`.
 The controller retains PDF, PNG, HTML, JSON, XML and text files before transient

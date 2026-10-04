@@ -180,15 +180,17 @@ def readiness(spec, payload):
             'config_sha256': hashlib.sha256(config.path.read_bytes()).hexdigest()}
 
 
-def renew(spec, payload, command_digest):
+def renew(spec, payload, command_digest, *, technical=None):
     """Effectful only after complete read-only readiness, never public inspection."""
-    observed = readiness(spec, payload)
+    observed = technical['readiness'] if technical else readiness(spec, payload)
     if not observed or not observed['required']:
         return spec, None
     identity, before, authority = (observed[key] for key in ('identity', 'before', 'authority'))
     source, revision = observed['source'], observed['source_revision']
     config = DeliveryConfig.load(Path(spec['config_path']))
-    root = Path(spec['state_dir']) / 'native-preparation-renewal'
+    root = Path(spec['state_dir']) / (
+        'technical-successor/native-generation' if technical else 'native-preparation-renewal'
+    )
     from .delivery_metadata_recovery import _immutable
     from .delivery_preparation import _lock
 
@@ -202,6 +204,8 @@ def renew(spec, payload, command_digest):
                    'authority': authority,
                    'authority_path': payload['preparation_authority_path'],
                    'authority_sha256': payload['preparation_authority_sha256']}
+        if technical:
+            binding['technical_predecessor'] = technical['predecessor']
         _immutable(root / 'authority.json', binding)
         path = root / 'preparation.json'
         if path.exists():
@@ -252,12 +256,15 @@ def renew(spec, payload, command_digest):
         return effective, reference
 
 
-def effective_spec(original, recovery):
+def effective_spec(original, recovery, *, technical=False):
     """Read immutable lineage without treating a historical proof as current execution."""
     reference = recovery.get('native_preparation_renewal')
     if not reference:
         return original
-    path = Path(original['state_dir']) / 'native-preparation-renewal/generation.json'
+    path = Path(original['state_dir']) / (
+        'technical-successor/native-generation/generation.json'
+        if technical else 'native-preparation-renewal/generation.json'
+    )
     if reference.get('path') != str(path):
         raise ValueError("native renewal generation left its exact owned path")
     raw = path.read_bytes()
@@ -268,6 +275,13 @@ def effective_spec(original, recovery):
             != canonical_json(recovery.get('execution_spec'))):
         raise ValueError("native renewal immutable generation changed")
     _same_execution(original, receipt['effective_spec'])
+    if technical:
+        from .delivery_technical_continuation import native_predecessor
+
+        if canonical_json(receipt.get('technical_predecessor')) != canonical_json(
+                recovery.get('native_predecessor')):
+            raise ValueError('technical native generation immediate predecessor changed')
+        native_predecessor(recovery['native_predecessor'], recovery['authority'])
     retained = receipt['retained_proof']
     if (retained['path'] != str(path.with_name('proof.json'))
             or hashlib.sha256(Path(retained['path']).read_bytes()).hexdigest()

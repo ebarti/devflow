@@ -21,13 +21,30 @@ def prepare(store, spec, state, previous, supplied, session):
     """Read-only authentication before the existing one-time repair admission."""
     authority = _reference(supplied["authority_path"], supplied["authority_sha256"])
     scope = authority.get("scope", {})
+    technical = (isinstance(previous, dict)
+                 and previous.get('kind') == 'accepted_technical_successor')
+    metadata = previous.get('original_recovery') if technical else previous
+    original_base = previous['spec']['base_sha'] if technical else spec['base_sha']
+    if technical:
+        from .delivery_technical_continuation import readback
+
+        readback(store, spec, previous, require_claim=False)
+        integration = previous.get('integration')
+        retained_roles = previous['state']['roles']
+        if (not integration or integration['original_base'] != original_base
+                or integration['main'] != spec['base_sha']
+                or state.get('roles', [])[:len(retained_roles)] != retained_roles
+                or any(role.get('role') not in {'review', 'verify'}
+                       or role.get('iteration') != 4 or role.get('cleanup') != 'confirmed'
+                       for role in state.get('roles', [])[len(retained_roles):])):
+            raise ValueError('title repair changed its integration or independent gate ancestry')
     if (
         authority.get("decision_owner") != "main task"
         or authority.get("new_user_approval_required") is not False
         or scope.get("run_id") != spec["run_id"]
         or scope.get("work_id") != spec["work_id"]
         or scope.get("session_id") != session
-        or scope.get("base") != spec["base_sha"]
+        or scope.get("base") != original_base
         or any(
             type(scope.get(k)) is not int or scope[k] != value
             for k, value in (
@@ -41,15 +58,18 @@ def prepare(store, spec, state, previous, supplied, session):
         or state["iteration"] != 4
         or spec["policy"]["max_repairs"] != 3
         or not isinstance(previous, dict)
-        or previous.get("kind") != "published_metadata_recovery"
-        or previous.get("old_head") != scope.get("known_old_head")
+        or not isinstance(metadata, dict)
+        or metadata.get("kind") != "published_metadata_recovery"
+        or metadata.get("old_head") != scope.get("known_old_head")
         or canonical_json(previous.get("candidate")) != canonical_json(state["candidate"])
         or canonical_json(previous.get("execution_spec", previous.get("spec")))
         != canonical_json(spec)
-        or canonical_json(state.get("roles")) != canonical_json(previous["state"]["roles"])
+        or (not technical and canonical_json(state.get("roles"))
+            != canonical_json(previous["state"]["roles"]))
     ):
         raise ValueError("title repair does not bind its one authorized effective metadata lineage")
-    validation_readback(store, spec, previous)
+    if not technical:
+        validation_readback(store, spec, previous)
     receipt = state.get("checks", {}).get("browser_qa")
     if (
         not isinstance(receipt, dict)

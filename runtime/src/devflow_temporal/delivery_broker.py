@@ -85,7 +85,9 @@ class DeliveryBroker:
         self.source = Path(spec["source_path"])
         self.checkout = Path(spec["checkout"])
         self.state_dir = Path(spec["state_dir"])
-        self.evidence_dir = self.state_dir
+        from .delivery_resources import _gate_evidence_root
+
+        self.evidence_dir = _gate_evidence_root(spec)
         self.effect_namespace = ""
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
@@ -312,8 +314,13 @@ class DeliveryBroker:
             from .delivery_native_guard import validate_native_turn
 
             validate_native_turn(self.spec, role, iteration, self.store)
-        path = self.state_dir / "gates" / str(iteration) / role
-        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        current = self.candidate()
+        if any(candidate.get(key) != current[key] for key in ('id', 'head')):
+            raise RuntimeError('gate candidate no longer matches its owned source')
+        path = self._gate_path(role, iteration)
+        from .delivery_resources import private_directory
+
+        private_directory(path.parent)
         resources = None
         if self.spec.get("resource_cleanup_version") == 1:
             from .delivery_resources import RunResources
@@ -333,12 +340,19 @@ class DeliveryBroker:
             raise RuntimeError("gate checkout does not match the published candidate")
         return path
 
+    def _gate_path(self, role: str, iteration: int) -> Path:
+        from .delivery_resources import _gate_evidence_root, _gate_path
+
+        if self.evidence_dir != _gate_evidence_root(self.spec):
+            raise ValueError('broker gate namespace differs from durable admission')
+        return _gate_path(self.spec, role, iteration)
+
     def gate_diff(self, role: str, iteration: int, candidate: dict[str, Any]) -> dict[str, str]:
         """Freeze the controller's base-to-head diff for a role without Git access."""
 
         if role not in {"review", "verify"}:
             raise ValueError("only independent gates receive a controller diff")
-        checkout = self.state_dir / "gates" / str(iteration) / role
+        checkout = self._gate_path(role, iteration)
         if candidate_for(checkout)["id"] != candidate["id"]:
             raise ValueError("gate checkout changed before diff production")
         base = self.spec["base_sha"]
@@ -363,7 +377,9 @@ class DeliveryBroker:
         if result.returncode or not result.stdout:
             raise RuntimeError("controller could not produce a nonempty bound candidate diff")
         folder = self.evidence_dir / "gate-evidence" / str(iteration) / role
-        folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+        from .delivery_resources import private_directory
+
+        private_directory(folder)
         folder_info = folder.lstat()
         if (
             not stat.S_ISDIR(folder_info.st_mode)

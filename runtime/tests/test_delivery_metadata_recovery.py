@@ -624,3 +624,93 @@ def test_required_native_authority_refusal_does_not_freeze_metadata_request(
     result = store.reconcile_published_metadata('run-1', corrected)
     assert result == store.reconcile_published_metadata('run-1', corrected)
     assert result['phase'] == 'metadata_validation_queued'
+
+
+def test_metadata_gate_namespace_preserves_retained_old_head_and_artifacts(published):
+    from pathlib import Path
+
+    from devflow_temporal.delivery_activities import _context
+    from devflow_temporal.delivery_resources import RunResources, private_directory, read_private
+
+    store, broker, state, _closed, command, _title = published
+    resources = RunResources(broker.spec)
+    old_path = broker.state_dir / 'gates/1/verify'
+    private_directory(old_path.parent)
+    resources.register(old_path, 'gate')
+    old = broker.gate_checkout('verify', 1, state['candidate'])
+    resources.created(old)
+    old_patch = broker.gate_diff('verify', 1, state['candidate'])
+    retained = Path(old_patch['path']).read_bytes()
+    store.reconcile_published_metadata('run-1', command)
+    spec = store.effective_spec('run-1')
+    _store, successor = _context(spec)
+    candidate = successor.candidate()
+    expected = broker.state_dir / 'metadata-reconciliation/evidence/gates/1/verify'
+    private_directory(expected.parent)
+    resources.register(expected, 'gate')
+    path = successor.gate_checkout('verify', 1, candidate)
+    resources.created(path)
+    assert path == broker.state_dir / 'metadata-reconciliation/evidence/gates/1/verify'
+    assert path != old and _git(path, 'rev-parse', 'HEAD') == candidate['head']
+    diff = successor.gate_diff('verify', 1, candidate)
+    from devflow_temporal.delivery_sandbox import _review_diff_path
+
+    request = {'spec': spec, 'role': 'verify', 'iteration': 1,
+               'candidate': candidate, 'workspace': str(path), 'review_diff': diff}
+    assert _review_diff_path(request) == Path(diff['path'])
+    resources = RunResources(spec)
+    resources._allowed(path, 'gate')
+    assert str(old) in read_private(resources.manifest)['roots']
+    assert _git(old, 'rev-parse', 'HEAD') == state['candidate']['head']
+    assert Path(old_patch['path']).read_bytes() == retained
+    assert successor.state_dir == broker.state_dir
+    generated = path / 'node_modules'
+    resources.register(generated, 'generated')
+    generated.mkdir()
+    resources.created(generated)
+    generated.joinpath('owned.txt').write_text('temporary generated dependency')
+    resources.finalize('blocked')
+    assert not generated.exists()
+    assert _git(old, 'rev-parse', 'HEAD') == state['candidate']['head']
+    assert Path(old_patch['path']).read_bytes() == retained
+
+
+@pytest.mark.parametrize('change', ['foreign', 'alias', 'raw-spec', 'head', 'candidate', 'seal'])
+def test_metadata_gate_namespace_refuses_foreign_alias_or_changed_custody(published, change):
+    from copy import deepcopy
+
+    from devflow_temporal.delivery_activities import _context
+    from devflow_temporal.delivery_resources import write_private
+
+    store, original, state, _closed, command, _title = published
+    store.reconcile_published_metadata('run-1', command)
+    spec = store.effective_spec('run-1')
+    _store, broker = _context(spec)
+    candidate = broker.candidate()
+    expected = broker.state_dir / 'metadata-reconciliation/evidence/gates/1/verify'
+    outside = store.config.state_root / 'foreign-gates'
+    outside.mkdir()
+    outside.joinpath('sentinel').write_text('unchanged')
+    if change == 'foreign':
+        broker.evidence_dir = outside
+    elif change == 'alias':
+        expected.parents[1].symlink_to(outside, target_is_directory=True)
+    elif change == 'raw-spec':
+        broker.spec = {**spec, 'evidence_root': str(outside)}
+    elif change == 'head':
+        broker.gate_checkout('verify', 1, candidate)
+        _git(expected, 'checkout', '--detach', state['candidate']['head'])
+    elif change == 'candidate':
+        candidate = {**candidate, 'id': '0' * 64}
+    else:
+        path = broker.state_dir / 'metadata-reconciliation/intent.json'
+        intent = deepcopy(metadata.read_private(path))
+        intent['new_head'] = '0' * 40
+        write_private(path, intent)
+    with pytest.raises((ValueError, RuntimeError)):
+        broker.gate_checkout('verify', 1, candidate)
+    assert outside.joinpath('sentinel').read_text() == 'unchanged'
+    assert sorted(p.name for p in outside.iterdir()) == ['sentinel']
+    if change in {'foreign', 'alias', 'raw-spec', 'seal'}:
+        assert not expected.exists()
+    assert original.state_dir == broker.state_dir

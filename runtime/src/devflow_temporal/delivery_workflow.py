@@ -137,7 +137,9 @@ class DeliveryWorkflow:
                     maximum_interval=timedelta(seconds=10),
                 )
             }
-        elif name in {"delivery_metadata_readback", "delivery_gates_readback"}:
+        elif name in {
+            "delivery_metadata_readback", "delivery_gates_readback", "delivery_technical_readback",
+        }:
             options = {
                 "schedule_to_close_timeout": timedelta(minutes=5),
                 "retry_policy": RetryPolicy(
@@ -653,6 +655,8 @@ class DeliveryWorkflow:
                 return await self._resume_metadata(spec, recovery)
             if recovery.get("kind") == "investigation_gates_only":
                 return await self._resume_gates_only(spec, recovery)
+            if recovery.get("kind") == "accepted_technical_successor":
+                return await self._resume_technical(spec, recovery)
             if recovery.get("kind") == "execution_policy_recovery":
                 return await self._resume_policy(spec, recovery)
             if recovery.get("kind") == "scope_amendment":
@@ -868,6 +872,39 @@ class DeliveryWorkflow:
         await self._project(spec, "delivered",
                             "Metadata reconciled with explicit source-evidence applicability")
         return self.state
+
+    async def _resume_technical(self, spec, recovery):
+        if (recovery.get('execution_spec') != spec or recovery.get('maximum_iteration') != 4
+                or recovery.get('command', {}).get('additional_iterations') != 0
+                or recovery.get('resume_stage') not in {'review', 'checks'}
+                or recovery.get('state', {}).get('iteration') != 4):
+            raise ValueError('technical continuation changed its admitted existing checkpoint')
+        self.state = deepcopy(recovery['state'])
+        self.state.update(candidate=recovery['candidate'], pull_request=recovery['publication'],
+                          phase='technical_preflight', execution_state='running', outcome=None,
+                          error=None, cleanup='none')
+        self.state['candidate_revision'] += 1
+        try:
+            await self._activity('delivery_technical_readback', {
+                'spec': spec, 'recovery': recovery,
+            })
+            tracker = await self._activity('delivery_tracker_start', {
+                'spec': spec, 'repair_continuation': True,
+            })
+            self.state['tracker'] = tracker
+            if tracker.get('state') != 'consistent':
+                return await self._stop(spec, 'technical tracker is pending or conflicting')
+        except Exception as exc:
+            return await self._stop(spec, 'technical custody failed: ' + type(exc).__name__)
+        self.state['revision'] += 1
+        await self._project(spec, 'technical_successor_started',
+                            'Preserved candidate resumes independent gates at existing iteration')
+        return await self._run_iterations(
+            spec, start_iteration=4, prior_implementer_session=recovery['session_id'],
+            repair_findings=[], continuation=None, recovery=None,
+            authorized_max_iteration=4, published_checkpoint=True,
+            resume_prechecks=recovery['resume_stage'] == 'checks',
+        )
 
     async def _resume_gates_only(self, spec, recovery):
         self.state = deepcopy(recovery["state"])
@@ -1193,6 +1230,7 @@ class DeliveryWorkflow:
         authorized_max_iteration: int | None = None,
         attempt_generation: int = 0,
         resume_prechecks: bool = False,
+        published_checkpoint: bool = False,
         title_constraint: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         max_repairs = (
@@ -1207,7 +1245,24 @@ class DeliveryWorkflow:
         )
         for iteration in range(start_iteration, max_repairs + 1):
             self.state["iteration"] = iteration
-            if recovery is not None and iteration == start_iteration:
+            if published_checkpoint and iteration == start_iteration:
+                published = self.state['pull_request']
+                # Technical integration has already authenticated its one publication. A
+                # review-only launch failure resumes without publication or implementation.
+                if resume_prechecks:
+                    try:
+                        checked = await self._activity('delivery_precheck', {
+                            'spec': spec, 'iteration': iteration,
+                            'candidate': self.state['candidate'],
+                        })
+                    except Exception as exc:
+                        self.state['cleanup'] = 'unknown'
+                        return await self._stop(spec, 'technical prepublication checks failed: '
+                                                + type(exc).__name__)
+                    self.state['checks']['prepublish'] = checked
+                    if checked.get('state') != 'passed' or checked.get('cleanup') == 'unknown':
+                        return await self._stop(spec, 'technical prepublication checks failed')
+            elif recovery is not None and iteration == start_iteration:
                 if self.cancel_requested:
                     self.state["cleanup"] = "unknown"
                     return await self._cancelled(spec)
