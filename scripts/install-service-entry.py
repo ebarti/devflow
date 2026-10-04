@@ -83,7 +83,9 @@ def install(skills, home, force):
             target = (compatibility / child.name).resolve(strict=True)
             guard.path(str(target))
             guard.directory(target)
-            if hashes(target) != hashes(child):
+            # Older active work keeps its reference documents. Only executable
+            # helpers must match the service's compatibility contract.
+            if child.name == "scripts" and hashes(target) != hashes(child):
                 raise ValueError(
                     "retained helper/reference bytes differ from current source"
                 )

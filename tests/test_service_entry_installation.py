@@ -66,6 +66,9 @@ class ServiceEntryInstallation(unittest.TestCase):
         old = self.root / "retained-authentic"
         shutil.copytree(ROOT / "skills/devflow", old)
         (old / "SKILL.md").unlink()
+        reference = old / "references/implementation-worker.md"
+        reference.write_text("Retained instructions for already-running work\n")
+        retained_reference = reference.read_bytes()
         self.skills.mkdir()
         (self.skills / "devflow").symlink_to(old)
         cache = (
@@ -77,6 +80,7 @@ class ServiceEntryInstallation(unittest.TestCase):
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.skills / "devflow/scripts/state.py").resolve(), before)
+        self.assertEqual(reference.read_bytes(), retained_reference)
         self.assertFalse((self.skills / "devflow-local-delivery").exists())
         self.assertTrue((cache / "SKILL.md").exists())
         snapshot = self.snapshot()

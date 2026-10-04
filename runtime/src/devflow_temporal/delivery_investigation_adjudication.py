@@ -293,11 +293,7 @@ def _historical(store, spec, previous, authority):
 def _gates(spec, state, attempts, authority, evidence):
     candidate = authority["candidate"]
     canonical_candidate = {k: v for k, v in candidate.items() if k != "revision"}
-    if (
-        state.get("candidate") != canonical_candidate
-        or state.get("candidate_revision") != candidate["revision"]
-    ):
-        raise ValueError("adjudication candidate/source revision changed")
+    _candidate_checkpoint(state, authority)
     local = state.get("checks", {}).get("local", {})
     prepublish = state.get("checks", {}).get("prepublish", {})
     if (
@@ -430,6 +426,18 @@ def _gates(spec, state, attempts, authority, evidence):
     }
 
 
+def _candidate_checkpoint(state, authority, row=None):
+    """Workflow and projected candidate counters have separate lifecycles."""
+    candidate = {k: v for k, v in authority["candidate"].items() if k != "revision"}
+    counter = authority.get("workflow_candidate_revision")
+    if (type(counter) is not int or counter < 1
+            or state.get("candidate") != candidate
+            or state.get("candidate_revision") != counter
+            or (row is not None
+                and row["candidate_revision"] != authority["candidate"]["revision"])):
+        raise ValueError("candidate identity or explicit checkpoint counters changed")
+
+
 def _snapshot(store, run_id, payload):
     authority, evidence = _authority(payload, run_id)
     spec = store.effective_spec(run_id)
@@ -439,6 +447,7 @@ def _snapshot(store, run_id, payload):
     _historical(store, spec, previous, authority)
     closed = store._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
     state = closed["result"]
+    _candidate_checkpoint(state, authority, row)
     if (
         spec["work_id"] != authority["work_id"]
         or spec["provider"] != "codex"
