@@ -445,6 +445,9 @@ def reconcile(store, run_id, payload, *, preflight=False):
     command_digest = digest({"run_id": run_id, **payload})
     if preflight:
         grant = _snapshot(store, run_id, payload)
+        from .delivery_native_renewal import readiness
+
+        ready = readiness(grant['spec'], payload)
         return {
             "run_id": run_id,
             "preflight": True,
@@ -453,6 +456,7 @@ def reconcile(store, run_id, payload, *, preflight=False):
             "new_head": grant["new_head"],
             "commits": len(grant["mapping"]),
             "provider_turns": 0,
+            "native_preparation_required": bool(ready and ready['required']),
         }
     root = Path(store.effective_spec(run_id)["state_dir"]) / "metadata-reconciliation"
     private_directory(root)
@@ -489,9 +493,11 @@ def reconcile(store, run_id, payload, *, preflight=False):
             _guard(store, grant)
         else:
             grant = _snapshot(store, run_id, payload)
+        from .delivery_native_renewal import readiness, renew
+
+        readiness(grant['spec'], payload)
         _immutable(root / "intent.json", grant)
         preserve_resources(root, grant["spec"])
-        from .delivery_native_renewal import renew
 
         execution_spec, renewal = renew(grant['spec'], payload, command_digest)
         _guard(store, grant)

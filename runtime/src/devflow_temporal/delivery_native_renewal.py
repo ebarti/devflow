@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import stat
 from copy import deepcopy
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from .delivery_broker import _git
 from .delivery_config import DeliveryConfig
 from .delivery_native_preparation import (
     SCHEMA,
-    _validate,
+    _validate_observed,
     native_identity,
     verify_native_spec,
 )
@@ -45,6 +47,63 @@ def _same_execution(before, after):
     _payload_only(before['policy']['native_identity'], after['policy']['native_identity'])
 
 
+def _existing_bytes(path, root):
+    """Observe private proof ancestry without mkdir/chmod, including missing evidence."""
+    if (not path.is_absolute() or not path.is_relative_to(root)
+            or root.resolve(strict=True) != root):
+        raise ValueError("native renewal proof left its canonical evidence root")
+    descriptors = []
+    try:
+        for part in (root, *path.relative_to(root).parts[:-1]):
+            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         **({'dir_fd': descriptors[-1]} if descriptors else {}))
+            descriptors.append(fd)
+            info = os.fstat(fd)
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError("native renewal proof ancestry is not private and owned")
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptors[-1])
+        descriptors.append(fd)
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+                or before.st_size > 4 * 1024 * 1024):
+            raise ValueError("native renewal proof is not a bounded private receipt")
+        with os.fdopen(os.dup(fd), 'rb') as stream:
+            raw = stream.read(4 * 1024 * 1024 + 1)
+        after = os.fstat(fd)
+        if (len(raw) != before.st_size
+                or any(getattr(before, key) != getattr(after, key) for key in (
+                    'st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_nlink', 'st_size',
+                    'st_mtime_ns', 'st_ctime_ns'))):
+            raise ValueError("native renewal proof changed during readback")
+        return raw
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def _frozen_measurement(proof, identity, root):
+    if (not isinstance(proof, dict) or proof.get('schema') != SCHEMA
+            or canonical_json(proof.get('identity')) != canonical_json(identity)
+            or proof.get('fingerprint') != digest(identity)):
+        raise ValueError("native renewal predecessor proof changed")
+    measurement = proof.get('measurement', {})
+    if (measurement.get('process_cleanup') != 'observed-native-confirmed'
+            or canonical_json(measurement.get('exit_code')) != '0'):
+        raise ValueError("native renewal predecessor measurement is unconfirmed")
+    for key in ('observed', 'log', 'path_control'):
+        reference = measurement[key]
+        raw = _existing_bytes(Path(reference['path']), root / 'runs')
+        if hashlib.sha256(raw).hexdigest() != reference['sha256']:
+            raise ValueError("native renewal predecessor measured evidence changed")
+        if key == 'observed':
+            _validate_observed(json.loads(raw),
+                               trusted=identity.get('execution_mode') == 'trusted-local')
+        if key == 'path_control' and raw.decode().strip() != (
+                'codex-cli ' + identity['runtime_dependencies']['codex_cli_version']):
+            raise ValueError("native renewal predecessor PATH control changed")
+
+
 def _old_proof(spec):
     identity = spec.get('policy', {}).get('native_identity')
     prepared = spec.get('preparation')
@@ -54,7 +113,7 @@ def _old_proof(spec):
     path = root / 'preparation-native' / digest(identity) / 'proof.json'
     if not path.is_file():
         raise ValueError("native renewal predecessor proof is absent")
-    raw = _private_bytes(path, root / 'preparation-native')
+    raw = _existing_bytes(path, root / 'preparation-native')
     if (prepared.get('schema') != SCHEMA or prepared.get('fingerprint') != digest(identity)
             or prepared.get('environment') != {'path': str(path),
                                                'sha256': hashlib.sha256(raw).hexdigest()}
@@ -63,7 +122,7 @@ def _old_proof(spec):
             or spec['policy'].get('security_binding_sha256') != run_binding(spec)
             or spec['policy_digest'] != digest(spec['policy'])):
         raise ValueError("native renewal predecessor proof or binding changed")
-    _validate(json.loads(raw), identity, root)
+    _frozen_measurement(json.loads(raw), identity, root)
 
 
 def _authority(spec, payload):
@@ -91,17 +150,17 @@ def _authority(spec, payload):
     return value
 
 
-def renew(spec, payload, command_digest):
-    """Effectful only during admitted successor construction, never public inspection."""
+def readiness(spec, payload):
+    """Read-only required authority/payload/proof checks, before sealing any request."""
     if spec['provider'] == 'fake':
-        return spec, None
+        return None
     authority = _authority(spec, payload) if REQUEST_FIELDS & set(payload) else None
     identity = native_identity(spec)
     before = spec['policy'].get('native_identity')
     _payload_only(before, identity)
     if canonical_json(before) == canonical_json(identity):
         verify_native_spec(spec)
-        return spec, None
+        return {'required': False}
     authority = authority or _authority(spec, payload)
     if (spec['policy'].get('host_sandbox') != 'trusted-local'
             or spec.get('role_home_generation') != 'policy-1'
@@ -116,6 +175,19 @@ def renew(spec, payload, command_digest):
     revision = _git(source, 'rev-parse', 'HEAD')
     if _git(source, 'status', '--porcelain', '--untracked-files=all'):
         raise ValueError("native renewal requires clean installed reviewed source")
+    return {'required': True, 'identity': identity, 'before': before,
+            'authority': authority, 'source_revision': revision, 'source': source,
+            'config_sha256': hashlib.sha256(config.path.read_bytes()).hexdigest()}
+
+
+def renew(spec, payload, command_digest):
+    """Effectful only after complete read-only readiness, never public inspection."""
+    observed = readiness(spec, payload)
+    if not observed or not observed['required']:
+        return spec, None
+    identity, before, authority = (observed[key] for key in ('identity', 'before', 'authority'))
+    source, revision = observed['source'], observed['source_revision']
+    config = DeliveryConfig.load(Path(spec['config_path']))
     root = Path(spec['state_dir']) / 'native-preparation-renewal'
     from .delivery_metadata_recovery import _immutable
     from .delivery_preparation import _lock
@@ -126,7 +198,7 @@ def renew(spec, payload, command_digest):
                    'command_digest': command_digest, 'source_revision': revision,
                    'installed_source_root': str(source),
                    'runtime_import_path': str(Path(__file__).resolve()),
-                   'config_sha256': hashlib.sha256(config.path.read_bytes()).hexdigest(),
+                   'config_sha256': observed['config_sha256'],
                    'authority': authority,
                    'authority_path': payload['preparation_authority_path'],
                    'authority_sha256': payload['preparation_authority_sha256']}

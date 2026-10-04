@@ -562,3 +562,65 @@ def test_metadata_successor_refuses_late_changed_source_instead_of_adopting_it(
         assert row['phase'] == 'blocked'
         assert db.execute('SELECT COUNT(*) FROM delivery_repair_grants').fetchone()[0] == 0
     assert (broker.state_dir / 'metadata-reconciliation/intent.json').is_file()
+
+
+@pytest.mark.parametrize('bad', ['missing', 'wrong-hash'])
+def test_required_native_authority_refusal_does_not_freeze_metadata_request(
+    published, monkeypatch, bad,
+):
+    from devflow_temporal import delivery_native_renewal as renewal
+    from devflow_temporal.delivery_resources import write_private
+
+    store, broker, _state, _closed, command, _title = published
+    trigger = store.config.state_root / 'controlled-native-delta.json'
+    write_private(trigger, {'controlled': 'installed payload-only requirement'})
+    authority = store.config.state_root / 'controlled-native-authority.json'
+    write_private(authority, {
+        'decision_owner': 'main task', 'authority_source': 'Controlled renewal fixture',
+        'new_user_approval_required': False, 'runs': ['run-1'],
+        'max_generations_per_run': 1, 'max_total_generations': 2,
+        'provider_turns_for_renewal': 0, 'implementation_turns_for_renewal': 0,
+        'new_repair_grants_for_renewal': 0, 'trigger_path': str(trigger),
+        'trigger_sha256': hashlib.sha256(trigger.read_bytes()).hexdigest(),
+    })
+    corrected = {**command, 'preparation_authority_path': str(authority),
+                 'preparation_authority_sha256': hashlib.sha256(authority.read_bytes()).hexdigest()}
+    supplied = command if bad == 'missing' else {
+        **corrected, 'preparation_authority_sha256': '0' * 64,
+    }
+    # Only the native dependency requirement is controlled. Production immutable
+    # metadata admission, real authority reader, Git/closed range and replay run.
+    def validate(spec, payload):
+        renewal._authority(spec, payload)
+        return {'required': True}
+
+    def renew(spec, payload, _digest):
+        validate(spec, payload)
+        return spec, None
+
+    monkeypatch.setattr(renewal, 'readiness', validate, raising=False)
+    monkeypatch.setattr(renewal, 'renew', renew)
+    old = _git(broker.checkout, 'rev-parse', 'HEAD')
+    refs = _git(broker.checkout, 'for-each-ref', '--format=%(refname) %(objectname)')
+    remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + broker.spec['branch'])
+    with store._connect() as db:
+        baseline_claim = canonical_json(store.state.claim_for(db, 'work-1'))
+    with pytest.raises(ValueError):
+        store.reconcile_published_metadata('run-1', supplied)
+    assert not (broker.state_dir / 'metadata-reconciliation/intent.json').exists()
+    assert not (broker.state_dir / 'metadata-reconciliation/predecessor-resources').exists()
+    with pytest.raises(ValueError):
+        store.metadata_preflight('run-1', supplied)
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_metadata_recoveries').fetchone()[0] == 0
+        assert db.execute('SELECT COUNT(*) FROM delivery_commands WHERE command_id=?',
+                          (command['command_id'],)).fetchone()[0] == 0
+        assert canonical_json(store.state.claim_for(db, 'work-1')) == baseline_claim
+    assert _git(broker.checkout, 'rev-parse', 'HEAD') == old
+    assert _git(broker.checkout, 'for-each-ref', '--format=%(refname) %(objectname)') == refs
+    assert _git(broker.source, 'ls-remote', 'origin',
+                'refs/heads/' + broker.spec['branch']) == remote
+    assert store.metadata_preflight('run-1', corrected)['native_preparation_required'] is True
+    result = store.reconcile_published_metadata('run-1', corrected)
+    assert result == store.reconcile_published_metadata('run-1', corrected)
+    assert result['phase'] == 'metadata_validation_queued'

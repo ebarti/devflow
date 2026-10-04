@@ -172,3 +172,29 @@ def test_renewal_lineage_preserves_typed_feature_authority():
     with pytest.raises(ValueError):
         renewal._same_execution(before, changed)
     assert canonical_json(before) != canonical_json(after)
+
+
+@pytest.mark.parametrize('bad', ['missing', 'wrong-hash'])
+def test_readonly_native_readiness_rejects_authority_without_sealing(payload_update, bad):
+    _store, spec, payload, old, _package = payload_update
+    supplied = ({'command_id': payload['command_id']} if bad == 'missing' else
+                {**payload, 'preparation_authority_sha256': '0' * 64})
+    with pytest.raises(ValueError):
+        renewal.readiness(spec, supplied)
+    assert not (Path(spec['state_dir']) / 'native-preparation-renewal').exists()
+    assert Path(spec['preparation']['environment']['path']).read_bytes() == old
+    assert renewal.readiness(spec, payload)['required'] is True
+    assert not (Path(spec['state_dir']) / 'native-preparation-renewal').exists()
+
+
+def test_readonly_readiness_does_not_recreate_missing_old_measurement(payload_update):
+    _store, spec, payload, old, _package = payload_update
+    proof = json.loads(old)
+    path = Path(proof['measurement']['path_control']['path'])
+    original = path.parent
+    original.rename(original.with_name('retained-original-measurement'))
+    with pytest.raises(OSError):
+        renewal.readiness(spec, payload)
+    assert not original.exists()
+    assert not (Path(spec['state_dir']) / 'native-preparation-renewal').exists()
+    assert Path(spec['preparation']['environment']['path']).read_bytes() == old

@@ -289,8 +289,14 @@ step in either stopped admission request: add `preparation_authority_path` and
 `preparation_authority_sha256`. The hash-bound deciding receipt admits at most
 two original runs and one immutable preparation generation per run, with zero
 provider turns and no implementation or repair grant. Read-only preflight never
-renews preparation. Admission authenticates the old proof, requires clean
-installed Git source and freezes its revision/import path, then measures the
+renews preparation. Metadata preflight validates the required renewal
+authority/payload/proof before accepting a request; admission repeats those
+read-only checks before freezing any immutable metadata intent or original
+resource archive. A missing or bad authority therefore causes no command, claim,
+ref or archive effect and allows a corrected request. Once a valid intent is
+sealed, its exact request remains immutable. Missing old measurement ancestry is
+observed without creating directories. Admission authenticates the old proof,
+requires clean installed Git source and freezes its revision/import path, then measures the
 new payload through the same native launcher. Only `runtime_payload_sha256`
 may differ: protected installed command paths, dependencies, binaries, mode,
 configuration, checks, plan, source, session and iteration authority stay exact.
