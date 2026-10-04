@@ -330,6 +330,20 @@ def verify_native_spec(spec: dict) -> None:
     if not isinstance(prepared, dict) or prepared.get("schema") != SCHEMA:
         raise PreparationError("native execution authority has not been frozen or changed")
     identity = native_identity(spec)
+    frozen = spec["policy"].get("native_identity", {})
+    if identity != frozen and (
+        {k: v for k, v in identity.items() if k != "runtime_payload_sha256"}
+        == {k: v for k, v in frozen.items() if k != "runtime_payload_sha256"}
+    ):
+        from .delivery_transport_adoption import transport_adoption
+
+        try:
+            transport_adoption(spec, frozen["runtime_payload_sha256"])
+        except (OSError, ValueError, KeyError) as exc:
+            raise PreparationError(
+                "native transport update has no valid installation receipt"
+            ) from exc
+        identity = frozen
     if (
         spec["policy"].get("native_identity") != identity
         or prepared.get("schema") != SCHEMA

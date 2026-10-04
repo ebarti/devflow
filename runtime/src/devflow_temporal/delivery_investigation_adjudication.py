@@ -218,9 +218,19 @@ def _controller(store, spec, payload):
     from .payload import payload_digest
 
     source = Path(__file__).resolve().parents[3]
+    original = value
+    adoption = value.get("source_revision") != _git(source, "rev-parse", "HEAD")
+    if adoption:
+        from .delivery_transport_adoption import controller_installation
+
+        value, _ = controller_installation(spec, original)
     config_raw = _bytes(spec["config_path"], value.get("config_sha256"))
     processes_path = store.config.state_root / "service-processes.json"
-    processes = json.loads(_bytes(processes_path, value.get("service_manifest_sha256")))
+    if adoption:
+        # The receipt retains the old instance; current ownership is re-observed below.
+        processes = read_private(processes_path)
+    else:
+        processes = json.loads(_bytes(processes_path, value.get("service_manifest_sha256")))
     active = value.get("active_config", {})
     active_raw = _bytes(Path(active.get("path", "")), active.get("sha256"))
     frozen_policy = json.loads(config_raw)
@@ -261,7 +271,7 @@ def _controller(store, spec, payload):
         )
     ):
         raise ValueError("final controller source/config/publication/CI/service identity changed")
-    return value
+    return original
 
 
 def _historical(store, spec, previous, authority):
