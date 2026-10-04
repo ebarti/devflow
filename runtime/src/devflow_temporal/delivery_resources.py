@@ -6,13 +6,14 @@ import fcntl
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import subprocess
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
-from .contracts import digest
+from .contracts import canonical_json, digest
 
 
 def private_directory(path: Path) -> None:
@@ -75,6 +76,104 @@ def _ancestors(path: Path, *, allow_missing: bool = False) -> None:
             raise ValueError("resource ancestor is absent")
 
 
+def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
+    """Resolve existing continuation custody read-only, never from a caller path."""
+    state = Path(spec['state_dir'])
+    if (not state.is_absolute() or state.name != spec['run_id'] or '..' in state.parts
+            or state.resolve() != state or 'evidence_root' in spec):
+        raise ValueError('gate namespace left its canonical original run')
+    _ancestors(state, allow_missing=True)
+    namespace = None
+    roots = {state}
+    if 'config_path' in spec:
+        from .delivery_config import DeliveryConfig
+
+        config = DeliveryConfig.load(Path(spec['config_path']))
+        if (digest(config.raw) != spec['config_digest']
+                or config.path != Path(spec['config_path'])
+                or state != config.state_root / 'runs' / spec['run_id']):
+            raise ValueError('gate namespace frozen configuration changed')
+        with closing(sqlite3.connect(config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
+            row = db.execute(
+                'SELECT request_digest,recovery_json FROM delivery_runs WHERE run_id=?',
+                (spec['run_id'],),
+            ).fetchone()
+            if row is None or row[0] != spec['request_digest']:
+                raise ValueError('gate namespace has no durable original run')
+            recovery = json.loads(row[1]) if row[1] else None
+            while recovery and recovery.get('kind') in {
+                'terminal_tracker_recovery', 'repair_continuation',
+            }:
+                recovery = recovery.get('original_recovery')
+            first = True
+            while recovery and recovery.get('kind') in {
+                'published_metadata_recovery', 'investigation_gates_only',
+                'accepted_technical_successor',
+            }:
+                if first and canonical_json(recovery.get('execution_spec')) != canonical_json(spec):
+                    raise ValueError('gate namespace execution authority changed')
+                if recovery['kind'] == 'accepted_technical_successor':
+                    from .delivery_technical_continuation import namespace_custody
+
+                    admitted_namespace = 'technical-successor'
+                    namespace_custody(db, recovery['execution_spec'], recovery)
+                elif recovery['kind'] == 'published_metadata_recovery':
+                    admitted_namespace = 'metadata-reconciliation'
+                    _ancestors(state / admitted_namespace / 'intent.json')
+                    intent = read_private(state / admitted_namespace / 'intent.json')
+                    admitted = db.execute(
+                        'SELECT grant_json,state FROM delivery_metadata_recoveries WHERE run_id=?',
+                        (spec['run_id'],),
+                    ).fetchone()
+                    if (not admitted or admitted[1] != 'queued'
+                            or canonical_json(json.loads(admitted[0])) != canonical_json(intent)
+                            or digest(intent) != recovery.get('grant_digest')
+                            or any(canonical_json(recovery.get(key)) != canonical_json(value)
+                                   for key, value in intent.items())):
+                        raise ValueError('gate namespace metadata admission changed')
+                else:
+                    admitted_namespace = 'gates-admission'
+                    _ancestors(state / admitted_namespace / 'admission.json')
+                    admission = read_private(state / admitted_namespace / 'admission.json')
+                    admitted = db.execute(
+                        'SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
+                        (spec['run_id'],),
+                    ).fetchone()
+                    if (not admitted or canonical_json(admission) != canonical_json(recovery)
+                            or canonical_json(json.loads(admitted[0])) != canonical_json(recovery)):
+                        raise ValueError('gate namespace gates-only admission changed')
+                roots.add(state / admitted_namespace / 'evidence')
+                if first:
+                    namespace = admitted_namespace
+                first = False
+                recovery = recovery.get('original_recovery')
+    root = state / namespace / 'evidence' if namespace else state
+    _ancestors(root, allow_missing=True)
+    for path in (state, *((state / namespace, root) if namespace else ())):
+        if path.exists():
+            info = path.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or (path != state and stat.S_IMODE(info.st_mode) != 0o700)):
+                raise ValueError('gate namespace is not private and owned')
+    for historical in roots:
+        _ancestors(historical, allow_missing=True)
+    return root, roots
+
+
+def _gate_evidence_root(spec: dict) -> Path:
+    return _gate_roots(spec)[0]
+
+
+def _gate_path(spec: dict, role: str, iteration: int) -> Path:
+    if role not in {'review', 'verify'} or type(iteration) is not int or iteration < 0:
+        raise ValueError('gate namespace role or iteration is invalid')
+    path = _gate_evidence_root(spec) / 'gates' / str(iteration) / role
+    _ancestors(path, allow_missing=True)
+    if path.is_symlink():
+        raise ValueError('gate checkout is a symlink alias')
+    return path
+
+
 def _remove_contents(fd: int) -> None:
     """Never follow an entry, including a symlink swapped during traversal."""
     for name in os.listdir(fd):
@@ -113,15 +212,45 @@ def remove_directory(path: Path, identity: dict) -> None:
         raise ValueError("temporary root is still present after removal")
 
 
+def projected_cleanup(spec: dict, checks: dict, recorded: str, *, terminal: bool) -> str:
+    """Read legacy terminal success only from the exact owning finalization proof."""
+    if recorded == "unknown" or not terminal:
+        return recorded
+    receipt = checks.get("resource_cleanup", {})
+    if not isinstance(receipt, dict):
+        return recorded
+    try:
+        path = Path(spec["state_dir"]) / "resources/finalization.json"
+        if receipt.get("receipt") != str(path):
+            return recorded
+        observed = read_private(path)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != receipt.get("receipt_sha256"):
+            return "unknown"
+        expected = {key: value for key, value in receipt.items()
+                    if key not in {"receipt", "receipt_sha256"}}
+        if canonical_json(observed) != canonical_json(expected):
+            return "unknown"
+        if (observed.get("state") == "confirmed"
+                and observed.get("process_cleanup") == "observed-native-confirmed"
+                and observed.get("resource_cleanup") == "confirmed"):
+            return "confirmed"
+        return "unknown"
+    except (OSError, ValueError, KeyError):
+        return "unknown"
+
+
 class RunResources:
-    def __init__(self, spec: dict) -> None:
+    def __init__(self, spec: dict, *, read_only: bool = False) -> None:
         self.spec = spec
         self.state = Path(spec["state_dir"])
         self.root = self.state / "resources"
         self.manifest = self.root / "manifest.json"
         if not self.state.is_absolute() or self.state.name != spec["run_id"]:
             raise ValueError("resource registry is outside its run")
-        private_directory(self.root)
+        if read_only:
+            _identity(self.root)
+        else:
+            private_directory(self.root)
         _ancestors(self.state)
 
     @contextmanager
@@ -156,12 +285,13 @@ class RunResources:
         if kind == "checkout":
             valid = path == Path(self.spec["checkout"])
         elif kind == "gate":
-            relative = path.relative_to(self.state / "gates")
-            valid = (
-                len(relative.parts) == 2
-                and relative.parts[0].isdecimal()
-                and relative.parts[1] in {"review", "verify"}
-            )
+            valid = False
+            for root in _gate_roots(self.spec)[1]:
+                if not path.is_relative_to(root / 'gates'):
+                    continue
+                relative = path.relative_to(root / 'gates')
+                valid = (len(relative.parts) == 2 and relative.parts[0].isdecimal()
+                         and relative.parts[1] in {"review", "verify"})
         elif kind == "generated":
             allowed_names = {
                 "node_modules",
@@ -279,6 +409,8 @@ class RunResources:
                     self._allowed(path, entry["kind"], finalizing=True)
                     if not os.path.lexists(path):
                         receipt.update(state="already_absent")
+                        if entry.get("clean_base_removal"):
+                            receipt["clean_base_removal"] = entry["clean_base_removal"]
                     elif uncertain:
                         receipt.update(
                             state="retained",
@@ -291,6 +423,18 @@ class RunResources:
                         if reason:
                             receipt.update(state="retained", reason=reason)
                         else:
+                            if entry["kind"] == "checkout" and outcome == "cancelled":
+                                from .candidate import candidate_for
+
+                                candidate = candidate_for(path)
+                                if candidate["head"] != self.spec["base_sha"]:
+                                    raise ValueError("cancelled removable source is not the base")
+                                # Persist before removal, so a lost completion can
+                                # authenticate the absent clean source on retry.
+                                proof = {"candidate": candidate, "base_sha": self.spec["base_sha"],
+                                         "outcome": outcome}
+                                entry["clean_base_removal"] = proof
+                                receipt["clean_base_removal"] = proof
                             entry["state"] = "removing"
                             write_private(self.manifest, manifest)
                             subprocess.run(
@@ -345,6 +489,9 @@ class RunResources:
             }
 
     def _retain_source(self, path: Path, kind: str, outcome: str) -> str | None:
+        if kind == "gate" and not path.is_relative_to(_gate_evidence_root(self.spec) / "gates"):
+            return "historical gate checkout and candidate evidence are preserved"
+
         def git(*args):
             return subprocess.check_output(
                 ["git", "--no-optional-locks", "-C", str(path), *args], text=True, timeout=30

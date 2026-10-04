@@ -48,16 +48,25 @@ def package_fixture(tmp_path):
     return tmp_path / "marketplace", runtime, config
 
 
-def test_discovery_canonical_skill_explicit_paths_and_idempotency(package_fixture):
+@pytest.mark.parametrize("package_format", ["portable", "codex"])
+def test_discovery_canonical_skill_explicit_paths_and_idempotency(package_fixture, package_format):
     root, runtime, config = package_fixture
-    target = packager.package(root, runtime, config)
+    target = packager.package(root, runtime, config, package_format=package_format)
     catalog = json.loads((root / ".agents/plugins/marketplace.json").read_text())
     assert root / catalog["plugins"][0]["source"]["path"] == target
-    manifest = json.loads((target / "plugin.json").read_text())
-    assert manifest["$schema"].endswith("/1.0.0/plugin.schema.json")
-    assert manifest["extensions"]["com.openai"]["interface"]["displayName"]
-    mcp = json.loads((target / "mcp.json").read_text())
-    assert mcp["$schema"].endswith("/1.0.0/mcp.schema.json")
+    if package_format == "portable":
+        manifest = json.loads((target / "plugin.json").read_text())
+        assert manifest["$schema"].endswith("/1.0.0/plugin.schema.json")
+        assert manifest["extensions"]["com.openai"]["interface"]["displayName"]
+        mcp = json.loads((target / "mcp.json").read_text())
+        assert mcp["$schema"].endswith("/1.0.0/mcp.schema.json")
+        assert not (target / ".codex-plugin").exists()
+    else:
+        manifest = json.loads((target / ".codex-plugin/plugin.json").read_text())
+        assert manifest["skills"] == "./skills/" and manifest["mcpServers"] == "./.mcp.json"
+        assert manifest["interface"]["displayName"]
+        assert not (target / "plugin.json").exists() and not (target / "mcp.json").exists()
+        mcp = json.loads((target / ".mcp.json").read_text())
     assert mcp["mcpServers"] == {"devflow-local-delivery": {
         "type": "stdio", "command": str(runtime / ".venv/bin/devflow-delivery-mcp"),
         "args": ["--config", str(config)],
@@ -66,9 +75,19 @@ def test_discovery_canonical_skill_explicit_paths_and_idempotency(package_fixtur
     assert (target / "skills/devflow-local-delivery/SKILL.md").read_bytes() == source.read_bytes()
     files = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()}
     assert all(b"SECRET_CONFIG" not in data for data, _mtime in files.values())
-    assert packager.package(root, runtime, config) == target
+    assert packager.package(root, runtime, config, package_format=package_format) == target
     assert files == {p: (p.read_bytes(), p.stat().st_mtime_ns)
                      for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("first,second", [("portable", "codex"), ("codex", "portable")])
+def test_package_selection_never_rewrites_an_existing_other_layout(package_fixture, first, second):
+    root, runtime, config = package_fixture
+    packager.package(root, runtime, config, package_format=first)
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    with pytest.raises(ValueError, match="same-name plugin differs"):
+        packager.package(root, runtime, config, package_format=second)
+    assert before == {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
 def test_unrelated_catalog_fields_and_plugins_preserved(package_fixture):

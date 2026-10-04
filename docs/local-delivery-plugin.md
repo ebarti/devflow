@@ -38,6 +38,26 @@ The skill is copied from `runtime/desktop/devflow-local-delivery/SKILL.md`. The 
 
 Packaging performs no host registration, service start, install or update. Identical repetition leaves existing files untouched. A changed same-name plugin or catalog entry is rejected before publishing files. Unrelated catalog entries and fields are retained. Symlink destinations are rejected. Use a new explicit root for a different candidate rather than overwriting an installed or modified package.
 
+The default `portable` output remains unchanged. The pinned Codex SDK CLI 0.160.0
+recognizes its skill but does not import its bundled MCP server, including when
+a compatibility overlay is added alongside the portable root. For that host,
+select the supported compatibility-only package explicitly:
+
+```sh
+python3 runtime/desktop/package_plugin.py \
+  --format codex \
+  --marketplace-root /absolute/private/state/fresh-codex-marketplace \
+  --runtime-dir /absolute/path/to/devflow/runtime \
+  --config /absolute/path/to/service-config.json
+```
+
+This selection emits `.codex-plugin/plugin.json`, root `.mcp.json`, and the same
+canonical skill. Its manifest declares `skills: "./skills/"` and
+`mcpServers: "./.mcp.json"`. Both formats derive the same plugin identity, real
+stdio executable/configuration and skill; they use the same service. Select one
+package for the primary installation. Changing the layout of an existing root
+is refused; retain it and generate a fresh root.
+
 ## Install on a local host
 
 Register the chosen root using the supported CLI:
@@ -56,9 +76,29 @@ codex plugin list --json
 
 If adding to an existing catalog, use that catalog's `name` in place of `devflow-local`. Validate tool discovery in a fresh local conversation by invoking `get_service`. Registration and CLI installation do not establish GUI discovery in an already-open conversation. Refresh or restart the desktop app yourself if required by your host's marketplace discovery; packaging never restarts it.
 
-The [direct MCP and skill installer](../runtime/desktop/README.md) remains available. Before switching to the plugin, manually disable the matching direct `devflow-local-delivery` MCP entry and direct skill in your host settings to avoid duplicate tools and instructions. Retain their configuration for switching back. The packager does not edit installed settings or disable another installation.
+The [direct MCP and skill installer](../runtime/desktop/README.md) remains available. For an inspected existing direct installation and a trusted-local configuration, its `--activate-owned-plugin-request` operation makes this plugin primary: a private request seals the exact prior registration, configuration, skill and public plugin/marketplace inventories. It registers a fresh owned package through the public CLI, removes the exact duplicate direct MCP entry, and archives its skill outside discovery. A durable rollback manifest restores them through supported commands. Identical requests observe completed effects; changed owned inputs conflict. The packager itself does not change host settings. Use `--rollback-owned-plugin-manifest` to switch back, and retain both manifests when a separate mode-only pointer update preceded activation.
 
 This stdio package is for a host that can execute the local runtime, including local Codex Desktop, CLI and IDE MCP support. ChatGPT cloud cannot execute a Mac-local stdio process or reach that Mac's loopback API. A remote HTTPS service would be a different deployment; tunnels, cloud exposure and public marketplace submission are outside this package.
+
+An owned primary activation request can explicitly set `package_format: "codex"`.
+Its command digest and rollback manifest bind the exact selected layout and
+bytes. Missing `package_format` retains the legacy portable interpretation.
+For an already activated older package, finish active runs and stop its owned
+service, then use its original installer/source and rollback manifest before
+advancing installed source. Verify the restored direct registration, canonical
+skill and unrelated host inventory. Preserve the old package/request/manifest;
+generate a fresh selected package and new activation request against the same
+service config. The guarded activation archives the duplicate direct skill and
+removes only its owned direct entry. A fresh SDK `skills/list` and full
+`mcpServerStatus/list` must recognize the canonical skill and the complete current tool inventory;
+then `get_service` must agree with the standalone client. An old cached/manual
+stdio client does not establish automatic plugin discovery.
+The public CLI's MCP inventory aggregates direct and plugin-provided servers, so
+the imported Devflow server remains visible after its duplicate direct entry is
+removed. The owning readback classifies it only when the raw direct table is
+absent, the selected enabled plugin/cache is intact and its public transport
+matches the frozen registration. A real raw duplicate, changed/disabled transport
+or missing compatibility server is a conflict.
 
 ## Use
 
@@ -76,7 +116,7 @@ Origin metadata comes from the individual MCP request. If the host does not supp
 
 ## Validation and evaluation
 
-The package follows the official [portable plugin and local marketplace format](https://developers.openai.com/plugins/build/plugins): root `plugin.json`, explicit stdio transport in root `mcp.json`, auto-discovered `skills/`, and OpenAI presentation in `extensions.com.openai.interface`. The [MCP host guide](https://developers.openai.com/codex/mcp) describes local stdio support. [UI extensions](https://developers.openai.com/plugins/build/extensions) are optional, so this entry point reuses the existing dashboard.
+Both selections follow the official [plugin and local marketplace formats](https://developers.openai.com/plugins/build/plugins). Portable packages retain root `plugin.json`, root `mcp.json`, `skills/` and inline OpenAI presentation. The explicit Codex selection uses the supported compatibility manifest and declared `.mcp.json`; the pinned 0.160.0 host requires that selection for automatic MCP discovery. The [MCP host guide](https://developers.openai.com/codex/mcp) describes local stdio support. [UI extensions](https://developers.openai.com/plugins/build/extensions) are optional, so this entry point reuses the existing dashboard.
 
 Automated checks cover package discovery, identical repetition, conflicting files/catalogs, catalog preservation, symlink isolation, missing inputs, and rollback after a catalog write failure. The generated real MCP executable is exercised through the official stdio SDK against a disposable loopback API and real Temporal server, using the existing fake intake provider. It submits a raw goal, returns a blocking question, accepts its answer, binds the automatic plan, reaches implementation, and reads status/evidence. Only lifecycle startup is bypassed in that fixture; an implementation stub deliberately stops the run without publishing. Existing startup tests exercise the self-start path separately. No paid provider or live GitHub workflow is submitted.
 
@@ -94,3 +134,7 @@ Evaluate the skill with the following requests in a disposable environment, with
 | Cloud-only conversation | Explain the local host requirement; do not propose loopback access or invent a remote endpoint |
 
 An isolated `CODEX_HOME` can verify CLI marketplace registration and plugin installation without modifying the user's installation. That check does not prove desktop GUI discovery, originating-thread metadata, callback display, paid-provider execution or live GitHub publication. Those remain explicit host/product trials, outside this package's simulated checks.
+The owning compatibility test additionally uses the pinned real CLI for guarded
+primary activation/replay, then a fresh app-server for automatic skill and
+ten-tool discovery, followed by guarded rollback. It makes no provider turn,
+thread or service call. Manual stdio integration remains a separate check.

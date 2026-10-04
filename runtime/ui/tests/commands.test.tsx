@@ -12,6 +12,43 @@ import waitingDecisionProjection from './waiting-decision-projection.json'
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('dashboard commands', () => {
+  it.each([false, true])('offers tracker reconciliation with frozen cancellation (closed=%s)', async closed => {
+    const reconcile = vi.spyOn(api, 'reconcileTracker')
+      .mockRejectedValueOnce(new ApiError('receipt unavailable', 503))
+      .mockResolvedValue(undefined)
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    const user = userEvent.setup()
+    const run: RunDetail = { ...mockRun, decisions: [], outcome: null,
+      phase: 'waiting_tracker', execution_state: 'waiting_tracker',
+      tracker: { state: 'pending', pending: true },
+      checks: { terminal_tracker_checkpoint: { state: 'pending', waiting: !closed, closed,
+        deadline: '2026-10-03T16:10:00+00:00', cycles: 1, attempts: 3 } },
+    }
+    const { rerender } = render(<RunDetails run={run} onRefresh={refresh} />)
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
+    expect(screen.getByText(/terminal transition is fixed/i)).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: 'Reconcile tracker' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
+    expect(reconcile.mock.calls[0][1]).toMatchObject({ expected_revision: 5 })
+    expect(reconcile.mock.calls[0][1].command_id).toBeTruthy()
+    // The accepted cycle arrives over SSE before the lost HTTP ACK is retried.
+    rerender(<RunDetails run={{ ...run, protocol_revision: 9,
+      checks: { terminal_tracker_checkpoint: { ...run.checks?.terminal_tracker_checkpoint,
+        cycles: 2, deadline: '2026-10-03T16:20:00+00:00', waiting: false } },
+    }} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Retry same reconciliation' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2))
+    expect(reconcile.mock.calls[1]).toEqual(reconcile.mock.calls[0])
+  })
+
+  it('disables a new tracker command while a bounded cycle is already running', () => {
+    render(<RunDetails run={{ ...mockRun, decisions: [], outcome: null,
+      phase: 'waiting_tracker', checks: { terminal_tracker_checkpoint: { waiting: false } },
+    }} onRefresh={vi.fn()} />)
+    expect((screen.getByRole('button', { name: 'Reconcile tracker' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
+  })
+
   it.each(['question', 'plan'] as const)('keeps a retired nonterminal %s readable without action controls', kind => {
     const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
     const cancel = vi.spyOn(api, 'cancel').mockResolvedValue(undefined)

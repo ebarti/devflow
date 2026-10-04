@@ -2770,7 +2770,7 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
                 {"iteration": 0, "input_candidate_id": payload["candidate"]["id"]},
             )
             _git(broker.checkout, "add", "devflow-fake-change.txt")
-            _git(broker.checkout, "commit", "-qm", "first candidate")
+            _git(broker.checkout, "commit", "--signoff", "-qm", "feat: first candidate")
             _git(broker.checkout, "push", "origin", "HEAD:refs/heads/feat/fixture")
             first_head["value"] = _git(broker.checkout, "rev-parse", "HEAD")
             result = {
@@ -3712,3 +3712,62 @@ async def test_large_public_submit_dispatches_through_real_temporal_and_safe_act
     finally:
         server.terminate()
         await server.wait()
+
+
+def test_public_legacy_cleanup_readback_keeps_original_none_and_authenticates_receipt(service):
+    from devflow_temporal.delivery_resources import RunResources
+
+    store, request = service
+    store.submit(request)
+    spec = store.spec('run-1')
+    resources = RunResources(spec)
+    resources.scratch('check', 'terminal')
+    receipt = resources.finalize('blocked')
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message='original terminal history', checks={'resource_cleanup': receipt},
+                  outcome='blocked', cleanup='none')
+    assert store.detail('run-1')['run']['cleanup'] == 'confirmed'
+    assert store.list_runs()[0]['cleanup_recorded'] == 'none'
+    detail = store.detail('run-1')
+    assert detail['cleanup'] == 'confirmed' and detail['cleanup_recorded'] == 'none'
+    with store._connect() as db:
+        assert db.execute('SELECT cleanup FROM delivery_runs').fetchone()[0] == 'none'
+    Path(receipt['receipt']).write_text('{}')
+    assert store.detail('run-1')['cleanup'] == 'unknown'
+
+
+@pytest.mark.parametrize('own_state', [None, 'running', 'queued', 'unknown-cleanup'])
+def test_confirmed_run_cleanup_is_independent_of_foreign_capacity(service, own_state):
+    from devflow_temporal.delivery_resources import RunResources
+
+    store, request = service
+    store.submit(request)
+    resources = RunResources(store.spec('run-1'))
+    resources.scratch('check', 'terminal')
+    receipt = resources.finalize('blocked')
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message='original terminal history', checks={'resource_cleanup': receipt},
+                  outcome='blocked', cleanup='none')
+    store.submit({**request, 'command_id': 'foreign-command', 'run_id': 'foreign-run',
+                  'work_id': 'foreign-work', 'branch': 'feat/foreign',
+                  'issue_url': 'https://github.com/example/fixture/issues/4'})
+    with store._connect() as db:
+        db.execute("INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,"
+                   "state,cleanup) VALUES ('foreign-attempt','foreign-run','implement',0,"
+                   "'foreign-candidate','running','none')")
+        if own_state:
+            db.execute("INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,"
+                       "state,cleanup) VALUES ('own-attempt','run-1','implement',4,?,?,?)",
+                       ('own-candidate', 'finished' if own_state == 'unknown-cleanup'
+                        else own_state, 'unknown' if own_state == 'unknown-cleanup' else 'none'))
+    detail = store.detail('run-1')
+    assert detail['capacity']['active'] == (2 if own_state == 'running' else 1)
+    assert detail['checks']['resource_cleanup'] == receipt
+    assert detail['run']['cleanup'] == ('none' if own_state else 'confirmed')
+    assert detail['cleanup'] == ('unknown' if own_state == 'unknown-cleanup' else
+                                 'none' if own_state else 'confirmed')
+    assert detail['cleanup_recorded'] == 'none'
+    with store._connect() as db:
+        unchanged = db.execute(
+            "SELECT cleanup FROM delivery_runs WHERE run_id='run-1'").fetchone()[0]
+        assert unchanged == 'none'

@@ -87,6 +87,11 @@ class DeliveryClient:
     def cancel(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/cancel", payload)
 
+    def reconcile_tracker(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/reconcile-tracker", payload,
+        )
+
     def recover_publication(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request(
             "POST",
@@ -94,11 +99,47 @@ class DeliveryClient:
             payload,
         )
 
+    def reconcile_published_metadata(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/reconcile-published-metadata",
+            payload, timeout=180,
+        )
+
+    def gates_only_preflight(self, run_id: str) -> dict:
+        return self._request(
+            "GET", "/api/runs/" + quote(run_id, safe="") + "/gates-only-preflight", timeout=120,
+        )
+
+    def admit_gates_only(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/admit-gates-only", payload,
+            timeout=120,
+        )
+
+    def recovery_preflight(self, run_id: str) -> dict:
+        return self._request(
+            "GET", "/api/runs/" + quote(run_id, safe="") + "/recovery-preflight", timeout=120,
+        )
+
+    def recover_execution(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/recover-execution", payload,
+            timeout=180,
+        )
+
+    def metadata_preflight(self, run_id, request):
+        return self._request("POST", "/api/runs/" + quote(run_id, safe="")
+                             + "/metadata-preflight", request, timeout=120)
+
+    def repair_admission_preflight(self, run_id, request):
+        return self._request("POST", "/api/runs/" + quote(run_id, safe="")
+                             + "/repair-admission-preflight", request, timeout=120)
+
     def continue_repair(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request(
             "POST",
             "/api/runs/" + quote(run_id, safe="") + "/continue-repair",
-            payload,
+            payload, timeout=180,
         )
 
     def retry_prelaunch(self, run_id: str, payload: dict[str, Any]) -> dict:

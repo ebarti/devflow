@@ -18,7 +18,7 @@ from .candidate import candidate_for
 from .contracts import canonical_json
 from .delivery_browser_qa import run_browser_qa as execute_browser_qa
 from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
-from .delivery_output import observed_test_count, visible_output
+from .delivery_output import observed_test_count, rejection_causes, visible_output
 from .delivery_store import DeliveryStore, _now
 
 
@@ -57,6 +57,20 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def conventional_subject(goal: str) -> str:
+    """Keep an admitted conventional subject, otherwise use a neutral type."""
+    subject = goal.splitlines()[0].strip()
+    if not subject or any(ord(character) < 32 for character in subject):
+        raise ValueError("publication subject is empty or contains control characters")
+    if not _conventional_subject(subject):
+        subject = "chore: " + subject
+    return subject
+
+
+def _conventional_subject(subject: str) -> bool:
+    return bool(re.fullmatch(r"[a-z][a-z0-9-]*(?:\([^()\r\n]+\))?!?: \S.*", subject))
+
+
 class BrokerReadbackUnavailable(RuntimeError):
     """A remote PR query failed before its authority could be inspected."""
 
@@ -71,6 +85,10 @@ class DeliveryBroker:
         self.source = Path(spec["source_path"])
         self.checkout = Path(spec["checkout"])
         self.state_dir = Path(spec["state_dir"])
+        from .delivery_resources import _gate_evidence_root
+
+        self.evidence_dir = _gate_evidence_root(spec)
+        self.effect_namespace = ""
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -296,8 +314,13 @@ class DeliveryBroker:
             from .delivery_native_guard import validate_native_turn
 
             validate_native_turn(self.spec, role, iteration, self.store)
-        path = self.state_dir / "gates" / str(iteration) / role
-        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        current = self.candidate()
+        if any(candidate.get(key) != current[key] for key in ('id', 'head')):
+            raise RuntimeError('gate candidate no longer matches its owned source')
+        path = self._gate_path(role, iteration)
+        from .delivery_resources import private_directory
+
+        private_directory(path.parent)
         resources = None
         if self.spec.get("resource_cleanup_version") == 1:
             from .delivery_resources import RunResources
@@ -317,12 +340,19 @@ class DeliveryBroker:
             raise RuntimeError("gate checkout does not match the published candidate")
         return path
 
+    def _gate_path(self, role: str, iteration: int) -> Path:
+        from .delivery_resources import _gate_evidence_root, _gate_path
+
+        if self.evidence_dir != _gate_evidence_root(self.spec):
+            raise ValueError('broker gate namespace differs from durable admission')
+        return _gate_path(self.spec, role, iteration)
+
     def gate_diff(self, role: str, iteration: int, candidate: dict[str, Any]) -> dict[str, str]:
         """Freeze the controller's base-to-head diff for a role without Git access."""
 
         if role not in {"review", "verify"}:
             raise ValueError("only independent gates receive a controller diff")
-        checkout = self.state_dir / "gates" / str(iteration) / role
+        checkout = self._gate_path(role, iteration)
         if candidate_for(checkout)["id"] != candidate["id"]:
             raise ValueError("gate checkout changed before diff production")
         base = self.spec["base_sha"]
@@ -346,8 +376,10 @@ class DeliveryBroker:
         result = subprocess.run(command, capture_output=True, check=False, timeout=120)
         if result.returncode or not result.stdout:
             raise RuntimeError("controller could not produce a nonempty bound candidate diff")
-        folder = self.state_dir / "gate-evidence" / str(iteration) / role
-        folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+        folder = self.evidence_dir / "gate-evidence" / str(iteration) / role
+        from .delivery_resources import private_directory
+
+        private_directory(folder)
         folder_info = folder.lstat()
         if (
             not stat.S_ISDIR(folder_info.st_mode)
@@ -409,10 +441,11 @@ class DeliveryBroker:
             ):
                 raise ValueError("configured check command or cwd is invalid")
             native_result = None
+            check_evidence = None
             if self.spec["provider"] == "codex":
                 from .delivery_native_process import NativeProcess
                 from .delivery_preparation import verify_prepared_spec
-                from .delivery_sandbox import prepare_native_check
+                from .delivery_sandbox import native_check_argv, prepare_native_check
 
                 verify_prepared_spec(self.spec)
                 profile, environment = prepare_native_check(
@@ -430,16 +463,7 @@ class DeliveryBroker:
                 native_result = NativeProcess(
                     self.spec,
                     evidence_dir / check["id"] / "native",
-                    argv=[
-                        self.spec["policy"]["codex_bin"],
-                        "sandbox",
-                        "-P",
-                        profile,
-                        "-C",
-                        str(cwd),
-                        "--",
-                        *command,
-                    ],
+                    argv=native_check_argv(self.spec, profile, cwd, command),
                     cwd=cwd,
                     environment=environment,
                     timeout=int(check.get("timeout_seconds", 600)),
@@ -477,15 +501,26 @@ class DeliveryBroker:
                 os.chmod(artifact, 0o600)
             else:
                 raise ValueError("unknown delivery provider")
+            evidence_failure = None
+            if (self.spec["policy"].get("host_sandbox") == "trusted-local"
+                    and check.get("kind") == "test"):
+                from .delivery_check_evidence import retain_artifacts
+
+                try:
+                    check_evidence = retain_artifacts(evidence_dir / check["id"], candidate)
+                except (ValueError, OSError) as exc:
+                    evidence_failure = str(exc)
             parsed_output = visible_output(output)
             count = None
             if check.get("test_count_regex"):
                 count = observed_test_count(output, check["test_count_regex"])
-            rejected_output = False
-            if check.get("reject_regex"):
-                rejected_output = re.search(check["reject_regex"], parsed_output) is not None
+            rejected_causes = rejection_causes(
+                parsed_output, [check["reject_regex"]] if check.get("reject_regex") else []
+            )
+            rejected_output = bool(rejected_causes)
             passed = (
                 exit_code == 0
+                and evidence_failure is None
                 and (count is None or count >= int(check.get("min_tests", 1)))
                 and not rejected_output
             )
@@ -497,10 +532,13 @@ class DeliveryBroker:
                     "exit_code": exit_code,
                     "test_count": count,
                     "rejected_output": rejected_output,
+                    "rejection_causes": rejected_causes,
                     "passed": passed,
                     "diagnostic": parsed_output[-2000:] if not passed else None,
                     "log": str(artifact),
                     "log_sha256": _sha256(artifact),
+                    **({"artifacts": check_evidence} if check_evidence else {}),
+                    **({"evidence_failure": evidence_failure} if evidence_failure else {}),
                     "cleanup": "confirmed",
                     **(
                         {
@@ -562,7 +600,7 @@ class DeliveryBroker:
         from .delivery_native_process import NativeProcess
         from .delivery_preparation import verify_prepared_spec
         from .delivery_resources import RunResources, private_directory, read_private, write_private
-        from .delivery_sandbox import prepare_native_check
+        from .delivery_sandbox import native_check_argv, prepare_native_check
 
         verify_prepared_spec(self.spec)
         manager, inputs = frozen_pnpm_inputs(self.spec, checkout)
@@ -570,7 +608,7 @@ class DeliveryBroker:
         scratch = resources.scratch("dependencies", self.spec["policy_digest"])
         transient = read_private(resources.manifest)["roots"][str(self.state_dir / "transient")]
         generation = transient.get("generation", 0)
-        folder = self.state_dir / "dependency-preparation" / f"native-{generation}"
+        folder = self.evidence_dir / "dependency-preparation" / f"native-{generation}"
         staging = scratch / "staging"
         dependencies = staging / "store"
         for path in (folder, staging, dependencies):
@@ -598,11 +636,10 @@ class DeliveryBroker:
         })
         process = NativeProcess(
             self.spec, folder / "process",
-            argv=[
-                self.spec["policy"]["codex_bin"], "sandbox", "-P", profile, "-C", str(staging),
-                "--", "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
+            argv=native_check_argv(self.spec, profile, staging, [
+                "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
                 "--ignore-pnpmfile", "--store-dir", str(dependencies),
-            ],
+            ]),
             cwd=staging, environment=environment, timeout=1800, cancelled=self._native_cancelled,
         ).run()
         unchanged = hashes == write_frozen_inputs(staging, inputs)
@@ -616,7 +653,11 @@ class DeliveryBroker:
             "native_process": process, "log": process["log"],
             "log_sha256": _sha256(Path(process["log"])),
             "candidate_setup_executed": False,
-            "network_authority": "registry.npmjs.org fetch only; candidate checks remain offline",
+            "network_authority": ("trusted-local full host network"
+                                  if self.spec["policy"].get("host_sandbox") == "trusted-local"
+                                  else "registry.npmjs.org fetch only; "
+                                       "candidate checks remain offline"
+                                  ),
         }
         write_private(receipt, result)
         result.update(receipt=str(receipt), receipt_sha256=_sha256(receipt))
@@ -636,7 +677,7 @@ class DeliveryBroker:
         return self._run_check_list(
             self.checkout,
             self.spec["policy"].get("prepublish_checks", []),
-            self.state_dir / "prechecks" / str(iteration),
+            self.evidence_dir / "prechecks" / str(iteration),
             candidate,
         )
 
@@ -645,14 +686,14 @@ class DeliveryBroker:
         return self._run_check_list(
             checkout,
             self.spec["policy"].get("checks", []),
-            self.state_dir / "checks" / str(iteration),
+            self.evidence_dir / "checks" / str(iteration),
             candidate,
         )
 
     def run_browser_qa(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         return execute_browser_qa(self, iteration, candidate)
 
-    def _existing_pr(self) -> dict[str, Any] | None:
+    def _existing_pr(self, *, validate_metadata: bool = True) -> dict[str, Any] | None:
         try:
             output = _run(
                 [
@@ -666,7 +707,7 @@ class DeliveryBroker:
                     "--head",
                     self.spec["branch"],
                     "--json",
-                    "number,url,state,isDraft,baseRefName,headRefName,headRefOid",
+                    "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title",
                 ],
                 timeout=60,
             )
@@ -685,9 +726,30 @@ class DeliveryBroker:
             or found["state"] != "OPEN"
         ):
             raise RuntimeError("owned branch PR is not the authorized open regular PR")
+        if validate_metadata and not _conventional_subject(found.get("title", "")):
+            raise ValueError("owned PR title does not satisfy Conventional Commits")
         return found
 
+    def _validate_publication_commits(self) -> None:
+        """Check every owned commit; a valid head cannot mask invalid ancestors."""
+        _git(self.checkout, "merge-base", "--is-ancestor", self.spec["base_sha"], "HEAD")
+        commits = _git(
+            self.checkout, "rev-list", "--reverse", self.spec["base_sha"] + "..HEAD"
+        ).splitlines()
+        for commit in commits:
+            subject = _git(self.checkout, "show", "-s", "--format=%s", commit)
+            if not _conventional_subject(subject):
+                raise ValueError("owned commit is not a Conventional Commit: " + commit)
+            author = _git(self.checkout, "show", "-s", "--format=%an <%ae>", commit)
+            signers = _git(
+                self.checkout, "show", "-s",
+                "--format=%(trailers:key=Signed-off-by,valueonly)", commit,
+            ).splitlines()
+            if author not in signers:
+                raise ValueError("owned commit lacks its author Signed-off-by trailer: " + commit)
+
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        self._validate_publication_commits()
         key = f"publish:{self.spec['run_id']}:{iteration}"
         before = self.candidate()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
@@ -707,6 +769,10 @@ class DeliveryBroker:
             )
         existing = self._existing_pr()
         if changed:
+            author = _git(self.checkout, "var", "GIT_AUTHOR_IDENT").rsplit(" ", 2)[0]
+            committer = _git(self.checkout, "var", "GIT_COMMITTER_IDENT").rsplit(" ", 2)[0]
+            if author != committer:
+                raise ValueError("publication author and configured sign-off identity disagree")
             for relative in sorted(changed):
                 attribute = _git(self.checkout, "check-attr", "filter", "--", relative)
                 if not attribute.endswith(": filter: unspecified") and not attribute.endswith(
@@ -720,9 +786,11 @@ class DeliveryBroker:
                     "-c",
                     "core.hooksPath=/dev/null",
                     "commit",
+                    "--signoff",
                     "-m",
-                    f"Implement {self.spec['goal'].splitlines()[0][:65]}",
+                    conventional_subject(self.spec["goal"]),
                 )
+        self._validate_publication_commits()
         head = _git(self.checkout, "rev-parse", "HEAD")
         if head == self.spec["base_sha"]:
             raise ValueError("no meaningful commit is available for publication")
@@ -748,7 +816,7 @@ class DeliveryBroker:
                     raise RuntimeError("remote feature branch diverged")
             _git(self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}")
         if existing is None:
-            title = self.spec["goal"].splitlines()[0][:100]
+            title = conventional_subject(self.spec["goal"])
             body = self.state_dir / "pull-request.md"
             body.write_text(
                 self.spec["policy"].get("pr_body")
@@ -816,6 +884,7 @@ class DeliveryBroker:
         successful push followed by a stale GitHub PR projection.
         """
         key = f"publish:{self.spec['run_id']}:{iteration}"
+        self._validate_publication_commits()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
         with self.store._connect() as db:
             saved = db.execute(

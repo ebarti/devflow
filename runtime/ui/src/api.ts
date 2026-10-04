@@ -124,6 +124,9 @@ export const api = {
   cancel: async (runId: string, body: { command_id: string; expected_revision: number; reason: string }): Promise<void> => {
     await command(`/api/runs/${encodeURIComponent(runId)}/cancel`, body)
   },
+  reconcileTracker: async (runId: string, body: { command_id: string; expected_revision: number }): Promise<void> => {
+    await command(`/api/runs/${encodeURIComponent(runId)}/reconcile-tracker`, body)
+  },
   eventUrl: (runId: string, after: number): string => `/api/runs/${encodeURIComponent(runId)}/events?after=${after}`,
 }
 

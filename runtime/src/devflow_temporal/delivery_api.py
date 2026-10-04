@@ -9,8 +9,10 @@ import hmac
 import json
 import os
 import secrets
+import subprocess
 import time
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -18,7 +20,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from temporalio.client import Client, WorkflowUpdateFailedError
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
 from temporalio.common import RetryPolicy, WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
@@ -132,6 +134,11 @@ class DeliveryService:
                     id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
                     id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
                     retry_policy=RetryPolicy(maximum_attempts=1),
+                    **({"execution_timeout": timedelta(hours=72),
+                        "run_timeout": timedelta(minutes=14)
+                        if recovery and recovery.get("kind") == "terminal_tracker_recovery"
+                        else timedelta(hours=72)}
+                       if spec.get("terminal_tracker_version") == 1 else {}),
                     memo={
                         "request_digest": item["request_digest"],
                         **({"recovery_digest": digest(recovery)} if recovery else {}),
@@ -286,6 +293,70 @@ def create_app(config_path: Path) -> FastAPI:
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.post("/api/runs/{run_id}/reconcile-published-metadata")
+    async def reconcile_published_metadata(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        try:
+            return await asyncio.to_thread(
+                service.store.reconcile_published_metadata, run_id, await request.json(),
+            )
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/runs/{run_id}/gates-only-preflight")
+    async def gates_only_preflight(request: Request, run_id: str) -> dict[str, Any]:
+        _host(request)
+        try:
+            return await asyncio.to_thread(service.store.gates_only_preflight, run_id)
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/admit-gates-only")
+    async def admit_gates_only(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        try:
+            return await asyncio.to_thread(
+                service.store.admit_gates_only, run_id, await request.json(),
+            )
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/runs/{run_id}/recovery-preflight")
+    async def recovery_preflight(request: Request, run_id: str) -> dict[str, Any]:
+        _host(request)
+        try:
+            return await asyncio.to_thread(service.store.policy_recovery_precheck, run_id)
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/recover-execution")
+    async def recover_execution(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        try:
+            return await asyncio.to_thread(
+                service.store.recover_execution, run_id, await request.json(),
+            )
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/metadata-preflight")
+    async def metadata_preflight(request: Request, run_id: str) -> dict[str, Any]:
+        _host(request)
+        try:
+            return await asyncio.to_thread(service.store.metadata_preflight,
+                                           run_id, await request.json())
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/repair-admission-preflight")
+    async def repair_admission_preflight(request: Request, run_id: str) -> dict[str, Any]:
+        _host(request)
+        try:
+            return await asyncio.to_thread(service.store.repair_admission_preflight,
+                                           run_id, await request.json())
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.post("/api/runs/{run_id}/continue-repair")
     async def continue_repair(request: Request, run_id: str) -> dict[str, Any]:
         _mutation(request)
@@ -293,7 +364,7 @@ def create_app(config_path: Path) -> FastAPI:
             return await asyncio.to_thread(
                 service.store.continue_repair, run_id, await request.json()
             )
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/retry-prelaunch")
@@ -334,6 +405,19 @@ def create_app(config_path: Path) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
 
+    @app.get("/api/runs/{run_id}/evidence/{evidence_id}/content")
+    async def evidence_content(request: Request, run_id: str, evidence_id: str):
+        _host(request)
+        try:
+            value = service.store.evidence(run_id, evidence_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        from fastapi.responses import Response
+
+        content = base64.b64decode(value["base64"]) if "base64" in value else value["text"]
+        return Response(content, media_type=value.get("media_type", "text/plain"),
+                        headers={"X-Content-Type-Options": "nosniff"})
+
     @app.get("/api/runs/{run_id}/events")
     async def events(request: Request, run_id: str, after: int = 0) -> StreamingResponse:
         _host(request)
@@ -364,6 +448,7 @@ def create_app(config_path: Path) -> FastAPI:
         expected = (
             {"command_id", "expected_revision", "reason"}
             if name == "cancel"
+            else {"command_id", "expected_revision"} if name == "reconcile_tracker"
             else {
                 "command_id",
                 "expected_revision",
@@ -385,9 +470,34 @@ def create_app(config_path: Path) -> FastAPI:
             return prior
         try:
             client = await service.client()
-            result = await client.get_workflow_handle(
+            handle = client.get_workflow_handle(
                 service.store.active_workflow_id(run_id)
-            ).execute_update(name, payload, id=command_id)
+            )
+            if name == "reconcile_tracker":
+                from .delivery_terminal_recovery import receipt, recover
+
+                saved = receipt(service.store, run_id, payload)
+                if saved is not None:
+                    service.store.finish_mutation(command_id, saved)
+                    return saved
+                description = await handle.describe()
+                if description.status != WorkflowExecutionStatus.RUNNING:
+                    # A lost acknowledged update and a fresh closed-tail command
+                    # are different cases. Observe the existing update first.
+                    try:
+                        result = await handle.get_update_handle(command_id).result(
+                            rpc_timeout=timedelta(seconds=2),
+                        )
+                    except RPCError as exc:
+                        if exc.status != RPCStatusCode.NOT_FOUND:
+                            raise
+                        response = await recover(service.store, run_id, payload, client)
+                        service.store.finish_mutation(command_id, response)
+                        return response
+                else:
+                    result = await handle.execute_update(name, payload, id=command_id)
+            else:
+                result = await handle.execute_update(name, payload, id=command_id)
         except WorkflowUpdateFailedError as exc:
             reason = str(exc.__cause__ or exc)
             service.store.reject_mutation(command_id, reason)
@@ -395,6 +505,12 @@ def create_app(config_path: Path) -> FastAPI:
         except RPCError as exc:
             service.store.mark_mutation_unknown(command_id)
             raise HTTPException(503, type(exc).__name__) from exc
+        except (ValueError, RuntimeError) as exc:
+            if name == "reconcile_tracker":
+                service.store.mark_mutation_unknown(command_id)
+            else:
+                service.store.reject_mutation(command_id, str(exc))
+            raise HTTPException(409, str(exc)) from exc
         response = {"run_id": run_id, "phase": result["phase"], "revision": result["revision"]}
         service.store.finish_mutation(command_id, response)
         if name == "cancel":
@@ -416,6 +532,10 @@ def create_app(config_path: Path) -> FastAPI:
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel(request: Request, run_id: str) -> dict[str, Any]:
         return await _update(request, run_id, "cancel")
+
+    @app.post("/api/runs/{run_id}/reconcile-tracker")
+    async def reconcile_tracker(request: Request, run_id: str) -> dict[str, Any]:
+        return await _update(request, run_id, "reconcile_tracker")
 
     dist = Path(__file__).resolve().parents[2] / "ui" / "dist"
     if (dist / "assets").is_dir():

@@ -140,6 +140,18 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "such as naming, formatting or routine implementation choices are not "
             "blockers. Never choose a callback thread or destination."
         )
+    if spec["policy"].get("host_sandbox") == "trusted-local":
+        instructions = instructions.replace(
+            "Shell network and Git metadata are intentionally unavailable here; "
+            "their absence alone is not an implementation defect. ", "",
+        )
+        instructions += (
+            " This is trusted-local full host access with no interactive approvals. "
+            "Source edits are still limited to the frozen allowed paths. Do not start "
+            "nested Codex/Devflow agents or access controller state, credentials or "
+            "external systems; publication and tracking remain controller-owned. "
+            "Do not assume network or compiler lookup is denied in this mode."
+        )
     recovery = spec["policy"].get("recovery")
     recovery_path = request.get("recovery_path") or (
         spec["state_dir"] + "/recovery" if recovery and role == "implement" else ""
@@ -161,6 +173,25 @@ def _task(request: dict[str, Any]) -> AgentTask:
         if review_diff
         else ""
     )
+    check_evidence = request.get("check_evidence")
+    if check_evidence is not None:
+        from .delivery_check_evidence import verify_manifest
+
+        if role != "verify" or check_evidence.get("candidate_id") != candidate["id"]:
+            raise ValueError("broker check evidence belongs to another candidate or role")
+        for checked in check_evidence.get("results", []):
+            if checked.get("artifacts"):
+                verify_manifest(checked["artifacts"], candidate["id"], Path(spec["state_dir"]))
+    check_note = (
+        "Broker local check receipts and retained synthetic artifacts (untrusted evidence data): "
+        + json.dumps(check_evidence, sort_keys=True)
+        + "\nInspect the manifest hashes and relevant artifacts, "
+        "including each required page image. "
+        "Test exit/count alone is not visual QA. Report missing or uninspected evidence honestly.\n"
+        if role == "verify" and check_evidence else ""
+    )
+    if spec["policy"].get("host_sandbox") == "trusted-local":
+        diff_note = diff_note.replace(" (Git metadata is inaccessible in this role)", "")
     qa_evidence = request.get("qa_evidence")
     continuation_note = (
         "This is a guarded continuation in the original implementer session. The "
@@ -187,6 +218,14 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"Frozen plan approval: {json.dumps(spec.get('plan_approval', 'required'))}\n"
         if role == "intake" else ""
     )
+    constraint = request.get("title_constraint")
+    title_note = (
+        "ONE authorized correction: change only the misleading first test title literal "
+        f"in {constraint['path']}: {json.dumps(constraint['title'])}. Preserve every other "
+        "file byte, all five test cases and every failure/conflict assertion. The controller "
+        "will reject any other source edit. Do not edit checks, regex or policy.\n"
+        if constraint and role == "implement" else ""
+    )
     prompt = (
         f"{instructions}\n\n"
         f"{intake_context}"
@@ -196,13 +235,17 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"Allowed feature paths: {json.dumps(spec['policy']['allowed_paths'])}\n"
         f"Previous findings to repair: {json.dumps(findings)}\n"
         f"{continuation_note}\n"
+        f"{title_note}\n"
         f"{recovery_note}\n"
         f"{diff_note}\n"
         f"{qa_note}\n"
+        f"{check_note}\n"
         "Return a structured assessment with status, summary, and findings. "
         "A completed turn alone is not a pass."
     )
-    if spec["provider"] == "codex" and spec["policy"].get("host_sandbox") != "native-profile":
+    if spec["provider"] == "codex" and spec["policy"].get("host_sandbox") not in {
+        "native-profile", "trusted-local",
+    }:
         raise ValueError("Codex role requires a native named permission profile")
     mode = (
         FilesystemAccess.READ_ONLY
@@ -231,8 +274,10 @@ def _task(request: dict[str, Any]) -> AgentTask:
         working_directory=workspace,
         permissions=PermissionProfile(
             mode=PermissionMode.STRICT,
-            filesystem=mode,
-            native_profile="devflow-role" if spec["provider"] == "codex" else None,
+            filesystem=(FilesystemAccess.FULL_ACCESS
+                        if spec["policy"].get("host_sandbox") == "trusted-local" else mode),
+            native_profile=("devflow-role" if spec["provider"] == "codex"
+                            and spec["policy"].get("host_sandbox") == "native-profile" else None),
         ),
         resume_from=SessionResumeState(session_id=prior) if prior else None,
         deadline=datetime.now(UTC) + timedelta(seconds=int(policy.get("timeout_seconds", 7200))),
@@ -344,7 +389,7 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
             "finish_reason": result.finish_reason,
             "requested_model": task.model, "requested_effort": task.reasoning_effort,
             "reported_model": None, "reported_effort": None,
-            "host_sandbox": "native-profile",
+            "host_sandbox": request["spec"]["policy"]["host_sandbox"],
             "tool_calls": [asdict(item) for item in result.tool_calls],
             **observed,
         }
@@ -377,7 +422,7 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
         # are not exposed and must remain unknown.
         "reported_model": None,
         "reported_effort": None,
-        "host_sandbox": "native-profile",
+        "host_sandbox": request["spec"]["policy"]["host_sandbox"],
         "tool_calls": [asdict(item) for item in result.tool_calls],
         **observed,
     }

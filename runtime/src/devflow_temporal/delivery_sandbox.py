@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 import tempfile
@@ -260,6 +261,29 @@ def _profile_lines(
     return lines
 
 
+def trusted_local(spec: dict[str, Any]) -> bool:
+    return spec["policy"].get("host_sandbox") == "trusted-local"
+
+
+def _trusted_lines(workspace: Path) -> list[str]:
+    # The SDK supplies full_access and deny_all. Checks run directly on the host.
+    # These controls prevent ordinary nested tools, not hostile-code escape.
+    return [
+        'approval_policy = "never"', 'sandbox_mode = "danger-full-access"',
+        'web_search = "disabled"', '[features]', 'plugins = false',
+        'multi_agent = false', '[agents]', 'enabled = false',
+        f"[projects.{_path(workspace)}]", 'trust_level = "trusted"',
+    ]
+
+
+def native_check_argv(
+    spec: dict[str, Any], profile: str, cwd: Path, argv: list[str],
+) -> list[str]:
+    if trusted_local(spec):
+        return list(argv)
+    return [spec["policy"]["codex_bin"], "sandbox", "-P", profile, "-C", str(cwd), "--", *argv]
+
+
 def validate_network_domain(domain: str) -> str:
     normalized = domain.lower()
     try:
@@ -287,13 +311,15 @@ def prepare_native_role(
     from .delivery_preparation import require_native_execution
 
     require_native_execution(spec)
-    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
+    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") not in {
+        "native-profile", "trusted-local",
+    }:
         raise ValueError("real role did not require the native profile boundary")
+    diff_path = _review_diff_path(request)
+    _browser_qa_evidence(request)
     workspace = Path(request["workspace"]).resolve(strict=True)
     _remove_generated_project_directory(workspace)
-    role_home = Path(spec["state_dir"]) / "role-homes" / request["role"]
-    if request["role"] != "implement":
-        role_home /= str(request["iteration"])
+    role_home = _native_role_home(request)
     codex_home = role_home / "codex"
     from .delivery_resources import RunResources
 
@@ -308,59 +334,7 @@ def prepare_native_role(
     toolchain_roots = tuple(Path(root) for root in spec["policy"].get("toolchain_roots", []))
     cache = spec["policy"].get("package_manager_cache")
     review_diff = request.get("review_diff")
-    if request["role"] in {"review", "verify"}:
-        if not isinstance(review_diff, dict):
-            raise ValueError("independent role requires the controller-bound diff")
-        diff_path = Path(review_diff["path"])
-        expected_parent = (
-            Path(spec["state_dir"]) / "gate-evidence" / str(request["iteration"]) / request["role"]
-        ).resolve(strict=True)
-        info = diff_path.lstat()
-        if (
-            diff_path.parent.resolve(strict=True) != expected_parent
-            or diff_path.is_symlink()
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or review_diff.get("candidate_id") != request["candidate"]["id"]
-            or review_diff.get("head") != request["candidate"]["head"]
-            or review_diff.get("base_sha") != spec["base_sha"]
-            or hashlib.sha256(diff_path.read_bytes()).hexdigest() != review_diff.get("sha256")
-        ):
-            raise ValueError("controller-bound diff is unavailable or changed")
-    elif review_diff is not None:
-        raise ValueError("non-gate role may not receive an independent gate diff")
     qa_evidence = request.get("qa_evidence")
-    if qa_evidence is not None:
-        if request["role"] != "verify" or not isinstance(qa_evidence, dict):
-            raise ValueError("browser QA evidence belongs only to independent verification")
-        qa_parent = (Path(spec["state_dir"]) / "browser-qa" / str(request["iteration"])).resolve(
-            strict=True
-        )
-        for field, hash_field in (("path", "sha256"), ("log", "log_sha256")):
-            file = Path(qa_evidence[field])
-            info = file.lstat()
-            if (
-                file.parent.resolve(strict=True) != qa_parent
-                or file.is_symlink()
-                or not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or hashlib.sha256(file.read_bytes()).hexdigest() != qa_evidence[hash_field]
-            ):
-                raise ValueError("browser QA evidence is unavailable or changed")
-        receipt = json.loads(Path(qa_evidence["path"]).read_text(encoding="utf-8"))
-        if (
-            qa_evidence.get("candidate_id") != request["candidate"]["id"]
-            or qa_evidence.get("iteration") != request["iteration"]
-            or receipt.get("candidate_id") != request["candidate"]["id"]
-            or receipt.get("iteration") != request["iteration"]
-            or receipt.get("state") != "passed"
-            or receipt.get("log_sha256") != qa_evidence["log_sha256"]
-        ):
-            raise ValueError("browser QA evidence assessed a different candidate")
-    elif request["role"] == "verify" and spec["policy"].get("browser_qa"):
-        raise ValueError("configured browser QA receipt is required for verification")
     extra_read = (
         toolchain_roots
         + ((Path(cache),) if cache else ())
@@ -384,11 +358,100 @@ def prepare_native_role(
         extra_read=extra_read,
         protected_executables=_protected_native_commands(spec),
     )
+    if trusted_local(spec):
+        lines = _trusted_lines(workspace)
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
     env = _native_env(ephemeral_home, codex_home, scratch, toolchain_roots)
     if cache:
         env["COREPACK_HOME"] = cache
     return profile_name, env
+
+
+def _native_role_home(request: dict[str, Any]) -> Path:
+    spec = request['spec']
+    home = Path(spec['state_dir']) / 'role-homes' / (
+        request['role'] + ('-' + spec['role_home_generation']
+                           if spec.get('role_home_generation') else '')
+    )
+    if request['role'] != 'implement':
+        home /= str(request['iteration'])
+    if request['role'] in {'review', 'verify'}:
+        from .delivery_resources import _gate_evidence_root
+
+        namespace = _gate_evidence_root(spec).relative_to(Path(spec['state_dir']))
+        if namespace != Path('.'):
+            # A retained independent config binds its old workspace. Keep it intact
+            # and allocate the new independent home from authenticated custody.
+            home /= namespace.parent.name
+    return home
+
+
+def _review_diff_path(request: dict[str, Any]) -> Path | None:
+    """Consume the exact broker diff in its authenticated gate namespace."""
+    review_diff = request.get('review_diff')
+    if request['role'] not in {'review', 'verify'}:
+        if review_diff is not None:
+            raise ValueError('non-gate role may not receive an independent gate diff')
+        return None
+    if not isinstance(review_diff, dict):
+        raise ValueError('independent role requires the controller-bound diff')
+    from .delivery_resources import _ancestors, _gate_evidence_root, _gate_path
+
+    spec = request['spec']
+    diff_path = Path(review_diff['path'])
+    parent = (_gate_evidence_root(spec) / 'gate-evidence'
+              / str(request['iteration']) / request['role'])
+    if (diff_path.parent != parent
+            or diff_path.name != request['candidate']['id'] + '.patch'
+            or Path(request['workspace']) != _gate_path(spec, request['role'], request['iteration'])
+            or review_diff.get('candidate_id') != request['candidate']['id']
+            or review_diff.get('head') != request['candidate']['head']
+            or review_diff.get('base_sha') != spec['base_sha']):
+        raise ValueError('controller-bound diff is unavailable or changed')
+    _ancestors(diff_path)
+    fd = os.open(diff_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                or hashlib.file_digest(stream, 'sha256').hexdigest() != review_diff.get('sha256')):
+            raise ValueError('controller-bound diff is unavailable or changed')
+    return diff_path
+
+
+def _browser_qa_evidence(request: dict[str, Any]) -> None:
+    evidence = request.get('qa_evidence')
+    if evidence is None:
+        if request['role'] == 'verify' and request['spec']['policy'].get('browser_qa'):
+            raise ValueError('configured browser QA receipt is required for verification')
+        return
+    if request['role'] != 'verify' or not isinstance(evidence, dict):
+        raise ValueError('browser QA evidence belongs only to independent verification')
+    from .delivery_resources import _ancestors, _gate_evidence_root
+
+    parent = _gate_evidence_root(request['spec']) / 'browser-qa' / str(request['iteration'])
+    for field, hash_field in (('path', 'sha256'), ('log', 'log_sha256')):
+        path = Path(evidence[field])
+        if path.parent != parent:
+            raise ValueError('browser QA evidence is unavailable or changed')
+        _ancestors(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or hashlib.file_digest(stream, 'sha256').hexdigest() != evidence[hash_field]):
+                raise ValueError('browser QA evidence is unavailable or changed')
+    receipt = json.loads(Path(evidence['path']).read_bytes())
+    if (evidence.get('candidate_id') != request['candidate']['id']
+            or type(evidence.get('iteration')) is not int
+            or evidence['iteration'] != request['iteration']
+            or receipt.get('candidate_id') != request['candidate']['id']
+            or type(receipt.get('iteration')) is not int
+            or receipt['iteration'] != request['iteration']
+            or receipt.get('state') != 'passed'
+            or receipt.get('log_sha256') != evidence['log_sha256']):
+        raise ValueError('browser QA evidence assessed a different candidate')
 
 
 def prepare_native_check(
@@ -400,7 +463,9 @@ def prepare_native_check(
     from .delivery_preparation import require_native_execution
 
     require_native_execution(spec)
-    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
+    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") not in {
+        "native-profile", "trusted-local",
+    }:
         raise ValueError("real checks require the native profile boundary")
 
     from .delivery_resources import RunResources
@@ -431,6 +496,8 @@ def prepare_native_check(
         network_domains=domains,
         protected_executables=_protected_native_commands(spec),
     )
+    if trusted_local(spec):
+        lines = _trusted_lines(checkout)
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
     env = _native_env(home, codex_home, scratch, toolchain_roots)
     env.update(
@@ -443,6 +510,10 @@ def prepare_native_check(
             "npm_config_build_from_source": "true",
         }
     )
+    if trusted_local(spec) and check.get("kind") == "test":
+        artifacts = evidence_dir / check["id"] / "pytest-artifacts"
+        _private(artifacts)
+        env["PYTEST_ADDOPTS"] = "--basetemp=" + shlex.quote(str(artifacts))
     if toolchain_roots:
         env["npm_config_nodedir"] = str(toolchain_roots[0])
     if cache:
@@ -467,9 +538,11 @@ def prepare_browser_qa(
     from .delivery_preparation import require_native_execution
 
     require_native_execution(spec)
-    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") != "native-profile":
+    if spec.get("provider") != "codex" or spec["policy"].get("host_sandbox") not in {
+        "native-profile", "trusted-local",
+    }:
         raise ValueError("real browser QA requires the admitted macOS boundary")
-    if not Path("/usr/bin/sandbox-exec").is_file():
+    if not trusted_local(spec) and not Path("/usr/bin/sandbox-exec").is_file():
         raise ValueError("required macOS sandbox-exec is unavailable")
     checkout = checkout.resolve(strict=True)
     state_root = Path(spec["state_dir"]).parent.parent.resolve(strict=True)
@@ -544,6 +617,8 @@ def prepare_browser_qa(
         )
     )
     profile = evidence_dir / "browser-qa.sb"
+    if trusted_local(spec):
+        lines = ["(version 1)", "(allow default)"]
     _write_once(profile, ("\n".join(lines) + "\n").encode())
     env = _native_env(
         home,

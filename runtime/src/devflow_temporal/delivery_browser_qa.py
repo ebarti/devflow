@@ -3,15 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 import socket
 from pathlib import Path
 from typing import Any
 
 from .candidate import candidate_for
 from .contracts import digest
-from .delivery_output import observed_test_count, visible_output
-from .delivery_sandbox import prepare_browser_qa
+from .delivery_output import observed_test_count, rejection_causes, visible_output
+from .delivery_sandbox import prepare_browser_qa, trusted_local
 
 
 def _hash(path: Path) -> str:
@@ -69,7 +68,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     qa = spec["policy"].get("browser_qa")
     if not qa or broker.candidate() != candidate:
         raise ValueError("native browser QA needs its admitted exact candidate and configuration")
-    key = f"browser_qa:{spec['run_id']}:{iteration}"
+    key = f"browser_qa:{spec['run_id']}:{iteration}" + broker.effect_namespace
     request = {
         "iteration": iteration,
         "candidate_id": candidate["id"],
@@ -87,7 +86,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     cwd = (checkout / qa.get("cwd", ".")).resolve(strict=True)
     if checkout not in (cwd, *cwd.parents):
         raise ValueError("browser QA cwd escaped the gate checkout")
-    folder = broker.state_dir / "browser-qa" / str(iteration)
+    folder = broker.evidence_dir / "browser-qa" / str(iteration)
     private_directory(folder)
     receipt = folder / "receipt.json"
     if receipt.exists():
@@ -121,7 +120,8 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     process = NativeProcess(
         spec,
         folder / "native",
-        argv=["/usr/bin/sandbox-exec", "-f", str(profile), *qa["argv"]],
+        argv=(list(qa["argv"]) if trusted_local(spec)
+              else ["/usr/bin/sandbox-exec", "-f", str(profile), *qa["argv"]]),
         cwd=cwd,
         environment=environment,
         timeout=qa["timeout_seconds"],
@@ -145,10 +145,11 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         _write_new(log, content)
     output = visible_output(content.decode("utf-8", errors="replace"))
     count = observed_test_count(output, qa["test_count_regex"])
-    rejected = bool(qa.get("reject_regex") and re.search(qa["reject_regex"], output))
-    rejected = rejected or bool(
-        re.search(r"(?m)^\s*\d+\s+(?:failed|skipped|flaky|did not run)\b", output)
-    )
+    causes = rejection_causes(output, [
+        *([qa["reject_regex"]] if qa.get("reject_regex") else []),
+        r"(?m)^\s*\d+\s+(?:failed|skipped|flaky|did not run)\b",
+    ])
+    rejected = bool(causes)
     artifacts = []
     for index, item in enumerate(_artifacts(checkout, qa.get("artifact_paths", []))):
         original = Path(item["path"])
@@ -175,9 +176,11 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "state": "passed" if passed else "failed",
         "cwd": str(cwd),
         "profile_sha256": _hash(profile),
+        "execution_mode": spec["policy"].get("host_sandbox", "native-profile"),
         "exit_code": process["exit_code"],
         "test_count": count,
         "rejected_output": rejected,
+        "rejection_causes": causes,
         "log": str(log),
         "log_sha256": _hash(log),
         "artifacts": artifacts,

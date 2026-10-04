@@ -10,7 +10,7 @@ import pytest
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_intake import intake_fixture as intake_fixture
-from test_delivery_native import ControlledNativeTerminalFixture
+from test_delivery_native import ControlledNativeTerminalFixture, controlled_terminal_tracker
 from test_delivery_native import native_configuration as native_configuration
 
 from devflow_temporal.delivery_activities import delivery_finalize_resources, delivery_project
@@ -207,7 +207,8 @@ async def test_fresh_native_registry_fetch_offline_install_check_and_resource_re
                 task_queue="native-dependency-finalization",
                 workflows=[ControlledNativeTerminalFixture],
                 workflow_runner=UnsandboxedWorkflowRunner(),
-                activities=[delivery_project, delivery_finalize_resources],
+                activities=[delivery_project, delivery_finalize_resources,
+                            controlled_terminal_tracker],
             ):
                 terminal = await environment.client.execute_workflow(
                     ControlledNativeTerminalFixture.run,

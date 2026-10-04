@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -22,8 +23,25 @@ def slash_tmp_path():
         yield Path(path)
 
 
+@pytest.fixture
+def native_profile_python():
+    """Execute a real interpreter under existing toolchain reads, without an SDK shim."""
+    roots = (Path('/opt/homebrew').resolve(), Path('/usr/local').resolve())
+    configured = os.environ.get('DEVFLOW_PROFILE_PYTHON')
+    candidates = ((configured,) if configured else
+                  (sys.executable, '/opt/homebrew/bin/python3', '/usr/local/bin/python3'))
+    for value in candidates:
+        interpreter = Path(value).resolve()
+        if (interpreter.is_file() and os.access(interpreter, os.X_OK)
+                and any(interpreter.is_relative_to(root) for root in roots)):
+            return str(interpreter)
+    pytest.fail('constrained probe requires real Python within existing toolchain reads')
+
+
 @pytest.mark.skipif(not os.environ.get("DEVFLOW_CODEX_BIN"), reason="real Codex CLI path required")
-def test_native_profile_restricts_sibling_tmp_paths_and_alias(slash_tmp_path: Path):
+def test_native_profile_restricts_sibling_tmp_paths_and_alias(
+    slash_tmp_path: Path, native_profile_python: str,
+):
     """A real Codex sandbox must not inherit broad /tmp access from its cwd."""
 
     binary = os.environ["DEVFLOW_CODEX_BIN"]
@@ -85,7 +103,7 @@ def test_native_profile_restricts_sibling_tmp_paths_and_alias(slash_tmp_path: Pa
             "devflow-role",
             "-C",
             str(workspace),
-            "/usr/bin/python3",
+            native_profile_python,
             str(probe),
         ],
         env=env,
@@ -104,17 +122,24 @@ def test_native_profile_restricts_sibling_tmp_paths_and_alias(slash_tmp_path: Pa
 
 
 @pytest.mark.skipif(not os.environ.get("DEVFLOW_CODEX_BIN"), reason="real Codex CLI path required")
-def test_independent_profile_reads_only_bound_diff_not_git_or_controller(slash_tmp_path: Path):
+@pytest.mark.parametrize('namespace', ['', 'metadata-reconciliation/evidence',
+                                       'gates-admission/evidence',
+                                       'technical-successor/evidence'])
+def test_independent_profile_reads_only_bound_diff_not_git_or_controller(
+    slash_tmp_path: Path, native_profile_python: str, namespace: str,
+):
     binary = os.environ["DEVFLOW_CODEX_BIN"]
     root = slash_tmp_path
     workspace = root / "review-checkout"
     workspace.mkdir()
     (workspace / ".git").write_text("gitdir: private\n")
     state = root / "controller"
-    evidence = state / "gate-evidence" / "0" / "review"
+    evidence = state / namespace / "gate-evidence" / "0" / "review"
     evidence.mkdir(parents=True)
     patch = evidence / "candidate.patch"
     patch.write_text("BOUND_DIFF\n")
+    sibling = evidence / 'unbound.patch'
+    sibling.write_text('UNBOUND\n')
     protected = state / "private.txt"
     protected.write_text("SAFE\n")
     home = state / "runs" / "run" / "role-homes" / "review" / "0"
@@ -136,7 +161,7 @@ def test_independent_profile_reads_only_bound_diff_not_git_or_controller(slash_t
         "import json,pathlib,sys\n"
         "paths=[pathlib.Path(value) for value in sys.argv[1:]]\n"
         "observed={}\n"
-        "for name,path in zip(('diff','controller','git'),paths):\n"
+        "for name,path in zip(('diff','controller','git','sibling'),paths):\n"
         " try: observed[name]=path.read_text()\n"
         " except PermissionError: observed[name]='denied'\n"
         "try: paths[0].write_text('BREACH'); observed['diff_write']='allowed'\n"
@@ -151,12 +176,13 @@ def test_independent_profile_reads_only_bound_diff_not_git_or_controller(slash_t
             "devflow-role",
             "-C",
             str(workspace),
-            "/usr/bin/python3",
+            native_profile_python,
             "-c",
             probe,
             str(patch),
             str(protected),
             str(workspace / ".git"),
+            str(sibling),
         ],
         env={
             "PATH": "/usr/bin:/bin",
@@ -175,6 +201,7 @@ def test_independent_profile_reads_only_bound_diff_not_git_or_controller(slash_t
         "diff": "BOUND_DIFF\n",
         "controller": "denied",
         "git": "denied",
+        "sibling": "denied",
         "diff_write": "denied",
     }
     assert patch.read_text() == "BOUND_DIFF\n"
