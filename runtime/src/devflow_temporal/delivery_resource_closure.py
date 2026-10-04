@@ -7,7 +7,12 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker
-from .delivery_investigation_adjudication import FIELDS, _bytes, _controller
+from .delivery_investigation_adjudication import (
+    FIELDS,
+    _bytes,
+    _candidate_checkpoint,
+    _controller,
+)
 from .delivery_metadata_recovery import _immutable
 from .delivery_policy_recovery import _rows, work_binding
 from .delivery_resources import _ancestors, private_directory, read_private
@@ -165,6 +170,7 @@ def _snapshot(store, run_id, payload):
     closed = store._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
     state = closed["result"]
     candidate = {k: v for k, v in authority["candidate"].items() if k != "revision"}
+    _candidate_checkpoint(state, authority, row)
     if (
         spec["work_id"] != authority["work_id"]
         or spec["provider"] != "codex"
@@ -181,7 +187,6 @@ def _snapshot(store, run_id, payload):
         or state.get("cleanup") != "unknown"
         or state.get("error") != "repair limit exhausted"
         or state.get("candidate") != candidate
-        or state.get("candidate_revision") != authority["candidate"]["revision"]
         or payload["expected_candidate_id"] != candidate["id"]
         or payload["expected_pr_head"] != candidate["head"]
         or state.get("pull_request", {}).get("number") != payload["expected_pr_number"]

@@ -88,6 +88,22 @@ def test_source_type_errors_are_not_misclassified_as_dependency_preparation():
     assert _preparation_failure(result) is None
 
 
+def test_workflow_and_projection_candidate_counters_are_bound_separately():
+    candidate = {"id": "a" * 64, "head": "b" * 40}
+    authority = {"candidate": {**candidate, "revision": 7},
+                 "workflow_candidate_revision": 6}
+    state = {"candidate": candidate, "candidate_revision": 6}
+    row = {"candidate_revision": 7}
+    adjudication._candidate_checkpoint(state, authority, row)
+    for changed_state, changed_row in (
+        ({**state, "candidate_revision": 7}, row),
+        (state, {"candidate_revision": 6}),
+        ({**state, "candidate": {**candidate, "head": "c" * 40}}, row),
+    ):
+        with pytest.raises(ValueError, match="checkpoint counters"):
+            adjudication._candidate_checkpoint(changed_state, authority, changed_row)
+
+
 @pytest.mark.parametrize("kind", [adjudication.KIND, closure.KIND])
 @pytest.mark.parametrize("bad", ["missing", "grant", "boolean", "iteration", "root", "child"])
 def test_public_discriminator_refuses_before_ordinary_grant_or_any_effect(
