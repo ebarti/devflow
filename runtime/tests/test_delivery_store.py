@@ -2132,6 +2132,38 @@ def test_gate_diff_is_bound_to_base_head_and_rejects_tampering(service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["committed", "uncommitted", "none", "empty_commit", "reverted"])
+async def test_implementer_admits_net_feature_diff_against_frozen_base(
+    service, monkeypatch, change
+):
+    store, request = service
+    store.submit(request)
+    spec = store.spec("run-1")
+    broker = DeliveryBroker(store, spec)
+    before = broker.prepare()["candidate"]
+
+    class ReadySupervisor:
+        async def run(self, _request):
+            if change in {"committed", "uncommitted", "reverted"}:
+                (broker.checkout / "README.md").write_text("Feature\n")
+            if change in {"committed", "empty_commit", "reverted"}:
+                _git(broker.checkout, "add", "README.md")
+                _git(broker.checkout, "commit", "--allow-empty", "-qm", "fix: feature")
+            if change == "reverted":
+                (broker.checkout / "README.md").write_text("Test repository\n")
+            return {"status": "pass", "summary": "Ready for controller checks", "findings": []}
+
+    monkeypatch.setattr("devflow_temporal.delivery_activities.get_supervisor",
+                        lambda _store: ReadySupervisor())
+    result = await delivery_role({"spec": spec, "role": "implement", "iteration": 0,
+                                  "candidate": before})
+    assert result["status"] == ("pass" if change in {"committed", "uncommitted"} else "blocked")
+    assert result["candidate"] == broker.candidate()
+    if result["status"] == "blocked":
+        assert "implementer candidate has no feature diff" in result["findings"]
+
+
+@pytest.mark.asyncio
 async def test_delivery_review_role_receives_a_bound_diff_in_its_gate_checkout(service):
     store, request = service
     store.submit(request)

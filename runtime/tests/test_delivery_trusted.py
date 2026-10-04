@@ -26,6 +26,22 @@ def terminal_unit_clock(monkeypatch):
     monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _name: True)
 
 
+@pytest.mark.parametrize(
+    'mapping', [None, [], {'unknown': 'Done'}, {'blocked': ''}, {'blocked': 1}]
+)
+def test_invalid_project_status_mapping_is_rejected(intake_fixture, mapping):
+    import json
+
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    path, _request = intake_fixture
+    value = json.loads(path.read_text())
+    value['repositories']['fixture']['project_statuses'] = mapping
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match='Project status mapping'):
+        DeliveryConfig.load(path)
+
+
 def test_trusted_mode_uses_supported_noninteractive_sdk_contract(native_configuration):
     config, request = native_configuration
     config.raw['execution_mode'] = 'trusted-local'
@@ -202,8 +218,9 @@ async def test_transient_final_readback_finishes_original_transition(monkeypatch
 
 
 @pytest.mark.parametrize('status', ['blocked', 'in-review'])
+@pytest.mark.parametrize('mapped', [False, True])
 def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, monkeypatch,
-                                                              status):
+                                                              status, mapped):
     import contextlib
     import importlib.util
     import io
@@ -219,6 +236,8 @@ def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, 
     repository = config.raw['repositories']['fixture']
     repository.update(project_url='https://github.com/users/example/projects/1',
                       assignee='example')
+    if mapped:
+        repository['project_statuses'] = {status: 'Needs validation'}
     store = DeliveryStore(config)
     store.submit(request)
     spec = store.spec(request['run_id'])
@@ -236,10 +255,15 @@ def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, 
     reconciliation.loader.exec_module(module)
     selected = {'host': 'github.com', 'url': repository['project_url'], 'id': 'project',
                 'field': 'field', 'option': 'option',
-                'status': 'Blocked' if status == 'blocked' else 'In review'}
+                'status': 'Needs validation' if mapped else (
+                    'Blocked' if status == 'blocked' else 'In review')}
     item = {'id': 'item', 'project': {'id': 'project'},
             'fieldValueByName': {'optionId': 'option', 'name': selected['status']}}
-    monkeypatch.setattr(helper, 'project', lambda *_args: selected)
+    def select_project(_url, requested):
+        assert requested == selected['status']
+        return selected
+
+    monkeypatch.setattr(helper, 'project', select_project)
     monkeypatch.setattr(helper, 'view', lambda issue: {
         'id': 'issue', 'url': issue, 'title': 'Fixture', 'state': 'OPEN',
         'assignees': [{'login': 'example'}],
@@ -267,6 +291,7 @@ def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, 
                            reason='Observed gate failure')
     assert result['state'] == 'consistent', result
     assert len(calls) == 1 and '--release' in calls[0]
+    assert ('--project-status' in calls[0]) == mapped
     if status == 'blocked':
         assert '--reason' in calls[0]
     with store._connect() as db:

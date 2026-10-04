@@ -257,20 +257,7 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
     if role == "implement":
         after = broker.candidate()
         if result.get("status") == "pass":
-            changed = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(broker.checkout),
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=30,
-            ).stdout.strip()
+            changed = broker._changed_paths(request["spec"]["base_sha"])
             if not changed:
                 result["status"] = "blocked"
                 result.setdefault("findings", []).append(
@@ -561,6 +548,9 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
         "--status",
         status,
     ]
+    project_status = repository.get("project_statuses", {}).get(status)
+    if project_status:
+        command.extend(["--project-status", project_status])
     if status == "blocked":
         command.extend(["--reason", reason or "Managed delivery stopped at a terminal boundary"])
     if release:

@@ -405,6 +405,18 @@ max_repairs3 ceiling, with no iteration6 or automatic renewal. Metadata repair
 must precede this source correction. No generic old failed run gains this
 released-claim or effective-policy exception.
 
+Implementation admission measures the net file diff against the frozen base,
+including untracked files. A committed, clean feature proceeds to the same
+mandatory controller gates as uncommitted edits; an empty commit or reverted
+feature does not establish a pass. Readiness does not certify later checks.
+
+A repository may configure `project_statuses`, mapping logical work statuses
+to existing GitHub Project Status options, for example
+`{"blocked": "Needs validation"}`. The controller passes that mapping to the
+owning tracker helper; the logical work remains blocked, and the helper still
+requires a real matching option and live readback before releasing the claim.
+Omitted mappings retain the helper's existing defaults.
+
 Public terminal cleanup now derives confirmation from the exact hashed owning
 finalization receipt, with process and resource confirmation and no unfinished
 or unknown-cleanup attempt belonging to that run. Foreign active runs affect

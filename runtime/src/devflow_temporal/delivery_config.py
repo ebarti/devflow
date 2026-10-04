@@ -53,6 +53,13 @@ class DeliveryConfig:
                 raise ValueError(f"{key} must be absolute")
         if not value.get("repositories") or not value.get("roles"):
             raise ValueError("service requires repository and role policy")
+        for repository in value["repositories"].values():
+            statuses = repository.get("project_statuses", {})
+            if (not isinstance(statuses, dict)
+                    or statuses.keys() - {"in-progress", "in-review", "blocked", "paused", "done"}
+                    or any(not isinstance(name, str) or not name.strip()
+                           for name in statuses.values())):
+                raise ValueError("repository Project status mapping is invalid")
         roles = set(value["roles"])
         if not {"implement", "review", "verify"} <= roles or roles - {
             "intake", "implement", "review", "verify"
