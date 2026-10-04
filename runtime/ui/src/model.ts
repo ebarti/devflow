@@ -111,6 +111,14 @@ export interface Evidence {
 }
 
 export interface RunDetail extends RunSummary {
+  investigation_adjudication?: {
+    raw_status: 'findings'
+    raw_findings: string[]
+    disposition: { finding1: string; finding2: string; finding3: string; accepted_baseline_medium: number; remaining_blocker_high: number }
+    historical_runtime: string
+    controller_source: string
+    additional_native_execution: false
+  } | null
   outcome?: string | null
   protocol_revision?: number | null
   projection_revision?: number | null

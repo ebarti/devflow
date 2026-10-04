@@ -78,7 +78,7 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 def _task(request: dict[str, Any]) -> AgentTask:
     spec = request["spec"]
     role = request["role"]
-    policy = spec["policy"]["roles"][role]
+    policy = request.get("execution_role_policy", spec["policy"]["roles"][role])
     candidate = request["candidate"]
     workspace = Path(request["workspace"])
     findings = request.get("findings") or []
@@ -129,6 +129,14 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "Do not push, open a PR, or change GitHub tracking."
         ),
     }[role]
+    if role in {"review", "verify"}:
+        instructions += (
+            " Judge the requested outcome against the accepted plan. For an investigation, "
+            "correctly reproduced and documented baseline problems are investigation results; "
+            "they do not require unrelated implementation. Findings must identify defects in "
+            "the delivered outcome or missing required evidence. Retain baseline observations "
+            "in the assessment summary."
+        )
     if role == "intake" and spec.get("blocking_questions_version") == 1:
         instructions += (
             " Proceed autonomously with reasonable reversible assumptions; record them "

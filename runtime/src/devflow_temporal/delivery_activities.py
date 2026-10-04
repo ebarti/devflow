@@ -46,6 +46,28 @@ def _context(
     return store, broker
 
 
+@activity.defn(name="delivery_resource_closure_readback")
+async def delivery_resource_closure_readback(request: dict[str, Any]) -> dict[str, Any]:
+    def execute():
+        from .delivery_resource_closure import readback
+
+        store, _ = _context(request['spec'])
+        return readback(store, request['spec'], request['recovery'])
+
+    return await asyncio.to_thread(execute)
+
+
+@activity.defn(name="delivery_adjudication_readback")
+async def delivery_adjudication_readback(request: dict[str, Any]) -> dict[str, Any]:
+    def execute():
+        from .delivery_investigation_adjudication import readback
+
+        store, _ = _context(request['spec'])
+        return readback(store, request['spec'], request['recovery'])
+
+    return await asyncio.to_thread(execute)
+
+
 @activity.defn(name="delivery_technical_readback")
 async def delivery_technical_readback(request: dict[str, Any]) -> dict[str, Any]:
     def execute():
@@ -195,6 +217,21 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
     else:
         raise ValueError("unknown delivery role")
     constraint = request.get("title_constraint")
+    with store._connect() as db:
+        saved = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+            (request["spec"]["run_id"],),
+        ).fetchone()[0] or "null")
+    if saved and saved.get("kind") == "stopped_resource_closure":
+        from .delivery_investigation_adjudication import _controller
+        from .delivery_resource_closure import custody
+
+        if role != "verify" or iteration != 4:
+            raise ValueError("resource closure cannot launch a coding or review turn")
+        with store._connect() as db:
+            custody(db, saved)
+        controller = _controller(store, request["spec"], saved["command"])
+        request = {**request, "execution_role_policy": controller["active_config"]["roles"][role]}
     if constraint:
         from .delivery_title_repair import validate_source
 
@@ -671,6 +708,8 @@ DELIVERY_ACTIVITIES = [
     delivery_metadata_readback,
     delivery_gates_readback,
     delivery_technical_readback,
+    delivery_adjudication_readback,
+    delivery_resource_closure_readback,
     delivery_repair_preflight,
     delivery_checks,
     delivery_browser_qa,

@@ -29,11 +29,14 @@ def observed_test_count(output: str, pattern: str) -> int:
     return max(int(number) for number in numbers) if numbers else 0
 
 
-def rejection_causes(output: str, patterns: list[str]) -> list[dict]:
+def rejection_causes(
+    output: str, patterns: list[str], *, test_results: bool = False,
+) -> list[dict]:
     """Bounded matched evidence, independent of a diagnostic's tail truncation."""
     causes = []
     for pattern in patterns:
-        match = re.search(pattern, output)
+        match = next((m for m in re.finditer(pattern, output)
+                      if not (test_results and _passing_test_title(output, m))), None)
         if match is None:
             continue
         start = max(0, match.start() - 120)
@@ -47,3 +50,17 @@ def rejection_causes(output: str, patterns: list[str]) -> list[dict]:
             "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
         })
     return causes
+
+
+def _passing_test_title(output: str, match: re.Match[str]) -> bool:
+    """Outcome words in an explicitly passing test description are not outcomes.
+
+    Keep matching on the original normalized log so genuine subsequent failures
+    still produce their original spans and hashes. Other configured prohibitions
+    remain effective even on a passing test line.
+    """
+    if match.group().lower() not in {"failed", "skipped", "flaky", "did not run"}:
+        return False
+    line_start = output.rfind("\n", 0, match.start()) + 1
+    prefix = output[line_start:match.start()]
+    return bool(re.match(r"^\s*(?:[✓✔√]\s+|ok\s+\d+\s+-\s+)", prefix))

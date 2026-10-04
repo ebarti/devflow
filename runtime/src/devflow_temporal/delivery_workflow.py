@@ -16,6 +16,25 @@ from .delivery_metadata_contract import evidence_applicability
 from .delivery_questions import valid_blocking_questions
 
 
+def _preparation_failure(result: dict[str, Any]) -> str | None:
+    """Dependency installers are controller prerequisites, not feature repairs."""
+    for item in result.get("results", []):
+        if not isinstance(item, dict) or item.get("passed"):
+            continue
+        argv = item.get("argv", [])
+        if not isinstance(argv, list):
+            continue
+        preparation = any(
+            argv[i:i + len(command)] == list(command)
+            for command in (("pnpm", "install"), ("playwright", "install"))
+            for i in range(len(argv))
+        )
+        preparation |= "uv" in argv and "sync" in argv and "run" not in argv
+        if preparation:
+            return str(item.get("id", "dependency installer"))[:128]
+    return None
+
+
 def _broker_findings(stage: str, result: dict[str, Any], *, iteration: int) -> list[str]:
     """Give a repair role bounded, candidate-bound broker diagnostics as data."""
 
@@ -105,8 +124,25 @@ class DeliveryWorkflow:
         self.decision_answer: str | dict[str, Any] | None = None
         self.tracker_retry_requested = False
         self.terminal_reconciliation_only = False
+        self.controller_only_adjudication = False
+        self.controller_only_resource_closure = False
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
+        if self.controller_only_resource_closure and name not in {
+            'delivery_resource_closure_readback', 'delivery_project',
+            'delivery_finalize_resources', 'delivery_terminal_tracker',
+            'delivery_checks', 'delivery_browser_qa', 'delivery_role', 'delivery_ci',
+        }:
+            raise ValueError('resource closure cannot execute feature/provider/native gates')
+        if (self.controller_only_resource_closure and name == 'delivery_role'
+                and (request.get('role') != 'verify' or request.get('iteration') != 4)):
+            raise ValueError('resource closure permits only QA at the preserved iteration')
+        if self.controller_only_adjudication:
+            if name not in {
+                'delivery_adjudication_readback', 'delivery_ci', 'delivery_project',
+                'delivery_finalize_resources', 'delivery_terminal_tracker',
+            }:
+                raise ValueError('adjudication cannot execute provider/preparation/native gates')
         automatic_preparation = (
             name == "delivery_prepare" and request["spec"].get("preparation_version") == 1
         )
@@ -655,6 +691,10 @@ class DeliveryWorkflow:
                 return await self._resume_metadata(spec, recovery)
             if recovery.get("kind") == "investigation_gates_only":
                 return await self._resume_gates_only(spec, recovery)
+            if recovery.get("kind") == "stopped_resource_closure":
+                return await self._resume_resource_closure(spec, recovery)
+            if recovery.get("kind") == "investigation_assessment_adjudication":
+                return await self._resume_adjudication(spec, recovery)
             if recovery.get("kind") == "accepted_technical_successor":
                 return await self._resume_technical(spec, recovery)
             if recovery.get("kind") == "execution_policy_recovery":
@@ -873,6 +913,75 @@ class DeliveryWorkflow:
                             "Metadata reconciled with explicit source-evidence applicability")
         return self.state
 
+    async def _resume_resource_closure(self, spec, recovery):
+        if (recovery.get('execution_spec') != spec or recovery['state'].get('iteration') != 4
+                or recovery.get('command', {}).get('additional_iterations') != 0):
+            raise ValueError('resource closure changed its existing zero-grant checkpoint')
+        self.controller_only_resource_closure = True
+        self.state = deepcopy(recovery['state'])
+        self.state.update(candidate=recovery['candidate'], pull_request=recovery['publication'],
+                          phase='resource_closure_preflight', execution_state='running',
+                          outcome=None, error=None, cleanup='none')
+        self.state['checks'].pop('terminal_tracker_checkpoint', None)
+        self.state['checks'].pop('resource_cleanup', None)
+        try:
+            result = await self._activity('delivery_resource_closure_readback', {
+                'spec': spec, 'recovery': recovery,
+            })
+            if (result.get('state') != 'observed'
+                    or result.get('current_payload_verified') is not True):
+                return await self._stop(spec, 'resource closure current custody is unconfirmed')
+            self.state['checks']['resource_closure_applicability'] = (
+                recovery['source_applicability'])
+            self.state['candidate_revision'] += 1
+        except Exception as exc:
+            return await self._stop(spec, 'resource closure custody failed: ' + type(exc).__name__)
+        return await self._run_iterations(
+            spec, start_iteration=4, prior_implementer_session=None,
+            repair_findings=[], continuation=None, recovery=None,
+            authorized_max_iteration=4, published_checkpoint=True, verify_only=True,
+        )
+
+    async def _resume_adjudication(self, spec, recovery):
+        if (recovery.get('execution_spec') != spec or recovery.get('maximum_iteration') != 4
+                or recovery.get('command', {}).get('additional_iterations') != 0
+                or recovery.get('state', {}).get('iteration') != 4):
+            raise ValueError('adjudication changed its controller-only existing checkpoint')
+        self.controller_only_adjudication = True
+        self.state = deepcopy(recovery['state'])
+        self.state.update(phase='adjudication_preflight', execution_state='running',
+                          outcome=None, error=None, cleanup='none')
+        self.state['checks'].pop('terminal_tracker_checkpoint', None)
+        self.state['checks'].pop('resource_cleanup', None)
+        try:
+            disposition = await self._activity('delivery_adjudication_readback', {
+                'spec': spec, 'recovery': recovery,
+            })
+            self.state['checks']['investigation_adjudication'] = disposition
+            if (disposition.get('state') != 'adjudicated'
+                    or disposition.get('raw_status') != 'findings'):
+                return await self._stop(spec, 'investigation disposition is unconfirmed')
+            self.state['phase'] = 'waiting_ci'
+            self.state['revision'] += 1
+            await self._project(spec, 'investigation_adjudicated',
+                                'Raw QA findings retained with independent disposition')
+            ci = await self._activity('delivery_ci', {
+                'spec': spec, 'pull_request': self.state['pull_request'],
+            }, hours=1)
+            self.state['checks']['ci'] = ci
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            if ci.get('state') != 'passed':
+                return await self._stop(spec, 'required CI did not confirm this PR head')
+        except Exception as exc:
+            return await self._stop(spec, 'adjudication final gate failed: '
+                                    + type(exc).__name__)
+        self.state.update(phase='delivered', execution_state='terminal', outcome='delivered')
+        self.state['revision'] += 1
+        await self._project(spec, 'delivered',
+                            'Investigation delivered with classified raw findings and current CI')
+        return self.state
+
     async def _resume_technical(self, spec, recovery):
         if (recovery.get('execution_spec') != spec or recovery.get('maximum_iteration') != 4
                 or recovery.get('command', {}).get('additional_iterations') != 0
@@ -884,6 +993,7 @@ class DeliveryWorkflow:
                           phase='technical_preflight', execution_state='running', outcome=None,
                           error=None, cleanup='none')
         self.state.get('checks', {}).pop('terminal_tracker_checkpoint', None)
+        self.state.get('checks', {}).pop('resource_cleanup', None)
         self.state['candidate_revision'] += 1
         try:
             await self._activity('delivery_technical_readback', {
@@ -1233,6 +1343,7 @@ class DeliveryWorkflow:
         resume_prechecks: bool = False,
         published_checkpoint: bool = False,
         title_constraint: dict[str, Any] | None = None,
+        verify_only: bool = False,
     ) -> dict[str, Any]:
         max_repairs = (
             authorized_max_iteration
@@ -1378,6 +1489,12 @@ class DeliveryWorkflow:
                 if self.cancel_requested:
                     return await self._cancelled(spec)
                 if prechecked.get("state") != "passed":
+                    prerequisite = _preparation_failure(prechecked)
+                    if prerequisite:
+                        return await self._stop(
+                            spec, f"environment preparation failed: {prerequisite}; "
+                            "candidate retained without requesting code repair",
+                        )
                     repair_findings = _broker_findings(
                         "prepublication", prechecked, iteration=iteration
                     )
@@ -1428,7 +1545,7 @@ class DeliveryWorkflow:
                 )
             repair_findings = []
             qa_evidence = None
-            for role in ("review", "verify"):
+            for role in (("verify",) if verify_only else ("review", "verify")):
                 if self.cancel_requested:
                     return await self._cancelled(spec)
                 if role == "verify":
@@ -1458,6 +1575,12 @@ class DeliveryWorkflow:
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                     if checked.get("state") != "passed":
+                        prerequisite = _preparation_failure(checked)
+                        if prerequisite:
+                            return await self._stop(
+                                spec, f"environment preparation failed: {prerequisite}; "
+                                "candidate retained without requesting code repair",
+                            )
                         repair_findings.extend(
                             _broker_findings("local_checks", checked, iteration=iteration)
                         )

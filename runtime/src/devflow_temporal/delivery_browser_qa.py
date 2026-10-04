@@ -148,7 +148,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     causes = rejection_causes(output, [
         *([qa["reject_regex"]] if qa.get("reject_regex") else []),
         r"(?m)^\s*\d+\s+(?:failed|skipped|flaky|did not run)\b",
-    ])
+    ], test_results=True)
     rejected = bool(causes)
     artifacts = []
     for index, item in enumerate(_artifacts(checkout, qa.get("artifact_paths", []))):
