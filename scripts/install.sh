@@ -2,6 +2,13 @@
 # Link bundled skills and copy loadable agent definitions into the host directories.
 set -eu
 
+# The explicit launcher operation runs before any classic skill/agent/hook action.
+if [ "${1:-}" = "--delivery-launchers" ]; then
+    shift
+    source_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+    exec "${DEVFLOW_PYTHON:-python3.12}" -B "$source_root/scripts/install-delivery-launchers.py" "$@"
+fi
+
 force=false
 if [ "${1:-}" = "--force" ]; then
     force=true
