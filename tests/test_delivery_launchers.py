@@ -97,6 +97,7 @@ class DeliveryLaunchers(unittest.TestCase):
                 if p.is_file() or p.is_symlink()}
 
     def test_original_legacy_to_canonical_route_and_immutable_rollback(self):
+        (self.release / "scripts/devflow").chmod(0o555)
         before = self.snapshot()
         preview = self.cli("preflight")
         self.assertEqual(preview.returncode, 0, preview.stderr)
@@ -153,6 +154,7 @@ class DeliveryLaunchers(unittest.TestCase):
                 else:
                     patches = [patch.object(self.module.os, "getuid", return_value=os.getuid() + 1)]
                 self.write_request()
+
                 before = self.snapshot()
                 if patches:
                     with patches[0], self.assertRaises(ValueError):
@@ -170,6 +172,16 @@ class DeliveryLaunchers(unittest.TestCase):
                     (self.root / "alias").unlink()
                 self.request = original_request
                 self.write_request()
+
+    def test_legacy_permission_modes_preserve_read_only_release(self):
+        entry = self.release / "scripts/devflow"
+        for mode in (0o555, 0o755, 0o444, 0o777, 0o4755):
+            with self.subTest(mode=oct(mode)):
+                entry.chmod(mode)
+                before = self.snapshot()
+                preview = self.cli("preflight")
+                self.assertEqual(preview.returncode == 0, mode in (0o555, 0o755), preview.stderr)
+                self.assertEqual(before, self.snapshot())
 
     def test_lost_response_after_one_link_resumes_without_overwriting_legacy_history(self):
         original = self.module.replace_link

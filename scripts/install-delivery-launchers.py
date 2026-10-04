@@ -139,7 +139,7 @@ def legacy(request):
             or marker["tree"] != "39c64386a78904e6cbd33ac832cc7a92309d415c"
             or marker["contents_hash"] != "43e27a2bd72a2331327c5e95dd46fb5ea2f96da5905da0085eb8dfa012b2a69b"):
         raise ValueError("legacy release marker identity changed")
-    if stat.S_IMODE((release / "scripts/devflow").lstat().st_mode) != 0o755:
+    if stat.S_IMODE((release / "scripts/devflow").lstat().st_mode) not in (0o555, 0o755):
         raise ValueError("legacy entry is not the recognized executable")
     return saved
 

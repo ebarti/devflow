@@ -516,3 +516,31 @@ def test_controller_effort_amendment_preserves_frozen_non_role_authority(
     else:
         assert adjudication._controller(store, spec, command) == controller
         assert store.config.raw == frozen
+
+
+def test_browser_checkpoint_accepts_report_projection_and_binds_test_evidence():
+    recorded = {
+        "candidate_id": "candidate",
+        "state": "failed",
+        "exit_code": 0,
+        "test_count": 5,
+        "log": "/owned/browser.log",
+        "log_sha256": "a" * 64,
+    }
+    actual = {
+        **recorded,
+        "diagnostic": "five passing titles",
+        "native_process": {"journal": "/owned/native.json"},
+    }
+    assert closure._browser_checkpoint(actual, recorded)
+    for key, value in [
+        ("candidate_id", "other"),
+        ("state", "passed"),
+        ("exit_code", 1),
+        ("test_count", 4),
+        ("log", "/other/log"),
+        ("log_sha256", "b" * 64),
+    ]:
+        assert not closure._browser_checkpoint({**actual, key: value}, recorded)
+    assert not closure._browser_checkpoint({**actual, "unexpected": True}, recorded)
+
