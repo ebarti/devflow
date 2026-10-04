@@ -47,7 +47,11 @@ def _registry_data(value) -> None:
             _registry_url(item)
 
 
-def frozen_pnpm_inputs(spec: dict, checkout: Path) -> tuple[str, dict[str, bytes]]:
+def frozen_pnpm_inputs(
+    spec: dict, checkout: Path, *, provenance: dict | None = None
+) -> tuple[str, dict[str, bytes]]:
+    source_hashes = {}
+
     def blob(name: str, *, optional: bool = False) -> bytes | None:
         path = Path(name)
         if path.is_absolute() or any(p in {"..", ".git", ".codex"} for p in path.parts):
@@ -61,6 +65,7 @@ def frozen_pnpm_inputs(spec: dict, checkout: Path) -> tuple[str, dict[str, bytes
         content = subprocess.check_output([*prefix, "show", spec["base_sha"] + ":" + name])
         if len(content) > 10 * 1024 * 1024:
             raise ValueError("frozen PNPM input exceeds its bounded size")
+        source_hashes[name] = hashlib.sha256(content).hexdigest()
         return content
 
     lock = blob("pnpm-lock.yaml")
@@ -130,6 +135,20 @@ def frozen_pnpm_inputs(spec: dict, checkout: Path) -> tuple[str, dict[str, bytes
         if not patch["path"].endswith(".patch") or patch["path"] in inputs:
             raise ValueError("frozen dependency patch cannot supply setup configuration")
         inputs[patch["path"]] = blob(patch["path"])
+    if provenance is not None:
+        provenance.update(
+            schema="devflow-frozen-pnpm-input-provenance-v1",
+            source_input_hashes=source_hashes,
+            input_hashes_semantics="staged bytes after the declared transformations",
+            transformations={
+                name: ({"operation": "json-key-allowlist", "keys": ["packageManager"]}
+                       if name == "package.json" else
+                       {"operation": "yaml-key-allowlist", "keys": [
+                           "packages", "catalog", "catalogs", "patchedDependencies"]}
+                       if name == "pnpm-workspace.yaml" else {"operation": "identity"})
+                for name in inputs
+            },
+        )
     return manager, inputs
 
 
