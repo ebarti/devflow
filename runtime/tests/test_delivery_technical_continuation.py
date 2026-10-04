@@ -4,13 +4,17 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from temporalio import workflow
+from temporalio.exceptions import ApplicationError
 from test_delivery_gates_admission import stopped as stopped
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
@@ -27,6 +31,64 @@ from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker, _git
 from devflow_temporal.delivery_resources import read_private, write_private
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+
+@pytest.mark.parametrize("size", [1358726, 1894818])
+def test_complete_authentic_row_sizes_have_private_bounded_readback(tmp_path, size):
+    empty = json.dumps({"run_id": "run-1", "padding": ""}, separators=(",", ":")).encode()
+    raw = json.dumps(
+        {"run_id": "run-1", "padding": "x" * (size - len(empty))}, separators=(",", ":")
+    ).encode()
+    path = tmp_path / "sealed-row.json"
+    path.write_bytes(raw)
+    path.chmod(0o600)
+    binding = {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}
+    assert len(raw) == size
+    assert technical._sealed_row(binding, "run-1")["run_id"] == "run-1"
+    with pytest.raises(ValueError, match="unsafe"):
+        integration.reference(str(path), binding["sha256"])
+    assert path.read_bytes() == raw and path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    "adverse",
+    ["size", "hash", "alias", "parent-alias", "hardlink", "mode", "owner", "foreign-run", "type"],
+)
+def test_sealed_row_refuses_oversize_alias_hash_foreign_or_nonprivate_before_effects(
+    tmp_path,
+    monkeypatch,
+    adverse,
+):
+    value = (
+        ["run-1"]
+        if adverse == "type"
+        else {"run_id": "other" if adverse == "foreign-run" else "run-1", "payload": "retained"}
+    )
+    raw = json.dumps(value).encode()
+    if adverse == "size":
+        raw = b" " * (technical.SEALED_ROW_LIMIT + 1)
+    root = tmp_path / "rows"
+    root.mkdir()
+    path = root / "sealed.json"
+    path.write_bytes(raw)
+    path.chmod(0o600)
+    binding = {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}
+    if adverse == "hash":
+        binding["sha256"] = "f" * 64
+    elif adverse in {"alias", "parent-alias"}:
+        alias = tmp_path / "alias"
+        alias.symlink_to(path if adverse == "alias" else root)
+        binding["path"] = str(alias if adverse == "alias" else alias / path.name)
+    elif adverse == "hardlink":
+        os.link(path, root / "other")
+    elif adverse == "mode":
+        path.chmod(0o644)
+    elif adverse == "owner":
+        monkeypatch.setattr(technical.os, "getuid", lambda: path.stat().st_uid + 1)
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        technical._sealed_row(binding, "run-1")
+    assert path.read_bytes() == before
 
 
 def request():
@@ -213,6 +275,100 @@ def accepted_gate_boundary(stopped, monkeypatch):
         technical, "_source_readiness", lambda *_a: {"controlled_native_seam": True}
     )
     return store, broker, payload
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="actual owned macOS root observation")
+@pytest.mark.parametrize(
+    "adverse", [None, "command", "authority", "source", "closed-history", "proof", "controller"]
+)
+def test_orphan_exclusive_intent_recovers_same_bytes_after_transaction_and_actor_loss(
+    accepted_gate_boundary,
+    monkeypatch,
+    adverse,
+):
+    store, broker, payload = accepted_gate_boundary
+    root = broker.state_dir / "technical-successor"
+    original = technical._immutable
+    actor = {
+        "pid": 111,
+        "identity": "original birth",
+        "source_revision": payload["expected_source_revision"],
+    }
+    monkeypatch.setattr(technical, "_controller", lambda _payload: dict(actor))
+
+    def lost_commit(path, *args, **kwargs):
+        original(path, *args, **kwargs)
+        if path.name == "intent.json":
+            raise RuntimeError("lost after exclusive intent before SQLite commit")
+
+    monkeypatch.setattr(technical, "_immutable", lost_commit)
+    with pytest.raises(RuntimeError, match="exclusive intent"):
+        store.continue_repair("run-1", payload)
+    before = (root / "intent.json").read_bytes()
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_technical_successors").fetchone()[0] == 0
+        assert store.state.claim_for(db, "work-1") is None
+    assert not (root / "predecessor-resources").exists()
+    actor.update(pid=222, identity="fresh birth")
+    monkeypatch.setattr(technical, "_immutable", original)
+    proposed = dict(payload)
+    if adverse == "command":
+        proposed["command_id"] = "foreign-command"
+    elif adverse == "authority":
+        proposed["authority_sha256"] = "f" * 64
+    elif adverse == "source":
+        (broker.checkout / "README.md").write_text("unaccepted source drift")
+    elif adverse == "closed-history":
+        closed = store._completed_temporal_result("run-1")
+        monkeypatch.setattr(
+            store,
+            "_completed_temporal_result",
+            lambda *_a, **_kw: {**closed, "request_digest": "f" * 64},
+        )
+    elif adverse == "proof":
+        monkeypatch.setattr(
+            technical,
+            "_source_readiness",
+            lambda *_a: (_ for _ in ()).throw(ValueError("consumed native proof drift")),
+        )
+    elif adverse == "controller":
+        forged = read_private(root / "intent.json")
+        forged["controller"]["source_revision"] = "e" * 40
+        write_private(root / "intent.json", forged)
+        before = (root / "intent.json").read_bytes()
+    if adverse:
+        for operation in (store.repair_admission_preflight, store.continue_repair):
+            with pytest.raises(ValueError):
+                operation("run-1", proposed)
+        with store._connect() as db:
+            assert (
+                db.execute("SELECT COUNT(*) FROM delivery_technical_successors").fetchone()[0] == 0
+            )
+            assert store.state.claim_for(db, "work-1") is None
+        assert not (root / "predecessor-resources").exists()
+    else:
+        observed = store.repair_admission_preflight("run-1", payload)
+        assert observed["preflight"] and observed["additional_iterations"] == 0
+        monkeypatch.setattr(
+            renewal,
+            "renew",
+            lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("next native boundary")),
+        )
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="next native"):
+                store.continue_repair("run-1", payload)
+        resumes = list((root / "resume-actors").glob("*.json"))
+        assert len(resumes) == 1
+        recorded = read_private(resumes[0])
+        assert recorded["original_controller"]["pid"] == 111
+        assert recorded["observed_controller"] == actor
+        with store._connect() as db:
+            assert (
+                db.execute("SELECT COUNT(*) FROM delivery_technical_successors").fetchone()[0] == 1
+            )
+            assert store.state.claim_for(db, "work-1") is None
+            assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 0
+    assert (root / "intent.json").read_bytes() == before
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual owned macOS root observation")
@@ -626,6 +782,151 @@ def test_public_technical_preflight_refuses_before_intent_claim_archive_or_effec
         assert db.execute("SELECT COUNT(*) FROM delivery_technical_successors").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM delivery_effects").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("stage", ["review", "checks"])
+@pytest.mark.parametrize("point", ["preflight", "role"])
+def test_inherited_confirmed_blocked_checkpoint_does_not_freeze_fresh_technical_cancel(
+    service,
+    monkeypatch,
+    stage,
+    point,
+):
+    store, submitted = service
+    store.submit(submitted)
+    spec = store.spec("run-1")
+    candidate = {"id": "a" * 64, "head": "b" * 40}
+    published = {"number": 7, "head": candidate["head"], "candidate": candidate}
+    checkpoint = {
+        "event": "blocked",
+        "phase": "blocked",
+        "execution_state": "blocked",
+        "outcome": "blocked",
+        "status": "blocked",
+        "release": True,
+        "state": "confirmed",
+        "waiting": False,
+        "attempts": 1,
+        "cycles": 1,
+    }
+    state = {
+        "run_id": "run-1",
+        "iteration": 4,
+        "revision": 27,
+        "candidate_revision": 1,
+        "candidate": candidate,
+        "pull_request": published,
+        "roles": [],
+        "findings": [],
+        "usage": {},
+        "tracker": {},
+        "cleanup": "confirmed",
+        "outcome": "blocked",
+        "phase": "blocked",
+        "checks": {"prepublish": {"state": "passed"}, "terminal_tracker_checkpoint": checkpoint},
+    }
+    recovery = {
+        "kind": technical.KIND,
+        "execution_spec": spec,
+        "maximum_iteration": 4,
+        "command": {"additional_iterations": 0},
+        "state": state,
+        "resume_stage": stage,
+        "candidate": candidate,
+        "publication": published,
+        "session_id": "original",
+    }
+    frozen = deepcopy(recovery)
+    flow = DeliveryWorkflow()
+    cancelled = []
+
+    async def wait(predicate, **_kw):
+        assert predicate()
+
+    async def project(*_a, **_kw):
+        return None
+
+    async def execute(name, body, **_kw):
+        if not cancelled and name == (
+            "delivery_technical_readback" if point == "preflight" else "delivery_role"
+        ):
+            assert flow.state["outcome"] is None
+            result = await flow.cancel(
+                {
+                    "expected_revision": flow.state["revision"],
+                    "reason": "cancel fresh owning continuation",
+                }
+            )
+            assert result["phase"] == "cancelling"
+            cancelled.append(name)
+        if name == "delivery_tracker_start":
+            return {"state": "consistent"}
+        if name == "delivery_role":
+            return {
+                "role": body["role"],
+                "iteration": 4,
+                "status": "pass",
+                "candidate": candidate,
+                "cleanup": "confirmed",
+                "session_id": "independent",
+                "findings": [],
+            }
+        return {"state": "passed", "cleanup": "confirmed"}
+
+    monkeypatch.setattr(workflow, "wait_condition", wait)
+    monkeypatch.setattr(flow, "_project", project)
+    monkeypatch.setattr(flow, "_activity", execute)
+    result = asyncio.run(flow.run(spec, recovery))
+    assert cancelled and result["outcome"] == "cancelled"
+    assert "terminal_tracker_checkpoint" not in result["checks"]
+    if stage == "review":
+        assert result["checks"]["prepublish"] == frozen["state"]["checks"]["prepublish"]
+    else:
+        assert result["checks"]["prepublish"] == {"state": "passed", "cleanup": "confirmed"}
+    assert recovery == frozen
+
+
+def test_new_owning_terminal_checkpoint_still_freezes_cancellation(service, monkeypatch):
+    store, submitted = service
+    store.submit(submitted)
+    spec = {**store.spec("run-1"), "terminal_tracker_version": 1}
+    flow = DeliveryWorkflow()
+    flow.state = {
+        "phase": "delivered",
+        "execution_state": "terminal",
+        "outcome": "delivered",
+        "revision": 30,
+        "iteration": 4,
+        "checks": {},
+        "roles": [],
+        "cleanup": "confirmed",
+    }
+
+    async def wait(predicate, **_kw):
+        assert predicate()
+
+    async def execute(*_a, **_kw):
+        return {
+            "state": "confirmed",
+            "process_cleanup": "observed-native-confirmed",
+            "resource_cleanup": "confirmed",
+        }
+
+    async def pending(_spec, checkpoint):
+        assert checkpoint["event"] == "delivered" and checkpoint["status"] == "in-review"
+        flow.state.update(phase="waiting_tracker", execution_state="waiting_tracker", outcome=None)
+        with pytest.raises(ApplicationError, match="terminal transition is frozen"):
+            await flow.cancel({"expected_revision": flow.state["revision"], "reason": "too late"})
+        return False
+
+    monkeypatch.setattr(workflow, "now", lambda: datetime(2026, 10, 4, tzinfo=UTC))
+    monkeypatch.setattr(workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(workflow, "wait_condition", wait)
+    monkeypatch.setattr(flow, "_activity", execute)
+    monkeypatch.setattr(flow, "_finish_terminal_tracker", pending)
+    asyncio.run(flow._project(spec, "delivered", "fresh terminal transition"))
+    assert flow.state["checks"]["terminal_tracker_checkpoint"]["event"] == "delivered"
+    assert flow.cancel_requested is False
 
 
 @pytest.mark.parametrize("stage", ["review", "checks"])

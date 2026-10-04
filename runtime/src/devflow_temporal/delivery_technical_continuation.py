@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 from contextlib import contextmanager
 from copy import deepcopy
@@ -38,6 +39,89 @@ FIELDS = {
     "expected_source_revision",
 }
 PACKET_FIELDS = {"prospective_path", "prospective_sha256"}
+SEALED_ROW_LIMIT = 4 * 1024 * 1024
+
+
+def _sealed_row(binding, run_id):
+    """The hash-bound complete row is larger than an authority receipt, but finite."""
+    if (
+        not isinstance(binding, dict)
+        or set(binding) != {"path", "sha256"}
+        or not isinstance(binding["path"], str)
+        or not isinstance(binding["sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", binding["sha256"])
+    ):
+        raise ValueError("technical sealed row reference is invalid")
+    path = Path(binding["path"])
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("technical sealed row left its exact reference")
+
+    def ancestors():
+        identities = []
+        for parent in reversed(path.parents):
+            info = parent.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError("technical sealed row ancestor is aliased or replaced")
+            identities.append((info.st_dev, info.st_ino, info.st_mode, info.st_uid))
+        return identities
+
+    descriptors = []
+    try:
+        parents = ancestors()
+        # macOS protected top-level directories need not grant directory-open access.
+        # Anchor the actual owned evidence parent and retain every ancestor identity.
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.append(descriptor)
+        parent_info = os.fstat(descriptor)
+        if (
+            parent_info.st_dev,
+            parent_info.st_ino,
+            parent_info.st_mode,
+            parent_info.st_uid,
+        ) != parents[-1]:
+            raise ValueError("technical sealed row parent custody changed")
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptors[-1])
+        descriptors.append(descriptor)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size > SEALED_ROW_LIMIT
+        ):
+            raise ValueError("technical sealed row is not bounded, private and owned")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            raw = stream.read(SEALED_ROW_LIMIT + 1)
+        after = os.fstat(descriptor)
+        if (
+            len(raw) != before.st_size
+            or parents != ancestors()
+            or any(
+                getattr(before, k) != getattr(after, k)
+                for k in (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_uid",
+                    "st_nlink",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                )
+            )
+            or hashlib.sha256(raw).hexdigest() != binding["sha256"]
+        ):
+            raise ValueError("technical sealed row custody or hash changed")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or value.get("run_id") != run_id:
+            raise ValueError("technical sealed row does not own this original")
+        return value
+    except OSError as exc:
+        raise ValueError("technical sealed row no-follow custody is unavailable") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _request(payload):
@@ -309,6 +393,33 @@ def _quiescent(store, spec):
         return store.state.claim_for(db, spec["work_id"])
 
 
+def _controller(payload):
+    actor = process_table().get(os.getpid())
+    if not actor:
+        raise ValueError("technical controller process identity is unobservable")
+    return {
+        "pid": os.getpid(),
+        "identity": actor["identity"],
+        "source_revision": payload["expected_source_revision"],
+    }
+
+
+def _same_orphan(seal, fresh):
+    historical = seal.get("controller", {})
+    if (
+        not isinstance(historical, dict)
+        or set(historical) != {"pid", "identity", "source_revision"}
+        or type(historical.get("pid")) is not int
+        or historical["pid"] < 1
+        or not isinstance(historical.get("identity"), str)
+        or not historical["identity"]
+        or historical.get("source_revision") != fresh["controller"]["source_revision"]
+        or canonical_json({k: v for k, v in seal.items() if k != "controller"})
+        != canonical_json({k: v for k, v in fresh.items() if k != "controller"})
+    ):
+        raise ValueError("technical orphan intent no longer binds the stopped whole request")
+
+
 @contextmanager
 def _claim_lease(store, seal):
     """Only the released original is borrowed; failed admission releases that lease."""
@@ -353,7 +464,7 @@ def _snapshot(store, run_id, payload):
     sealed = evidence["sealed_actual_failures"]["runs"].get(run_id)
     if not sealed:
         raise ValueError("technical successor has no sealed authentic failure trigger")
-    historical = reference(sealed["row"]["path"], sealed["row"]["sha256"])
+    historical = _sealed_row(sealed["row"], run_id)
     fields = (
         "request_json",
         "request_digest",
@@ -477,9 +588,6 @@ def _snapshot(store, run_id, payload):
         proposed["base_sha"] = merge["main"]
     else:
         output = None
-    controller = process_table().get(os.getpid())
-    if not controller:
-        raise ValueError("technical controller process identity is unobservable")
     seal = {
         "kind": KIND,
         "command": payload,
@@ -501,11 +609,7 @@ def _snapshot(store, run_id, payload):
         "session_sha256": session_digest,
         "resume_stage": "checks" if integration else "review",
         "maximum_iteration": 4,
-        "controller": {
-            "pid": os.getpid(),
-            "identity": controller["identity"],
-            "source_revision": payload["expected_source_revision"],
-        },
+        "controller": _controller(payload),
     }
     return seal, readiness, output
 
@@ -764,6 +868,7 @@ def continue_technical(store, run_id, payload, *, preflight=False):
         ).fetchone()
     if command and command["request_digest"] != command_digest:
         raise ValueError("technical command ID already belongs to different inputs")
+    orphan_raw = None
     if prior:
         seal = json.loads(prior["intent_json"])
         if canonical_json(seal["command"]) != canonical_json(payload):
@@ -799,7 +904,23 @@ def continue_technical(store, run_id, payload, *, preflight=False):
             else None
         )
     else:
-        seal, readiness, output = _snapshot(store, run_id, payload)
+        # Exclusive intent publication can outlive an uncommitted SQLite transaction.
+        # Authenticate that original seal instead of replacing historical actor custody.
+        state = Path(store.effective_spec(run_id)["state_dir"])
+        intent_path = state / "technical-successor/intent.json"
+        _ancestors(intent_path, allow_missing=True)
+        if intent_path.exists():
+            root_identity(intent_path.parent)
+            if intent_path.parent.lstat().st_mode & 0o777 != 0o700:
+                raise ValueError("technical orphan namespace is not private and owned")
+            seal = read_private(intent_path)
+            orphan_raw = intent_path.read_bytes()
+            if canonical_json(seal.get("command")) != canonical_json(payload):
+                raise ValueError("technical orphan intent belongs to a different command")
+            fresh, readiness, output = _snapshot(store, run_id, payload)
+            _same_orphan(seal, fresh)
+        else:
+            seal, readiness, output = _snapshot(store, run_id, payload)
     response = {
         "run_id": run_id,
         "workflow_id": f"delivery-{run_id}-technical-1",
@@ -826,7 +947,9 @@ def continue_technical(store, run_id, payload, *, preflight=False):
         if not prior:
             # Revalidate the whole request before the first durable write and claim mutation.
             fresh, readiness, output = _snapshot(store, run_id, payload)
-            if canonical_json(fresh) != canonical_json(seal):
+            if orphan_raw is not None:
+                _same_orphan(seal, fresh)
+            elif canonical_json(fresh) != canonical_json(seal):
                 raise ValueError("technical successor request changed before immutable admission")
             with store._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
@@ -852,13 +975,27 @@ def continue_technical(store, run_id, payload, *, preflight=False):
                         f"external:devflow:{run_id}",
                         store.config.dashboard_url,
                     )
-                _immutable(root / "intent.json", seal)
+                _immutable(
+                    root / "intent.json",
+                    seal,
+                    **({"raw": orphan_raw} if orphan_raw is not None else {}),
+                )
                 db.execute(
                     "INSERT INTO delivery_technical_successors "
                     "(run_id,command_id,intent_json,state) VALUES (?,?,?,'pending')",
                     (run_id, payload["command_id"], canonical_json(seal)),
                 )
         with _claim_lease(store, seal):
+            actor = _controller(payload)
+            private_directory(root / "resume-actors")
+            _immutable(
+                root / "resume-actors" / (digest(actor) + ".json"),
+                {
+                    "intent_sha256": digest(seal),
+                    "original_controller": seal["controller"],
+                    "observed_controller": actor,
+                },
+            )
             for name, key in (
                 ("manifest.json", "manifest_sha256"),
                 ("finalization.json", "finalization_sha256"),

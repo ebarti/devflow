@@ -883,6 +883,7 @@ class DeliveryWorkflow:
         self.state.update(candidate=recovery['candidate'], pull_request=recovery['publication'],
                           phase='technical_preflight', execution_state='running', outcome=None,
                           error=None, cleanup='none')
+        self.state.get('checks', {}).pop('terminal_tracker_checkpoint', None)
         self.state['candidate_revision'] += 1
         try:
             await self._activity('delivery_technical_readback', {

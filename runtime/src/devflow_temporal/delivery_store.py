@@ -3335,6 +3335,13 @@ class DeliveryStore:
                     indexed.append({"id": namespace + "-predecessor-" + name,
                                     "label": namespace + " original cleanup " + name,
                                     "path": path, "limit": 4 * 1024 * 1024})
+        actor_root = root / "technical-successor/resume-actors"
+        if actor_root.is_dir() and not actor_root.is_symlink():
+            for path in sorted(actor_root.glob('*.json')):
+                if path.is_file() and not path.is_symlink():
+                    indexed.append({"id": "technical-resume-actor-" + path.stem,
+                                    "label": "Technical controller resume observation",
+                                    "path": path, "limit": 64 * 1024})
         for generation in ("native-preparation-renewal", "technical-successor/native-generation"):
             renewal_intent = root / generation / "preparation.json"
             if not renewal_intent.is_file() or renewal_intent.is_symlink():

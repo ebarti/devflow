@@ -350,6 +350,16 @@ identity. A failed borrowing of a released claim rolls back that owning claim;
 a previously retained original claim stays bound. Exact request replay checks
 actual partial effects and resumes their journals.
 
+An exclusive intent whose SQLite transaction did not commit is recovered by the
+same command only after fresh whole-request validation under its owning lock.
+The original seal and controller identity remain byte-for-byte historical;
+separate append-only observations bind each resume controller. Complete sealed
+failure rows have a dedicated 4 MiB read limit with exact hash, run identity,
+private ownership and no-follow custody; ordinary authority receipts retain
+their smaller limit. A resumed workflow drops the inherited active terminal
+checkpoint while preserving the frozen predecessor and its passed checks.
+A newly initiated terminal transition still freezes cancellation.
+
 The review launch boundary resumes review and QA of the unchanged published
 candidate at iteration 4. It preserves prior source-applicable checks and never
 repeats publication. The separately authorized integration computes the entire
@@ -365,6 +375,8 @@ and current CI run at existing iteration 4. The existing title-only iteration 5
 remains a separate admission after its fresh exact browser rejection; there is
 no iteration 6. None of these source contracts authorizes an installation or
 public continuation before independent review and current CI pass.
+After a separate title admission changes the current head, replay of an older
+technical command may refuse stale source identity rather than repeat effects.
 
 Resource roots stay under their original
 registered ownership. For trusted pytest checks, the unchanged frozen argv runs
