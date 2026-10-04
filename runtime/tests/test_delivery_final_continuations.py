@@ -544,3 +544,95 @@ def test_browser_checkpoint_accepts_report_projection_and_binds_test_evidence():
         assert not closure._browser_checkpoint({**actual, key: value}, recorded)
     assert not closure._browser_checkpoint({**actual, "unexpected": True}, recorded)
 
+
+
+def test_native_renewal_reads_candidate_without_resolving_uncommitted_namespace(monkeypatch):
+    original = {'policy': {'native_identity': {'runtime_payload_sha256': 'old'}},
+                'policy_digest': 'old-policy', 'checkout': '/preserved/checkout'}
+    renewed = deepcopy(original)
+    renewed['policy']['native_identity']['runtime_payload_sha256'] = 'new'
+    renewed['policy_digest'] = 'new-policy'
+    calls = []
+
+    class Broker:
+        def __init__(self, store, spec):
+            assert spec == original, 'renewed namespace has not been admitted yet'
+            calls.append(spec)
+
+        def candidate(self):
+            return {'id': 'content', 'head': 'head', 'policy_digest': 'old-policy'}
+
+    monkeypatch.setattr(closure, 'DeliveryBroker', Broker)
+    assert closure._renewed_candidate(None, original, renewed) == {
+        'id': 'content', 'head': 'head', 'policy_digest': 'new-policy'}
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match='feature authority'):
+        closure._renewed_candidate(None, original, {**renewed, 'checkout': '/other'})
+
+
+@pytest.mark.parametrize('case', ['success', 'queued', 'claim', 'same-source', 'lost-response'])
+def test_pending_abandonment_preserves_history_checkpoint_and_is_replayable(
+    stopped_tail, monkeypatch, case,
+):
+    store, payload, old = seal_for(stopped_tail, closure.KIND)
+    old.update(closed={}, attempts=[], effects=[], controller={'source_revision': 'old'})
+    root = Path(old['spec']['state_dir']) / 'resource-closure'
+    closure.private_directory(root)
+    closure._immutable(root / 'intent.json', old)
+    closure._immutable(root / 'retained-proof.json', {'historical': True})
+    retained = {p.name: p.read_bytes() for p in root.iterdir()}
+    with store._connect() as db:
+        db.execute('INSERT INTO delivery_resource_closures (run_id,command_id,intent_json,state) '
+                   'VALUES (?,?,?,?)', ('run-1', payload['command_id'], json.dumps(old),
+                                       'queued' if case == 'queued' else 'pending'))
+    fresh = deepcopy(old)
+    fresh['controller']['source_revision'] = 'old' if case == 'same-source' else 'new'
+    if case == 'claim':
+        fresh['claim'] = None
+    monkeypatch.setattr(closure, '_snapshot', lambda *_a: (deepcopy(fresh), {}))
+    command = {**payload, 'continuation_kind': closure.ABANDON, 'command_id': 'abandon-1'}
+    if case in {'queued', 'claim', 'same-source'}:
+        with pytest.raises(ValueError):
+            store.continue_repair('run-1', command)
+        assert {p.name: p.read_bytes() for p in root.iterdir()} == retained
+        return
+    preview = store.repair_admission_preflight('run-1', command)
+    assert preview['preflight']
+    assert {p.name: p.read_bytes() for p in root.iterdir()} == retained
+    if case == 'lost-response':
+        immutable = closure._immutable
+
+        def interrupted(path, *args, **kwargs):
+            immutable(path, *args, **kwargs)
+            raise RuntimeError('response lost after archive publication')
+
+        monkeypatch.setattr(closure, '_immutable', interrupted)
+        with pytest.raises(RuntimeError):
+            store.continue_repair('run-1', command)
+        monkeypatch.setattr(closure, '_immutable', immutable)
+    response = store.continue_repair('run-1', command)
+    archive = Path(response['archive'])
+    assert not root.exists()
+    for name, raw in retained.items():
+        assert (archive / name).read_bytes() == raw
+    assert store.continue_repair('run-1', command)['existing']
+    with store._connect() as db:
+        assert dict(db.execute('SELECT * FROM delivery_runs').fetchone()) == old['original_row']
+        assert store.state.claim_for(db, old['spec']['work_id']) == old['claim']
+        assert db.execute('SELECT COUNT(*) FROM delivery_repair_grants').fetchone()[0] == 0
+        assert db.execute('SELECT COUNT(*) FROM delivery_attempts').fetchone()[0] == 0
+        assert (db.execute('SELECT state FROM delivery_resource_closures').fetchone()[0]
+                == 'abandoned')
+    if case == 'success':
+        continued = {**payload, 'command_id': 'continue-2'}
+        fresh['command'] = continued
+        monkeypatch.setattr(renewal, 'renew', lambda spec, *_a, **_kw: (spec, None))
+        monkeypatch.setattr(closure, 'readback', lambda *_a: {})
+        response = store.continue_repair('run-1', continued)
+        assert response['phase'] == 'resource_closure_queued'
+        assert (archive / 'intent.json').read_bytes() == retained['intent.json']
+        with store._connect() as db:
+            assert (db.execute('SELECT state FROM delivery_resource_closures').fetchone()[0]
+                    == 'queued')
+            assert db.execute('SELECT COUNT(*) FROM delivery_repair_grants').fetchone()[0] == 0
+            assert db.execute('SELECT COUNT(*) FROM delivery_attempts').fetchone()[0] == 0

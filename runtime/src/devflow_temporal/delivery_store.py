@@ -984,6 +984,11 @@ class DeliveryStore:
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
         if (isinstance(supplied, dict)
+                and supplied.get('continuation_kind') == 'abandon_pending_resource_closure'):
+            from .delivery_resource_closure import abandon_pending
+
+            return abandon_pending(self, run_id, supplied, preflight=preflight)
+        if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') == 'stopped_resource_closure'):
             from .delivery_resource_closure import admit
 
