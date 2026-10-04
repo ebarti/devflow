@@ -160,6 +160,14 @@ def _readiness(store, spec, payload, authority, parent):
     }, controller
 
 
+def _browser_checkpoint(actual, recorded):
+    """Failure reports omit diagnostic text and the separately bound native journal."""
+    metadata = {"diagnostic", "native_process"}
+    return {k: v for k, v in actual.items() if k not in metadata} == {
+        k: v for k, v in recorded.items() if k not in metadata
+    }
+
+
 def _snapshot(store, run_id, payload):
     authority, bindings, failure = _authority(payload, run_id)
     spec = store.effective_spec(run_id)
@@ -190,7 +198,9 @@ def _snapshot(store, run_id, payload):
         or payload["expected_candidate_id"] != candidate["id"]
         or payload["expected_pr_head"] != candidate["head"]
         or state.get("pull_request", {}).get("number") != payload["expected_pr_number"]
-        or state.get("checks", {}).get("browser_qa") != failure["browser"]
+        or not _browser_checkpoint(
+            state.get("checks", {}).get("browser_qa", {}), failure["browser"]
+        )
         or state["checks"].get("resource_cleanup", {}).get("state") != "unknown"
         or claim != failure["run"]["tracker"]["observed"]["claim"]
         or any(a["state"] != "finished" or a["cleanup"] == "unknown" for a in attempts)
