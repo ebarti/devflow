@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -83,13 +84,30 @@ def test_frozen_fetch_excludes_setup_and_rejects_candidate_lock_or_manager_drift
         ["git", "-C", str(source), "config", "user.email", "fixture@example.com"], check=True
     )
     subprocess.run(["git", "-C", str(source), "config", "user.name", "Fixture"], check=True)
+    source.joinpath("pnpm-workspace.yaml").write_text(
+        "packages: [packages/*]\nonlyBuiltDependencies: [esbuild]\n"
+    )
     spec = fixture_inputs(source)
-    manager, inputs = frozen_pnpm_inputs(spec, source)
+    provenance = {}
+    manager, inputs = frozen_pnpm_inputs(spec, source, provenance=provenance)
     staging = tmp_path / "registered-staging"
     staging.mkdir(mode=0o700)
     hashes = write_frozen_inputs(staging, inputs)
-    assert manager == "pnpm@10.24.0" and set(hashes) == {"pnpm-lock.yaml", "package.json"}
+    assert manager == "pnpm@10.24.0" and set(hashes) == {
+        "pnpm-lock.yaml", "package.json", "pnpm-workspace.yaml"
+    }
     assert json.loads((staging / "package.json").read_bytes()) == {"packageManager": manager}
+    assert provenance["source_input_hashes"] == {
+        name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in inputs
+    }
+    assert hashes["package.json"] != provenance["source_input_hashes"]["package.json"]
+    assert provenance["transformations"]["package.json"] == {
+        "operation": "json-key-allowlist", "keys": ["packageManager"]
+    }
+    assert hashes["pnpm-lock.yaml"] == provenance["source_input_hashes"]["pnpm-lock.yaml"]
+    assert hashes["pnpm-workspace.yaml"] != provenance["source_input_hashes"]["pnpm-workspace.yaml"]
+    assert "onlyBuiltDependencies" not in (staging / "pnpm-workspace.yaml").read_text()
+    assert provenance["transformations"]["pnpm-workspace.yaml"]["operation"] == "yaml-key-allowlist"
     assert not (staging / ".pnpmfile.cjs").exists()
     source.joinpath("pnpm-lock.yaml").write_text(LOCK + "# candidate drift\n")
     with pytest.raises(ValueError, match="lock differs"):
@@ -191,6 +209,9 @@ async def test_fresh_native_registry_fetch_offline_install_check_and_resource_re
         assert dependency["state"] == "passed"
         assert dependency["native_process"]["cleanup"] == "observed-native-confirmed"
         assert dependency["candidate_setup_executed"] is False
+        assert dependency["input_provenance"]["source_input_hashes"]["package.json"] == (
+            hashlib.sha256((source / "package.json").read_bytes()).hexdigest()
+        )
         assert any(Path(dependency["store"]).iterdir())
         gate = Path(checks["results"][0]["cwd"])
         assert (gate / "node_modules/is-number").exists()

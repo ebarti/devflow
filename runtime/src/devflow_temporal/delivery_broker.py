@@ -604,7 +604,8 @@ class DeliveryBroker:
         from .delivery_sandbox import native_check_argv, prepare_native_check
 
         verify_prepared_spec(self.spec)
-        manager, inputs = frozen_pnpm_inputs(self.spec, checkout)
+        provenance = {}
+        manager, inputs = frozen_pnpm_inputs(self.spec, checkout, provenance=provenance)
         resources = RunResources(self.spec)
         scratch = resources.scratch("dependencies", self.spec["policy_digest"])
         transient = read_private(resources.manifest)["roots"][str(self.state_dir / "transient")]
@@ -620,6 +621,7 @@ class DeliveryBroker:
         request = {
             "base_sha": self.spec["base_sha"], "policy_digest": self.spec["policy_digest"],
             "package_manager": manager, "input_hashes": hashes, "registry": REGISTRY,
+            "input_provenance": provenance,
             "store": str(dependencies), "store_identity": identity, "generation": generation,
         }
         if receipt.exists():

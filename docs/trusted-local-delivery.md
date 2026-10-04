@@ -410,6 +410,12 @@ including untracked files. A committed, clean feature proceeds to the same
 mandatory controller gates as uncommitted edits; an empty commit or reverted
 feature does not establish a pass. Readiness does not certify later checks.
 
+Dependency receipts label `input_hashes` as staged-byte hashes and include
+`input_provenance`: original base Git-blob hashes and the exact manifest key
+allowlists used for staging. Lockfiles and patches use the identity transform.
+Independent verification can reconstruct the staging inputs without confusing
+the sanitized manifests with repository bytes. Candidate setup stays excluded.
+
 A repository may configure `project_statuses`, mapping logical work statuses
 to existing GitHub Project Status options, for example
 `{"blocked": "Needs validation"}`. The controller passes that mapping to the
