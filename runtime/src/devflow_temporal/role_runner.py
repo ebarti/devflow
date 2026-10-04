@@ -103,6 +103,8 @@ def _task(request: dict[str, Any]) -> AgentTask:
         ),
         "implement": (
             "Implement the accepted plan in this owned checkout. Preserve unrelated work. "
+            "Leave source changes uncommitted: the controller creates and validates "
+            "the author-signed Conventional Commit during publication. Do not run git commit. "
             "Run checks available within your role and report concrete evidence. The "
             "controller, not this role, runs frozen dependency preparation, mandatory "
             "prepublication and final checks, browser/API QA, CI and publication after "
