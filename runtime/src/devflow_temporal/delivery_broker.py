@@ -300,8 +300,8 @@ class DeliveryBroker:
                 relevant.append((name, _sha256(file)))
         return hashlib.sha256(canonical_json(relevant).encode()).hexdigest()
 
-    def _changed_paths(self) -> set[str]:
-        changed = set(_git(self.checkout, "diff", "--name-only", "HEAD").splitlines())
+    def _changed_paths(self, base_ref: str = "HEAD") -> set[str]:
+        changed = set(_git(self.checkout, "diff", "--name-only", base_ref).splitlines())
         changed.update(
             _git(self.checkout, "ls-files", "--others", "--exclude-standard").splitlines()
         )
