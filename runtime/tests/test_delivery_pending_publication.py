@@ -189,3 +189,37 @@ def test_published_assessment_after_publication_recovery_keeps_all_admissions(pe
         assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
     with pytest.raises(ValueError):
         store.continue_repair('run-1', {**retry, 'command_id': 'second-published-assessment'})
+    with store._connect() as db:
+        published_recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0])
+    unknown = deepcopy(published_recovery['state'])
+    unknown.update(candidate=published_recovery['candidate'], revision=29,
+                   error='local check process cleanup is unknown', cleanup='unknown')
+    unknown['checks']['local'] = {'state': 'unknown', 'cleanup': 'unknown',
+                                 'reason': 'ValueError', 'candidate_id': candidate['id']}
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message=unknown['error'], candidate=unknown['candidate'],
+                  pull_request=publication, checks=unknown['checks'], iteration=0,
+                  protocol_revision=29, outcome='blocked', cleanup='unknown',
+                  error=unknown['error'])
+    closed.update(workflow_id=result['workflow_id'], recovery_digest=digest(published_recovery),
+                  result=unknown)
+    monkeypatch.setattr('devflow_temporal.delivery_check_prelaunch.observe',
+                        lambda *_a: {'state': 'observed-quiescent-prelaunch'})
+    prelaunch = {**retry, 'continuation_kind': 'published_check_prelaunch_retry',
+                 'command_id': 'one-unlaunched-check-retry', 'expected_revision': 29}
+    resumed = store.continue_repair('run-1', prelaunch)
+    assert resumed['additional_iterations'] == 0
+    assert resumed['workflow_id'].endswith('published-gates-retry-2')
+    assert DeliveryBroker(store, store.effective_spec('run-1')).evidence_dir.parent.name \
+        == 'published-gates-admission-2'
+    with store._connect() as db:
+        latest = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0])
+        assert latest['state']['checks']['local']['cleanup'] == 'unknown'
+        assert latest['original_recovery'] == published_recovery
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
+    with pytest.raises(ValueError):
+        store.continue_repair('run-1', {**prelaunch, 'command_id': 'another-prelaunch'})

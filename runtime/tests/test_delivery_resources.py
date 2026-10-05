@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,45 @@ def spec(root: Path, name: str = "run") -> dict:
         "policy_digest": "a" * 64,
         "policy": {"execution_backend": "native-macos"},
     }
+
+
+def test_plan_environment_has_real_broker_ownership_and_safe_cleanup(tmp_path):
+    from test_delivery_store import _git
+
+    from devflow_temporal.delivery_broker import DeliveryBroker
+
+    owned = spec(tmp_path)
+    owned['policy']['host_sandbox'] = 'trusted-local'
+    owned['accepted_plan'] = json.dumps({'verification': ['Run test_owned.py']})
+    root = Path(owned['checkout'])
+    root.parent.mkdir(parents=True)
+    resources = RunResources(owned)
+    resources.register(root, 'checkout')
+    root.mkdir()
+    resources.created(root)
+    project = root / 'worker'
+    (project / 'tests').mkdir(parents=True)
+    (project / 'tests/test_owned.py').write_text('def test_owned(): assert True\n')
+    (project / 'pyproject.toml').write_text('[project]\nname="fixture"\nversion="1"\n')
+    (project / 'uv.lock').write_text('version=1\n')
+    _git(root, 'init', '-q')
+    _git(root, 'add', '.')
+    broker = DeliveryBroker.__new__(DeliveryBroker)
+    broker.spec = owned
+    outputs = broker._register_generated(root, ['worker/.venv'])
+    assert outputs == [project / '.venv']
+    (project / '.venv').mkdir()
+    (project / '.venv/package').write_text('owned fixture dependency')
+    broker._record_generated(outputs)
+    for other in ['.venv', 'outside/.venv', '../foreign', '/tmp/foreign']:
+        with pytest.raises(ValueError):
+            broker._register_generated(root, [other])
+    sentinel = tmp_path / 'precious'
+    sentinel.write_text('SAFE')
+    assert resources.finalize('blocked')['state'] == 'confirmed'
+    assert not (project / '.venv').exists()
+    assert sentinel.read_text() == 'SAFE'
+    assert resources.finalize('blocked')['state'] == 'confirmed'
 
 
 @pytest.mark.parametrize(

@@ -3249,7 +3249,7 @@ async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure
                 task_queue=spec["run_id"],
             )
             result = await handle.result()
-    assert calls[:4] == ["implement", "review", "local_checks", "browser_qa"]
+    assert calls[:4] == ["implement", "local_checks", "review", "browser_qa"]
     assert ("verify" in calls) is (qa_state == "passed")
     assert result["outcome"] == ("delivered" if qa_state == "passed" else "blocked")
     if qa_state == "unknown":

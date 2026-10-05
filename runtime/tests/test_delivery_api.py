@@ -182,6 +182,32 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('activity_fn', [delivery_precheck, delivery_checks])
+async def test_check_preparation_failure_keeps_diagnostics_without_claiming_a_launch(
+    activity_fn, monkeypatch, tmp_path,
+):
+    from devflow_temporal.delivery_broker import CheckPreparationFailure
+
+    class Broker:
+        def run_prechecks(self, _iteration, _candidate):
+            raise CheckPreparationFailure('planned-dependencies', ValueError('owned root rejected'))
+
+        run_checks = run_prechecks
+
+        def candidate(self):
+            return {'id': 'candidate'}
+
+    monkeypatch.setattr('devflow_temporal.delivery_activities._context', lambda _: (
+        SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()))
+    result = await activity_fn({'spec': {'provider': 'codex'}, 'iteration': 0,
+                               'candidate': {'id': 'candidate'}})
+    assert result['state'] == 'failed' and result['cleanup'] == 'confirmed'
+    assert result['source_unchanged'] is True
+    assert result['results'][0]['launched'] is False
+    assert result['diagnostic'] == 'owned root rejected'
+
+
 @pytest.fixture
 def api_fixture(tmp_path: Path) -> tuple[Path, dict]:
     source = tmp_path / "source"

@@ -86,6 +86,17 @@ class BrokerReadbackUnavailable(RuntimeError):
     """A remote PR query failed before its authority could be inspected."""
 
 
+class CheckPreparationFailure(ValueError):
+    """Preparation failed before this check's NativeProcess could launch."""
+
+    def __init__(self, check_id: str, cause: Exception, results: list | None = None):
+        super().__init__(str(cause)[:500])
+        self.results = [*(results or []), {
+            'id': check_id, 'passed': False, 'cleanup': 'confirmed',
+            'launched': False, 'failure_kind': 'preparation', 'diagnostic': str(self),
+        }]
+
+
 class DeliveryBroker:
     def __init__(self, store: DeliveryStore, spec: dict[str, Any]) -> None:
         from .delivery_preparation import require_native_execution
@@ -459,15 +470,18 @@ class DeliveryBroker:
                 from .delivery_sandbox import native_check_argv, prepare_native_check
 
                 verify_prepared_spec(self.spec)
-                profile, environment = prepare_native_check(
-                    self.spec, checkout, evidence_dir, check,
-                    dependency_store=(
-                        Path(native_dependencies["store"]) if native_dependencies else None
-                    ),
-                )
-                generated = self._register_generated(
-                    checkout, ["node_modules", *check.get("generated_directories", [])]
-                )
+                try:
+                    profile, environment = prepare_native_check(
+                        self.spec, checkout, evidence_dir, check,
+                        dependency_store=(
+                            Path(native_dependencies["store"]) if native_dependencies else None
+                        ),
+                    )
+                    generated = self._register_generated(
+                        checkout, ["node_modules", *check.get("generated_directories", [])]
+                    )
+                except (ValueError, OSError) as exc:
+                    raise CheckPreparationFailure(check['id'], exc, results) from exc
                 # The same frozen lock populates an owned store before offline
                 # installation. Candidate commands may read, never mutate it.
                 command = [
@@ -709,9 +723,12 @@ class DeliveryBroker:
                 self.spec["policy"].get("host_sandbox") == "trusted-local"):
             from .delivery_plan_checks import planned_checks
 
-            checks.extend(planned_checks(
-                self.spec, checkout, self.evidence_dir / "checks" / str(iteration)
-            ))
+            try:
+                checks.extend(planned_checks(
+                    self.spec, checkout, self.evidence_dir / "checks" / str(iteration)
+                ))
+            except (ValueError, OSError) as exc:
+                raise CheckPreparationFailure('accepted-plan-recipes', exc) from exc
         return self._run_check_list(
             checkout,
             checks,

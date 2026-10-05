@@ -18,6 +18,7 @@ from .delivery_resources import read_private, write_private
 
 KIND = 'published_gate_retry'
 PREPUBLICATION_KIND = 'prepublication_gate_retry'
+PRELAUNCH_KIND = 'published_check_prelaunch_retry'
 
 
 def snapshot(store, run_id, kind=KIND):
@@ -27,6 +28,9 @@ def snapshot(store, run_id, kind=KIND):
     closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    prelaunch = bool(kind == PRELAUNCH_KIND and previous and previous.get('kind') == KIND
+                    and spec.get('gate_retry_stage') == 'published'
+                    and spec.get('gate_retry_generation') == 1)
     renewed = bool(unpublished and previous
                    and previous.get('kind') == PREPUBLICATION_KIND
                    and spec.get('gate_retry_generation') == 1)
@@ -37,7 +41,7 @@ def snapshot(store, run_id, kind=KIND):
         if history.get('kind') == KIND:
             published_after_recovery = False
         history = history.get('original_recovery')
-    if (renewed or published_after_recovery) and spec['provider'] != 'fake':
+    if (renewed or published_after_recovery or prelaunch) and spec['provider'] != 'fake':
         from .delivery_native_preparation import native_identity
         old_payload = spec['policy']['native_identity']['runtime_payload_sha256']
         if native_identity(spec)['runtime_payload_sha256'] == old_payload:
@@ -57,15 +61,24 @@ def snapshot(store, run_id, kind=KIND):
                    and not any(e['kind'] == 'publish' for e in effects)
                    and any(r.get('passed') is False and r.get('cleanup') == 'confirmed'
                            for r in precheck.get('results', []))) if unpublished else bool(failed)
+    prelaunch_observation = None
+    if prelaunch:
+        from .delivery_check_prelaunch import observe
+
+        prelaunch_observation = observe(spec, state, previous)
+        failed_gate = True
     if (spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local'):
         raise ValueError('gate retry requires the existing trusted native execution policy')
-    if ((previous is not None and not (renewed or published_after_recovery))
+    if ((kind == PRELAUNCH_KIND and not prelaunch)
+            or (previous is not None and not (renewed or published_after_recovery or prelaunch))
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
-            or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
+            or row['execution_state'] != 'blocked'
+            or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
             or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
-            or state.get('cleanup') != 'confirmed'
+            or state.get('cleanup') != ('unknown' if prelaunch else 'confirmed')
             or row['error'] != state.get('error')
-            or state.get('error') != ('prepublication repair limit exhausted'
+            or state.get('error') != ('local check process cleanup is unknown' if prelaunch
+                                      else 'prepublication repair limit exhausted'
                                       if unpublished else 'repair limit exhausted')
             or row['protocol_revision'] != state.get('revision')
             or row['iteration'] != state.get('iteration')
@@ -74,7 +87,7 @@ def snapshot(store, run_id, kind=KIND):
             or not implementation or implementation.get('status') != 'pass' or not failed_gate
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
             or any(e['state'] != 'complete' or not e['observed_json'] for e in effects)
-            or claim is not None):
+            or (claim is not None and not prelaunch)):
         raise ValueError('gate retry requires a closed, finalized failed gate and released claim')
     frozen = json.loads(row['candidate_json'])
     publication = json.loads(row['pr_json'] or 'null')
@@ -109,14 +122,15 @@ def snapshot(store, run_id, kind=KIND):
         ancestor = previous
         while ancestor and ancestor.get('kind') == 'pending_publication_retry':
             ancestor = ancestor.get('original_recovery')
-        if admitted and (not (renewed or published_after_recovery) or prior_gate != ancestor):
+        if admitted and (not (renewed or published_after_recovery or prelaunch)
+                         or prior_gate != ancestor):
             raise ValueError('this run already received its bounded gate assessment retry')
     return {'row': row, 'closed': closed, 'original_spec': spec, 'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
-            'cleanup': _stopped_cleanup(spec), 'work_binding': binding,
+            'cleanup': prelaunch_observation or _stopped_cleanup(spec), 'work_binding': binding,
             'previous': previous, 'prior_gate': prior_gate,
-            'stage': 'published' if published_after_recovery else None,
-            'generation': 2 if renewed else 1}
+            'stage': 'published' if published_after_recovery or prelaunch else None,
+            'generation': 2 if renewed or prelaunch else 1}
 
 
 def admit(store, run_id, payload, *, preflight=False):
@@ -128,7 +142,7 @@ def admit(store, run_id, payload, *, preflight=False):
     if not unpublished:
         fields.add('expected_pr_number')
     if (not isinstance(payload, dict) or set(payload) != fields
-            or kind not in {KIND, PREPUBLICATION_KIND}
+            or kind not in {KIND, PREPUBLICATION_KIND, PRELAUNCH_KIND}
             or not isinstance(payload.get('command_id'), str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', payload['command_id'])
             or any(type(payload.get(k)) is not int or payload[k] < low for k, low in (
@@ -239,9 +253,9 @@ def admit(store, run_id, payload, *, preflight=False):
 
 def gate_namespace(generation, stage=None):
     if stage is not None:
-        if stage != 'published' or generation != 1:
-            raise ValueError('published gate retry exceeds its single assessment bound')
-        return 'published-gates-admission'
+        if stage != 'published' or generation not in (1, 2):
+            raise ValueError('published gate retry exceeds its finite assessment bound')
+        return 'published-gates-admission' + ('-2' if generation == 2 else '')
     if generation not in (1, 2):
         raise ValueError('gate retry generation exceeds the finite recovery bound')
     return 'gates-admission' if generation == 1 else 'gates-admission-2'

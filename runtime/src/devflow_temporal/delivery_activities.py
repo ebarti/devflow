@@ -17,7 +17,7 @@ from temporalio.exceptions import ApplicationError
 
 from .candidate import candidate_for
 from .contracts import digest
-from .delivery_broker import DeliveryBroker
+from .delivery_broker import CheckPreparationFailure, DeliveryBroker
 from .delivery_config import DeliveryConfig
 from .delivery_preparation import _lock
 from .delivery_repair import RepairReadbackPending
@@ -335,7 +335,8 @@ async def delivery_gates_readback(request: dict[str, Any]) -> dict[str, Any]:
         if request["recovery"].get("kind") == "pending_publication_retry":
             from .delivery_pending_publication import readback
         elif request["recovery"].get("kind") in {
-                "published_gate_retry", "prepublication_gate_retry"}:
+                "published_gate_retry", "prepublication_gate_retry",
+                "published_check_prelaunch_retry"}:
             from .delivery_gate_retry import readback
         else:
             from .delivery_gates_admission import readback
@@ -378,6 +379,11 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
             with (_lock(store.config.state_root / "check-execution")
                   if request["spec"]["provider"] == "codex" else nullcontext()):
                 return broker.run_checks(request["iteration"], request["candidate"])
+        except CheckPreparationFailure as exc:
+            return {'state': 'failed', 'cleanup': 'confirmed',
+                    'candidate_id': request['candidate']['id'],
+                    'source_unchanged': broker.candidate()['id'] == request['candidate']['id'],
+                    'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
             if request["spec"]["provider"] != "codex":
                 raise
@@ -423,6 +429,11 @@ async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
             with (_lock(store.config.state_root / "check-execution")
                   if request["spec"]["provider"] == "codex" else nullcontext()):
                 return broker.run_prechecks(request["iteration"], request["candidate"])
+        except CheckPreparationFailure as exc:
+            return {'state': 'failed', 'cleanup': 'confirmed',
+                    'candidate_id': request['candidate']['id'],
+                    'source_unchanged': broker.candidate()['id'] == request['candidate']['id'],
+                    'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
             if request["spec"]["provider"] != "codex":
                 raise

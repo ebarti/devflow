@@ -6,11 +6,26 @@ one `published_gate_retry` command through `repair-admission-preflight` and
 `continue-repair`. Use the current `protocol_revision`, iteration, candidate ID,
 PR number and PR head; `additional_iterations` must be **0**. This resumes the
 same run and PR, preserves its original failed results and resource receipts,
-refreshes the measured runtime, and runs fresh review, local checks, QA, CI and
+refreshes the measured runtime, and runs exact-head local checks before fresh review, QA, CI and
 tracker readbacks. It grants no implementation turn, changes no source or repair
 budget, and does not accept an old failed result as a pass. A stale head, unfinished
 process, changed configuration or outstanding effect is rejected. Published-gate
 retries remain limited to one admission.
+
+Accepted structured verification that names tracked pytest files also runs those
+files in their tracked locked Python project. The controller owns the generated
+environment and retains manager/lock/selector provenance and candidate-bound JUnit
+artifacts. Failures before a check launches are preparation failures with concrete
+diagnostics; uncertain native execution remains unknown.
+
+An earlier published assessment that stopped before any fresh independent role
+launched because the planned Python environment could not be registered may use
+one `published_check_prelaunch_retry` with the same exact zero-iteration request
+fields. It requires a repaired measured runtime, complete observed process
+journals, no live owned process or port, a prepared profile but no planned process
+launch or generated environment, and unchanged owned source and open PR head.
+The old unknown receipt and prior admissions remain immutable; this resumes the
+unassessed checks and gates without another source repair. A second retry is rejected.
 
 A finalized run whose implementation passed but whose prepublication checks
 failed can use `prepublication_gate_retry` through those same public commands.

@@ -144,6 +144,7 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 'published_metadata_recovery', 'investigation_gates_only',
                 'accepted_technical_successor', 'published_gate_retry', 'prepublication_gate_retry',
                 'pending_publication_retry',
+                'published_check_prelaunch_retry',
             }:
                 if first and canonical_json(recovery.get('execution_spec')) != canonical_json(spec):
                     raise ValueError('gate namespace execution authority changed')
@@ -351,7 +352,18 @@ class RunResources:
                 root = Path(raw_root)
                 if entry["kind"] not in {"checkout", "gate"}:
                     continue
-                if not any(path == root / name for name in allowed_names):
+                names = set(allowed_names)
+                if (path.name == '.venv' and path.is_relative_to(root)
+                        and self.spec['policy'].get('host_sandbox') == 'trusted-local'):
+                    if root.exists():
+                        from .delivery_plan_checks import planned_projects
+
+                        names.update((project / '.venv').relative_to(root).as_posix()
+                                     for project in planned_projects(self.spec, root))
+                    elif finalizing and ownership.get(str(path), {}).get(
+                            'accepted_plan_sha256') == digest(self.spec['accepted_plan']):
+                        names.add(path.relative_to(root).as_posix())
+                if not any(path == root / name for name in names):
                     continue
                 self._allowed(root, entry["kind"], finalizing=finalizing)
                 if os.path.lexists(root) and _identity(root) != entry["identity"]:
@@ -388,6 +400,9 @@ class RunResources:
             if os.path.lexists(path):
                 raise ValueError("cannot adopt an existing unregistered resource")
             manifest["roots"][str(path)] = {"kind": kind, "state": "allocated", "identity": None}
+            if kind == 'generated' and path.name == '.venv':
+                manifest['roots'][str(path)]['accepted_plan_sha256'] = digest(
+                    self.spec['accepted_plan'])
             write_private(self.manifest, manifest)
 
     def created(self, path: Path) -> None:

@@ -12,17 +12,17 @@ from .contracts import digest
 from .delivery_broker import _git
 
 
-def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
+def planned_projects(spec: dict, checkout: Path) -> dict[Path, list[Path]]:
     try:
         plan = json.loads(spec['accepted_plan'])
     except (ValueError, TypeError):
-        return []  # Historical text plans do not grant a structured recipe.
+        return {}  # Historical text plans do not grant a structured recipe.
     if not isinstance(plan, dict) or not isinstance(plan.get('verification'), list):
-        return []
+        return {}
     names = sorted({name for step in plan['verification'] if isinstance(step, str)
                     for name in re.findall(r'\btest_[A-Za-z0-9_]+\.py\b', step)})
     if not names:
-        return []
+        return {}
     files = _git(checkout, 'ls-files', '--', '*.py').splitlines()
     projects: dict[Path, list[Path]] = {}
     for name in names:
@@ -43,6 +43,14 @@ def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
                     != path.relative_to(checkout).as_posix()):
                 raise ValueError('planned Python metadata escaped its fixed project')
         projects.setdefault(project, []).append(test)
+    return projects
+
+
+def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
+    projects = planned_projects(spec, checkout)
+    if not projects:
+        return []
+    plan = json.loads(spec['accepted_plan'])
     manager = shutil.which('uv')
     if not manager:
         raise ValueError('accepted locked pytest evidence requires the uv executable')

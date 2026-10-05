@@ -21,6 +21,8 @@ def _preparation_failure(result: dict[str, Any]) -> str | None:
     for item in result.get("results", []):
         if not isinstance(item, dict) or item.get("passed"):
             continue
+        if item.get('failure_kind') == 'preparation' and item.get('launched') is False:
+            return str(item.get('id', 'check preparation'))[:128]
         argv = item.get("argv", [])
         if not isinstance(argv, list):
             continue
@@ -29,7 +31,8 @@ def _preparation_failure(result: dict[str, Any]) -> str | None:
             for command in (("pnpm", "install"), ("playwright", "install"))
             for i in range(len(argv))
         )
-        preparation |= "uv" in argv and "sync" in argv and "run" not in argv
+        preparation |= (bool(argv) and argv[0].rsplit('/', 1)[-1] == 'uv'
+                        and 'sync' in argv and 'run' not in argv)
         if preparation:
             return str(item.get("id", "dependency installer"))[:128]
     return None
@@ -687,7 +690,8 @@ class DeliveryWorkflow:
         if recovery is not None:
             if recovery.get("kind") == "pending_publication_retry":
                 return await self._resume_pending_publication(spec, recovery)
-            if recovery.get("kind") in {"published_gate_retry", "prepublication_gate_retry"}:
+            if recovery.get("kind") in {"published_gate_retry", "prepublication_gate_retry",
+                                       "published_check_prelaunch_retry"}:
                 return await self._resume_published_gates(spec, recovery)
             if recovery.get("kind") == "terminal_tracker_recovery":
                 return await self._resume_terminal_tracker(spec, recovery)
@@ -902,7 +906,8 @@ class DeliveryWorkflow:
         )
 
     async def _resume_published_gates(self, spec, recovery):
-        published = recovery.get("kind") == "published_gate_retry"
+        published = recovery.get("kind") in {
+            "published_gate_retry", "published_check_prelaunch_retry"}
         if (recovery.get("execution_spec") != spec
                 or recovery.get("command", {}).get("additional_iterations") != 0):
             raise ValueError("gate retry changed its zero-repair authority")
