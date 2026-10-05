@@ -479,6 +479,7 @@ def prepare_native_check(
     domains = tuple(check.get("network_domains", ()))
     toolchain_roots = tuple(Path(root) for root in spec["policy"].get("toolchain_roots", []))
     cache = spec["policy"].get("package_manager_cache")
+    browser_cache = Path.home() / "Library/Caches/ms-playwright"
     profile_name = "devflow-check"
     lines = _profile_lines(
         profile_name,
@@ -491,6 +492,7 @@ def prepare_native_check(
             toolchain_roots
             + ((Path(cache),) if cache else ())
             + ((dependency_store,) if dependency_store else ())
+            + (browser_cache,)
             + (Path(sys.base_prefix),)
         ),
         network_domains=domains,
@@ -508,6 +510,8 @@ def prepare_native_check(
             "PNPM_HOME": str(home / ".pnpm"),
             "npm_config_cache": str(home / ".npm"),
             "npm_config_build_from_source": "true",
+            # Private HOME must not hide already prepared browser executables.
+            "PLAYWRIGHT_BROWSERS_PATH": str(browser_cache),
         }
     )
     if trusted_local(spec) and check.get("kind") == "test":
