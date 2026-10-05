@@ -465,7 +465,9 @@ class DeliveryBroker:
                         Path(native_dependencies["store"]) if native_dependencies else None
                     ),
                 )
-                generated = self._register_generated(checkout, ["node_modules"])
+                generated = self._register_generated(
+                    checkout, ["node_modules", *check.get("generated_directories", [])]
+                )
                 # The same frozen lock populates an owned store before offline
                 # installation. Candidate commands may read, never mutate it.
                 command = [
@@ -549,6 +551,8 @@ class DeliveryBroker:
                     "diagnostic": parsed_output[-2000:] if not passed else None,
                     "log": str(artifact),
                     "log_sha256": _sha256(artifact),
+                    **({"plan_provenance": check["plan_provenance"]}
+                       if check.get("plan_provenance") else {}),
                     **({"artifacts": check_evidence} if check_evidence else {}),
                     **({"evidence_failure": evidence_failure} if evidence_failure else {}),
                     "cleanup": "confirmed",
@@ -589,6 +593,9 @@ class DeliveryBroker:
         resources = RunResources(self.spec)
         roots = []
         for name in names:
+            if (not isinstance(name, str) or Path(name).is_absolute()
+                    or ".." in Path(name).parts):
+                raise ValueError("generated directory left its owned checkout")
             root = checkout / name
             if _git(checkout, "ls-files", "--", name):
                 raise ValueError("configured generated directory contains tracked source")
@@ -697,9 +704,17 @@ class DeliveryBroker:
 
     def run_checks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         checkout = self.gate_checkout("verify", iteration, candidate)
+        checks = list(self.spec["policy"].get("checks", []))
+        if self.spec["provider"] == "codex" and (
+                self.spec["policy"].get("host_sandbox") == "trusted-local"):
+            from .delivery_plan_checks import planned_checks
+
+            checks.extend(planned_checks(
+                self.spec, checkout, self.evidence_dir / "checks" / str(iteration)
+            ))
         return self._run_check_list(
             checkout,
-            self.spec["policy"].get("checks", []),
+            checks,
             self.evidence_dir / "checks" / str(iteration),
             candidate,
         )

@@ -138,3 +138,54 @@ def test_pending_workflow_completes_effect_then_independent_gates_without_implem
     assert 'delivery_precheck' not in [name for name, _ in calls]
     assert calls.index(('delivery_publish', None)) < calls.index(('delivery_role', 'review'))
     assert ('delivery_ci', None) in calls
+
+
+def test_published_assessment_after_publication_recovery_keeps_all_admissions(pending, monkeypatch):
+    from devflow_temporal.delivery_gate_retry import KIND
+
+    store, broker, old_state, request = pending
+    store.recover_publication('run-1', request)
+    spec = store.effective_spec('run-1')
+    with store._connect() as db:
+        previous = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0])
+    original_bytes = {name: (broker.state_dir / name / 'admission.json').read_bytes()
+                      for name in ('gates-admission', 'publication-retry')}
+    candidate = DeliveryBroker(store, spec).candidate()
+    publication = {'number': 7, 'head': candidate['head'], 'candidate': candidate}
+    broker._finish_effect('publish:run-1:0', publication)
+    monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_a, **_kw: {
+        'number': 7, 'state': 'OPEN', 'isDraft': False, 'headRefOid': candidate['head']})
+    state = deepcopy(old_state)
+    state.update(candidate=candidate, pull_request=publication, revision=23,
+                 error='repair limit exhausted')
+    state['roles'].append({'role': 'review', 'iteration': 0, 'status': 'findings',
+                           'findings': ['Missing broker evidence'], 'cleanup': 'confirmed'})
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message=state['error'], candidate=candidate, pull_request=publication,
+                  checks=state['checks'], iteration=0, protocol_revision=23, outcome='blocked',
+                  cleanup='confirmed', error=state['error'])
+    with store._connect() as db:
+        store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
+        workflow = db.execute("SELECT workflow_id FROM delivery_runs WHERE run_id='run-1'")
+        closed = {'workflow_id': workflow.fetchone()[0], 'request_digest': spec['request_digest'],
+                  'recovery_digest': digest(previous), 'result': state}
+    monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_kw: closed)
+    retry = {'continuation_kind': KIND, 'command_id': 'published-evidence-assessment',
+             'expected_revision': 23, 'expected_iteration': 0,
+             'expected_candidate_id': candidate['id'], 'expected_pr_number': 7,
+             'expected_pr_head': candidate['head'], 'additional_iterations': 0}
+    result = store.continue_repair('run-1', retry)
+    assert result['implementation_authority'] is False
+    assert 'published-gates-retry-1' in result['workflow_id']
+    current = store.effective_spec('run-1')
+    assert current['policy']['max_repairs'] == spec['policy']['max_repairs']
+    assert DeliveryBroker(store, current).evidence_dir.parent.name == 'published-gates-admission'
+    assert DeliveryBroker(store, current).candidate()['id'] == candidate['id']
+    for name, data in original_bytes.items():
+        assert (broker.state_dir / name / 'admission.json').read_bytes() == data
+    with store._connect() as db:
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
+    with pytest.raises(ValueError):
+        store.continue_repair('run-1', {**retry, 'command_id': 'second-published-assessment'})

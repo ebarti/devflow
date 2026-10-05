@@ -1627,10 +1627,9 @@ class DeliveryWorkflow:
             for role in (("verify",) if verify_only else ("review", "verify")):
                 if self.cancel_requested:
                     return await self._cancelled(spec)
-                if role == "verify":
-                    # The broker installs/builds the disposable gate checkout
-                    # before browser QA and before the independent verifier
-                    # inspects either source or receipts.
+                if role == ("verify" if verify_only else "review"):
+                    # Exact-head broker checks must be ready before either independent
+                    # role assesses required evidence. Browser QA still precedes verify.
                     self.state["phase"] = "checks"
                     self.state["revision"] += 1
                     await self._project(spec, "checks_started", "Executing required local checks")
@@ -1722,8 +1721,7 @@ class DeliveryWorkflow:
                             "resume_session": None,
                             "qa_evidence": qa_evidence if role == "verify" else None,
                             **({"check_evidence": self.state["checks"].get("local")}
-                               if role == "verify"
-                               and spec["policy"].get("host_sandbox") == "trusted-local" else {}),
+                               if spec["policy"].get("host_sandbox") == "trusted-local" else {}),
                         },
                     )
                 except Exception as exc:

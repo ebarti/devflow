@@ -119,8 +119,13 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "Independently review the exact candidate against the accepted plan. "
             "Inspect source, controller-bound diff and meaningful tests. Report actionable "
             "defects and missing evidence available at this review gate as findings. "
-            "Final broker checks and browser QA are later gates; do not call them passed "
-            "or block solely because they have not run yet. Do not edit files."
+            "Broker local checks have bound receipts supplied at this gate. Inspect them "
+            "without claiming you ran them. Browser QA and CI remain later gates; do not "
+            "call them passed or block solely because they have not run yet. A missing "
+            "dependency in your raw read-only checkout does not invalidate a successful "
+            "exact-candidate broker check. Run meaningful focused checks when available; "
+            "report actual source defects and evidence gaps, not duplicated mandatory "
+            "checks that the controller has already executed. Do not edit files."
         ),
         "verify": (
             "Independently assess the exact candidate, controller-bound diff and broker "
@@ -187,7 +192,8 @@ def _task(request: dict[str, Any]) -> AgentTask:
     if check_evidence is not None:
         from .delivery_check_evidence import verify_manifest
 
-        if role != "verify" or check_evidence.get("candidate_id") != candidate["id"]:
+        if (role not in {"review", "verify"}
+                or check_evidence.get("candidate_id") != candidate["id"]):
             raise ValueError("broker check evidence belongs to another candidate or role")
         for checked in check_evidence.get("results", []):
             if checked.get("artifacts"):
@@ -198,7 +204,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         + "\nInspect the manifest hashes and relevant artifacts, "
         "including each required page image. "
         "Test exit/count alone is not visual QA. Report missing or uninspected evidence honestly.\n"
-        if role == "verify" and check_evidence else ""
+        if role in {"review", "verify"} and check_evidence else ""
     )
     if spec["policy"].get("host_sandbox") == "trusted-local":
         diff_note = diff_note.replace(" (Git metadata is inaccessible in this role)", "")

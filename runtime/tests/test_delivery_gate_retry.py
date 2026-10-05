@@ -226,10 +226,13 @@ def test_workflow_runs_fresh_gates_without_implementation_or_publication(
     store, _, state, _, request = stopped
     store.continue_repair('run-1', request)
     spec = store.effective_spec('run-1')
+    spec['policy']['host_sandbox'] = 'trusted-local'
     with store._connect() as db:
         recovery = json.loads(db.execute(
             "SELECT recovery_json FROM delivery_gate_admissions WHERE run_id='run-1'"
         ).fetchone()[0])
+    # Workflow-only fixture: both halves bind the selected receipt-capable profile.
+    recovery['execution_spec'] = spec
     flow = DeliveryWorkflow()
     calls = []
 
@@ -239,13 +242,16 @@ def test_workflow_runs_fresh_gates_without_implementation_or_publication(
             return {'state': 'consistent'}
         if name == 'delivery_role':
             assert body['role'] in {'review', 'verify'}
+            assert ('delivery_checks', None) in calls
+            assert body['check_evidence']['candidate_id'] == recovery['candidate']['id']
             return {'role': body['role'], 'iteration': 1,
                     'status': qa_status if body['role'] == 'verify' else 'pass',
                     'findings': ['Fresh QA failure'] if qa_status != 'pass' else [],
                     'session_id': 'fresh-' + body['role'], 'candidate': recovery['candidate']}
         if name == 'delivery_tracker':
             return {'state': 'consistent'}
-        return {'state': 'passed', 'cleanup': 'confirmed'}
+        return {'state': 'passed', 'cleanup': 'confirmed',
+                'candidate_id': recovery['candidate']['id']}
 
     async def project(*args):
         pass

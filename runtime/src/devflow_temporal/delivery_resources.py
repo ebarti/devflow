@@ -143,10 +143,16 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
             while recovery and recovery.get('kind') in {
                 'published_metadata_recovery', 'investigation_gates_only',
                 'accepted_technical_successor', 'published_gate_retry', 'prepublication_gate_retry',
+                'pending_publication_retry',
             }:
                 if first and canonical_json(recovery.get('execution_spec')) != canonical_json(spec):
                     raise ValueError('gate namespace execution authority changed')
-                if recovery['kind'] == 'accepted_technical_successor':
+                if recovery['kind'] == 'pending_publication_retry':
+                    admitted_namespace = 'publication-retry'
+                    if canonical_json(read_private(state / admitted_namespace / 'admission.json')) \
+                            != canonical_json(recovery):
+                        raise ValueError('historical publication admission changed')
+                elif recovery['kind'] == 'accepted_technical_successor':
                     from .delivery_technical_continuation import namespace_custody
 
                     admitted_namespace = 'technical-successor'
@@ -169,7 +175,8 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                     from .delivery_gate_retry import gate_namespace
 
                     admitted_namespace = gate_namespace(
-                        recovery['execution_spec'].get('gate_retry_generation', 1))
+                        recovery['execution_spec'].get('gate_retry_generation', 1),
+                        recovery['execution_spec'].get('gate_retry_stage'))
                     _ancestors(state / admitted_namespace / 'admission.json')
                     admission = read_private(state / admitted_namespace / 'admission.json')
                     admitted = db.execute(

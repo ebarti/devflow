@@ -30,11 +30,18 @@ def snapshot(store, run_id, kind=KIND):
     renewed = bool(unpublished and previous
                    and previous.get('kind') == PREPUBLICATION_KIND
                    and spec.get('gate_retry_generation') == 1)
-    if renewed and spec['provider'] != 'fake':
+    history = previous
+    published_after_recovery = bool(not unpublished and previous and previous.get('kind') in {
+        PREPUBLICATION_KIND, 'pending_publication_retry'})
+    while history:
+        if history.get('kind') == KIND:
+            published_after_recovery = False
+        history = history.get('original_recovery')
+    if (renewed or published_after_recovery) and spec['provider'] != 'fake':
         from .delivery_native_preparation import native_identity
         old_payload = spec['policy']['native_identity']['runtime_payload_sha256']
         if native_identity(spec)['runtime_payload_sha256'] == old_payload:
-            raise ValueError('a second prepublication retry requires a repaired measured runtime')
+            raise ValueError('a later gate retry requires a repaired measured runtime')
     broker = DeliveryBroker(store, spec)
     candidate = broker.candidate()
     pr = broker._existing_pr()
@@ -52,7 +59,7 @@ def snapshot(store, run_id, kind=KIND):
                            for r in precheck.get('results', []))) if unpublished else bool(failed)
     if (spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local'):
         raise ValueError('gate retry requires the existing trusted native execution policy')
-    if ((previous is not None and not renewed)
+    if ((previous is not None and not (renewed or published_after_recovery))
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
             or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
@@ -98,12 +105,18 @@ def snapshot(store, run_id, kind=KIND):
         binding = work_binding(store, spec, db)
         admitted = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
                               (run_id,)).fetchone()
-        if admitted and (not renewed or json.loads(admitted[0]) != previous):
+        prior_gate = json.loads(admitted[0]) if admitted else None
+        ancestor = previous
+        while ancestor and ancestor.get('kind') == 'pending_publication_retry':
+            ancestor = ancestor.get('original_recovery')
+        if admitted and (not (renewed or published_after_recovery) or prior_gate != ancestor):
             raise ValueError('this run already received its bounded gate assessment retry')
     return {'row': row, 'closed': closed, 'original_spec': spec, 'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
             'cleanup': _stopped_cleanup(spec), 'work_binding': binding,
-            'previous': previous, 'generation': 2 if renewed else 1}
+            'previous': previous, 'prior_gate': prior_gate,
+            'stage': 'published' if published_after_recovery else None,
+            'generation': 2 if renewed else 1}
 
 
 def admit(store, run_id, payload, *, preflight=False):
@@ -148,7 +161,7 @@ def admit(store, run_id, payload, *, preflight=False):
                 'additional_iterations': 0, 'candidate_id': seal['candidate']['id']}
     spec = seal['original_spec']
     generation = seal['generation']
-    root = Path(spec['state_dir']) / gate_namespace(generation)
+    root = Path(spec['state_dir']) / gate_namespace(generation, seal['stage'])
     with _lock(root / 'controller.lock'):
         with store._connect() as db:
             prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
@@ -164,6 +177,8 @@ def admit(store, run_id, payload, *, preflight=False):
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
         execution['role_home_generation'] = f'gate-retry-{generation}'
         execution['gate_retry_generation'] = generation
+        if seal['stage']:
+            execution['gate_retry_stage'] = seal['stage']
         if digest(snapshot(store, run_id, kind)) != digest(seal):
             raise ValueError('stopped gate checkpoint changed during runtime preparation')
         after = {**DeliveryBroker(store, spec).candidate(),
@@ -181,7 +196,8 @@ def admit(store, run_id, payload, *, preflight=False):
                                     else {**seal['publication'], 'candidate': after})}
         _immutable(root / 'admission.json', recovery)
         preserve_resources(root, spec)
-        workflow_id = f'delivery-{run_id}-gates-retry-{generation}'
+        workflow_id = (f'delivery-{run_id}-published-gates-retry-{generation}' if seal['stage']
+                       else f'delivery-{run_id}-gates-retry-{generation}')
         response = {'run_id': run_id, 'phase': 'gates_retry_queued', 'workflow_id': workflow_id,
                     'candidate_id': after['id'], 'implementation_authority': False,
                     'additional_iterations': 0}
@@ -194,14 +210,14 @@ def admit(store, run_id, payload, *, preflight=False):
                 raise ValueError('gate retry admission lost issue ownership')
             store.state.claim_work(db, spec['work_id'], f'external:devflow:{run_id}',
                                    store.config.dashboard_url)
-            if generation == 1:
+            if seal['prior_gate'] is None:
                 db.execute('INSERT INTO delivery_gate_admissions VALUES (?,?,?)',
                            (run_id, payload['command_id'], canonical_json(recovery)))
             else:
                 prior_gate = db.execute(
                     'SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
                     (run_id,)).fetchone()
-                if not prior_gate or json.loads(prior_gate[0]) != seal['previous']:
+                if not prior_gate or json.loads(prior_gate[0]) != seal['prior_gate']:
                     raise ValueError('gate retry lost historical admission custody')
                 db.execute('UPDATE delivery_gate_admissions SET command_id=?,recovery_json=? '
                            'WHERE run_id=?',
@@ -221,7 +237,11 @@ def admit(store, run_id, payload, *, preflight=False):
         return response
 
 
-def gate_namespace(generation):
+def gate_namespace(generation, stage=None):
+    if stage is not None:
+        if stage != 'published' or generation != 1:
+            raise ValueError('published gate retry exceeds its single assessment bound')
+        return 'published-gates-admission'
     if generation not in (1, 2):
         raise ValueError('gate retry generation exceeds the finite recovery bound')
     return 'gates-admission' if generation == 1 else 'gates-admission-2'
@@ -229,7 +249,8 @@ def gate_namespace(generation):
 
 def effective_spec(store, original, recovery):
     root = Path(original['state_dir']) / gate_namespace(
-        recovery['execution_spec'].get('gate_retry_generation', 1))
+        recovery['execution_spec'].get('gate_retry_generation', 1),
+        recovery['execution_spec'].get('gate_retry_stage'))
     with store._connect() as db:
         saved = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
                            (original['run_id'],)).fetchone()
