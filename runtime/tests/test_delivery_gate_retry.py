@@ -207,6 +207,29 @@ def test_same_run_admission_replay_and_unchanged_source(stopped):
         store.continue_repair('run-1', {**request, 'expected_pr_head': 'a' * 40})
 
 
+def test_selector_preflight_reads_original_custody_before_sealing_execution(stopped, monkeypatch):
+    store, _, _, _, request = stopped
+    original = store.effective_spec('run-1')
+    initialize = DeliveryBroker.__init__
+
+    def guarded(self, store, spec):
+        assert spec == original  # New selectors have not received admission custody yet.
+        initialize(self, store, spec)
+
+    def recipes(spec, checkout, evidence):
+        assert spec['verification_test_paths'] == ['worker/tests/test_owned.py']
+        return [{'id': 'focused-tests', 'plan_provenance': {'test_paths':
+                                                        spec['verification_test_paths']}}]
+
+    monkeypatch.setattr(DeliveryBroker, '__init__', guarded)
+    monkeypatch.setattr('devflow_temporal.delivery_plan_checks.planned_checks', recipes)
+    selected = {**request, 'verification_test_paths': ['worker/tests/test_owned.py']}
+    assert store.repair_admission_preflight('run-1', selected)['additional_iterations'] == 0
+    store.continue_repair('run-1', selected)
+    assert store.effective_spec('run-1')['verification_test_paths'] == selected[
+        'verification_test_paths']
+
+
 @pytest.mark.parametrize('field,value', [('additional_iterations', 1),
                                         ('expected_revision', 12),
                                         ('expected_pr_head', 'a' * 40),

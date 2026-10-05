@@ -201,7 +201,7 @@ def admit(store, run_id, payload, *, preflight=False):
         selected = {**seal['original_spec'],
                     'verification_test_paths': payload['verification_test_paths']}
         seal['verification_checks'] = planned_checks(
-            selected, DeliveryBroker(store, selected).checkout,
+            selected, DeliveryBroker(store, seal['original_spec']).checkout,
             Path(selected['state_dir']) / 'selected-verification')
         if not seal['verification_checks']:
             raise ValueError('explicit verification selection must execute existing tests')
@@ -240,7 +240,7 @@ def admit(store, run_id, payload, *, preflight=False):
         current = snapshot(store, run_id, kind)
         if 'verification_checks' in seal:
             current['verification_checks'] = planned_checks(
-                selected, DeliveryBroker(store, selected).checkout,
+                selected, DeliveryBroker(store, seal['original_spec']).checkout,
                 Path(selected['state_dir']) / 'selected-verification')
         if digest(current) != digest(seal):
             raise ValueError('stopped gate checkpoint changed during runtime preparation')
