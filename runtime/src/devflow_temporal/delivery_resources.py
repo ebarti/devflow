@@ -122,7 +122,7 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 recovery = recovery.get('original_recovery')
             while recovery and recovery.get('kind') in {
                 'published_metadata_recovery', 'investigation_gates_only',
-                'accepted_technical_successor',
+                'accepted_technical_successor', 'published_gate_retry',
             }:
                 if first and canonical_json(recovery.get('execution_spec')) != canonical_json(spec):
                     raise ValueError('gate namespace execution authority changed')

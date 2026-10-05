@@ -992,6 +992,11 @@ class DeliveryStore:
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
         if (isinstance(supplied, dict)
+                and supplied.get('continuation_kind') == 'published_gate_retry'):
+            from .delivery_gate_retry import admit
+
+            return admit(self, run_id, supplied, preflight=preflight)
+        if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') == 'abandon_pending_resource_closure'):
             from .delivery_resource_closure import abandon_pending
 
@@ -2509,6 +2514,10 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            if recovery and recovery.get('kind') == 'published_gate_retry':
+                from .delivery_gate_retry import effective_spec
+
+                return effective_spec(self, original, recovery)
             renewals = []
 
             def renewed(spec):

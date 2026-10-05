@@ -93,6 +93,8 @@ class DeliverySupervisor:
             "candidate_id": request["candidate"]["id"],
             "policy_digest": spec["policy_digest"],
         }
+        if spec.get("gate_retry_generation") == 1 and request["role"] in {"review", "verify"}:
+            identity["gate_retry_generation"] = 1
         if generation:
             identity["attempt_generation"] = generation
         job_key = hashlib.sha256(canonical_json(identity).encode()).hexdigest()

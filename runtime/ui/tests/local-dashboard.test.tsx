@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { RunDetails } from '../src/RunDetails'
 import { App } from '../src/App'
 import { api } from '../src/api'
 import { subscribeRun } from '../src/stream'
@@ -53,4 +54,16 @@ describe('tokenless local dashboard', () => {
     expect(screen.getByText('Connected')).toBeTruthy()
     expect(screen.getByText('Live update after retry')).toBeTruthy()
   })
+})
+
+it('shows the actual failed QA finding above the workflow instead of relying on its optimistic summary', () => {
+  render(<RunDetails run={{ ...mockRun, error: 'repair limit exhausted', phase: 'blocked',
+    decisions: [], checks: { qa: { state: 'failed', detail: 'Supported checks succeeded.' } },
+    roles: [{ role: 'verify', state: 'findings', summary: 'Supported checks succeeded.',
+      findings: ['Dependency receipt omits source hashes and staged transformations.'] }],
+  }} onRefresh={async () => {}} />)
+  const blocker = screen.getByRole('region', { name: 'Blocking findings' })
+  expect(blocker.textContent).toContain('Dependency receipt omits source hashes')
+  expect(blocker.textContent).toContain('repair budget')
+  expect(blocker.compareDocumentPosition(screen.getByRole('region', { name: 'Workflow phase gates' })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
 })

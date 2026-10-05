@@ -330,7 +330,10 @@ async def delivery_metadata_readback(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_gates_readback")
 async def delivery_gates_readback(request: dict[str, Any]) -> dict[str, Any]:
     def execute():
-        from .delivery_gates_admission import readback
+        if request["recovery"].get("kind") == "published_gate_retry":
+            from .delivery_gate_retry import readback
+        else:
+            from .delivery_gates_admission import readback
 
         store, _ = _context(request["spec"])
         return readback(store, request["spec"], request["recovery"])

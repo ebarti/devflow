@@ -75,6 +75,21 @@ function QualityRow({ label, value }: { label: string; value: CheckState | null 
   return <div className="quality-row"><span>{label}</span><State value={value?.state} /><span className="quality-row__detail">{display(value?.detail, 'Evidence not available')}</span></div>
 }
 
+function BlockingFindings({ run }: { run: RunDetail }) {
+  if (!run.error) return null
+  const findings = ['review', 'verify'].flatMap(name => {
+    const gate = run.checks?.[name === 'review' ? 'review' : 'qa']
+    const role = [...(run.roles ?? [])].reverse().find(item => item.role === name)
+    return gate?.state === 'failed' ? role?.findings ?? [] : []
+  })
+  if (!findings.length) return null
+  return <section className="inline-alert" aria-label="Blocking findings">
+    <strong>What blocked this run</strong>
+    <ul>{findings.map((finding, index) => <li key={index}>{finding}</li>)}</ul>
+    {run.error === 'repair limit exhausted' ? <p>The allowed repair budget ended before these findings were resolved.</p> : null}
+  </section>
+}
+
 function EvidenceAndQuality({ run }: { run: RunDetail }) {
   const adjudication = run.investigation_adjudication
   return <section className="section lower-section" aria-labelledby="quality-heading">
@@ -295,6 +310,7 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     </header>
     {run.execution_retired ? <p className="inline-alert">Historical run · read-only. Its execution backend is retired.</p> : null}
     {run.error ? <p className="inline-alert" role="alert">{run.error}</p> : null}
+    <BlockingFindings run={run} />
     <PhaseStrip gates={run.phase_gates} />
     {decisions.map(decision => <DecisionCard key={`${decision.id}:${decision.revision}`} run={run} decision={decision} onRefresh={onRefresh} />)}
     <IntakeHistory run={run} />
