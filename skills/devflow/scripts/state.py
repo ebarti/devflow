@@ -62,12 +62,22 @@ def timestamps(values, prior=None):
 
 def connect(path):
     path = Path(path).expanduser()
-    previous_umask = os.umask(0o077)
+    # umask is process-wide: even a temporary change races with other state
+    # connections and unrelated subprocess launches in the delivery worker.
+    missing = []
+    parent = path.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for parent in reversed(missing):
+        parent.mkdir(mode=0o700, exist_ok=True)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(path, timeout=30)
-    finally:
-        os.umask(previous_umask)
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        os.close(descriptor)
+    db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
     try:
         db.execute("PRAGMA foreign_keys=ON")
