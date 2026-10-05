@@ -998,7 +998,7 @@ class DeliveryStore:
         if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') in {
                     'published_gate_retry', 'prepublication_gate_retry',
-                    'published_check_prelaunch_retry'}):
+                    'published_check_prelaunch_retry', 'published_ci_retry'}):
             from .delivery_gate_retry import admit
 
             return admit(self, run_id, supplied, preflight=preflight)
@@ -2561,7 +2561,7 @@ class DeliveryStore:
                 return effective_repair(self, recovery)
             if recovery and recovery.get('kind') in {
                     'published_gate_retry', 'prepublication_gate_retry',
-                    'published_check_prelaunch_retry'}:
+                    'published_check_prelaunch_retry', 'published_ci_retry'}:
                 from .delivery_gate_retry import effective_spec
 
                 return effective_spec(self, original, recovery)

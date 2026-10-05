@@ -691,7 +691,7 @@ class DeliveryWorkflow:
             if recovery.get("kind") == "pending_publication_retry":
                 return await self._resume_pending_publication(spec, recovery)
             if recovery.get("kind") in {"published_gate_retry", "prepublication_gate_retry",
-                                       "published_check_prelaunch_retry"}:
+                                       "published_check_prelaunch_retry", "published_ci_retry"}:
                 return await self._resume_published_gates(spec, recovery)
             if recovery.get("kind") == "terminal_tracker_recovery":
                 return await self._resume_terminal_tracker(spec, recovery)
@@ -906,8 +906,10 @@ class DeliveryWorkflow:
         )
 
     async def _resume_published_gates(self, spec, recovery):
+        if recovery.get('kind') == 'published_ci_retry':
+            return await self._resume_ci(spec, recovery)
         published = recovery.get("kind") in {
-            "published_gate_retry", "published_check_prelaunch_retry"}
+            "published_gate_retry", "published_check_prelaunch_retry", "published_ci_retry"}
         if (recovery.get("execution_spec") != spec
                 or recovery.get("command", {}).get("additional_iterations") != 0):
             raise ValueError("gate retry changed its zero-repair authority")
@@ -936,6 +938,49 @@ class DeliveryWorkflow:
             authorized_max_iteration=self.state["iteration"],
             resume_prechecks=True, published_checkpoint=published,
         )
+
+    async def _resume_ci(self, spec, recovery):
+        if (recovery.get('execution_spec') != spec
+                or recovery.get('command', {}).get('additional_iterations') != 0):
+            raise ValueError('CI continuation changed its zero-repair authority')
+        self.state = deepcopy(recovery['state'])
+        self.state.update(phase='waiting_ci', execution_state='running', outcome=None,
+                          error=None, cleanup='none', candidate=recovery['candidate'],
+                          pull_request=recovery['publication'])
+        for key in ('terminal_tracker_checkpoint', 'resource_cleanup'):
+            self.state['checks'].pop(key, None)
+        try:
+            await self._activity('delivery_gates_readback', {'spec': spec, 'recovery': recovery})
+            tracker = await self._activity('delivery_tracker_start', {
+                'spec': spec, 'repair_continuation': True})
+            self.state['tracker'] = tracker
+            if tracker.get('state') != 'consistent':
+                return await self._stop(spec, 'CI continuation tracker readback remains pending')
+            self.state['revision'] += 1
+            await self._project(spec, 'ci_retry_started',
+                                'Observing required CI on the independently passed candidate')
+            ci = await self._activity('delivery_ci', {
+                'spec': spec, 'pull_request': self.state['pull_request']}, hours=1)
+            self.state['checks']['ci'] = ci
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            if ci.get('state') != 'passed':
+                return await self._stop(spec, 'required CI did not confirm this PR head')
+            if spec.get('terminal_tracker_version') != 1:
+                tracker = await self._activity('delivery_tracker', {
+                    'spec': spec, 'pr': self.state['pull_request']})
+                self.state['tracker'] = tracker
+                if tracker.get('state') != 'consistent':
+                    return await self._stop(spec, 'tracker readback remains pending or conflicting')
+        except Exception as exc:
+            return await self._stop(spec, 'CI continuation failed: ' + type(exc).__name__)
+        if self.cancel_requested:
+            return await self._cancelled(spec)
+        self.state.update(phase='delivered', execution_state='terminal', outcome='delivered')
+        self.state['revision'] += 1
+        await self._project(spec, 'delivered',
+                            'Passed independent candidate delivered after fresh required CI')
+        return self.state
 
     async def _resume_metadata(self, spec, recovery):
         self.state = deepcopy(recovery["state"])

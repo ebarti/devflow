@@ -12,11 +12,31 @@ budget, and does not accept an old failed result as a pass. A stale head, unfini
 process, changed configuration or outstanding effect is rejected. Published-gate
 retries remain limited to one admission.
 
+The first published assessment after a finalized source repair is also supported.
+It retains the original sealed repair grant and iteration ceiling, grants no new
+source turn, and authenticates every historical admission during cleanup.
+
 Accepted structured verification that names tracked pytest files also runs those
 files in their tracked locked Python project. The controller owns the generated
 environment and retains manager/lock/selector provenance and candidate-bound JUnit
 artifacts. Failures before a check launches are preparation failures with concrete
 diagnostics; uncertain native execution remains unknown.
+
+When an accepted verification step requests focused regressions without naming
+files, `published_gate_retry` can include `verification_test_paths`: at most 32
+unique tracked Python or Vitest test paths. These are sealed execution selectors,
+not a changed accepted plan or policy. Python projects require tracked metadata
+and `uv.lock`; Vitest packages require the tracked pnpm workspace lock. Recipes
+retain the plan hash, selector hash, lock metadata, executed count and JUnit report
+for the exact candidate. Arbitrary commands, source changes and escaping paths
+are rejected.
+
+A finalized run that passed independent review, QA and local checks but stopped
+on required CI can use one `published_ci_retry` with the same zero-iteration
+request fields. It preserves candidate-bound passed assessments and the failed
+CI history, observes required checks again on the same open PR/head, then performs
+normal cleanup and tracker finalization. It executes no model role, source repair,
+publication or repeated local check. Delivery still requires fresh successful CI.
 
 An earlier published assessment that stopped before any fresh independent role
 launched because the planned Python environment could not be registered may use

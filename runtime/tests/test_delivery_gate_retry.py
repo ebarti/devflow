@@ -332,6 +332,58 @@ def test_finalized_run_can_receive_one_real_code_repair_and_keep_its_grant(stopp
         store.continue_repair('run-1', {**request, 'command_id': 'another-repair'})
 
 
+def test_first_published_assessment_after_finalized_repair_keeps_historical_grant(
+    stopped, monkeypatch,
+):
+    from copy import deepcopy
+
+    from devflow_temporal.contracts import digest
+
+    store, _, state, closed, request = stopped
+    with store._connect() as db:
+        original = json.loads(db.execute(
+            "SELECT request_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0])
+        original['resource_cleanup_version'] = 1
+        db.execute("UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'",
+                   (canonical_json(original),))
+    resources = RunResources(store.spec('run-1'))
+    resources.scratch('original', 'checks')
+    state['checks'] = {'resource_cleanup': resources.finalize('blocked')}
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET checks_json=? WHERE run_id='run-1'",
+                   (canonical_json(state['checks']),))
+    grant = {k: v for k, v in request.items() if k != 'continuation_kind'}
+    grant.update(command_id='one-source-grant', additional_iterations=1)
+    store.continue_repair('run-1', grant)
+    with store._connect() as db:
+        prior = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0])
+    state.update(iteration=2, revision=14)
+    state['roles'].extend([{**deepcopy(state['roles'][1]), 'iteration': 2},
+                           {**deepcopy(state['roles'][-1]), 'iteration': 2}])
+    closed.update(workflow_id='delivery-run-1-repair-continuation-1',
+                  recovery_digest=digest(prior))
+    work_id = store.spec('run-1')['work_id']
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET phase='blocked',execution_state='blocked',"
+                   "outcome='blocked',iteration=2,protocol_revision=14,error=?,cleanup='confirmed'"
+                   " WHERE run_id='run-1'", (state['error'],))
+        store.state.release_work(db, work_id, 'external:devflow:run-1')
+    request.update(command_id='post-repair-assessment', expected_iteration=2, expected_revision=14)
+    before_grant = canonical_json(prior)
+    store.continue_repair('run-1', request)
+    effective = store.effective_spec('run-1')
+    assert effective['gate_retry_stage'] == 'published'
+    assert effective['policy']['max_repairs'] == store.spec('run-1')['policy']['max_repairs']
+    assert RunResources(effective).root.name == 'resources'
+    with store._connect() as db:
+        current = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0])
+        assert canonical_json(current['original_recovery']) == before_grant
+        grant = db.execute('SELECT granted_iterations FROM delivery_repair_grants').fetchone()
+        assert grant[0] == 1
+
+
 def test_second_prepublication_retry_preserves_history_and_has_no_third_grant(unpublished,
                                                                             monkeypatch):
     from copy import deepcopy

@@ -144,11 +144,19 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 'published_metadata_recovery', 'investigation_gates_only',
                 'accepted_technical_successor', 'published_gate_retry', 'prepublication_gate_retry',
                 'pending_publication_retry',
-                'published_check_prelaunch_retry',
+                'published_check_prelaunch_retry', 'published_ci_retry',
+                'repair_continuation',
             }:
                 if first and canonical_json(recovery.get('execution_spec')) != canonical_json(spec):
                     raise ValueError('gate namespace execution authority changed')
-                if recovery['kind'] == 'pending_publication_retry':
+                if recovery['kind'] == 'repair_continuation':
+                    from .delivery_gate_retry import effective_repair
+
+                    if not recovery.get('finalized_checkpoint'):
+                        raise ValueError('historical repair checkpoint is not finalized')
+                    effective_repair(None, recovery, db=db)
+                    admitted_namespace = 'repair-continuation'
+                elif recovery['kind'] == 'pending_publication_retry':
                     admitted_namespace = 'publication-retry'
                     if canonical_json(read_private(state / admitted_namespace / 'admission.json')) \
                             != canonical_json(recovery):

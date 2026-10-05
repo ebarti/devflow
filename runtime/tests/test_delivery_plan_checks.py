@@ -70,3 +70,62 @@ def test_freeform_plan_and_steps_cannot_supply_commands(project):
     for plan in ['Run test_owned.py', json.dumps({'steps': ['Run test_owned.py']}),
                  json.dumps({'verification': ['echo arbitrary-command']})]:
         assert planned_checks({**spec, 'accepted_plan': plan}, checkout, evidence) == []
+
+
+def test_explicit_tracked_selection_executes_prose_plan_without_changing_it(project):
+    spec, checkout, _, evidence = project
+    spec['accepted_plan'] = json.dumps({'verification': ['Execute focused worker regressions']})
+    spec['verification_test_paths'] = ['worker/tests/test_owned.py']
+    before = dict(spec)
+    checks = planned_checks(spec, checkout, evidence)
+    assert checks[1]['argv'][3] == 'tests/test_owned.py'
+    assert checks[1]['plan_provenance']['selection_sha256']
+    assert spec == before
+
+
+@pytest.mark.parametrize('paths', [
+    ['/tmp/test_owned.py'], ['../test_owned.py'], ['worker/tests/missing.test.ts'],
+    ['worker/tests/test_owned.py'] * 2, ['worker/pyproject.toml'], 'test_owned.py',
+])
+def test_explicit_selection_rejects_missing_or_unbounded_test_authority(project, paths):
+    spec, checkout, _, evidence = project
+    with pytest.raises((ValueError, FileNotFoundError)):
+        planned_checks({**spec, 'verification_test_paths': paths}, checkout, evidence)
+
+
+def test_explicit_selection_requires_a_structured_test_step_and_fixed_test_file(project):
+    spec, checkout, root, evidence = project
+    spec.update(accepted_plan=json.dumps({'verification': ['Inspect documentation']}),
+                verification_test_paths=['worker/tests/test_owned.py'])
+    with pytest.raises(ValueError, match='structured test step'):
+        planned_checks(spec, checkout, evidence)
+    spec['accepted_plan'] = json.dumps({'verification': ['Run focused tests']})
+    target = root / 'tests/test_owned.py'
+    target.unlink()
+    target.symlink_to(Path(__file__).resolve())
+    with pytest.raises(ValueError, match='fixed tracked test'):
+        planned_checks(spec, checkout, evidence)
+
+
+def test_node_selection_uses_locked_vitest_and_retained_junit(project):
+    spec, checkout, _, evidence = project
+    package = checkout / 'api'
+    (package / 'test').mkdir(parents=True)
+    (package / 'test/audit.test.ts').write_text('test("audit", () => {});')
+    (package / 'package.json').write_text(json.dumps({'devDependencies': {'vitest': '4.1.11'}}))
+    (checkout / 'package.json').write_text('{"packageManager":"pnpm@10.33.3"}')
+    (checkout / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
+    _git(checkout, 'add', '.')
+    spec.update(accepted_plan=json.dumps({'verification': ['Run focused API tests']}),
+                verification_test_paths=['api/test/audit.test.ts'])
+    checks = planned_checks(spec, checkout, evidence)
+    assert len(checks) == 1
+    test = checks[0]
+    assert test['argv'][:6] == ['corepack', 'pnpm', 'exec', 'vitest', 'run', 'test/audit.test.ts']
+    assert '--reporter=junit' in test['argv']
+    assert test['cwd'] == 'api'
+    assert test['min_tests'] == 1
+    assert 'pnpm-lock.yaml' in test['plan_provenance']['metadata']
+    (checkout / 'pnpm-lock.yaml').unlink()
+    with pytest.raises(FileNotFoundError):
+        planned_checks(spec, checkout, evidence)

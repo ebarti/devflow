@@ -19,6 +19,7 @@ from .delivery_resources import read_private, write_private
 KIND = 'published_gate_retry'
 PREPUBLICATION_KIND = 'prepublication_gate_retry'
 PRELAUNCH_KIND = 'published_check_prelaunch_retry'
+CI_KIND = 'published_ci_retry'
 
 
 def snapshot(store, run_id, kind=KIND):
@@ -28,6 +29,7 @@ def snapshot(store, run_id, kind=KIND):
     closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    ci_only = kind == CI_KIND
     prelaunch = bool(kind == PRELAUNCH_KIND and previous and previous.get('kind') == KIND
                     and spec.get('gate_retry_stage') == 'published'
                     and spec.get('gate_retry_generation') == 1)
@@ -36,10 +38,15 @@ def snapshot(store, run_id, kind=KIND):
                    and spec.get('gate_retry_generation') == 1)
     history = previous
     published_after_recovery = bool(not unpublished and previous and previous.get('kind') in {
-        PREPUBLICATION_KIND, 'pending_publication_retry'})
+        PREPUBLICATION_KIND, 'pending_publication_retry', 'repair_continuation'})
+    if previous and previous.get('kind') == 'repair_continuation' and not previous.get(
+            'finalized_checkpoint'):
+        published_after_recovery = False
     while history:
         if history.get('kind') == KIND:
             published_after_recovery = False
+        if ci_only and history.get('kind') == CI_KIND:
+            raise ValueError('this run already received its bounded CI observation retry')
         history = history.get('original_recovery')
     if (renewed or published_after_recovery or prelaunch) and spec['provider'] != 'fake':
         from .delivery_native_preparation import native_identity
@@ -67,17 +74,38 @@ def snapshot(store, run_id, kind=KIND):
 
         prelaunch_observation = observe(spec, state, previous)
         failed_gate = True
+    if ci_only:
+        checks = state.get('checks', {})
+        latest = {role: next((r for r in reversed(roles) if r.get('role') == role), {})
+                  for role in ('review', 'verify')}
+        sessions = [implementation.get('session_id') if implementation else None,
+                    *(r.get('session_id') for r in latest.values())]
+        if (checks != json.loads(row['checks_json'] or '{}')
+                or checks.get('ci', {}).get('state') not in {'failed', 'pending'}
+                or any(checks.get(k, {}).get('state') != 'passed'
+                       or checks[k].get('candidate_id') != candidate['id']
+                       for k in ('review', 'qa', 'local'))
+                or (spec['policy'].get('browser_qa')
+                    and checks.get('browser_qa', {}).get('state') != 'passed')
+                or any(r.get('status') != 'pass'
+                       or r.get('candidate', {}).get('id') != candidate['id']
+                       for r in latest.values())
+                or None in sessions or len(set(sessions)) != 3):
+            raise ValueError('CI retry requires unchanged independent candidate passes')
+        failed_gate = True
     if (spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local'):
         raise ValueError('gate retry requires the existing trusted native execution policy')
     if ((kind == PRELAUNCH_KIND and not prelaunch)
-            or (previous is not None and not (renewed or published_after_recovery or prelaunch))
+            or (previous is not None and not (
+                renewed or published_after_recovery or prelaunch or ci_only))
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
             or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
             or state.get('cleanup') != ('unknown' if prelaunch else 'confirmed')
             or row['error'] != state.get('error')
-            or state.get('error') != ('local check process cleanup is unknown' if prelaunch
+            or state.get('error') != ('required CI did not confirm this PR head' if ci_only
+                                      else 'local check process cleanup is unknown' if prelaunch
                                       else 'prepublication repair limit exhausted'
                                       if unpublished else 'repair limit exhausted')
             or row['protocol_revision'] != state.get('revision')
@@ -120,16 +148,18 @@ def snapshot(store, run_id, kind=KIND):
                               (run_id,)).fetchone()
         prior_gate = json.loads(admitted[0]) if admitted else None
         ancestor = previous
-        while ancestor and ancestor.get('kind') == 'pending_publication_retry':
+        while ancestor and ancestor.get('kind') in {
+                'pending_publication_retry', 'repair_continuation'}:
             ancestor = ancestor.get('original_recovery')
-        if admitted and (not (renewed or published_after_recovery or prelaunch)
+        if admitted and (not (renewed or published_after_recovery or prelaunch or ci_only)
                          or prior_gate != ancestor):
             raise ValueError('this run already received its bounded gate assessment retry')
     return {'row': row, 'closed': closed, 'original_spec': spec, 'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
             'cleanup': prelaunch_observation or _stopped_cleanup(spec), 'work_binding': binding,
             'previous': previous, 'prior_gate': prior_gate,
-            'stage': 'published' if published_after_recovery or prelaunch else None,
+            'stage': 'ci' if ci_only else 'published'
+                     if published_after_recovery or prelaunch else None,
             'generation': 2 if renewed or prelaunch else 1}
 
 
@@ -141,8 +171,10 @@ def admit(store, run_id, payload, *, preflight=False):
               'expected_candidate_id', head_field, 'additional_iterations'}
     if not unpublished:
         fields.add('expected_pr_number')
-    if (not isinstance(payload, dict) or set(payload) != fields
-            or kind not in {KIND, PREPUBLICATION_KIND, PRELAUNCH_KIND}
+    if (not isinstance(payload, dict) or set(payload) not in (
+            fields, fields | {'verification_test_paths'})
+            or ('verification_test_paths' in payload and kind != KIND)
+            or kind not in {KIND, PREPUBLICATION_KIND, PRELAUNCH_KIND, CI_KIND}
             or not isinstance(payload.get('command_id'), str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', payload['command_id'])
             or any(type(payload.get(k)) is not int or payload[k] < low for k, low in (
@@ -163,6 +195,16 @@ def admit(store, run_id, payload, *, preflight=False):
             raise ValueError('command ID already belongs to different inputs')
         return json.loads(prior['response_json'])
     seal = snapshot(store, run_id, kind)
+    if 'verification_test_paths' in payload:
+        from .delivery_plan_checks import planned_checks
+
+        selected = {**seal['original_spec'],
+                    'verification_test_paths': payload['verification_test_paths']}
+        seal['verification_checks'] = planned_checks(
+            selected, DeliveryBroker(store, selected).checkout,
+            Path(selected['state_dir']) / 'selected-verification')
+        if not seal['verification_checks']:
+            raise ValueError('explicit verification selection must execute existing tests')
     if (payload['expected_revision'] != seal['row']['protocol_revision']
             or payload['expected_iteration'] != seal['row']['iteration']
             or payload['expected_candidate_id'] != seal['candidate']['id']
@@ -189,11 +231,18 @@ def admit(store, run_id, payload, *, preflight=False):
                 '--untracked-files=all'):
             raise ValueError('gate retry requires clean installed runtime source')
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
+        if 'verification_test_paths' in payload:
+            execution['verification_test_paths'] = payload['verification_test_paths']
         execution['role_home_generation'] = f'gate-retry-{generation}'
         execution['gate_retry_generation'] = generation
         if seal['stage']:
             execution['gate_retry_stage'] = seal['stage']
-        if digest(snapshot(store, run_id, kind)) != digest(seal):
+        current = snapshot(store, run_id, kind)
+        if 'verification_checks' in seal:
+            current['verification_checks'] = planned_checks(
+                selected, DeliveryBroker(store, selected).checkout,
+                Path(selected['state_dir']) / 'selected-verification')
+        if digest(current) != digest(seal):
             raise ValueError('stopped gate checkpoint changed during runtime preparation')
         after = {**DeliveryBroker(store, spec).candidate(),
                  'policy_digest': execution['policy_digest']}
@@ -202,7 +251,8 @@ def admit(store, run_id, payload, *, preflight=False):
             raise ValueError('gate retry changed feature source')
         recovery = {'kind': kind, 'command': payload, 'seal': seal,
                     'original_recovery': seal['previous'],
-                    'original_spec': (seal['previous']['original_spec']
+                    'original_spec': (seal['previous'].get('original_spec')
+                                      or store.intake_execution_spec(run_id)
                                       if seal['previous'] else spec),
                     'execution_spec': execution,
                     'state': seal['closed']['result'], 'candidate': after,
@@ -210,7 +260,8 @@ def admit(store, run_id, payload, *, preflight=False):
                                     else {**seal['publication'], 'candidate': after})}
         _immutable(root / 'admission.json', recovery)
         preserve_resources(root, spec)
-        workflow_id = (f'delivery-{run_id}-published-gates-retry-{generation}' if seal['stage']
+        workflow_id = (f'delivery-{run_id}-ci-retry-1' if kind == CI_KIND else
+                       f'delivery-{run_id}-published-gates-retry-{generation}' if seal['stage']
                        else f'delivery-{run_id}-gates-retry-{generation}')
         response = {'run_id': run_id, 'phase': 'gates_retry_queued', 'workflow_id': workflow_id,
                     'candidate_id': after['id'], 'implementation_authority': False,
@@ -253,6 +304,8 @@ def admit(store, run_id, payload, *, preflight=False):
 
 def gate_namespace(generation, stage=None):
     if stage is not None:
+        if stage == 'ci' and generation == 1:
+            return 'ci-admission'
         if stage != 'published' or generation not in (1, 2):
             raise ValueError('published gate retry exceeds its finite assessment bound')
         return 'published-gates-admission' + ('-2' if generation == 2 else '')
