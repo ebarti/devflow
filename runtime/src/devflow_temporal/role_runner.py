@@ -281,6 +281,12 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"{qa_note}\n"
         f"{check_note}\n"
         "Return a structured assessment with status, summary, and findings. "
+        "For non-intake assessments, status=pass requires a nonempty summary and "
+        "findings=[]. Findings are unresolved defects or unmet requirements in this "
+        "delivery; when present, return status=findings or blocked. Put baseline "
+        "observations that satisfy the investigation scope and resolved historical "
+        "failures in the summary or authorized document. Never omit an unresolved "
+        "delivery defect to obtain a pass. "
         "A completed turn alone is not a pass."
     )
     if spec["provider"] == "codex" and spec["policy"].get("host_sandbox") not in {
