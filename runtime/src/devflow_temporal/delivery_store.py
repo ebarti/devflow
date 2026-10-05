@@ -649,6 +649,10 @@ class DeliveryStore:
         Git and GitHub are checked twice: before this transaction and by the
         read-only recovery activity before any downstream gate can start.
         """
+        if isinstance(supplied, dict) and supplied.get('expected_pr_number') == 0:
+            from .delivery_pending_publication import admit
+
+            return admit(self, run_id, supplied)
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))
@@ -2545,6 +2549,10 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            if recovery and recovery.get('kind') == 'pending_publication_retry':
+                from .delivery_pending_publication import effective_spec
+
+                return effective_spec(self, original, recovery)
             if recovery and recovery.get('kind') == 'repair_continuation' and recovery.get(
                     'finalized_checkpoint'):
                 from .delivery_gate_retry import effective_repair

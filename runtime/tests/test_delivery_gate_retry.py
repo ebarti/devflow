@@ -324,3 +324,70 @@ def test_finalized_run_can_receive_one_real_code_repair_and_keep_its_grant(stopp
     store.repair_preflight(current, recovery)
     with pytest.raises(ValueError, match='one repair grant'):
         store.continue_repair('run-1', {**request, 'command_id': 'another-repair'})
+
+
+def test_second_prepublication_retry_preserves_history_and_has_no_third_grant(unpublished,
+                                                                            monkeypatch):
+    from copy import deepcopy
+
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_gate_retry import snapshot
+
+    store, broker, original_state, request = unpublished
+    store.continue_repair('run-1', request)
+    first_spec = store.effective_spec('run-1')
+    with store._connect() as db:
+        previous = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_gate_admissions WHERE run_id='run-1'"
+        ).fetchone()[0])
+    old_file = broker.state_dir / 'gates-admission/admission.json'
+    old_bytes = old_file.read_bytes()
+
+    def finalize(spec, recovery, revision):
+        state = deepcopy(original_state)
+        state['revision'] = revision
+        store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                      message=state['error'], candidate=state['candidate'], checks=state['checks'],
+                      iteration=0, protocol_revision=revision, outcome='blocked',
+                      cleanup='confirmed', error=state['error'])
+        with store._connect() as db:
+            store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
+            workflow = db.execute("SELECT workflow_id FROM delivery_runs WHERE run_id='run-1'")
+            closed = {'workflow_id': workflow.fetchone()[0],
+                      'request_digest': spec['request_digest'], 'recovery_digest': digest(recovery),
+                      'result': state}
+        monkeypatch.setattr(store, '_completed_temporal_result', lambda *_args, **_kw: closed)
+        return {**request, 'command_id': f'retry-prechecks-{revision}',
+                'expected_revision': revision}
+
+    second_request = finalize(first_spec, previous, 19)
+    native_spec = deepcopy(first_spec)
+    native_spec.update(provider='codex')
+    native_spec['policy'].update(host_sandbox='trusted-local',
+                                 native_identity={'runtime_payload_sha256': 'same-runtime'})
+    with monkeypatch.context() as m:
+        m.setattr(store, 'effective_spec', lambda _: native_spec)
+        m.setattr('devflow_temporal.delivery_native_preparation.native_identity',
+                  lambda _: {'runtime_payload_sha256': 'same-runtime'})
+        with pytest.raises(ValueError, match='repaired measured runtime'):
+            snapshot(store, 'run-1', PREPUBLICATION_KIND)
+
+    admitted = store.continue_repair('run-1', second_request)
+    assert admitted['workflow_id'].endswith('gates-retry-2')
+    assert admitted['additional_iterations'] == 0
+    assert store.continue_repair('run-1', request)['workflow_id'].endswith('gates-retry-1')
+    spec = store.effective_spec('run-1')
+    with store._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_gate_admissions WHERE run_id='run-1'"
+        ).fetchone()[0])
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
+    assert recovery['original_spec'] == store.spec('run-1')
+    assert recovery['original_recovery'] == previous
+    assert readback(store, spec, recovery) is None
+    assert old_file.read_bytes() == old_bytes
+    assert RunResources(spec).root.name == 'resources'
+    assert DeliveryBroker(store, spec).evidence_dir.parent.name == 'gates-admission-2'
+    third = finalize(spec, recovery, 29)
+    with pytest.raises(ValueError, match='closed, finalized'):
+        store.continue_repair('run-1', third)

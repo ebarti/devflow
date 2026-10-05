@@ -685,6 +685,8 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if recovery is not None:
+            if recovery.get("kind") == "pending_publication_retry":
+                return await self._resume_pending_publication(spec, recovery)
             if recovery.get("kind") in {"published_gate_retry", "prepublication_gate_retry"}:
                 return await self._resume_published_gates(spec, recovery)
             if recovery.get("kind") == "terminal_tracker_recovery":
@@ -856,6 +858,47 @@ class DeliveryWorkflow:
             repair_findings=[],
             continuation=None,
             recovery=recovery,
+        )
+
+    async def _resume_pending_publication(self, spec, recovery):
+        self.state = deepcopy(recovery["state"])
+        self.state.update(phase="publishing", execution_state="running", outcome=None,
+                          error=None, cleanup="none")
+        self.state["checks"].pop("terminal_tracker_checkpoint", None)
+        try:
+            await self._activity("delivery_gates_readback", {"spec": spec, "recovery": recovery})
+            tracker = await self._activity("delivery_tracker_start", {
+                "spec": spec, "repair_continuation": True,
+            })
+            self.state["tracker"] = tracker
+            if tracker.get("state") != "consistent":
+                return await self._stop(spec, "pending publication tracker readback pending")
+            if self.cancel_requested:
+                return await self._stop(spec, "cancelled")
+            published = await self._activity("delivery_publish", {
+                "spec": spec, "iteration": self.state["iteration"],
+                "candidate": self.state["candidate"],
+            })
+            if published.get("state") == "pending":
+                published = await self._published_result(
+                    spec, self.state["iteration"], self.state["candidate"], published,
+                    expected_head=recovery["seal"]["candidate"]["head"],
+                )
+            if self.state.get("outcome") == "cancelled":
+                return self.state
+            self.state.update(candidate=published["candidate"], pull_request=published)
+            self.state["candidate_revision"] += 1
+            self.state["revision"] += 1
+            await self._project(spec, "published", "Pending controller publication completed")
+        except Exception as exc:
+            return await self._stop(spec, "publication retry failed: " + type(exc).__name__)
+        implementation = next(r for r in reversed(self.state["roles"])
+                              if r.get("role") == "implement")
+        return await self._run_iterations(
+            spec, start_iteration=self.state["iteration"],
+            prior_implementer_session=implementation.get("session_id"), repair_findings=[],
+            continuation=None, recovery=None, authorized_max_iteration=self.state["iteration"],
+            published_checkpoint=True,
         )
 
     async def _resume_published_gates(self, spec, recovery):

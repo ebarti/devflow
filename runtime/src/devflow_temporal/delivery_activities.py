@@ -8,6 +8,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from .candidate import candidate_for
 from .contracts import digest
 from .delivery_broker import DeliveryBroker
 from .delivery_config import DeliveryConfig
+from .delivery_preparation import _lock
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
@@ -330,7 +332,9 @@ async def delivery_metadata_readback(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_gates_readback")
 async def delivery_gates_readback(request: dict[str, Any]) -> dict[str, Any]:
     def execute():
-        if request["recovery"].get("kind") in {
+        if request["recovery"].get("kind") == "pending_publication_retry":
+            from .delivery_pending_publication import readback
+        elif request["recovery"].get("kind") in {
                 "published_gate_retry", "prepublication_gate_retry"}:
             from .delivery_gate_retry import readback
         else:
@@ -369,9 +373,11 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_checks")
 async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        _, broker = _context(request["spec"])
+        store, broker = _context(request["spec"])
         try:
-            return broker.run_checks(request["iteration"], request["candidate"])
+            with (_lock(store.config.state_root / "check-execution")
+                  if request["spec"]["provider"] == "codex" else nullcontext()):
+                return broker.run_checks(request["iteration"], request["candidate"])
         except Exception as exc:
             if request["spec"]["provider"] != "codex":
                 raise
@@ -388,9 +394,11 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_browser_qa")
 async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        _, broker = _context(request["spec"])
+        store, broker = _context(request["spec"])
         try:
-            return broker.run_browser_qa(request["iteration"], request["candidate"])
+            with (_lock(store.config.state_root / "check-execution")
+                  if request["spec"]["provider"] == "codex" else nullcontext()):
+                return broker.run_browser_qa(request["iteration"], request["candidate"])
         except Exception as exc:
             if request["spec"]["provider"] != "codex":
                 raise
@@ -410,9 +418,11 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_precheck")
 async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        _, broker = _context(request["spec"])
+        store, broker = _context(request["spec"])
         try:
-            return broker.run_prechecks(request["iteration"], request["candidate"])
+            with (_lock(store.config.state_root / "check-execution")
+                  if request["spec"]["provider"] == "codex" else nullcontext()):
+                return broker.run_prechecks(request["iteration"], request["candidate"])
         except Exception as exc:
             if request["spec"]["provider"] != "codex":
                 raise

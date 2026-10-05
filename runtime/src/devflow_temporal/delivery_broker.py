@@ -71,6 +71,17 @@ def _conventional_subject(subject: str) -> bool:
     return bool(re.fullmatch(r"[a-z][a-z0-9-]*(?:\([^()\r\n]+\))?!?: \S.*", subject))
 
 
+def publication_title(goal: str) -> str:
+    """Bound PR metadata without shortening the admitted commit subject or goal."""
+    subject = conventional_subject(goal)
+    if len(subject) <= 256:
+        return subject
+    title = subject[:253].rsplit(" ", 1)[0].rstrip() + "..."
+    if not _conventional_subject(title):
+        raise ValueError("publication subject prefix exceeds the PR title limit")
+    return title
+
+
 class BrokerReadbackUnavailable(RuntimeError):
     """A remote PR query failed before its authority could be inspected."""
 
@@ -819,7 +830,7 @@ class DeliveryBroker:
                     raise RuntimeError("remote feature branch diverged")
             _git(self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}")
         if existing is None:
-            title = conventional_subject(self.spec["goal"])
+            title = publication_title(self.spec["goal"])
             body = self.state_dir / "pull-request.md"
             body.write_text(
                 self.spec["policy"].get("pr_body")

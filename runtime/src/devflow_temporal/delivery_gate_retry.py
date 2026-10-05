@@ -1,4 +1,4 @@
-"""One explicit fresh gate execution on an unchanged, stopped candidate."""
+"""Bounded fresh gates on unchanged candidates after measured runtime repairs."""
 from __future__ import annotations
 
 import hashlib
@@ -27,6 +27,14 @@ def snapshot(store, run_id, kind=KIND):
     closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    renewed = bool(unpublished and previous
+                   and previous.get('kind') == PREPUBLICATION_KIND
+                   and spec.get('gate_retry_generation') == 1)
+    if renewed and spec['provider'] != 'fake':
+        from .delivery_native_preparation import native_identity
+        old_payload = spec['policy']['native_identity']['runtime_payload_sha256']
+        if native_identity(spec)['runtime_payload_sha256'] == old_payload:
+            raise ValueError('a second prepublication retry requires a repaired measured runtime')
     broker = DeliveryBroker(store, spec)
     candidate = broker.candidate()
     pr = broker._existing_pr()
@@ -44,7 +52,8 @@ def snapshot(store, run_id, kind=KIND):
                            for r in precheck.get('results', []))) if unpublished else bool(failed)
     if (spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local'):
         raise ValueError('gate retry requires the existing trusted native execution policy')
-    if (previous is not None or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
+    if ((previous is not None and not renewed)
+            or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
             or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
             or state.get('cleanup') != 'confirmed'
@@ -54,7 +63,7 @@ def snapshot(store, run_id, kind=KIND):
             or row['protocol_revision'] != state.get('revision')
             or row['iteration'] != state.get('iteration')
             or closed['request_digest'] != row['request_digest']
-            or closed['recovery_digest'] is not None
+            or closed['recovery_digest'] != (digest(previous) if previous else None)
             or not implementation or implementation.get('status') != 'pass' or not failed_gate
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
             or any(e['state'] != 'complete' or not e['observed_json'] for e in effects)
@@ -66,7 +75,8 @@ def snapshot(store, run_id, kind=KIND):
     publication_matches = (
         publication is None and state.get('pull_request') is None and pr is None
         and not remote and candidate['head'] == spec['base_sha']
-        and implementation.get('candidate') == candidate
+        and all(implementation.get('candidate', {}).get(k) == candidate.get(k)
+                for k in ('id', 'head', 'base_sha', 'content_sha256', 'environment_digest'))
     ) if unpublished else (
         isinstance(publication, dict) and publication == state.get('pull_request')
         and pr and pr['state'] == 'OPEN' and not pr['isDraft']
@@ -86,12 +96,14 @@ def snapshot(store, run_id, kind=KIND):
         raise ValueError('gate retry frozen configuration changed')
     with store._connect() as db:
         binding = work_binding(store, spec, db)
-        if db.execute('SELECT 1 FROM delivery_gate_admissions WHERE run_id=?',
-                      (run_id,)).fetchone():
-            raise ValueError('this run already received its one gate assessment retry')
+        admitted = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
+                              (run_id,)).fetchone()
+        if admitted and (not renewed or json.loads(admitted[0]) != previous):
+            raise ValueError('this run already received its bounded gate assessment retry')
     return {'row': row, 'closed': closed, 'original_spec': spec, 'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
-            'cleanup': _stopped_cleanup(spec), 'work_binding': binding}
+            'cleanup': _stopped_cleanup(spec), 'work_binding': binding,
+            'previous': previous, 'generation': 2 if renewed else 1}
 
 
 def admit(store, run_id, payload, *, preflight=False):
@@ -135,7 +147,8 @@ def admit(store, run_id, payload, *, preflight=False):
         return {'run_id': run_id, 'preflight': True, 'implementation_authority': False,
                 'additional_iterations': 0, 'candidate_id': seal['candidate']['id']}
     spec = seal['original_spec']
-    root = Path(spec['state_dir']) / 'gates-admission'
+    generation = seal['generation']
+    root = Path(spec['state_dir']) / gate_namespace(generation)
     with _lock(root / 'controller.lock'):
         with store._connect() as db:
             prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
@@ -149,22 +162,26 @@ def admit(store, run_id, payload, *, preflight=False):
                 '--untracked-files=all'):
             raise ValueError('gate retry requires clean installed runtime source')
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
-        execution['role_home_generation'] = 'gate-retry-1'
-        execution['gate_retry_generation'] = 1
+        execution['role_home_generation'] = f'gate-retry-{generation}'
+        execution['gate_retry_generation'] = generation
         if digest(snapshot(store, run_id, kind)) != digest(seal):
             raise ValueError('stopped gate checkpoint changed during runtime preparation')
-        after = DeliveryBroker(store, execution).candidate()
+        after = {**DeliveryBroker(store, spec).candidate(),
+                 'policy_digest': execution['policy_digest']}
         if any(after[k] != seal['candidate'][k]
                for k in ('id', 'head', 'base_sha', 'content_sha256', 'environment_digest')):
             raise ValueError('gate retry changed feature source')
         recovery = {'kind': kind, 'command': payload, 'seal': seal,
-                    'original_recovery': None, 'original_spec': spec, 'execution_spec': execution,
+                    'original_recovery': seal['previous'],
+                    'original_spec': (seal['previous']['original_spec']
+                                      if seal['previous'] else spec),
+                    'execution_spec': execution,
                     'state': seal['closed']['result'], 'candidate': after,
                     'publication': (None if unpublished
                                     else {**seal['publication'], 'candidate': after})}
         _immutable(root / 'admission.json', recovery)
         preserve_resources(root, spec)
-        workflow_id = f'delivery-{run_id}-gates-retry-1'
+        workflow_id = f'delivery-{run_id}-gates-retry-{generation}'
         response = {'run_id': run_id, 'phase': 'gates_retry_queued', 'workflow_id': workflow_id,
                     'candidate_id': after['id'], 'implementation_authority': False,
                     'additional_iterations': 0}
@@ -177,8 +194,18 @@ def admit(store, run_id, payload, *, preflight=False):
                 raise ValueError('gate retry admission lost issue ownership')
             store.state.claim_work(db, spec['work_id'], f'external:devflow:{run_id}',
                                    store.config.dashboard_url)
-            db.execute('INSERT INTO delivery_gate_admissions VALUES (?,?,?)',
-                       (run_id, payload['command_id'], canonical_json(recovery)))
+            if generation == 1:
+                db.execute('INSERT INTO delivery_gate_admissions VALUES (?,?,?)',
+                           (run_id, payload['command_id'], canonical_json(recovery)))
+            else:
+                prior_gate = db.execute(
+                    'SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
+                    (run_id,)).fetchone()
+                if not prior_gate or json.loads(prior_gate[0]) != seal['previous']:
+                    raise ValueError('gate retry lost historical admission custody')
+                db.execute('UPDATE delivery_gate_admissions SET command_id=?,recovery_json=? '
+                           'WHERE run_id=?',
+                           (payload['command_id'], canonical_json(recovery), run_id))
             db.execute("UPDATE delivery_runs SET phase='gates_retry_queued',"
                        "execution_state='queued',"
                        "outcome=NULL,error=NULL,revision=revision+1,workflow_id=?,recovery_json=?,"
@@ -194,8 +221,15 @@ def admit(store, run_id, payload, *, preflight=False):
         return response
 
 
+def gate_namespace(generation):
+    if generation not in (1, 2):
+        raise ValueError('gate retry generation exceeds the finite recovery bound')
+    return 'gates-admission' if generation == 1 else 'gates-admission-2'
+
+
 def effective_spec(store, original, recovery):
-    root = Path(original['state_dir']) / 'gates-admission'
+    root = Path(original['state_dir']) / gate_namespace(
+        recovery['execution_spec'].get('gate_retry_generation', 1))
     with store._connect() as db:
         saved = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
                            (original['run_id'],)).fetchone()

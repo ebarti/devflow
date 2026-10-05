@@ -49,6 +49,9 @@ class DeliveryLaunchers(unittest.TestCase):
         self.env = dict(os.environ, DEVFLOW_PYTHON=sys.executable,
                         GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
         self.git("init", "-q")
+        # Git maintenance can otherwise mutate .git after the preservation snapshot.
+        self.git("config", "maintenance.auto", "false")
+        self.git("config", "gc.auto", "0")
         self.git("config", "user.name", "Fixture")
         self.git("config", "user.email", "fixture@example.invalid")
         self.git("add", ".")

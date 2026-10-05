@@ -154,3 +154,15 @@ def test_preserves_long_conventional_prefix_and_rejects_control_subject():
     assert conventional_subject(goal) == goal.strip()
     with pytest.raises(ValueError, match="control"):
         conventional_subject("fix: bad\tname")
+
+
+def test_raw_goal_becomes_bounded_pr_title_without_shortening_commit_subject():
+    from devflow_temporal.delivery_broker import publication_title
+
+    goal = 'Deliver backlog issue #953 as a documentation investigation. ' + 'requirements ' * 200
+    title = publication_title(goal)
+    assert title.startswith('chore: Deliver backlog issue #953')
+    assert len(title) <= 256
+    assert title.endswith('...')
+    assert len(conventional_subject(goal)) > 256
+    assert publication_title('fix: preserve a short goal') == 'fix: preserve a short goal'

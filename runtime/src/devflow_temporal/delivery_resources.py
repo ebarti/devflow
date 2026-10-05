@@ -102,6 +102,16 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 raise ValueError('gate namespace has no durable original run')
             recovery = json.loads(row[1]) if row[1] else None
             first = True
+            if recovery and recovery.get('kind') == 'pending_publication_retry':
+                from .delivery_pending_publication import custody
+
+                custody(db, recovery)
+                if canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                    raise ValueError('pending publication execution authority changed')
+                namespace = 'publication-retry'
+                roots.add(state / namespace / 'evidence')
+                first = False
+                recovery = recovery.get('original_recovery')
             while recovery and recovery.get('kind') in {
                 'terminal_tracker_recovery', 'repair_continuation',
                 'investigation_assessment_adjudication', 'stopped_resource_closure',
@@ -156,7 +166,10 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                                    for key, value in intent.items())):
                         raise ValueError('gate namespace metadata admission changed')
                 else:
-                    admitted_namespace = 'gates-admission'
+                    from .delivery_gate_retry import gate_namespace
+
+                    admitted_namespace = gate_namespace(
+                        recovery['execution_spec'].get('gate_retry_generation', 1))
                     _ancestors(state / admitted_namespace / 'admission.json')
                     admission = read_private(state / admitted_namespace / 'admission.json')
                     admitted = db.execute(
@@ -164,7 +177,8 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                         (spec['run_id'],),
                     ).fetchone()
                     if (not admitted or canonical_json(admission) != canonical_json(recovery)
-                            or canonical_json(json.loads(admitted[0])) != canonical_json(recovery)):
+                            or (first and canonical_json(json.loads(admitted[0]))
+                                != canonical_json(recovery))):
                         raise ValueError('gate namespace gates-only admission changed')
                 roots.add(state / admitted_namespace / 'evidence')
                 if first:

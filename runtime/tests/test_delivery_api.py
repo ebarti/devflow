@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -122,7 +123,7 @@ async def test_public_policy_recovery_requires_csrf_and_reports_unavailable_read
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks])
-async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch):
+async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch, tmp_path):
     started = threading.Event()
     release = threading.Event()
 
@@ -135,9 +136,13 @@ async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkey
         run_checks = run_prechecks
 
     monkeypatch.setattr(
-        "devflow_temporal.delivery_activities._context", lambda _spec: (None, Broker())
+        "devflow_temporal.delivery_activities._context", lambda _spec: (
+            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()
+        )
     )
-    task = asyncio.create_task(activity_fn({"spec": {}, "iteration": 0, "candidate": {}}))
+    task = asyncio.create_task(activity_fn(
+        {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {}}
+    ))
     try:
         beginning = time.monotonic()
         assert await asyncio.to_thread(started.wait, 1)
@@ -152,7 +157,7 @@ async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkey
 @pytest.mark.asyncio
 @pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks, delivery_browser_qa])
 async def test_native_effect_uncertainty_is_returned_for_durable_projection(
-    activity_fn, monkeypatch
+    activity_fn, monkeypatch, tmp_path
 ):
     class Broker:
         def run_prechecks(self, _iteration, _candidate):
@@ -162,7 +167,9 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
         run_browser_qa = run_prechecks
 
     monkeypatch.setattr(
-        "devflow_temporal.delivery_activities._context", lambda _spec: (None, Broker())
+        "devflow_temporal.delivery_activities._context", lambda _spec: (
+            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()
+        )
     )
     result = await activity_fn(
         {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {"id": "candidate"}}
