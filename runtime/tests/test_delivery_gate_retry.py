@@ -435,6 +435,7 @@ def test_first_published_assessment_after_finalized_repair_keeps_historical_gran
 @pytest.fixture
 def missing_report(stopped, monkeypatch):
     from copy import deepcopy
+
     from devflow_temporal.contracts import digest
     from devflow_temporal.delivery_check_evidence import retain_artifacts
 
@@ -483,12 +484,14 @@ def test_missing_accepted_report_has_one_zero_source_reassessment_and_preserves_
         current = json.loads(db.execute(
             "SELECT recovery_json FROM delivery_gate_admissions WHERE run_id='run-1'"
         ).fetchone()[0])
-        assert db.execute('SELECT granted_iterations FROM delivery_repair_grants').fetchone()[0] == 1
+        granted = db.execute('SELECT granted_iterations FROM delivery_repair_grants').fetchone()
+        assert granted[0] == 1
     assert current['original_recovery'] == previous
     assert current['seal']['report_observation']['omitted_recipes']
     assert readback(store, spec, current)['head'] == state['candidate']['head']
     assert RunResources(spec).root.name == 'resources'
-    assert (broker.state_dir / 'published-gates-admission/admission.json').read_bytes() == original_bytes
+    assert ((broker.state_dir / 'published-gates-admission/admission.json').read_bytes()
+            == original_bytes)
     state['revision'] = 33
     store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
                   message=state['error'], candidate=state['candidate'], checks=state['checks'],

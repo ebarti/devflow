@@ -80,7 +80,8 @@ def snapshot(store, run_id, kind=KIND):
         if ci_only and history.get('kind') == CI_KIND:
             raise ValueError('this run already received its bounded CI observation retry')
         history = history.get('original_recovery')
-    if (renewed or published_after_recovery or prelaunch or report_retry) and spec['provider'] != 'fake':
+    if ((renewed or published_after_recovery or prelaunch or report_retry)
+            and spec['provider'] != 'fake'):
         from .delivery_native_preparation import native_identity
         old_payload = spec['policy']['native_identity']['runtime_payload_sha256']
         if native_identity(spec)['runtime_payload_sha256'] == old_payload:
@@ -135,7 +136,8 @@ def snapshot(store, run_id, kind=KIND):
         raise ValueError('gate retry requires the existing trusted native execution policy')
     if ((kind == PRELAUNCH_KIND and not prelaunch)
             or (previous is not None and not (
-                renewed or published_after_recovery or prelaunch or report_retry or ci_only))
+                renewed or published_after_recovery or prelaunch
+                or report_retry or ci_only))
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
@@ -143,8 +145,10 @@ def snapshot(store, run_id, kind=KIND):
             or state.get('cleanup') != ('unknown' if prelaunch else 'confirmed')
             or row['error'] != state.get('error')
             or state.get('error') not in ({'repair limit exhausted',
-                                          'required CI did not confirm this PR head'} if report_retry
-                                        else {'required CI did not confirm this PR head' if ci_only
+                                          'required CI did not confirm this PR head'}
+                                        if report_retry
+                                        else {'required CI did not confirm this PR head'
+                                              if ci_only
                                       else 'local check process cleanup is unknown' if prelaunch
                                       else 'prepublication repair limit exhausted'
                                       if unpublished else 'repair limit exhausted'})
@@ -191,7 +195,8 @@ def snapshot(store, run_id, kind=KIND):
         while ancestor and ancestor.get('kind') in {
                 'pending_publication_retry', 'repair_continuation'}:
             ancestor = ancestor.get('original_recovery')
-        if admitted and (not (renewed or published_after_recovery or prelaunch or report_retry or ci_only)
+        if admitted and (not (renewed or published_after_recovery or prelaunch
+                             or report_retry or ci_only)
                          or prior_gate != ancestor):
             raise ValueError('this run already received its bounded gate assessment retry')
     return {'row': row, 'closed': closed, 'original_spec': spec, 'attempts': attempts,
@@ -274,7 +279,8 @@ def admit(store, run_id, payload, *, preflight=False):
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
         if 'verification_test_paths' in payload:
             execution['verification_test_paths'] = payload['verification_test_paths']
-        execution['role_home_generation'] = (f'report-retry-{generation}' if seal['stage'] == 'report'
+        execution['role_home_generation'] = (f'report-retry-{generation}'
+                                              if seal['stage'] == 'report'
                                               else f'gate-retry-{generation}')
         execution['gate_retry_generation'] = generation
         if seal['stage']:
@@ -303,7 +309,8 @@ def admit(store, run_id, payload, *, preflight=False):
         _immutable(root / 'admission.json', recovery)
         preserve_resources(root, spec)
         workflow_id = (f'delivery-{run_id}-ci-retry-1' if kind == CI_KIND else
-                       f'delivery-{run_id}-report-gates-retry-{generation}' if seal['stage'] == 'report' else
+                       f'delivery-{run_id}-report-gates-retry-{generation}'
+                       if seal['stage'] == 'report' else
                        f'delivery-{run_id}-published-gates-retry-{generation}' if seal['stage']
                        else f'delivery-{run_id}-gates-retry-{generation}')
         response = {'run_id': run_id, 'phase': 'gates_retry_queued', 'workflow_id': workflow_id,

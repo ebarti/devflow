@@ -80,7 +80,8 @@ def junit_counts(reference: dict, candidate_id: str, state_dir: Path) -> dict:
     if len(reports) != 1:
         raise ValueError('required owned JUnit report is missing')
     content = Path(reports[0]['path']).read_bytes()
-    if len(content) > 50 * 1024 * 1024 or b'<!DOCTYPE' in content.upper() or b'<!ENTITY' in content.upper():
+    if (len(content) > 50 * 1024 * 1024 or b'<!DOCTYPE' in content.upper()
+            or b'<!ENTITY' in content.upper()):
         raise ValueError('JUnit report contains unsupported declarations or exceeds its bound')
     try:
         root = ET.fromstring(content)

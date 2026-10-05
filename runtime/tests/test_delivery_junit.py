@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import subprocess
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from test_delivery_native import native_configuration as native_configuration
 from test_delivery_intake import intake_fixture as intake_fixture
+from test_delivery_native import native_configuration as native_configuration
 
 from devflow_temporal.delivery_check_evidence import junit_counts, retain_artifacts
 
@@ -18,7 +18,8 @@ def test_actual_node_case_outcomes_are_not_inferred_from_exit_or_log(tmp_path, o
     script = tmp_path / 'report.test.mjs'
     script.write_text('import test from "node:test"; test("actual case",'
                       + ('{skip:true},' if outcome == 'skip' else '')
-                      + '() => {' + ('throw Error("measured failure");' if outcome == 'fail' else '')
+                      + '() => {'
+                      + ('throw Error("measured failure");' if outcome == 'fail' else '')
                       + '});\n')
     folder = tmp_path / 'check'
     source = folder / 'pytest-artifacts'
@@ -107,4 +108,5 @@ def test_actual_broker_enforces_delegated_report_and_retains_it_after_cleanup(
                   message='controlled report fixture', checks={'local': result},
                   iteration=0, outcome='blocked', cleanup='none')
     assert RunResources(spec).finalize('blocked')['resource_cleanup'] == 'confirmed'
-    assert junit_counts(report['artifacts'], candidate['id'], Path(spec['state_dir'])) == report['junit']
+    assert (junit_counts(report['artifacts'], candidate['id'], Path(spec['state_dir']))
+            == report['junit'])

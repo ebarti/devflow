@@ -120,7 +120,8 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path) -> list[di
                 or not (checkout / relative).resolve(strict=True).is_relative_to(checkout)):
             raise ValueError('planned JUnit recipe has invalid bounded execution authority')
         provenance = {'accepted_plan_sha256': digest(plan), 'recipe': 'checks.' + key,
-                      'metadata': {'scripts/checks.toml': hashlib.sha256(path.read_bytes()).hexdigest()},
+                      'metadata': {'scripts/checks.toml': hashlib.sha256(
+                          path.read_bytes()).hexdigest()},
                       'recipe_sha256': digest(recipe)}
         check_id = 'planned-junit-' + digest(provenance)[:16]
         report = evidence / check_id / 'pytest-artifacts/junit.xml'
