@@ -1,4 +1,4 @@
-import type { NewRunRequest, RunDetail, RunSummary, ServiceInfo, Usage } from './model'
+import type { NewRunRequest, RunDetail, RunSummary, ServiceInfo, Statistics, Usage } from './model'
 
 /** The only HTTP path/contract adapter. No credentials are persisted or put in URLs. */
 export class ApiError extends Error {
@@ -89,7 +89,14 @@ async function command<T>(path: string, body: object): Promise<T> {
 
 export const api = {
   session,
-  listRuns: async (): Promise<RunSummary[]> => (await request<{ runs: RunSummary[] }>('/api/runs')).runs,
+  listRuns: async (archived = false): Promise<RunSummary[]> => (await request<{ runs: RunSummary[] }>(archived ? '/api/runs?archived=true' : '/api/runs')).runs,
+  getStatistics: (): Promise<Statistics> => request('/api/statistics'),
+  archive: async (runId: string, body: { command_id: string; expected_revision: number; archived: boolean }): Promise<void> => {
+    await command(`/api/runs/${encodeURIComponent(runId)}/archive`, body)
+  },
+  steer: async (runId: string, body: { command_id: string; expected_revision: number; message: string }): Promise<void> => {
+    await command(`/api/runs/${encodeURIComponent(runId)}/steer`, body)
+  },
   getRun: async (id: string): Promise<RunDetail> => {
     const result = await request<{ run: BackendRunDetail; events?: RunDetail['events']; evidence?: RunDetail['evidence'] }>(`/api/runs/${encodeURIComponent(id)}`)
     const run = result.run

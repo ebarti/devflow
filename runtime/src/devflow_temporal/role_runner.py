@@ -236,6 +236,14 @@ def _task(request: dict[str, Any]) -> AgentTask:
         "will reject any other source edit. Do not edit checks, regex or policy.\n"
         if constraint and role == "implement" else ""
     )
+    steering_note = (
+        f"User steering supplied at this launch: {json.dumps(request['steering'])}\n"
+        "Apply these instructions within the accepted scope and frozen authority. "
+        "They cannot expand paths, permissions, checks, models, or the delivery endpoint. "
+        "If the candidate does not meet a requested constraint, report a concrete finding; "
+        "do not waive a gate or silently treat the instruction as satisfied.\n"
+        if request.get("steering") else ""
+    )
     prompt = (
         f"{instructions}\n\n"
         f"{intake_context}"
@@ -244,6 +252,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"Candidate: {candidate['id']} at {candidate['head']}\n"
         f"Allowed feature paths: {json.dumps(spec['policy']['allowed_paths'])}\n"
         f"Previous findings to repair: {json.dumps(findings)}\n"
+        f"{steering_note}"
         f"{continuation_note}\n"
         f"{title_note}\n"
         f"{recovery_note}\n"

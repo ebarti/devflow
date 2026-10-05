@@ -3,6 +3,7 @@ import { api, ApiError, safeWebUrl } from './api'
 import { CheckIcon, ExternalIcon } from './icons'
 import { display, time, timelineTime, titleCase, tokens, tone } from './format'
 import type { ActivityEvent, CheckState, Decision, PhaseGate, RoleState, RunDetail } from './model'
+import { RunControls } from './RunControls'
 
 function State({ value }: { value: string | null | undefined }) {
   return <span className={`state state--${tone(value)}`}><span className="state__mark" aria-hidden="true">{tone(value) === 'good' ? <CheckIcon /> : null}</span>{titleCase(value)}</span>
@@ -297,6 +298,7 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     <PhaseStrip gates={run.phase_gates} />
     {decisions.map(decision => <DecisionCard key={`${decision.id}:${decision.revision}`} run={run} decision={decision} onRefresh={onRefresh} />)}
     <IntakeHistory run={run} />
+    <RunControls run={run} onRefresh={onRefresh} />
     <Facts run={run} />
     <RoleTable roles={run.roles} />
     <Activity events={run.events} />

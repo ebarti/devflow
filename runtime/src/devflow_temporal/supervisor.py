@@ -174,6 +174,9 @@ class DeliverySupervisor:
         request = {**request, "result_path": str(result_path), "start_path": str(start_path)}
         await self._acquire_capacity(job_key)
         try:
+            from .delivery_dashboard import launch_steering
+
+            request = launch_steering(self.store, request, job_key)
             _private_json(request_path, request)
             if Path("/usr/bin/sandbox-exec").is_file():
                 profile, role_env = prepare_sandbox(request, folder)
@@ -317,6 +320,9 @@ class DeliverySupervisor:
                 await self._acquire_capacity(job_key, cancelled=cancelled)
             elif not (folder / "native-process.json").is_file():
                 return self._mark_unknown(job_key, "native prelaunch identity gap")
+            from .delivery_dashboard import launch_steering
+
+            native_request = launch_steering(self.store, native_request, job_key)
             _private_json(request_path, native_request)
             _, environment = prepare_native_role(native_request, folder)
             process = NativeProcess(

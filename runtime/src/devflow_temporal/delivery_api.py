@@ -261,19 +261,51 @@ def create_app(config_path: Path) -> FastAPI:
                 """SELECT COUNT(*) FROM delivery_attempts
                    WHERE state IN ('starting','running','unknown')"""
             ).fetchone()[0]
+        from .delivery_dashboard import runtime_identity
+
+        identity = runtime_identity()
         return {
             "status": "running",
             "pid": os.getpid(),
-            "version": "0.2.0-local",
+            "version": identity["release"] or (
+                f"local-{identity['revision'][:8]}" if identity["revision"] else "unknown"
+            ),
+            "runtime_identity": identity,
             "temporal": service.temporal_status,
             "capacity": {"limit": service.config.raw.get("capacity", 2), "active": active},
             "policy": service.config.public_policy(),
         }
 
     @app.get("/api/runs")
-    async def list_runs(request: Request) -> dict[str, Any]:
+    async def list_runs(request: Request, archived: bool = False) -> dict[str, Any]:
         _host(request)
-        return {"runs": service.store.list_runs()}
+        return {"runs": service.store.list_runs(archived)}
+
+    @app.get("/api/statistics")
+    async def statistics(request: Request) -> dict[str, Any]:
+        _host(request)
+        from .delivery_dashboard import statistics_for
+
+        return await asyncio.to_thread(statistics_for, service.store)
+
+    async def dashboard_command(request: Request, run_id: str, kind: str):
+        _mutation(request)
+        from .delivery_dashboard import mutate
+
+        try:
+            return await asyncio.to_thread(
+                mutate, service.store, run_id, kind, await request.json()
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/archive")
+    async def archive(request: Request, run_id: str):
+        return await dashboard_command(request, run_id, "archive")
+
+    @app.post("/api/runs/{run_id}/steer")
+    async def steer(request: Request, run_id: str):
+        return await dashboard_command(request, run_id, "steer")
 
     @app.post("/api/runs")
     async def submit(request: Request) -> dict[str, Any]:
@@ -545,6 +577,7 @@ def create_app(config_path: Path) -> FastAPI:
     @app.get("/runs/{run_id}")
     @app.get("/new")
     @app.get("/settings")
+    @app.get("/statistics")
     async def dashboard(request: Request, run_id: str | None = None):
         _host(request)
         if (dist / "index.html").is_file():

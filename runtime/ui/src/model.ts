@@ -15,6 +15,8 @@ export interface Usage {
 }
 
 export interface RunSummary {
+  archived?: boolean
+  runtime_identity?: RuntimeIdentity | null
   id: string
   run_id?: string | null
   work_id?: string | null
@@ -111,6 +113,8 @@ export interface Evidence {
 }
 
 export interface RunDetail extends RunSummary {
+  can_steer?: boolean
+  steering?: Array<{ id: number; message: string; created_at: string; included_in: Array<{ role: string; job_key: string }> }>
   investigation_adjudication?: {
     raw_status: 'findings'
     raw_findings: string[]
@@ -176,6 +180,7 @@ export interface RepositoryInfo {
 }
 
 export interface ServiceInfo {
+  runtime_identity?: RuntimeIdentity | null
   status?: string | null
   version?: string | null
   temporal?: string | { status?: string | null; address?: string | null } | null
@@ -183,6 +188,26 @@ export interface ServiceInfo {
   repositories?: RepositoryInfo[] | null
   policy?: { roles?: Record<string, { model?: string | null; effort?: string | null }> | null; repositories?: RepositoryInfo[] | null; authorized_endpoint?: string | null; intake_enabled?: boolean | null } | null
 }
+
+export interface RuntimeIdentity {
+  release: string | null
+  revision: string | null
+  local_digest: string | null
+  dirty?: boolean | null
+}
+
+export interface Cohort extends RuntimeIdentity {
+  provider: string
+  runs: number; terminal: number; active: number; delivered: number; blocked: number; cancelled: number
+  first_pass_delivered: number; success_rate: number | null; repairs: number
+  unknown_outcomes: number
+  median_duration_seconds: number | null; duration_observations: number
+  attempts: number; token_observations: number; observed_tokens: number | null
+  cost_observations: number; observed_cost_usd: number | null
+  roles: Record<string, { attempts: number; observed_tokens: number; token_observations: number }>
+}
+
+export interface Statistics { total_runs: number; cohorts: Cohort[]; definitions: string }
 
 export interface NewRunRequest {
   command_id: string

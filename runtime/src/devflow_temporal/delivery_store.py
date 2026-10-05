@@ -377,6 +377,10 @@ class DeliveryStore:
                 )"""
             )
 
+            from .delivery_dashboard import initialize
+
+            initialize(db)
+
     def policy_recovery_precheck(self, run_id: str) -> dict:
         from .delivery_policy_recovery import precheck
 
@@ -579,6 +583,10 @@ class DeliveryStore:
                     timestamp,
                 ),
             )
+            from .delivery_dashboard import runtime_identity
+
+            db.execute("INSERT INTO delivery_dashboard_state(run_id,identity_json) VALUES (?,?)",
+                       (run_id, canonical_json(runtime_identity())))
             db.execute(
                 "INSERT INTO delivery_outbox(run_id,state,updated_at) VALUES (?,'pending',?)",
                 (run_id, timestamp),
@@ -3048,10 +3056,12 @@ class DeliveryStore:
                 (command_id,),
             )
 
-    def list_runs(self) -> list[dict[str, Any]]:
+    def list_runs(self, archived: bool = False) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM delivery_runs ORDER BY updated_at DESC LIMIT 100"
+                "SELECT r.* FROM delivery_runs r LEFT JOIN delivery_dashboard_state d "
+                "ON r.run_id=d.run_id WHERE COALESCE(d.archived,0)=? ORDER BY r.updated_at DESC",
+                (int(archived),),
             ).fetchall()
             return [self._compact(dict(row)) for row in rows]
 
@@ -3079,6 +3089,9 @@ class DeliveryStore:
         from .delivery_resources import projected_cleanup
 
         with self._connect() as db:
+            from .delivery_dashboard import presentation
+
+            dashboard_state = presentation(db, row["run_id"])
             active = db.execute(
                 "SELECT COUNT(*) FROM delivery_attempts WHERE run_id=? "
                 "AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
@@ -3090,6 +3103,7 @@ class DeliveryStore:
             }),
         )
         return {
+            **dashboard_state,
             "id": row["run_id"],
             "run_id": row["run_id"],
             "work_id": row["work_id"],
@@ -3128,6 +3142,11 @@ class DeliveryStore:
                 )
             ]
         compact = self._compact(row)
+        from .delivery_dashboard import steering_history, steering_open
+
+        with self._connect() as db:
+            steering = steering_history(db, run_id)
+            can_steer = not compact["execution_retired"] and steering_open(db, row)
         spec = self.effective_spec(run_id)
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         adjudication = (recovery if recovery and recovery.get("kind")
@@ -3357,6 +3376,8 @@ class DeliveryStore:
             "preparation": spec.get("preparation"),
             "checks": checks,
             "tracker": tracker,
+            "steering": steering,
+            "can_steer": can_steer,
             "usage": json.loads(row["usage_json"]) if row["usage_json"] else {},
             "decisions": [json.loads(row["decision_json"])]
             if row["decision_json"] and json.loads(row["decision_json"]) is not None
