@@ -597,6 +597,43 @@ async def test_public_evidence_keeps_historical_codex_logs(api_fixture):
 
 
 @pytest.mark.asyncio
+async def test_repeated_gate_attempts_have_distinct_stable_evidence(api_fixture):
+    path, request = api_fixture
+    app = create_app(path)
+    store = app.state.delivery.store
+    store.submit(request)
+    root = Path(store.spec("run-1")["state_dir"])
+    with store._connect() as db:
+        for job_key, text in (("original-review", "old finding"), ("fresh-review", "fresh pass")):
+            folder = root / "attempts" / job_key
+            folder.mkdir(parents=True)
+            (folder / "process.log").write_text(text)
+            db.execute(
+                """INSERT INTO delivery_attempts
+                   (job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup)
+                   VALUES (?,?,'review',0,'candidate','finished','{}','confirmed')""",
+                (job_key, "run-1"),
+            )
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
+        detail = (await browser.get("/api/runs/run-1")).json()
+        assert {role["attempt_id"] for role in detail["run"]["roles"]} == {
+            "original-review", "fresh-review"}
+        ids = [item["id"] for item in detail["evidence"] if item["id"].startswith("role-review-")]
+        assert ids == ["role-review-0", "role-review-0-fresh-review"]
+        for evidence_id, expected in zip(ids, ("old finding", "fresh pass"), strict=True):
+            response = await browser.get(f"/api/runs/run-1/evidence/{evidence_id}")
+            assert response.status_code == 200
+            assert response.json()["text"] == expected
+        # Removing an older log must not reassign its stable URL to the retry.
+        (root / "attempts" / "original-review" / "process.log").unlink()
+        assert (await browser.get("/api/runs/run-1/evidence/role-review-0")).status_code == 404
+        response = await browser.get("/api/runs/run-1/evidence/role-review-0-fresh-review")
+        assert response.status_code == 200
+        assert response.json()["text"] == "fresh pass"
+
+
+@pytest.mark.asyncio
 async def test_terminal_cancel_is_conflict_without_pending_mutation(api_fixture):
     path, request = api_fixture
     app = create_app(path)

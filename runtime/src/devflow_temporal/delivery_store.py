@@ -3232,6 +3232,7 @@ class DeliveryStore:
             roles.append(
                 {
                     "role": attempt["role"],
+                    "attempt_id": attempt["job_key"],
                     "iteration": attempt["iteration"],
                     "state": attempt["state"],
                     "session_id": attempt["session_id"],
@@ -3506,7 +3507,7 @@ class DeliveryStore:
         with self._connect() as db:
             attempts = db.execute(
                 """SELECT job_key,role,iteration,process_identity,result_json
-                   FROM delivery_attempts WHERE run_id=?""",
+                   FROM delivery_attempts WHERE run_id=? ORDER BY rowid""",
                 (run_id,),
             ).fetchall()
             browser_effects = {
@@ -3518,7 +3519,12 @@ class DeliveryStore:
                     (run_id,),
                 )
             }
+        role_ids: set[str] = set()
         for attempt in attempts:
+            role_id = f"role-{attempt['role']}-{attempt['iteration']}"
+            evidence_id = (role_id if role_id not in role_ids
+                           else f"{role_id}-{attempt['job_key']}")
+            role_ids.add(role_id)
             folder = root / "attempts" / attempt["job_key"]
             result = json.loads(attempt["result_json"]) if attempt["result_json"] else {}
             contained_log = folder / "container" / "container.log"
@@ -3534,7 +3540,7 @@ class DeliveryStore:
             if path.is_file():
                 indexed.append(
                     {
-                        "id": f"role-{attempt['role']}-{attempt['iteration']}",
+                        "id": evidence_id,
                         "label": f"{attempt['role']} log, attempt {attempt['iteration']}",
                         "path": path,
                         "expected_sha256": result.get("container_log_sha256")

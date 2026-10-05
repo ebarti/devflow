@@ -67,3 +67,14 @@ it('shows the actual failed QA finding above the workflow instead of relying on 
   expect(blocker.textContent).toContain('repair budget')
   expect(blocker.compareDocumentPosition(screen.getByRole('region', { name: 'Workflow phase gates' })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
 })
+
+it('retains repeated review attempts without duplicate React keys', () => {
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+  render(<RunDetails run={{ ...mockRun, roles: [
+    { role: 'review', state: 'finished', iteration: 0, attempt_id: 'original', session_id: 'old-review' },
+    { role: 'review', state: 'finished', iteration: 0, attempt_id: 'retry', session_id: 'fresh-review' },
+  ] }} onRefresh={async () => {}} />)
+  expect(screen.getByText('old-review')).toBeTruthy()
+  expect(screen.getByText('fresh-review')).toBeTruthy()
+  expect(errors).not.toHaveBeenCalled()
+})

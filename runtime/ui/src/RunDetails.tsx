@@ -48,7 +48,7 @@ function RoleTable({ roles }: { roles: RoleState[] | null | undefined }) {
     <h2 id="roles-heading">Roles</h2>
     <div className="table-scroll"><table>
       <thead><tr><th>Role</th><th>State</th><th>Session</th><th>Tokens</th></tr></thead>
-      <tbody>{roles?.length ? roles.map((role, index) => <tr key={`${role.role}-${role.iteration ?? role.attempt_id ?? index}`}>
+      <tbody>{roles?.length ? roles.map((role, index) => <tr key={`${role.role}-${role.attempt_id ?? index}`}>
         <td>{titleCase(role.role)}</td>
         <td><State value={role.state} /></td>
         <td className="mono">{display(role.session_id, 'Unknown')}</td>
@@ -142,7 +142,7 @@ function Operations({ run }: { run: RunDetail }) {
       <div><dt>Environment digest</dt><dd className="mono">{display(run.candidate?.environment_digest)}</dd></div>
       <div><dt>Protocol revision</dt><dd>{display(run.protocol_revision)}</dd></div>
     </dl>
-    {run.roles?.length ? <div className="role-provenance"><h3>Role provenance</h3><ul>{run.roles.map((role, index) => <li key={`${role.role}-${role.iteration ?? role.attempt_id ?? index}`}><strong>{titleCase(role.role)}</strong><span>Model {display(role.model, 'unobserved')} · Effort {display(role.effort, 'unobserved')} · Iteration {display(role.iteration, 'unknown')} · Cleanup {display(role.cleanup)} · Last activity {time(role.last_activity_at)}{role.summary ? ` · ${role.summary}` : ''}{role.findings?.length ? ` · Findings: ${role.findings.join('; ')}` : ''}</span></li>)}</ul></div> : null}
+    {run.roles?.length ? <div className="role-provenance"><h3>Role provenance</h3><ul>{run.roles.map((role, index) => <li key={`${role.role}-${role.attempt_id ?? index}`}><strong>{titleCase(role.role)}</strong><span>Model {display(role.model, 'unobserved')} · Effort {display(role.effort, 'unobserved')} · Iteration {display(role.iteration, 'unknown')} · Cleanup {display(role.cleanup)} · Last activity {time(role.last_activity_at)}{role.summary ? ` · ${role.summary}` : ''}{role.findings?.length ? ` · Findings: ${role.findings.join('; ')}` : ''}</span></li>)}</ul></div> : null}
     {run.tracker?.conflict ? <p className="inline-alert">Tracker conflict: {run.tracker.conflict}</p> : null}
   </section>
 }
