@@ -685,7 +685,7 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if recovery is not None:
-            if recovery.get("kind") == "published_gate_retry":
+            if recovery.get("kind") in {"published_gate_retry", "prepublication_gate_retry"}:
                 return await self._resume_published_gates(spec, recovery)
             if recovery.get("kind") == "terminal_tracker_recovery":
                 return await self._resume_terminal_tracker(spec, recovery)
@@ -859,9 +859,10 @@ class DeliveryWorkflow:
         )
 
     async def _resume_published_gates(self, spec, recovery):
+        published = recovery.get("kind") == "published_gate_retry"
         if (recovery.get("execution_spec") != spec
                 or recovery.get("command", {}).get("additional_iterations") != 0):
-            raise ValueError("published gate retry changed its zero-repair authority")
+            raise ValueError("gate retry changed its zero-repair authority")
         self.state = deepcopy(recovery["state"])
         self.state.update(phase="gates_retry", execution_state="running", outcome=None,
                           error=None, cleanup="none", checks={}, findings=[],
@@ -878,14 +879,14 @@ class DeliveryWorkflow:
             return await self._stop(spec, "gate retry preflight failed: " + type(exc).__name__)
         self.state["revision"] += 1
         await self._project(spec, "gates_retry_started",
-                            "Rechecking unchanged published code with fresh review and QA")
+                            "Rechecking preserved code with fresh gates, review and QA")
         return await self._run_iterations(
             spec, start_iteration=self.state["iteration"],
             prior_implementer_session=next((role.get("session_id") for role in reversed(
                 self.state["roles"]) if role.get("role") == "implement"), None),
             repair_findings=[], continuation=None, recovery=None,
             authorized_max_iteration=self.state["iteration"],
-            resume_prechecks=True, published_checkpoint=True,
+            resume_prechecks=True, published_checkpoint=published,
         )
 
     async def _resume_metadata(self, spec, recovery):

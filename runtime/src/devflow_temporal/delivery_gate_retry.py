@@ -1,4 +1,4 @@
-"""One explicit fresh assessment of an unchanged, stopped published candidate."""
+"""One explicit fresh gate execution on an unchanged, stopped candidate."""
 from __future__ import annotations
 
 import hashlib
@@ -17,9 +17,11 @@ from .delivery_preparation import _lock
 from .delivery_resources import read_private, write_private
 
 KIND = 'published_gate_retry'
+PREPUBLICATION_KIND = 'prepublication_gate_retry'
 
 
-def snapshot(store, run_id):
+def snapshot(store, run_id, kind=KIND):
+    unpublished = kind == PREPUBLICATION_KIND
     spec = store.effective_spec(run_id)
     row, attempts, effects, claim = _rows(store, run_id)
     closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
@@ -32,33 +34,51 @@ def snapshot(store, run_id):
     implementation = next((r for r in roles if r.get('role') == 'implement'), None)
     failed = [r for r in roles if r.get('role') in {'review', 'verify'}
               and r.get('status') != 'pass' and r.get('findings')]
+    precheck = state.get('checks', {}).get('prepublish', {})
+    failed_gate = (precheck.get('state') == 'failed'
+                   and precheck.get('source_unchanged') is True
+                   and precheck.get('candidate_id') == candidate['id']
+                   and state.get('checks') == json.loads(row['checks_json'] or '{}')
+                   and not any(e['kind'] == 'publish' for e in effects)
+                   and any(r.get('passed') is False and r.get('cleanup') == 'confirmed'
+                           for r in precheck.get('results', []))) if unpublished else bool(failed)
     if (spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local'):
         raise ValueError('gate retry requires the existing trusted native execution policy')
     if (previous is not None or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
             or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
-            or state.get('cleanup') != 'confirmed' or state.get('error') != 'repair limit exhausted'
+            or state.get('cleanup') != 'confirmed'
+            or row['error'] != state.get('error')
+            or state.get('error') != ('prepublication repair limit exhausted'
+                                      if unpublished else 'repair limit exhausted')
             or row['protocol_revision'] != state.get('revision')
             or row['iteration'] != state.get('iteration')
             or closed['request_digest'] != row['request_digest']
             or closed['recovery_digest'] is not None
-            or not implementation or implementation.get('status') != 'pass' or not failed
+            or not implementation or implementation.get('status') != 'pass' or not failed_gate
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
             or any(e['state'] != 'complete' or not e['observed_json'] for e in effects)
             or claim is not None):
         raise ValueError('gate retry requires a closed, finalized failed gate and released claim')
     frozen = json.loads(row['candidate_json'])
-    publication = json.loads(row['pr_json'])
+    publication = json.loads(row['pr_json'] or 'null')
+    remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])
+    publication_matches = (
+        publication is None and state.get('pull_request') is None and pr is None
+        and not remote and candidate['head'] == spec['base_sha']
+        and implementation.get('candidate') == candidate
+    ) if unpublished else (
+        isinstance(publication, dict) and publication == state.get('pull_request')
+        and pr and pr['state'] == 'OPEN' and not pr['isDraft']
+        and pr['number'] == publication['number'] and pr['headRefOid'] == candidate['head']
+        and remote and remote.split()[0] == candidate['head']
+        and not _git(broker.checkout, 'status', '--porcelain', '--untracked-files=no')
+    )
     if (any(candidate.get(k) != frozen.get(k) for k in candidate)
-            or frozen != state.get('candidate') or publication != state.get('pull_request')
-            or not pr or pr['state'] != 'OPEN' or pr['isDraft']
-            or pr['number'] != publication['number'] or pr['headRefOid'] != candidate['head']
-            or _git(broker.checkout, 'status', '--porcelain', '--untracked-files=no')
+            or frozen != state.get('candidate') or not publication_matches
             or _git(broker.checkout, 'branch', '--show-current') != spec['branch']
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') != spec['origin_url']
             or _git(broker.source, 'remote', 'get-url', 'origin') != spec['origin_url']
-            or _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch']).split()[0]
-            != candidate['head']
             or not broker._changed_paths() <= set(spec['policy']['allowed_paths'])):
         raise ValueError('gate retry lost unchanged owned source or exact published PR head')
     config = DeliveryConfig.load(Path(spec['config_path']))
@@ -75,21 +95,26 @@ def snapshot(store, run_id):
 
 
 def admit(store, run_id, payload, *, preflight=False):
+    kind = payload.get('continuation_kind') if isinstance(payload, dict) else None
+    unpublished = kind == PREPUBLICATION_KIND
+    head_field = 'expected_candidate_head' if unpublished else 'expected_pr_head'
     fields = {'continuation_kind', 'command_id', 'expected_revision', 'expected_iteration',
-              'expected_candidate_id', 'expected_pr_number', 'expected_pr_head',
-              'additional_iterations'}
+              'expected_candidate_id', head_field, 'additional_iterations'}
+    if not unpublished:
+        fields.add('expected_pr_number')
     if (not isinstance(payload, dict) or set(payload) != fields
-            or payload.get('continuation_kind') != KIND
+            or kind not in {KIND, PREPUBLICATION_KIND}
             or not isinstance(payload.get('command_id'), str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', payload['command_id'])
             or any(type(payload.get(k)) is not int or payload[k] < low for k, low in (
-                ('expected_revision', 1), ('expected_iteration', 0), ('expected_pr_number', 1)))
+                ('expected_revision', 1), ('expected_iteration', 0),
+                *([] if unpublished else [('expected_pr_number', 1)])))
             or type(payload.get('additional_iterations')) is not int
             or payload['additional_iterations'] != 0
             or any(not isinstance(payload.get(k), str)
                    or not re.fullmatch(r'[0-9a-f]{' + str(n) + '}', payload[k])
-                   for k, n in (('expected_candidate_id', 64), ('expected_pr_head', 40)))):
-        raise ValueError('published gate retry requires an exact zero-repair request')
+                   for k, n in (('expected_candidate_id', 64), (head_field, 40)))):
+        raise ValueError('gate retry requires an exact zero-repair request')
     command_digest = digest({'run_id': run_id, **payload})
     with store._connect() as db:
         prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
@@ -98,13 +123,14 @@ def admit(store, run_id, payload, *, preflight=False):
         if prior['request_digest'] != command_digest:
             raise ValueError('command ID already belongs to different inputs')
         return json.loads(prior['response_json'])
-    seal = snapshot(store, run_id)
+    seal = snapshot(store, run_id, kind)
     if (payload['expected_revision'] != seal['row']['protocol_revision']
             or payload['expected_iteration'] != seal['row']['iteration']
             or payload['expected_candidate_id'] != seal['candidate']['id']
-            or payload['expected_pr_head'] != seal['candidate']['head']
-            or payload['expected_pr_number'] != seal['publication']['number']):
-        raise ValueError('stale published gate retry checkpoint')
+            or payload[head_field] != seal['candidate']['head']
+            or (not unpublished
+                and payload['expected_pr_number'] != seal['publication']['number'])):
+        raise ValueError('stale gate retry checkpoint')
     if preflight:
         return {'run_id': run_id, 'preflight': True, 'implementation_authority': False,
                 'additional_iterations': 0, 'candidate_id': seal['candidate']['id']}
@@ -125,16 +151,17 @@ def admit(store, run_id, payload, *, preflight=False):
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
         execution['role_home_generation'] = 'gate-retry-1'
         execution['gate_retry_generation'] = 1
-        if digest(snapshot(store, run_id)) != digest(seal):
+        if digest(snapshot(store, run_id, kind)) != digest(seal):
             raise ValueError('stopped gate checkpoint changed during runtime preparation')
         after = DeliveryBroker(store, execution).candidate()
         if any(after[k] != seal['candidate'][k]
                for k in ('id', 'head', 'base_sha', 'content_sha256', 'environment_digest')):
             raise ValueError('gate retry changed feature source')
-        recovery = {'kind': KIND, 'command': payload, 'seal': seal,
+        recovery = {'kind': kind, 'command': payload, 'seal': seal,
                     'original_recovery': None, 'original_spec': spec, 'execution_spec': execution,
                     'state': seal['closed']['result'], 'candidate': after,
-                    'publication': {**seal['publication'], 'candidate': after}}
+                    'publication': (None if unpublished
+                                    else {**seal['publication'], 'candidate': after})}
         _immutable(root / 'admission.json', recovery)
         preserve_resources(root, spec)
         workflow_id = f'delivery-{run_id}-gates-retry-1'
@@ -162,7 +189,7 @@ def admit(store, run_id, payload, *, preflight=False):
             db.execute('INSERT INTO delivery_commands VALUES (?,?,?,?)',
                        (payload['command_id'], run_id, command_digest, canonical_json(response)))
             store._event(db, run_id, row['revision'] + 1, 'gates_retry_queued',
-                         'Fresh gates on the existing PR; no implementation or repair grant',
+                         'Fresh candidate gates; no implementation or repair grant',
                          response)
         return response
 
@@ -186,7 +213,14 @@ def readback(store, spec, recovery):
         raise ValueError('gate retry source or execution authority changed')
     broker = DeliveryBroker(store, spec)
     pr = broker._existing_pr()
-    if (not pr or pr['number'] != recovery['publication']['number'] or pr['state'] != 'OPEN'
+    unpublished = recovery['kind'] == PREPUBLICATION_KIND
+    if unpublished:
+        if (pr is not None or recovery['publication'] is not None
+                or recovery['candidate']['head'] != spec['base_sha']
+                or _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])
+                or not broker._changed_paths() <= set(spec['policy']['allowed_paths'])):
+            raise ValueError('gate retry unpublished candidate acquired publication or lost scope')
+    elif (not pr or pr['number'] != recovery['publication']['number'] or pr['state'] != 'OPEN'
             or pr['headRefOid'] != recovery['candidate']['head']):
         raise ValueError('gate retry exact published PR head changed')
     if spec['provider'] != 'fake':

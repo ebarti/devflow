@@ -992,7 +992,8 @@ class DeliveryStore:
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
         if (isinstance(supplied, dict)
-                and supplied.get('continuation_kind') == 'published_gate_retry'):
+                and supplied.get('continuation_kind') in {
+                    'published_gate_retry', 'prepublication_gate_retry'}):
             from .delivery_gate_retry import admit
 
             return admit(self, run_id, supplied, preflight=preflight)
@@ -2549,7 +2550,8 @@ class DeliveryStore:
                 from .delivery_gate_retry import effective_repair
 
                 return effective_repair(self, recovery)
-            if recovery and recovery.get('kind') == 'published_gate_retry':
+            if recovery and recovery.get('kind') in {
+                    'published_gate_retry', 'prepublication_gate_retry'}:
                 from .delivery_gate_retry import effective_spec
 
                 return effective_spec(self, original, recovery)

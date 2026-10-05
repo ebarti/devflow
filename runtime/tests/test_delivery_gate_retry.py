@@ -8,9 +8,153 @@ from test_delivery_metadata_recovery import published as published
 from test_delivery_store import service as service
 
 from devflow_temporal.contracts import canonical_json
-from devflow_temporal.delivery_gate_retry import KIND, readback
+from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_gate_retry import KIND, PREPUBLICATION_KIND, readback
 from devflow_temporal.delivery_resources import RunResources
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+
+@pytest.fixture
+def unpublished(service, monkeypatch):
+    store, request = service
+    store.submit(request)
+    spec = store.spec('run-1')
+    broker = DeliveryBroker(store, spec)
+    broker.prepare()
+    (broker.checkout / 'README.md').write_text('Owned unpublished candidate\n')
+    candidate = broker.candidate()
+    implementation = {'role': 'implement', 'iteration': 0, 'status': 'pass',
+                      'session_id': 'original-implementation', 'cleanup': 'confirmed',
+                      'candidate': candidate}
+    checks = {'prepublish': {'state': 'failed', 'source_unchanged': True,
+                            'candidate_id': candidate['id'],
+                            'results': [{'id': 'packaging', 'passed': False,
+                                         'cleanup': 'confirmed', 'exit_code': 1}]}}
+    state = {'run_id': 'run-1', 'revision': 9, 'iteration': 0, 'phase': 'blocked',
+             'execution_state': 'blocked', 'outcome': 'blocked', 'cleanup': 'confirmed',
+             'error': 'prepublication repair limit exhausted', 'candidate': candidate,
+             'pull_request': None, 'candidate_revision': 2, 'roles': [implementation],
+             'checks': checks, 'usage': {}, 'findings': ['Historical packaging failure']}
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message=state['error'], candidate=candidate, pull_request=None, checks=checks,
+                  iteration=0, protocol_revision=9, outcome='blocked', cleanup='confirmed',
+                  error=state['error'])
+    with store._connect() as db:
+        db.execute("INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,"
+                   "state,session_id,result_json,cleanup) VALUES "
+                   "('original','run-1','implement',0,?,'finished',?,?, 'confirmed')",
+                   (candidate['id'], implementation['session_id'], canonical_json(implementation)))
+        db.execute("UPDATE delivery_runs SET workflow_id='delivery-run-1' WHERE run_id='run-1'")
+        store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
+    closed = {'workflow_id': 'delivery-run-1', 'execution_run_id': 'closed-original',
+              'request_digest': spec['request_digest'], 'recovery_digest': None, 'result': state}
+    monkeypatch.setattr(store, '_completed_temporal_result', lambda *_args, **_kw: closed)
+    monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_args, **_kw: None)
+    monkeypatch.setattr('devflow_temporal.delivery_gate_retry._stopped_cleanup', lambda _: {})
+    request = {'continuation_kind': PREPUBLICATION_KIND, 'command_id': 'retry-prechecks-1',
+               'expected_revision': 9, 'expected_iteration': 0,
+               'expected_candidate_id': candidate['id'],
+               'expected_candidate_head': candidate['head'], 'additional_iterations': 0}
+    return store, broker, state, request
+
+
+def test_unpublished_retry_retains_candidate_failure_budget_and_one_admission(unpublished):
+    store, broker, state, request = unpublished
+    before = broker.candidate()
+    assert store.repair_admission_preflight('run-1', request)['additional_iterations'] == 0
+    admitted = store.continue_repair('run-1', request)
+    assert store.continue_repair('run-1', request) == admitted
+    spec = store.effective_spec('run-1')
+    assert spec['policy'] == store.spec('run-1')['policy']
+    assert broker.candidate() == before
+    with store._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_gate_admissions WHERE run_id='run-1'"
+        ).fetchone()[0])
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
+        assert store.state.claim_for(db, spec['work_id'])['owner'] == 'external:devflow:run-1'
+    assert recovery['state']['checks'] == state['checks']
+    assert readback(store, spec, recovery) is None
+    assert RunResources(spec).root.name == 'resources'
+    with pytest.raises(ValueError):
+        store.continue_repair('run-1', {**request, 'command_id': 'second-retry'})
+
+
+@pytest.mark.parametrize('drift', ['source', 'assessment', 'cleanup', 'gate', 'scope', 'budget'])
+def test_unpublished_retry_rejects_changed_or_unsealed_authority(unpublished, drift):
+    store, broker, state, request = unpublished
+    if drift == 'source':
+        (broker.checkout / 'README.md').write_text('Changed after failure\n')
+    elif drift == 'scope':
+        (broker.checkout / 'outside.txt').write_text('Outside allowed paths\n')
+    elif drift == 'assessment':
+        state['roles'][0]['status'] = 'findings'
+    elif drift == 'cleanup':
+        state['cleanup'] = 'unknown'
+    elif drift == 'gate':
+        state['checks']['prepublish']['source_unchanged'] = False
+    else:
+        request['additional_iterations'] = 1
+    with pytest.raises(ValueError):
+        store.continue_repair('run-1', request)
+    with store._connect() as db:
+        assert not db.execute('SELECT 1 FROM delivery_gate_admissions').fetchone()
+
+
+@pytest.mark.parametrize('gate_passes', [True, False])
+def test_unpublished_retry_runs_checks_before_publication_and_independent_roles(
+    unpublished, monkeypatch, gate_passes,
+):
+    store, _, state, request = unpublished
+    store.continue_repair('run-1', request)
+    spec = store.effective_spec('run-1')
+    with store._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_gate_admissions WHERE run_id='run-1'"
+        ).fetchone()[0])
+    flow = DeliveryWorkflow()
+    calls = []
+
+    async def execute(name, body, **kw):
+        calls.append((name, body.get('role')))
+        if name == 'delivery_tracker_start' or name == 'delivery_tracker':
+            return {'state': 'consistent'}
+        if name == 'delivery_precheck':
+            return {'state': 'passed' if gate_passes else 'failed', 'cleanup': 'confirmed'}
+        if name == 'delivery_publish':
+            return {'number': 7, 'head': recovery['candidate']['head'],
+                    'candidate': recovery['candidate']}
+        if name == 'delivery_role':
+            assert body['role'] in {'review', 'verify'}
+            return {'role': body['role'], 'iteration': 0, 'status': 'pass',
+                    'session_id': 'independent-' + body['role'], 'candidate': recovery['candidate']}
+        return {'state': 'passed', 'cleanup': 'confirmed'}
+
+    async def project(*args):
+        pass
+
+    async def stop(_spec, reason):
+        flow.state.update(outcome='blocked', error=reason)
+        return flow.state
+
+    monkeypatch.setattr(flow, '_activity', execute)
+    monkeypatch.setattr(flow, '_project', project)
+    monkeypatch.setattr(flow, '_stop', stop)
+    result = asyncio.run(flow._resume_published_gates(spec, recovery))
+    names = [name for name, _ in calls]
+    assert result['iteration'] == 0
+    assert result['roles'][0] == state['roles'][0]
+    assert ('delivery_role', 'implement') not in calls
+    if gate_passes:
+        assert result['outcome'] == 'delivered'
+        assert names.index('delivery_precheck') < names.index('delivery_publish')
+        assert [role for name, role in calls if name == 'delivery_role'] == ['review', 'verify']
+        assert names.index('delivery_publish') < names.index('delivery_ci')
+    else:
+        assert result['outcome'] == 'blocked'
+        assert 'delivery_publish' not in names
+        assert 'delivery_role' not in names
+        assert 'delivery_ci' not in names
 
 
 @pytest.fixture
