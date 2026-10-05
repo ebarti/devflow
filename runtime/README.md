@@ -12,6 +12,19 @@ budget, and does not accept an old failed result as a pass. A stale head, unfini
 process, changed configuration or outstanding effect is rejected. Published-gate
 retries remain limited to one admission.
 
+Verification that explicitly names a JUnit recipe in tracked `scripts/checks.toml`
+executes that recipe with `{report_path}` bound to an owned artifact path. The
+controller retains the real report, metadata and plan hashes, and counts actual
+test cases. Missing, malformed, empty, changed or failing reports cannot pass.
+Existing configured checks continue to run unchanged.
+
+A finalized published candidate whose passed local assessment omitted such a
+requested report may receive one report assessment through `published_gate_retry`
+after a measured runtime repair. Admission authenticates the old empty artifact
+manifest and the omitted tracked recipe. It uses a separate report namespace,
+retains prior admissions and source grants, and requires fresh local checks,
+review and QA with no source iteration. A second report assessment is rejected.
+
 The first published assessment after a finalized source repair is also supported.
 It retains the original sealed repair grant and iteration ceiling, grants no new
 source turn, and authenticates every historical admission during cleanup.

@@ -2634,7 +2634,7 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
             assert blocked["error"] == "repair limit exhausted"
             assert calls["publish"] == [0]
             assert calls["precheck"] == [0]
-            assert calls["checks"] == []
+            assert calls["checks"] == [0]
             assert calls["ci"] == []
             app = create_app(original.config.path)
             origin_url = app.state.delivery.config.dashboard_url
@@ -2725,7 +2725,7 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
         assert delivered["iteration"] == 1
         assert calls["publish"] == [0, 1]
         assert calls["precheck"] == [0, 1]
-        assert calls["checks"] == [1]
+        assert calls["checks"] == [0, 1]
         assert calls["ci"] == [delivered["pull_request"]["head"]]
         assert calls["preflight"] == 4
         assert calls["tracker_start"] == 3

@@ -129,3 +129,67 @@ def test_node_selection_uses_locked_vitest_and_retained_junit(project):
     (checkout / 'pnpm-lock.yaml').unlink()
     with pytest.raises(FileNotFoundError):
         planned_checks(spec, checkout, evidence)
+
+
+@pytest.fixture
+def junit_project(project):
+    spec, checkout, _, evidence = project
+    scripts = checkout / 'scripts'
+    scripts.mkdir()
+    metadata = scripts / 'checks.toml'
+    metadata.write_text('schema_version=1\n[checks.scripts]\nkind="junit"\n'
+                        'argv=["node","--test","--test-reporter=junit",'
+                        '"--test-reporter-destination={report_path}","scripts/report.test.mjs"]\n'
+                        'timeout_seconds=600\n')
+    (scripts / 'report.test.mjs').write_text(
+        'import test from "node:test"; test("actual case", () => {});\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Run the configured scripts recipe from scripts/checks.toml with owned JUnit output.']})
+    return spec, checkout, metadata, evidence
+
+
+def test_real_tracked_recipe_retains_candidate_bound_junit(junit_project):
+    import shutil
+    import subprocess
+
+    from devflow_temporal.delivery_check_evidence import junit_counts, retain_artifacts
+
+    spec, checkout, metadata, evidence = junit_project
+    before = dict(spec)
+    checks = planned_checks(spec, checkout, evidence)
+    assert len(checks) == 1
+    check = checks[0]
+    assert check['junit_required'] is True
+    assert check['plan_provenance']['recipe'] == 'checks.scripts'
+    assert check['plan_provenance']['metadata']['scripts/checks.toml']
+    folder = evidence / check['id']
+    (folder / 'pytest-artifacts').mkdir(parents=True)
+    subprocess.run(check['argv'], cwd=checkout, check=True, capture_output=True)
+    reference = retain_artifacts(folder, {'id': 'candidate'})
+    shutil.rmtree(folder / 'pytest-artifacts')
+    assert junit_counts(reference, 'candidate', evidence) == {
+        'tests': 1, 'passed': 1, 'failures': 0, 'errors': 0, 'skipped': 0}
+    assert spec == before  # Neither frozen plan nor configured commands changed.
+
+
+@pytest.mark.parametrize('bad', ['untracked', 'symlink', 'no-report', 'two-reports',
+                                 'timeout', 'kind', 'cwd', 'unnamed'])
+def test_recipe_rejects_unsealed_or_unbounded_execution(junit_project, bad):
+    spec, checkout, metadata, evidence = junit_project
+    if bad == 'untracked':
+        _git(checkout, 'rm', '--cached', 'scripts/checks.toml')
+    elif bad == 'symlink':
+        metadata.unlink()
+        metadata.symlink_to(Path(__file__).resolve())
+    elif bad == 'unnamed':
+        spec['accepted_plan'] = json.dumps({'verification': ['Run scripts/checks.toml JUnit']})
+    else:
+        replacements = {'no-report': ('{report_path}', 'report.xml'),
+                        'two-reports': ('{report_path}', '{report_path}{report_path}'),
+                        'timeout': ('600', '0'), 'kind': ('kind="junit"', 'kind="static"'),
+                        'cwd': ('timeout_seconds=600', 'cwd="../escape"')}
+        old, new = replacements[bad]
+        metadata.write_text(metadata.read_text().replace(old, new))
+    with pytest.raises(ValueError):
+        planned_checks(spec, checkout, evidence)

@@ -95,6 +95,7 @@ class DeliverySupervisor:
         }
         if spec.get("gate_retry_generation") in (1, 2) and request["role"] in {"review", "verify"}:
             identity["gate_retry_generation"] = spec["gate_retry_generation"]
+            identity["gate_retry_stage"] = spec.get("gate_retry_stage")
         if generation:
             identity["attempt_generation"] = generation
         job_key = hashlib.sha256(canonical_json(identity).encode()).hexdigest()

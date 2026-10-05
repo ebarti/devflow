@@ -97,8 +97,26 @@ def test_unpublished_retry_rejects_changed_or_unsealed_authority(unpublished, dr
         request['additional_iterations'] = 1
     with pytest.raises(ValueError):
         store.continue_repair('run-1', request)
+
     with store._connect() as db:
         assert not db.execute('SELECT 1 FROM delivery_gate_admissions').fetchone()
+
+
+def test_report_assessment_has_a_distinct_role_attempt_even_at_same_generation(missing_report):
+    from devflow_temporal.supervisor import DeliverySupervisor
+
+    store, broker, _, _, request, _, _ = missing_report
+    original = store.effective_spec('run-1')
+    supervisor = DeliverySupervisor(store, capacity=1)
+    body = {'spec': original, 'role': 'verify', 'iteration': 2,
+            'candidate': broker.candidate()}
+    old_key, _ = supervisor._claim(body)
+    with store._connect() as db:
+        db.execute('DELETE FROM delivery_attempts WHERE job_key=?', (old_key,))
+    store.continue_repair('run-1', request)
+    current = store.effective_spec('run-1')
+    new_key, cached = supervisor._claim({**body, 'spec': current})
+    assert old_key != new_key and cached is None
 
 
 @pytest.mark.parametrize('gate_passes', [True, False])
@@ -355,14 +373,14 @@ def test_finalized_run_can_receive_one_real_code_repair_and_keep_its_grant(stopp
         store.continue_repair('run-1', {**request, 'command_id': 'another-repair'})
 
 
-def test_first_published_assessment_after_finalized_repair_keeps_historical_grant(
+def first_published_after_repair(
     stopped, monkeypatch,
 ):
     from copy import deepcopy
 
     from devflow_temporal.contracts import digest
 
-    store, _, state, closed, request = stopped
+    store, broker, state, closed, request = stopped
     with store._connect() as db:
         original = json.loads(db.execute(
             "SELECT request_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0])
@@ -405,6 +423,112 @@ def test_first_published_assessment_after_finalized_repair_keeps_historical_gran
         assert canonical_json(current['original_recovery']) == before_grant
         grant = db.execute('SELECT granted_iterations FROM delivery_repair_grants').fetchone()
         assert grant[0] == 1
+    return store, broker, state, closed, request, current
+
+
+def test_first_published_assessment_after_finalized_repair_keeps_historical_grant(
+    stopped, monkeypatch,
+):
+    first_published_after_repair(stopped, monkeypatch)
+
+
+@pytest.fixture
+def missing_report(stopped, monkeypatch):
+    from copy import deepcopy
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_check_evidence import retain_artifacts
+
+    store, broker, state, closed, request, previous = first_published_after_repair(
+        stopped, monkeypatch)
+    spec = store.effective_spec('run-1')
+    reference = retain_artifacts(broker.state_dir / 'missing-report', state['candidate'])
+    local = {'state': 'passed', 'candidate_id': state['candidate']['id'],
+             'results': [{'id': 'diff', 'passed': True, 'artifacts': reference}]}
+    # Frozen fixture's configured check becomes a test before admission in reality;
+    # only the recipe-observation seam uses this synthetic classification here.
+    observation = deepcopy(spec)
+    observation['policy']['checks'][0]['kind'] = 'test'
+    from devflow_temporal.delivery_gate_retry import missing_planned_report as observe
+    monkeypatch.setattr('devflow_temporal.delivery_gate_retry.missing_planned_report',
+                        lambda _spec, current, owned: observe(observation, current, owned))
+    monkeypatch.setattr('devflow_temporal.delivery_plan_checks.planned_junit_recipes',
+                        lambda *_: [{'plan_provenance': {'recipe': 'checks.scripts',
+                                                        'metadata': {'tracked': 'hash'}}}])
+    state.update(revision=23, checks={'local': local})
+    state['roles'][-1]['candidate'] = state['candidate']
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message=state['error'], candidate=state['candidate'], checks=state['checks'],
+                  iteration=2, protocol_revision=23, outcome='blocked',
+                  cleanup='confirmed', error=state['error'])
+    with store._connect() as db:
+        store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
+        workflow = db.execute("SELECT workflow_id FROM delivery_runs WHERE run_id='run-1'")
+        closed.update(workflow_id=workflow.fetchone()[0], recovery_digest=digest(previous))
+    return store, broker, state, closed, {**request, 'command_id': 'missing-report-reassessment',
+                                        'expected_revision': 23}, previous, reference
+
+
+def test_missing_accepted_report_has_one_zero_source_reassessment_and_preserves_grant(
+    missing_report, monkeypatch,
+):
+    from devflow_temporal.contracts import digest
+
+    store, broker, state, closed, request, previous, _ = missing_report
+    original_bytes = (broker.state_dir / 'published-gates-admission/admission.json').read_bytes()
+    result = store.continue_repair('run-1', request)
+    assert result['workflow_id'].endswith('report-gates-retry-1')
+    assert result['implementation_authority'] is False
+    spec = store.effective_spec('run-1')
+    with store._connect() as db:
+        current = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_gate_admissions WHERE run_id='run-1'"
+        ).fetchone()[0])
+        assert db.execute('SELECT granted_iterations FROM delivery_repair_grants').fetchone()[0] == 1
+    assert current['original_recovery'] == previous
+    assert current['seal']['report_observation']['omitted_recipes']
+    assert readback(store, spec, current)['head'] == state['candidate']['head']
+    assert RunResources(spec).root.name == 'resources'
+    assert (broker.state_dir / 'published-gates-admission/admission.json').read_bytes() == original_bytes
+    state['revision'] = 33
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message=state['error'], candidate=state['candidate'], checks=state['checks'],
+                  iteration=2, protocol_revision=33, outcome='blocked',
+                  cleanup='confirmed', error=state['error'])
+    with store._connect() as db:
+        store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
+        workflow = db.execute("SELECT workflow_id FROM delivery_runs WHERE run_id='run-1'")
+        closed.update(workflow_id=workflow.fetchone()[0], recovery_digest=digest(current))
+    with pytest.raises(ValueError, match='closed, finalized'):
+        store.continue_repair('run-1', {**request, 'command_id': 'third-report-attempt',
+                                      'expected_revision': 33})
+
+
+@pytest.mark.parametrize('drift', ['candidate', 'local-failed', 'manifest', 'recipe-present',
+                                 'no-delegation', 'source-turn'])
+def test_missing_report_reassessment_rejects_changed_or_absent_proof(missing_report, drift,
+                                                                  monkeypatch):
+    from pathlib import Path
+
+    store, _, state, _, request, _, reference = missing_report
+    if drift == 'candidate':
+        state['candidate']['id'] = 'f' * 64
+    elif drift == 'local-failed':
+        state['checks']['local']['state'] = 'failed'
+    elif drift == 'manifest':
+        Path(reference['path']).write_text('{}')
+    elif drift == 'recipe-present':
+        state['checks']['local']['results'][0]['plan_provenance'] = {'recipe': 'checks.scripts'}
+    elif drift == 'no-delegation':
+        monkeypatch.setattr('devflow_temporal.delivery_plan_checks.planned_junit_recipes',
+                            lambda *_: [])
+    else:
+        request['additional_iterations'] = 1
+    if drift in {'local-failed', 'recipe-present'}:
+        with store._connect() as db:
+            db.execute("UPDATE delivery_runs SET checks_json=? WHERE run_id='run-1'",
+                       (canonical_json(state['checks']),))
+    with pytest.raises(ValueError):
+        store.continue_repair('run-1', request)
 
 
 def test_second_prepublication_retry_preserves_history_and_has_no_third_grant(unpublished,

@@ -22,6 +22,33 @@ PRELAUNCH_KIND = 'published_check_prelaunch_retry'
 CI_KIND = 'published_ci_retry'
 
 
+def missing_planned_report(spec, state, broker):
+    """Prove a delegated report recipe was omitted from a passed local assessment."""
+    from .delivery_check_evidence import verify_manifest
+    from .delivery_plan_checks import planned_junit_recipes
+
+    local = state.get('checks', {}).get('local', {})
+    if local.get('state') != 'passed' or local.get('candidate_id') != state['candidate']['id']:
+        raise ValueError('report recovery requires unchanged passed local checks')
+    recipes = planned_junit_recipes(spec, broker.checkout, broker.evidence_dir / 'checks')
+    if not recipes or any(result.get('plan_provenance', {}).get('recipe')
+                          in {c['plan_provenance']['recipe'] for c in recipes}
+                          for result in local.get('results', [])):
+        raise ValueError('report recovery requires an omitted accepted JUnit recipe')
+    configured = {c['id'] for c in spec['policy']['checks'] if c.get('kind') == 'test'}
+    missing = []
+    for result in local.get('results', []):
+        if result.get('id') in configured and result.get('passed') is True:
+            reference = result.get('artifacts')
+            if reference and verify_manifest(reference, state['candidate']['id'],
+                                             Path(spec['state_dir']))['count'] == 0:
+                missing.append(reference)
+    if not missing:
+        raise ValueError('report recovery lacks authenticated missing report evidence')
+    return {'omitted_recipes': [c['plan_provenance'] for c in recipes],
+            'empty_manifests': missing}
+
+
 def snapshot(store, run_id, kind=KIND):
     unpublished = kind == PREPUBLICATION_KIND
     spec = store.effective_spec(run_id)
@@ -33,6 +60,9 @@ def snapshot(store, run_id, kind=KIND):
     prelaunch = bool(kind == PRELAUNCH_KIND and previous and previous.get('kind') == KIND
                     and spec.get('gate_retry_stage') == 'published'
                     and spec.get('gate_retry_generation') == 1)
+    report_retry = bool(kind == KIND and previous
+                        and previous.get('kind') in {KIND, PRELAUNCH_KIND, CI_KIND}
+                        and spec.get('gate_retry_stage') in {None, 'published', 'ci'})
     renewed = bool(unpublished and previous
                    and previous.get('kind') == PREPUBLICATION_KIND
                    and spec.get('gate_retry_generation') == 1)
@@ -43,12 +73,14 @@ def snapshot(store, run_id, kind=KIND):
             'finalized_checkpoint'):
         published_after_recovery = False
     while history:
+        if report_retry and history.get('execution_spec', {}).get('gate_retry_stage') == 'report':
+            raise ValueError('this run already received its bounded report assessment retry')
         if history.get('kind') == KIND:
             published_after_recovery = False
         if ci_only and history.get('kind') == CI_KIND:
             raise ValueError('this run already received its bounded CI observation retry')
         history = history.get('original_recovery')
-    if (renewed or published_after_recovery or prelaunch) and spec['provider'] != 'fake':
+    if (renewed or published_after_recovery or prelaunch or report_retry) and spec['provider'] != 'fake':
         from .delivery_native_preparation import native_identity
         old_payload = spec['policy']['native_identity']['runtime_payload_sha256']
         if native_identity(spec)['runtime_payload_sha256'] == old_payload:
@@ -69,6 +101,12 @@ def snapshot(store, run_id, kind=KIND):
                    and any(r.get('passed') is False and r.get('cleanup') == 'confirmed'
                            for r in precheck.get('results', []))) if unpublished else bool(failed)
     prelaunch_observation = None
+    report_observation = None
+    if report_retry:
+        if state.get('checks') != json.loads(row['checks_json'] or '{}'):
+            raise ValueError('report recovery lost its passed check projection')
+        report_observation = missing_planned_report(spec, state, broker)
+        failed_gate = True
     if prelaunch:
         from .delivery_check_prelaunch import observe
 
@@ -97,17 +135,19 @@ def snapshot(store, run_id, kind=KIND):
         raise ValueError('gate retry requires the existing trusted native execution policy')
     if ((kind == PRELAUNCH_KIND and not prelaunch)
             or (previous is not None and not (
-                renewed or published_after_recovery or prelaunch or ci_only))
+                renewed or published_after_recovery or prelaunch or report_retry or ci_only))
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
             or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
             or state.get('cleanup') != ('unknown' if prelaunch else 'confirmed')
             or row['error'] != state.get('error')
-            or state.get('error') != ('required CI did not confirm this PR head' if ci_only
+            or state.get('error') not in ({'repair limit exhausted',
+                                          'required CI did not confirm this PR head'} if report_retry
+                                        else {'required CI did not confirm this PR head' if ci_only
                                       else 'local check process cleanup is unknown' if prelaunch
                                       else 'prepublication repair limit exhausted'
-                                      if unpublished else 'repair limit exhausted')
+                                      if unpublished else 'repair limit exhausted'})
             or row['protocol_revision'] != state.get('revision')
             or row['iteration'] != state.get('iteration')
             or closed['request_digest'] != row['request_digest']
@@ -151,14 +191,15 @@ def snapshot(store, run_id, kind=KIND):
         while ancestor and ancestor.get('kind') in {
                 'pending_publication_retry', 'repair_continuation'}:
             ancestor = ancestor.get('original_recovery')
-        if admitted and (not (renewed or published_after_recovery or prelaunch or ci_only)
+        if admitted and (not (renewed or published_after_recovery or prelaunch or report_retry or ci_only)
                          or prior_gate != ancestor):
             raise ValueError('this run already received its bounded gate assessment retry')
     return {'row': row, 'closed': closed, 'original_spec': spec, 'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
             'cleanup': prelaunch_observation or _stopped_cleanup(spec), 'work_binding': binding,
             'previous': previous, 'prior_gate': prior_gate,
-            'stage': 'ci' if ci_only else 'published'
+            **({'report_observation': report_observation} if report_observation else {}),
+            'stage': 'report' if report_retry else 'ci' if ci_only else 'published'
                      if published_after_recovery or prelaunch else None,
             'generation': 2 if renewed or prelaunch else 1}
 
@@ -233,7 +274,8 @@ def admit(store, run_id, payload, *, preflight=False):
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
         if 'verification_test_paths' in payload:
             execution['verification_test_paths'] = payload['verification_test_paths']
-        execution['role_home_generation'] = f'gate-retry-{generation}'
+        execution['role_home_generation'] = (f'report-retry-{generation}' if seal['stage'] == 'report'
+                                              else f'gate-retry-{generation}')
         execution['gate_retry_generation'] = generation
         if seal['stage']:
             execution['gate_retry_stage'] = seal['stage']
@@ -261,6 +303,7 @@ def admit(store, run_id, payload, *, preflight=False):
         _immutable(root / 'admission.json', recovery)
         preserve_resources(root, spec)
         workflow_id = (f'delivery-{run_id}-ci-retry-1' if kind == CI_KIND else
+                       f'delivery-{run_id}-report-gates-retry-{generation}' if seal['stage'] == 'report' else
                        f'delivery-{run_id}-published-gates-retry-{generation}' if seal['stage']
                        else f'delivery-{run_id}-gates-retry-{generation}')
         response = {'run_id': run_id, 'phase': 'gates_retry_queued', 'workflow_id': workflow_id,
@@ -304,6 +347,8 @@ def admit(store, run_id, payload, *, preflight=False):
 
 def gate_namespace(generation, stage=None):
     if stage is not None:
+        if stage == 'report' and generation == 1:
+            return 'report-gates-admission'
         if stage == 'ci' and generation == 1:
             return 'ci-admission'
         if stage != 'published' or generation not in (1, 2):

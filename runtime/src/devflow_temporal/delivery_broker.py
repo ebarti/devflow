@@ -541,6 +541,19 @@ class DeliveryBroker:
             count = None
             if check.get("test_count_regex"):
                 count = observed_test_count(output, check["test_count_regex"])
+            junit = None
+            if check.get("junit_required"):
+                from .delivery_check_evidence import junit_counts
+
+                try:
+                    if not check_evidence:
+                        raise ValueError('required owned JUnit report was not retained')
+                    junit = junit_counts(check_evidence, candidate['id'], self.state_dir)
+                    count = junit['passed']
+                    if junit['failures'] or junit['errors']:
+                        raise ValueError('required JUnit report records failed test cases')
+                except (ValueError, OSError) as exc:
+                    evidence_failure = str(exc)
             rejected_causes = rejection_causes(
                 parsed_output, [check["reject_regex"]] if check.get("reject_regex") else [],
                 test_results=check.get("kind") == "test",
@@ -559,6 +572,7 @@ class DeliveryBroker:
                     "cwd": str(cwd),
                     "exit_code": exit_code,
                     "test_count": count,
+                    **({"junit": junit} if junit is not None else {}),
                     "rejected_output": rejected_output,
                     "rejection_causes": rejected_causes,
                     "passed": passed,
