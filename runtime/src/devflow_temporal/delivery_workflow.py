@@ -1103,7 +1103,8 @@ class DeliveryWorkflow:
             or previous.get("phase") != "blocked"
             or previous.get("outcome") != "blocked"
             or previous.get("cleanup") not in (
-                {"none", "confirmed"} if recovery.get("title_constraint") else {"none"}
+                {"none", "confirmed"} if recovery.get("title_constraint") or recovery.get(
+                    "finalized_checkpoint") else {"none"}
             )
             or recovery.get("candidate") != previous.get("candidate")
             or recovery.get("session_id") != previous_implementer
@@ -1155,6 +1156,8 @@ class DeliveryWorkflow:
             "error": None,
             "cleanup": "none",
         }
+        if recovery.get("execution_candidate"):
+            self.state["candidate"] = recovery["execution_candidate"]
         self.state.get("checks", {}).pop("terminal_tracker_checkpoint", None)
         self.state["revision"] += 1
         await self._project(

@@ -122,24 +122,7 @@ def admit(store, run_id, payload, *, preflight=False):
                 Path(__file__).resolve().parents[3], 'status', '--porcelain',
                 '--untracked-files=all'):
             raise ValueError('gate retry requires clean installed runtime source')
-        intent_path = root / 'retry-preparation.json'
-        intent = read_private(intent_path) if intent_path.exists() else {
-            'command_digest': command_digest, 'seal_digest': digest(seal),
-            'preparation_attempts': []}
-        if intent['command_digest'] != command_digest or intent['seal_digest'] != digest(seal):
-            raise ValueError('pending gate retry preparation belongs to changed authority')
-        write_private(intent_path, intent)
-        execution = deepcopy(spec)
-        if spec['provider'] != 'fake':
-            # Relocate the identical locked CLI; keep its bytes and version.
-            binary = Path(distribution('openai-codex-cli-bin').locate_file(
-                'codex_cli_bin/bin/codex'))
-            if (hashlib.sha256(binary.read_bytes()).hexdigest()
-                    != spec['policy']['codex_bin_sha256']):
-                raise ValueError('gate retry cannot change the frozen CLI executable')
-            execution['policy']['codex_bin'] = str(binary.resolve())
-            execution = _prepare(execution, DeliveryConfig.load(Path(spec['config_path'])),
-                                 intent, intent_path)
+        execution = prepare_runtime(spec, root, command_digest, digest(seal))
         execution['role_home_generation'] = 'gate-retry-1'
         execution['gate_retry_generation'] = 1
         if digest(snapshot(store, run_id)) != digest(seal):
@@ -210,3 +193,46 @@ def readback(store, spec, recovery):
         from .delivery_native_preparation import verify_native_spec
         verify_native_spec(spec)
     return recovery['publication']
+
+
+def prepare_runtime(spec, root, command_digest, seal_digest):
+    """Bind the same locked executable to current source without changing feature authority."""
+    if spec['provider'] == 'fake':
+        return deepcopy(spec)
+    source = Path(__file__).resolve().parents[3]
+    if _git(source, 'status', '--porcelain', '--untracked-files=all'):
+        raise ValueError('continuation requires clean installed runtime source')
+    with _lock(root / 'runtime-preparation'):
+        path = root / 'runtime-preparation' / 'intent.json'
+        intent = read_private(path) if path.exists() else {
+            'command_digest': command_digest, 'seal_digest': seal_digest,
+            'preparation_attempts': []}
+        if intent['command_digest'] != command_digest or intent['seal_digest'] != seal_digest:
+            raise ValueError('pending runtime preparation belongs to changed authority')
+        write_private(path, intent)
+        execution = deepcopy(spec)
+        binary = Path(distribution('openai-codex-cli-bin').locate_file(
+            'codex_cli_bin/bin/codex'))
+        if hashlib.sha256(binary.read_bytes()).hexdigest() != spec['policy']['codex_bin_sha256']:
+            raise ValueError('continuation cannot change the frozen CLI executable')
+        execution['policy']['codex_bin'] = str(binary.resolve())
+        return _prepare(execution, DeliveryConfig.load(Path(spec['config_path'])), intent, path)
+
+
+def effective_repair(store, recovery, *, db=None):
+    """Read the sealed modern repair authority, including its historical gate predecessor."""
+    spec = recovery['execution_spec']
+    run_id = spec['run_id']
+    if db is None:
+        with store._connect() as connection:
+            return effective_repair(store, recovery, db=connection)
+    grant = db.execute('SELECT predecessor_result_digest,maximum_iteration,granted_iterations '
+                       'FROM delivery_repair_grants WHERE run_id=?', (run_id,)).fetchone()
+    root = Path(spec['state_dir']) / 'repair-continuation'
+    if (not grant or canonical_json(read_private(root / 'admission.json'))
+            != canonical_json(recovery)
+            or grant[0] != digest(recovery['state'])
+            or grant[1] != recovery['maximum_iteration']
+            or grant[2] != recovery['additional_iterations']):
+        raise ValueError('finalized repair lost its immutable grant')
+    return spec

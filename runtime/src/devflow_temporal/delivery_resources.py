@@ -106,6 +106,16 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 'terminal_tracker_recovery', 'repair_continuation',
                 'investigation_assessment_adjudication', 'stopped_resource_closure',
             }:
+                if recovery.get('kind') == 'repair_continuation' and recovery.get(
+                        'finalized_checkpoint'):
+                    from .delivery_gate_retry import effective_repair
+
+                    effective_repair(None, recovery, db=db)
+                    if canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                        raise ValueError('finalized repair execution authority changed')
+                    namespace = 'repair-continuation'
+                    roots.add(state / namespace / 'evidence')
+                    first = False
                 if recovery.get('kind') == 'stopped_resource_closure':
                     from .delivery_resource_closure import custody
 

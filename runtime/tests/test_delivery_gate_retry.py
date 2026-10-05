@@ -142,3 +142,41 @@ def test_fresh_gate_attempt_cannot_reuse_the_failed_qa_job(stopped):
     new_key, cached = supervisor._claim({**body, 'spec': current})
     assert new_key != old_key
     assert cached is None
+
+
+def test_finalized_run_can_receive_one_real_code_repair_and_keep_its_grant(stopped):
+    store, broker, state, _, old_request = stopped
+    with store._connect() as db:
+        row = db.execute("SELECT request_json FROM delivery_runs WHERE run_id='run-1'").fetchone()
+        original = json.loads(row[0])
+        original['resource_cleanup_version'] = 1  # Explicit modern fake fixture; no native claim.
+        db.execute("UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'",
+                   (canonical_json(original),))
+    spec = store.spec('run-1')
+    resources = RunResources(spec)
+    resources.scratch('original', 'checks')
+    receipt = resources.finalize('blocked')
+    state['checks'] = {'resource_cleanup': receipt}
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET checks_json=? WHERE run_id='run-1'",
+                   (canonical_json(state['checks']),))
+    request = {k: v for k, v in old_request.items() if k != 'continuation_kind'}
+    request.update(command_id='real-code-repair-1', additional_iterations=1)
+    before = broker.candidate()
+    preflight = store.repair_admission_preflight('run-1', request)
+    assert preflight['diagnostics'] == ['Receipt omits source hash semantics']
+    result = store.continue_repair('run-1', request)
+    assert result['authorized_through_iteration'] == 2
+    assert store.continue_repair('run-1', request) == result
+    current = store.effective_spec('run-1')
+    assert current == spec
+    with store._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+        ).fetchone()[0])
+    assert recovery['state']['cleanup'] == 'confirmed'
+    assert recovery['finalized_checkpoint']
+    assert broker.candidate() == before
+    store.repair_preflight(current, recovery)
+    with pytest.raises(ValueError, match='one repair grant'):
+        store.continue_repair('run-1', {**request, 'command_id': 'another-repair'})
