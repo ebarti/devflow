@@ -82,6 +82,13 @@ completes the original pending publication effect, then runs independent review,
 QA, CI and tracking; it creates no implementation turn or duplicate branch. Both
 admission and execution require the owned remote head to remain unchanged.
 
+Native admission freezes the GitHub publication branch separately from the Git
+base commit. A full commit SHA resolves through symbolic `origin/HEAD` only when
+that branch identifies the exact pinned commit. Tags, unbound commits and moved
+defaults are rejected before accepting work. PR creation and readback use the same
+branch binding. Legacy SHA-based publication recovery preserves the original Git
+base and applies the same exact-match resolution.
+
 Native heavyweight prepublication, local and browser check batches share one
 service-wide host execution slot. Model roles remain parallel up to configured
 capacity; queued checks leave the async worker available. Required commands,

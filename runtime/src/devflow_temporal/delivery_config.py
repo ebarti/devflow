@@ -38,6 +38,25 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def publication_base_ref(source: Path, base_ref: str, base_sha: str) -> str:
+    """Bind GitHub's branch primitive independently of the pinned Git object."""
+    try:
+        ref = _git(source, "rev-parse", "--symbolic-full-name", base_ref)
+        if not ref and re.fullmatch(r"[0-9a-fA-F]{40}", base_ref):
+            ref = _git(source, "symbolic-ref", "refs/remotes/origin/HEAD")
+        if _git(source, "rev-parse", ref) != base_sha:
+            raise ValueError("publication branch does not identify the frozen base commit")
+        for prefix in ("refs/remotes/origin/", "refs/heads/"):
+            if ref.startswith(prefix):
+                branch = ref.removeprefix(prefix)
+                if branch != "HEAD":
+                    _git(source, "check-ref-format", "refs/heads/" + branch)
+                    return branch
+    except subprocess.CalledProcessError as exc:
+        raise ValueError("publication base requires a resolvable branch") from exc
+    raise ValueError("publication base requires a branch, not a tag or ambiguous commit")
+
+
 @dataclass(frozen=True)
 class DeliveryConfig:
     path: Path
@@ -200,6 +219,10 @@ class DeliveryConfig:
         expected = repository.get("expected_base_sha")
         if expected and base_sha != expected:
             raise ValueError("base ref moved from the accepted plan")
+        publication_branch = (
+            publication_base_ref(source, supplied["base_ref"], base_sha)
+            if self.raw.get("provider", "codex") == "codex" else None
+        )
         state_dir = self.state_root / "runs" / supplied["run_id"]
         checkout = self.state_root / "checkouts" / supplied["run_id"]
         policy = {
@@ -445,6 +468,7 @@ class DeliveryConfig:
             "origin_url": actual_remote,
             "github_repo": owner_repo,
             "base_sha": base_sha,
+            **({"publication_base_ref": publication_branch} if publication_branch else {}),
             "state_dir": str(state_dir),
             "checkout": str(checkout),
             "policy": policy,

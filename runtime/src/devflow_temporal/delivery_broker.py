@@ -17,6 +17,7 @@ from typing import Any
 from .candidate import candidate_for
 from .contracts import canonical_json
 from .delivery_browser_qa import run_browser_qa as execute_browser_qa
+from .delivery_config import publication_base_ref
 from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
 from .delivery_output import observed_test_count, rejection_causes, visible_output
 from .delivery_store import DeliveryStore, _now
@@ -753,6 +754,17 @@ class DeliveryBroker:
     def run_browser_qa(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         return execute_browser_qa(self, iteration, candidate)
 
+    def _publication_base_ref(self) -> str:
+        frozen = self.spec.get("publication_base_ref")
+        if frozen:
+            return frozen
+        # Legacy named bases already bind a branch. A legacy SHA needs the
+        # same exact-match resolution as admission, never a guessed PR target.
+        raw = self.spec["base_ref"]
+        if re.fullmatch(r"[0-9a-fA-F]{40}", raw):
+            return publication_base_ref(self.source, raw, self.spec["base_sha"])
+        return raw.removeprefix("origin/")
+
     def _existing_pr(self, *, validate_metadata: bool = True) -> dict[str, Any] | None:
         try:
             output = _run(
@@ -781,7 +793,7 @@ class DeliveryBroker:
         found = matches[0]
         if (
             found["headRefName"] != self.spec["branch"]
-            or found["baseRefName"] != self.spec["base_ref"].removeprefix("origin/")
+            or found["baseRefName"] != self._publication_base_ref()
             or found["isDraft"]
             or found["state"] != "OPEN"
         ):
@@ -809,6 +821,7 @@ class DeliveryBroker:
                 raise ValueError("owned commit lacks its author Signed-off-by trailer: " + commit)
 
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        publication_branch = self._publication_base_ref()
         self._validate_publication_commits()
         key = f"publish:{self.spec['run_id']}:{iteration}"
         before = self.candidate()
@@ -898,7 +911,7 @@ class DeliveryBroker:
                     "--head",
                     self.spec["branch"],
                     "--base",
-                    self.spec["base_ref"].removeprefix("origin/"),
+                    publication_branch,
                     "--title",
                     title,
                     "--body-file",
