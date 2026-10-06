@@ -97,6 +97,8 @@ registration stops installation with its precise path and reason, even with
 registration and retry. Do not delete source helpers or user data to resolve a
 registration conflict.
 
+Snapshot file bytes, mode and identity come from one opened-file observation;
+a write during that read refuses capture before installation effects.
 On preflight refusal, destinations are left untouched. After an installer effect,
 rollback restores only matching recorded object identities; later changed or
 foreign objects remain, with an actionable path and retained private backup.
