@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -141,11 +142,8 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
              and (static or re.search(r'\bjunit\b', step, re.I))]
     if not steps:
         return []
-    path = checkout / 'scripts/checks.toml'
-    if (path.is_symlink() or path.resolve(strict=True) != path
-            or _git(checkout, 'ls-files', '--', 'scripts/checks.toml') != 'scripts/checks.toml'):
-        raise ValueError('planned JUnit recipes require fixed tracked metadata')
-    metadata = tomllib.loads(path.read_text())
+    content = _base_recipe_metadata(spec)
+    metadata = tomllib.loads(content.decode('utf-8'))
     recipes = metadata.get('checks', {})
     if metadata.get('schema_version') != 1 or not isinstance(recipes, dict):
         raise ValueError('planned JUnit recipe schema is unsupported')
@@ -176,8 +174,9 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
                 or not (checkout / relative).resolve(strict=True).is_relative_to(checkout)):
             raise ValueError('planned JUnit recipe has invalid bounded execution authority')
         provenance = {'accepted_plan_sha256': digest(plan), 'recipe': 'checks.' + key,
+                      'base_sha': spec['base_sha'],
                       'metadata': {'scripts/checks.toml': hashlib.sha256(
-                          path.read_bytes()).hexdigest()},
+                          content).hexdigest()},
                       'recipe_sha256': digest(recipe)}
         check_id = ('planned-static-' if static else 'planned-junit-') + digest(provenance)[:16]
         report = evidence / check_id / 'pytest-artifacts/junit.xml'
@@ -186,6 +185,29 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
                        'timeout_seconds': timeout, 'min_tests': minimum,
                        'junit_required': not static, 'plan_provenance': provenance})
     return result
+
+
+def _base_recipe_metadata(spec: dict) -> bytes:
+    """Read the admitted source commit, never the candidate's recipe or Git refs."""
+    base = spec.get('base_sha')
+    source = Path(spec.get('source_path', ''))
+    if (not isinstance(base, str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', base)
+            or not source.is_absolute() or source.resolve(strict=True) != source):
+        raise ValueError('planned recipes require an admitted source commit')
+    path = 'scripts/checks.toml'
+    entry = _git(source, '--no-replace-objects', 'ls-tree', '--full-tree', base, '--', path)
+    fields = entry.split()
+    if (len(fields) != 4 or fields[0] not in {'100644', '100755'}
+            or fields[1] != 'blob' or fields[3] != path):
+        raise ValueError('planned recipes require fixed tracked metadata in the base commit')
+    result = subprocess.run(
+        ['git', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null',
+         '-c', 'core.fsmonitor=false', '-C', str(source), 'cat-file', 'blob', fields[2]],
+        capture_output=True, timeout=120, check=False,
+    )
+    if result.returncode:
+        raise ValueError('planned recipe base blob is unavailable')
+    return result.stdout
 
 
 def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
