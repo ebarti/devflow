@@ -439,6 +439,7 @@ class DeliveryBroker:
         checks: list[dict[str, Any]],
         evidence_dir: Path,
         candidate: dict[str, Any],
+        *, python_environments: dict[str, Path] | None = None,
     ) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         checkout = checkout.resolve(strict=True)
@@ -478,9 +479,16 @@ class DeliveryBroker:
                             Path(native_dependencies["store"]) if native_dependencies else None
                         ),
                     )
-                    generated = self._register_generated(
-                        checkout, ["node_modules", *check.get("generated_directories", [])]
-                    )
+                    isolated_python = (python_environments or {}).get(check['id'])
+                    if isolated_python is not None:
+                        if (not isolated_python.is_relative_to(
+                                self.state_dir / 'transient/implementation-python')
+                                or isolated_python.resolve() != isolated_python):
+                            raise ValueError('locked Python environment left controller ownership')
+                        environment['UV_PROJECT_ENVIRONMENT'] = str(isolated_python)
+                    generated = self._register_generated(checkout,
+                        [] if isolated_python is not None else
+                        ["node_modules", *check.get("generated_directories", [])])
                 except (ValueError, OSError) as exc:
                     raise CheckPreparationFailure(check['id'], exc, results) from exc
                 # The same frozen lock populates an owned store before offline
@@ -512,6 +520,8 @@ class DeliveryBroker:
                 # Explicit fixture provider only; real deliveries never take
                 # this unsandboxed path.
                 check_env = {"PATH": os.environ.get("PATH", ""), "CI": "1"}
+                if check['id'] in (python_environments or {}):
+                    check_env['UV_PROJECT_ENVIRONMENT'] = str(python_environments[check['id']])
                 command = argv
                 checked = subprocess.run(
                     command,
@@ -729,10 +739,34 @@ class DeliveryBroker:
         if any(c['id'].startswith('planned-vitest-') for c in planned):
             dependencies = [c for c in self.spec['policy'].get('prepublish_checks', [])
                             if '/store' in c['argv']] + dependencies
-        result = (self._run_check_list(self.checkout, dependencies, folder, candidate)
+        from .delivery_resources import RunResources
+
+        resources = RunResources(self.spec)
+        with resources.locked() as manifest:
+            owned = set(manifest['roots'])
+        isolated = {}
+        interpreters = []
+        for check in dependencies:
+            if not check['id'].startswith('planned-python-dependencies-'):
+                continue
+            retained = self.checkout / check['cwd'] / '.venv'
+            if not os.path.lexists(retained) or str(retained) in owned:
+                continue
+            # Historical ignored environments are not ours to adopt or overwrite.
+            key = folder.relative_to(self.state_dir).as_posix() + '/' + check['id']
+            environment = resources.scratch('implementation-python', key) / 'environment'
+            isolated[check['id']] = environment
+            interpreters.append({'project': check['cwd'],
+                                 'interpreter': str(environment / 'bin/python')})
+        options = {'python_environments': isolated} if isolated else {}
+        result = (self._run_check_list(self.checkout, dependencies, folder, candidate, **options)
                   if dependencies else {'state': 'passed', 'results': [],
                                         'candidate_id': candidate['id'],
                                         'source_unchanged': True})
+        if interpreters:
+            result['python_interpreters'] = interpreters
+            result['diagnostic'] = 'Use these controller-owned locked Python interpreters; ' \
+                'the historical project .venv is preserved untouched: ' + json.dumps(interpreters)
         result['cleanup'] = ('unknown' if result.get('cleanup') == 'unknown'
                              or any(r.get('cleanup') != 'confirmed'
                                     for r in result.get('results', [])) else 'confirmed')

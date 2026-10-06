@@ -26,6 +26,7 @@ FIELDS = {
     'plan_provenance', 'metadata', 'recipe', 'recipe_sha256', 'accepted_plan_sha256',
     'test_paths', 'input_hashes', 'source_input_hashes', 'dependency_preparation',
     'checks_identity', 'started_at', 'finished_at', 'measurements', 'observations',
+    'python_interpreters', 'project', 'interpreter',
 }
 
 

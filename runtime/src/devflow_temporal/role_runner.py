@@ -191,8 +191,10 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "UTC timestamps and source/lock hashes here. "
             "This evidence directory is outside feature "
             "source scope by explicit controller allocation; it survives scratch cleanup. "
-            "Use the controller-prepared project .venv/bin/python for imported Python probes; "
-            "do not substitute a system interpreter or claim unexecuted measurements. "
+            "Use the locked interpreter explicitly named in the preparation receipt for "
+            "imported Python probes; otherwise use the controller-prepared project "
+            ".venv/bin/python. Do not substitute a system interpreter "
+            "or claim unexecuted measurements. "
             "Do not put credentials, personal data, nested agent state or packages here. "
             "The controller seals a hashed snapshot after your turn for independent inspection.\n"
         )
