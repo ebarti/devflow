@@ -1964,7 +1964,9 @@ def test_failed_broker_gate_returns_bounded_candidate_diagnostics_for_repair():
 
 
 def test_continuation_rejects_temporal_projection_before_workflow_close(service, monkeypatch):
-    store, _request = service
+    store, request = service
+    store.submit(request)
+    described = []
 
     class RunningDescription:
         status = WorkflowExecutionStatus.RUNNING
@@ -1972,6 +1974,7 @@ def test_continuation_rejects_temporal_projection_before_workflow_close(service,
 
     class RunningHandle:
         async def describe(self):
+            described.append(True)
             return RunningDescription()
 
     class RunningClient:
@@ -1984,6 +1987,7 @@ def test_continuation_rejects_temporal_projection_before_workflow_close(service,
     monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", connect)
     with pytest.raises(ValueError, match="Temporal closure is unproven"):
         store._completed_temporal_result("run-1")
+    assert described == [True]
 
 
 def test_check_network_domains_reject_local_destinations():
