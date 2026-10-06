@@ -7,6 +7,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import subprocess
@@ -31,6 +32,8 @@ from .delivery_config import DeliveryConfig
 from .delivery_preparation import execution_retired
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
+
+logger = logging.getLogger(__name__)
 
 
 class LocalSession:
@@ -96,8 +99,16 @@ class DeliveryService:
         pending = self.store.pending_starts()
         starts = []
         for item in pending:
-            spec = self.store.effective_spec(item["run_id"])
-            if not execution_retired(spec) and self.store.owns_execution(spec):
+            try:
+                spec = self.store.effective_spec(item["run_id"])
+                owned = not execution_retired(spec) and self.store.owns_execution(spec)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                logger.warning(
+                    "Run %s skipped: execution specification unavailable (%s)",
+                    item["run_id"], type(exc).__name__,
+                )
+                continue
+            if owned:
                 starts.append((item, spec))
         # Retired and foreign outbox entries cannot authorize this service's transport.
         if pending and not starts:
