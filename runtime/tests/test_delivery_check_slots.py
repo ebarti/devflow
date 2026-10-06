@@ -320,7 +320,8 @@ async def test_broker_native_runner_tracks_cleanup_and_owned_cancellation(owned_
     process = NativeProcess(
         request["spec"], Path(request["spec"]["state_dir"]) / "native",
         argv=[sys.executable, "-c", "import subprocess,sys,time; "
-              "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);time.sleep(30)"],
+              "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+              "time.sleep(30)"],
         cwd=tmp_path, environment={"PATH": os.environ["PATH"]}, timeout=60,
         cancelled=broker._native_cancelled,
     )
