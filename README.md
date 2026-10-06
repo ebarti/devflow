@@ -100,10 +100,13 @@ registration conflict.
 On preflight refusal, destinations are left untouched. After an installer effect,
 rollback restores only matching recorded object identities; later changed or
 foreign objects remain, with an actionable path and retained private backup.
-Owned destination pointers use native atomic exchange on Linux/macOS before helper cleanup;
-unsupported hosts refuse without a replacement fallback. Cleanup captures the actual
-Forward writes exchange existing targets and authenticate the displaced object in that same private backup; retirement captures targets before deleting them. Concurrent drift refuses installation and retains foreign bytes and the full backup at the reported paths.
-object inside the existing private backup before authenticating and deleting it. Upgrades begun
+Owned destination pointers use native atomic exchange on Linux/macOS before
+helper cleanup; unsupported hosts refuse without a replacement fallback.
+Native exchange and capture require the private backup and target on the same
+filesystem. Forward writes authenticate the displaced object in that backup;
+retirement and rollback cleanup capture objects before authenticating and deleting
+them. Concurrent drift refuses installation and retains foreign bytes and the
+full backup at the reported paths. Upgrades begun
 by the historical updater also restore its previous detached checkout when it
 remains clean; newer updater failures restore their previous branch or commit.
 SQLite, unrelated host files and background services remain outside this
