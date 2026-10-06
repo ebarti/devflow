@@ -17,7 +17,7 @@ from temporalio.exceptions import ApplicationError
 
 from .candidate import candidate_for
 from .contracts import digest
-from .delivery_broker import CheckPreparationFailure, DeliveryBroker
+from .delivery_broker import BrokerReadbackUnavailable, CheckPreparationFailure, DeliveryBroker
 from .delivery_config import DeliveryConfig
 from .delivery_preparation import _lock
 from .delivery_repair import RepairReadbackPending
@@ -556,7 +556,9 @@ def _tracker_helper_retryable(result) -> bool:
 
 
 def _tracker_error_retryable(exc) -> bool:
-    return isinstance(exc, (subprocess.TimeoutExpired, TimeoutError, ConnectionError)) or (
+    return isinstance(exc, (
+        BrokerReadbackUnavailable, subprocess.TimeoutExpired, TimeoutError, ConnectionError,
+    )) or (
         isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).casefold()
     )
 

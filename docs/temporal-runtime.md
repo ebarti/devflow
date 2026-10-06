@@ -128,3 +128,9 @@ runtime/.venv/bin/python runtime/scripts/smoke_preparation.py \
 ```
 
 The restart option crashes only the disposable service's identified worker after proof publication and before freeze, restarts through the public CLI, and verifies recovery from the same proof. Successful real intake requires the configured model to be available for the runtime's account. This proves the preparation/intake surface, not a full feature delivery or implementation-session resume. The latter is a separately labelled integration check.
+
+Terminal tracker retries include unavailable PR queries and remote-branch queries,
+including their timeouts. Successful conflicting PR/head observations still block
+without releasing the claim; unavailable observations exhaust into recoverable
+`waiting_tracker` at the frozen deadline. Existing unversioned inputs keep their
+original activity result shapes.

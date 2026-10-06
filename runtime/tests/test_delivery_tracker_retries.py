@@ -20,7 +20,7 @@ from test_delivery_native import native_configuration as native_configuration
 from test_delivery_store import service as service
 from test_delivery_terminal_recovery import ControlledTrackerCheckpoint
 
-from devflow_temporal import delivery_activities
+from devflow_temporal import delivery_activities, delivery_broker, delivery_terminal_recovery
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_config import scope_amended_spec
@@ -359,3 +359,131 @@ async def test_real_terminal_retry_survives_worker_replacement_without_operator(
         )
         history = await handle.fetch_history()
         (tmp_path / 'automatic-tracker-history.json').write_text(history.to_json())
+
+
+def terminal_readback_controller(monkeypatch, tmp_path, failure, *, failures=4, conflict=None):
+    admitted = spec()
+    admitted.update(provider='codex', branch='feat/fixture', github_repo='example/fixture',
+                    origin_url='https://github.com/example/fixture.git')
+    head = 'a' * 40
+    pr = {'number': 7, 'head': head, 'url': 'https://github.com/example/fixture/pull/7'}
+    observed = {'number': 7, 'url': pr['url'], 'state': 'OPEN', 'isDraft': False,
+                'baseRefName': 'main', 'headRefName': admitted['branch'], 'headRefOid': head,
+                'title': 'fix: owned change'}
+    if conflict == 'closed':
+        observed['state'] = 'CLOSED'
+    elif conflict == 'foreign':
+        observed['headRefName'] = 'foreign'
+    elif conflict == 'head':
+        observed['headRefOid'] = 'b' * 40
+    broker = object.__new__(delivery_broker.DeliveryBroker)
+    broker.spec, broker.source = admitted, tmp_path
+    broker._publication_base_ref = lambda **_: 'main'
+    monkeypatch.setattr(delivery_terminal_recovery, 'DeliveryBroker', lambda *_: broker)
+    monkeypatch.setattr(delivery_activities, '_context', lambda _: (object(), broker))
+    queries, syncs, projected = [], [], []
+
+    def command(argv, **_):
+        query = 'gh' if argv[0] == 'gh' else 'git' if 'ls-remote' in argv else 'origin'
+        if query != 'origin':
+            queries.append(query)
+        if query == failure.split('_')[0] and queries.count(query) <= failures:
+            if failure.endswith('timeout'):
+                raise subprocess.TimeoutExpired(argv, 60)
+            return subprocess.CompletedProcess(argv, 1, '', 'fixture query unavailable')
+        if query == 'gh':
+            values = [observed, observed] if conflict == 'multiple' else [observed]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(values), '')
+        value = '' if conflict == 'absent' else head + '\trefs/heads/' + admitted['branch']
+        output = admitted['origin_url'] if query == 'origin' else value
+        return subprocess.CompletedProcess(argv, 0, output, '')
+
+    monkeypatch.setattr(delivery_broker.subprocess, 'run', command)
+
+    def synchronize(_spec, status, *, release, **_):
+        syncs.append((status, release))
+        return {'state': 'consistent', 'pending': False}
+
+    monkeypatch.setattr(delivery_activities, '_tracker_sync', synchronize)
+    controller = DeliveryWorkflow()
+    controller.state = {'phase': 'delivered', 'execution_state': 'terminal',
+                        'outcome': 'delivered', 'iteration': 0, 'revision': 1,
+                        'cleanup': 'none', 'checks': {}, 'candidate': {'head': head},
+                        'pull_request': pr}
+
+    async def execute(name, request, **_):
+        if name == 'delivery_finalize_resources':
+            return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+                    'resource_cleanup': 'confirmed'}
+        if name == 'delivery_terminal_tracker':
+            return await delivery_activities.delivery_terminal_tracker(request)
+        projected.append(request)
+        return {}
+
+    controller._activity = execute
+    return controller, admitted, queries, syncs, projected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['gh_failure', 'gh_timeout', 'git_failure', 'git_timeout'])
+async def test_real_terminal_pr_transport_readback_retries_then_finishes(
+    monkeypatch, tmp_path, clock, failure,
+):
+    controller, admitted, queries, syncs, projected = terminal_readback_controller(
+        monkeypatch, tmp_path, failure)
+    await controller._project(admitted, 'delivered', 'finished')
+    assert controller.state['outcome'] == 'delivered'
+    assert controller.state['checks']['terminal_tracker_checkpoint']['state'] == 'confirmed'
+    assert queries.count(failure.split('_')[0]) == 5
+    assert syncs == [('in-review', True)]
+    assert not any(p['event_type'] == 'tracker_deadline' for p in projected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['gh_failure', 'git_failure'])
+async def test_real_terminal_pr_transport_deadline_stays_recoverable(
+    monkeypatch, tmp_path, clock, failure,
+):
+    controller, admitted, queries, syncs, projected = terminal_readback_controller(
+        monkeypatch, tmp_path, failure, failures=100)
+    await controller._project(admitted, 'delivered', 'finished')
+    assert controller.state['phase'] == 'waiting_tracker'
+    assert controller.state['outcome'] is None
+    checkpoint = controller.state['checks']['terminal_tracker_checkpoint']
+    assert checkpoint['closed'] and checkpoint['state'] == 'pending'
+    assert queries.count(failure.split('_')[0]) >= 3
+    assert not syncs
+    assert projected[-1]['event_type'] == 'tracker_deadline'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('conflict', ['multiple', 'closed', 'foreign', 'head', 'absent'])
+async def test_real_terminal_pr_identity_conflict_never_retries_or_releases(
+    monkeypatch, tmp_path, clock, conflict,
+):
+    controller, admitted, queries, syncs, projected = terminal_readback_controller(
+        monkeypatch, tmp_path, 'gh_failure', failures=0, conflict=conflict)
+    await controller._project(admitted, 'delivered', 'finished')
+    assert controller.state['outcome'] == 'blocked'
+    assert controller.state['checks']['terminal_tracker_checkpoint']['state'] == 'conflicted'
+    assert queries.count('gh') == 1
+    assert not syncs and not clock[1]
+    assert all(p['outcome'] != 'delivered' for p in projected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure,reason', [('gh_failure', 'BrokerReadbackUnavailable'),
+                                          ('git_failure', 'RuntimeError')])
+async def test_legacy_published_transport_failure_keeps_original_result_shape(
+    monkeypatch, tmp_path, failure, reason,
+):
+    controller, admitted, _, syncs, _ = terminal_readback_controller(
+        monkeypatch, tmp_path, failure, failures=100)
+    admitted.pop('tracker_retry_version')
+    result = await delivery_activities.delivery_terminal_tracker({
+        'spec': admitted, 'status': 'in-review', 'release': True,
+        'candidate': controller.state['candidate'],
+        'pull_request': controller.state['pull_request'],
+    })
+    assert result['state'] == 'pending' and result['reason'] == reason
+    assert 'retryable' not in result and not syncs
