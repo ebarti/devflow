@@ -49,7 +49,7 @@ def identity(path, *, saved=None):
     if path.is_symlink():
         result.update(type="link", target=os.readlink(path))
     elif stat.S_ISREG(info.st_mode):
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             fields = ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink",
                       "st_size", "st_mtime_ns", "st_ctime_ns")
@@ -73,10 +73,41 @@ def identity(path, *, saved=None):
     return result
 
 
+def canonical_target(path):
+    # Resolve ancestors, never the registered object itself (often a symlink).
+    return Path(path).parent.resolve() / Path(path).name
+
+
+def preflight(directory, paths):
+    """Check the actual backup/target boundaries before installation effects."""
+    parents = set()
+    for path in paths:
+        parent = path.parent
+        while not parent.exists():
+            parent = parent.parent
+        if not parent.is_dir() or parent.stat().st_dev != directory.stat().st_dev:
+            raise ValueError(f"atomic installation requires one filesystem: {path}; "
+                             f"backup {directory}; choose skills and Codex locations on the same volume")
+        parents.add(parent)
+    for parent in parents:
+        with tempfile.TemporaryDirectory(prefix=".devflow-exchange-check-", dir=parent) as probe:
+            stage, target = directory / ".exchange-check", Path(probe) / "target"
+            try:
+                stage.write_bytes(b"backup")
+                target.write_bytes(b"target")
+                exchange(stage, target)
+            except OSError as exc:
+                raise ValueError(f"atomic exchange unsupported at {parent}: {exc}; "
+                                 "use locations supporting native exchange before retrying") from exc
+            finally:
+                stage.unlink(missing_ok=True)
+
+
 def remember(directory, path, installed):
     """Bind one actual installer effect inside its existing private snapshot."""
     if directory is None:
         return
+    path = canonical_target(path)
     snapshot = Path(directory) / "snapshot.json"
     entries = json.loads(snapshot.read_text())
     saved = entries.get(str(path))
@@ -90,6 +121,7 @@ def remember(directory, path, installed):
 
 def effect(directory, path, stage=None):
     """Authenticate the object displaced by a forward installer mutation."""
+    path = canonical_target(path)
     snapshot = Path(directory) / "snapshot.json"
     entries = json.loads(snapshot.read_text())
     expected = entries[str(path)].get("installed", entries[str(path)]["before"])
@@ -104,10 +136,17 @@ def effect(directory, path, stage=None):
         exchange(captured, path)  # The displaced object is already in the private backup.
     else:
         os.replace(path, captured)
-    if identity(captured) != expected:
+    reason = None
+    try:
+        matches = identity(captured) == expected
+    except (OSError, ValueError) as exc:
+        matches, reason = False, str(exc)
+    if not matches:
         message = f"{path} captured at {captured}"
         entries = json.loads(snapshot.read_text())
-        entries[str(path)]["drift"] = message
+        entries[str(path)]["drift"] = message + (f"; authentication failed: {reason}" if reason else "")
+        info = captured.lstat()
+        entries[str(path)]["displaced_node"] = [info.st_dev, info.st_ino, info.st_uid, info.st_mode]
         save_snapshot(snapshot, entries)
         if stage is None:
             try:
@@ -135,6 +174,7 @@ def created(directory, path):
     # no previous object was overwritten and subsequent drift will not match.
     if directory is None:
         return
+    path = canonical_target(path)
     snapshot = Path(directory) / "snapshot.json"
     entries = json.loads(snapshot.read_text())
     saved = entries[str(path)]
@@ -176,7 +216,13 @@ def target_paths(source, skills, codex):
 
 
 def capture(source, skills, codex):
-    directory = Path(tempfile.mkdtemp(prefix="devflow-install-rollback-"))
+    anchor = codex if codex.exists() else codex.parent
+    while not anchor.exists():
+        anchor = anchor.parent
+    info = anchor.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValueError("backup parent must be owned and protected: " + str(anchor))
+    directory = Path(tempfile.mkdtemp(prefix="devflow-install-rollback-", dir=anchor))
     directory.chmod(0o700)
     # Pre-marker failures can occur when an older updater has already switched
     # the checkout. That updater may `exec` the new installer and never run
@@ -210,8 +256,10 @@ def capture(source, skills, codex):
     snapshot = directory / "snapshot.json"
     save_snapshot(snapshot, {})
     try:
+        paths = target_paths(source, skills, codex)
+        preflight(directory, paths)
         entries = {}
-        for path in target_paths(source, skills, codex):
+        for path in paths:
             saved = {}
             before = identity(path, saved=saved)
             saved.update(type=before["type"], before=before)
@@ -227,9 +275,9 @@ def capture(source, skills, codex):
     print(directory)
 
 
-def restore(directory, *, checkout_only=False):
-    entries = {} if checkout_only else json.loads((directory / "snapshot.json").read_text())
-    conflicts = [saved["drift"] for saved in entries.values() if "drift" in saved]
+def restore_targets(directory):
+    entries = json.loads((directory / "snapshot.json").read_text())
+    conflicts = []
     bound = {}
     for name, saved in entries.items():
         if "installed" not in saved:
@@ -301,6 +349,17 @@ def restore(directory, *, checkout_only=False):
                 captured.rmdir() if captured.is_dir() and not captured.is_symlink() else captured.unlink()
             except OSError:
                 conflicts.append(f"{name} captured at {captured}")
+    return conflicts
+
+
+def restore(directory, *, checkout_only=False):
+    entries = json.loads((directory / "snapshot.json").read_text())
+    conflicts = [saved["drift"] for saved in entries.values() if "drift" in saved]
+    if not checkout_only:
+        try:
+            conflicts.extend(restore_targets(directory))
+        except (OSError, ValueError, KeyError) as exc:
+            conflicts.append("destination recovery failed: " + str(exc))
     previous = json.loads((directory / "prior-checkout.json").read_text())
     if previous:
         source = Path(previous["source"])

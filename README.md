@@ -75,15 +75,19 @@ bash scripts/update.sh "$RELEASE_TAG"
 The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. If installation fails before service activation, the installer restores owned hooks, agent copies and the previous detached checkout, including upgrades begun with the older updater. The service waits for a matching activation marker written only after bootstrap succeeds; it does not open or migrate SQLite before that point. Obsolete skill links and unchanged owned agent copies are removed on success; modified copies, other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
 
 Installation rollback requires the native Linux/macOS atomic exchange interface;
-unsupported hosts refuse before installation effects. Private rollback snapshots
-bind the installer's actual file/link/directory identities. File bytes, mode and
+unsupported hosts refuse before installation effects. Private rollback snapshots live in the owned Codex directory (or its nearest
+owned existing parent), outside the OS temporary-directory policy, and bind the installer's actual file/link/directory identities. File bytes, mode and
 identity come from one opened-file observation; a write during that read refuses
 capture before installation effects. Rollback atomically
 restores helper pointers, captures cleanup targets into that existing private
 backup and deletes only matching installer objects. Changed or foreign objects
 remain with actionable original/captured locations and the complete backup;
 preflight and zero-effect capture refusals restore only checkout state, including
-upgrades begun by the historical exec-based updater. It never excludes other writers.
+upgrades begun by the historical exec-based updater. Backup/target filesystems and real native exchange are checked before destination
+effects. Failed destination recovery still attempts authenticated source checkout
+recovery, reports unresolved paths and retains the backup until the operator
+recovers it. Public installation refusals return status 1. It never excludes
+other writers.
 Forward installer writes exchange existing targets and authenticate the displaced object in that same private backup; retirement captures targets before deleting them. Concurrent drift refuses installation and retains the foreign bytes and full backup at the reported paths.
 
 ## Candidate trials

@@ -25,5 +25,5 @@ else
   else
     "$PYTHON" -B "$ROOT/scripts/install-rollback.py" restore "$backup"
   fi
-  exit "$result"
+  exit 1
 fi

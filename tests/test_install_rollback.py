@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,9 @@ class InstallRollback(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="devflow-rollback-test-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
+        self.source = self.root / "source"
+        subprocess.run(["git", "clone", "--quiet", "--shared", str(ROOT), str(self.source)], check=True)
+        subprocess.run(["git", "-C", str(self.source), "checkout", "--quiet", "--detach", "HEAD"], check=True)
         self.skills, self.home = self.root / "skills", self.root / "codex"
         self.skills.mkdir()
         self.home.mkdir()
@@ -29,17 +33,17 @@ class InstallRollback(unittest.TestCase):
         self.rollback = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.rollback)
         self.compatibility = self.skills / "devflow"
-        self.compatibility.symlink_to(ROOT / "skills/devflow")
+        self.compatibility.symlink_to(self.source / "skills/devflow")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.rollback.capture(ROOT, self.skills, self.home)
+            self.rollback.capture(self.source, self.skills, self.home)
         self.backup = Path(output.getvalue().strip())
         self.addCleanup(shutil.rmtree, self.backup, True)
         self.helper = self.skills / ".devflow-helpers"
         self.helper.mkdir()
         self.rollback.created(self.backup, self.helper)
         for name in ("scripts", "references"):
-            (self.helper / name).symlink_to(ROOT / "skills/devflow" / name)
+            (self.helper / name).symlink_to(self.source / "skills/devflow" / name)
             self.rollback.created(self.backup, self.helper / name)
         stage = self.skills / "pointer"
         stage.symlink_to(self.helper)
@@ -106,7 +110,7 @@ class InstallRollback(unittest.TestCase):
         self.assertTrue(observations)
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.helper.exists())
-        self.assertEqual(os.readlink(self.compatibility), str(ROOT / "skills/devflow"))
+        self.assertEqual(os.readlink(self.compatibility), str(self.source / "skills/devflow"))
 
     def test_agent_write_authenticates_displaced_foreign_file(self):
         target = self.home / "agents/devflow-implementer.toml"
@@ -114,7 +118,7 @@ class InstallRollback(unittest.TestCase):
         target.write_bytes(b"old installed agent")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.rollback.capture(ROOT, self.skills, self.home)
+            self.rollback.capture(self.source, self.skills, self.home)
         backup = Path(output.getvalue().strip())
         self.addCleanup(shutil.rmtree, backup, True)
         spec = importlib.util.spec_from_file_location("test_agents", ROOT / "scripts/install-agents.py")
@@ -170,7 +174,7 @@ class InstallRollback(unittest.TestCase):
         agents = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(agents)
         before = list(self.home.iterdir())
-        arguments = [str(ROOT / "scripts/install-agents.py"), "apply", str(ROOT),
+        arguments = [str(ROOT / "scripts/install-agents.py"), "apply", str(self.source),
                      str(self.skills), str(self.home), "false"]
         with mock.patch.object(sys, "argv", arguments):
             with self.assertRaisesRegex(ValueError, "installer snapshot; run scripts/install.sh"):
@@ -230,7 +234,7 @@ class InstallRollback(unittest.TestCase):
                 mock.patch.object(tempfile, "mkdtemp", private_directory), \
                 contextlib.redirect_stdout(output):
             try:
-                self.rollback.capture(ROOT, self.skills, self.home)
+                self.rollback.capture(self.source, self.skills, self.home)
             except ValueError as exc:
                 error = exc
         self.assertTrue(injected, "ordinary update at the actual byte observation was not exercised")
@@ -242,6 +246,105 @@ class InstallRollback(unittest.TestCase):
                              saved["before"]["sha256"], "old bytes were bound to a newer file identity")
         self.assertEqual(json.loads(target.read_text())["foreign_capture_note"], "ordinary update during capture")
         self.assertTrue((self.compatibility / "scripts/state.py").is_file())
+
+    def test_unreadable_and_fifo_displaced_objects_remain_unresolved(self):
+        for kind in ("unreadable", "fifo"):
+            for retire in (False, True):
+                with self.subTest(kind=kind, retire=retire):
+                    target = self.home / "agents/devflow-implementer.toml"
+                    target.parent.mkdir(exist_ok=True)
+                    target.unlink(missing_ok=True)
+                    target.write_bytes(b"old installed agent")
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        self.rollback.capture(self.source, self.skills, self.home)
+                    backup = Path(output.getvalue().strip())
+                    self.addCleanup(shutil.rmtree, backup, True)
+                    stage = self.home / "stage"
+                    stage.write_bytes(b"new installed agent")
+                    replace, exchange = os.replace, self.rollback.exchange
+
+                    def plant(target=target, kind=kind):
+                        target.unlink()
+                        if kind == "fifo":
+                            os.mkfifo(target)
+                        else:
+                            target.write_bytes(b"foreign unreadable bytes")
+                            target.chmod(0o200)
+
+                    def before_exchange(left, right, target=target, plant=plant, exchange=exchange):
+                        if right == target:
+                            plant()
+                        return exchange(left, right)
+
+                    def before_replace(left, right, target=target, plant=plant, replace=replace):
+                        if left == target:
+                            plant()
+                        return replace(left, right)
+
+                    with mock.patch.object(self.rollback, "exchange", before_exchange), \
+                            mock.patch.object(os, "replace", before_replace):
+                        with self.assertRaisesRegex(ValueError, "forward installer drift preserved"):
+                            self.rollback.effect(backup, target, None if retire else stage)
+                    saved = json.loads((backup / "snapshot.json").read_text())[str(target)]
+                    captured = next(backup.glob("forward-*"))
+                    self.assertIn("authentication failed", saved["drift"])
+                    self.assertEqual(saved["displaced_node"][1], captured.lstat().st_ino)
+                    with self.assertRaisesRegex(ValueError, "captured at.*retained backup"):
+                        self.rollback.restore(backup)
+                    self.assertTrue(os.path.lexists(captured))
+                    if kind == "unreadable":
+                        captured.chmod(0o600)
+                        self.assertEqual(captured.read_bytes(), b"foreign unreadable bytes")
+                    self.assertEqual(backup.parent, self.home, "retained data was left in the OS temporary directory")
+
+    def test_cross_filesystem_and_unsupported_exchange_refuse_before_effects(self):
+        import errno
+        for error in (errno.EXDEV, errno.ENOTSUP):
+            with self.subTest(error=error):
+                before = sorted(p.name for p in self.home.iterdir())
+                with mock.patch.object(self.rollback, "exchange", side_effect=OSError(error, os.strerror(error))):
+                    with self.assertRaisesRegex(ValueError, "atomic exchange unsupported"):
+                        self.rollback.capture(self.source, self.skills, self.home)
+                self.assertEqual(sorted(p.name for p in self.home.iterdir()), before)
+                self.assertTrue((self.compatibility / "scripts/state.py").is_file())
+
+    def test_destination_restore_error_still_restores_owned_prior_checkout(self):
+        import errno
+        prior = "c04f00eb43eb225728b63c82026ffe97a41cafc2"
+        current = subprocess.check_output(["git", "-C", str(self.source), "rev-parse", "HEAD"], text=True).strip()
+        for revision in (prior, current):
+            subprocess.run(["git", "-C", str(self.source), "checkout", "--quiet", "--detach", revision], check=True)
+        self.compatibility.unlink()
+        self.compatibility.symlink_to(self.source / "skills/devflow")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.rollback.capture(self.source, self.skills, self.home)
+        backup = Path(output.getvalue().strip())
+        self.addCleanup(shutil.rmtree, backup, True)
+        stage = self.skills / "pointer"
+        stage.symlink_to(self.helper)
+        self.rollback.effect(backup, self.compatibility, stage)
+        with mock.patch.object(self.rollback, "exchange", side_effect=OSError(errno.EXDEV, "injected restore failure")):
+            with self.assertRaisesRegex(ValueError, "destination recovery failed.*retained backup"):
+                self.rollback.restore(backup)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(self.source), "rev-parse", "HEAD"], text=True).strip(), prior)
+        self.assertTrue((backup / "snapshot.json").is_file())
+
+    def test_aliased_install_and_canonical_replay_record_every_effect(self):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+            shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
+        alias = self.root / "alias"
+        alias.symlink_to(self.root)
+        home = self.root / "fresh-codex"
+        home.mkdir()
+        for location in (alias, self.root):
+            installed = subprocess.run(["sh", str(self.source / "scripts/install.sh"),
+                                        str(location / "fresh-skills"), str(location / "fresh-codex")],
+                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable), capture_output=True, text=True)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertTrue((self.root / "fresh-skills/devflow/scripts/state.py").is_file())
+        self.assertTrue((self.root / "fresh-skills/devflow-local-delivery/SKILL.md").is_file())
 
     def test_unsupported_host_refuses_without_replacement_fallback(self):
         before = os.readlink(self.compatibility)
