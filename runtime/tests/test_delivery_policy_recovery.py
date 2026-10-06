@@ -11,6 +11,7 @@ import pytest
 from temporalio.service import RPCError, RPCStatusCode
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
+from test_delivery_store import submit_historical_admission
 
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_api import DeliveryService
@@ -30,8 +31,9 @@ def preserved(native_configuration, monkeypatch):
     config.raw['max_repairs'] = 2
     config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
-    store.submit({**request, 'accepted_plan':
-                  'Change the owned README and verify the exact candidate'})
+    submit_historical_admission(
+        store, {**request, 'accepted_plan':
+                'Change the owned README and verify the exact candidate'}, monkeypatch)
     spec = prepare_authority(store, store.spec(request['run_id']))
     broker = DeliveryBroker(store, spec)
     broker.prepare()

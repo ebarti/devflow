@@ -21,6 +21,7 @@ from test_delivery_native import native_configuration as native_configuration
 from test_delivery_native_renewal import payload_update as payload_update
 from test_delivery_resources import spec as resource_spec
 from test_delivery_store import service as service
+from test_delivery_store import submit_historical_admission
 from test_delivery_title_repair import title_repair as title_repair
 
 from devflow_temporal import delivery_native_renewal as renewal
@@ -794,7 +795,7 @@ def test_inherited_confirmed_blocked_checkpoint_does_not_freeze_fresh_technical_
 ):
     monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, submitted = service
-    store.submit(submitted)
+    submit_historical_admission(store, submitted, monkeypatch)
     spec = store.spec("run-1")
     candidate = {"id": "a" * 64, "head": "b" * 40}
     published = {"number": 7, "head": candidate["head"], "candidate": candidate}
@@ -940,7 +941,7 @@ def test_published_technical_checkpoint_never_implements_or_republishes(
 ):
     monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, submitted = service
-    store.submit(submitted)
+    submit_historical_admission(store, submitted, monkeypatch)
     spec = store.spec("run-1")
     spec["policy"]["browser_qa"] = {"argv": ["fixture"]}
     candidate = {"id": "a" * 64, "head": "b" * 40}

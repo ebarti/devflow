@@ -130,9 +130,21 @@ def test_submit_claim_and_temporal_outbox_are_atomic_and_idempotent(service):
         store.submit({**request, "command_id": "command-3", "goal": "A different change"})
 
 
+def submit_historical_admission(store, request, monkeypatch):
+    """Set up a pre-budget admission for tests of retained legacy continuations."""
+    spec = store.config.admit(request)
+    spec.pop("automatic_retry_version", None)
+    spec.pop("retry_budget_version", None)
+    spec["policy"].pop("max_attempts", None)
+    spec["policy_digest"] = digest(spec["policy"])
+    with monkeypatch.context() as historical:
+        historical.setattr(DeliveryConfig, "admit", lambda *_args: copy.deepcopy(spec))
+        return store.submit(request)
+
+
 def _failed_published_repair_fixture(store, request, monkeypatch):
     """One published failed gate with sealed role/PR/cleanup evidence."""
-    store.submit(request)
+    submit_historical_admission(store, request, monkeypatch)
     store.mark_start(request["run_id"], accepted=True)
     spec = store.spec(request["run_id"])
     broker = DeliveryBroker(store, spec)

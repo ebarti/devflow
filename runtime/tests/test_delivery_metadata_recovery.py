@@ -7,7 +7,7 @@ import os
 from datetime import timedelta
 
 import pytest
-from test_delivery_store import _git
+from test_delivery_store import _git, submit_historical_admission
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_metadata_recovery as metadata
@@ -32,7 +32,7 @@ def published(service, monkeypatch):
     ]
     repository["checks"] = repository["prepublish_checks"]
     store.config.path.write_text(json.dumps(store.config.raw))
-    store.submit(request)
+    submit_historical_admission(store, request, monkeypatch)
     spec = store.spec("run-1")
     broker = DeliveryBroker(store, spec)
     broker.prepare()

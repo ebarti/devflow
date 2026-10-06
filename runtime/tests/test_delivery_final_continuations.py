@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from temporalio import workflow
 from test_delivery_store import service as service
+from test_delivery_store import submit_historical_admission
 
 from devflow_temporal import delivery_investigation_adjudication as adjudication
 from devflow_temporal import delivery_native_renewal as renewal
@@ -172,9 +173,9 @@ def test_hash_bound_evidence_reader_refuses_before_writes(tmp_path, monkeypatch,
 
 
 @pytest.fixture
-def stopped_tail(service):
+def stopped_tail(service, monkeypatch):
     store, submitted = service
-    store.submit(submitted)
+    submit_historical_admission(store, submitted, monkeypatch)
     spec = store.spec("run-1")
     spec["resource_cleanup_version"] = 1
     spec["terminal_tracker_version"] = 1
