@@ -567,6 +567,11 @@ def scope_amended_spec(
         supplied.pop("accepted_plan", None)
         supplied["plan_approval"] = original.get("plan_approval", "required")
     effective = amended.admit(supplied)
+    if "provider_max_attempts" in original["policy"]:
+        effective["policy"]["provider_max_attempts"] = original["policy"]["provider_max_attempts"]
+    else:
+        effective["policy"].pop("provider_max_attempts", None)
+    effective["policy_digest"] = digest(effective["policy"])
     effective["accepted_plan"] = original["accepted_plan"]
     if "plan_approval" in original:
         effective["plan_approval"] = original["plan_approval"]

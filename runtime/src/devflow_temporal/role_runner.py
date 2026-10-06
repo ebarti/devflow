@@ -411,6 +411,14 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
             "reported_effort": None,
         }
     result: AgentResult = await runtime.run(task)
+    provider_findings = []
+    if not result.is_success:
+        failure = observation.failure() if observation else None
+        if failure:
+            provider_findings = [f"provider_error={failure['classification']}: "
+                                 f"{failure['message'] or 'no provider message'}"]
+        elif result.error:
+            provider_findings = [f"provider_error: {result.error[:512]}"]
     parsed = result.parsed_output if result.parsed_output_available else None
     if not result.is_success or not isinstance(parsed, dict):
         status = "blocked"
@@ -463,7 +471,7 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
         ):
             status, findings = "blocked", ["intake did not justify a blocking ambiguity"]
         return {
-            "status": status, "summary": summary, "findings": findings,
+            "status": status, "summary": summary, "findings": findings + provider_findings,
             "questions": questions if status == "questions" else [],
             "plan": plan if status == "plan" else None,
             "session_id": result.session_id, "usage": asdict(result.usage),
@@ -493,7 +501,7 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": status,
         "summary": summary,
-        "findings": findings,
+        "findings": findings + provider_findings,
         "session_id": result.session_id,
         "usage": asdict(result.usage),
         "finish_reason": result.finish_reason,

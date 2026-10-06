@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -54,7 +55,8 @@ def usage(multiplier=1):
 
 def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
             collaboration=False, foreign=False, interrupted=False, max_attempts=3,
-            resume=False, missing_usage=False, assessment=None):
+            resume=False, missing_usage=False, assessment=None,
+            failure_message="Controlled provider failure"):
     folder = tmp_path / "attempt"
     folder.mkdir()
     write_private(folder / "native-process.json",
@@ -106,7 +108,7 @@ def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
                         id=self.id, status=("interrupted" if interrupted else
                                             "failed" if self.error else "completed"),
                         items=[item], itemsView="full",
-                        error=TurnError(message="Controlled provider failure",
+                        error=TurnError(message=failure_message,
                                         codexErrorInfo=CodexErrorInfo(self.error))
                         if self.error else None)))
 
@@ -386,3 +388,82 @@ def test_provider_attempt_limit_is_frozen_and_cannot_be_supplied_per_run(service
     assert store.config.admit(request)["policy"]["provider_max_attempts"] == 1
     with pytest.raises(ValueError, match="submit fields"):
         store.config.admit({**request, "provider_max_attempts": 3})
+
+
+@pytest.mark.asyncio
+async def test_large_completed_item_stays_private_with_bounded_reference(tmp_path, monkeypatch):
+    _runtime, _task, observation, *_ = harness(tmp_path, monkeypatch, [])
+    observation.started("owned-thread")
+    output = "x" * 1048576
+    item = ThreadItem.model_validate({
+        "type": "commandExecution", "id": "cmd", "command": "pytest -vv",
+        "commandActions": [], "cwd": "/tmp", "status": "completed",
+        "aggregatedOutput": output,
+    })
+
+    class Handle:
+        id, thread_id = "turn-1", "owned-thread"
+
+        async def stream(self):
+            yield Notification("item/completed", ItemCompletedNotification(
+                item=item, threadId=self.thread_id, turnId=self.id, completedAtMs=0))
+            yield Notification("turn/completed", TurnCompletedNotification(
+                threadId=self.thread_id, turn=Turn(id=self.id, status="completed", items=[])))
+
+    await observation.collect(Handle())
+    reference = observation.reference()
+    assert len(json.dumps(reference).encode()) < 64 * 1024
+    assert output not in json.dumps(reference)
+    assert read_private(observation.path)["turns"][0]["items"][0]["aggregatedOutput"] == output
+    assert reference["sha256"] == hashlib.sha256(observation.path.read_bytes()).hexdigest()
+
+
+def test_reference_bounds_arbitrary_provider_fields_and_turn_count(tmp_path, monkeypatch):
+    _runtime, _task, observation, *_ = harness(tmp_path, monkeypatch, [])
+    oversized = "\u0000" * 16384
+    record = {"thread_id": oversized, "turn_id": oversized,
+              "turn": {"status": "failed", "error": {
+                  "message": oversized, "codexErrorInfo": {"httpConnectionFailed": {
+                      "httpStatusCode": 503, "message": oversized}}}},
+              "start_error": {"type": oversized, "message": oversized, "data": oversized},
+              "items": [{"output": oversized}]}
+    observation.data.update({"turns": [record] * 100, "parent_thread_id": oversized,
+                             "resumed_from": oversized, "collaboration_items": [record] * 100,
+                             "thread_inventory_before": [oversized] * 200,
+                             "thread_inventory_after": [oversized] * 200,
+                             "new_child_thread_ids": [oversized] * 200})
+    write_private(observation.path, observation.data)
+    reference = observation.reference()
+    assert len(json.dumps(reference).encode()) < 64 * 1024
+    assert reference["turn_count"] == 100
+    assert len(reference["turns"]) <= observation.max_attempts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["unauthorized", "contextWindowExceeded",
+                                  "rateLimitExceeded"])
+@pytest.mark.parametrize("role", ["implement", "intake", "verify"])
+async def test_failed_role_exposes_bounded_typed_provider_reason(
+        tmp_path, monkeypatch, error, role):
+    from devflow_temporal import role_runner
+
+    runtime, task, observation, *_ = harness(
+        tmp_path, monkeypatch, [error] * 3,
+        max_attempts=3 if error == "rateLimitExceeded" else 1,
+        failure_message="Controlled provider failure " + "x" * 16384)
+    monkeypatch.setattr(delivery_native_threads, "NativeThreadObservation", lambda _r: observation)
+    monkeypatch.setattr(role_runner, "CodexAgentRuntime", lambda **_kw: runtime)
+    monkeypatch.setattr(role_runner, "_task", lambda _r: task)
+    binary = tmp_path / "codex"
+    binary.write_bytes(b"fixture binary")
+    request = {"role": role, "qa_evidence": {"sha256": "fixture"}, "spec": {"policy": {
+        "codex_bin": str(binary),
+        "codex_bin_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "execution_backend": "native-macos", "config_overrides": [], "host_sandbox": {},
+    }}}
+    result = await role_runner._run_codex(request)
+    assert result["status"] == "blocked"
+    assert error in " ".join(result["findings"])
+    assert "Controlled provider failure" in " ".join(result["findings"])
+    assert len(" ".join(result["findings"])) < 2048
+    assert len(json.dumps(result["native_thread_observation"]).encode()) < 64 * 1024

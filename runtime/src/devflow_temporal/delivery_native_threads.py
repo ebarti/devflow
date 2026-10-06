@@ -24,6 +24,24 @@ from openai_codex.generated.v2_all import (
 from .delivery_resources import read_private, write_private
 
 
+def _bounded_text(value, limit=256):
+    return value[:limit] if isinstance(value, str) else None
+
+
+def _turn_failure(record):
+    error = (record.get("turn") or {}).get("error")
+    if error:
+        info = error.get("codexErrorInfo")
+        classification = next(iter(info), "other") if isinstance(info, dict) else info
+        return {"classification": _bounded_text(classification, 128) or "other",
+                "message": _bounded_text(error.get("message"), 512)}
+    error = record.get("start_error")
+    if error:
+        return {"classification": _bounded_text(error.get("type"), 128) or "other",
+                "message": _bounded_text(error.get("message"), 512)}
+    return None
+
+
 def collaboration_items(items) -> list[dict]:
     found = []
     for wrapped in items:
@@ -209,10 +227,29 @@ class NativeThreadObservation:
                 code = value[kind].get("httpStatusCode")
                 return code is None or code in {408, 429} or 500 <= code <= 599
         return False
+
+    def failure(self) -> dict | None:
+        turns = self.data.get("turns", [])
+        return _turn_failure(turns[-1]) if turns else None
+
     def reference(self) -> dict:
+        # Full transcripts and inventories stay in the private file. This
+        # fixed-size projection is copied into role results and workflow history.
+        turns = self.data.get("turns", [])
         return {
-            **self.data,
-            "path": str(self.path),
+            **{key: _bounded_text(self.data[key]) for key in (
+                "schema", "run_id", "role", "start_identity", "resumed_from",
+                "state", "parent_thread_id", "observation_source")},
+            **{key: self.data[key] for key in ("iteration", "pid", "raw_turn_items")},
+            **{key + "_count": len(self.data[key]) if self.data[key] is not None else None
+               for key in ("collaboration_items", "thread_inventory_before",
+                           "thread_inventory_after", "new_child_thread_ids")},
+            "turn_count": len(turns),
+            "turns": [{"thread_id": _bounded_text(record.get("thread_id")),
+                       "turn_id": _bounded_text(record.get("turn_id")),
+                       "status": _bounded_text((record.get("turn") or {}).get("status")),
+                       "error": _turn_failure(record)} for record in turns[:self.max_attempts]],
+            "path": _bounded_text(str(self.path), 4096),
             "sha256": hashlib.sha256(self.path.read_bytes()).hexdigest(),
         }
 
