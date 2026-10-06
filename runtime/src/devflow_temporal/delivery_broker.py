@@ -757,8 +757,6 @@ class DeliveryBroker:
         tools["native_builder"] = builder
         receipt = evidence / "native-addon-preparation.json"
         if receipt.exists():
-            from .delivery_native_process import reconcile_process
-
             old = read_private(receipt)
             if old["candidate_id"] != candidate["id"] or old["native_addon_authority"] != authority:
                 raise ValueError("native addon preparation receipt has stale source authority")
@@ -779,7 +777,8 @@ class DeliveryBroker:
             for row in old["results"]:
                 if (
                     _sha256(Path(row["log"])) != row["log_sha256"]
-                    or reconcile_process(Path(row["native_process"]["journal"]))["cleanup"]
+                    or self._reconcile_native_check(
+                        Path(row["native_process"]["journal"]))["cleanup"]
                     != "observed-native-confirmed"
                 ):
                     raise ValueError("native addon process/log readback changed across replay")
@@ -875,6 +874,14 @@ class DeliveryBroker:
             raise RuntimeError("native check cancelled before launch")
         self.native_cleanup_confirmed = False
         result = process.run()
+        self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
+        return result
+
+    def _reconcile_native_check(self, journal: Path) -> dict:
+        from .delivery_native_process import reconcile_process
+
+        self.native_cleanup_confirmed = False
+        result = reconcile_process(journal)
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
         return result
 

@@ -30,10 +30,30 @@ _CHECK_HEARTBEAT_INTERVAL = 5
 _UNCLEAN_CHECK_SLOTS: list[int] = []
 
 
-async def _execute_check(request: dict[str, Any], execute) -> dict[str, Any]:
+def _try_check_lock(path: Path) -> int | None:
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise ValueError("check lock is not private and owned")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descriptor
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+async def _execute_check(
+    request: dict[str, Any], execute, *, ports: tuple[int, ...] = (),
+) -> dict[str, Any]:
     """Bound native gates across workers and join their monitor on cancellation."""
     cancelled = threading.Event()
     admitted = threading.Event()
+    ports_admitted = threading.Event()
 
     def run():
         from .delivery_resources import private_directory
@@ -47,20 +67,24 @@ async def _execute_check(request: dict[str, Any], execute) -> dict[str, Any]:
         private_directory(root)
         slots = store.config.raw.get("check_concurrency", 2)
         descriptor = None
+        port_descriptors = []
         try:
+            # Frozen port sets may overlap across runs. Acquire them in one
+            # consistent order, before consuming generic check capacity.
+            for port in sorted(set(ports)):
+                while not cancelled.is_set() and not broker._native_cancelled():
+                    handle = _try_check_lock(root / f"port-{port}.lock")
+                    if handle is not None:
+                        port_descriptors.append(handle)
+                        break
+                    cancelled.wait(0.1)
+                else:
+                    raise asyncio.CancelledError
+            ports_admitted.set()
             while not cancelled.is_set() and not broker._native_cancelled():
                 for slot in range(slots):
-                    handle = os.open(root / f"slot-{slot}.lock",
-                                     os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-                    info = os.fstat(handle)
-                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
-                        os.close(handle)
-                        raise ValueError("check slot is not private and owned")
-                    try:
-                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        os.close(handle)
+                    handle = _try_check_lock(root / f"slot-{slot}.lock")
+                    if handle is None:
                         continue
                     descriptor = handle
                     break
@@ -76,19 +100,24 @@ async def _execute_check(request: dict[str, Any], execute) -> dict[str, Any]:
             raise asyncio.CancelledError
         finally:
             if descriptor is not None:
-                if broker.native_cleanup_confirmed:
-                    os.close(descriptor)
-                else:
-                    # An unknown teardown cannot supply capacity to another gate.
-                    _UNCLEAN_CHECK_SLOTS.append(descriptor)
+                port_descriptors.append(descriptor)
+            if broker.native_cleanup_confirmed:
+                for handle in port_descriptors:
+                    os.close(handle)
+            else:
+                # Unknown teardown cannot supply ports or capacity to another gate.
+                _UNCLEAN_CHECK_SLOTS.extend(port_descriptors)
 
     pending = asyncio.create_task(asyncio.to_thread(run))
     try:
         while not pending.done():
             if activity.in_activity():
+                stage = ("executing-check" if admitted.is_set() else
+                         "waiting-browser-ports" if ports and not ports_admitted.is_set() else
+                         "waiting-check-slot")
                 activity.heartbeat({
                     "run_id": request["spec"]["run_id"],
-                    "stage": "executing-check" if admitted.is_set() else "waiting-check-slot",
+                    "stage": stage,
                 })
             await asyncio.wait({pending}, timeout=_CHECK_HEARTBEAT_INTERVAL)
         return await asyncio.shield(pending)
@@ -516,7 +545,8 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
     # Browser/API fixtures may run for minutes. Keep the Temporal worker loop
     # available for cancellation updates and unrelated workflows while this
     # bounded child is supervised on its own thread.
-    return await _execute_check(request, execute)
+    qa = request["spec"].get("policy", {}).get("browser_qa") or {}
+    return await _execute_check(request, execute, ports=tuple(qa.get("ports", {}).values()))
 
 
 @activity.defn(name="delivery_precheck")
