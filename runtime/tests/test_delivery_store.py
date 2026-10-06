@@ -2755,6 +2755,16 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
     service, monkeypatch, failure_window
 ):
     original, request = service
+    # This test exercises historical manual continuation, frozen without automatic readback.
+    real_admit = DeliveryConfig.admit
+
+    def legacy_admit(config, supplied):
+        admitted = real_admit(config, supplied)
+        admitted.pop("publication_readback_version", None)
+        admitted.pop("publication_readback_seconds", None)
+        return admitted
+
+    monkeypatch.setattr(DeliveryConfig, "admit", legacy_admit)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]

@@ -9,7 +9,8 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from .contracts import digest
 from .delivery_metadata_contract import evidence_applicability
@@ -192,6 +193,11 @@ class DeliveryWorkflow:
         timeout = timedelta(hours=hours)
         if name in {"delivery_terminal_tracker", "delivery_terminal_preflight"}:
             timeout = timedelta(seconds=min(request.get("timeout_seconds", 180), 180))
+            options["schedule_to_close_timeout"] = timeout
+        if (name in {"delivery_publish", "delivery_reconcile_publish"}
+                and request["spec"].get("publication_readback_version") == 1):
+            limit = 180 if name == "delivery_publish" else 60
+            timeout = timedelta(seconds=min(request.get("timeout_seconds", limit), limit))
             options["schedule_to_close_timeout"] = timeout
         return await workflow.execute_activity(
             name,
@@ -430,6 +436,68 @@ class DeliveryWorkflow:
         )
         return self.state
 
+    async def _publish_original(self, spec, iteration, candidate):
+        """Invoke mutation once; a lost completion can only inspect its existing effect."""
+        self.state["cleanup"] = "unknown"
+        try:
+            initial = await self._activity("delivery_publish", {
+                "spec": spec, "iteration": iteration, "candidate": candidate,
+            })
+        except ActivityError:
+            initial = None
+        previous = self.state.get("pull_request") or {}
+        return await self._published_result(
+            spec, iteration, candidate, initial,
+            expected_head=initial.get("head") if initial else None,
+            expected_pr_number=previous.get("number"),
+        )
+
+    @staticmethod
+    def _publication_transport_failure(exc):
+        cause = exc.cause if isinstance(exc, ActivityError) else exc
+        return (isinstance(cause, ActivityTimeoutError)
+                or isinstance(cause, ApplicationError) and cause.type in {
+                    "BrokerReadbackUnavailable", "TimeoutExpired", "TimeoutError",
+                    "ConnectionError",
+                })
+
+    async def _bounded_published_result(self, spec, request, initial):
+        deadline = workflow.now() + timedelta(seconds=spec["publication_readback_seconds"])
+        delay = 5
+        result = initial
+        self.state["cleanup"] = "unknown"
+        while True:
+            if self.cancel_requested:
+                self.state["cleanup"] = "unknown"
+                await self._cancelled(spec)
+                return {"state": "cancelled"}
+            remaining = (deadline - workflow.now()).total_seconds()
+            if remaining <= 0:
+                raise ApplicationError("original publication readback deadline exhausted")
+            if result is None:
+                try:
+                    result = await self._activity("delivery_reconcile_publish", {
+                        **request, "timeout_seconds": max(1, int(remaining)),
+                    })
+                except Exception as exc:
+                    if not self._publication_transport_failure(exc):
+                        raise
+                    result = {"state": "pending"}
+            if result.get("state") != "pending":
+                self.state["cleanup"] = "none"
+                return result
+            if result.get("head"):
+                request["expected_head"] = request["expected_head"] or result["head"]
+            self.state["phase"] = "publishing_pending"
+            self.state["revision"] += 1
+            await self._project(
+                spec, "publication_pending", "Waiting for original publication readback"
+            )
+            remaining = (deadline - workflow.now()).total_seconds()
+            await self._wait_repair_readback(min(delay, max(0, remaining)))
+            delay = min(delay * 2, 30)
+            result = None
+
     async def _published_result(
         self,
         spec: dict[str, Any],
@@ -447,6 +515,8 @@ class DeliveryWorkflow:
             "expected_head": expected_head,
             "expected_pr_number": expected_pr_number,
         }
+        if spec.get("publication_readback_version") == 1:
+            return await self._bounded_published_result(spec, request, initial)
         result = initial or await self._activity("delivery_reconcile_publish", request)
         delay = 5
         while result.get("state") == "pending":
@@ -906,15 +976,21 @@ class DeliveryWorkflow:
                 return await self._stop(spec, "pending publication tracker readback pending")
             if self.cancel_requested:
                 return await self._stop(spec, "cancelled")
-            published = await self._activity("delivery_publish", {
-                "spec": spec, "iteration": self.state["iteration"],
-                "candidate": self.state["candidate"],
-            })
-            if published.get("state") == "pending":
+            if spec.get("publication_readback_version") == 1:
                 published = await self._published_result(
-                    spec, self.state["iteration"], self.state["candidate"], published,
+                    spec, self.state["iteration"], self.state["candidate"], None,
                     expected_head=recovery["seal"]["candidate"]["head"],
                 )
+            else:
+                published = await self._activity("delivery_publish", {
+                    "spec": spec, "iteration": self.state["iteration"],
+                    "candidate": self.state["candidate"],
+                })
+                if published.get("state") == "pending":
+                    published = await self._published_result(
+                        spec, self.state["iteration"], self.state["candidate"], published,
+                        expected_head=recovery["seal"]["candidate"]["head"],
+                    )
             if self.state.get("outcome") == "cancelled":
                 return self.state
             self.state.update(candidate=published["candidate"], pull_request=published)
@@ -1745,27 +1821,32 @@ class DeliveryWorkflow:
                 self.state["revision"] += 1
                 await self._project(spec, "candidate_ready", "Candidate ready for publication")
                 try:
-                    published = await self._activity(
-                        "delivery_publish",
-                        {
-                            "spec": spec,
-                            "iteration": iteration,
-                            "candidate": self.state["candidate"],
-                        },
-                    )
-                    if published.get("state") == "pending":
-                        published = await self._published_result(
-                            spec,
-                            iteration,
-                            self.state["candidate"],
-                            published,
-                            expected_head=published["head"],
-                            expected_pr_number=(
-                                self.state["pull_request"]["number"]
-                                if self.state["pull_request"]
-                                else None
-                            ),
+                    if spec.get("publication_readback_version") == 1:
+                        published = await self._publish_original(
+                            spec, iteration, self.state["candidate"]
                         )
+                    else:
+                        published = await self._activity(
+                            "delivery_publish",
+                            {
+                                "spec": spec,
+                                "iteration": iteration,
+                                "candidate": self.state["candidate"],
+                            },
+                        )
+                        if published.get("state") == "pending":
+                            published = await self._published_result(
+                                spec,
+                                iteration,
+                                self.state["candidate"],
+                                published,
+                                expected_head=published["head"],
+                                expected_pr_number=(
+                                    self.state["pull_request"]["number"]
+                                    if self.state["pull_request"]
+                                    else None
+                                ),
+                            )
                 except Exception as exc:
                     return await self._stop(spec, f"publication unresolved: {type(exc).__name__}")
                 if published.get("state") == "cancelled":

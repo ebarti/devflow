@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -82,6 +83,23 @@ def publication_title(goal: str) -> str:
     if not _conventional_subject(title):
         raise ValueError("publication subject prefix exceeds the PR title limit")
     return title
+
+
+def _transport_failure(exc: Exception) -> bool:
+    """Only known transport failures may defer publication authority readback."""
+    if isinstance(exc, (subprocess.TimeoutExpired, TimeoutError, ConnectionError)):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in {errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNREFUSED,
+                             errno.ENETUNREACH, errno.EHOSTUNREACH}
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        return any(marker in message for marker in (
+            "connection reset", "connection refused", "connection timed out",
+            "could not resolve host", "temporary failure in name resolution",
+            "i/o timeout", "tls handshake timeout", "http 502", "http 503", "http 504",
+        ))
+    return False
 
 
 class BrokerReadbackUnavailable(RuntimeError):
@@ -1203,6 +1221,8 @@ class DeliveryBroker:
                 timeout=60,
             )
         except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+            if self.spec.get("publication_readback_version") == 1 and not _transport_failure(exc):
+                raise
             raise BrokerReadbackUnavailable("owned branch PR readback unavailable") from exc
         matches = json.loads(output)
         if len(matches) > 1:
@@ -1245,6 +1265,26 @@ class DeliveryBroker:
             ).splitlines()
             if author not in signers:
                 raise ValueError("owned commit lacks its author Signed-off-by trailer: " + commit)
+
+    def _bind_pending_publication(self, key: str, head: str, number: int | None) -> None:
+        """Freeze observed identity in the existing effect before remote mutation."""
+        with self.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = db.execute(
+                "SELECT state,observed_json FROM delivery_effects WHERE effect_key=?", (key,),
+            ).fetchone()
+            if saved is None or saved["state"] != "pending":
+                raise ValueError("original publication effect is no longer pending")
+            previous = json.loads(saved["observed_json"] or "null")
+            if previous:
+                if (previous["head"] != head
+                        or number is not None and previous.get("number") not in {None, number}):
+                    raise ValueError("original publication identity changed")
+                number = previous.get("number") or number
+            db.execute(
+                "UPDATE delivery_effects SET observed_json=? WHERE effect_key=?",
+                (canonical_json({"head": head, "number": number}), key),
+            )
 
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
         publication_branch = self._publication_base_ref()
@@ -1293,6 +1333,8 @@ class DeliveryBroker:
         head = _git(self.checkout, "rev-parse", "HEAD")
         if head == self.spec["base_sha"]:
             raise ValueError("no meaningful commit is available for publication")
+        if self.spec.get("publication_readback_version") == 1:
+            self._bind_pending_publication(key, head, existing["number"] if existing else None)
         remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
         if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
             raise RuntimeError("Git push destination changed from the admitted origin")
@@ -1397,6 +1439,24 @@ class DeliveryBroker:
             or saved["request_json"] != canonical_json(request)
         ):
             raise ValueError("publication effect does not match this candidate")
+        if saved["state"] == "complete" and self.spec.get("publication_readback_version") == 1:
+            done = json.loads(saved["observed_json"])
+            if expected_head is not None and expected_head != done["head"]:
+                raise ValueError("publication expected head differs from original effect")
+            if expected_pr_number is not None and expected_pr_number != done["number"]:
+                raise ValueError("publication expected PR differs from original effect")
+            expected_head, expected_pr_number = done["head"], done["number"]
+        elif self.spec.get("publication_readback_version") == 1:
+            original = json.loads(saved["observed_json"] or "null")
+            if not original or not original.get("head"):
+                raise ValueError("original publication head has not been observed")
+            if expected_head is not None and expected_head != original["head"]:
+                raise ValueError("publication expected head differs from original effect")
+            if (expected_pr_number is not None and original.get("number") is not None
+                    and expected_pr_number != original["number"]):
+                raise ValueError("publication expected PR differs from original effect")
+            expected_head = original["head"]
+            expected_pr_number = original.get("number") or expected_pr_number
         current = self.candidate()
         head = current["head"]
         if expected_head is not None and head != expected_head:
@@ -1415,10 +1475,29 @@ class DeliveryBroker:
             raise ValueError("published commit does not descend directly from checked candidate")
         if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
             raise ValueError("published Git destination changed")
-        remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        try:
+            remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+            if self.spec.get("publication_readback_version") == 1 and _transport_failure(exc):
+                raise BrokerReadbackUnavailable("published branch readback unavailable") from exc
+            raise
+        if (self.spec.get("publication_readback_version") == 1 and saved["state"] == "pending"
+                and (not remote or (remote.split()[0] != head
+                                    and remote.split()[0] == input_candidate["head"]))):
+            return {"state": "pending", "reason": "original_push_readback", "head": head}
         if not remote or remote.split()[0] != head:
             raise ValueError("remote feature branch differs from the published checkout")
         found = self._existing_pr()
+        if found is not None:
+            if (self.spec.get("publication_readback_version") == 1
+                    and expected_pr_number is not None and found["number"] != expected_pr_number):
+                raise ValueError("publication resolved to a different PR")
+            if (self.spec.get("publication_readback_version") == 1
+                    and found["headRefOid"] not in {head, input_candidate["head"]}):
+                raise ValueError("owned PR head changed from the original publication")
+        if (found is not None and saved["state"] == "pending"
+                and self.spec.get("publication_readback_version") == 1):
+            self._bind_pending_publication(key, head, found["number"])
         if found is None or found["headRefOid"] != head:
             return {"state": "pending", "reason": "pr_head_readback", "head": head}
         if expected_pr_number is not None and found["number"] != expected_pr_number:
