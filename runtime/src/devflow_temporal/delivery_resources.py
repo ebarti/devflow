@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -27,15 +28,32 @@ def private_directory(path: Path) -> None:
 
 
 def read_private(path: Path) -> dict:
-    info = path.lstat()
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.getuid()
-        or info.st_mode & 0o777 != 0o600
-        or info.st_nlink != 1
-    ):
-        raise ValueError("resource evidence is not a private owned file")
-    return json.loads(path.read_bytes())
+    # Atomic journal publication may unlink an inode after open. Validate and
+    # read one descriptor, reopening only that bounded replacement race.
+    for _ in range(3):
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError("resource evidence is not a private owned file") from exc
+            raise
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_mode & 0o777 != 0o600
+            ):
+                raise ValueError("resource evidence is not a private owned file")
+            if info.st_nlink == 0:
+                continue
+            if info.st_nlink != 1:
+                raise ValueError("resource evidence is not a private owned file")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                return json.load(stream)
+        finally:
+            os.close(descriptor)
+    raise ValueError("resource evidence is not a private owned file")
 
 
 def write_private(path: Path, value: dict) -> None:

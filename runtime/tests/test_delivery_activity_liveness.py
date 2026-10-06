@@ -248,7 +248,6 @@ asyncio.run(main())
     ('implement', 'loop_stall'), ('review', 'loop_stall'), ('verify', 'loop_stall'),
     ('intake', 'loop_stall'), ('implement', 'cancel'),
     ('implement', 'deadline'), ('implement', 'terminate'),
-    ('review', 'scratch'), ('verify', 'scratch'),
     ('review', 'dirty_result'), ('verify', 'dirty_result'),
 ])
 async def test_real_temporal_worker_loss_reuses_original_native_command(
@@ -311,13 +310,14 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
         "if request['role']=='implement': "
         "(Path(request['workspace'])/'README.md').write_text('Changed by the fixed provider\\n')",
     ))
-    if interruption in {'scratch', 'dirty_result'}:
+    temporary_scratch = stage in {'review', 'verify'} and interruption == 'loop_stall'
+    if temporary_scratch or interruption == 'dirty_result':
         text = provider.read_text().replace(
             "print('started',flush=True)",
             "(Path(request['workspace'])/'scratch-output.txt').write_text('temporary output')\n"
             "print('started',flush=True)",
         )
-        if interruption == 'scratch':
+        if temporary_scratch:
             text = text.replace(
                 "write_private(Path(request['result_path'])",
                 "(Path(request['workspace'])/'scratch-output.txt').unlink()\n"
@@ -349,7 +349,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             if interruption == 'worker_loss':
                 workers[0].kill()
                 await asyncio.to_thread(workers[0].wait, 5)
-            elif interruption in {'loop_stall', 'scratch', 'dirty_result'}:
+            elif interruption in {'loop_stall', 'dirty_result'}:
                 stall = await environment.client.start_workflow(
                     ActivityLivenessWorkflow.run, {
                         'activity_name': 'blocking_loop_probe', 'request': request,
@@ -362,8 +362,13 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             elif interruption in {'deadline', 'terminate'}:
                 if interruption == 'terminate':
                     await handle.terminate(reason='Fixture closes without a replacement activity')
-                with pytest.raises(WorkflowFailureError):
-                    await asyncio.wait_for(handle.result(), 55)
+                try:
+                    early = await asyncio.wait_for(handle.result(), 55)
+                except WorkflowFailureError:
+                    pass
+                else:
+                    pytest.fail(f'Workflow finished before its deadline: {early}; '
+                                f'worker log: {(tmp_path / "first-worker.log").read_text()}')
                 # Let the live worker receive the deadline cancellation via heartbeat.
                 await asyncio.sleep(15)
                 # A physical SIGKILL without any replacement worker cannot run this
@@ -376,7 +381,8 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                         row = dict(db.execute('SELECT * FROM delivery_attempts').fetchone())
                     if row['state'] == 'finished':
                         break
-                    assert time.monotonic()<deadline, row
+                    assert time.monotonic()<deadline, (json.dumps(row),
+                        (tmp_path / 'first-worker.log').read_text())
                     await asyncio.sleep(0.05)
                 assert row['cleanup'] == 'confirmed' and row['finished_at']
                 result = json.loads(row['result_json'])
@@ -410,7 +416,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                 return
             logs.append((tmp_path / 'replacement-worker.log').open('wb'))
             workers.append(subprocess.Popen(argv, stdout=logs[1], stderr=subprocess.STDOUT))
-            if interruption in {'loop_stall', 'scratch', 'dirty_result'}:
+            if interruption in {'loop_stall', 'dirty_result'}:
                 await asyncio.wait_for(stall.result(), 30)
                 # Let rejected heartbeats cancel the live first attempt before releasing its child.
                 await asyncio.sleep(2)

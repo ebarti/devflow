@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +13,136 @@ import pytest
 from devflow_temporal.delivery_native_process import NativeProcess, process_table
 from devflow_temporal.delivery_resources import RunResources, read_private
 
+
+def test_private_read_reopens_atomically_replaced_inode(tmp_path, monkeypatch):
+    from devflow_temporal import delivery_resources
+
+    path = tmp_path / 'journal.json'
+    replacement = tmp_path / 'replacement.json'
+    for target, value in [(path, 'old'), (replacement, 'current')]:
+        target.write_text(json.dumps({'generation': value}))
+        target.chmod(0o600)
+    original_lstat, original_fstat = Path.lstat, os.fstat
+    replaced = False
+
+    def replace(info):
+        nonlocal replaced
+        if not replaced and stat.S_ISREG(info.st_mode):
+            replaced = True
+            os.replace(replacement, path)
+            fields = list(info)
+            fields[3] = 0  # The opened old inode was unlinked by atomic publication.
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(Path, 'lstat', lambda self: replace(original_lstat(self)))
+    monkeypatch.setattr(os, 'fstat', lambda fd: replace(original_fstat(fd)))
+    assert delivery_resources.read_private(path) == {'generation': 'current'}
+    assert replaced
+
+
+def test_private_read_uses_the_validated_descriptor(tmp_path, monkeypatch):
+    path = tmp_path / 'journal.json'
+    replacement = tmp_path / 'replacement.json'
+    path.write_text(json.dumps({'generation': 'validated'}))
+    path.chmod(0o600)
+    replacement.write_text(json.dumps({'generation': 'unvalidated'}))
+    original_lstat, original_fstat = Path.lstat, os.fstat
+    replaced = False
+
+    def replace(info):
+        nonlocal replaced
+        if not replaced and stat.S_ISREG(info.st_mode):
+            replaced = True
+            os.replace(replacement, path)
+        return info
+
+    monkeypatch.setattr(Path, 'lstat', lambda self: replace(original_lstat(self)))
+    monkeypatch.setattr(os, 'fstat', lambda fd: replace(original_fstat(fd)))
+    assert read_private(path) == {'generation': 'validated'}
+
+
+@pytest.mark.parametrize('violation', ['mode', 'symlink', 'hardlink', 'fifo', 'directory'])
+def test_private_read_still_rejects_unowned_evidence(tmp_path, violation):
+    path = tmp_path / 'journal.json'
+    path.write_text('{}')
+    path.chmod(0o600)
+    if violation == 'mode':
+        path.chmod(0o644)
+    elif violation == 'symlink':
+        original = tmp_path / 'original.json'
+        path.rename(original)
+        path.symlink_to(original)
+    elif violation == 'hardlink':
+        os.link(path, tmp_path / 'second.json')
+    elif violation == 'fifo':
+        path.unlink()
+        os.mkfifo(path, mode=0o600)
+    else:
+        path.unlink()
+        path.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match='private owned file'):
+        read_private(path)
+
+
+def test_private_read_preserves_snapshots_during_actual_atomic_publication(tmp_path):
+    from devflow_temporal.delivery_resources import write_private
+
+    path = tmp_path / 'journal.json'
+    write_private(path, {'generation': 0})
+
+    def publish():
+        for generation in range(1, 201):
+            write_private(path, {'generation': generation})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        writer = executor.submit(publish)
+        reads = 0
+        while not writer.done() or reads < 1000:
+            snapshot = read_private(path)
+            assert set(snapshot) == {'generation'}
+            assert 0 <= snapshot['generation'] <= 200
+            reads += 1
+        writer.result()
+    assert read_private(path) == {'generation': 200}
+
+
+@pytest.mark.parametrize('violation', ['mode', 'symlink', 'hardlink', 'owner'])
+def test_private_read_rechecks_replacement_security(tmp_path, monkeypatch, violation):
+    path = tmp_path / 'journal.json'
+    replacement = tmp_path / 'replacement.json'
+    path.write_text('{}')
+    path.chmod(0o600)
+    replacement.write_text('{}')
+    replacement.chmod(0o600)
+    original_fstat = os.fstat
+    replaced = False
+
+    def replace(fd):
+        nonlocal replaced
+        info = original_fstat(fd)
+        if not replaced:
+            replaced = True
+            os.replace(replacement, path)
+            if violation == 'mode':
+                path.chmod(0o644)
+            elif violation == 'symlink':
+                path.rename(replacement)
+                path.symlink_to(replacement)
+            elif violation == 'hardlink':
+                os.link(path, replacement)
+            fields = list(info)
+            fields[3] = 0
+            return os.stat_result(fields)
+        if violation == 'owner':
+            fields = list(info)
+            fields[4] = os.getuid() + 1
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(os, 'fstat', replace)
+    with pytest.raises(ValueError, match='private owned file'):
+        read_private(path)
 
 def spec(root: Path, name: str = "run") -> dict:
     state = root / "runs" / name
