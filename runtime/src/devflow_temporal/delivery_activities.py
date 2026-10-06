@@ -232,8 +232,8 @@ def _role_context(request, store, broker, supervisor):
         workspace = broker.checkout
         review_diff = None
     elif role in {"review", "verify"}:
-        workspace = broker.gate_checkout(role, iteration, candidate)
-        review_diff = broker.gate_diff(role, iteration, candidate)
+        workspace = broker._gate_path(role, iteration)
+        review_diff = None
     else:
         raise ValueError("unknown delivery role")
     constraint = request.get("title_constraint")
@@ -264,9 +264,16 @@ def _role_context(request, store, broker, supervisor):
                 or digest(saved.get("title_constraint")) != digest(constraint)
                 or request.get("resume_session") != saved["session_id"]):
             raise ValueError("title repair role does not match its sealed single turn")
-    retained = supervisor.retained_request(
-        {**request, 'workspace': str(workspace), 'review_diff': review_diff}
-    ) if role == 'implement' else None
+    retained = supervisor.retained_request({
+        **request, 'workspace': str(workspace),
+        **({'review_diff': review_diff} if role == 'implement' else {}),
+    })
+    if role in {'review', 'verify'}:
+        if retained is not None:
+            review_diff = retained['review_diff']
+        else:
+            workspace = broker.gate_checkout(role, iteration, candidate)
+            review_diff = broker.gate_diff(role, iteration, candidate)
     if role == 'implement' and retained is None:
         if broker.candidate() != candidate:
             raise ValueError('implementer checkout changed before its role')

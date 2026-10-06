@@ -247,6 +247,9 @@ asyncio.run(main())
         sys.platform != 'darwin', reason='actual macOS TCP listener inspection required')),
     ('implement', 'loop_stall'), ('review', 'loop_stall'), ('verify', 'loop_stall'),
     ('intake', 'loop_stall'), ('implement', 'cancel'),
+    ('implement', 'deadline'), ('implement', 'terminate'),
+    ('review', 'scratch'), ('verify', 'scratch'),
+    ('review', 'dirty_result'), ('verify', 'dirty_result'),
 ])
 async def test_real_temporal_worker_loss_reuses_original_native_command(
     api_fixture, tmp_path, stage, interruption,
@@ -308,6 +311,19 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
         "if request['role']=='implement': "
         "(Path(request['workspace'])/'README.md').write_text('Changed by the fixed provider\\n')",
     ))
+    if interruption in {'scratch', 'dirty_result'}:
+        text = provider.read_text().replace(
+            "print('started',flush=True)",
+            "(Path(request['workspace'])/'scratch-output.txt').write_text('temporary output')\n"
+            "print('started',flush=True)",
+        )
+        if interruption == 'scratch':
+            text = text.replace(
+                "write_private(Path(request['result_path'])",
+                "(Path(request['workspace'])/'scratch-output.txt').unlink()\n"
+                "write_private(Path(request['result_path'])",
+            )
+        provider.write_text(text)
     input_path = tmp_path / 'input.json'
     input_path.write_text(json.dumps(request))
     workers, logs = [], []
@@ -321,7 +337,8 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             logs.append((tmp_path / 'first-worker.log').open('wb'))
             workers.append(subprocess.Popen(argv, stdout=logs[0], stderr=subprocess.STDOUT))
             handle = await environment.client.start_workflow(
-                ActivityLivenessWorkflow.run, {'activity_name': name, 'request': request},
+                ActivityLivenessWorkflow.run, {'activity_name': name, 'request': request,
+                    **({'hours': 40/3600} if interruption == 'deadline' else {})},
                 id='worker-loss', task_queue='activity-worker-loss',
             )
             deadline = time.monotonic()+20
@@ -332,7 +349,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             if interruption == 'worker_loss':
                 workers[0].kill()
                 await asyncio.to_thread(workers[0].wait, 5)
-            elif interruption == 'loop_stall':
+            elif interruption in {'loop_stall', 'scratch', 'dirty_result'}:
                 stall = await environment.client.start_workflow(
                     ActivityLivenessWorkflow.run, {
                         'activity_name': 'blocking_loop_probe', 'request': request,
@@ -342,6 +359,37 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                 while not (state / 'stall-started').exists():
                     assert time.monotonic()<deadline
                     await asyncio.sleep(0.05)
+            elif interruption in {'deadline', 'terminate'}:
+                if interruption == 'terminate':
+                    await handle.terminate(reason='Fixture closes without a replacement activity')
+                with pytest.raises(WorkflowFailureError):
+                    await asyncio.wait_for(handle.result(), 55)
+                # Let the live worker receive the deadline cancellation via heartbeat.
+                await asyncio.sleep(15)
+                # A physical SIGKILL without any replacement worker cannot run this
+                # finalizer; that separate orphan-reconciliation case is not covered.
+                assert workers[0].poll() is None
+                (state / 'release').touch()
+                deadline = time.monotonic()+10
+                while True:
+                    with store._connect() as db:
+                        row = dict(db.execute('SELECT * FROM delivery_attempts').fetchone())
+                    if row['state'] == 'finished':
+                        break
+                    assert time.monotonic()<deadline, row
+                    await asyncio.sleep(0.05)
+                assert row['cleanup'] == 'confirmed' and row['finished_at']
+                result = json.loads(row['result_json'])
+                assert result['status'] == 'pass'
+                assert result['session_id'] == 'fixed-native-session'
+                assert result['native_process']['cancelled'] is False
+                with store._connect() as db:
+                    assert db.execute(
+                        "SELECT COUNT(*) FROM delivery_attempts "
+                        "WHERE state IN ('starting','running','unknown')").fetchone()[0] == 0
+                assert (state / 'invocations').read_text().splitlines() == ['one']
+                assert RunResources(spec).finalize('blocked')['resource_cleanup'] == 'confirmed'
+                return
             else:
                 store.project(spec['run_id'], phase='cancelling', execution_state='cancelling',
                               event_type='cancel_requested', message='Fixture user cancellation')
@@ -362,7 +410,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                 return
             logs.append((tmp_path / 'replacement-worker.log').open('wb'))
             workers.append(subprocess.Popen(argv, stdout=logs[1], stderr=subprocess.STDOUT))
-            if interruption == 'loop_stall':
+            if interruption in {'loop_stall', 'scratch', 'dirty_result'}:
                 await asyncio.wait_for(stall.result(), 30)
                 # Let rejected heartbeats cancel the live first attempt before releasing its child.
                 await asyncio.sleep(2)
@@ -373,7 +421,11 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             except TimeoutError:
                 await handle.cancel()
                 raise
-            assert result.get('status', result.get('state')) in {'pass', 'passed'}, result
+            if interruption == 'dirty_result':
+                assert result['status'] == 'blocked', result
+                assert 'candidate or controller diff changed' in ' '.join(result['findings'])
+            else:
+                assert result.get('status', result.get('state')) in {'pass', 'passed'}, result
             history = await handle.fetch_history()
             started = [e.activity_task_started_event_attributes for e in history.events
                        if e.HasField('activity_task_started_event_attributes')]
@@ -390,7 +442,8 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                 assert result['results']
                 assert all(row['cleanup'] == 'confirmed' for row in result['results'])
             await Replayer(workflows=[ActivityLivenessWorkflow]).replay_workflow(history)
-            assert RunResources(spec).finalize('delivered')['resource_cleanup'] == 'confirmed'
+            outcome = 'blocked' if interruption == 'dirty_result' else 'delivered'
+            assert RunResources(spec).finalize(outcome)['resource_cleanup'] == 'confirmed'
     finally:
         for worker in workers:
             if worker.poll() is None:

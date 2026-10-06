@@ -7,4 +7,6 @@ from devflow_temporal.delivery_workflow import DeliveryWorkflow
 class ActivityLivenessWorkflow(DeliveryWorkflow):
     @workflow.run
     async def run(self, payload: dict) -> dict:
-        return await self._activity(payload['activity_name'], payload['request'])
+        return await self._activity(
+            payload['activity_name'], payload['request'], hours=payload.get('hours', 2),
+        )

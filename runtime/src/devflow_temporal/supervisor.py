@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -118,7 +119,8 @@ class DeliverySupervisor:
         saved = read_private(folder / 'request.json')
         # These fields are added by the controller after activity admission.
         enriched = {'native_authorized', 'result_path', 'start_path', 'role_evidence_key',
-                    'artifact_directory', 'artifact_write_root', 'receipt_handoff', 'steering'}
+                    'artifact_directory', 'artifact_write_root', 'receipt_handoff', 'steering',
+                    'review_diff'}
         for name in saved.keys() | request.keys():
             if name in enriched and name not in request:
                 continue
@@ -374,7 +376,7 @@ class DeliverySupervisor:
     async def _run_native(self, request: dict[str, Any], job_key: str) -> dict[str, Any]:
         from .delivery_native_process import NativeProcess
         from .delivery_preparation import verify_prepared_spec
-        from .delivery_resources import read_private, write_private
+        from .delivery_resources import read_private
 
         spec = request["spec"]
         folder = Path(spec["state_dir"]) / "attempts" / job_key
@@ -410,7 +412,7 @@ class DeliverySupervisor:
             from .delivery_dashboard import launch_steering
 
             native_request = launch_steering(self.store, native_request, job_key)
-            from .delivery_role_evidence import allocate, seal
+            from .delivery_role_evidence import allocate
 
             if not request_path.exists():
                 native_request = allocate(native_request, job_key)
@@ -434,9 +436,22 @@ class DeliverySupervisor:
                 timeout=int(spec["policy"]["roles"][request["role"]].get("timeout_seconds", 7200)),
                 cancelled=cancelled,
             )
-            pending = asyncio.create_task(asyncio.to_thread(process.run))
+            def monitor():
+                # Finalize independently of the Temporal waiter. Its overall deadline
+                # can close the workflow without leaving a replacement activity.
+                try:
+                    outcome = process.run()
+                    return outcome, self._complete_native(
+                        request, native_request, process, job_key, outcome,
+                    )
+                except Exception as exc:
+                    return {"cleanup": "unknown"}, self._mark_unknown(
+                        job_key, f"native completion failed: {type(exc).__name__}",
+                    )
+
+            pending = asyncio.create_task(asyncio.to_thread(monitor))
             try:
-                outcome = await asyncio.shield(pending)
+                outcome, result = await asyncio.shield(pending)
             except asyncio.CancelledError:
                 from temporalio import activity
 
@@ -452,13 +467,37 @@ class DeliverySupervisor:
                     )
                     raise
                 stopped.set()
-                outcome = await asyncio.shield(pending)
+                outcome, result = await asyncio.shield(pending)
                 self._mark_unknown(
                     job_key,
                     "native activity cancelled during provider work",
                     cleanup="confirmed" if outcome["cleanup"] != "unknown" else "unknown",
                 )
                 raise
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not (folder / "native-process.json").exists():
+                return self._mark_prelaunch_blocked(job_key, str(exc)[:300])
+            return self._mark_unknown(job_key, f"native launch failed: {type(exc).__name__}")
+
+    def _complete_native(self, request, native_request, process, job_key, outcome):
+        from .delivery_resources import read_private, write_private
+        from .delivery_role_evidence import seal
+
+        # Superseded and replacement waiters can both observe the same process.
+        # Use its existing lock to publish one stable result and session binding.
+        descriptor = os.open(process.folder / "native-process.lock", os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            with self.store._connect() as db:
+                row = db.execute(
+                    "SELECT state,result_json FROM delivery_attempts WHERE job_key=?", (job_key,),
+                ).fetchone()
+            if row["state"] == "finished":
+                return json.loads(row["result_json"])
+            result_path = process.folder / "result.json"
             if outcome["cleanup"] == "unknown":
                 return self._mark_unknown(job_key, "native monitoring/provider outcome ambiguous")
             if result_path.is_file():
@@ -481,7 +520,7 @@ class DeliverySupervisor:
                 }
             if native_request.get("role_evidence_key"):
                 try:
-                    result.update(await asyncio.to_thread(seal, native_request))
+                    result.update(seal(native_request))
                 except (ValueError, OSError) as exc:
                     result["status"] = "blocked"
                     result.setdefault("findings", []).append(str(exc))
@@ -491,7 +530,7 @@ class DeliverySupervisor:
                 resource_cleanup="pending_workflow_finalization",
                 native_process=outcome,
             )
-            output_candidate = await asyncio.to_thread(self._completed_candidate, request, result)
+            output_candidate = self._completed_candidate(request, result)
             journal = read_private(process.journal)
             journal["provider_session"] = {
                 "session_id": result.get("session_id"),
@@ -518,12 +557,8 @@ class DeliverySupervisor:
                     ),
                 )
             return result
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if not (folder / "native-process.json").exists():
-                return self._mark_prelaunch_blocked(job_key, str(exc)[:300])
-            return self._mark_unknown(job_key, f"native launch failed: {type(exc).__name__}")
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _completed_candidate(request: dict[str, Any], result: dict[str, Any]) -> dict | None:
