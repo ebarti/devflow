@@ -60,6 +60,25 @@ def test_public_resume_is_finite_idempotent_and_retains_terminal_failure(stopped
         store.continue_repair('run-1', {**command, 'additional_iterations': 1})
 
 
+@pytest.mark.parametrize('foreign', [False, True])
+def test_original_admission_authenticates_default_workflow_identity(stopped, monkeypatch, foreign):
+    store, _, _, command = stopped
+    original_read = store._completed_temporal_result
+    closed = original_read('run-1')
+    closed['workflow_id'] = 'delivery-foreign' if foreign else 'delivery-run-1'
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET workflow_id=NULL WHERE run_id='run-1'")
+    monkeypatch.setattr(store, '_completed_temporal_result', lambda *a, **k: closed)
+    if foreign:
+        with pytest.raises(ValueError, match='closed finalized delivery'):
+            store.repair_admission_preflight('run-1', command)
+    else:
+        assert store.repair_admission_preflight('run-1', command)['preflight'] is True
+        admitted = store.continue_repair('run-1', command)
+        assert saved(store)['state'] == closed['result']
+        assert admitted['workflow_id'] != closed['workflow_id']
+
+
 @pytest.mark.parametrize('drift', ['source', 'scope', 'claim', 'cleanup', 'attempt',
                                     'remote', 'origin', 'plan', 'candidate', 'finite'])
 def test_public_resume_rejects_unowned_or_unsealed_stop(stopped, drift):

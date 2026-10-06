@@ -104,7 +104,9 @@ def snapshot(store, run_id):
     if not store.owns_execution(spec):
         raise ValueError('stopped execution belongs to a different service')
     row, attempts, effects, claim = _rows(store, run_id)
-    closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
+    # Original admissions use the deterministic ID without a successor override.
+    predecessor_id = row['workflow_id'] or 'delivery-' + run_id
+    closed = store._completed_temporal_result(run_id, workflow_id=predecessor_id)
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     if (row['phase'] != 'blocked' or row['outcome'] != 'blocked'
@@ -112,7 +114,7 @@ def snapshot(store, run_id):
             or state.get('run_id') != run_id or state.get('phase') != 'blocked'
             or state.get('outcome') != 'blocked' or state.get('cleanup') != 'confirmed'
             or state.get('execution_state') != 'blocked'
-            or closed.get('workflow_id') != row['workflow_id']
+            or closed.get('workflow_id') != predecessor_id
             or state.get('candidate') != json.loads(row['candidate_json'] or 'null')
             or state.get('checks') != json.loads(row['checks_json'] or '{}')
             or state.get('pull_request') != json.loads(row['pr_json'] or 'null')
