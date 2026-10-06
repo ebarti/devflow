@@ -17,10 +17,13 @@ from devflow_temporal.delivery_store import DeliveryStore
 
 
 @pytest.fixture
-def scope_broker(api_fixture, monkeypatch):
+def scope_broker(api_fixture, monkeypatch, request):
+    allowed_extra = getattr(request, 'param', None)
     path, request = api_fixture
     raw = json.loads(path.read_text())
     repository = raw['repositories']['fixture']
+    if allowed_extra:
+        repository['allowed_paths'].append(allowed_extra)
     source = Path(repository['source_path'])
     (source / 'protected.txt').write_text('Protected baseline file\n')
     _git(source, 'add', 'protected.txt')
@@ -114,12 +117,26 @@ def test_role_normalization_preserves_index_and_worktree(scope_broker):
     assert _git(broker.checkout, 'diff', '--name-only') == 'README.md'
 
 
-@pytest.mark.parametrize('name', [' foreign.txt', 'line\nbreak.txt', 'trailing.txt '])
+@pytest.mark.parametrize('name', [
+    ' foreign.txt', 'line\nbreak.txt', 'carriage\rreturn.txt', 'trailing.txt ',
+])
 def test_changed_paths_preserves_exact_untracked_filenames(scope_broker, name):
     (scope_broker.checkout / name).write_text('Foreign file\n')
     assert scope_broker._changed_paths() == {name}
     with pytest.raises(ValueError, match='outside allowed paths'):
         scope_broker.validate_candidate_scope()
+
+
+@pytest.mark.parametrize('scope_broker', ['carriage\nreturn.txt'], indirect=True)
+def test_committed_carriage_return_cannot_alias_allowed_newline_path(scope_broker):
+    broker = scope_broker
+    (broker.checkout / 'carriage\rreturn.txt').write_text('Foreign path\n')
+    _git(broker.checkout, 'add', '-A')
+    _git(broker.checkout, 'commit', '--signoff', '-qm', 'fix: foreign filename')
+    remote_before = _git(broker.source, 'ls-remote', 'origin')
+    with pytest.raises(ValueError, match='outside allowed paths'):
+        broker.publish(0, broker.candidate())
+    assert _git(broker.source, 'ls-remote', 'origin') == remote_before
 
 
 NATIVE_ROLE_DRIVER = '''

@@ -25,16 +25,19 @@ from .delivery_store import DeliveryStore, _now
 
 
 def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 120) -> str:
+    nul_output = argv[0] == 'git' and '-z' in argv
     result = subprocess.run(
-        argv, cwd=cwd, text=True, capture_output=True, timeout=timeout, check=False
+        argv, cwd=cwd, text=not nul_output, capture_output=True, timeout=timeout, check=False
     )
+    stdout = result.stdout.decode('utf-8', 'surrogateescape') if nul_output else result.stdout
+    stderr = result.stderr.decode('utf-8', 'surrogateescape') if nul_output else result.stderr
     if result.returncode:
         raise RuntimeError(
             f"command failed ({result.returncode}): {argv[0]} {argv[1]}: "
-            + (result.stderr.strip() or result.stdout.strip())[:500]
+            + (stderr.strip() or stdout.strip())[:500]
         )
-    # NUL-delimited paths must retain leading/trailing whitespace verbatim.
-    return result.stdout if '\0' in result.stdout else result.stdout.strip()
+    # Preserve exact filenames, including CR/LF and leading/trailing whitespace.
+    return stdout if nul_output else stdout.strip()
 
 
 def _git(path: Path, *args: str) -> str:
