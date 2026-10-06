@@ -221,7 +221,9 @@ def _prepare(original, config, intent, intent_path):
     effective['policy']['host_sandbox'] = 'trusted-local'
     effective['policy_digest'] = digest(effective['policy'])
     effective.update(config_path=str(config.path), config_digest=digest(config.raw),
-                     terminal_tracker_version=1, role_home_generation='policy-1')
+                     terminal_tracker_version=1)
+    if original['policy'].get('host_sandbox') != 'trusted-local':
+        effective['role_home_generation'] = 'policy-1'
     root = Path(effective['state_dir']).parents[1]
     # Preparation has its own finite, journalled resource generations. It cannot
     # recreate or rewrite the predecessor's finalized transient roots/manifest.

@@ -163,7 +163,6 @@ def readiness(spec, payload):
         return {'required': False}
     authority = authority or _authority(spec, payload)
     if (spec['policy'].get('host_sandbox') != 'trusted-local'
-            or spec.get('role_home_generation') != 'policy-1'
             or type(spec.get('terminal_tracker_version')) is not int
             or spec['terminal_tracker_version'] != 1):
         raise ValueError("native renewal requires the admitted trusted installed execution")

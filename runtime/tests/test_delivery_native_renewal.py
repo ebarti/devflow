@@ -70,11 +70,17 @@ def payload_update(native_configuration, monkeypatch, tmp_path):
     return store, spec, payload, old, package
 
 
-def test_payload_only_native_generation_preserves_old_proof_and_replays_strictly(payload_update):
+@pytest.mark.parametrize('home_generation', ['policy-1', None])
+def test_payload_only_native_generation_preserves_old_proof_and_replays_strictly(
+    payload_update, home_generation,
+):
     store, before, payload, old, _package = payload_update
+    if home_generation is None:
+        before.pop('role_home_generation')
     with pytest.raises(PreparationError):
         native.verify_native_spec(before)
     after, reference = renewal.renew(before, payload, digest(payload))
+    assert after.get('role_home_generation') == home_generation
     assert Path(before['preparation']['environment']['path']).read_bytes() == old
     assert after['preparation']['fingerprint'] != before['preparation']['fingerprint']
     assert after['policy']['native_identity']['protected_commands'] == (
