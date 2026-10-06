@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 import socket
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -78,6 +80,36 @@ def test_discovery_canonical_skill_explicit_paths_and_idempotency(package_fixtur
     assert packager.package(root, runtime, config, package_format=package_format) == target
     assert files == {p: (p.read_bytes(), p.stat().st_mtime_ns)
                      for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("package_format", ["portable", "codex"])
+def test_package_root_resolves_ancestor_alias_before_descendant_checks(
+    package_fixture, tmp_path, package_format,
+):
+    _root, runtime, config = package_fixture
+    physical = tmp_path / "physical parent"
+    physical.mkdir()
+    alias = tmp_path / "parent alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    selected = alias / "new marketplace"
+    target = packager.package(selected, runtime, config, package_format=package_format)
+    assert target == physical / "new marketplace/plugins/devflow"
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns)
+              for p in target.parent.parent.rglob("*") if p.is_file()}
+    assert packager.package(selected, runtime, config, package_format=package_format) == target
+    assert packager.package(selected.resolve(), runtime, config,
+                            package_format=package_format) == target
+    assert before == {p: (p.read_bytes(), p.stat().st_mtime_ns)
+                      for p in target.parent.parent.rglob("*") if p.is_file()}
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='native macOS temporary-root spelling')
+def test_native_temporary_package_root_uses_physical_path(package_fixture):
+    _root, runtime, config = package_fixture
+    with tempfile.TemporaryDirectory(prefix='devflow-package-alias-') as temporary:
+        selected = Path(temporary) / 'marketplace'
+        target = packager.package(selected, runtime, config)
+        assert target == selected.resolve() / 'plugins/devflow'
 
 
 @pytest.mark.parametrize("first,second", [("portable", "codex"), ("codex", "portable")])
