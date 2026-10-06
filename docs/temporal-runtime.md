@@ -115,6 +115,8 @@ npm test
 
 Tests cover real Temporal restart/decision and repair gates, submission/claim conflicts, cancellation races, native command boundaries, and the local API. The dashboard suite exercises the real response shape as well as UI state changes. Live model availability, actual repository checks, GitHub effects, browser interaction against the real service, and independent review/verification require separate evidence for the **exact candidate**. A successful unit suite or fake provider run does not establish those effects. The service is local, single-host, and uses Temporal's development server and SQLite; interrupted external effects may need human reconciliation.
 
+Runtime CI runs the locked package, Ruff and pytest on both Ubuntu and `macos-latest`. The separate macOS job supplies Python 3.12 and Temporal CLI 1.9.1 through pinned setup actions; tests own their disposable Temporal servers. Its 20-minute bound includes native sandbox, subprocess and cleanup cases that Linux skips; the Linux job retains its existing bound. Pytest reports macOS skip reasons, including fixtures that require local browser assets or an explicitly configured Codex binary. Hosted success does not establish live provider or browser-service behavior.
+
 A reproducible live smoke uses the installed public CLI, a new private Git fixture and a separate local service. It submits two raw goals with no manually supplied proof, verifies real intake plus environment reuse, then cancels before plan acceptance and tracker writes. This disposable smoke explicitly selects `plan_approval: "required"` to keep that checkpoint. Supply an existing configured runtime and a new private evidence directory, such as a unique directory under `~/.local/state/devflow`:
 
 ```sh
