@@ -16,10 +16,14 @@ fi
 SKILLS=${1:-"${HOME}/.agents/skills"}
 CODEX_DIR=${2:-"${CODEX_HOME:-${HOME}/.codex}"}
 backup=$("$PYTHON" -B "$ROOT/scripts/install-rollback.py" capture "$ROOT" "$SKILLS" "$CODEX_DIR")
-if "$PYTHON" -B "$ROOT/scripts/install-service-entry.py" "$SKILLS" "$CODEX_DIR" "$FORCE"; then
+if "$PYTHON" -B "$ROOT/scripts/install-service-entry.py" "$SKILLS" "$CODEX_DIR" "$FORCE" "$backup"; then
   "$PYTHON" -B "$ROOT/scripts/install-rollback.py" discard "$backup"
 else
   result=$?
-  "$PYTHON" -B "$ROOT/scripts/install-rollback.py" restore "$backup"
+  if [ "$result" -eq 3 ]; then
+    "$PYTHON" -B "$ROOT/scripts/install-rollback.py" restore-checkout "$backup"
+  else
+    "$PYTHON" -B "$ROOT/scripts/install-rollback.py" restore "$backup"
+  fi
   exit "$result"
 fi

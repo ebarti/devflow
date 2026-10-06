@@ -1,13 +1,23 @@
 #!/usr/bin/env python3.12
 """Preflight and install loadable regular agent definitions without replacing custom files."""
 import hashlib
+import importlib.util
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import sys
 import tempfile
+from pathlib import Path
+
+ROLLBACK = None
+
+
+def rollback_module():
+    spec = importlib.util.spec_from_file_location("agent_install_rollback", Path(__file__).with_name("install-rollback.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def fail(message):
@@ -140,6 +150,9 @@ def atomic_write(path, content, mode=0o644):
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(content)
         temporary.chmod(mode)
+        if ROLLBACK:
+            rollback = rollback_module()
+            rollback.remember(ROLLBACK, path, rollback.identity(temporary))
         os.replace(temporary, path)
     finally:
         if exists(temporary):
@@ -207,9 +220,11 @@ def plan(source_root, skills, codex_home, force):
 
 
 def main():
-    if len(sys.argv) != 6 or sys.argv[1] not in {"preflight", "apply"}:
+    global ROLLBACK
+    if len(sys.argv) not in {6, 7} or sys.argv[1] not in {"preflight", "apply"}:
         fail("usage: install-agents.py preflight|apply SOURCE_ROOT SKILLS CODEX_HOME FORCE")
-    mode, source_root, skills, codex_home, force = sys.argv[1:]
+    mode, source_root, skills, codex_home, force = sys.argv[1:6]
+    ROLLBACK = Path(sys.argv[6]) if len(sys.argv) == 7 else None
     check_skills_destination(skills)
     source_root = Path(source_root).expanduser().resolve()
     skills = Path(skills).resolve()
@@ -219,6 +234,8 @@ def main():
         return 0
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     for target in obsolete:
+        if ROLLBACK:
+            rollback_module().remember(ROLLBACK, target, {"type": "absent"})
         target.unlink()
     for name, action in actions.items():
         if action == "copy":
@@ -238,4 +255,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (ValueError, OSError) as exc:
         print(exc, file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

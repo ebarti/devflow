@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+MUTATING = False
 
 
 def load(name):
@@ -36,8 +37,11 @@ def hashes(root):
     return result
 
 
-def install(skills, home, force):
+def install(skills, home, force, backup=None):
+    global MUTATING
     agents = load("install-agents")
+    rollback = load("install-rollback")
+    rollback.exchange_function()
     guard = load("install-delivery-launchers")
     agents.check_skills_destination(str(skills))
     # Retire existing global registrations explicitly. Normal installation neither
@@ -89,6 +93,7 @@ def install(skills, home, force):
                 raise ValueError(
                     "retained helper/reference bytes differ from current source"
                 )
+    MUTATING = True
     if obsolete or any(action == "copy" for action in actions.values()):
         subprocess.run(
             [
@@ -100,16 +105,20 @@ def install(skills, home, force):
                 str(skills),
                 str(home),
                 str(force).lower(),
+                *([str(backup)] if backup else []),
             ],
             check=True,
         )
     skills.mkdir(parents=True, exist_ok=True)
     if not os.path.lexists(compatibility):
         compatibility.mkdir(mode=0o700)
+        rollback.created(backup, compatibility)
         for child in children:
             (compatibility / child.name).symlink_to(child)
+            rollback.created(backup, compatibility / child.name)
     if not plugin.exists() and not os.path.lexists(service):
         service.symlink_to(source)
+        rollback.created(backup, service)
     print("Installed the delivery service entry and internal roles; hooks unchanged.")
 
 
@@ -119,6 +128,7 @@ if __name__ == "__main__":
             Path(sys.argv[1]).absolute(),
             Path(sys.argv[2]).absolute(),
             sys.argv[3] == "true",
+            Path(sys.argv[4]) if len(sys.argv) == 5 else None,
         )
     except (
         ValueError,
@@ -127,4 +137,5 @@ if __name__ == "__main__":
         TypeError,
         subprocess.SubprocessError,
     ) as exc:
-        raise SystemExit(str(exc)) from exc
+        print(exc, file=sys.stderr)
+        raise SystemExit(1 if MUTATING else 3) from exc

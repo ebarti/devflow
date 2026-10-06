@@ -74,6 +74,14 @@ bash scripts/update.sh "$RELEASE_TAG"
 
 The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. If installation fails before service activation, the installer restores owned hooks, agent copies and the previous detached checkout, including upgrades begun with the older updater. The service waits for a matching activation marker written only after bootstrap succeeds; it does not open or migrate SQLite before that point. Obsolete skill links and unchanged owned agent copies are removed on success; modified copies, other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
 
+Installation rollback requires the native Linux/macOS atomic exchange interface;
+unsupported hosts refuse before installation effects. Private rollback snapshots
+bind the installer's actual file/link/directory identities. Rollback atomically
+restores helper pointers, captures cleanup targets into that existing private
+backup and deletes only matching installer objects. Changed or foreign objects
+remain with actionable original/captured locations and the complete backup;
+preflight refusals restore only checkout state. It never excludes other writers.
+
 ## Candidate trials
 
 From a development worktree, use a new trial directory for each candidate and a separate target-project worktree:
