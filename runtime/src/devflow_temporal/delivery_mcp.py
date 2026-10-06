@@ -46,9 +46,9 @@ def build_server(config_path: Path) -> FastMCP:
         return client(config_path).submit(bind_origin(value, metadata_origin(metadata)))
 
     @server.tool(annotations=read)
-    def list_runs() -> dict:
-        """List compact, factual status for recent local delivery runs."""
-        return client(config_path).runs()
+    def list_runs(limit: int = 50, cursor: str | None = None, archived: bool = False) -> dict:
+        """Read one bounded run page; pass next_cursor to explicitly read older history."""
+        return client(config_path).runs(limit=limit, cursor=cursor, archived=archived)
 
     @server.tool(annotations=read)
     def get_run(run_id: str) -> dict:

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
@@ -277,9 +277,16 @@ def create_app(config_path: Path) -> FastAPI:
         }
 
     @app.get("/api/runs")
-    async def list_runs(request: Request, archived: bool = False) -> dict[str, Any]:
+    async def list_runs(
+        request: Request, archived: bool = False, limit: int = Query(50, ge=1, le=100),
+        cursor: str | None = Query(None, max_length=2048),
+    ) -> dict[str, Any]:
         _host(request)
-        return {"runs": service.store.list_runs(archived)}
+        try:
+            return await asyncio.to_thread(
+                service.store.list_runs_page, archived, limit=limit, cursor=cursor)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/statistics")
     async def statistics(request: Request) -> dict[str, Any]:

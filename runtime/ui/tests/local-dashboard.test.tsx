@@ -34,7 +34,7 @@ describe('tokenless local dashboard', () => {
 
   it('restores event subscription when Retry succeeds after the first detail read failed', async () => {
     window.history.replaceState(null, '', `/runs/${mockRun.id}`)
-    vi.spyOn(api, 'listRuns').mockResolvedValue([mockRun])
+    vi.spyOn(api, 'listRunsPage').mockResolvedValue({ runs: [mockRun], next_cursor: null })
     vi.spyOn(api, 'getService').mockResolvedValue(mockService)
     const read = vi.spyOn(api, 'getRun').mockRejectedValueOnce(new Error('API reloading')).mockResolvedValue(mockRun)
     const subscribe = vi.mocked(subscribeRun)

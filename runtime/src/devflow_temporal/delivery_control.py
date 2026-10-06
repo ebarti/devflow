@@ -450,6 +450,9 @@ def main() -> None:
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
     parser.add_argument("--id", help="run ID")
     parser.add_argument("--evidence-id", help="indexed evidence ID")
+    parser.add_argument("--limit", type=int, default=50, help="run page size (1-100)")
+    parser.add_argument("--cursor", help="next_cursor from a previous run page")
+    parser.add_argument("--archived", action="store_true", help="list archived runs")
     args = parser.parse_args()
     try:
         _run(args, parser)
@@ -539,7 +542,9 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             caller = api_client(config.path)
             result = {
                 "submit": lambda: caller.submit(request),
-                "runs": caller.runs,
+                "runs": lambda: caller.runs(limit=getattr(args, "limit", 50),
+                                            cursor=getattr(args, "cursor", None),
+                                            archived=getattr(args, "archived", False)),
                 "run": lambda: caller.status(args.id),
                 "evidence": lambda: caller.evidence(args.id, args.evidence_id),
                 "decision": lambda: caller.decision(args.id, request),

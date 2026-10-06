@@ -54,7 +54,7 @@ describe('workflow board and controls', () => {
   })
 
   it('makes the board the landing page and isolates settings from the run rail', async () => {
-    vi.spyOn(api, 'listRuns').mockResolvedValue([mockRun])
+    vi.spyOn(api, 'listRunsPage').mockResolvedValue({ runs: [mockRun], next_cursor: null })
     vi.spyOn(api, 'getService').mockResolvedValue(mockService)
     const read = vi.spyOn(api, 'getRun')
     render(<App />)
@@ -67,7 +67,7 @@ describe('workflow board and controls', () => {
   })
 
   it('reads the archive collection and retains explicit restore commands', async () => {
-    const list = vi.spyOn(api, 'listRuns').mockImplementation(async archived => archived ? [{ ...mockRun, archived: true }] : [])
+    const list = vi.spyOn(api, 'listRunsPage').mockImplementation(async archived => ({ runs: archived ? [{ ...mockRun, archived: true }] : [], next_cursor: null }))
     vi.spyOn(api, 'getService').mockResolvedValue(mockService)
     render(<App />)
     await screen.findByRole('button', { name: 'Show archived tasks' })
