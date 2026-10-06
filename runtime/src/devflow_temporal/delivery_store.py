@@ -1013,6 +1013,11 @@ class DeliveryStore:
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
         if (isinstance(supplied, dict)
+                and supplied.get('continuation_kind') == 'stopped_delivery_resume'):
+            from .delivery_stopped_resume import admit
+
+            return admit(self, run_id, supplied, preflight=preflight)
+        if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') in {
                     'published_gate_retry', 'prepublication_gate_retry',
                     'published_check_prelaunch_retry', 'published_ci_retry'}):
@@ -2567,6 +2572,10 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            if recovery and recovery.get('kind') == 'stopped_delivery_resume':
+                from .delivery_stopped_resume import effective_spec
+
+                return effective_spec(self, recovery)
             if recovery and recovery.get('kind') == 'pending_publication_retry':
                 from .delivery_pending_publication import effective_spec
 
@@ -3578,6 +3587,21 @@ class DeliveryStore:
                         "limit": 20 * 1024 * 1024 if path == contained_log else 1024 * 1024,
                     }
                 )
+            if result.get("role_artifacts"):
+                from .delivery_role_evidence import validate_handoff
+
+                reference = result["role_artifacts"]
+                manifest = validate_handoff(reference, root)
+                indexed.append({"id": evidence_id + "-artifacts",
+                                "label": "Retained original role probes and outputs",
+                                "path": Path(reference["path"]),
+                                "expected_sha256": reference["sha256"],
+                                "limit": 4 * 1024 * 1024})
+                for index, item in enumerate(manifest["artifacts"]):
+                    indexed.append({"id": evidence_id + "-artifact-" + str(index),
+                                    "label": item["relative_path"], "path": Path(item["path"]),
+                                    "expected_sha256": item["sha256"],
+                                    "limit": 50 * 1024 * 1024})
         details = self.detail(run_id)
         for result in details.get("checks", {}).get("local", {}).get("results", []):
             path = Path(result["log"])

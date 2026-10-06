@@ -101,6 +101,7 @@ def test_pending_retry_rejects_changed_pushed_source_or_failed_checkpoint(pendin
 
 def test_pending_workflow_completes_effect_then_independent_gates_without_implementation(pending,
                                                                                     monkeypatch):
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, broker, state, request = pending
     store.recover_publication('run-1', request)
     spec = store.effective_spec('run-1')

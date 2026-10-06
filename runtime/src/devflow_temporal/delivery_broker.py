@@ -717,6 +717,29 @@ class DeliveryBroker:
         return result
 
 
+    def run_implementation_preparation(self, iteration: int, candidate: dict) -> dict:
+        """Prepare only accepted locked dependencies before a role executes probes."""
+        if self.candidate() != candidate:
+            raise ValueError("implementation preparation candidate is stale")
+        from .delivery_plan_checks import planned_checks
+
+        folder = self.evidence_dir / "implementation-preparation" / str(iteration)
+        planned = planned_checks(self.spec, self.checkout, folder)
+        dependencies = [c for c in planned if c['id'].startswith('planned-python-dependencies-')]
+        if any(c['id'].startswith('planned-vitest-') for c in planned):
+            dependencies = [c for c in self.spec['policy'].get('prepublish_checks', [])
+                            if '/store' in c['argv']] + dependencies
+        result = (self._run_check_list(self.checkout, dependencies, folder, candidate)
+                  if dependencies else {'state': 'passed', 'results': [],
+                                        'candidate_id': candidate['id'],
+                                        'source_unchanged': True})
+        result['cleanup'] = ('unknown' if result.get('cleanup') == 'unknown'
+                             or any(r.get('cleanup') != 'confirmed'
+                                    for r in result.get('results', [])) else 'confirmed')
+        if self.candidate() != candidate:
+            raise ValueError("locked dependency preparation changed feature source")
+        return result
+
     def run_prechecks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         if self.spec["policy"].get("execution_backend") == "native-macos":
             from .delivery_native_guard import validate_native_turn
@@ -754,18 +777,136 @@ class DeliveryBroker:
     def run_browser_qa(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         return execute_browser_qa(self, iteration, candidate)
 
-    def _publication_base_ref(self) -> str:
+    def _legacy_published_base(self, found: dict[str, Any]) -> str:
+        """Authenticate an unchanged published target independently of its tip."""
+        with self.store._connect() as db:
+            receipts = db.execute(
+                "SELECT observed_json FROM delivery_effects "
+                "WHERE run_id=? AND kind='publish' AND state='complete'",
+                (self.spec["run_id"],),
+            ).fetchall()
+        published = [json.loads(row[0]) for row in receipts if row[0]]
+        if not any(
+            isinstance(receipt, dict)
+            and receipt.get("number") == found.get("number")
+            and receipt.get("url") == found.get("url")
+            and receipt.get("base") == self.spec["base_sha"]
+            and receipt.get("state") == "OPEN"
+            and re.fullmatch(r"[0-9a-f]{40}", receipt.get("head", ""))
+            for receipt in published
+        ):
+            raise ValueError("legacy target has no completed owned publication")
+        owner, name = self.spec["github_repo"].split("/", 1)
+        query = (
+            "query($owner:String!,$name:String!,$number:Int!,$after:String){"
+            "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+            "number url state isDraft baseRefName headRefName headRefOid "
+            "baseRef{name target{oid}} "
+            "timelineItems(first:100,after:$after){totalCount pageInfo{hasNextPage endCursor} "
+            "nodes{__typename}}}}}"
+        )
+        deadline = time.monotonic() + 60
+        cursor = None
+        cursors = set()
+        count = 0
+        total = None
+        live_ref = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BrokerReadbackUnavailable("legacy published target history timed out")
+            try:
+                response = json.loads(_run([
+                    "gh", "api", "graphql", "-f", "query=" + query,
+                    "-F", "owner=" + owner, "-F", "name=" + name,
+                    "-F", "number=" + str(found["number"]),
+                    *(["-f", "after=" + cursor] if cursor else []),
+                ], timeout=remaining))
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+                raise BrokerReadbackUnavailable(
+                    "legacy published target history unavailable"
+                ) from exc
+            try:
+                observed = response["data"]["repository"]["pullRequest"]
+                timeline = observed["timelineItems"]
+                nodes = timeline["nodes"]
+                if total is None:
+                    total = timeline["totalCount"]
+                    live_ref = observed['baseRef']
+                if (
+                    response.get("errors")
+                    or any(observed[key] != found[key] for key in (
+                        "number", "url", "state", "isDraft", "baseRefName",
+                        "headRefName", "headRefOid",
+                    ))
+                    or not isinstance(nodes, list)
+                    or type(total) is not int or total < 0
+                    or timeline["totalCount"] != total
+                    or observed['baseRef'] != live_ref
+                    or any(not isinstance(node, dict) or not node.get("__typename")
+                           or node["__typename"] == "BaseRefChangedEvent" for node in nodes)
+                ):
+                    raise ValueError("legacy published target history changed or is incomplete")
+                count += len(nodes)
+                if count > total:
+                    raise ValueError("legacy published target history count changed")
+                if timeline["pageInfo"]["hasNextPage"] is False:
+                    if count != total:
+                        raise ValueError("legacy published target history is incomplete")
+                    break
+                next_cursor = timeline['pageInfo'].get('endCursor')
+                if (timeline['pageInfo']['hasNextPage'] is not True or not nodes
+                        or not isinstance(next_cursor, str) or not next_cursor
+                        or next_cursor in cursors):
+                    raise ValueError("legacy published target history pagination is incomplete")
+                cursors.add(next_cursor)
+                cursor = next_cursor
+            except (KeyError, TypeError, AttributeError) as exc:
+                raise ValueError("legacy published target history unavailable") from exc
+        branch = found["baseRefName"]
+        try:
+            live_tip = live_ref["target"]["oid"]
+            if (live_ref["name"] != branch
+                    or not re.fullmatch(r"[0-9a-f]{40}", live_tip)):
+                raise ValueError("legacy published target branch identity changed")
+            _git(self.source, "check-ref-format", "refs/heads/" + branch)
+            try:
+                _git(self.source, "cat-file", "-e", live_tip + "^{commit}")
+            except RuntimeError:
+                if _git(self.source, "remote", "get-url", "origin") != self.spec["origin_url"]:
+                    raise ValueError("legacy published source origin changed") from None
+                # Fetch objects for the authenticated live SHA without moving refs or FETCH_HEAD.
+                _run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(self.source),
+                      "fetch", "--no-write-fetch-head", "--no-tags", "--refmap=",
+                      "origin", live_tip], timeout=max(1, deadline - time.monotonic()))
+            _git(self.source, "merge-base", "--is-ancestor", self.spec["base_sha"], live_tip)
+        except (KeyError, TypeError, RuntimeError) as exc:
+            raise ValueError("legacy published target ancestry unavailable") from exc
+        return branch
+
+    def _publication_base_ref(self, *, found: dict[str, Any] | None = None) -> str:
         frozen = self.spec.get("publication_base_ref")
         if frozen:
             return frozen
-        # Legacy named bases already bind a branch. A legacy SHA needs the
-        # same exact-match resolution as admission, never a guessed PR target.
+        # First publication stays exact-match. An authenticated completed
+        # publication may retain its unchanged target while upstream advances.
         raw = self.spec["base_ref"]
         if re.fullmatch(r"[0-9a-fA-F]{40}", raw):
+            with self.store._connect() as db:
+                published = db.execute(
+                    "SELECT 1 FROM delivery_effects WHERE run_id=? "
+                    "AND kind='publish' AND state='complete' LIMIT 1",
+                    (self.spec["run_id"],),
+                ).fetchone()
+            if published:
+                found = found or self._read_owned_pr()
+                if found is None:
+                    raise ValueError("legacy published PR identity is unavailable")
+                return self._legacy_published_base(found)
             return publication_base_ref(self.source, raw, self.spec["base_sha"])
         return raw.removeprefix("origin/")
 
-    def _existing_pr(self, *, validate_metadata: bool = True) -> dict[str, Any] | None:
+    def _read_owned_pr(self) -> dict[str, Any] | None:
         try:
             output = _run(
                 [
@@ -793,10 +934,17 @@ class DeliveryBroker:
         found = matches[0]
         if (
             found["headRefName"] != self.spec["branch"]
-            or found["baseRefName"] != self._publication_base_ref()
             or found["isDraft"]
             or found["state"] != "OPEN"
         ):
+            raise RuntimeError("owned branch PR is not the authorized open regular PR")
+        return found
+
+    def _existing_pr(self, *, validate_metadata: bool = True) -> dict[str, Any] | None:
+        found = self._read_owned_pr()
+        if found is None:
+            return None
+        if found["baseRefName"] != self._publication_base_ref(found=found):
             raise RuntimeError("owned branch PR is not the authorized open regular PR")
         if validate_metadata and not _conventional_subject(found.get("title", "")):
             raise ValueError("owned PR title does not satisfy Conventional Commits")

@@ -180,6 +180,9 @@ class DeliverySupervisor:
             from .delivery_dashboard import launch_steering
 
             request = launch_steering(self.store, request, job_key)
+            from .delivery_role_evidence import allocate
+
+            request = allocate(request, job_key)
             _private_json(request_path, request)
             if Path("/usr/bin/sandbox-exec").is_file():
                 profile, role_env = prepare_sandbox(request, folder)
@@ -326,6 +329,13 @@ class DeliverySupervisor:
             from .delivery_dashboard import launch_steering
 
             native_request = launch_steering(self.store, native_request, job_key)
+            from .delivery_role_evidence import allocate, seal
+
+            if not request_path.exists():
+                native_request = allocate(native_request, job_key)
+            else:
+                # A supervised reattachment keeps the original durable launch contract.
+                native_request = read_private(request_path)
             _private_json(request_path, native_request)
             _, environment = prepare_native_role(native_request, folder)
             process = NativeProcess(
@@ -375,6 +385,12 @@ class DeliverySupervisor:
                     "usage": None,
                     "finish_reason": reason,
                 }
+            if native_request.get("role_evidence_key"):
+                try:
+                    result.update(seal(native_request))
+                except (ValueError, OSError) as exc:
+                    result["status"] = "blocked"
+                    result.setdefault("findings", []).append(str(exc))
             result.update(
                 cleanup="confirmed",
                 process_cleanup=outcome["cleanup"],

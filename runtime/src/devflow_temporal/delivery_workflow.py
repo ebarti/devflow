@@ -688,6 +688,8 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if recovery is not None:
+            if recovery.get("kind") == "stopped_delivery_resume":
+                return await self._resume_stopped(spec, recovery)
             if recovery.get("kind") == "pending_publication_retry":
                 return await self._resume_pending_publication(spec, recovery)
             if recovery.get("kind") in {"published_gate_retry", "prepublication_gate_retry",
@@ -1199,6 +1201,68 @@ class DeliveryWorkflow:
             authorized_max_iteration=self.state["iteration"], resume_prechecks=True,
         )
 
+    async def _resume_stopped(self, spec, recovery):
+        if (recovery['execution_spec'] != spec
+                or recovery['maximum_iteration'] != (recovery['state']['iteration']
+                    + recovery['command']['additional_iterations'])):
+            raise ValueError('stopped resume changed its finite command authority')
+        self.state = deepcopy(recovery['state'])
+        self.state.update(phase='repair_preflight', execution_state='running', outcome=None,
+                          error=None, cleanup='none', candidate=recovery['execution_candidate'])
+        for key in ('resource_cleanup', 'terminal_tracker_checkpoint'):
+            self.state['checks'].pop(key, None)
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        tracker_pending_projected = False
+        delay = 5
+        while True:
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            try:
+                tracker = await self._activity(
+                    "delivery_tracker_start",
+                    {"spec": spec, "repair_continuation": True},
+                )
+            except Exception as exc:
+                return await self._stop(
+                    spec, f"repair tracker authority failed: {type(exc).__name__}"
+                )
+            self.state["tracker"] = tracker
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            if tracker.get("state") == "consistent":
+                break
+            if tracker.get("state") != "pending" or tracker.get("conflict"):
+                return await self._stop(spec, "repair tracker readback conflicts with authority")
+            if not await self._confirm_repair_preflight(spec, recovery):
+                return self.state
+            if not tracker_pending_projected:
+                self.state["revision"] += 1
+                await self._project(
+                    spec,
+                    "tracker_start_pending",
+                    "Waiting for issue and claim readback before the repair role",
+                )
+                tracker_pending_projected = True
+            await self._wait_repair_readback(delay)
+            delay = min(delay * 2, 30)
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        self.state['revision'] += 1
+        await self._project(spec, 'stopped_resume_started',
+                            'Resuming original delivery with earlier failures retained')
+        return await self._run_iterations(
+            spec, start_iteration=recovery['state']['iteration'] + 1,
+            prior_implementer_session=recovery['session_id'],
+            repair_findings=[recovery['state']['error'], *[
+                finding for role in recovery['state'].get('roles', [])
+                if role.get('iteration') == recovery['state']['iteration']
+                for finding in role.get('findings', [])]],
+            operator_brief=None, continuation=None, recovery=None,
+            authorized_max_iteration=recovery['maximum_iteration'],
+            allow_first_session=recovery['session_id'] is None,
+        )
+
     async def _resume_repair(
         self, spec: dict[str, Any], recovery: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1494,6 +1558,7 @@ class DeliveryWorkflow:
         recovery: dict[str, Any] | None,
         authorized_max_iteration: int | None = None,
         attempt_generation: int = 0,
+        allow_first_session: bool = False,
         resume_prechecks: bool = False,
         published_checkpoint: bool = False,
         title_constraint: dict[str, Any] | None = None,
@@ -1510,6 +1575,7 @@ class DeliveryWorkflow:
             if operator_brief else None
         )
         for iteration in range(start_iteration, max_repairs + 1):
+            evidence_iteration = self.state["iteration"]
             self.state["iteration"] = iteration
             if published_checkpoint and iteration == start_iteration:
                 published = self.state['pull_request']
@@ -1557,6 +1623,13 @@ class DeliveryWorkflow:
                 )
             else:
                 if not (resume_prechecks and iteration == start_iteration):
+                    evidence_context = None
+                    if workflow.patched("role-evidence-handoff-v1"):
+                        evidence_context = {
+                            "candidate": self.state["candidate"],
+                            "iteration": evidence_iteration,
+                            "checks": deepcopy(self.state["checks"]),
+                        }
                     self.state["checks"] = {
                         key: value for key, value in self.state["checks"].items()
                         if key == "baseline"
@@ -1574,6 +1647,8 @@ class DeliveryWorkflow:
                                 "role": "implement",
                                 "iteration": iteration,
                                 "candidate": self.state["candidate"],
+                                **({"evidence_context": evidence_context}
+                                   if evidence_context else {}),
                                 "findings": [
                                     *repair_findings,
                                     *([acceptance_note] if acceptance_note else []),
@@ -1605,7 +1680,9 @@ class DeliveryWorkflow:
                         return await self._stop(
                             spec, "continuation did not resume the original implementer"
                         )
-                    if iteration and implementation.get("session_id") != prior_implementer_session:
+                    if (iteration
+                            and not (allow_first_session and prior_implementer_session is None)
+                            and implementation.get("session_id") != prior_implementer_session):
                         return await self._stop(
                             spec, "repair did not resume the original implementer"
                         )
@@ -1801,6 +1878,11 @@ class DeliveryWorkflow:
                             "findings": [acceptance_note] if acceptance_note else [],
                             "resume_session": None,
                             "qa_evidence": qa_evidence if role == "verify" else None,
+                            **({"evidence_context": {"role_artifacts": [
+                                r["role_artifacts"] for r in self.state["roles"]
+                                if r.get("role_artifacts") and r.get("role") == "implement"
+                                and r.get("iteration") == iteration
+                            ]}} if workflow.patched("role-evidence-handoff-v1") else {}),
                             **({"check_evidence": self.state["checks"].get("local")}
                                if spec["policy"].get("host_sandbox") == "trusted-local" else {}),
                         },

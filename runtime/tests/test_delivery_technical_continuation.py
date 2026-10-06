@@ -792,6 +792,7 @@ def test_inherited_confirmed_blocked_checkpoint_does_not_freeze_fresh_technical_
     stage,
     point,
 ):
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, submitted = service
     store.submit(submitted)
     spec = store.spec("run-1")
@@ -937,6 +938,7 @@ def test_published_technical_checkpoint_never_implements_or_republishes(
     stage,
     failure,
 ):
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, submitted = service
     store.submit(submitted)
     spec = store.spec("run-1")

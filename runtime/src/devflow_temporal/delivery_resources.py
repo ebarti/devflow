@@ -115,25 +115,40 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
             while recovery and recovery.get('kind') in {
                 'terminal_tracker_recovery', 'repair_continuation',
                 'investigation_assessment_adjudication', 'stopped_resource_closure',
+                'stopped_delivery_resume',
             }:
+                if recovery.get('kind') == 'stopped_delivery_resume':
+                    from .delivery_stopped_resume import custody
+                    from .delivery_stopped_resume import namespace as resume_namespace
+
+                    custody(db, recovery)
+                    if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                        raise ValueError('stopped resume execution authority changed')
+                    admitted = resume_namespace(recovery)
+                    roots.add(state / admitted / 'evidence')
+                    if first:
+                        namespace = admitted
+                    first = False
                 if recovery.get('kind') == 'repair_continuation' and recovery.get(
                         'finalized_checkpoint'):
                     from .delivery_gate_retry import effective_repair
 
                     effective_repair(None, recovery, db=db)
-                    if canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                    if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
                         raise ValueError('finalized repair execution authority changed')
-                    namespace = 'repair-continuation'
-                    roots.add(state / namespace / 'evidence')
+                    if first:
+                        namespace = 'repair-continuation'
+                    roots.add(state / 'repair-continuation' / 'evidence')
                     first = False
                 if recovery.get('kind') == 'stopped_resource_closure':
                     from .delivery_resource_closure import custody
 
                     custody(db, recovery)
-                    if canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                    if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
                         raise ValueError('resource closure current execution authority changed')
-                    namespace = 'resource-closure'
-                    roots.add(state / namespace / 'evidence')
+                    if first:
+                        namespace = 'resource-closure'
+                    roots.add(state / 'resource-closure' / 'evidence')
                     first = False
                 if recovery.get('kind') == 'investigation_assessment_adjudication':
                     from .delivery_investigation_adjudication import custody

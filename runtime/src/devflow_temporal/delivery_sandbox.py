@@ -212,6 +212,7 @@ def _profile_lines(
     codex_home: Path,
     scratch: Path,
     extra_read: tuple[Path, ...] = (),
+    extra_write: tuple[Path, ...] = (),
     network_domains: tuple[str, ...] = (),
     protected_executables: tuple[Path, ...] = (),
 ) -> list[str]:
@@ -241,6 +242,8 @@ def _profile_lines(
         f'{_path(scratch)} = "write"',
         f'{_path(codex_home)} = "deny"',
     ]
+    for path in extra_write:
+        lines.append(f'{_path(path)} = "write"')
     for path in extra_read:
         lines.append(f'{_path(path)} = "read"')
     for path in sorted({item.resolve() for item in protected_executables}, key=str):
@@ -341,6 +344,8 @@ def prepare_native_role(
         + ((recovery,) if request["role"] == "implement" and recovery.is_dir() else ())
         + ((diff_path,) if review_diff else ())
         + ((Path(qa_evidence["path"]), Path(qa_evidence["log"])) if qa_evidence else ())
+        + ((Path(spec["state_dir"]) / "role-evidence",)
+           if request.get("role_evidence_key") else ())
         + (Path(sys.base_prefix),)
     )
     profile_workspace = workspace
@@ -356,6 +361,8 @@ def prepare_native_role(
         codex_home=profile_codex_home,
         scratch=profile_scratch,
         extra_read=extra_read,
+        extra_write=((Path(request["artifact_write_root"]),)
+                     if request.get("artifact_write_root") else ()),
         protected_executables=_protected_native_commands(spec),
     )
     if trusted_local(spec):

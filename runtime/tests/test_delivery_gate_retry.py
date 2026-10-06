@@ -123,6 +123,7 @@ def test_report_assessment_has_a_distinct_role_attempt_even_at_same_generation(m
 def test_unpublished_retry_runs_checks_before_publication_and_independent_roles(
     unpublished, monkeypatch, gate_passes,
 ):
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, _, state, request = unpublished
     store.continue_repair('run-1', request)
     spec = store.effective_spec('run-1')
@@ -264,6 +265,7 @@ def test_changed_authority_is_rejected_before_admission(stopped, field, value):
 def test_workflow_runs_fresh_gates_without_implementation_or_publication(
     stopped, monkeypatch, qa_status,
 ):
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, _, state, _, request = stopped
     store.continue_repair('run-1', request)
     spec = store.effective_spec('run-1')

@@ -247,6 +247,23 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
                 or request.get("resume_session") != saved["session_id"]):
             raise ValueError("title repair role does not match its sealed single turn")
         validate_source(request["spec"], constraint, completed=False)
+    if (role == "implement" and request["spec"].get("provider") == "codex"
+            and request["spec"]["policy"].get("host_sandbox") == "trusted-local"):
+        prerequisites = await asyncio.to_thread(
+            broker.run_implementation_preparation, iteration, candidate,
+        )
+        if prerequisites.get("state") != "passed":
+            return {"status": "blocked", "role": role, "iteration": iteration,
+                    "candidate": candidate, "cleanup": prerequisites.get("cleanup", "unknown"),
+                    "summary": "Controller dependency preparation failed before the role",
+                    "findings": ["Required locked execution prerequisites are unavailable"],
+                    "session_id": None, "implementation_preparation": prerequisites}
+        from .delivery_role_evidence import historical_context
+
+        context = {**historical_context(store, request["spec"]),
+                   **(request.get("evidence_context") or {}),
+                   "implementation_preparation": prerequisites}
+        request = {**request, "evidence_context": context}
     result = await get_supervisor(store).run(
         {**request, "workspace": str(workspace), "review_diff": review_diff}
     )
@@ -352,6 +369,10 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
         try:
             store, _ = _context(request["spec"])
+            if request["recovery"].get("kind") == "stopped_delivery_resume":
+                from .delivery_stopped_resume import readback
+
+                return readback(store, request["spec"], request["recovery"])
             if request["recovery"].get("kind") == "execution_policy_recovery":
                 from .delivery_policy_recovery import resume_preflight
 
