@@ -1,4 +1,23 @@
 
+### QA findings require a passing assessment
+
+New investigation assessment adjudication requests are rejected. A disposition
+cannot turn failed QA into a delivered result; repair the findings and obtain a
+passing assessment. Already consumed command responses remain readable without
+creating another admission. Historical completed results are preserved for replay.
+
+Before deploying, check every owning dashboard's run details for
+`investigation_adjudication` and unfinished `investigation_adjudication_queued`,
+`adjudication_preflight`, or `waiting_ci` executions. Finish or cancel those legacy
+paths through the normal controls first. If an unfinished legacy tail nevertheless
+reaches its terminal transition after upgrade, it blocks, retains its original
+QA/findings, and performs normal cleanup and tracker reconciliation.
+
+The two `delivery-adjudication*-history.json` fixtures were recorded from
+`c04f00eb43eb225728b63c82026ffe97a41cafc2` on an isolated in-memory Temporal server using synthetic inputs
+and a fixed fixture worker identity. They cover both completed and waiting-CI
+histories; the legacy workflow body is retained solely for replay compatibility.
+
 ### Rerun gates after a runtime repair
 
 A finalized native run that published a PR and stopped on review or QA can receive

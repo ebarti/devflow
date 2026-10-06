@@ -704,7 +704,7 @@ class DeliveryWorkflow:
             if recovery.get("kind") == "stopped_resource_closure":
                 return await self._resume_resource_closure(spec, recovery)
             if recovery.get("kind") == "investigation_assessment_adjudication":
-                return await self._resume_adjudication(spec, recovery)
+                return await self._replay_legacy_adjudication(spec, recovery)
             if recovery.get("kind") == "accepted_technical_successor":
                 return await self._resume_technical(spec, recovery)
             if recovery.get("kind") == "execution_policy_recovery":
@@ -1095,7 +1095,7 @@ class DeliveryWorkflow:
             authorized_max_iteration=4, published_checkpoint=True, verify_only=True,
         )
 
-    async def _resume_adjudication(self, spec, recovery):
+    async def _replay_legacy_adjudication(self, spec, recovery):
         if (recovery.get('execution_spec') != spec or recovery.get('maximum_iteration') != 4
                 or recovery.get('command', {}).get('additional_iterations') != 0
                 or recovery.get('state', {}).get('iteration') != 4):
@@ -1129,6 +1129,11 @@ class DeliveryWorkflow:
         except Exception as exc:
             return await self._stop(spec, 'adjudication final gate failed: '
                                     + type(exc).__name__)
+        # The legacy body exists only so already recorded histories can replay.
+        # An old execution paused at CI has not reached this patch yet, so its
+        # next live terminal transition is blocked along with new executions.
+        if workflow.patched("qa-findings-require-passing-assessment-v1"):
+            return await self._stop(spec, 'QA findings require repair and a passing QA assessment')
         self.state.update(phase='delivered', execution_state='terminal', outcome='delivered')
         self.state['revision'] += 1
         await self._project(spec, 'delivered',
