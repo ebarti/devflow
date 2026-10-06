@@ -18,8 +18,14 @@ from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 @pytest.fixture
 def published(service, monkeypatch):
+    return _published(service, monkeypatch)
+
+
+def _published(service, monkeypatch, *, goal=None, summary=None, legacy=False):
     store, request = service
-    request["goal"] = "refactor(profile): share pure production and demo coaching policy"
+    request["goal"] = goal or "refactor(profile): share pure production and demo coaching policy"
+    if summary is not None:
+        request["publication_summary"] = summary
     repository = store.config.raw["repositories"]["fixture"]
     repository["prepublish_checks"] = [
         {
@@ -32,7 +38,14 @@ def published(service, monkeypatch):
     ]
     repository["checks"] = repository["prepublish_checks"]
     store.config.path.write_text(json.dumps(store.config.raw))
-    store.submit(request)
+    if legacy:
+        admit = store.config.admit
+        with monkeypatch.context() as context:
+            context.setattr(type(store.config), "admit", lambda self, supplied: admit(
+                supplied, legacy_publication=True))
+            store.submit(request)
+    else:
+        store.submit(request)
     spec = store.spec("run-1")
     broker = DeliveryBroker(store, spec)
     broker.prepare()
@@ -714,3 +727,21 @@ def test_metadata_gate_namespace_refuses_foreign_alias_or_changed_custody(publis
     if change in {'foreign', 'alias', 'raw-spec', 'seal'}:
         assert not expected.exists()
     assert original.state_dir == broker.state_dir
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_recovery_title_uses_frozen_summary_or_historical_goal(service, monkeypatch, legacy):
+    from devflow_temporal.delivery_broker import publication_title
+
+    goal = 'Investigate the fixture behavior. Publish only the documented design.'
+    summary = 'docs: investigate fixture behavior'
+    store, broker, _state, _closed, command, title = _published(
+        service, monkeypatch, goal=goal, summary=None if legacy else summary, legacy=legacy)
+    expected = publication_title(goal) if legacy else summary
+    assert expected != goal
+    assert ('publication_summary' not in broker.spec) == legacy
+    store.reconcile_published_metadata('run-1', command)
+    snapshot = metadata.read_private(broker.state_dir / 'metadata-reconciliation/intent.json')
+    assert snapshot['new_title'] == expected
+    assert title['value'] == expected  # Actual intercepted gh pr edit --title argument.
+    assert store.spec('run-1')['goal'] == goal

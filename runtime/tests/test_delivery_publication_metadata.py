@@ -255,3 +255,70 @@ def test_publisher_uses_summary_without_leaking_execution_instructions(publisher
     assert 'Implements ' not in body
     assert broker.publish(0, candidate) == result
     assert len(created) == 1
+
+
+@pytest.mark.parametrize('text', [
+    'fix: correct U.S. date formats', 'docs: explain e.g. retries',
+    'perf: compare map vs. dict lookups', 'fix: handle ... in titles',
+    'docs: explain i.e. the default behavior', 'docs: describe retries etc. in examples',
+    'fix: handle a U.K. locale', 'Fix crash on U.S. locale dates',
+])
+@pytest.mark.parametrize('explicit', [False, True])
+def test_summary_accepts_abbreviations_and_ellipses_without_changing_goal(service, text, explicit):
+    store, request = service
+    goal = 'Investigate the fixture. Publish only the documented design.' if explicit else text
+    request['goal'] = goal
+    expected = text if ':' in text else 'chore: ' + text
+    if explicit:
+        request['publication_summary'] = expected
+    store.submit(request)
+    assert store.spec(request['run_id'])['publication_summary'] == expected
+    assert store.spec(request['run_id'])['goal'] == goal
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+def test_summary_trims_outer_textarea_whitespace_and_preserves_goal(service, explicit):
+    store, request = service
+    goal = 'Fix the login redirect bug\n'
+    request['goal'] = goal
+    if explicit:
+        request['publication_summary'] = ' \nfix: correct the login redirect\n '
+    store.submit(request)
+    expected = ('fix: correct the login redirect' if explicit
+                else 'chore: Fix the login redirect bug')
+    assert store.spec(request['run_id'])['publication_summary'] == expected
+    assert store.spec(request['run_id'])['goal'] == goal
+
+
+@pytest.mark.parametrize('control', ['\u009b', '\u0085', '\u202e', '\u2066', '\u200f'])
+@pytest.mark.parametrize('explicit', [False, True])
+@pytest.mark.parametrize('position', ['inside', 'outside'])
+def test_summary_rejects_unicode_controls_before_claiming_work(
+    service, control, explicit, position
+):
+    store, request = service
+    text = 'docs: a' + control + 'red' if position == 'inside' else control + 'docs: red' + control
+    request['publication_summary' if explicit else 'goal'] = text
+    with pytest.raises(ValueError, match='control'):
+        store.submit(request)
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 0
+        assert store.state.claim_for(db, request['work_id']) is None
+
+
+@pytest.mark.parametrize('field,text,rule', [
+    ('publication_summary', 'docs: First sentence. Second sentence.', 'multiple sentences'),
+    ('publication_summary', 'docs: one\nline two', 'single line'),
+    ('publication_summary', 'Plain prose', 'Conventional Commit'),
+    ('goal', 'First sentence. Second sentence.', 'multiple sentences'),
+    ('goal', 'x' * 115, '120 characters including its type'),
+])
+def test_summary_error_names_checked_input_and_failed_rule(service, field, text, rule):
+    store, request = service
+    request[field] = text
+    with pytest.raises(ValueError) as error:
+        store.submit(request)
+    assert field in str(error.value)
+    assert rule in str(error.value)
+    if field == 'goal':
+        assert 'provide publication_summary separately' in str(error.value)
