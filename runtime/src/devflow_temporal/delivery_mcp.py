@@ -21,6 +21,9 @@ def build_server(config_path: Path) -> FastMCP:
             "The local service owns roles, planning and authorized GitHub delivery through an "
             "unmerged PR. Use status/evidence on request; dashboard SSE supplies progress. "
             "Read tools require an already running service and never start it. "
+            "For an authorized delivery or mutation, use start_service if a prerequisite "
+            "read reports transport unavailable, then repeat the required reads. "
+            "Status/evidence requests and callbacks alone do not authorize startup. "
             "Keep mutation IDs stable after uncertain responses; inspect the run before retrying."
         ),
     )
@@ -35,6 +38,11 @@ def build_server(config_path: Path) -> FastMCP:
     def get_service() -> dict:
         """Read local health and public policy; report unavailable if stopped."""
         return read_only_client(config_path).service()
+
+    @server.tool(annotations=write)
+    def start_service() -> dict:
+        """Start for an authorized delivery or mutation; may activate pending work."""
+        return client(config_path).service()
 
     @server.tool(annotations=write)
     def submit_run(request_json: str, ctx: Context) -> dict:

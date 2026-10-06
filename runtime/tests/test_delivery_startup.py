@@ -356,7 +356,6 @@ def test_cli_read_failure_is_concise_and_status_does_not_start(config, monkeypat
         control, "read_only_client",
         lambda _config: (_ for _ in ()).throw(ServiceUnavailable("service unavailable"))
     )
-    monkeypatch.setattr(control, "_config", lambda _path: config)
     monkeypatch.setattr(sys, "argv", ["devflow-delivery", "--config", str(config.path), "runs"])
     with pytest.raises(SystemExit) as result:
         control.main()

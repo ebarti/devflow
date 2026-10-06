@@ -31,8 +31,8 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
     seen = []
     policy = {"policy": {"repositories": [{"key": "fixture", "base_ref": "main"}]}}
 
-    def client(path):
-        seen.append(path)
+    def client(path, factory):
+        seen.append((factory, path))
         return SimpleNamespace(
             service=lambda: policy,
             recovery_preflight=lambda run_id: {"run_id": run_id, "precheck_sha256": "a" * 64},
@@ -46,12 +46,14 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             continue_repair=lambda run_id, request: {"run_id": run_id, **request},
         )
 
-    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", client)
-    monkeypatch.setattr("devflow_temporal.delivery_mcp.read_only_client", client)
+    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", lambda path: client(path, "write"))
+    monkeypatch.setattr("devflow_temporal.delivery_mcp.read_only_client",
+                        lambda path: client(path, "read"))
     async with create_connected_server_and_client_session(build_server(config)) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
         assert set(tools) == {
             "get_service",
+            "start_service",
             "submit_run",
             "list_runs",
             "get_run",
@@ -82,6 +84,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             assert tools[name].annotations.destructiveHint is False
             assert tools[name].annotations.openWorldHint is False
         for name in (
+            "start_service",
             "submit_run",
             "answer_decision",
             "cancel_run",
@@ -97,6 +100,8 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         assert tools["cancel_run"].annotations.destructiveHint is True
         assert tools["submit_run"].inputSchema["required"] == ["request_json"]
         assert tools["get_service"].inputSchema.get("required", []) == []
+        assert tools["start_service"].inputSchema.get("required", []) == []
+        assert tools["start_service"].annotations.destructiveHint is False
         result = await session.call_tool("get_service")
         assert not result.isError and json.loads(result.content[0].text) == policy
         preflight = await session.call_tool("recovery_preflight", {"run_id": "same-run"})
@@ -141,4 +146,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             }
         result = await session.call_tool("gates_only_preflight", {"run_id": "same-run"})
         assert not result.isError and json.loads(result.content[0].text) == {"run_id": "same-run"}
-        assert seen == [config] * 10
+        assert seen == [(factory, config) for factory in (
+            "read", "read", "write", "write", "write", "write",
+            "read", "read", "write", "read",
+        )]
