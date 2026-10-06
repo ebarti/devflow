@@ -208,6 +208,45 @@ def test_no_dependency_plan_has_explicit_successful_noop_preparation(service):
                       'candidate_id': request['candidate']['id'], 'source_unchanged': True}
 
 
+def test_controller_prepares_named_node_dependencies_before_role(service, tmp_path):
+    import sys
+
+    from test_delivery_store import _git
+
+    from devflow_temporal.delivery_store import DeliveryStore
+
+    store, request = service
+    source = Path(store.config.raw['repositories']['fixture']['source_path'])
+    package = source / 'api'
+    (package / 'test').mkdir(parents=True)
+    (package / 'test/audit.test.ts').write_text('test("audit", () => {});')
+    (package / 'package.json').write_text(json.dumps({'devDependencies': {'vitest': '4.1.11'}}))
+    (source / 'package.json').write_text('{"packageManager":"pnpm@10.33.3"}')
+    (source / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
+    _git(source, 'add', '.')
+    _git(source, 'commit', '-qm', 'test: accepted Node test fixture')
+    store.config.raw['repositories']['fixture']['expected_base_sha'] = _git(
+        source, 'rev-parse', 'HEAD')
+    store.config.path.write_text(json.dumps(store.config.raw))
+    store = DeliveryStore(store.config)
+    store.submit({**request, 'base_ref': 'HEAD'})
+    spec = store.spec(request['run_id'])
+    marker = tmp_path / 'prepared-dependencies.txt'
+    dependency = {'id': 'docs-install', 'argv': [sys.executable, '-c',
+        f'from pathlib import Path; Path({str(marker)!r}).write_text("prepared")', '/store']}
+    spec['accepted_plan'] = json.dumps({'verification': ['Run API audit.test.ts']})
+    spec['policy']['prepublish_checks'] = [dependency]
+    broker = DeliveryBroker(store, spec)
+    broker.prepare()
+    before = broker.candidate()
+    result = broker.run_implementation_preparation(0, before)
+    assert result['state'] == 'passed'
+    assert marker.read_text() == 'prepared'
+    assert [r['id'] for r in result['results']] == ['docs-install']
+    assert broker.candidate() == before
+    assert 'verification_test_paths' not in spec
+
+
 def test_prompt_and_profile_name_authorized_output_without_exposing_controller(service, tmp_path):
     from devflow_temporal.delivery_role_evidence import allocate
     from devflow_temporal.delivery_sandbox import prepare_native_role
