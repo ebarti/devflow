@@ -211,8 +211,6 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
     if role == "implement":
         workspace = broker.checkout
         review_diff = None
-        if broker.candidate() != candidate:
-            raise ValueError("implementer checkout changed before its role")
     elif role in {"review", "verify"}:
         workspace = broker.gate_checkout(role, iteration, candidate)
         review_diff = broker.gate_diff(role, iteration, candidate)
@@ -246,9 +244,18 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
                 or digest(saved.get("title_constraint")) != digest(constraint)
                 or request.get("resume_session") != saved["session_id"]):
             raise ValueError("title repair role does not match its sealed single turn")
-        validate_source(request["spec"], constraint, completed=False)
+    supervisor = get_supervisor(store)
+    retained = supervisor.retained_request(
+        {**request, 'workspace': str(workspace), 'review_diff': review_diff}
+    ) if role == 'implement' else None
+    if role == 'implement' and retained is None:
+        if broker.candidate() != candidate:
+            raise ValueError('implementer checkout changed before its role')
+        if constraint:
+            validate_source(request['spec'], constraint, completed=False)
     if (role == "implement" and request["spec"].get("provider") == "codex"
-            and request["spec"]["policy"].get("host_sandbox") == "trusted-local"):
+            and request["spec"]["policy"].get("host_sandbox") == "trusted-local"
+            and retained is None):
         prerequisites = await asyncio.to_thread(
             broker.run_implementation_preparation, iteration, candidate,
         )
@@ -264,7 +271,7 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
                    **(request.get("evidence_context") or {}),
                    "implementation_preparation": prerequisites}
         request = {**request, "evidence_context": context}
-    result = await get_supervisor(store).run(
+    result = await supervisor.run(
         {**request, "workspace": str(workspace), "review_diff": review_diff}
     )
     if constraint:

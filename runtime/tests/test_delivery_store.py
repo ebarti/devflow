@@ -1885,7 +1885,7 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     assert not (copied / "codex" / "config.toml").exists()
     assert (home / "codex" / "auth.json").read_text() == "old-auth-must-not-copy\n"
 
-    class ReadySupervisor:
+    class ReadySupervisor(DeliverySupervisor):
         async def run(self, role_request):
             assert role_request["resume_session"] == session_id
             assert role_request["continuation"] is True
@@ -1899,7 +1899,7 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
 
     monkeypatch.setattr(
         "devflow_temporal.delivery_activities.get_supervisor",
-        lambda _store: ReadySupervisor(),
+        lambda _store: ReadySupervisor(_store, capacity=2),
     )
     ready = asyncio.run(
         delivery_role(
@@ -2146,7 +2146,7 @@ async def test_implementer_admits_net_feature_diff_against_frozen_base(
     broker = DeliveryBroker(store, spec)
     before = broker.prepare()["candidate"]
 
-    class ReadySupervisor:
+    class ReadySupervisor(DeliverySupervisor):
         async def run(self, _request):
             if change in {"committed", "uncommitted", "reverted"}:
                 (broker.checkout / "README.md").write_text("Feature\n")
@@ -2158,7 +2158,7 @@ async def test_implementer_admits_net_feature_diff_against_frozen_base(
             return {"status": "pass", "summary": "Ready for controller checks", "findings": []}
 
     monkeypatch.setattr("devflow_temporal.delivery_activities.get_supervisor",
-                        lambda _store: ReadySupervisor())
+                        lambda _store: ReadySupervisor(_store, capacity=2))
     result = await delivery_role({"spec": spec, "role": "implement", "iteration": 0,
                                   "candidate": before})
     assert result["status"] == ("pass" if change in {"committed", "uncommitted"} else "blocked")
