@@ -91,8 +91,8 @@ def effect(directory, path, stage=None):
         return
     captured = Path(directory) / ("forward-" + hashlib.sha256(str(path).encode()).hexdigest())
     if stage:
-        exchange(stage, path)
-        os.replace(stage, captured)  # Preserve the displaced object before any cleanup.
+        os.replace(stage, captured)  # Cross-device failure precedes public mutation.
+        exchange(captured, path)  # The displaced object is already in the private backup.
     else:
         os.replace(path, captured)
     if identity(captured) != expected:
