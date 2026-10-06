@@ -97,9 +97,9 @@ class DeliveryService:
         starts = []
         for item in pending:
             spec = self.store.effective_spec(item["run_id"])
-            if not execution_retired(spec):
+            if not execution_retired(spec) and self.store.owns_execution(spec):
                 starts.append((item, spec))
-        # Retired outbox entries are historical data, including after an interrupted start.
+        # Retired and foreign outbox entries cannot authorize this service's transport.
         if pending and not starts:
             return
         client = await self.healthy_client()
@@ -160,10 +160,10 @@ class DeliveryService:
                 for item in self.store.pending_starts():
                     try:
                         spec = self.store.effective_spec(item["run_id"])
+                        if execution_retired(spec) or not self.store.owns_execution(spec):
+                            continue
                     except Exception:
                         # Unknown authority cannot authorize an outbox acknowledgement.
-                        continue
-                    if execution_retired(spec):
                         continue
                     self.store.mark_start(item["run_id"], accepted=False, error=type(exc).__name__)
             try:

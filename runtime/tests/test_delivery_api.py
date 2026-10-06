@@ -261,6 +261,100 @@ def api_fixture(tmp_path: Path) -> tuple[Path, dict]:
     return path, request
 
 
+def _foreign_queued_service(api_fixture, key, value):
+    path, request = api_fixture
+    owner = create_app(path).state.delivery
+    raw = json.loads(path.read_text())
+    raw[key] = value
+    foreign_path = path.with_name("foreign-service.json")
+    foreign_path.write_text(json.dumps(raw))
+    foreign = create_app(foreign_path).state.delivery
+    foreign.store.submit(request)
+    return owner, foreign, request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key,value", [
+    ("temporal_address", "127.0.0.1:17399"),
+    ("temporal_namespace", "another-namespace"),
+    ("queue", "another-queue"),
+    ("dashboard_url", "http://127.0.0.1:18799"),
+])
+async def test_shared_database_cannot_dispatch_another_service_run(
+    api_fixture, monkeypatch, key, value,
+):
+    owner, foreign, request = _foreign_queued_service(api_fixture, key, value)
+    before = foreign.store.detail(request["run_id"])
+
+    async def wrong_transport():
+        pytest.fail("foreign outbox selected the wrong service transport")
+
+    monkeypatch.setattr(owner, "healthy_client", wrong_transport)
+    await owner.dispatch_once()
+    assert foreign.store.detail(request["run_id"]) == before
+    assert len(foreign.store.pending_starts()) == 1
+
+
+def test_foreign_predecessor_readback_rejected_before_temporal_connection(
+    api_fixture, monkeypatch,
+):
+    owner, _foreign, request = _foreign_queued_service(
+        api_fixture, "temporal_address", "127.0.0.1:17399",
+    )
+
+    async def wrong_transport(*_args, **_kwargs):
+        pytest.fail("foreign predecessor was queried through this service transport")
+
+    monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", wrong_transport)
+    with pytest.raises(ValueError, match="service transport ownership"):
+        owner.store._completed_temporal_result(request["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_does_not_acknowledge_foreign_outbox(
+    api_fixture, monkeypatch,
+):
+    owner, foreign, request = _foreign_queued_service(
+        api_fixture, "temporal_address", "127.0.0.1:17399",
+    )
+    own_request = {**request, "command_id": "own-submit", "run_id": "own-run",
+                   "work_id": "own-work", "branch": "feat/own-run",
+                   "issue_url": "https://github.com/example/fixture/issues/4"}
+    owner.store.submit(own_request)
+
+    async def unavailable():
+        raise ConnectionError("own transport unavailable")
+
+    async def stop_loop(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(owner, "healthy_client", unavailable)
+    monkeypatch.setattr("devflow_temporal.delivery_api.asyncio.sleep", stop_loop)
+    with pytest.raises(asyncio.CancelledError):
+        await owner.dispatch_loop()
+    with foreign.store._connect() as db:
+        assert db.execute("SELECT state FROM delivery_outbox WHERE run_id=?",
+                          (request["run_id"],)).fetchone()[0] == "pending"
+        assert db.execute("SELECT state FROM delivery_outbox WHERE run_id=?",
+                          (own_request["run_id"],)).fetchone()[0] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_same_transport_config_snapshot_remains_dispatchable(api_fixture, monkeypatch):
+    path, _request = api_fixture
+    owner, _peer, _ = _foreign_queued_service(
+        api_fixture, "temporal_address", "127.0.0.1:17333",
+    )
+    assert "temporal_address" not in json.loads(path.read_text())
+
+    async def selected():
+        raise RuntimeError("same-owner transport selected")
+
+    monkeypatch.setattr(owner, "healthy_client", selected)
+    with pytest.raises(RuntimeError, match="same-owner transport selected"):
+        await owner.dispatch_once()
+
+
 @pytest.mark.asyncio
 async def test_tokenless_local_api_csrf_submit_replay_and_conflict(api_fixture):
     path, request = api_fixture

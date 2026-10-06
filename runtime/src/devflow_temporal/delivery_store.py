@@ -604,10 +604,27 @@ class DeliveryStore:
             )
             return response
 
+    def owns_execution(self, spec: dict[str, Any]) -> bool:
+        """Shared database visibility does not grant another service's transport."""
+        frozen = DeliveryConfig.load(Path(spec["config_path"]))
+        if digest(frozen.raw) != spec["config_digest"]:
+            raise ValueError("frozen service configuration changed")
+
+        def binding(config: DeliveryConfig) -> tuple:
+            return (
+                config.tracking_db.resolve(), config.state_root.resolve(),
+                config.temporal_address, config.raw.get("temporal_namespace", "default"),
+                config.queue, config.dashboard_url.rstrip("/"),
+            )
+
+        return binding(frozen) == binding(self.config)
+
     def _completed_temporal_result(
         self, run_id: str, *, workflow_id: str | None = None
     ) -> dict[str, Any]:
         """Read a closed workflow from Temporal, never from caller-authored JSON."""
+        if not self.owns_execution(self.effective_spec(run_id)):
+            raise ValueError("continuation service transport ownership differs from frozen run")
 
         async def read() -> dict[str, Any]:
             client = await Client.connect(
