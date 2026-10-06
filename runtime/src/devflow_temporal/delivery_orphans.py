@@ -146,7 +146,8 @@ def _reconcile(store, original, spec, closed):
         receipt = {'state': 'unknown', 'resource_cleanup': 'unknown',
                    'process_cleanup': 'unknown', 'reason': str(exc)[:300]}
     current = _unchanged(store, original)
-    receipt = {**receipt, 'closed_workflow': closed, 'native_observations': observations}
+    receipt = {**receipt, 'closed_workflow': closed, 'native_observations': observations,
+               'original_attempts': [item for item in attempts if item['state'] != 'finished']}
     checks = {**json.loads(current['checks_json'] or '{}'), 'resource_cleanup': receipt}
     store.project(spec['run_id'], phase=current['phase'],
         execution_state=current['execution_state'], outcome=current['outcome'],

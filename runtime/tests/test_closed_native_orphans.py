@@ -128,9 +128,17 @@ async def test_closed_native_role_is_reconciled_after_worker_sigkill_without_rep
                         assert db.execute('SELECT state FROM delivery_attempts').fetchone()[0] \
                             == before['state']
                 write_private(journal_path, original_journal)
+                from devflow_temporal.supervisor import get_supervisor
+
+                original_observation = get_supervisor(store)._mark_unknown(
+                    before['job_key'], 'Original lost observer')
+                with store._connect() as db:
+                    original_unknown = dict(db.execute(
+                        'SELECT * FROM delivery_attempts').fetchone())
                 store.project(spec['run_id'], phase='blocked', execution_state='blocked',
                     event_type='blocked', message='Original workflow terminated', outcome='blocked',
-                    error='Original worker was killed', cleanup='unknown')
+                    error='Original worker was killed', cleanup='unknown',
+                    checks={'original_role': original_observation})
                 service = DeliveryService(path)
                 service._health_client = environment.client
                 await service.dispatch_once()
@@ -142,6 +150,13 @@ async def test_closed_native_role_is_reconciled_after_worker_sigkill_without_rep
                 assert after['session_id'] == 'fixed-native-session'
                 assert run['outcome'] == 'blocked' and run['error'] == 'Original worker was killed'
                 assert run['cleanup'] == 'confirmed'
+                cleanup = json.loads(run['checks_json'])['resource_cleanup']
+                assert cleanup['original_attempts'] == [original_unknown]
+                assert original_unknown['state'] == 'unknown'
+                assert original_unknown['result_json'] is None
+                assert original_unknown['cleanup'] == 'unknown'
+                assert json.loads(run['checks_json'])['original_role'] == original_observation
+                assert original_observation['status'] == 'recovery_unknown'
                 assert (state / 'invocations').read_text().splitlines() == ['one']
                 assert len(list(state.rglob('native-process.json'))) == 1
             finally:
