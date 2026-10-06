@@ -361,7 +361,7 @@ async def test_tokenless_local_api_csrf_submit_replay_and_conflict(api_fixture):
     app = create_app(path)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        assert (await browser.get("/api/runs")).json() == {"runs": []}
+        assert (await browser.get("/api/runs")).json() == {"runs": [], "next_cursor": None}
         token_path = Path(json.loads(path.read_text())["state_root"]) / "service-token"
         assert not token_path.exists()
         assert (
