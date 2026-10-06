@@ -107,6 +107,36 @@ def test_private_read_preserves_snapshots_during_actual_atomic_publication(tmp_p
     assert read_private(path) == {'generation': 200}
 
 
+def test_private_read_preserves_an_authenticated_snapshot_under_repeated_replacement(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / 'journal.json'
+    path.write_text(json.dumps({'generation': 0}))
+    path.chmod(0o600)
+    replacements = []
+    for generation in range(1, 13):
+        replacement = tmp_path / f'publication-{generation}.json'
+        replacement.write_text(json.dumps({'generation': generation}))
+        replacement.chmod(0o600)
+        replacements.append(replacement)
+    original_fstat = os.fstat
+    published = 0
+
+    def publish_before_stat(fd):
+        nonlocal published
+        # Real publications unlink the opened inode at every observation boundary.
+        for _ in range(4):
+            os.replace(replacements[published], path)
+            published += 1
+        return original_fstat(fd)
+
+    monkeypatch.setattr(os, 'fstat', publish_before_stat)
+    snapshot = read_private(path)
+    assert published > 3
+    assert 0 <= snapshot['generation'] < published
+    assert json.loads(path.read_text()) == {'generation': published}
+
+
 @pytest.mark.parametrize('violation', ['mode', 'symlink', 'hardlink', 'owner'])
 def test_private_read_rechecks_replacement_security(tmp_path, monkeypatch, violation):
     path = tmp_path / 'journal.json'

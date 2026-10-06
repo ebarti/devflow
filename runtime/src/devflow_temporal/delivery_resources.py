@@ -28,9 +28,10 @@ def private_directory(path: Path) -> None:
 
 
 def read_private(path: Path) -> dict:
-    # Atomic journal publication may unlink an inode after open. Validate and
-    # read one descriptor, reopening only that bounded replacement race.
-    for _ in range(3):
+    # Recheck the replacement once when publication unlinks the first inode.
+    # A second authenticated descriptor remains a valid snapshot if unlinked too;
+    # it need not be the latest pathname value under continuous publication.
+    for observation in range(2):
         try:
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except OSError as exc:
@@ -43,12 +44,11 @@ def read_private(path: Path) -> dict:
                 not stat.S_ISREG(info.st_mode)
                 or info.st_uid != os.getuid()
                 or info.st_mode & 0o777 != 0o600
+                or info.st_nlink not in (0, 1)
             ):
                 raise ValueError("resource evidence is not a private owned file")
-            if info.st_nlink == 0:
+            if info.st_nlink == 0 and observation == 0:
                 continue
-            if info.st_nlink != 1:
-                raise ValueError("resource evidence is not a private owned file")
             with os.fdopen(descriptor, "rb", closefd=False) as stream:
                 return json.load(stream)
         finally:
