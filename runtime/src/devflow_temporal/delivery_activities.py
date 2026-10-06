@@ -83,28 +83,50 @@ async def delivery_technical_readback(request: dict[str, Any]) -> dict[str, Any]
 
 @activity.defn(name="delivery_project")
 async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
-    store, _ = _context(request["spec"], preparation_input=True)
-    result = store.project(
-        request["spec"]["run_id"],
-        phase=request["phase"],
-        execution_state=request["execution_state"],
-        event_type=request["event_type"],
-        message=request["message"],
-        candidate=request.get("candidate"),
-        pull_request=request.get("pull_request"),
-        checks=request.get("checks"),
-        tracker=request.get("tracker"),
-        usage=request.get("usage"),
-        decision=request.get("decision"),
-        intake=request.get("intake"),
-        iteration=request.get("iteration"),
-        protocol_revision=request.get("protocol_revision"),
-        outcome=request.get("outcome"),
-        cleanup=request.get("cleanup"),
-        error=request.get("error"),
-        key=request.get("key"),
-    )
-    return {"revision": result["revision"], "phase": result["phase"]}
+    def execute() -> dict[str, Any]:
+        store, _ = _context(request["spec"], preparation_input=True)
+        result = store.project(
+            request["spec"]["run_id"],
+            phase=request["phase"],
+            execution_state=request["execution_state"],
+            event_type=request["event_type"],
+            message=request["message"],
+            candidate=request.get("candidate"),
+            pull_request=request.get("pull_request"),
+            checks=request.get("checks"),
+            tracker=request.get("tracker"),
+            usage=request.get("usage"),
+            decision=request.get("decision"),
+            intake=request.get("intake"),
+            iteration=request.get("iteration"),
+            protocol_revision=request.get("protocol_revision"),
+            outcome=request.get("outcome"),
+            cleanup=request.get("cleanup"),
+            error=request.get("error"),
+            key=request.get("key"),
+        )
+        return {"revision": result["revision"], "phase": result["phase"]}
+
+    if request["spec"].get("projection_retry_version") != 1:
+        return execute()
+    if not isinstance(request.get("key"), str) or not request["key"].strip():
+        raise ApplicationError("projection requires its original event key", non_retryable=True)
+    try:
+        return await asyncio.to_thread(execute)
+    except Exception as exc:
+        import sqlite3
+
+        code = getattr(exc, "sqlite_errorcode", None)
+        transient = isinstance(exc, sqlite3.OperationalError) and (
+            (code is not None and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+            or str(exc).startswith(("database is locked", "database table is locked",
+                                   "database schema is locked", "database is busy"))
+        )
+        raise ApplicationError(
+            f"projection failed: {type(exc).__name__}: {str(exc)[:400]}",
+            type="ProjectionContention" if transient else "ProjectionRejected",
+            non_retryable=not transient,
+        ) from exc
 
 
 @activity.defn(name="delivery_prepare")

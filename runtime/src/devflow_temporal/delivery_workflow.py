@@ -176,6 +176,15 @@ class DeliveryWorkflow:
                     maximum_interval=timedelta(seconds=10),
                 )
             }
+        elif (name == "delivery_project"
+              and request["spec"].get("projection_retry_version") == 1):
+            options = {
+                "schedule_to_close_timeout": timedelta(minutes=3),
+                "retry_policy": RetryPolicy(
+                    maximum_attempts=3, initial_interval=timedelta(seconds=2),
+                    maximum_interval=timedelta(seconds=10),
+                ),
+            }
         elif name in {
             "delivery_metadata_readback", "delivery_gates_readback", "delivery_technical_readback",
         }:
@@ -190,6 +199,8 @@ class DeliveryWorkflow:
         else:
             options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         timeout = timedelta(hours=hours)
+        if name == "delivery_project" and request["spec"].get("projection_retry_version") == 1:
+            timeout = timedelta(seconds=45)
         if name in {"delivery_terminal_tracker", "delivery_terminal_preflight"}:
             timeout = timedelta(seconds=min(request.get("timeout_seconds", 180), 180))
             options["schedule_to_close_timeout"] = timeout

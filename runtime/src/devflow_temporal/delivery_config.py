@@ -460,6 +460,7 @@ class DeliveryConfig:
             **supplied,
             "plan_approval": plan_approval,
             "blocking_questions_version": 1,
+            "projection_retry_version": 1,
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
@@ -562,6 +563,10 @@ def scope_amended_spec(
         supplied.pop("accepted_plan", None)
         supplied["plan_approval"] = original.get("plan_approval", "required")
     effective = amended.admit(supplied)
+    if "projection_retry_version" in original:
+        effective["projection_retry_version"] = original["projection_retry_version"]
+    else:
+        effective.pop("projection_retry_version", None)
     effective["accepted_plan"] = original["accepted_plan"]
     if "plan_approval" in original:
         effective["plan_approval"] = original["plan_approval"]
