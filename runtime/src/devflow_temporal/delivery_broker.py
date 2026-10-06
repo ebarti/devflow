@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -440,6 +441,7 @@ class DeliveryBroker:
         evidence_dir: Path,
         candidate: dict[str, Any],
         *, python_environments: dict[str, Path] | None = None,
+        native_projects: list[str] | None = None,
     ) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         checkout = checkout.resolve(strict=True)
@@ -447,12 +449,27 @@ class DeliveryBroker:
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec)
+        if self.spec['provider'] == 'codex' and native_projects:
+            from .delivery_native_dependencies import native_addon_authority
+
+            try:
+                # Validate candidate setup before even the original ignored-script
+                # install; that install must not load a candidate PNPM hook/config.
+                authority = native_addon_authority(self.spec, checkout, native_projects)
+                if authority and not any('/store' in c['argv'] for c in checks):
+                    raise ValueError(
+                        'native addon requires the frozen ignore-scripts install first'
+                    )
+            except (ValueError, OSError, KeyError) as exc:
+                raise CheckPreparationFailure('native-addon-authority', exc) from exc
         native_dependencies = (
             self._ensure_native_dependency_store(checkout)
             if self.spec["provider"] == "codex"
             and any("/store" in check["argv"] for check in checks)
             else None
         )
+        node_toolchain = None
+        native_addon = None
         for check in checks:
             argv = check.get("argv")
             relative = check.get("cwd", ".")
@@ -464,6 +481,13 @@ class DeliveryBroker:
                 or checkout not in (cwd, *cwd.parents)
             ):
                 raise ValueError("configured check command or cwd is invalid")
+            range_binding = None
+            if check.get('plan_provenance', {}).get('recipe') == 'checks.diff':
+                if argv != ['git', 'diff', '--check', 'origin/main...HEAD']:
+                    raise ValueError(
+                        'tracked checks.diff must retain its exact committed-range command'
+                    )
+                range_binding = self._diff_range_binding(checkout, candidate)
             native_result = None
             check_evidence = None
             if self.spec["provider"] == "codex":
@@ -479,6 +503,8 @@ class DeliveryBroker:
                             Path(native_dependencies["store"]) if native_dependencies else None
                         ),
                     )
+                    if check.get('native_addon_prerequisite'):
+                        environment['npm_config_python'] = str(Path(sys.executable).resolve())
                     isolated_python = (python_environments or {}).get(check['id'])
                     if isolated_python is not None:
                         if (not isolated_python.is_relative_to(
@@ -539,6 +565,8 @@ class DeliveryBroker:
                 os.chmod(artifact, 0o600)
             else:
                 raise ValueError("unknown delivery provider")
+            if range_binding and self._diff_range_binding(checkout, candidate) != range_binding:
+                raise ValueError('tracked diff range changed during controller execution')
             evidence_failure = None
             if (self.spec["policy"].get("host_sandbox") == "trusted-local"
                     and check.get("kind") == "test"):
@@ -595,6 +623,7 @@ class DeliveryBroker:
                     **({"artifacts": check_evidence} if check_evidence else {}),
                     **({"evidence_failure": evidence_failure} if evidence_failure else {}),
                     "cleanup": "confirmed",
+                    **({'range_binding': range_binding} if range_binding else {}),
                     **(
                         {
                             "process_cleanup": native_result["cleanup"],
@@ -608,6 +637,24 @@ class DeliveryBroker:
             )
             if not passed:
                 break
+            if (self.spec['provider'] == 'codex' and native_projects and '/store' in argv):
+                if (argv[:3] != ['corepack', 'pnpm', 'install']
+                        or not {'--offline', '--frozen-lockfile', '--ignore-scripts'} <= set(argv)):
+                    raise ValueError(
+                        'native addon requires the unchanged frozen ignore-scripts install'
+                    )
+                try:
+                    addon = self._prepare_native_addon(checkout, native_projects,
+                                                       evidence_dir, candidate, native_dependencies)
+                except (ValueError, OSError, KeyError) as exc:
+                    raise CheckPreparationFailure('native-addon-build', exc, results) from exc
+                if addon:
+                    results.extend(addon.get('results', []))
+                    native_addon = addon
+                    node_toolchain = addon.get('node_toolchain')
+                    if addon['state'] != 'passed':
+                        return {**addon, 'results': results}
+                native_projects = None
         after = candidate_for(checkout)
         source_unchanged = after["id"] == candidate["id"]
         return {
@@ -617,7 +664,200 @@ class DeliveryBroker:
             "results": results,
             "candidate_id": candidate["id"],
             "source_unchanged": source_unchanged,
+            **({'node_toolchain': node_toolchain} if node_toolchain else {}),
+            **({'native_addon_preparation': native_addon} if native_addon else {}),
         }
+
+    def _diff_range_binding(self, checkout: Path, candidate: dict) -> dict:
+        observed = candidate_for(checkout)
+        if observed["id"] != candidate["id"]:
+            raise ValueError("tracked diff source candidate changed")
+        return {
+            "candidate_id": candidate["id"],
+            "head": observed["head"],
+            "content_sha256": observed["content_sha256"],
+            "base_sha": self.spec["base_sha"],
+            "origin_main_sha": _git(checkout, "rev-parse", "origin/main"),
+            "merge_base_sha": _git(checkout, "merge-base", "origin/main", "HEAD"),
+        }
+
+    def _prepare_native_addon(
+        self,
+        checkout: Path,
+        projects: list[str],
+        evidence: Path,
+        candidate: dict,
+        dependencies: dict,
+    ) -> dict | None:
+        from .delivery_native_dependencies import (
+            frozen_native_builder,
+            native_addon_authority,
+            validate_native_addon,
+        )
+        from .delivery_resources import RunResources, read_private, write_private
+
+        authority = native_addon_authority(self.spec, checkout, projects)
+        if authority is None:
+            return None
+        resources = RunResources(self.spec)
+        owned = read_private(resources.manifest)
+        # The original install owns this generated root; a historical/foreign tree
+        # cannot be adopted merely because it contains the expected package name.
+        root_record = owned["roots"].get(str(checkout / "node_modules"), {})
+        if root_record.get("kind") != "generated" or not root_record.get("identity"):
+            raise ValueError("native addon requires a controller-created dependency root")
+        resources.register(checkout / "node_modules", "generated")
+        package = validate_native_addon(checkout, authority, Path(dependencies["store"]))
+        roots = [Path(p) for p in self.spec["policy"].get("toolchain_roots", [])]
+        if not roots:
+            raise ValueError("native addon requires the frozen Node22 toolchain root")
+        toolchain = roots[0]
+        node, corepack = toolchain / "bin/node", toolchain / "bin/corepack"
+        if (
+            node.resolve(strict=True) != node
+            or not node.is_file()
+            or not corepack.resolve(strict=True).is_relative_to(toolchain)
+            or node.stat().st_uid != os.getuid()
+            or corepack.stat().st_uid != os.getuid()
+        ):
+            raise ValueError("native addon toolchain escaped its frozen root")
+        tools = {
+            "node_interpreter": {
+                "absolute_path": str(node),
+                "realpath": str(node),
+                "sha256": _sha256(node),
+            },
+            "corepack": {
+                "absolute_path": str(corepack),
+                "realpath": str(corepack.resolve()),
+                "sha256": _sha256(corepack),
+            },
+            "package_manager": authority["package_manager"],
+            "environment": {
+                "PATH": ":".join(
+                    [
+                        *(str(p / "bin") for p in roots),
+                        "/opt/homebrew/bin",
+                        "/usr/local/bin",
+                        "/usr/bin",
+                        "/bin",
+                        "/usr/sbin",
+                        "/sbin",
+                    ]
+                ),
+                "COREPACK_HOME": self.spec["policy"]["package_manager_cache"],
+                "npm_config_nodedir": str(toolchain),
+                "npm_config_build_from_source": "true",
+                "npm_config_python": str(Path(sys.executable).resolve()),
+            },
+        }
+        builder = frozen_native_builder(self.spec, authority["package_manager"])
+        tools["native_builder"] = builder
+        receipt = evidence / "native-addon-preparation.json"
+        if receipt.exists():
+            from .delivery_native_process import reconcile_process
+
+            old = read_private(receipt)
+            if old["candidate_id"] != candidate["id"] or old["native_addon_authority"] != authority:
+                raise ValueError("native addon preparation receipt has stale source authority")
+            recorded = old.get("node_toolchain", {})
+            for key in ("node_interpreter", "corepack", "native_builder"):
+                if recorded and any(recorded[key].get(k) != v for k, v in tools[key].items()):
+                    raise ValueError("native addon preparation toolchain drifted across replay")
+            if recorded and (recorded['environment'] != tools['environment']
+                             or recorded['package_manager'] != tools['package_manager']):
+                raise ValueError('native addon preparation environment changed across replay')
+            if recorded:
+                binary = package / "build/Release/better_sqlite3.node"
+                if (
+                    binary.resolve(strict=True) != binary
+                    or _sha256(binary) != recorded["native_binding"]["sha256"]
+                ):
+                    raise ValueError("native addon binary changed across replay")
+            for row in old["results"]:
+                if (
+                    _sha256(Path(row["log"])) != row["log_sha256"]
+                    or reconcile_process(Path(row["native_process"]["journal"]))["cleanup"]
+                    != "observed-native-confirmed"
+                ):
+                    raise ValueError("native addon process/log readback changed across replay")
+            return {**old, "receipt": str(receipt), "receipt_sha256": _sha256(receipt)}
+        checks = [
+            {
+                "id": "native-addon-node-identity",
+                "argv": [
+                    str(node),
+                    "-e",
+                    "const a=require('node:assert/strict');"
+                    "a.equal(process.versions.node.split('.')[0],'22');"
+                    "console.log(JSON.stringify({version:process.version,modules_ABI:process.versions.modules,"
+                    "architecture:process.arch,platform:process.platform,execPath:process.execPath}))",
+                ],
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "native-addon-build",
+                "cwd": package.relative_to(checkout).as_posix(),
+                "argv": [str(node), builder['absolute_path'], 'rebuild', '--release',
+                         '--nodedir=' + str(toolchain),
+                         '--python=' + str(Path(sys.executable).resolve())],
+                "timeout_seconds": 600,
+                "native_addon_prerequisite": True,
+            },
+            {
+                "id": "native-addon-load",
+                "argv": [
+                    str(node),
+                    "-e",
+                    "const a=require('node:assert/strict');const Database=require("
+                    + json.dumps(str(package))
+                    + ");"
+                    "const fs=require('node:fs'),crypto=require('node:crypto');"
+                    "const binary="
+                    + json.dumps(str(package / 'build/Release/better_sqlite3.node'))
+                    + ";"
+                    "a.equal(fs.realpathSync(binary),binary);"
+                    "const hash=()=>crypto.createHash('sha256')"
+                    ".update(fs.readFileSync(binary)).digest('hex');"
+                    "const before=hash();const db=new Database(':memory:',{nativeBinding:binary});"
+                    "db.exec('CREATE TABLE smoke(value INTEGER)');"
+                    "db.prepare('INSERT INTO smoke VALUES (?)').run(42);"
+                    "a.equal(db.prepare('SELECT value FROM smoke').get().value,42);db.close();"
+                    "a.equal(hash(),before);console.log(JSON.stringify({native_binding_sha256:before,"
+                    "smoke:'native SQLite create/insert/query passed'}))",
+                ],
+                "timeout_seconds": 30,
+            },
+        ]
+        result = self._run_check_list(checkout, checks, evidence, candidate)
+        # Even failure retains original process logs and its exact source authority.
+        result["native_addon_authority"] = authority
+        result.setdefault("results", [])
+        if result["state"] == "passed":
+            validate_native_addon(checkout, authority, Path(dependencies["store"]))
+            if native_addon_authority(self.spec, checkout, projects) != authority:
+                raise ValueError("native addon frozen source changed during preparation")
+            if (
+                _sha256(node) != tools["node_interpreter"]["sha256"]
+                or _sha256(corepack) != tools["corepack"]["sha256"]
+            ):
+                raise ValueError("native addon toolchain changed during preparation")
+            if frozen_native_builder(self.spec, authority["package_manager"]) != builder:
+                raise ValueError("native builder module closure changed during preparation")
+            runtime = json.loads(Path(result["results"][0]["log"]).read_text().strip())
+            tools["node_interpreter"].update(runtime)
+            binary = package / "build/Release/better_sqlite3.node"
+            if binary.resolve(strict=True) != binary or not binary.is_file():
+                raise ValueError("native addon binary escaped its generated target")
+            smoke = json.loads(Path(result['results'][-1]['log']).read_text().strip())
+            binary_hash = _sha256(binary)
+            if smoke.get('native_binding_sha256') != binary_hash:
+                raise ValueError('native load smoke describes a different binary')
+            tools["native_binding"] = {"absolute_path": str(binary), "sha256": binary_hash}
+            result["node_toolchain"] = tools
+        write_private(receipt, result)
+        result.update(receipt=str(receipt), receipt_sha256=_sha256(receipt))
+        return result
 
     def _native_cancelled(self) -> bool:
         with self.store._connect() as db:
@@ -759,6 +999,9 @@ class DeliveryBroker:
             interpreters.append({'project': check['cwd'],
                                  'interpreter': str(environment / 'bin/python')})
         options = {'python_environments': isolated} if isolated else {}
+        options['native_projects'] = [
+            c['cwd'] for c in planned if c['id'].startswith('planned-vitest-')
+        ]
         result = (self._run_check_list(self.checkout, dependencies, folder, candidate, **options)
                   if dependencies else {'state': 'passed', 'results': [],
                                         'candidate_id': candidate['id'],
@@ -806,6 +1049,7 @@ class DeliveryBroker:
             checks,
             self.evidence_dir / "checks" / str(iteration),
             candidate,
+            native_projects=[c['cwd'] for c in checks if c['id'].startswith('planned-vitest-')],
         )
 
     def run_browser_qa(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:

@@ -195,6 +195,10 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "imported Python probes; otherwise use the controller-prepared project "
             ".venv/bin/python. Do not substitute a system interpreter "
             "or claim unexecuted measurements. "
+            "For Node probes/tests use node_toolchain.node_interpreter.absolute_path and "
+            "corepack.absolute_path with the exact recorded environment (PATH, COREPACK_HOME "
+            "and npm_config_nodedir). A login shell may replace PATH with another Node; "
+            "set the recorded environment inside that shell before invoking commands. "
             "Do not put credentials, personal data, nested agent state or packages here. "
             "The controller seals a hashed snapshot after your turn for independent inspection.\n"
         )

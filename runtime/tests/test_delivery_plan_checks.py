@@ -264,3 +264,81 @@ def test_recipe_rejects_unsealed_or_unbounded_execution(junit_project, bad):
         metadata.write_text(metadata.read_text().replace(old, new))
     with pytest.raises(ValueError):
         planned_checks(spec, checkout, evidence)
+
+
+def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_project):
+    spec, checkout, metadata, evidence = junit_project
+    metadata.write_text(metadata.read_text() + '\n[checks.diff]\nkind="static"\n'
+                        'argv=["git","diff","--check","origin/main...HEAD"]\n'
+                        '\n[checks.docs]\nkind="static"\nargv=["corepack","pnpm","docs:build"]\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Execute tracked scripts/checks.toml checks.diff and checks.docs.']})
+    spec['policy'] = {'checks': [{'id': 'diff', 'argv': ['git', 'diff', '--check']}]}
+    before = json.dumps(spec, sort_keys=True)
+    checks = planned_checks(spec, checkout, evidence)
+    assert [c['plan_provenance']['recipe'] for c in checks] == ['checks.diff', 'checks.docs']
+    assert checks[0]['argv'] == ['git', 'diff', '--check', 'origin/main...HEAD']
+    assert all(c['kind'] == 'static' and not c.get('junit_required') for c in checks)
+    assert json.dumps(spec, sort_keys=True) == before
+
+
+@pytest.mark.parametrize('bad', ['untracked', 'symlink', 'cwd', 'timeout', 'report'])
+def test_static_recipes_reject_unowned_or_unbounded_metadata(junit_project, bad):
+    spec, checkout, metadata, evidence = junit_project
+    metadata.write_text('schema_version=1\n[checks.diff]\nkind="static"\n'
+                        'argv=["git","diff","--check","origin/main...HEAD"]\n'
+                        'timeout_seconds=30\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Execute tracked scripts/checks.toml checks.diff.']})
+    if bad == 'untracked':
+        _git(checkout, 'rm', '--cached', 'scripts/checks.toml')
+    elif bad == 'symlink':
+        metadata.unlink()
+        metadata.symlink_to(Path(__file__).resolve())
+    else:
+        old, new = {'cwd': ('timeout_seconds=30', 'cwd="../foreign"'),
+                    'timeout': ('timeout_seconds=30', 'timeout_seconds=2701'),
+                    'report': ('origin/main...HEAD', '{report_path}')}[bad]
+        metadata.write_text(metadata.read_text().replace(old, new))
+    with pytest.raises(ValueError):
+        planned_checks(spec, checkout, evidence)
+
+
+def test_metadata_defined_junit_shell_wrapper_remains_exact_with_static_recipes(junit_project):
+    spec, checkout, metadata, evidence = junit_project
+    metadata.write_text('schema_version=1\n[checks.scripts]\nkind="junit"\n'
+                        'argv=["sh","-c","node --test --test-reporter=junit > {report_path}"]\n'
+                        '[checks.diff]\nkind="static"\n'
+                        'argv=["git","diff","--check","origin/main...HEAD"]\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Execute scripts/checks.toml checks.scripts with JUnit and checks.diff.']})
+    checks = planned_checks(spec, checkout, evidence)
+    assert checks[0]['argv'][:2] == ['sh', '-c']
+    assert checks[0]['junit_required'] is True
+    assert checks[1]['argv'] == ['git', 'diff', '--check', 'origin/main...HEAD']
+
+
+def test_static_recipe_and_named_vitest_can_share_junit_verification_step(project):
+    spec, checkout, _, evidence = project
+    package = checkout / 'api'
+    (package / 'test').mkdir(parents=True)
+    (package / 'test/audit.test.ts').write_text('test("audit", () => {});')
+    (package / 'package.json').write_text(json.dumps({'devDependencies': {'vitest': '4.1.11'}}))
+    (checkout / 'package.json').write_text('{"packageManager":"pnpm@10.33.3"}')
+    (checkout / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
+    (checkout / 'scripts').mkdir()
+    (checkout / 'scripts/checks.toml').write_text(
+        'schema_version=1\n[checks.diff]\nkind="static"\n'
+        'argv=["git","diff","--check","origin/main...HEAD"]\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Run scripts/checks.toml checks.diff and API audit.test.ts with retained JUnit output.']})
+    checks = planned_checks(spec, checkout, evidence)
+    assert len(checks) == 2
+    assert checks[0]['argv'] == ['git', 'diff', '--check', 'origin/main...HEAD']
+    assert checks[1]['id'].startswith('planned-vitest-')
+    assert '--reporter=junit' in checks[1]['argv']
+    assert any(arg.endswith('/pytest-artifacts/junit.xml') for arg in checks[1]['argv'])

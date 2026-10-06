@@ -127,7 +127,8 @@ def planned_node_tests(spec: dict, checkout: Path, junit_recipes: list[dict]) ->
     return result
 
 
-def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
+def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
+                          static: bool = False) -> list[dict]:
     """Execute explicitly named, tracked recipes; prose never supplies an argv."""
     try:
         plan = json.loads(spec['accepted_plan'])
@@ -136,7 +137,8 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path) -> list[di
     if not isinstance(plan, dict) or not isinstance(plan.get('verification'), list):
         return []
     steps = [step for step in plan['verification'] if isinstance(step, str)
-             and 'scripts/checks.toml' in step and re.search(r'\bjunit\b', step, re.I)]
+             and 'scripts/checks.toml' in step
+             and (static or re.search(r'\bjunit\b', step, re.I))]
     if not steps:
         return []
     path = checkout / 'scripts/checks.toml'
@@ -155,15 +157,18 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path) -> list[di
     result = []
     for key in selected:
         recipe = recipes[key]
+        if isinstance(recipe, dict) and recipe.get('kind') != ('static' if static else 'junit'):
+            if recipe.get('kind') in {'static', 'junit'}:
+                continue
         argv = recipe.get('argv') if isinstance(recipe, dict) else None
         timeout = recipe.get('timeout_seconds', 600) if isinstance(recipe, dict) else None
         minimum = recipe.get('min_executed', 1) if isinstance(recipe, dict) else None
         relative = recipe.get('cwd', '.') if isinstance(recipe, dict) else None
-        if (not isinstance(recipe, dict) or recipe.get('kind') != 'junit'
+        if (not isinstance(recipe, dict) or recipe.get('kind') != ('static' if static else 'junit')
                 or not isinstance(argv, list) or not 1 <= len(argv) <= 64
                 or any(not isinstance(arg, str) or not arg or len(arg) > 8192
                        or '\0' in arg for arg in argv)
-                or sum(arg.count('{report_path}') for arg in argv) != 1
+                or sum(arg.count('{report_path}') for arg in argv) != (0 if static else 1)
                 or type(timeout) is not int or not 1 <= timeout <= 2700
                 or type(minimum) is not int or not 1 <= minimum <= 1000000
                 or not isinstance(relative, str) or Path(relative).is_absolute()
@@ -174,17 +179,18 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path) -> list[di
                       'metadata': {'scripts/checks.toml': hashlib.sha256(
                           path.read_bytes()).hexdigest()},
                       'recipe_sha256': digest(recipe)}
-        check_id = 'planned-junit-' + digest(provenance)[:16]
+        check_id = ('planned-static-' if static else 'planned-junit-') + digest(provenance)[:16]
         report = evidence / check_id / 'pytest-artifacts/junit.xml'
-        result.append({'id': check_id, 'kind': 'test', 'cwd': relative,
+        result.append({'id': check_id, 'kind': 'static' if static else 'test', 'cwd': relative,
                        'argv': [arg.replace('{report_path}', str(report)) for arg in argv],
                        'timeout_seconds': timeout, 'min_tests': minimum,
-                       'junit_required': True, 'plan_provenance': provenance})
+                       'junit_required': not static, 'plan_provenance': provenance})
     return result
 
 
 def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
     result = planned_junit_recipes(spec, checkout, evidence)
+    result.extend(planned_junit_recipes(spec, checkout, evidence, static=True))
     projects = planned_projects(spec, checkout)
     node_tests = planned_node_tests(spec, checkout, result)
     if not projects and not node_tests:

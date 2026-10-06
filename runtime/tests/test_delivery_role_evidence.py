@@ -275,3 +275,28 @@ def test_prompt_and_profile_name_authorized_output_without_exposing_controller(s
     task = _task(first)
     assert first['artifact_directory'] in task.goal
     assert 'full stdout/stderr, failed attempts' in task.goal
+
+
+def test_node_preparation_handoff_names_tool_paths_and_login_shell_environment(service):
+    from devflow_temporal.delivery_role_evidence import allocate, read_context
+    from devflow_temporal.role_runner import _task
+
+    _, broker, request = setup(service)
+    tools = {'node_interpreter': {'absolute_path': '/frozen/node22/bin/node',
+             'realpath': '/frozen/node22/bin/node', 'sha256': 'a' * 64,
+             'version': 'v22.21.1', 'modules_ABI': '127'},
+             'corepack': {'absolute_path': '/frozen/node22/bin/corepack', 'sha256': 'b' * 64},
+             'environment': {'PATH': '/frozen/node22/bin:/usr/bin',
+                             'COREPACK_HOME': '/frozen/cache',
+                             'npm_config_nodedir': '/frozen/node22'}}
+    enriched = allocate({**request, 'evidence_context': {
+        'implementation_preparation': {'node_toolchain': tools,
+            'native_addon_authority': {'dependency_links': {
+                'better-sqlite3@12.9.0': {'bindings': 'bindings@1.5.0'}}}}}}, '7' * 64)
+    assert read_context(enriched)['implementation_preparation']['node_toolchain'] == tools
+    assert read_context(enriched)['implementation_preparation']['native_addon_authority'] == {
+        'dependency_links': {'better-sqlite3@12.9.0': {'bindings': 'bindings@1.5.0'}}}
+    task = _task(enriched)
+    assert 'node_toolchain.node_interpreter.absolute_path' in task.goal
+    assert '/frozen/node22/bin/node' in task.goal
+    assert 'set the recorded environment inside that shell' in task.goal
