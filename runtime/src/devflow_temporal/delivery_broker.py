@@ -325,20 +325,22 @@ class DeliveryBroker:
                 relevant.append((name, _sha256(file)))
         return hashlib.sha256(canonical_json(relevant).encode()).hexdigest()
 
-    def _changed_paths(self, base_ref: str = "HEAD") -> set[str]:
+    def _changed_paths(self, base_ref: str = "HEAD", *, include_index: bool = False) -> set[str]:
         changed = set(_git(
             self.checkout, "diff", "--no-renames", "--name-only", "-z", base_ref, "--"
         ).split('\0'))
-        changed.update(_git(
-            self.checkout, 'diff', '--cached', '--no-renames', '--name-only', '-z', base_ref, '--'
-        ).split('\0'))
+        if include_index:
+            changed.update(_git(
+                self.checkout, 'diff', '--cached', '--no-renames', '--name-only', '-z',
+                base_ref, '--'
+            ).split('\0'))
         changed.update(
             _git(self.checkout, "ls-files", "--others", "--exclude-standard", "-z").split('\0')
         )
         return {item for item in changed if item}
 
     def validate_candidate_scope(self) -> set[str]:
-        changed = self._changed_paths(self.spec['base_sha'])
+        changed = self._changed_paths(self.spec['base_sha'], include_index=True)
         escaped = changed - set(self.spec['policy'].get('allowed_paths', []))
         if escaped:
             raise ValueError(
@@ -1286,9 +1288,9 @@ class DeliveryBroker:
             if found is None or found["headRefOid"] != done["head"]:
                 return {"state": "pending", "reason": "pr_head_readback", "head": done["head"]}
             return done
-        if before["id"] != input_candidate["id"] and self._changed_paths():
+        if before["id"] != input_candidate["id"] and self._changed_paths(include_index=True):
             raise RuntimeError("candidate changed during publication recovery")
-        changed = self._changed_paths()
+        changed = self._changed_paths(include_index=True)
         allowed = set(self.spec["policy"].get("allowed_paths", []))
         if changed - allowed:
             raise ValueError(
