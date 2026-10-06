@@ -55,7 +55,7 @@ def usage(multiplier=1):
 
 def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
             collaboration=False, foreign=False, interrupted=False, max_attempts=3,
-            resume=False, missing_usage=False, assessment=None,
+            resume=False, missing_usage=False, assessment=None, hold_backoff=False,
             failure_message="Controlled provider failure"):
     folder = tmp_path / "attempt"
     folder.mkdir()
@@ -68,7 +68,20 @@ def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
         "resume_session": "owned-thread" if resume else None,
     })
     calls, clients = [], []
-    control = {"completed": asyncio.Event(), "closed": [], "exited": []}
+    control = {"completed": asyncio.Event(), "closed": [], "exited": [], "backoffs": []}
+    real_sleep = asyncio.sleep
+
+    async def controlled_backoff(seconds):
+        assert seconds in (1, 2) and type(seconds) is int
+        control["backoffs"].append(seconds)
+        if hold_backoff:
+            await asyncio.Event().wait()
+        else:
+            await real_sleep(0)
+
+    # Intercept only this module's backoff, preserving the kit/event loop clocks.
+    monkeypatch.setattr(delivery_native_threads, "asyncio",
+                        SimpleNamespace(sleep=controlled_backoff))
 
     class Handle:
         def __init__(self, sequence, error):
@@ -119,8 +132,15 @@ def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
     class Thread:
         id = "owned-thread"
 
+        def __init__(self):
+            self.attempts = 0
+            self.backoff_start = len(control["backoffs"])
+
         @wraps(AsyncThread.turn)
         async def turn(self, *args, **kwargs):
+            assert control["backoffs"][self.backoff_start:] == [
+                2 ** attempt for attempt in range(self.attempts)]
+            self.attempts += 1
             error = errors[len(calls)] if len(calls) < len(errors) else None
             calls.append({"thread": self.id, "args": args, "kwargs": kwargs})
             if isinstance(error, BaseException):
@@ -136,12 +156,17 @@ def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
             self.threads = [Thread.id] if resume else []
             self.resumed = []
             clients.append(self)
+            self.call_start = len(calls)
+            self.backoff_start = len(control["backoffs"])
 
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, *_args):
             control["exited"].append(self)
+            if not hold_backoff:
+                assert control["backoffs"][self.backoff_start:] == [
+                    2 ** attempt for attempt in range(len(calls) - self.call_start - 1)]
 
         @wraps(AsyncCodex.thread_start)
         async def thread_start(self, **_kwargs):
@@ -346,19 +371,20 @@ async def test_interrupted_completion_is_not_retried(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_backoff_obeys_original_deadline(tmp_path, monkeypatch):
     runtime, task, observation, calls, clients, control = harness(
-        tmp_path, monkeypatch, ["rateLimitExceeded"])
+        tmp_path, monkeypatch, ["rateLimitExceeded"], hold_backoff=True)
     deadline = datetime.now(UTC) + timedelta(seconds=.15)
     with pytest.raises(AgentTaskTimeoutError):
         await runtime.run(replace(task, deadline=deadline))
     assert len(calls) == 1 and len(clients) == 1
     assert len(read_private(observation.path)["turns"]) == 1
     assert control["closed"] == ["turn-1"] and len(control["exited"]) == 1
+    assert control["backoffs"] == [1]
 
 
 @pytest.mark.asyncio
 async def test_application_cancellation_during_backoff_never_retries(tmp_path, monkeypatch):
     runtime, task, observation, calls, clients, control = harness(
-        tmp_path, monkeypatch, ["rateLimitExceeded"])
+        tmp_path, monkeypatch, ["rateLimitExceeded"], hold_backoff=True)
     running = asyncio.create_task(runtime.run(task))
     await asyncio.wait_for(control["completed"].wait(), timeout=1)
     await runtime.cancel(task.task_id)
@@ -367,6 +393,7 @@ async def test_application_cancellation_during_backoff_never_retries(tmp_path, m
     assert len(calls) == 1 and len(clients) == 1
     assert len(read_private(observation.path)["turns"]) == 1
     assert control["closed"] == ["turn-1"] and len(control["exited"]) == 1
+    assert control["backoffs"] == [1]
 
 
 @pytest.mark.parametrize("limit", [0, 4, True, "3", None])
@@ -420,13 +447,15 @@ async def test_large_completed_item_stays_private_with_bounded_reference(tmp_pat
 
 def test_reference_bounds_arbitrary_provider_fields_and_turn_count(tmp_path, monkeypatch):
     _runtime, _task, observation, *_ = harness(tmp_path, monkeypatch, [])
-    oversized = "\u0000" * 16384
+    oversized = "\u0000" * 1024
     record = {"thread_id": oversized, "turn_id": oversized,
               "turn": {"status": "failed", "error": {
                   "message": oversized, "codexErrorInfo": {"httpConnectionFailed": {
                       "httpStatusCode": 503, "message": oversized}}}},
               "start_error": {"type": oversized, "message": oversized, "data": oversized},
-              "items": [{"output": oversized}]}
+              "items": [{"output": oversized}],
+              **{key: oversized for key in ("id", "type", "tool", "status", "senderThreadId")},
+              "receiverThreadIds": [oversized] * 100}
     observation.data.update({"turns": [record] * 100, "parent_thread_id": oversized,
                              "resumed_from": oversized, "collaboration_items": [record] * 100,
                              "thread_inventory_before": [oversized] * 200,
@@ -467,3 +496,88 @@ async def test_failed_role_exposes_bounded_typed_provider_reason(
     assert "Controlled provider failure" in " ".join(result["findings"])
     assert len(" ".join(result["findings"])) < 2048
     assert len(json.dumps(result["native_thread_observation"]).encode()) < 64 * 1024
+
+
+@pytest.mark.asyncio
+async def test_bounded_reference_keeps_actual_managed_resume_smoke_compatible(
+    tmp_path, monkeypatch,
+):
+    import importlib.util
+    import uuid
+    from pathlib import Path
+
+    from devflow_temporal import delivery_broker, delivery_config, delivery_store, supervisor
+
+    marker = 'remembered-marker'
+    runtime, task, observation, *_ = harness(
+        tmp_path, monkeypatch, [], resume=True,
+        assessment={'status': 'pass', 'summary': marker, 'findings': []})
+    path = Path(__file__).resolve().parents[1] / 'scripts/smoke_preparation.py'
+    module = importlib.util.spec_from_file_location('bounded_resume_smoke', path)
+    smoke = importlib.util.module_from_spec(module)
+    module.loader.exec_module(smoke)
+    candidate = {'head': 'controlled-source', 'id': 'controlled-candidate'}
+    spec = {'checkout': str(tmp_path), 'policy': {}}
+    monkeypatch.setattr(delivery_config.DeliveryConfig, 'load', lambda _path: None)
+    monkeypatch.setattr(delivery_store, 'DeliveryStore',
+                        lambda _config: SimpleNamespace(spec=lambda _run: spec))
+    monkeypatch.setattr(delivery_broker, 'DeliveryBroker',
+                        lambda *_args: SimpleNamespace(candidate=lambda: candidate))
+    monkeypatch.setattr(uuid, 'uuid4', lambda: SimpleNamespace(hex=marker))
+    results = {}
+
+    class ManagedSupervisor:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def run(self, request):
+            key = request['iteration']
+            if key not in results:
+                result = await runtime.run(task)
+                assert result.is_success and result.session_id == 'owned-thread'
+                results[key] = {
+                    'status': 'pass', 'cleanup': 'confirmed', 'session_id': result.session_id,
+                    'summary': result.parsed_output['summary'],
+                    'native_thread_observation': observation.reference(),
+                    'requested_model': 'gpt-6.1-sol', 'requested_effort': 'max',
+                    'usage': {'total_tokens': result.usage.total_tokens},
+                }
+            return results[key]
+
+    monkeypatch.setattr(supervisor, 'DeliverySupervisor', ManagedSupervisor)
+    summary = await smoke.managed_resume_qa(tmp_path / 'unused.json', tmp_path)
+    assert summary['same_session_id'] == 'owned-thread'
+    assert summary['builtin_collaboration_items'] == 0
+    assert summary['new_child_provider_threads'] == []
+    assert summary['prior_context_recalled'] and summary['duplicate_request_reused_receipt']
+
+
+@pytest.mark.asyncio
+async def test_collaboration_reference_is_bounded_without_restoring_transcripts(
+    tmp_path, monkeypatch,
+):
+    runtime, task, observation, *_ = harness(
+        tmp_path, monkeypatch, ['rateLimitExceeded'], collaboration=True)
+    result = await runtime.run(task)
+    assert not result.is_success
+    reference = observation.reference()
+    assert reference['state'] == 'blocked'
+    assert reference['new_child_thread_ids'] == ['child']
+    assert reference['collaboration_items'][0]['receiverThreadIds'] == ['child']
+    assert reference['collaboration_items'][0]['senderThreadId'] == 'owned-thread'
+    oversized = '\u0000' * 1024
+    item = {key: oversized for key in ['id', 'type', 'tool', 'status', 'senderThreadId',
+                                     'prompt', 'output', 'message', 'agentsStates']}
+    item['receiverThreadIds'] = [oversized] * 100
+    observation.data['collaboration_items'] = [item] * 100
+    observation.data['new_child_thread_ids'] = [oversized] * 200
+    write_private(observation.path, observation.data)
+    bounded = observation.reference()
+    assert len(json.dumps(bounded).encode()) < 64 * 1024
+    assert len(bounded['collaboration_items']) <= 8
+    assert len(bounded['new_child_thread_ids']) <= 16
+    assert bounded['collaboration_items_count'] == 100
+    assert bounded['new_child_thread_ids_count'] == 200
+    assert all('output' not in entry and 'prompt' not in entry
+               for entry in bounded['collaboration_items'])
+    assert read_private(observation.path)['collaboration_items'][0]['output'] == oversized

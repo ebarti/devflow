@@ -244,6 +244,15 @@ class NativeThreadObservation:
             **{key + "_count": len(self.data[key]) if self.data[key] is not None else None
                for key in ("collaboration_items", "thread_inventory_before",
                            "thread_inventory_after", "new_child_thread_ids")},
+            "collaboration_items": [
+                {**{key: _bounded_text(item.get(key), 64) for key in (
+                    "id", "type", "tool", "status", "senderThreadId")},
+                 "receiverThreadIds": [_bounded_text(child, 64)
+                                       for child in (item.get("receiverThreadIds") or [])[:4]]}
+                for item in self.data["collaboration_items"][:4]],
+            "new_child_thread_ids": [
+                _bounded_text(child, 64) for child in self.data["new_child_thread_ids"][:8]]
+                if self.data["new_child_thread_ids"] is not None else None,
             "turn_count": len(turns),
             "turns": [{"thread_id": _bounded_text(record.get("thread_id")),
                        "turn_id": _bounded_text(record.get("turn_id")),
