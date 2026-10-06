@@ -1311,7 +1311,13 @@ class DeliveryBroker:
                     ": filter: unset"
                 ):
                     raise ValueError("candidate path would invoke a Git clean filter")
-            _git(self.checkout, "add", "--", *sorted(changed))
+            indexed = set(_git(self.checkout, 'ls-files', '-z').split('\0'))
+            stageable = sorted(path for path in changed
+                               if path in indexed or os.path.lexists(self.checkout / path))
+            # Already-staged removals are absent from both index and worktree;
+            # preserve them without passing an unmatched pathspec to git add.
+            if stageable:
+                _git(self.checkout, '--literal-pathspecs', 'add', '--all', '--', *stageable)
             if _git(self.checkout, "diff", "--cached", "--name-only"):
                 _git(
                     self.checkout,
