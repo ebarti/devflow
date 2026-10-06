@@ -47,6 +47,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         )
 
     monkeypatch.setattr("devflow_temporal.delivery_mcp.client", client)
+    monkeypatch.setattr("devflow_temporal.delivery_mcp.read_only_client", client)
     async with create_connected_server_and_client_session(build_server(config)) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
         assert set(tools) == {

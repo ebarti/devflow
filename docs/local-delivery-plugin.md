@@ -106,7 +106,7 @@ For an existing issue in an allowlisted repository, a realistic prompt is:
 
 > Use Devflow local delivery for https://github.com/example/project/issues/123. Fix the issue within its scope and publish an unmerged PR. Do not merge, release or deploy.
 
-The skill first reads `get_service`, matches the repository key and base ref, and generates stable unique routine IDs and a branch when absent. The issue URL and authorization through an unmerged PR must come from the user. It submits the original goal to `submit_run`, returns the run ID and dashboard URL, and ends the handoff without routine model polling. Calls start a stopped configured service using the existing bounded startup path. Service policy determines role models.
+The skill first reads `get_service`, matches the repository key and base ref, and generates stable unique routine IDs and a branch when absent. The issue URL and authorization through an unmerged PR must come from the user. It submits the original goal to `submit_run`, returns the run ID and dashboard URL, and ends the handoff without routine model polling. Read calls require an already running API and report unavailable if it is stopped. They never start the service or activate pending work. Explicit startup and write calls use the existing bounded startup path. Service policy determines role models.
 
 Automatic planning is the default. “Show me the plan for approval before implementing” sets `plan_approval: "required"`; only the user's explicit acceptance of the presented plan can release that gate. Blocking clarification still waits for the user under either policy. Broader endpoint or scope authority is never inferred from a service policy or a callback.
 

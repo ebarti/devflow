@@ -157,11 +157,16 @@ class DeliveryClient:
         )
 
 
+def read_only_client(config_path: Path) -> DeliveryClient:
+    """Connect to an existing service without starting it or creating local state."""
+    return DeliveryClient(DeliveryConfig.load(config_path))
+
+
 def client(config_path: Path) -> DeliveryClient:
     # The lifecycle controller also uses DeliveryClient for loopback readiness.
     from .delivery_control import ensure_service_running
 
-    caller = DeliveryClient(DeliveryConfig.load(config_path))
+    caller = read_only_client(config_path)
     ensure_service_running(caller.config)
     caller.login()
     return caller

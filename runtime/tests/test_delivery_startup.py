@@ -351,19 +351,21 @@ def test_startup_timeout_cleans_launched_processes(config, monkeypatch):
     assert not control._manifest(config).exists()
 
 
-def test_cli_boot_failure_is_concise_and_status_does_not_start(config, monkeypatch, capsys):
+def test_cli_read_failure_is_concise_and_status_does_not_start(config, monkeypatch, capsys):
     monkeypatch.setattr(
-        control, "api_client", lambda _config: (_ for _ in ()).throw(ValueError("boot failed"))
+        control, "read_only_client",
+        lambda _config: (_ for _ in ()).throw(ServiceUnavailable("service unavailable"))
     )
     monkeypatch.setattr(control, "_config", lambda _path: config)
     monkeypatch.setattr(sys, "argv", ["devflow-delivery", "--config", str(config.path), "runs"])
     with pytest.raises(SystemExit) as result:
         control.main()
     assert result.value.code == 1
-    assert capsys.readouterr().err == "devflow-delivery: boot failed\n"
+    assert capsys.readouterr().err == "devflow-delivery: service unavailable\n"
     monkeypatch.setattr(sys, "argv", ["devflow-delivery", "--config", str(config.path), "status"])
     control.main()
     assert json.loads(capsys.readouterr().out)["processes"] == {}
+    assert not config.state_root.exists()
 
 
 def test_cross_process_lock_times_out_without_starting(config, monkeypatch):

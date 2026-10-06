@@ -9,7 +9,7 @@ from pathlib import Path
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
-from .delivery_client import client
+from .delivery_client import client, read_only_client
 from .delivery_origin import bind_origin, metadata_origin
 
 
@@ -20,6 +20,7 @@ def build_server(config_path: Path) -> FastMCP:
             "Discover configured repository keys and base refs with get_service before submission. "
             "The local service owns roles, planning and authorized GitHub delivery through an "
             "unmerged PR. Use status/evidence on request; dashboard SSE supplies progress. "
+            "Read tools require an already running service and never start it. "
             "Keep mutation IDs stable after uncertain responses; inspect the run before retrying."
         ),
     )
@@ -32,8 +33,8 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool(annotations=read)
     def get_service() -> dict:
-        """Read local service health and public repository/role policy; starts it if stopped."""
-        return client(config_path).service()
+        """Read local health and public policy; report unavailable if stopped."""
+        return read_only_client(config_path).service()
 
     @server.tool(annotations=write)
     def submit_run(request_json: str, ctx: Context) -> dict:
@@ -48,17 +49,17 @@ def build_server(config_path: Path) -> FastMCP:
     @server.tool(annotations=read)
     def list_runs() -> dict:
         """List compact, factual status for recent local delivery runs."""
-        return client(config_path).runs()
+        return read_only_client(config_path).runs()
 
     @server.tool(annotations=read)
     def get_run(run_id: str) -> dict:
         """Read a run's current state, evidence index, and durable event timeline."""
-        return client(config_path).status(run_id)
+        return read_only_client(config_path).status(run_id)
 
     @server.tool(annotations=read)
     def read_evidence(run_id: str, evidence_id: str) -> dict:
         """Read one indexed, contained evidence artifact for a run."""
-        return client(config_path).evidence(run_id, evidence_id)
+        return read_only_client(config_path).evidence(run_id, evidence_id)
 
     @server.tool(annotations=write)
     def answer_decision(run_id: str, request_json: str) -> dict:
@@ -75,7 +76,7 @@ def build_server(config_path: Path) -> FastMCP:
     @server.tool(annotations=read)
     def recovery_preflight(run_id: str) -> dict:
         """Inspect a stopped unpublished candidate and seal its policy recovery preconditions."""
-        return client(config_path).recovery_preflight(run_id)
+        return read_only_client(config_path).recovery_preflight(run_id)
 
     @server.tool(annotations=write)
     def recover_execution(run_id: str, request_json: str) -> dict:
@@ -95,7 +96,7 @@ def build_server(config_path: Path) -> FastMCP:
     @server.tool(annotations=read)
     def gates_only_preflight(run_id: str) -> dict:
         """Inspect authentic stopped investigation custody without admitting a role or effect."""
-        return client(config_path).gates_only_preflight(run_id)
+        return read_only_client(config_path).gates_only_preflight(run_id)
 
     @server.tool(annotations=write)
     def admit_gates_only(run_id: str, request_json: str) -> dict:
@@ -105,12 +106,13 @@ def build_server(config_path: Path) -> FastMCP:
     @server.tool(annotations=read)
     def metadata_preflight(run_id: str, request_json: str) -> dict:
         """Observe stopped owned publication authority before metadata reconciliation."""
-        return client(config_path).metadata_preflight(run_id, json.loads(request_json))
+        return read_only_client(config_path).metadata_preflight(run_id, json.loads(request_json))
 
     @server.tool(annotations=read)
     def repair_admission_preflight(run_id: str, request_json: str) -> dict:
         """Read the exact failed gate, effective lineage and bounded repair authority."""
-        return client(config_path).repair_admission_preflight(run_id, json.loads(request_json))
+        return read_only_client(config_path).repair_admission_preflight(
+            run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
     def continue_repair(run_id: str, request_json: str) -> dict:

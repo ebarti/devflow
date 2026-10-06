@@ -28,7 +28,7 @@ from temporalio.worker import Worker
 
 from .delivery_activities import DELIVERY_ACTIVITIES
 from .delivery_api import create_app
-from .delivery_client import DeliveryClient, ServiceUnavailable
+from .delivery_client import DeliveryClient, ServiceUnavailable, read_only_client
 from .delivery_client import client as api_client
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
@@ -458,7 +458,14 @@ def main() -> None:
 
 
 def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    config = _config(args.config)
+    read_commands = {
+        "runs", "run", "evidence", "recovery-preflight", "gates-only-preflight",
+        "metadata-preflight", "repair-admission-preflight",
+    }
+    if args.command in read_commands | {"status", "token"}:
+        config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
+    else:
+        config = _config(args.config)
     if args.command == "worker":
         asyncio.run(worker(config))
         return
@@ -536,7 +543,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 from .delivery_origin import bind_origin
 
                 request = bind_origin(request, os.environ.get("CODEX_THREAD_ID"))
-            caller = api_client(config.path)
+            factory = read_only_client if args.command in read_commands else api_client
+            caller = factory(config.path)
             result = {
                 "submit": lambda: caller.submit(request),
                 "runs": caller.runs,
