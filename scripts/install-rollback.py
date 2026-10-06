@@ -178,16 +178,6 @@ def target_paths(source, skills, codex):
 def capture(source, skills, codex):
     directory = Path(tempfile.mkdtemp(prefix="devflow-install-rollback-"))
     directory.chmod(0o700)
-    entries = {}
-    for path in target_paths(source, skills, codex):
-        saved = {}
-        before = identity(path, saved=saved)
-        saved.update(type=before["type"], before=before)
-        if before["type"] == "link":
-            saved["target"] = before["target"]
-        entries[str(path)] = saved
-    (directory / "snapshot.json").write_text(json.dumps(entries, sort_keys=True))
-    (directory / "snapshot.json").chmod(0o600)
     # Pre-marker failures can occur when an older updater has already switched
     # the checkout. That updater may `exec` the new installer and never run
     # again, so retain its previous detached checkout for failure recovery.
@@ -217,6 +207,23 @@ def capture(source, skills, codex):
         except subprocess.CalledProcessError:
             pass
     (directory / "prior-checkout.json").write_text(json.dumps(previous))
+    snapshot = directory / "snapshot.json"
+    save_snapshot(snapshot, {})
+    try:
+        entries = {}
+        for path in target_paths(source, skills, codex):
+            saved = {}
+            before = identity(path, saved=saved)
+            saved.update(type=before["type"], before=before)
+            if before["type"] == "link":
+                saved["target"] = before["target"]
+            entries[str(path)] = saved
+        save_snapshot(snapshot, entries)
+    except (OSError, ValueError):
+        # Capture has no destination effects. The exec-based historical updater
+        # cannot recover its checkout after this process refuses the read.
+        restore(directory, checkout_only=True)
+        raise
     print(directory)
 
 
