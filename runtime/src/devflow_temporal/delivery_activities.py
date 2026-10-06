@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 import subprocess
 import sys
-from contextlib import nullcontext
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +22,87 @@ from .candidate import candidate_for
 from .contracts import digest
 from .delivery_broker import CheckPreparationFailure, DeliveryBroker
 from .delivery_config import DeliveryConfig
-from .delivery_preparation import _lock
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
+
+_CHECK_HEARTBEAT_INTERVAL = 5
+_UNCLEAN_CHECK_SLOTS: list[int] = []
+
+
+async def _execute_check(request: dict[str, Any], execute) -> dict[str, Any]:
+    """Bound native gates across workers and join their monitor on cancellation."""
+    cancelled = threading.Event()
+    admitted = threading.Event()
+
+    def run():
+        from .delivery_resources import private_directory
+
+        store, broker = _context(request["spec"])
+        broker.check_cancelled = cancelled.is_set
+        if request["spec"]["provider"] != "codex":
+            admitted.set()
+            return execute(broker)
+        root = store.config.state_root / "check-execution"
+        private_directory(root)
+        slots = store.config.raw.get("check_concurrency", 2)
+        descriptor = None
+        try:
+            while not cancelled.is_set() and not broker._native_cancelled():
+                for slot in range(slots):
+                    handle = os.open(root / f"slot-{slot}.lock",
+                                     os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                    info = os.fstat(handle)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                        os.close(handle)
+                        raise ValueError("check slot is not private and owned")
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        os.close(handle)
+                        continue
+                    descriptor = handle
+                    break
+                if descriptor is not None:
+                    if cancelled.is_set() or broker._native_cancelled():
+                        raise asyncio.CancelledError
+                    admitted.set()
+                    return execute(broker)
+                cancelled.wait(0.1)
+            raise asyncio.CancelledError
+        finally:
+            if descriptor is not None:
+                if broker.native_cleanup_confirmed:
+                    os.close(descriptor)
+                else:
+                    # An unknown teardown cannot supply capacity to another gate.
+                    _UNCLEAN_CHECK_SLOTS.append(descriptor)
+
+    pending = asyncio.create_task(asyncio.to_thread(run))
+    try:
+        while not pending.done():
+            if activity.in_activity():
+                activity.heartbeat({
+                    "run_id": request["spec"]["run_id"],
+                    "stage": "executing-check" if admitted.is_set() else "waiting-check-slot",
+                })
+            await asyncio.wait({pending}, timeout=_CHECK_HEARTBEAT_INTERVAL)
+        return await asyncio.shield(pending)
+    except BaseException:
+        cancelled.set()
+        # Cancelling to_thread only cancels its waiter. Keep that task shielded
+        # and let NativeProcess finish strict identity-bound teardown first.
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not pending.cancelled():
+            pending.exception()
+        raise
 
 
 def _context(
@@ -394,12 +474,9 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_checks")
 async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
-    def execute() -> dict[str, Any]:
-        store, broker = _context(request["spec"])
+    def execute(broker: DeliveryBroker) -> dict[str, Any]:
         try:
-            with (_lock(store.config.state_root / "check-execution")
-                  if request["spec"]["provider"] == "codex" else nullcontext()):
-                return broker.run_checks(request["iteration"], request["candidate"])
+            return broker.run_checks(request["iteration"], request["candidate"])
         except CheckPreparationFailure as exc:
             return {'state': 'failed', 'cleanup': 'confirmed',
                     'candidate_id': request['candidate']['id'],
@@ -415,17 +492,14 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
                 "reason": type(exc).__name__,
             }
 
-    return await asyncio.to_thread(execute)
+    return await _execute_check(request, execute)
 
 
 @activity.defn(name="delivery_browser_qa")
 async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
-    def execute() -> dict[str, Any]:
-        store, broker = _context(request["spec"])
+    def execute(broker: DeliveryBroker) -> dict[str, Any]:
         try:
-            with (_lock(store.config.state_root / "check-execution")
-                  if request["spec"]["provider"] == "codex" else nullcontext()):
-                return broker.run_browser_qa(request["iteration"], request["candidate"])
+            return broker.run_browser_qa(request["iteration"], request["candidate"])
         except Exception as exc:
             if request["spec"]["provider"] != "codex":
                 raise
@@ -439,17 +513,14 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
     # Browser/API fixtures may run for minutes. Keep the Temporal worker loop
     # available for cancellation updates and unrelated workflows while this
     # bounded child is supervised on its own thread.
-    return await asyncio.to_thread(execute)
+    return await _execute_check(request, execute)
 
 
 @activity.defn(name="delivery_precheck")
 async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
-    def execute() -> dict[str, Any]:
-        store, broker = _context(request["spec"])
+    def execute(broker: DeliveryBroker) -> dict[str, Any]:
         try:
-            with (_lock(store.config.state_root / "check-execution")
-                  if request["spec"]["provider"] == "codex" else nullcontext()):
-                return broker.run_prechecks(request["iteration"], request["candidate"])
+            return broker.run_prechecks(request["iteration"], request["candidate"])
         except CheckPreparationFailure as exc:
             return {'state': 'failed', 'cleanup': 'confirmed',
                     'candidate_id': request['candidate']['id'],
@@ -465,24 +536,21 @@ async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
                 "reason": type(exc).__name__,
             }
 
-    return await asyncio.to_thread(execute)
+    return await _execute_check(request, execute)
 
 
 @activity.defn(name="delivery_baseline_checks")
 async def delivery_baseline_checks(request: dict[str, Any]) -> dict[str, Any]:
-    def execute() -> dict[str, Any]:
+    def execute(broker: DeliveryBroker) -> dict[str, Any]:
         from .delivery_baseline import run_baseline_checks
 
-        store, broker = _context(request["spec"])
-        with (_lock(store.config.state_root / "check-execution")
-              if request["spec"]["provider"] == "codex" else nullcontext()):
-            try:
-                return run_baseline_checks(broker)
-            except CheckPreparationFailure as exc:
-                return {"state": "failed", "results": exc.results, "diagnostic": str(exc),
-                        "base_sha": request["spec"]["base_sha"]}
+        try:
+            return run_baseline_checks(broker)
+        except CheckPreparationFailure as exc:
+            return {"state": "failed", "results": exc.results, "diagnostic": str(exc),
+                    "base_sha": request["spec"]["base_sha"]}
 
-    return await asyncio.to_thread(execute)
+    return await _execute_check(request, execute)
 
 
 @activity.defn(name="delivery_ci")

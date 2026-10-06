@@ -193,6 +193,14 @@ class DeliveryWorkflow:
         if name in {"delivery_terminal_tracker", "delivery_terminal_preflight"}:
             timeout = timedelta(seconds=min(request.get("timeout_seconds", 180), 180))
             options["schedule_to_close_timeout"] = timeout
+        if name in {
+            "delivery_checks", "delivery_browser_qa", "delivery_precheck",
+            "delivery_baseline_checks",
+        } and workflow.patched("delivery-check-slots-v1"):
+            options["heartbeat_timeout"] = timedelta(seconds=30)
+            options["cancellation_type"] = (
+                workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+            )
         return await workflow.execute_activity(
             name,
             request,

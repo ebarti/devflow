@@ -113,6 +113,8 @@ class DeliveryBroker:
 
         self.evidence_dir = _gate_evidence_root(spec)
         self.effect_namespace = ""
+        self.check_cancelled = lambda: False
+        self.native_cleanup_confirmed = True
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -522,7 +524,7 @@ class DeliveryBroker:
                 command = [
                     native_dependencies["store"] if item == "/store" else item for item in argv
                 ]
-                native_result = NativeProcess(
+                native_result = self._run_native_check(NativeProcess(
                     self.spec,
                     evidence_dir / check["id"] / "native",
                     argv=native_check_argv(self.spec, profile, cwd, command),
@@ -530,7 +532,7 @@ class DeliveryBroker:
                     environment=environment,
                     timeout=int(check.get("timeout_seconds", 600)),
                     cancelled=self._native_cancelled,
-                ).run()
+                ))
                 self._record_generated(generated)
                 if native_result["cleanup"] == "unknown":
                     return {
@@ -860,11 +862,21 @@ class DeliveryBroker:
         return result
 
     def _native_cancelled(self) -> bool:
+        if self.check_cancelled():
+            return True
         with self.store._connect() as db:
             row = db.execute(
                 "SELECT phase FROM delivery_runs WHERE run_id=?", (self.spec["run_id"],)
             ).fetchone()
         return row is not None and row["phase"] == "cancelling"
+
+    def _run_native_check(self, process) -> dict:
+        if self._native_cancelled():
+            raise RuntimeError("native check cancelled before launch")
+        self.native_cleanup_confirmed = False
+        result = process.run()
+        self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
+        return result
 
     def _register_generated(self, checkout: Path, names: list[str]) -> list[Path]:
         from .delivery_resources import RunResources
@@ -934,14 +946,14 @@ class DeliveryBroker:
         environment.update({
             "COREPACK_ENABLE_NETWORK": "0", "npm_config_registry": "https://" + REGISTRY + "/",
         })
-        process = NativeProcess(
+        process = self._run_native_check(NativeProcess(
             self.spec, folder / "process",
             argv=native_check_argv(self.spec, profile, staging, [
                 "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
                 "--ignore-pnpmfile", "--store-dir", str(dependencies),
             ]),
             cwd=staging, environment=environment, timeout=1800, cancelled=self._native_cancelled,
-        ).run()
+        ))
         unchanged = hashes == write_frozen_inputs(staging, inputs)
         passed = (
             process["exit_code"] == 0
