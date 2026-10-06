@@ -99,7 +99,9 @@ registration conflict.
 
 Snapshot file bytes, mode and identity come from one opened-file observation;
 a write during that read refuses capture before installation effects.
-On preflight refusal, destinations are left untouched. After an installer effect,
+On preflight or zero-effect capture refusal, destinations are left untouched
+and the authenticated previous checkout is restored, including updates begun
+by the historical exec-based updater. After an installer effect,
 rollback restores only matching recorded object identities; later changed or
 foreign objects remain, with an actionable path and retained private backup.
 Owned destination pointers use native atomic exchange on Linux/macOS before

@@ -491,6 +491,62 @@ class UpgradeInstallation(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertFalse((self.skills / ".devflow-helpers").exists())
 
+    def test_public_old_updater_restores_source_on_zero_effect_capture_refusal(self):
+        # The published old updater execs the candidate installer; it cannot
+        # perform checkout recovery itself. This tag exists only in our fixture.
+        origin = self.root / "origin"
+        self.git("clone", "--shared", str(ROOT), str(origin), cwd=self.root)
+        self.git("-C", str(origin), "tag", "fixture-capture-refusal")
+        self.git("remote", "set-url", "origin", str(origin))
+        self.git("checkout", "--detach", V022)
+        installed = self.command(self.source / "scripts/install.sh", self.skills, self.home)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        old = self.git("rev-parse", "HEAD")
+        before = self.snapshot()
+        marker = self.root / "observer-ran"
+        observer = self.root / "observer-python"
+        body = """import json, os, pathlib, runpy, sys
+original = sys.argv[1:]
+arguments = original[1:] if original and original[0] == "-B" else original
+if len(arguments) > 1 and pathlib.Path(arguments[0]).name == "install-rollback.py" and arguments[1] == "capture":
+    target = pathlib.Path(arguments[4]) / "hooks.json"
+    inode, fdopen, injected = target.lstat().st_ino, os.fdopen, []
+    class Reader:
+        def __init__(self, stream): self.stream = stream
+        def __enter__(self): return self
+        def __exit__(self, *args): return self.stream.__exit__(*args)
+        def fileno(self): return self.stream.fileno()
+        def read(self):
+            raw = self.stream.read()
+            if not injected and os.fstat(self.fileno()).st_ino == inode:
+                hooks = json.loads(raw)
+                hooks["foreign_capture_note"] = "ordinary update during public old-updater capture"
+                target.write_text(json.dumps(hooks))
+                injected.append(True)
+                pathlib.Path(MARKER).write_text("observed")
+            return raw
+    os.fdopen = lambda descriptor, *a, **kw: Reader(fdopen(descriptor, *a, **kw))
+    sys.argv = arguments
+    runpy.run_path(arguments[0], run_name="__main__")
+else:
+    os.execv(sys.executable, [sys.executable, *original])
+"""
+        observer.write_text("#!" + sys.executable + "\n" + body.replace("MARKER", repr(str(marker))))
+        observer.chmod(0o700)
+        self.env["DEVFLOW_PYTHON"] = str(observer)
+        refused = self.command(self.source / "scripts/update.sh", "fixture-capture-refusal", self.skills, self.home)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertTrue(marker.is_file(), "ordinary capture writer was not exercised")
+        self.assertIn("installer file changed while reading", refused.stderr)
+        self.assertIn(str(self.hooks), refused.stderr)
+        self.assertIn("foreign_capture_note", json.loads(self.hooks.read_text()))
+        after = self.snapshot()
+        key = str(self.hooks.relative_to(self.root))
+        before.pop(key)
+        after.pop(key)
+        self.assertEqual(after, before, "zero-effect capture refusal changed installation destinations")
+        self.assertEqual(self.git("rev-parse", "HEAD"), old, "historical updater left the refused source active")
+
     def test_public_old_updater_to_candidate_then_normal_update_and_failed_upgrade(self):
         # The updater requires a tag fetched from origin. These two refs exist
         # only in this test's private repository, never in the source or GitHub.
