@@ -462,6 +462,9 @@ class DeliveryWorkflow:
                 })
 
     async def _bounded_published_result(self, spec, request, initial):
+        if initial is not None and initial.get("state") != "pending":
+            self.state["cleanup"] = "none"
+            return initial
         deadline = workflow.now() + timedelta(seconds=spec["publication_readback_seconds"])
         delay = 5
         result = initial
