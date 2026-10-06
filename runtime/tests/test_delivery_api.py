@@ -848,8 +848,9 @@ async def test_public_supersede_requires_new_branch_and_preserves_prior_checkout
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("project_delay", [0, 6])
 async def test_public_decision_and_cancel_use_temporal_revision_after_worker_restart(
-    api_fixture, tmp_path
+    api_fixture, tmp_path, project_delay
 ):
     path, request = api_fixture
     config = json.loads(path.read_text())
@@ -866,7 +867,18 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
     async def role_stub(payload):
         return {"status": "blocked", "candidate": payload["candidate"]}
 
-    activities = [delivery_project, delivery_prepare, tracker_start_stub, role_stub]
+    delayed_runs = set()
+
+    @activity.defn(name="delivery_project")
+    async def project_fixture(payload):
+        # Exercise scheduling beyond the former five-second readiness budget.
+        run_id = payload["spec"]["run_id"]
+        if run_id not in delayed_runs:
+            delayed_runs.add(run_id)
+            await asyncio.sleep(project_delay)
+        return await delivery_project(payload)
+
+    activities = [project_fixture, delivery_prepare, tracker_start_stub, role_stub]
     async with await WorkflowEnvironment.start_local(
         dev_server_database_filename=str(tmp_path / "public-decision.sqlite3")
     ) as environment:
@@ -909,11 +921,12 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
                         task_queue=queue,
                     )
                     store.mark_start(submitted["run_id"], accepted=True)
-                    for _ in range(100):
-                        if store.detail(submitted["run_id"])["decisions"]:
-                            break
-                        await asyncio.sleep(0.05)
-                    assert store.detail(submitted["run_id"])["decisions"]
+
+                    async def pending_decision(run_id):
+                        while not store.detail(run_id)["decisions"]:
+                            await asyncio.sleep(0.05)
+
+                    await asyncio.wait_for(pending_decision(submitted["run_id"]), 15)
                 # The public command is sent after a worker restart, using the
                 # HTTP revision rather than the unrelated SQLite event revision.
                 async with Worker(
