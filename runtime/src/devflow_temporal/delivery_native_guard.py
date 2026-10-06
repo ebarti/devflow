@@ -43,7 +43,7 @@ def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
         if role == "intake"
         else spec["policy"].get("max_repairs", 2)
     )
-    if role != "intake":
+    if role != "intake" and spec.get("retry_budget_version") != 1:
         with store._connect() as db:
             grants = db.execute(
                 """SELECT maximum_iteration FROM delivery_repair_grants WHERE run_id=?

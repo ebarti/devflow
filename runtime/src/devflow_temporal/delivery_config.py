@@ -132,6 +132,8 @@ class DeliveryConfig:
             "intake_enabled": "intake" in self.raw["roles"],
             "execution_backend": self.raw.get("execution_backend", "native-macos"),
             "execution_mode": self.raw.get("execution_mode", "native-profile"),
+            "max_attempts": self.raw.get("max_attempts"),
+            "max_repairs": self.raw.get("max_repairs", 2),
         }
 
     def admit(self, supplied: dict[str, Any]) -> dict[str, Any]:
@@ -251,6 +253,11 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
+        if "max_attempts" in self.raw:
+            maximum = self.raw["max_attempts"]
+            if type(maximum) is not int or not 1 <= maximum <= 10:
+                raise ValueError("max_attempts must be an integer between 1 and 10")
+            policy["max_attempts"] = maximum
         baseline_ids = repository.get("baseline_check_ids", [])
         if (not isinstance(baseline_ids, list)
                 or any(not isinstance(item, str) for item in baseline_ids)
@@ -463,6 +470,7 @@ class DeliveryConfig:
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
+            **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
             **({"baseline_checks_version": 1} if baseline_ids else {}),
             **(
                 {"preparation_version": 1}
