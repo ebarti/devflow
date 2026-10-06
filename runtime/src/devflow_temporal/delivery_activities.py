@@ -447,6 +447,23 @@ async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
     return await asyncio.to_thread(execute)
 
 
+@activity.defn(name="delivery_baseline_checks")
+async def delivery_baseline_checks(request: dict[str, Any]) -> dict[str, Any]:
+    def execute() -> dict[str, Any]:
+        from .delivery_baseline import run_baseline_checks
+
+        store, broker = _context(request["spec"])
+        with (_lock(store.config.state_root / "check-execution")
+              if request["spec"]["provider"] == "codex" else nullcontext()):
+            try:
+                return run_baseline_checks(broker)
+            except CheckPreparationFailure as exc:
+                return {"state": "failed", "results": exc.results, "diagnostic": str(exc),
+                        "base_sha": request["spec"]["base_sha"]}
+
+    return await asyncio.to_thread(execute)
+
+
 @activity.defn(name="delivery_ci")
 async def delivery_ci(request: dict[str, Any]) -> dict[str, Any]:
     _, broker = _context(request["spec"])
@@ -714,6 +731,7 @@ DELIVERY_ACTIVITIES = [
     delivery_terminal_tracker,
     delivery_project,
     delivery_prepare,
+    delivery_baseline_checks,
     delivery_finalize_resources,
     delivery_intake,
     delivery_accept_plan,

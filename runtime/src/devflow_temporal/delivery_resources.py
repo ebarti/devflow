@@ -219,8 +219,10 @@ def _gate_evidence_root(spec: dict) -> Path:
 
 
 def _gate_path(spec: dict, role: str, iteration: int) -> Path:
-    if role not in {'review', 'verify'} or type(iteration) is not int or iteration < 0:
+    if role not in {'review', 'verify', 'baseline'} or type(iteration) is not int or iteration < 0:
         raise ValueError('gate namespace role or iteration is invalid')
+    if role == 'baseline' and (spec.get('baseline_checks_version') != 1 or iteration != 0):
+        raise ValueError('baseline checkout requires a new baseline-check admission')
     path = _gate_evidence_root(spec) / 'gates' / str(iteration) / role
     _ancestors(path, allow_missing=True)
     if path.is_symlink():
@@ -345,7 +347,9 @@ class RunResources:
                     continue
                 relative = path.relative_to(root / 'gates')
                 valid = (len(relative.parts) == 2 and relative.parts[0].isdecimal()
-                         and relative.parts[1] in {"review", "verify"})
+                         and (relative.parts[1] in {"review", "verify"}
+                              or (relative.parts == ("0", "baseline")
+                                  and self.spec.get("baseline_checks_version") == 1)))
         elif kind == "generated":
             allowed_names = {
                 "node_modules",

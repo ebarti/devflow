@@ -747,6 +747,31 @@ class DeliveryWorkflow:
             return await self._cancelled(spec)
         self.state["candidate"] = prepared["candidate"]
         self.state["candidate_revision"] += 1
+        # Frozen legacy inputs omit this marker, preserving recorded histories.
+        # A shared baseline defect must not consume a feature repair turn.
+        if spec.get("baseline_checks_version") == 1:
+            self.state["phase"] = "baseline_checks"
+            self.state["revision"] += 1
+            await self._project(spec, "baseline_checks", "Checking the immutable project baseline")
+            try:
+                baseline = await self._activity("delivery_baseline_checks", {"spec": spec})
+            except Exception as exc:
+                return await self._stop(
+                    spec, f"baseline check execution unresolved: {type(exc).__name__}"
+                )
+            self.state["checks"]["baseline"] = baseline
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            if baseline.get("state") != "passed":
+                failed = [str(item.get("id", "unknown")) for item in baseline.get("results", [])
+                          if not item.get("passed")]
+                return await self._stop(
+                    spec, "project baseline failed before feature work: " + ", ".join(failed)
+                )
+            self.state["revision"] += 1
+            await self._project(
+                spec, "baseline_passed", "Project baseline passed; starting feature work"
+            )
         if spec.get("intake_required"):
             accepted_spec = await self._run_intake(spec)
             if accepted_spec is None:
@@ -1532,7 +1557,10 @@ class DeliveryWorkflow:
                 )
             else:
                 if not (resume_prechecks and iteration == start_iteration):
-                    self.state["checks"] = {}
+                    self.state["checks"] = {
+                        key: value for key, value in self.state["checks"].items()
+                        if key == "baseline"
+                    }
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                     self.state["phase"] = "implement" if iteration == 0 else "repair"
@@ -1587,7 +1615,10 @@ class DeliveryWorkflow:
                     self.state["candidate"] = implementation["candidate"]
                     self.state["candidate_revision"] += 1
                 else:
-                    self.state["checks"] = {}
+                    self.state["checks"] = {
+                        key: value for key, value in self.state["checks"].items()
+                        if key == "baseline"
+                    }
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                 self.state["phase"] = "prepublish_checks"

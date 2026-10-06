@@ -35,6 +35,19 @@ controller check. Existing PR titles must also be conventional. Invalid already
 published history is refused; the read-only publication recovery command cannot
 rewrite it or reuse gate evidence for a different head.
 
+Repositories can select `baseline_check_ids` from their existing
+`prepublish_checks`, in recipe order, for shared project prerequisites such as
+dependency installation, docs build and rendered browser regressions. New
+admissions run these checks in an isolated clean checkout of the frozen base
+before intake or implementation. A failed or unresolved baseline stops the run
+with its original logs and base identity, without consuming feature repair
+turns. Source-specific checks which require the proposed feature belong in the
+normal candidate gates. Baseline success never replaces candidate checks:
+every prepublication and verification recipe still runs on the feature result.
+Historical inputs without the baseline marker keep their recorded behavior.
+Resolve upstream defects through their owning change, then admit work against
+the verified corrected base; never silently rewrite an existing frozen input.
+
 New terminal runs synchronize tracker status and read back assignment, Project
 and claim through the existing tracker helper. Blocked/cancelled outcomes select
 Blocked; delivered outcomes select In review. Claims release only after proven

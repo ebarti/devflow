@@ -124,6 +124,7 @@ class DeliveryConfig:
                     "base_ref": value["base_ref"],
                     "base_sha": value.get("expected_base_sha"),
                     "recovery_keys": sorted(value.get("recovery", {})),
+                    "baseline_check_ids": value.get("baseline_check_ids", []),
                 }
                 for key, value in sorted(self.raw["repositories"].items())
             ],
@@ -250,6 +251,17 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
+        baseline_ids = repository.get("baseline_check_ids", [])
+        if (not isinstance(baseline_ids, list)
+                or any(not isinstance(item, str) for item in baseline_ids)
+                or len(set(baseline_ids)) != len(baseline_ids)):
+            raise ValueError("baseline check IDs must be a unique list")
+        if baseline_ids:
+            recipes = policy["prepublish_checks"]
+            selected = [check for check in recipes if check.get("id") in baseline_ids]
+            if len(selected) != len(baseline_ids):
+                raise ValueError("baseline checks must name existing prepublication checks")
+            policy["baseline_checks"] = selected
         if self.raw.get("execution_backend", "native-macos") != "native-macos":
             raise ValueError("Docker execution is retired; only native-macos is supported")
         if self.raw.get("provider", "codex") == "codex":
@@ -451,6 +463,7 @@ class DeliveryConfig:
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
+            **({"baseline_checks_version": 1} if baseline_ids else {}),
             **(
                 {"preparation_version": 1}
                 if self.raw.get("provider", "codex") == "codex"
