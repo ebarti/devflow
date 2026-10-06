@@ -20,7 +20,7 @@ from temporalio.exceptions import ApplicationError
 
 from .candidate import candidate_for
 from .contracts import digest
-from .delivery_broker import CheckPreparationFailure, DeliveryBroker
+from .delivery_broker import CheckCancelledBeforeLaunch, CheckPreparationFailure, DeliveryBroker
 from .delivery_config import DeliveryConfig
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
@@ -28,6 +28,19 @@ from .supervisor import get_supervisor
 
 _CHECK_HEARTBEAT_INTERVAL = 5
 _UNCLEAN_CHECK_SLOTS: list[int] = []
+
+
+def _cancelled_check_result(request: dict[str, Any], broker: DeliveryBroker) -> dict[str, Any]:
+    # Rejecting this launch cannot establish cleanup for any earlier child.
+    confirmed = broker.native_cleanup_confirmed
+    result = {"state": "failed" if confirmed else "unknown",
+              "cleanup": "confirmed" if confirmed else "unknown",
+              "cancelled": True, "results": []}
+    if "candidate" in request:
+        result["candidate_id"] = request["candidate"]["id"]
+    else:
+        result["base_sha"] = request["spec"]["base_sha"]
+    return result
 
 
 def _try_check_lock(path: Path) -> int | None:
@@ -79,7 +92,9 @@ async def _execute_check(
                         break
                     cancelled.wait(0.1)
                 else:
-                    raise asyncio.CancelledError
+                    raise CheckCancelledBeforeLaunch(
+                        "native check cancelled while queued for ports"
+                    )
             ports_admitted.set()
             while not cancelled.is_set() and not broker._native_cancelled():
                 for slot in range(slots):
@@ -90,14 +105,16 @@ async def _execute_check(
                     break
                 if descriptor is not None:
                     if cancelled.is_set() or broker._native_cancelled():
-                        raise asyncio.CancelledError
+                        raise CheckCancelledBeforeLaunch("native check cancelled before admission")
                     admitted.set()
                     result = execute(broker)
                     if not broker.native_cleanup_confirmed:
                         result = {**result, "state": "unknown", "cleanup": "unknown"}
                     return result
                 cancelled.wait(0.1)
-            raise asyncio.CancelledError
+            raise CheckCancelledBeforeLaunch("native check cancelled while queued for a slot")
+        except CheckCancelledBeforeLaunch:
+            return _cancelled_check_result(request, broker)
         finally:
             if descriptor is not None:
                 port_descriptors.append(descriptor)
@@ -361,9 +378,12 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
         validate_source(request["spec"], constraint, completed=False)
     if (role == "implement" and request["spec"].get("provider") == "codex"
             and request["spec"]["policy"].get("host_sandbox") == "trusted-local"):
-        prerequisites = await asyncio.to_thread(
-            broker.run_implementation_preparation, iteration, candidate,
-        )
+        try:
+            prerequisites = await asyncio.to_thread(
+                broker.run_implementation_preparation, iteration, candidate,
+            )
+        except CheckCancelledBeforeLaunch:
+            prerequisites = _cancelled_check_result(request, broker)
         if prerequisites.get("state") != "passed":
             return {"status": "blocked", "role": role, "iteration": iteration,
                     "candidate": candidate, "cleanup": prerequisites.get("cleanup", "unknown"),
@@ -515,7 +535,8 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
                     'source_unchanged': broker.candidate()['id'] == request['candidate']['id'],
                     'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
-            if request["spec"]["provider"] != "codex":
+            if (request["spec"]["provider"] != "codex"
+                    or isinstance(exc, CheckCancelledBeforeLaunch)):
                 raise
             return {
                 "state": "unknown",
@@ -533,7 +554,8 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
         try:
             return broker.run_browser_qa(request["iteration"], request["candidate"])
         except Exception as exc:
-            if request["spec"]["provider"] != "codex":
+            if (request["spec"]["provider"] != "codex"
+                    or isinstance(exc, CheckCancelledBeforeLaunch)):
                 raise
             return {
                 "state": "unknown",
@@ -560,7 +582,8 @@ async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
                     'source_unchanged': broker.candidate()['id'] == request['candidate']['id'],
                     'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
-            if request["spec"]["provider"] != "codex":
+            if (request["spec"]["provider"] != "codex"
+                    or isinstance(exc, CheckCancelledBeforeLaunch)):
                 raise
             return {
                 "state": "unknown",

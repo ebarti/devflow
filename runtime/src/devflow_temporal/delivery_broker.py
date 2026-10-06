@@ -99,6 +99,10 @@ class CheckPreparationFailure(ValueError):
         }]
 
 
+class CheckCancelledBeforeLaunch(RuntimeError):
+    """Cancellation was observed before entering the next native process."""
+
+
 class DeliveryBroker:
     def __init__(self, store: DeliveryStore, spec: dict[str, Any]) -> None:
         from .delivery_preparation import require_native_execution
@@ -871,7 +875,7 @@ class DeliveryBroker:
 
     def _run_native_check(self, process) -> dict:
         if self._native_cancelled():
-            raise RuntimeError("native check cancelled before launch")
+            raise CheckCancelledBeforeLaunch("native check cancelled before launch")
         self.native_cleanup_confirmed = False
         result = process.run()
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"

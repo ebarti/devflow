@@ -138,6 +138,28 @@ def test_concurrent_independent_roots_and_restart_after_removal(tmp_path, monkey
     assert not any((Path(value["state_dir"]) / "transient").exists() for value in specs)
 
 
+def test_unstarted_existing_native_journal_remains_owned_for_finalization(tmp_path):
+    from devflow_temporal.delivery_resources import private_directory, write_private
+
+    owned = spec(tmp_path)
+    resources = RunResources(owned)
+    scratch = resources.scratch("check", "earlier")
+    folder = Path(owned["state_dir"]) / "attempt"
+    private_directory(folder)
+    journal = folder / "native-process.json"
+    write_private(journal, {"phase": "authorized", "owned": {}, "ports": [],
+                            "monitoring_complete": False})
+    NativeProcess(
+        owned, folder, argv=[sys.executable, "-c", "raise AssertionError('must not launch')"],
+        cwd=scratch, environment={"PATH": "/usr/bin:/bin"}, timeout=5,
+    )
+    manifest = read_private(resources.manifest)
+    assert manifest["processes"] == [str(journal)]
+    cleanup = resources.finalize("cancelled")
+    assert cleanup["process_cleanup"] == "unknown"
+    assert scratch.exists()
+
+
 def test_real_observed_detached_child_is_stopped_and_journal_replays_without_effect(tmp_path):
     owned = spec(tmp_path)
     resources = RunResources(owned)

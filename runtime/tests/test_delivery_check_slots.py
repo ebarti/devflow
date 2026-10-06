@@ -24,6 +24,7 @@ from devflow_temporal import delivery_activities as activities
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_process import NativeProcess, process_table, reconcile_process
+from devflow_temporal.delivery_resources import RunResources
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -48,7 +49,7 @@ def owned_checks(tmp_path, monkeypatch):
     config = SimpleNamespace(state_root=tmp_path, raw={"check_concurrency": 2})
     database = tmp_path / "fixture.sqlite3"
     with sqlite3.connect(database) as db:
-        db.execute("CREATE TABLE delivery_runs(run_id TEXT, phase TEXT)")
+        db.execute("CREATE TABLE delivery_runs(run_id TEXT, phase TEXT, recovery_json TEXT)")
 
     class Broker(DeliveryBroker):
         def __init__(self, value):
@@ -98,9 +99,9 @@ def owned_checks(tmp_path, monkeypatch):
         run_prechecks = run_checks
         run_browser_qa = run_checks
 
-    def context(value):
+    def context(value, **_options):
         broker = brokers[value["run_id"]]
-        return SimpleNamespace(config=config), broker
+        return SimpleNamespace(config=config, _connect=broker.connect), broker
 
     def request(name, seconds=0.6, timeout=5):
         value = spec(tmp_path, name)
@@ -112,11 +113,16 @@ def owned_checks(tmp_path, monkeypatch):
     monkeypatch.setattr(activities.activity, "in_activity", lambda: True)
     monkeypatch.setattr(activities.activity, "heartbeat", hearts.append)
     monkeypatch.setattr(activities, "_CHECK_HEARTBEAT_INTERVAL", 0.05, raising=False)
-    return SimpleNamespace(
+    retained = len(activities._UNCLEAN_CHECK_SLOTS)
+    yield SimpleNamespace(
         request=request, brokers=brokers, hearts=hearts, config=config,
         maximum=lambda: maximum,
         in_activity=in_activity, heartbeat=heartbeat,
+        retained_slots=retained,
     )
+    for descriptor in activities._UNCLEAN_CHECK_SLOTS[retained:]:
+        os.close(descriptor)
+    del activities._UNCLEAN_CHECK_SLOTS[retained:]
 
 
 async def wait_until(predicate):
@@ -204,6 +210,213 @@ async def test_cancelled_waiter_never_launches(owned_checks):
     if launched:
         await wait_until(owned_checks.brokers["queued"].finished.is_set)
     assert not launched
+
+
+def project_cancel(broker):
+    db = broker.connect()
+    with db:
+        # The API writes this phase after the workflow accepts cancellation.
+        db.execute("INSERT INTO delivery_runs(run_id, phase) VALUES (?, 'cancelling')",
+                   (broker.spec["run_id"],))
+    db.close()
+
+
+@pytest.mark.parametrize("activity_name, stage", [
+    ("delivery_checks", "waiting-check-slot"),
+    ("delivery_precheck", "waiting-check-slot"),
+    ("delivery_browser_qa", "waiting-check-slot"),
+    ("delivery_baseline_checks", "waiting-check-slot"),
+    ("delivery_browser_qa", "waiting-browser-ports"),
+])
+async def test_run_cancel_while_queued_confirms_cleanup_without_launch(
+    owned_checks, activity_name, stage,
+):
+    owned_checks.config.raw["check_concurrency"] = 1
+    first_request = owned_checks.request("first", 1.0)
+    request = owned_checks.request("queued")
+    first_activity = activities.delivery_checks
+    if stage == "waiting-browser-ports":
+        for value in (first_request, request):
+            value["spec"]["policy"]["browser_qa"] = {"ports": {"web": 14001, "api": 14002}}
+        first_activity = activities.delivery_browser_qa
+    if activity_name == "delivery_baseline_checks":
+        request.pop("candidate")  # Baseline's production request has no candidate.
+    first = asyncio.create_task(first_activity(first_request))
+    await wait_until(owned_checks.brokers["first"].started.is_set)
+    queued = asyncio.create_task(getattr(activities, activity_name)(request))
+    try:
+        await wait_until(lambda: any(
+            heart["run_id"] == "queued" and heart["stage"] == stage
+            for heart in owned_checks.hearts
+        ))
+        project_cancel(owned_checks.brokers["queued"])
+        outcome = (await asyncio.gather(queued, return_exceptions=True))[0]
+    finally:
+        await first
+    print("queued run cancellation outcome:", repr(outcome))
+    assert not owned_checks.brokers["queued"].started.is_set()
+    assert isinstance(outcome, dict), f"queued activity raised {outcome!r}"
+    assert outcome["state"] == "failed"
+    assert outcome["cleanup"] == "confirmed"
+    assert outcome["cancelled"] is True
+    assert not owned_checks.brokers["queued"].result
+
+
+async def test_run_cancel_after_admission_does_not_launch_and_releases_slot(
+    owned_checks, monkeypatch, tmp_path,
+):
+    request = owned_checks.request("admitted")
+    broker = owned_checks.brokers["admitted"]
+    original = activities._try_check_lock
+
+    def cancel_after_lock(path):
+        descriptor = original(path)
+        if descriptor is not None:
+            project_cancel(broker)
+        return descriptor
+
+    monkeypatch.setattr(activities, "_try_check_lock", cancel_after_lock)
+    result = await activities.delivery_precheck(request)
+    assert result["cleanup"] == "confirmed"
+    assert result["cancelled"] is True
+    assert not broker.started.is_set()
+    descriptor = original(tmp_path / "check-execution/slot-0.lock")
+    assert descriptor is not None
+    os.close(descriptor)
+
+
+@pytest.mark.parametrize("activity_name", [
+    "delivery_checks", "delivery_precheck", "delivery_browser_qa", "delivery_baseline_checks",
+])
+@pytest.mark.parametrize("cleanup_confirmed", [True, False])
+async def test_run_cancel_at_native_launch_guard_returns_confirmed_outcome(
+    owned_checks, monkeypatch, tmp_path, activity_name, cleanup_confirmed,
+):
+    request = owned_checks.request("before-launch")
+    broker = owned_checks.brokers["before-launch"]
+    broker.native_cleanup_confirmed = cleanup_confirmed
+    process = NativeProcess(
+        request["spec"], Path(broker.spec["state_dir"]) / "native",
+        argv=[sys.executable, "-c", "raise AssertionError('must not launch')"],
+        cwd=tmp_path, environment={"PATH": os.environ["PATH"]}, timeout=5,
+    )
+
+    def cancel_before_launch(*_args):
+        project_cancel(broker)
+        return broker._run_native_check(process)
+
+    for name in ("run_checks", "run_prechecks", "run_browser_qa"):
+        monkeypatch.setattr(broker, name, cancel_before_launch)
+    monkeypatch.setattr("devflow_temporal.delivery_baseline.run_baseline_checks",
+                        cancel_before_launch)
+    if activity_name == "delivery_baseline_checks":
+        request.pop("candidate")
+    result = await getattr(activities, activity_name)(request)
+    assert result["cleanup"] == ("confirmed" if cleanup_confirmed else "unknown")
+    assert result["state"] == ("failed" if cleanup_confirmed else "unknown")
+    assert result["cancelled"] is True
+    assert broker.native_cleanup_confirmed is cleanup_confirmed
+    assert len(activities._UNCLEAN_CHECK_SLOTS) == (
+        owned_checks.retained_slots + (not cleanup_confirmed)
+    )
+    assert not process.journal.exists()
+
+
+@pytest.mark.parametrize("cleanup_confirmed", [True, False])
+async def test_run_cancel_before_implementation_preparation_retains_cleanup_truth(
+    owned_checks, monkeypatch, tmp_path, cleanup_confirmed,
+):
+    request = owned_checks.request("prepare-cancel")
+    request["role"] = "implement"
+    request["spec"]["policy"]["host_sandbox"] = "trusted-local"
+    broker = owned_checks.brokers["prepare-cancel"]
+    broker.checkout = tmp_path
+    broker.native_cleanup_confirmed = cleanup_confirmed
+    monkeypatch.setattr(broker, "candidate", lambda: request["candidate"])
+    process = NativeProcess(
+        request["spec"], Path(broker.spec["state_dir"]) / "native",
+        argv=[sys.executable, "-c", "raise AssertionError('must not launch')"],
+        cwd=tmp_path, environment={"PATH": os.environ["PATH"]}, timeout=5,
+    )
+    db = broker.connect()
+    with db:
+        db.execute("INSERT INTO delivery_runs(run_id, phase) VALUES (?, 'running')",
+                   (broker.spec["run_id"],))
+    db.close()
+
+    def cancel_preparation(*_args):
+        db = broker.connect()
+        with db:
+            db.execute("UPDATE delivery_runs SET phase='cancelling' WHERE run_id=?",
+                       (broker.spec["run_id"],))
+        db.close()
+        return broker._run_native_check(process)
+
+    monkeypatch.setattr(broker, "run_implementation_preparation", cancel_preparation)
+    result = await activities.delivery_role(request)
+    assert result["status"] == "blocked"
+    assert result["cleanup"] == ("confirmed" if cleanup_confirmed else "unknown")
+    assert not process.journal.exists()
+
+
+async def test_run_cancel_while_queued_reaches_terminal_resource_cleanup(
+    owned_checks, monkeypatch,
+):
+    owned_checks.config.raw["check_concurrency"] = 1
+    request = owned_checks.request("workflow-queued")
+    request["spec"]["resource_cleanup_version"] = 1
+    request["spec"]["policy"].update(max_repairs=0, prepublish_checks=[{"id": "fixture"}])
+    scratch = RunResources(request["spec"]).scratch("check", "queued")
+    (scratch / "owned.txt").write_text("temporary fixture")
+    execution = DeliveryWorkflow()
+    monkeypatch.setattr(workflow, "patched", lambda _name: True)
+
+    async def ready_condition(predicate, **_options):
+        assert predicate()
+
+    monkeypatch.setattr(workflow, "wait_condition", ready_condition)
+
+    async def dispatch(name, payload, **_options):
+        if name == "delivery_prepare":
+            return {"candidate": request["candidate"]}
+        if name == "delivery_tracker_start":
+            return {"state": "consistent"}
+        if name == "delivery_role":
+            return {"status": "pass", "candidate": payload["candidate"],
+                    "cleanup": "confirmed", "session_id": "fixture:implement"}
+        if name == "delivery_precheck":
+            try:
+                return await activities.delivery_precheck(payload)
+            except asyncio.CancelledError as exc:
+                # An activity exception without a server cancel is an activity failure.
+                raise RuntimeError("precheck activity failed") from exc
+        if name == "delivery_finalize_resources":
+            return await activities.delivery_finalize_resources(payload)
+        assert name == "delivery_project"
+        return {}
+
+    monkeypatch.setattr(execution, "_activity", dispatch)
+    first = asyncio.create_task(activities.delivery_checks(owned_checks.request("first", 1.0)))
+    await wait_until(owned_checks.brokers["first"].started.is_set)
+    pending = asyncio.create_task(execution.run(request["spec"]))
+    try:
+        await wait_until(lambda: any(
+            heart["run_id"] == "workflow-queued" and heart["stage"] == "waiting-check-slot"
+            for heart in owned_checks.hearts
+        ))
+        accepted = await execution.cancel(
+            {"expected_revision": execution.state["revision"], "reason": "fixture stop"},
+        )
+        assert accepted["phase"] == "cancelling"
+        project_cancel(owned_checks.brokers["workflow-queued"])
+        result = await pending
+    finally:
+        await first
+    assert result["outcome"] == "cancelled"
+    assert result["cleanup"] == "confirmed"
+    assert result["checks"]["resource_cleanup"]["resource_cleanup"] == "confirmed"
+    assert not scratch.exists()
+    assert not owned_checks.brokers["workflow-queued"].started.is_set()
 
 
 @pytest.mark.parametrize("slots", [0, -1, 33, True, 1.5, "2", None])

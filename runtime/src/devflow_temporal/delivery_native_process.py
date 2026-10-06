@@ -154,9 +154,13 @@ class NativeProcess:
         self.journal = folder / "native-process.json"
         if not self.journal.exists() and any(listeners(port) for port in ports):
             raise ValueError("native fixture port belongs to another process")
-        RunResources(spec).process(self.journal)
+        if self.journal.exists():
+            RunResources(spec).process(self.journal)
 
     def run(self) -> dict:
+        # Construction may be cancelled before launch; custody starts before
+        # entering execution, while existing journals remain owned immediately.
+        RunResources(self.spec).process(self.journal)
         lock = os.open(
             self.folder / "native-process.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
         )
