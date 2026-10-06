@@ -1,188 +1,151 @@
 # Devflow
 
-Small development skills for OpenAI Codex CLI agents, with Python helpers for work ownership, GitHub issue status and metrics. The agent follows the relevant skill and uses its host tools, Git, GitHub CLI and project commands directly.
+Devflow hands an authorized development goal to a configured local delivery
+service, which investigates the repository, plans the work and publishes an
+unmerged PR. The [Temporal runtime](docs/temporal-runtime.md) provides the
+service, dashboard, CLI and MCP interface. Native macOS execution uses the
+frozen agent-runtime-kit dependencies and measured command permissions.
 
-An [experimental local Temporal delivery service](docs/temporal-runtime.md) is available as a separate Python package under `runtime/`. It serves a dashboard, CLI, and MCP interface for allowlisted, published-unmerged issue delivery on a single host. Real execution runs natively on macOS using the frozen agent-runtime-kit dependencies and measured command permissions. The workflow owns process teardown and temporary-directory finalization; historical Docker records are read-only. This package does not change the release workflow.
-
-The [local delivery plugin](docs/local-delivery-plugin.md) packages that existing MCP entry point and skill in a portable plugin with an explicit local marketplace. It exposes raw-goal submission, automatic planning, status, evidence and blocking decisions without installing or changing the running service.
+The [local delivery plugin](docs/local-delivery-plugin.md) exposes the service
+through one `devflow-local-delivery` skill. Packaging and normal installation
+register entry points; service configuration, authentication and runtime startup
+are separate operations.
 
 ## Prerequisites
 
-Devflow targets Codex CLI: skills load from its skills directory, metrics hooks use its `hooks.json` and transcript format, and delegation uses its agent tools. Other hosts that discover `SKILL.md` directories can load the role skills, but hooks, metrics, candidate trials and worker spawning are Codex-specific. Supply Python 3.12+, a POSIX shell, Git and the tools required by your projects. Execution needs native nested-agent tools, capacity for the main task plus a coordinator and at least one leaf, and access to Astra and Sol. The installer supplies four agent definitions. See the [agents reference](skills/devflow/references/agents.md) and the [implementation worker reference](skills/devflow/references/implementation-worker.md). GitHub work requires authenticated `gh` and sequential stacks use the `gh stack` extension and skill; Project tracking also needs access to the selected existing Project (`project` scope for an OAuth token). Other tools need their usual authentication and permissions. Devflow does not install prerequisites or manage authentication. Check the tools needed for the requested action and report a missing prerequisite as a blocker rather than silently changing the workflow.
+Normal installation needs Python 3.12+, Git and a POSIX shell. Set
+`DEVFLOW_PYTHON` to choose a supported interpreter; the installation helpers use
+only the standard library. Delivery needs an existing configured local service,
+an allowlisted repository and the user's linked issue and authority to publish
+an unmerged PR. Follow the [runtime setup](docs/temporal-runtime.md) and
+[desktop/plugin setup](docs/local-delivery-plugin.md) for those prerequisites.
+Project tools and GitHub authentication retain their own requirements.
 
 ## Install
 
-Keep a published release checkout at a stable location; installed skills are
-symlinks into it, while agent definitions are regular file copies that Codex
-can load. Set `RELEASE_TAG` to an approved,
-published tag that contains the installer and agent definitions you intend to
-use. To get the regular-agent compatibility in this PR, that tag must be
-created after the change is approved and released; an open PR is not a release.
+Keep a trusted release checkout at a stable location. Set `RELEASE_TAG` to the
+chosen [published release](https://github.com/ebarti/devflow/releases). `main`
+and open PRs contain unreleased work.
 
 ```sh
 git clone --branch "$RELEASE_TAG" https://github.com/ebarti/devflow.git
 cd devflow
-bash scripts/install.sh
+sh scripts/install.sh
 ```
 
-The installer uses `python3.12`; set `DEVFLOW_PYTHON` to select another supported interpreter. Hooks record its resolved absolute executable path at installation, so later `PATH` changes do not switch Python. Reinstall to change the interpreter. The helpers use only the standard library; no pip dependencies are required.
+The normal installer exposes the sole `devflow-local-delivery` service skill
+and copies four internal agent definitions as regular files. If a matching
+installed local delivery plugin already provides that skill, installation
+preserves it without creating a duplicate direct entry. The `devflow` path
+contains script/reference helpers for retained work and has no `SKILL.md`.
+The other direct-agent skills in the source checkout are not globally installed.
 
-Global delivery commands are an explicit separate operation, described in
+Defaults are `~/.agents/skills` and `$CODEX_HOME` (`~/.codex` when unset).
+Use explicit locations for another host configuration:
+
+```sh
+sh scripts/install.sh /path/to/host/skills /path/to/codex-home
+```
+
+Normal installation does not configure MCP, create a runtime, install metrics
+hooks, activate a launchd reconciler or change global model settings. Existing
+foreign hooks, host configuration and user data are preserved. Internal agent
+copies are tracked by `agents/.devflow-agent-manifest.json`; installation
+refreshes unchanged owned copies and removes obsolete unchanged owned copies.
+Modified or custom copies are preserved. `--force` retains the existing agent
+installer's checkout-switch behavior; it does not bypass migration checks or
+replace custom files.
+
+Global delivery commands require the explicit operation described in
 [the launcher installation contract](docs/global-delivery-launchers.md).
-`scripts/install.sh --delivery-launchers` exposes the existing canonical
+`scripts/install.sh --delivery-launchers` exposes the canonical
 `devflow-delivery` and `devflow-delivery-mcp` environment and configuration.
-It can migrate the recognized historical `devflow` link into an alias of
+It can migrate the recognized historical `devflow` command into an alias of
 `devflow-delivery`, retaining the old immutable release and guarded rollback.
-Normal skill/agent installation does not migrate a CLI or create a runtime.
-
-The installed hook keeps a checkout snapshot in Codex home. If that checkout
-changes or a linked skill disappears, the hook reports installation drift before
-loading source code. Check it directly with
-`python3.12 "$CODEX_HOME/.devflow-hook.py" --check` (use `~/.codex` when
-`CODEX_HOME` is unset), then restore the checkout or rerun installation.
-
-The defaults are `~/.agents/skills` for skills and `$CODEX_HOME` (`~/.codex` when unset) for the agent definitions in `agents/` and the metrics hooks in `hooks.json`. Supply custom locations when needed:
-
-```sh
-bash scripts/install.sh /path/to/host/skills /path/to/codex-home
-```
-
-To switch an existing installation to another checkout, run this from that checkout:
-
-```sh
-bash scripts/install.sh --force
-```
-
-`--force` repoints bundled skill symlinks and migrates owned agent-definition symlinks to regular copies. Existing regular agent-definition files are preserved when byte-identical to this checkout's definitions. The installer records copied definitions in `$CODEX_HOME/agents/.devflow-agent-manifest.json`; on upgrade it refreshes unchanged owned copies and removes obsolete unchanged owned copies. Modified or custom copies and invalid skill destinations stop installation before any destination changes, even with `--force`; modified obsolete copies are preserved. Skill paths still require symlinks. Other files, agent definitions and hooks are preserved. Without `--force`, conflicting symlinks stop installation. Review and trust the metrics hooks with `/hooks`; use a fresh task after installation. Agent instructions and target repositories are not modified. Automatic collection requires a host supporting the documented Codex hook interface.
-
-On macOS, a default-home install also starts the managed launchd issue reconciler. Its plist pins the installed Python, script, `gh` and SQLite paths; logs are private under Codex home. Custom or candidate homes receive a staged plist without launchd activation. Read the managed-record and potential-write preview before installation or upgrade:
-
-```sh
-python3.12 skills/devflow/scripts/reconcile.py --db "$HOME/.local/state/devflow/workflow.sqlite3" once --dry-run --limit 100
-```
-
-The preview opens SQLite read-only, creates no lock file and makes no GitHub writes. Its `coverage` field reports the total Project-bound records and whether the selected limit truncated the result. Pending intents report their intended remote writes and local claim action, including an explicit first synchronization before its verified baseline exists. A first-sync intent in `needs_decision` instead reports its stored next action and error; `once` cannot drain it until an explicit retry creates a new revision. Legacy records show the observed issue, assignees, Project Status and local claim while remaining unknown until a verified sync baseline and explicit mapping are recorded; the service discovers drift only for managed records but also drains durable first-sync intents. Use `python3.12 skills/devflow/scripts/reconcile.py --db PATH once` for a bounded manual pass on hosts without launchd. Use `python3.12 scripts/reconcile-service.py inspect` or `python3.12 scripts/reconcile-service.py uninstall` to inspect or remove the owned launch agent. No background path calls a model or agent. A stopped owner's claim is released only after terminal root and descendant evidence; a missing hook or hard crash stays unknown. A completed Actions run becomes an In review or concrete Blocked outcome, never an automatic issue closure or acceptance.
+Normal installation does not migrate a CLI or create a runtime.
 
 ## Upgrade
 
-Set `RELEASE_TAG` to the chosen [approved release tag](https://github.com/ebarti/devflow/releases)
-and upgrade the existing checkout between tasks:
+Between tasks, select a published release and update the existing checkout:
 
 ```sh
-bash scripts/update.sh "$RELEASE_TAG"
+sh scripts/update.sh "$RELEASE_TAG"
+# For a custom installation, reuse its original locations:
+sh scripts/update.sh "$RELEASE_TAG" /path/to/host/skills /path/to/codex-home
 ```
 
-The updater fetches that tag, checks out its commit and reruns installation. Reuse custom directory arguments and `DEVFLOW_PYTHON` when applicable. Tracked edits stop the upgrade. If installation fails before service activation, the installer restores owned hooks, agent copies and the previous detached checkout, including upgrades begun with the older updater. The service waits for a matching activation marker written only after bootstrap succeeds; it does not open or migrate SQLite before that point. Obsolete skill links and unchanged owned agent copies are removed on success; modified copies, other files and SQLite records are preserved. Supported database migrations run on the next helper use. Review changed hooks with `/hooks`, then start a fresh task. Updates are explicit; `main` contains unreleased work.
+The updater fetches the tag, switches to its commit and reruns installation.
+Reuse the original `DEVFLOW_PYTHON` when it was set. Tracked source edits stop
+an update. No database migration or service activation occurs in this normal
+installation path.
 
-Installation rollback requires the native Linux/macOS atomic exchange interface;
-unsupported hosts refuse before installation effects. Private rollback snapshots live in the owned Codex directory (or its nearest
-owned protected ancestor; group-writable Codex directories use that ancestor without changing their modes), outside the OS temporary-directory policy, and bind the installer's actual file/link/directory identities. File bytes, mode and
-identity come from one opened-file observation; a write during that read refuses
-capture before installation effects. Rollback atomically
-restores helper pointers, captures cleanup targets into that existing private
-backup and deletes only matching installer objects. Changed or foreign objects
-remain with actionable original/captured locations and the complete backup;
-preflight and zero-effect capture refusals restore only checkout state, including
-upgrades begun by the historical exec-based updater. Backup/target filesystems and real native exchange are checked before destination
-effects. Failed destination recovery still attempts authenticated source checkout
-recovery. Recovery attempts independent paths after object errors; helper cleanup
-waits for pointer recovery. It reports every conflict and retains the backup until the operator
-recovers it. Public installation refusals return status 1. It never excludes
-other writers.
-Forward installer writes exchange existing targets and authenticate the displaced object in that same private backup; retirement captures targets before deleting them. Concurrent drift refuses installation and retains the foreign bytes and full backup at the reported paths.
+Upgrades from previous direct-agent installations retire only unchanged owned
+skill pointers and the recognized metrics hook registrations. Guarded installs
+must have an owned `.devflow-install.json` pin whose hashes match the historical
+Git inventory, and an unchanged `.devflow-hook.py`. The published v0.2.2 installer
+predates these manifests: that case requires its exact verified historical Git
+inventory, owned canonical source and skill symlinks, unchanged current source
+files and all of its exact generated telemetry hook registrations. Arbitrary
+unrecorded registrations are not migration candidates.
 
-## Candidate trials
+The migration atomically exchanges the `devflow` pointer for script-only
+helpers under the skills directory, preserving source files and keeping helper
+paths available. Other unchanged owned direct skills are removed from discovery.
+Foreign hook entries and metadata remain. A modified, unowned or ambiguous
+registration stops installation with its precise path and reason, even with
+`--force`. Restore the recorded bytes/pointer or relocate the conflicting
+registration and retry. Do not delete source helpers or user data to resolve a
+registration conflict.
 
-From a development worktree, use a new trial directory for each candidate and a separate target-project worktree:
-
-```sh
-python3.12 scripts/candidate.py /path/to/trial -C /path/to/project-worktree
-```
-
-The launcher isolates skills, agent definitions, hook configuration, sessions and SQLite, disables the normal Devflow skills in that session, and records the source commit in `candidate.json`. Its generated configuration selects Astra/xhigh for the main task and belongs to the trial. Authenticate that session with `candidate.py /path/to/trial login`, then review its hooks with `/hooks`. `--prepare-only` prepares the directories without starting a session. Freeze the candidate while a trial runs and retain its metrics with the recorded commit. A change still in an open PR belongs only in such a frozen review/trial checkout until it has an approved release tag.
-
-Publish a new release tag after the installation smoke check and the selected product trial pass. Release tags remain fixed; normal installations advance only through an explicit upgrade.
+On preflight refusal, destinations are left untouched. After an installer effect,
+rollback restores only matching recorded object identities; later changed or
+foreign objects remain, with an actionable path and retained private backup.
+Owned destination pointers use native atomic exchange on Linux/macOS before helper cleanup;
+unsupported hosts refuse without a replacement fallback. Cleanup captures the actual
+Forward writes exchange existing targets and authenticate the displaced object in that same private backup; retirement captures targets before deleting them. Concurrent drift refuses installation and retains foreign bytes and the full backup at the reported paths.
+object inside the existing private backup before authenticating and deleting it. Upgrades begun
+by the historical updater also restore its previous detached checkout when it
+remains clean; newer updater failures restore their previous branch or commit.
+SQLite, unrelated host files and background services remain outside this
+operation. Retained work must finish before changing its installed source.
 
 ## Start
 
-Ask for the outcome you want, for example: “Use devflow to fix the retry bug in this repository.” Or invoke a role such as `$devflow-reviewing` for a specific review. Skills are independently discoverable; loading one does not create work, issues or agents, or resume a backlog.
+Install the [local delivery plugin](docs/local-delivery-plugin.md), connect it
+to the configured service and use `devflow-local-delivery` for an authorized
+request, such as fixing the retry bug in a linked repository issue. The service
+reports its public policy and owns role selection, planning, implementation,
+review and verification. Missing issue or delivery authority requires a blocking
+decision. A submission authorizes publication through an unmerged PR;
+merge, release and deployment require separate authority.
 
-Use **Astra/xhigh** for the main task. It inspects the repository, asks user questions and produces the plan itself. Select that model in the host; skills cannot change an existing task's model and normal installation does not alter global model settings. From the CLI:
+Use the dashboard or the plugin's status/evidence operations to inspect a run.
+Blocking decisions carry the exact run and candidate identity. A fresh host
+task may be needed after registration for plugin discovery. The normal
+installer supplies internal roles rather than independent global role skills.
 
-```sh
-codex --model gpt-6-astra -c 'model_reasoning_effort="xhigh"'
-```
+## Retained helper workflows
 
-For implementation, the main task hands the inspected plan to one `devflow-coordinator` on **Sol/high**. That agent dispatches implementation on **Sol/xhigh** and review/verification on **Sol/xhigh**, owns the repair loop, maintains records and tracker state, and returns the consolidated outcome. Only material design decisions or unresolved blockers return to the main task. The coordinator inherits the main task's permissions for the shared database; leaf workers return reports.
-
-The implementer commits the first meaningful change, opens a non-draft PR immediately, and pushes subsequent fixes to that PR. Explicit local-only, no-commit and no-push instructions take precedence.
-
-Split features into coherent reviewable PRs. Features and slices developed sequentially while earlier work remains unmerged form one **gh stack**, even when they are logically independent. Each new branch and PR builds on its unmerged predecessor. See [PR workflow](skills/devflow/references/pr-workflow.md).
-
-Reuse the original coordinator for continuation, implementer for repairs and reviewer/verifier for rechecks when the scope is still related. Dispatch only the roles the work needs. The execution coordinator performs the final authorized merge directly. Standalone review/verification uses the corresponding leaf directly; merge-only requests run in the main task. There are no definer, planner or delivery agents.
-
-The [agents reference](skills/devflow/references/agents.md) lists the four delegated roles, default models and override mechanism. Briefs carry the inspected plan, acceptance conditions, candidate identity and verification limits. Reviewers and verifiers must still challenge demonstrated flaws in the plan. These are workflow instructions; this iteration does not add enforced input/output contracts or sequencing. The installed hook remains a backstop for common repository writes from the main claim holder and execution coordinator. Moving routine coordination to Sol aims to reduce expensive main-task turns; no cost saving is guaranteed or inferred from the topology alone.
-
-| Skill | Use |
-| --- | --- |
-| [devflow](skills/devflow/SKILL.md) | Shared method, role selection and state helper |
-| [devflow-defining-work](skills/devflow-defining-work/SKILL.md) | Clarify outcomes and investigate unclear requests |
-| [devflow-planning](skills/devflow-planning/SKILL.md) | Plan consequential changes and coverage |
-| [devflow-coordinating](skills/devflow-coordinating/SKILL.md) | Carry out a defined request and recover ongoing work |
-| [devflow-implementing](skills/devflow-implementing/SKILL.md) | Implement, open PRs early and push repairs |
-| [devflow-reviewing](skills/devflow-reviewing/SKILL.md) | Review a candidate and verify findings |
-| [devflow-verifying](skills/devflow-verifying/SKILL.md) | Reproduce behavior and run project checks |
-| [devflow-merging](skills/devflow-merging/SKILL.md) | Merge an authorized PR or gh stack |
-
-## How it works
-
-```mermaid
-flowchart LR
-    User[User request] --> Agent[Agent follows skill]
-    Agent --> Tools[Host tools, Git, gh, project commands]
-    Agent --> Helper[Python state helper]
-    Helper --> DB[(Local SQLite)]
-    Agent --> GitHub[GitHub helper through gh]
-    GitHub --> Issues[Issue assignee and Project Status]
-    GitHub --> DB
-```
-
-Enter at the role that fits the request. A small fix needs no separate planning exercise; a review-only request starts with review. Project rules determine checks, independent review and delivery requirements.
-
-```mermaid
-flowchart LR
-    Request[Implementation request] --> Claim[Claim issue and set in progress]
-    Claim --> Work[Implement a coherent change]
-    Work --> PR[Commit and open PR early]
-    PR --> Check[Review and verify as required]
-    Check -->|Repair needed| Fix[Fix and push to same PR]
-    Fix --> Check
-    PR -->|Next sequential feature| Stack[Add branch and PR to gh stack]
-    Stack --> Check
-    Check --> Merge[Coordinator merges when authorized]
-    Merge --> Record[Update issue and release claim]
-```
-
-Independent parallel issues use separate worktrees, each with one owner and work ID. Sequential unmerged issues retain that ownership while sharing a PR stack. The GitHub helper creates or reuses the issue, assigns the accountable user and updates its existing Project Status. Ownership rules, concurrency and interruption handling are defined once in [issue ownership](skills/devflow/references/ownership.md).
-
-The state helper stores work, claims, runs, results, findings and usage. The main task creates or reuses the record and claim; its execution coordinator then writes the results returned by its leaf workers. Installed hooks attribute runtime observations through both delegation levels. What is collected, how usage is attributed and what is deliberately not inferred are defined once in [work records and metrics](skills/devflow/references/state.md).
-
-`state.py metrics` reports outcomes, roles and models, delivery, ownership, recovery, timing, usage and coverage; add `--work-id ID` for one issue.
-
-The database location and helper commands are documented in [work records and metrics](skills/devflow/references/state.md); storage semantics are in the [storage contract](docs/implementation-contracts.md).
+Historical direct-agent skills, candidate trial tooling and standard-library
+state/metrics helpers remain in the source tree for existing work and explicit
+inspection. Their documentation describes those historical interfaces; normal
+installation does not activate their hooks, collect their metrics or start their
+reconciler. The [work records reference](skills/devflow/references/state.md) and
+[storage contract](docs/implementation-contracts.md) describe retained helper
+storage, separate from the delivery service's runtime configuration.
 
 ## Checks
 
 ```sh
-bash scripts/check-install.sh
+sh scripts/check-install.sh
+python3.12 -B -m unittest discover -s tests -v
 ```
 
-Devflow CI runs this installation smoke check and the helper unit tests in `tests/`:
-
-```sh
-python3.12 -m unittest discover -s tests
-```
-
-It does not run live model-driven workflow trials or target projects' suites, review/QA checks or merges; target projects retain their own check policies.
-
-[Architecture](docs/architecture.md)
+Installation checks use isolated temporary skills and Codex-home directories.
+They cover fresh installation, authentic historical upgrades, replay, refusal
+and failure rollback through the public installer/updater. Updater tests create
+tags only in their disposable local Git fixtures, because the public updater
+requires a release tag fetched from its origin. CI fetches history for these
+historical fixtures and separately checks the runtime and dashboard. These
+checks do not perform live installation, model-driven delivery, target-project
+checks, merges or deployment.
