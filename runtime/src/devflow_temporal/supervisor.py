@@ -50,7 +50,7 @@ class DeliverySupervisor:
     async def _acquire_capacity(self, job_key: str, *, cancelled=None) -> None:
         """Atomically claim one shared DB slot across config overlays and workers."""
 
-        while True:
+        def enter():
             if cancelled is not None and cancelled():
                 raise ValueError("native role cancelled before capacity admission")
             with self.store._connect() as db:
@@ -72,7 +72,10 @@ class DeliverySupervisor:
                     ).rowcount
                     if updated != 1:
                         raise NativeProcessUnknown("role capacity claim changed before launch")
-                    return
+                    return True
+            return False
+
+        while not await asyncio.to_thread(enter):
             # Ambiguous attempts retain their slots until reconciled.
             await asyncio.sleep(1)
 
@@ -233,8 +236,8 @@ class DeliverySupervisor:
         from .delivery_preparation import require_native_execution
 
         require_native_execution(request["spec"])
-        self.retained_request(request)
-        job_key, existing = self._claim(request)
+        await asyncio.to_thread(self.retained_request, request)
+        job_key, existing = await asyncio.to_thread(self._claim, request)
         if existing is not None:
             return existing
         if request["spec"].get("provider") == "codex":
@@ -325,7 +328,7 @@ class DeliverySupervisor:
             result = json.loads(result_path.read_text(encoding="utf-8"))
             from .delivery_resources import read_private, write_private
 
-            output_candidate = self._completed_candidate(request, result)
+            output_candidate = await asyncio.to_thread(self._completed_candidate, request, result)
             metadata = read_private(start_path)
             metadata.update(output_candidate=output_candidate, result_digest=digest(result))
             write_private(start_path, metadata)
@@ -395,7 +398,7 @@ class DeliverySupervisor:
             return row is not None and row["phase"] == "cancelling"
 
         try:
-            verify_prepared_spec(spec)
+            await asyncio.to_thread(verify_prepared_spec, spec)
             with self.store._connect() as db:
                 row = db.execute(
                     "SELECT state FROM delivery_attempts WHERE job_key=?", (job_key,)
@@ -415,7 +418,7 @@ class DeliverySupervisor:
                 # A supervised reattachment keeps the original durable launch contract.
                 native_request = read_private(request_path)
             _private_json(request_path, native_request)
-            _, environment = prepare_native_role(native_request, folder)
+            _, environment = await asyncio.to_thread(prepare_native_role, native_request, folder)
             process = NativeProcess(
                 spec,
                 folder,
@@ -465,7 +468,7 @@ class DeliverySupervisor:
                 }
             if native_request.get("role_evidence_key"):
                 try:
-                    result.update(seal(native_request))
+                    result.update(await asyncio.to_thread(seal, native_request))
                 except (ValueError, OSError) as exc:
                     result["status"] = "blocked"
                     result.setdefault("findings", []).append(str(exc))
@@ -475,7 +478,7 @@ class DeliverySupervisor:
                 resource_cleanup="pending_workflow_finalization",
                 native_process=outcome,
             )
-            output_candidate = self._completed_candidate(request, result)
+            output_candidate = await asyncio.to_thread(self._completed_candidate, request, result)
             journal = read_private(process.journal)
             journal["provider_session"] = {
                 "session_id": result.get("session_id"),

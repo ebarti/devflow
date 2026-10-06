@@ -176,6 +176,22 @@ class DeliveryWorkflow:
                     maximum_interval=timedelta(seconds=10),
                 )
             }
+        elif (name in {'delivery_intake', 'delivery_role', 'delivery_checks',
+                       'delivery_precheck', 'delivery_baseline_checks', 'delivery_browser_qa'}
+              and request['spec'].get('policy', {}).get('execution_backend') == 'native-macos'
+              and workflow.patched('delivery-activity-liveness-v1')):
+            options = {
+                'heartbeat_timeout': timedelta(seconds=15),
+                'schedule_to_close_timeout': timedelta(hours=hours),
+                'retry_policy': RetryPolicy(
+                    maximum_attempts=3,
+                    initial_interval=timedelta(seconds=1),
+                    maximum_interval=timedelta(seconds=10),
+                    non_retryable_error_types=[
+                        'ValueError', 'TypeError', 'PermissionError', 'NativeProcessUnknown',
+                    ],
+                ),
+            }
         elif name in {
             "delivery_metadata_readback", "delivery_gates_readback", "delivery_technical_readback",
         }:
