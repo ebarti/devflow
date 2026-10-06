@@ -88,6 +88,9 @@ class DeliveryConfig:
             raise ValueError("unsupported configured role provider")
         if value.get("execution_mode", "native-profile") not in {"native-profile", "trusted-local"}:
             raise ValueError("unsupported local execution mode")
+        attempts = value.get("provider_max_attempts", 3)
+        if type(attempts) is not int or not 1 <= attempts <= 3:
+            raise ValueError("provider_max_attempts must be between 1 and 3")
         return cls(path=path.resolve(), raw=value)
 
     @property
@@ -117,6 +120,7 @@ class DeliveryConfig:
     def public_policy(self) -> dict[str, Any]:
         return {
             "roles": self.raw["roles"],
+            "provider_max_attempts": self.raw.get("provider_max_attempts", 3),
             "repositories": [
                 {
                     "key": key,
@@ -228,6 +232,7 @@ class DeliveryConfig:
         checkout = self.state_root / "checkouts" / supplied["run_id"]
         policy = {
             "roles": self.raw["roles"],
+            "provider_max_attempts": self.raw.get("provider_max_attempts", 3),
             "checks": repository.get("checks", []),
             "prepublish_checks": repository.get("prepublish_checks", []),
             "browser_qa": repository.get("browser_qa"),
