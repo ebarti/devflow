@@ -105,6 +105,63 @@ class InstallRollback(unittest.TestCase):
         self.assertFalse(self.helper.exists())
         self.assertEqual(os.readlink(self.compatibility), str(ROOT / "skills/devflow"))
 
+    def test_agent_write_authenticates_displaced_foreign_file(self):
+        target = self.home / "agents/devflow-implementer.toml"
+        target.parent.mkdir()
+        target.write_bytes(b"old installed agent")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.rollback.capture(ROOT, self.skills, self.home)
+        backup = Path(output.getvalue().strip())
+        self.addCleanup(shutil.rmtree, backup, True)
+        spec = importlib.util.spec_from_file_location("test_agents", ROOT / "scripts/install-agents.py")
+        agents = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(agents)
+        agents.ROLLBACK = backup
+        agents.rollback_module = lambda: self.rollback
+        exchange = self.rollback.exchange
+        injected = []
+
+        def replace_before_exchange(stage, destination):
+            if destination == target:
+                target.unlink()
+                target.write_bytes(b"foreign agent at atomic writer boundary")
+                injected.append(target.lstat().st_ino)
+            exchange(stage, destination)
+
+        with mock.patch.object(self.rollback, "exchange", replace_before_exchange):
+            with self.assertRaisesRegex(ValueError, "forward installer drift preserved"):
+                agents.atomic_write(target, b"new installed agent")
+        with self.assertRaisesRegex(ValueError, "retained backup"):
+            self.rollback.restore(backup)
+        captured = [p for p in backup.glob("forward-*") if p.read_bytes() == b"foreign agent at atomic writer boundary"]
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].lstat().st_ino, injected[0])
+        self.assertEqual(target.read_bytes(), b"old installed agent")
+
+    def test_absent_agent_write_never_overwrites_concurrent_creation(self):
+        target = self.home / "agents/devflow-reviewer.toml"
+        target.parent.mkdir()
+        stage = self.home / "stage"
+        stage.write_bytes(b"new installed agent")
+        link = os.link
+        injected = []
+
+        def create_before_link(source, destination, **kwargs):
+            if destination == target:
+                target.write_bytes(b"foreign concurrently created agent")
+                injected.append(True)
+            return link(source, destination, **kwargs)
+
+        with mock.patch.object(os, "link", create_before_link):
+            with self.assertRaises(FileExistsError):
+                self.rollback.effect(self.backup, target, stage)
+        with self.assertRaisesRegex(ValueError, "retained backup"):
+            self.rollback.restore(self.backup)
+        self.assertTrue(injected)
+        self.assertEqual(target.read_bytes(), b"foreign concurrently created agent")
+        self.assertTrue((self.backup / "snapshot.json").is_file())
+
     def test_unsupported_host_refuses_without_replacement_fallback(self):
         before = os.readlink(self.compatibility)
         with mock.patch.object(sys, "platform", "unsupported"):

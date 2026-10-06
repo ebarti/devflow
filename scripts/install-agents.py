@@ -152,8 +152,9 @@ def atomic_write(path, content, mode=0o644):
         temporary.chmod(mode)
         if ROLLBACK:
             rollback = rollback_module()
-            rollback.remember(ROLLBACK, path, rollback.identity(temporary))
-        os.replace(temporary, path)
+            rollback.effect(ROLLBACK, path, temporary)
+        else:
+            os.replace(temporary, path)
     finally:
         if exists(temporary):
             temporary.unlink()
@@ -235,8 +236,9 @@ def main():
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     for target in obsolete:
         if ROLLBACK:
-            rollback_module().remember(ROLLBACK, target, {"type": "absent"})
-        target.unlink()
+            rollback_module().effect(ROLLBACK, target)
+        else:
+            target.unlink()
     for name, action in actions.items():
         if action == "copy":
             source = sources[name]

@@ -81,6 +81,7 @@ restores helper pointers, captures cleanup targets into that existing private
 backup and deletes only matching installer objects. Changed or foreign objects
 remain with actionable original/captured locations and the complete backup;
 preflight refusals restore only checkout state. It never excludes other writers.
+Forward installer writes exchange existing targets and authenticate the displaced object in that same private backup; retirement captures targets before deleting them. Concurrent drift refuses installation and retains the foreign bytes and full backup at the reported paths.
 
 ## Candidate trials
 

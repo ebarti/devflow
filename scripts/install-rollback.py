@@ -79,6 +79,37 @@ def remember(directory, path, installed):
     save_snapshot(snapshot, entries)
 
 
+def effect(directory, path, stage=None):
+    """Authenticate the object displaced by a forward installer mutation."""
+    snapshot = Path(directory) / "snapshot.json"
+    entries = json.loads(snapshot.read_text())
+    expected = entries[str(path)].get("installed", entries[str(path)]["before"])
+    remember(directory, path, identity(stage) if stage else {"type": "absent"})
+    if expected["type"] == "absent":
+        if stage:
+            os.link(stage, path, follow_symlinks=False)  # Never overwrite a new object.
+        return
+    captured = Path(directory) / ("forward-" + hashlib.sha256(str(path).encode()).hexdigest())
+    if stage:
+        exchange(stage, path)
+        os.replace(stage, captured)  # Preserve the displaced object before any cleanup.
+    else:
+        os.replace(path, captured)
+    if identity(captured) != expected:
+        message = f"{path} captured at {captured}"
+        entries = json.loads(snapshot.read_text())
+        entries[str(path)]["drift"] = message
+        save_snapshot(snapshot, entries)
+        if stage is None:
+            try:
+                os.link(captured, path, follow_symlinks=False)
+            except OSError:
+                pass  # Never overwrite a concurrently recreated destination.
+        raise ValueError("forward installer drift preserved: " + message
+                         + "; inspect retained backup " + str(directory))
+    captured.unlink()  # Only the authenticated prior installer object is retired.
+
+
 def save_snapshot(snapshot, entries):
     temporary = snapshot.with_name(".snapshot-" + str(os.getpid()))
     try:
@@ -186,7 +217,7 @@ def capture(source, skills, codex):
 
 def restore(directory, *, checkout_only=False):
     entries = {} if checkout_only else json.loads((directory / "snapshot.json").read_text())
-    conflicts = []
+    conflicts = [saved["drift"] for saved in entries.values() if "drift" in saved]
     bound = {}
     for name, saved in entries.items():
         if "installed" not in saved:
