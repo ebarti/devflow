@@ -1,8 +1,8 @@
 
 ### Fixed retry budgets
 
-Set `max_attempts` (1–10, for example 3) in the service configuration to enable
-fixed budgets for new admissions. The first budgeted admission freezes the issue's
+New admissions use a fixed `max_attempts` ceiling of 3. Set `max_attempts`
+(1–10) in the service configuration to choose a different ceiling. The first budgeted admission freezes the issue's
 attempt ceiling; all previous admissions, including archived and failed runs,
 consume it. Changing run IDs, work IDs, or later configuration cannot reset that
 ceiling. Replaying an accepted command does not consume another attempt.
@@ -13,6 +13,22 @@ grant rows to exceed it. Existing configurations and histories without the froze
 budget version retain their original behavior. Budgets are scoped to one
 authoritative tracking database; separate databases cannot enforce a shared limit.
 This supplies admission bounds for automatic retries; it does not add resubmission.
+
+### Failure classification
+
+New original runs freeze `automatic_retry_version: 1` at admission. When they
+stop, `checks.failure` records a bounded reason, the controller phase and a
+`terminal` or `transient` classification. The default is terminal. Only typed
+activity transport failures/timeouts and recognized controller deadline results
+are transient; model findings, invalid inputs, scope violations and failed or
+changed-head CI remain terminal. Returned provider findings also remain terminal.
+
+This is a diagnostic, not permission to execute again. Unknown cleanup and
+publication effects retain their existing guards. It does not schedule a retry
+or extend a budget. Scope amendments preserve the original version markers and
+attempt ceiling. Existing workflows and historical continuation paths keep their
+original payloads. Operator steps: deploy through the usual service update when
+ready; this change requires no migration or manual continuation.
 
 ### Rerun gates after a runtime repair
 

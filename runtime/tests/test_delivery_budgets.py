@@ -11,6 +11,7 @@ from temporalio.worker import Replayer
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_stopped_resume
+from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_guard import validate_native_turn
 from devflow_temporal.delivery_store import DeliveryStore
@@ -110,9 +111,17 @@ def test_command_replays_and_different_issues_do_not_spend_another_attempt(servi
     assert store.submit(other)['existing'] is False
 
 
-def test_enabling_budgets_counts_original_legacy_admissions(service):
+def test_enabling_budgets_counts_original_legacy_admissions(service, monkeypatch):
     store, request = service
-    store.submit(request)
+    # Retained pre-budget input, rather than a new admission under today's defaults.
+    legacy = store.config.admit(request)
+    legacy.pop('automatic_retry_version', None)
+    legacy.pop('retry_budget_version', None)
+    legacy['policy'].pop('max_attempts', None)
+    legacy['policy_digest'] = digest(legacy['policy'])
+    with monkeypatch.context() as historical:
+        historical.setattr(DeliveryConfig, 'admit', lambda *_args: copy.deepcopy(legacy))
+        store.submit(request)
     assert 'retry_budget_version' not in store.submitted_spec(request['run_id'])
     finish(store, request, archived=True)
     store = configured(store, max_attempts=1)

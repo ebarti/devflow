@@ -132,7 +132,7 @@ class DeliveryConfig:
             "intake_enabled": "intake" in self.raw["roles"],
             "execution_backend": self.raw.get("execution_backend", "native-macos"),
             "execution_mode": self.raw.get("execution_mode", "native-profile"),
-            "max_attempts": self.raw.get("max_attempts"),
+            "max_attempts": self.raw.get("max_attempts", 3),
             "max_repairs": self.raw.get("max_repairs", 2),
         }
 
@@ -253,11 +253,10 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
-        if "max_attempts" in self.raw:
-            maximum = self.raw["max_attempts"]
-            if type(maximum) is not int or not 1 <= maximum <= 10:
-                raise ValueError("max_attempts must be an integer between 1 and 10")
-            policy["max_attempts"] = maximum
+        maximum = self.raw.get("max_attempts", 3)
+        if type(maximum) is not int or not 1 <= maximum <= 10:
+            raise ValueError("max_attempts must be an integer between 1 and 10")
+        policy["max_attempts"] = maximum
         baseline_ids = repository.get("baseline_check_ids", [])
         if (not isinstance(baseline_ids, list)
                 or any(not isinstance(item, str) for item in baseline_ids)
@@ -470,6 +469,7 @@ class DeliveryConfig:
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
+            "automatic_retry_version": 1,
             **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
             **({"baseline_checks_version": 1} if baseline_ids else {}),
             **(
@@ -577,6 +577,16 @@ def scope_amended_spec(
         effective.pop("plan_approval")
     if "blocking_questions_version" not in original:
         effective.pop("blocking_questions_version")
+    for marker in ("automatic_retry_version", "retry_budget_version"):
+        if marker in original:
+            effective[marker] = original[marker]
+        else:
+            effective.pop(marker, None)
+    if "max_attempts" in original["policy"]:
+        effective["policy"]["max_attempts"] = original["policy"]["max_attempts"]
+    else:
+        effective["policy"].pop("max_attempts", None)
+    effective["policy_digest"] = digest(effective["policy"])
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
