@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from .contracts import RUN_ID_RE, digest
 from .delivery_native_guard import NATIVE_OVERRIDES
 from .delivery_origin import thread_uuid
+from .delivery_publication import publication_summary
 from .delivery_sandbox import validate_network_domain
 from .runtime_dependencies import locked_dependency_identity
 
@@ -134,7 +135,9 @@ class DeliveryConfig:
             "execution_mode": self.raw.get("execution_mode", "native-profile"),
         }
 
-    def admit(self, supplied: dict[str, Any]) -> dict[str, Any]:
+    def admit(
+        self, supplied: dict[str, Any], *, legacy_publication: bool = False
+    ) -> dict[str, Any]:
         required = {
             "command_id",
             "run_id",
@@ -148,12 +151,21 @@ class DeliveryConfig:
         }
         optional = {
             "accepted_plan", "recovery_key", "supersedes_run_id",
-            "plan_approval", "origin_thread_id"
+            "plan_approval", "origin_thread_id", "publication_summary"
         }
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
             raise ValueError("required submit fields must be non-empty strings")
+        if "publication_summary" in supplied and supplied["publication_summary"] is None:
+            raise ValueError("publication_summary must be a non-empty conventional summary")
+        summary = (
+            {} if legacy_publication else {
+                "publication_summary": publication_summary(
+                    supplied["goal"], supplied.get("publication_summary")
+                )
+            }
+        )
         accepted_plan = supplied.get("accepted_plan")
         if "origin_thread_id" in supplied:
             thread_uuid(supplied["origin_thread_id"])
@@ -458,6 +470,7 @@ class DeliveryConfig:
                     raise ValueError("browser QA requires positive count and bounded timeout")
         return {
             **supplied,
+            **summary,
             "plan_approval": plan_approval,
             "blocking_questions_version": 1,
             "accepted_plan": accepted_plan or "",
@@ -552,6 +565,7 @@ def scope_amended_spec(
         "recovery_key", "supersedes_run_id",
         "plan_approval",
         "origin_thread_id",
+        "publication_summary",
     }
     from .delivery_preparation import require_native_execution
 
@@ -561,7 +575,8 @@ def scope_amended_spec(
         # Re-admit the original raw goal; its separately bound plan is immutable.
         supplied.pop("accepted_plan", None)
         supplied["plan_approval"] = original.get("plan_approval", "required")
-    effective = amended.admit(supplied)
+    # Re-admission of a historical frozen spec must not acquire new metadata.
+    effective = amended.admit(supplied, legacy_publication="publication_summary" not in original)
     effective["accepted_plan"] = original["accepted_plan"]
     if "plan_approval" in original:
         effective["plan_approval"] = original["plan_approval"]
@@ -579,6 +594,8 @@ def scope_amended_spec(
             raise ValueError("scope amendment changed the admitted run identity")
     if effective.get("origin_thread_id") != original.get("origin_thread_id"):
         raise ValueError("scope amendment changed the originating thread")
+    if effective.get("publication_summary") != original.get("publication_summary"):
+        raise ValueError("scope amendment changed the publication summary")
     effective["request_digest"] = original["request_digest"]
     if "continuation" in original:
         effective["continuation"] = original["continuation"]

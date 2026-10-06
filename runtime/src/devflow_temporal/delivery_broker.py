@@ -21,6 +21,7 @@ from .delivery_browser_qa import run_browser_qa as execute_browser_qa
 from .delivery_config import publication_base_ref
 from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
 from .delivery_output import observed_test_count, rejection_causes, visible_output
+from .delivery_publication import conventional, publication_summary
 from .delivery_store import DeliveryStore, _now
 
 
@@ -70,7 +71,14 @@ def conventional_subject(goal: str) -> str:
 
 
 def _conventional_subject(subject: str) -> bool:
-    return bool(re.fullmatch(r"[a-z][a-z0-9-]*(?:\([^()\r\n]+\))?!?: \S.*", subject))
+    return conventional(subject)
+
+
+def publication_subject(spec: dict[str, Any]) -> str:
+    """Use frozen summary metadata; preserve old goals for historical specs."""
+    if "publication_summary" in spec:
+        return publication_summary(spec["goal"], spec["publication_summary"])
+    return conventional_subject(spec["goal"])
 
 
 def publication_title(goal: str) -> str:
@@ -1287,7 +1295,7 @@ class DeliveryBroker:
                     "commit",
                     "--signoff",
                     "-m",
-                    conventional_subject(self.spec["goal"]),
+                    publication_subject(self.spec),
                 )
         self._validate_publication_commits()
         head = _git(self.checkout, "rev-parse", "HEAD")
@@ -1315,13 +1323,13 @@ class DeliveryBroker:
                     raise RuntimeError("remote feature branch diverged")
             _git(self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}")
         if existing is None:
-            title = publication_title(self.spec["goal"])
+            title = publication_title(publication_subject(self.spec))
             body = self.state_dir / "pull-request.md"
             body.write_text(
                 self.spec["policy"].get("pr_body")
                 or (
                     f"{title}\n\n"
-                    f"Implements issue {self.spec['issue_url']} under the accepted local plan. "
+                    f"Addresses {self.spec['issue_url']} under the accepted local plan. "
                     "This PR is published for review and remains unmerged.\n"
                 ),
                 encoding="utf-8",

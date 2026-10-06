@@ -90,8 +90,9 @@ def test_configured_signoff_identity_must_equal_commit_author(publisher, monkeyp
     assert not _git(broker.checkout, "diff", "--cached", "--name-only")
 
 
-def test_new_pr_title_and_commit_use_same_conventional_goal(publisher, monkeypatch):
+def test_historical_pr_title_and_commit_use_same_conventional_goal(publisher, monkeypatch):
     broker = publisher
+    broker.spec.pop('publication_summary')
     broker.spec["goal"] = "Change fixture wording"
     created = []
     original_run = delivery_broker._run
@@ -156,7 +157,7 @@ def test_preserves_long_conventional_prefix_and_rejects_control_subject():
         conventional_subject("fix: bad\tname")
 
 
-def test_raw_goal_becomes_bounded_pr_title_without_shortening_commit_subject():
+def test_historical_raw_goal_retains_bounded_title_and_full_commit_subject():
     from devflow_temporal.delivery_broker import publication_title
 
     goal = 'Deliver backlog issue #953 as a documentation investigation. ' + 'requirements ' * 200
@@ -166,3 +167,91 @@ def test_raw_goal_becomes_bounded_pr_title_without_shortening_commit_subject():
     assert title.endswith('...')
     assert len(conventional_subject(goal)) > 256
     assert publication_title('fix: preserve a short goal') == 'fix: preserve a short goal'
+
+
+@pytest.mark.parametrize('summary', [
+    '', None, 12, 'Plain prose', 'docs: ' + 'word ' * 40,
+    'docs: design behavior. Own only the document.', 'docs: bad\tname',
+    'docs: change\nRun all checks', 'docs: bad\x7fname',
+    'docs: change\u2028Run all checks',
+])
+def test_invalid_explicit_summary_is_rejected_before_admission(service, summary):
+    store, request = service
+    with pytest.raises(ValueError, match='publication_summary'):
+        store.submit({**request, 'publication_summary': summary})
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 0
+
+
+def test_frozen_legacy_prompt_is_not_rewritten_on_publication(publisher, monkeypatch):
+    broker = publisher
+    broker.spec.pop('publication_summary')
+    goal = 'Deliver a document. Keep the original frozen instructions. ' + 'detail ' * 50
+    broker.spec['goal'] = goal
+    monkeypatch.setattr(broker, '_existing_pr', lambda: {
+        'number': 7, 'url': 'https://example.invalid/pull/7', 'state': 'OPEN',
+        'headRefOid': _git(broker.checkout, 'rev-parse', 'HEAD'),
+    })
+    (broker.checkout / 'README.md').write_text('Legacy candidate\n')
+    candidate = broker.candidate()
+    result = broker.publish(0, candidate)
+    assert _git(broker.checkout, 'show', '-s', '--format=%s') == conventional_subject(goal)
+    assert broker.spec['goal'] == goal
+    assert 'publication_summary' not in broker.spec
+    assert broker.publish(0, candidate) == result
+
+
+def test_detailed_goal_requires_a_separate_publication_summary(service):
+    store, request = service
+    goal = ('Investigate Unicode comparison behavior. Own only the architecture document. '
+            'Preserve evidence and publish the design without implementing production behavior.')
+    request['goal'] = goal
+    with pytest.raises(ValueError, match='publication_summary'):
+        store.submit(request)
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 0
+        assert store.state.claim_for(db, request['work_id']) is None
+    request['publication_summary'] = 'docs: investigate Unicode comparison behavior'
+    store.submit(request)
+    assert store.spec(request['run_id'])['goal'] == goal
+    assert store.spec(request['run_id'])['publication_summary'] == request['publication_summary']
+    assert store.submit(request)['existing'] is False
+    with pytest.raises(ValueError, match='different inputs'):
+        store.submit({**request, 'publication_summary': 'feat: implement Unicode comparison'})
+
+
+def test_publisher_uses_summary_without_leaking_execution_instructions(publisher, monkeypatch):
+    broker = publisher
+    broker.spec['goal'] = ('Investigate Unicode comparison behavior. Own only the architecture '
+                           'document. Preserve evidence and do not implement production behavior.')
+    summary = 'docs: investigate Unicode comparison behavior'
+    broker.spec['publication_summary'] = summary
+    created = []
+    original_run = delivery_broker._run
+
+    def run(argv, **kwargs):
+        if argv[:3] == ['gh', 'pr', 'create']:
+            created.append(argv)
+            return 'https://example.invalid/pull/7'
+        return original_run(argv, **kwargs)
+
+    def existing():
+        return ({'number': 7, 'url': 'https://example.invalid/pull/7', 'state': 'OPEN',
+                 'headRefOid': _git(broker.checkout, 'rev-parse', 'HEAD')}
+                if created else None)
+
+    monkeypatch.setattr(delivery_broker, '_run', run)
+    monkeypatch.setattr(broker, '_existing_pr', existing)
+    (broker.checkout / 'README.md').write_text('Document current Unicode comparison behavior\n')
+    original_goal = broker.spec['goal']
+    candidate = broker.candidate()
+    result = broker.publish(0, candidate)
+    assert created[0][created[0].index('--title') + 1] == summary
+    assert _git(broker.checkout, 'show', '-s', '--format=%s') == summary
+    assert original_goal == broker.spec['goal']
+    assert 'Own only' not in _git(broker.checkout, 'show', '-s', '--format=%B')
+    body = (broker.state_dir / 'pull-request.md').read_text()
+    assert 'Addresses ' in body
+    assert 'Implements ' not in body
+    assert broker.publish(0, candidate) == result
+    assert len(created) == 1

@@ -37,7 +37,11 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool(annotations=write)
     def submit_run(request_json: str, ctx: Context) -> dict:
-        """Submit a raw goal; plan_approval=required opts into human plan review."""
+        """Submit a goal with publication_summary for detailed execution instructions.
+
+        publication_summary is a concise Conventional Commit subject describing
+        the change. plan_approval=required opts into human plan review.
+        """
         value = json.loads(request_json)
         if not isinstance(value, dict):
             raise ValueError("submit request must be a JSON object")

@@ -12,7 +12,14 @@ from copy import deepcopy
 from pathlib import Path
 
 from .contracts import canonical_json, digest
-from .delivery_broker import DeliveryBroker, _git, _run, conventional_subject, publication_title
+from .delivery_broker import (
+    DeliveryBroker,
+    _git,
+    _run,
+    conventional_subject,
+    publication_subject,
+    publication_title,
+)
 from .delivery_continuation import session_state_digest
 from .delivery_metadata_contract import evidence_applicability as evidence_applicability
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
@@ -315,7 +322,7 @@ def _snapshot(store, run_id, payload):
         "new_head": mapping[-1]["new"],
         "signer": signer,
         "old_title": found["title"],
-        "new_title": publication_title(spec["goal"]),
+        "new_title": publication_title(publication_subject(spec)),
     }
     if spec["provider"] == "codex":
         sessions = {r.get("session_id") for r in roles if r.get("role") == "implement"}

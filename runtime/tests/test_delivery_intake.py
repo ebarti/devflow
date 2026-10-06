@@ -732,6 +732,8 @@ def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
         # Historical durable input, not a new public submission.
         spec.pop("plan_approval")
         spec.pop("blocking_questions_version")
+        spec.pop("publication_summary")
+        spec["goal"] += ". Preserve the existing detailed execution instructions."
         with store._connect() as db:
             db.execute("UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'",
                        (json.dumps(spec),))
@@ -752,6 +754,8 @@ def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
     assert effective.get("plan_approval") == original.get("plan_approval")
     assert ("plan_approval" in effective) == ("plan_approval" in original)
     assert effective.get("origin_thread_id") == original.get("origin_thread_id")
+    assert effective.get("publication_summary") == original.get("publication_summary")
+    assert ("publication_summary" in effective) == ("publication_summary" in original)
     assert effective.get("blocking_questions_version") == original.get("blocking_questions_version")
     assert ("blocking_questions_version" in effective) == ("blocking_questions_version" in original)
     assert effective["accepted_plan"] == original["accepted_plan"]
