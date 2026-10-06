@@ -131,7 +131,10 @@ def retry_once(store):
                     or result.get('checks', {}).get('resource_cleanup')
                     != checks['resource_cleanup']):
                 continue
-            observe_finalized_resources(spec)
+            observed = observe_finalized_resources(spec)
+            expected_cleanup = checks['resource_cleanup'].get('receipt_sha256')
+            if not expected_cleanup or observed['finalization_sha256'] != expected_cleanup:
+                continue
             base = fresh_unpublished_base(store, spec)
             identity = digest({'run_id': spec['run_id'],
                                'request_digest': row['request_digest']})[:24]

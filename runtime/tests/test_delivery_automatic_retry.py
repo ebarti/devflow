@@ -19,7 +19,7 @@ def stopped(service, monkeypatch):
                'reason': 'transport unavailable', 'cause_type': 'TimeoutError'}
     checks = {'failure': failure, 'resource_cleanup': {
         'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
-        'resource_cleanup': 'confirmed'}}
+        'resource_cleanup': 'confirmed', 'receipt_sha256': 'fixture-finalization'}}
     store.project(request['run_id'], phase='blocked', execution_state='blocked',
                   event_type='blocked', message='retained failure', outcome='blocked',
                   cleanup='confirmed', checks=checks)
@@ -32,7 +32,7 @@ def stopped(service, monkeypatch):
               'phase': 'blocked', 'execution_state': 'blocked',
               'cleanup': 'confirmed', 'checks': checks}}
     monkeypatch.setattr(DeliveryStore, '_completed_temporal_result', lambda *_a, **_k: closed)
-    monkeypatch.setattr(retry, 'observe_finalized_resources', lambda *_a, **_k: {'observed': True})
+    monkeypatch.setattr(retry, 'observe_finalized_resources', lambda *_a, **_k: {'finalization_sha256': 'fixture-finalization'})
     monkeypatch.setattr(retry, 'fresh_unpublished_base', lambda *_a: spec['base_sha'])
     return store, request, closed
 
@@ -208,3 +208,12 @@ async def test_service_loop_admits_closed_transient_successor_without_an_operato
         rows = [json.loads(row[0]) for row in db.execute('SELECT request_json FROM delivery_runs')]
         assert len(rows) == 2
         assert rows[1]['supersedes_run_id'] == request['run_id']
+
+
+def test_actual_cleanup_must_match_closed_controller_finalization_hash(service, monkeypatch):
+    store, request, _ = stopped(service, monkeypatch)
+    monkeypatch.setattr(retry, 'observe_finalized_resources',
+                        lambda *_a: {'finalization_sha256': 'changed-finalization'})
+    assert retry.retry_once(store) == []
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
