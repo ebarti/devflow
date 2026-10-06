@@ -9,7 +9,8 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from .contracts import digest
 from .delivery_metadata_contract import evidence_applicability
@@ -190,7 +191,9 @@ class DeliveryWorkflow:
         else:
             options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         timeout = timedelta(hours=hours)
-        if name in {"delivery_terminal_tracker", "delivery_terminal_preflight"}:
+        if name in {"delivery_terminal_tracker", "delivery_terminal_preflight"} or (
+            name == "delivery_tracker_start" and "timeout_seconds" in request
+        ):
             timeout = timedelta(seconds=min(request.get("timeout_seconds", 180), 180))
             options["schedule_to_close_timeout"] = timeout
         return await workflow.execute_activity(
@@ -304,7 +307,10 @@ class DeliveryWorkflow:
                 "status": "in-review" if event == "delivered" else "blocked",
                 "release": release, "reason": self.state.get("error") or message,
                 "cycles": 0, "attempts": 0, "waiting": False,
-                "deadline": (workflow.now() + timedelta(minutes=10)).isoformat(),
+                "deadline": (workflow.now() + timedelta(seconds=(
+                    spec["policy"]["tracker_retry_seconds"]
+                    if spec.get("tracker_retry_version") == 1 else 600
+                ))).isoformat(),
             }
             self.state["checks"]["terminal_tracker_checkpoint"] = checkpoint
             if not await self._finish_terminal_tracker(spec, checkpoint):
@@ -354,7 +360,10 @@ class DeliveryWorkflow:
                     )
                 except Exception as exc:
                     self.state["tracker"] = {"state": "pending", "pending": True,
-                                             "reason": type(exc).__name__}
+                                             "reason": type(exc).__name__,
+                                             **({"retryable": isinstance(exc, ActivityError)
+                                                 and isinstance(exc.cause, ActivityTimeoutError)}
+                                                if spec.get("tracker_retry_version") == 1 else {})}
                 if self.state["tracker"].get("state") == "consistent":
                     checkpoint["state"] = "confirmed"
                     self.state.update({key: checkpoint[key] for key in (
@@ -362,13 +371,42 @@ class DeliveryWorkflow:
                     )})
                     self.state["revision"] += 1
                     return True
+                if (spec.get("tracker_retry_version") == 1
+                        and not self.state["tracker"].get("retryable")):
+                    checkpoint.update(state="conflicted", waiting=False, closed=True)
+                    self.state.update(
+                        phase="blocked", execution_state="blocked", outcome="blocked",
+                        error="terminal tracker synchronization conflicted",
+                    )
+                    return False
                 self.state.update(phase="waiting_tracker", execution_state="waiting_tracker",
                                   outcome=None, error="terminal tracker readback is pending")
                 self.state["revision"] += 1
                 await self._project(spec, "tracker_pending",
                                     "Terminal tracker reconciliation is pending")
                 if attempt < 2:
-                    await workflow.sleep(timedelta(seconds=2 ** (attempt + 1)))
+                    delay = min(2 ** (attempt + 1), max(0, (
+                        datetime.fromisoformat(checkpoint["deadline"]) - workflow.now()
+                    ).total_seconds())) if spec.get("tracker_retry_version") == 1 else (
+                        2 ** (attempt + 1)
+                    )
+                    await workflow.sleep(timedelta(seconds=delay))
+            if spec.get("tracker_retry_version") == 1:
+                remaining = datetime.fromisoformat(checkpoint["deadline"]) - workflow.now()
+                if remaining.total_seconds() <= 0:
+                    checkpoint.update(state="pending", waiting=False, closed=True)
+                    return False
+                # Reuse the same owned intent. A durable timer replaces the manual
+                # update wait; no new feature role or repair iteration is admitted.
+                try:
+                    await workflow.wait_condition(
+                        lambda: self.tracker_retry_requested,
+                        timeout=min(remaining, timedelta(seconds=30)),
+                    )
+                except TimeoutError:
+                    pass
+                self.tracker_retry_requested = False
+                continue
             checkpoint.update(state="pending", waiting=True)
             self.state["revision"] += 1
             await self._project(spec, "tracker_retry_required",
@@ -381,6 +419,38 @@ class DeliveryWorkflow:
                 checkpoint.update(state="pending", waiting=False, closed=True)
                 return False
             self.tracker_retry_requested = False
+
+    async def _start_tracker(self, spec: dict[str, Any]) -> dict[str, Any]:
+        if spec.get("tracker_retry_version") != 1:
+            return await self._activity("delivery_tracker_start", {"spec": spec})
+        deadline = workflow.now() + timedelta(seconds=spec["policy"]["tracker_retry_seconds"])
+        progress = {"attempts": 0, "deadline": deadline.isoformat()}
+        self.state["checks"]["tracker_retry"] = progress
+        delay = 2
+        while True:
+            if self.cancel_requested:
+                return {"state": "cancelled", "retryable": False}
+            remaining = (deadline - workflow.now()).total_seconds()
+            if remaining <= 0:
+                return self.state["tracker"]
+            progress["attempts"] += 1
+            try:
+                result = await self._activity("delivery_tracker_start", {
+                    "spec": spec, "timeout_seconds": max(1, min(180, int(remaining))),
+                })
+            except ActivityError as exc:
+                if not isinstance(exc.cause, ActivityTimeoutError):
+                    raise
+                result = {"state": "pending", "retryable": True,
+                          "reason": "tracker activity timed out"}
+            self.state["tracker"] = result
+            if result.get("state") == "consistent" or not result.get("retryable"):
+                return result
+            self.state["revision"] += 1
+            await self._project(spec, "tracker_pending", "Waiting for owned tracker readback")
+            remaining = max(0, (deadline - workflow.now()).total_seconds())
+            await self._wait_repair_readback(min(delay, remaining))
+            delay = min(delay * 2, 30)
 
     async def _stop(self, spec: dict[str, Any], reason: str) -> dict[str, Any]:
         if any(
@@ -783,12 +853,14 @@ class DeliveryWorkflow:
         self.state["revision"] += 1
         await self._project(spec, "tracker_start", "Claimed issue entering In progress")
         try:
-            started_tracker = await self._activity("delivery_tracker_start", {"spec": spec})
+            started_tracker = await self._start_tracker(spec)
         except Exception as exc:
             return await self._stop(
                 spec, f"initial tracker synchronization pending: {type(exc).__name__}"
             )
         self.state["tracker"] = started_tracker
+        if spec.get("tracker_retry_version") == 1 and self.cancel_requested:
+            return await self._cancelled(spec)
         if started_tracker.get("state") != "consistent":
             return await self._stop(spec, "initial tracker readback remains pending")
         prompt = spec["policy"].get("initial_decision_prompt")

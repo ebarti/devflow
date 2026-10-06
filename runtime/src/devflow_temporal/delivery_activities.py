@@ -545,6 +545,22 @@ def _terminal_receipt(store, spec, status, release, project, assignee, desired):
             "readback_at": sync["readback_at"]}
 
 
+def _tracker_helper_retryable(result) -> bool:
+    try:
+        error = json.loads(result.stderr)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(error, dict) and error.get("error_type") in {
+        "GitHubTransientError", "TimeoutExpired", "ConnectionError",
+    }
+
+
+def _tracker_error_retryable(exc) -> bool:
+    return isinstance(exc, (subprocess.TimeoutExpired, TimeoutError, ConnectionError)) or (
+        isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).casefold()
+    )
+
+
 def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
                   terminal: bool = False, reason: str | None = None) -> dict[str, Any]:
     store, _ = _context(spec)
@@ -567,6 +583,7 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
             "state": "unconfigured",
             "desired": desired,
             "pending": True,
+            "retryable": False,
             "reason": "tracker project or assignee is missing",
         }
     script = store.config.helpers_dir / "github.py"
@@ -591,7 +608,8 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
                     or current != prior or observed.get("expected") != prior["observed"]["expected"]
                     or bool(observed.get("claim")) != (not release)):
                 return {"state": "pending", "pending": True, "desired": desired,
-                        "observed": observed, "reason": "acknowledged terminal readback is pending",
+                        "observed": observed, "retryable": _tracker_helper_retryable(audit),
+                        "reason": "acknowledged terminal readback is pending",
                         "readback_at": _now()}
             return {**prior, "observed": observed, "readback_at": _now()}
     command = [
@@ -629,6 +647,7 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
             "state": "pending",
             "desired": desired,
             "pending": True,
+            "retryable": _tracker_helper_retryable(result),
             "reason": (result.stderr or result.stdout).strip()[:500],
         }
     if terminal:
@@ -665,6 +684,7 @@ def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
             "state": "pending",
             "desired": desired,
             "pending": True,
+            "retryable": _tracker_helper_retryable(audit),
             "reason": (audit.stderr or audit.stdout).strip()[:500],
         }
     observed = json.loads(audit.stdout)
@@ -700,10 +720,14 @@ async def delivery_tracker_start(request: dict[str, Any]) -> dict[str, Any]:
         return {"state": "consistent", "observed": {"fixture": True}}
     try:
         return await asyncio.to_thread(_tracker_sync, request["spec"], "in-progress", release=False)
-    except (subprocess.TimeoutExpired, sqlite3.OperationalError) as exc:
-        if not request.get("repair_continuation"):
+    except (
+        subprocess.TimeoutExpired, sqlite3.OperationalError, TimeoutError, ConnectionError,
+    ) as exc:
+        if not request.get("repair_continuation") and "timeout_seconds" not in request:
             raise
-        return {"state": "pending", "reason": type(exc).__name__}
+        return {"state": "pending", "reason": type(exc).__name__,
+                **({"retryable": _tracker_error_retryable(exc)}
+                   if "timeout_seconds" in request else {})}
 
 
 @activity.defn(name="delivery_tracker")
@@ -729,6 +753,8 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         return {
             "state": "pending", "pending": True, "reason": type(exc).__name__,
+            **({"retryable": _tracker_error_retryable(exc)}
+               if request["spec"].get("tracker_retry_version") == 1 else {}),
             "desired": f"{request['status']}; claim "
                        + ("released" if request["release"] else "retained pending cleanup"),
             "readback_at": _now(),

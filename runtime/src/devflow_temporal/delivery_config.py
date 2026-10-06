@@ -132,6 +132,7 @@ class DeliveryConfig:
             "intake_enabled": "intake" in self.raw["roles"],
             "execution_backend": self.raw.get("execution_backend", "native-macos"),
             "execution_mode": self.raw.get("execution_mode", "native-profile"),
+            "tracker_retry_seconds": self.raw.get("tracker_retry_seconds", 600),
         }
 
     def admit(self, supplied: dict[str, Any]) -> dict[str, Any]:
@@ -252,6 +253,10 @@ class DeliveryConfig:
             else [],
         }
         baseline_ids = repository.get("baseline_check_ids", [])
+        duration = self.raw.get("tracker_retry_seconds", 600)
+        if type(duration) is not int or not 60 <= duration <= 3600:
+            raise ValueError("tracker_retry_seconds must be an integer from 60 to 3600")
+        policy["tracker_retry_seconds"] = duration
         if (not isinstance(baseline_ids, list)
                 or any(not isinstance(item, str) for item in baseline_ids)
                 or len(set(baseline_ids)) != len(baseline_ids)):
@@ -463,6 +468,7 @@ class DeliveryConfig:
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
+            "tracker_retry_version": 1,
             **({"baseline_checks_version": 1} if baseline_ids else {}),
             **(
                 {"preparation_version": 1}
@@ -569,6 +575,15 @@ def scope_amended_spec(
         effective.pop("plan_approval")
     if "blocking_questions_version" not in original:
         effective.pop("blocking_questions_version")
+    if "tracker_retry_version" in original:
+        effective["tracker_retry_version"] = original["tracker_retry_version"]
+    else:
+        effective.pop("tracker_retry_version", None)
+    if "tracker_retry_seconds" in original["policy"]:
+        effective["policy"]["tracker_retry_seconds"] = original["policy"]["tracker_retry_seconds"]
+    else:
+        effective["policy"].pop("tracker_retry_seconds", None)
+    effective["policy_digest"] = digest(effective["policy"])
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
