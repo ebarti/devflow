@@ -107,7 +107,8 @@ def test_explicit_selection_requires_a_structured_test_step_and_fixed_test_file(
         planned_checks(spec, checkout, evidence)
 
 
-def test_node_selection_uses_locked_vitest_and_retained_junit(project):
+@pytest.mark.parametrize('explicit_selector', [False, True])
+def test_node_selection_uses_locked_vitest_and_retained_junit(project, explicit_selector):
     spec, checkout, _, evidence = project
     package = checkout / 'api'
     (package / 'test').mkdir(parents=True)
@@ -116,8 +117,11 @@ def test_node_selection_uses_locked_vitest_and_retained_junit(project):
     (checkout / 'package.json').write_text('{"packageManager":"pnpm@10.33.3"}')
     (checkout / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
     _git(checkout, 'add', '.')
-    spec.update(accepted_plan=json.dumps({'verification': ['Run focused API tests']}),
-                verification_test_paths=['api/test/audit.test.ts'])
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Run API audit.test.ts twice and retain audit.test.ts evidence']})
+    if explicit_selector:
+        spec['verification_test_paths'] = ['api/test/audit.test.ts']
+    before = dict(spec)
     checks = planned_checks(spec, checkout, evidence)
     assert len(checks) == 1
     test = checks[0]
@@ -126,8 +130,38 @@ def test_node_selection_uses_locked_vitest_and_retained_junit(project):
     assert test['cwd'] == 'api'
     assert test['min_tests'] == 1
     assert 'pnpm-lock.yaml' in test['plan_provenance']['metadata']
+    assert spec == before
     (checkout / 'pnpm-lock.yaml').unlink()
     with pytest.raises(FileNotFoundError):
+        planned_checks(spec, checkout, evidence)
+
+
+@pytest.mark.parametrize('failure', ['missing', 'duplicate', 'symlink', 'package', 'bounded'])
+def test_named_node_tests_reject_missing_ambiguous_or_unsealed_owners(project, failure):
+    spec, checkout, _, evidence = project
+    package = checkout / 'api'
+    (package / 'test').mkdir(parents=True)
+    test = package / 'test/audit.test.ts'
+    test.write_text('test("audit", () => {});')
+    (package / 'package.json').write_text(json.dumps({'devDependencies': {'vitest': '4.1.11'}}))
+    (checkout / 'package.json').write_text('{"packageManager":"pnpm@10.33.3"}')
+    (checkout / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': ['Run API audit.test.ts']})
+    if failure == 'missing':
+        _git(checkout, 'rm', '--cached', 'api/test/audit.test.ts')
+    elif failure == 'duplicate':
+        (package / 'audit.test.ts').write_text('duplicate')
+        _git(checkout, 'add', '.')
+    elif failure == 'symlink':
+        test.unlink()
+        test.symlink_to(Path(__file__).resolve())
+    elif failure == 'package':
+        (package / 'package.json').write_text('{}')
+    else:
+        spec['accepted_plan'] = json.dumps({'verification': [
+            'Run ' + ' '.join(f'case{i}.test.ts' for i in range(33))]})
+    with pytest.raises(ValueError):
         planned_checks(spec, checkout, evidence)
 
 
@@ -173,6 +207,43 @@ def test_real_tracked_recipe_retains_candidate_bound_junit(junit_project):
     assert spec == before  # Neither frozen plan nor configured commands changed.
 
 
+def test_named_node_junit_recipe_is_not_redirected_to_vitest(junit_project):
+    spec, checkout, _, evidence = junit_project
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Run the configured scripts recipe from scripts/checks.toml with owned JUnit '
+        'output for scripts/report.test.mjs.']})
+    checks = planned_checks(spec, checkout, evidence)
+    assert len(checks) == 1
+    assert checks[0]['plan_provenance']['recipe'] == 'checks.scripts'
+    spec['verification_test_paths'] = ['scripts/report.test.mjs']
+    with pytest.raises(ValueError, match='tracked package owner'):
+        planned_checks(spec, checkout, evidence)
+
+
+def test_node_recipe_option_value_does_not_prove_named_test_execution(junit_project):
+    import subprocess
+
+    spec, checkout, metadata, evidence = junit_project
+    script = checkout / 'scripts/other.mjs'
+    script.write_text('import test from "node:test"; '
+                      'test("scripts/report.test.mjs", () => {});\n')
+    metadata.write_text(metadata.read_text().replace(
+        '"--test-reporter=junit",',
+        '"--test-name-pattern","scripts/report.test.mjs","--test-reporter=junit",'
+    ).replace('"scripts/report.test.mjs"]', '"scripts/other.mjs"]'))
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Run the configured scripts recipe from scripts/checks.toml with owned JUnit output.']})
+    recipe = planned_checks(spec, checkout, evidence)[0]
+    (evidence / recipe['id'] / 'pytest-artifacts').mkdir(parents=True)
+    subprocess.run(recipe['argv'], cwd=checkout, check=True, capture_output=True)
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Run the configured scripts recipe from scripts/checks.toml with owned JUnit '
+        'output for scripts/report.test.mjs.']})
+    with pytest.raises(ValueError, match='tracked package owner'):
+        planned_checks(spec, checkout, evidence)
+
+
 @pytest.mark.parametrize('bad', ['untracked', 'symlink', 'no-report', 'two-reports',
                                  'timeout', 'kind', 'cwd', 'unnamed'])
 def test_recipe_rejects_unsealed_or_unbounded_execution(junit_project, bad):
@@ -193,3 +264,81 @@ def test_recipe_rejects_unsealed_or_unbounded_execution(junit_project, bad):
         metadata.write_text(metadata.read_text().replace(old, new))
     with pytest.raises(ValueError):
         planned_checks(spec, checkout, evidence)
+
+
+def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_project):
+    spec, checkout, metadata, evidence = junit_project
+    metadata.write_text(metadata.read_text() + '\n[checks.diff]\nkind="static"\n'
+                        'argv=["git","diff","--check","origin/main...HEAD"]\n'
+                        '\n[checks.docs]\nkind="static"\nargv=["corepack","pnpm","docs:build"]\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Execute tracked scripts/checks.toml checks.diff and checks.docs.']})
+    spec['policy'] = {'checks': [{'id': 'diff', 'argv': ['git', 'diff', '--check']}]}
+    before = json.dumps(spec, sort_keys=True)
+    checks = planned_checks(spec, checkout, evidence)
+    assert [c['plan_provenance']['recipe'] for c in checks] == ['checks.diff', 'checks.docs']
+    assert checks[0]['argv'] == ['git', 'diff', '--check', 'origin/main...HEAD']
+    assert all(c['kind'] == 'static' and not c.get('junit_required') for c in checks)
+    assert json.dumps(spec, sort_keys=True) == before
+
+
+@pytest.mark.parametrize('bad', ['untracked', 'symlink', 'cwd', 'timeout', 'report'])
+def test_static_recipes_reject_unowned_or_unbounded_metadata(junit_project, bad):
+    spec, checkout, metadata, evidence = junit_project
+    metadata.write_text('schema_version=1\n[checks.diff]\nkind="static"\n'
+                        'argv=["git","diff","--check","origin/main...HEAD"]\n'
+                        'timeout_seconds=30\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Execute tracked scripts/checks.toml checks.diff.']})
+    if bad == 'untracked':
+        _git(checkout, 'rm', '--cached', 'scripts/checks.toml')
+    elif bad == 'symlink':
+        metadata.unlink()
+        metadata.symlink_to(Path(__file__).resolve())
+    else:
+        old, new = {'cwd': ('timeout_seconds=30', 'cwd="../foreign"'),
+                    'timeout': ('timeout_seconds=30', 'timeout_seconds=2701'),
+                    'report': ('origin/main...HEAD', '{report_path}')}[bad]
+        metadata.write_text(metadata.read_text().replace(old, new))
+    with pytest.raises(ValueError):
+        planned_checks(spec, checkout, evidence)
+
+
+def test_metadata_defined_junit_shell_wrapper_remains_exact_with_static_recipes(junit_project):
+    spec, checkout, metadata, evidence = junit_project
+    metadata.write_text('schema_version=1\n[checks.scripts]\nkind="junit"\n'
+                        'argv=["sh","-c","node --test --test-reporter=junit > {report_path}"]\n'
+                        '[checks.diff]\nkind="static"\n'
+                        'argv=["git","diff","--check","origin/main...HEAD"]\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Execute scripts/checks.toml checks.scripts with JUnit and checks.diff.']})
+    checks = planned_checks(spec, checkout, evidence)
+    assert checks[0]['argv'][:2] == ['sh', '-c']
+    assert checks[0]['junit_required'] is True
+    assert checks[1]['argv'] == ['git', 'diff', '--check', 'origin/main...HEAD']
+
+
+def test_static_recipe_and_named_vitest_can_share_junit_verification_step(project):
+    spec, checkout, _, evidence = project
+    package = checkout / 'api'
+    (package / 'test').mkdir(parents=True)
+    (package / 'test/audit.test.ts').write_text('test("audit", () => {});')
+    (package / 'package.json').write_text(json.dumps({'devDependencies': {'vitest': '4.1.11'}}))
+    (checkout / 'package.json').write_text('{"packageManager":"pnpm@10.33.3"}')
+    (checkout / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
+    (checkout / 'scripts').mkdir()
+    (checkout / 'scripts/checks.toml').write_text(
+        'schema_version=1\n[checks.diff]\nkind="static"\n'
+        'argv=["git","diff","--check","origin/main...HEAD"]\n')
+    _git(checkout, 'add', '.')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Run scripts/checks.toml checks.diff and API audit.test.ts with retained JUnit output.']})
+    checks = planned_checks(spec, checkout, evidence)
+    assert len(checks) == 2
+    assert checks[0]['argv'] == ['git', 'diff', '--check', 'origin/main...HEAD']
+    assert checks[1]['id'].startswith('planned-vitest-')
+    assert '--reporter=junit' in checks[1]['argv']
+    assert any(arg.endswith('/pytest-artifacts/junit.xml') for arg in checks[1]['argv'])

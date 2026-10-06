@@ -26,6 +26,14 @@ FIELDS = {
     'plan_provenance', 'metadata', 'recipe', 'recipe_sha256', 'accepted_plan_sha256',
     'test_paths', 'input_hashes', 'source_input_hashes', 'dependency_preparation',
     'checks_identity', 'started_at', 'finished_at', 'measurements', 'observations',
+    'python_interpreters', 'project', 'interpreter',
+    'node_toolchain', 'node_interpreter', 'corepack', 'absolute_path', 'realpath',
+    'version', 'modules_ABI', 'architecture', 'platform', 'execPath', 'package_manager',
+    'native_binding', 'environment', 'PATH', 'COREPACK_HOME',
+    'npm_config_nodedir', 'npm_config_build_from_source', 'npm_config_python',
+    'range_binding', 'origin_main_sha', 'merge_base_sha',
+    'native_addon_preparation', 'native_addon_authority', 'target', 'integrity',
+    'projects', 'registry_packages', 'registry_dependencies', 'dependency_links', 'native_builder',
 }
 
 
@@ -76,7 +84,9 @@ def _copy_receipts(value, root, folder):
                                    for item in manifest['artifacts']]
     else:
         clean = {key: (_copy_receipts(item, root, folder) if key not in {
-                     'metadata', 'input_hashes', 'source_input_hashes'} else item)
+                     'metadata', 'input_hashes', 'source_input_hashes', 'registry_packages',
+                     'registry_dependencies', 'dependency_links'
+                     } else item)
                  for key, item in value.items() if key in FIELDS}
     for field, checksum in [('log', 'log_sha256'), ('receipt', 'receipt_sha256'),
                             ('path', 'sha256')]:

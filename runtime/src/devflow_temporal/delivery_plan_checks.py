@@ -76,7 +76,59 @@ def planned_projects(spec: dict, checkout: Path) -> dict[Path, list[Path]]:
     return projects
 
 
-def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
+def _node_script_covered(test: Path, checkout: Path, recipe: dict) -> bool:
+    """Authenticate file operands of the known built-in Node/JUnit recipe form."""
+    if recipe['argv'][:2] != ['node', '--test']:
+        return False
+    operands = []
+    for arg in recipe['argv'][2:]:
+        if arg == '--test-only' or (arg.startswith('--test-') and '=' in arg):
+            continue
+        # Unknown flags may consume the next argument. They cannot prove that
+        # an apparent filename is a positional file executed by this recipe.
+        if arg.startswith('-') or Path(arg).is_absolute():
+            return False
+        operands.append(arg)
+    return any((checkout / recipe['cwd'] / arg).resolve() == test for arg in operands)
+
+
+def planned_node_tests(spec: dict, checkout: Path, junit_recipes: list[dict]) -> list[Path]:
+    """Resolve named Node tests from the same sealed plan used for Python."""
+    try:
+        plan = json.loads(spec['accepted_plan'])
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(plan, dict) or not isinstance(plan.get('verification'), list):
+        return []
+    names = sorted({name for step in plan['verification'] if isinstance(step, str)
+                    for name in re.findall(r'\b[A-Za-z0-9_.-]+\.test\.[cm]?[jt]sx?\b', step)})
+    if len(names) > 32:
+        raise ValueError('planned Node tests require a bounded name list')
+    chosen = [p for p in selected_tests(spec, checkout) if p.suffix != '.py']
+    files = _git(checkout, 'ls-files', '--', '*.test.*').splitlines()
+    for name in names:
+        matches = [checkout / f for f in files if Path(f).name == name]
+        if len(matches) != 1:
+            raise ValueError(f'planned Node test must have one tracked owner: {name}')
+        test = matches[0]
+        if test.is_symlink() or test.resolve(strict=True) != test or not test.is_file():
+            raise ValueError('planned Node test is not a fixed owned file')
+        # A named built-in Node/JUnit script already has its authenticated argv.
+        # Prose must not redirect it into a different package/test runner.
+        covered = any(_node_script_covered(test, checkout, recipe) for recipe in junit_recipes)
+        if not covered:
+            chosen.append(test)
+    result = sorted(set(chosen))
+    if len(result) > 32:
+        raise ValueError('planned Node tests require a bounded selection')
+    for test in result:
+        if test.is_symlink() or test.resolve(strict=True) != test or not test.is_file():
+            raise ValueError('planned Node test is not a fixed owned file')
+    return result
+
+
+def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
+                          static: bool = False) -> list[dict]:
     """Execute explicitly named, tracked recipes; prose never supplies an argv."""
     try:
         plan = json.loads(spec['accepted_plan'])
@@ -85,7 +137,8 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path) -> list[di
     if not isinstance(plan, dict) or not isinstance(plan.get('verification'), list):
         return []
     steps = [step for step in plan['verification'] if isinstance(step, str)
-             and 'scripts/checks.toml' in step and re.search(r'\bjunit\b', step, re.I)]
+             and 'scripts/checks.toml' in step
+             and (static or re.search(r'\bjunit\b', step, re.I))]
     if not steps:
         return []
     path = checkout / 'scripts/checks.toml'
@@ -104,15 +157,18 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path) -> list[di
     result = []
     for key in selected:
         recipe = recipes[key]
+        if isinstance(recipe, dict) and recipe.get('kind') != ('static' if static else 'junit'):
+            if recipe.get('kind') in {'static', 'junit'}:
+                continue
         argv = recipe.get('argv') if isinstance(recipe, dict) else None
         timeout = recipe.get('timeout_seconds', 600) if isinstance(recipe, dict) else None
         minimum = recipe.get('min_executed', 1) if isinstance(recipe, dict) else None
         relative = recipe.get('cwd', '.') if isinstance(recipe, dict) else None
-        if (not isinstance(recipe, dict) or recipe.get('kind') != 'junit'
+        if (not isinstance(recipe, dict) or recipe.get('kind') != ('static' if static else 'junit')
                 or not isinstance(argv, list) or not 1 <= len(argv) <= 64
                 or any(not isinstance(arg, str) or not arg or len(arg) > 8192
                        or '\0' in arg for arg in argv)
-                or sum(arg.count('{report_path}') for arg in argv) != 1
+                or sum(arg.count('{report_path}') for arg in argv) != (0 if static else 1)
                 or type(timeout) is not int or not 1 <= timeout <= 2700
                 or type(minimum) is not int or not 1 <= minimum <= 1000000
                 or not isinstance(relative, str) or Path(relative).is_absolute()
@@ -123,19 +179,20 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path) -> list[di
                       'metadata': {'scripts/checks.toml': hashlib.sha256(
                           path.read_bytes()).hexdigest()},
                       'recipe_sha256': digest(recipe)}
-        check_id = 'planned-junit-' + digest(provenance)[:16]
+        check_id = ('planned-static-' if static else 'planned-junit-') + digest(provenance)[:16]
         report = evidence / check_id / 'pytest-artifacts/junit.xml'
-        result.append({'id': check_id, 'kind': 'test', 'cwd': relative,
+        result.append({'id': check_id, 'kind': 'static' if static else 'test', 'cwd': relative,
                        'argv': [arg.replace('{report_path}', str(report)) for arg in argv],
                        'timeout_seconds': timeout, 'min_tests': minimum,
-                       'junit_required': True, 'plan_provenance': provenance})
+                       'junit_required': not static, 'plan_provenance': provenance})
     return result
 
 
 def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
     result = planned_junit_recipes(spec, checkout, evidence)
+    result.extend(planned_junit_recipes(spec, checkout, evidence, static=True))
     projects = planned_projects(spec, checkout)
-    node_tests = [p for p in selected_tests(spec, checkout) if p.suffix != '.py']
+    node_tests = planned_node_tests(spec, checkout, result)
     if not projects and not node_tests:
         return result
     plan = json.loads(spec['accepted_plan'])
@@ -190,7 +247,7 @@ def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
         node_projects.setdefault(project, []).append(test)
     for project, tests in sorted(node_projects.items()):
         provenance = {'accepted_plan_sha256': digest(plan),
-                      'selection_sha256': digest(spec['verification_test_paths']),
+                      'selection_sha256': digest(spec.get('verification_test_paths', [])),
                       'project': project.relative_to(checkout).as_posix(),
                       'metadata': {str(p.relative_to(checkout)): hashlib.sha256(
                           p.read_bytes()).hexdigest() for p in (
