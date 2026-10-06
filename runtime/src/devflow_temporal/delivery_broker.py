@@ -1450,27 +1450,38 @@ class DeliveryBroker:
             self._finish_effect(key, result)
         return result
 
-    async def checks(self, pr: dict[str, Any], *, timeout_seconds: int = 1200) -> dict[str, Any]:
+    async def checks(
+        self, pr: dict[str, Any], *, timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
         required = set(self.spec["policy"].get("required_ci", []))
         if not required:
             return {"state": "unverified", "reason": "no required CI checks configured"}
+        patient = "ci_wait_seconds" in self.spec["policy"]
+        if timeout_seconds is None:
+            timeout_seconds = self.spec["policy"].get("ci_wait_seconds", 1200)
         deadline = asyncio.get_running_loop().time() + timeout_seconds
+        delay, checks, diagnostic = 15, {}, None
+        argv = ["gh", "pr", "view", str(pr["number"]), "--repo", self.spec["github_repo"],
+                "--json", "headRefOid,statusCheckRollup"]
         while True:
-            found = json.loads(
-                _run(
-                    [
-                        "gh",
-                        "pr",
-                        "view",
-                        str(pr["number"]),
-                        "--repo",
-                        self.spec["github_repo"],
-                        "--json",
-                        "headRefOid,statusCheckRollup",
-                    ],
-                    timeout=60,
-                )
-            )
+            try:
+                if patient:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    found = json.loads(await asyncio.to_thread(
+                        _run, argv, timeout=max(1, min(60, remaining))))
+                else:
+                    found = json.loads(_run(argv, timeout=60))
+            except (RuntimeError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
+                if not patient:
+                    raise
+                diagnostic = str(exc)[:500]
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return {"state": "pending", "checks": checks, "reason": "CI deadline reached",
+                            "diagnostic": diagnostic}
+                await asyncio.sleep(min(delay, remaining))
+                delay = min(delay * 2, 60)
+                continue
             if found["headRefOid"] != pr["head"]:
                 return {"state": "stale", "reason": "PR head changed while checks were pending"}
             checks = {
@@ -1489,4 +1500,7 @@ class DeliveryBroker:
                 return {"state": "passed", "checks": checks, "head": pr["head"]}
             if asyncio.get_running_loop().time() >= deadline:
                 return {"state": "pending", "checks": checks, "reason": "CI deadline reached"}
-            await asyncio.sleep(15)
+            remaining = deadline - asyncio.get_running_loop().time()
+            await asyncio.sleep(min(delay, remaining) if patient else 15)
+            if patient:
+                delay = min(delay * 2, 60)

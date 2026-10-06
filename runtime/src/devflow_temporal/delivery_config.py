@@ -88,6 +88,9 @@ class DeliveryConfig:
             raise ValueError("unsupported configured role provider")
         if value.get("execution_mode", "native-profile") not in {"native-profile", "trusted-local"}:
             raise ValueError("unsupported local execution mode")
+        ci_wait = value.get("ci_wait_seconds", 10800)
+        if type(ci_wait) is not int or not 60 <= ci_wait <= 43200:
+            raise ValueError("ci_wait_seconds must be between 60 and 43200")
         return cls(path=path.resolve(), raw=value)
 
     @property
@@ -117,6 +120,7 @@ class DeliveryConfig:
     def public_policy(self) -> dict[str, Any]:
         return {
             "roles": self.raw["roles"],
+            "ci_wait_seconds": self.raw.get("ci_wait_seconds", 10800),
             "repositories": [
                 {
                     "key": key,
@@ -228,6 +232,7 @@ class DeliveryConfig:
         checkout = self.state_root / "checkouts" / supplied["run_id"]
         policy = {
             "roles": self.raw["roles"],
+            "ci_wait_seconds": self.raw.get("ci_wait_seconds", 10800),
             "checks": repository.get("checks", []),
             "prepublish_checks": repository.get("prepublish_checks", []),
             "browser_qa": repository.get("browser_qa"),

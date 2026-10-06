@@ -99,3 +99,11 @@ command can now continue a finalized native run: it authenticates the stopped
 result and cleanup, reacquires the same issue, preserves historical evidence,
 refreshes runtime preparation and resumes the original implementation session.
 It keeps the existing PR and allows only the explicitly requested repair grant.
+### Required CI waiting
+
+New admissions freeze `ci_wait_seconds` from service configuration (default
+10,800 seconds; range 60–43,200). Pending checks and unavailable GitHub readbacks
+use bounded backoff while the activity heartbeats. GitHub reads run off the
+worker loop, and required success must still match the exact PR head. A failed
+check or changed head stops immediately; the deadline leaves CI pending.
+Older frozen specifications keep their original twenty-minute waiting behavior.

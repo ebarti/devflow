@@ -153,6 +153,8 @@ class DeliveryWorkflow:
             name == "delivery_finalize_resources"
             and request["spec"].get("resource_cleanup_version") == 1
         )
+        patient_ci = (name == "delivery_ci"
+                      and "ci_wait_seconds" in request["spec"].get("policy", {}))
         options = {}
         if automatic_preparation or resource_finalization:
             options = {
@@ -176,6 +178,11 @@ class DeliveryWorkflow:
                     maximum_interval=timedelta(seconds=10),
                 )
             }
+        elif patient_ci:
+            options = {
+                "heartbeat_timeout": timedelta(seconds=30),
+                "retry_policy": RetryPolicy(maximum_attempts=3),
+            }
         elif name in {
             "delivery_metadata_readback", "delivery_gates_readback", "delivery_technical_readback",
         }:
@@ -190,6 +197,9 @@ class DeliveryWorkflow:
         else:
             options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         timeout = timedelta(hours=hours)
+        if patient_ci:
+            timeout = timedelta(seconds=request["spec"]["policy"]["ci_wait_seconds"] + 120)
+            options["schedule_to_close_timeout"] = timeout
         if name in {"delivery_terminal_tracker", "delivery_terminal_preflight"}:
             timeout = timedelta(seconds=min(request.get("timeout_seconds", 180), 180))
             options["schedule_to_close_timeout"] = timeout
