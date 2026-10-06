@@ -102,18 +102,53 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 raise ValueError('gate namespace has no durable original run')
             recovery = json.loads(row[1]) if row[1] else None
             first = True
+            if recovery and recovery.get('kind') == 'pending_publication_retry':
+                from .delivery_pending_publication import custody
+
+                custody(db, recovery)
+                if canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                    raise ValueError('pending publication execution authority changed')
+                namespace = 'publication-retry'
+                roots.add(state / namespace / 'evidence')
+                first = False
+                recovery = recovery.get('original_recovery')
             while recovery and recovery.get('kind') in {
                 'terminal_tracker_recovery', 'repair_continuation',
                 'investigation_assessment_adjudication', 'stopped_resource_closure',
+                'stopped_delivery_resume',
             }:
+                if recovery.get('kind') == 'stopped_delivery_resume':
+                    from .delivery_stopped_resume import custody
+                    from .delivery_stopped_resume import namespace as resume_namespace
+
+                    custody(db, recovery)
+                    if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                        raise ValueError('stopped resume execution authority changed')
+                    admitted = resume_namespace(recovery)
+                    roots.add(state / admitted / 'evidence')
+                    if first:
+                        namespace = admitted
+                    first = False
+                if recovery.get('kind') == 'repair_continuation' and recovery.get(
+                        'finalized_checkpoint'):
+                    from .delivery_gate_retry import effective_repair
+
+                    effective_repair(None, recovery, db=db)
+                    if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                        raise ValueError('finalized repair execution authority changed')
+                    if first:
+                        namespace = 'repair-continuation'
+                    roots.add(state / 'repair-continuation' / 'evidence')
+                    first = False
                 if recovery.get('kind') == 'stopped_resource_closure':
                     from .delivery_resource_closure import custody
 
                     custody(db, recovery)
-                    if canonical_json(recovery['execution_spec']) != canonical_json(spec):
+                    if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
                         raise ValueError('resource closure current execution authority changed')
-                    namespace = 'resource-closure'
-                    roots.add(state / namespace / 'evidence')
+                    if first:
+                        namespace = 'resource-closure'
+                    roots.add(state / 'resource-closure' / 'evidence')
                     first = False
                 if recovery.get('kind') == 'investigation_assessment_adjudication':
                     from .delivery_investigation_adjudication import custody
@@ -122,11 +157,26 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 recovery = recovery.get('original_recovery')
             while recovery and recovery.get('kind') in {
                 'published_metadata_recovery', 'investigation_gates_only',
-                'accepted_technical_successor',
+                'accepted_technical_successor', 'published_gate_retry', 'prepublication_gate_retry',
+                'pending_publication_retry',
+                'published_check_prelaunch_retry', 'published_ci_retry',
+                'repair_continuation',
             }:
                 if first and canonical_json(recovery.get('execution_spec')) != canonical_json(spec):
                     raise ValueError('gate namespace execution authority changed')
-                if recovery['kind'] == 'accepted_technical_successor':
+                if recovery['kind'] == 'repair_continuation':
+                    from .delivery_gate_retry import effective_repair
+
+                    if not recovery.get('finalized_checkpoint'):
+                        raise ValueError('historical repair checkpoint is not finalized')
+                    effective_repair(None, recovery, db=db)
+                    admitted_namespace = 'repair-continuation'
+                elif recovery['kind'] == 'pending_publication_retry':
+                    admitted_namespace = 'publication-retry'
+                    if canonical_json(read_private(state / admitted_namespace / 'admission.json')) \
+                            != canonical_json(recovery):
+                        raise ValueError('historical publication admission changed')
+                elif recovery['kind'] == 'accepted_technical_successor':
                     from .delivery_technical_continuation import namespace_custody
 
                     admitted_namespace = 'technical-successor'
@@ -146,7 +196,11 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                                    for key, value in intent.items())):
                         raise ValueError('gate namespace metadata admission changed')
                 else:
-                    admitted_namespace = 'gates-admission'
+                    from .delivery_gate_retry import gate_namespace
+
+                    admitted_namespace = gate_namespace(
+                        recovery['execution_spec'].get('gate_retry_generation', 1),
+                        recovery['execution_spec'].get('gate_retry_stage'))
                     _ancestors(state / admitted_namespace / 'admission.json')
                     admission = read_private(state / admitted_namespace / 'admission.json')
                     admitted = db.execute(
@@ -154,7 +208,8 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                         (spec['run_id'],),
                     ).fetchone()
                     if (not admitted or canonical_json(admission) != canonical_json(recovery)
-                            or canonical_json(json.loads(admitted[0])) != canonical_json(recovery)):
+                            or (first and canonical_json(json.loads(admitted[0]))
+                                != canonical_json(recovery))):
                         raise ValueError('gate namespace gates-only admission changed')
                 roots.add(state / admitted_namespace / 'evidence')
                 if first:
@@ -179,8 +234,10 @@ def _gate_evidence_root(spec: dict) -> Path:
 
 
 def _gate_path(spec: dict, role: str, iteration: int) -> Path:
-    if role not in {'review', 'verify'} or type(iteration) is not int or iteration < 0:
+    if role not in {'review', 'verify', 'baseline'} or type(iteration) is not int or iteration < 0:
         raise ValueError('gate namespace role or iteration is invalid')
+    if role == 'baseline' and (spec.get('baseline_checks_version') != 1 or iteration != 0):
+        raise ValueError('baseline checkout requires a new baseline-check admission')
     path = _gate_evidence_root(spec) / 'gates' / str(iteration) / role
     _ancestors(path, allow_missing=True)
     if path.is_symlink():
@@ -305,7 +362,9 @@ class RunResources:
                     continue
                 relative = path.relative_to(root / 'gates')
                 valid = (len(relative.parts) == 2 and relative.parts[0].isdecimal()
-                         and relative.parts[1] in {"review", "verify"})
+                         and (relative.parts[1] in {"review", "verify"}
+                              or (relative.parts == ("0", "baseline")
+                                  and self.spec.get("baseline_checks_version") == 1)))
         elif kind == "generated":
             allowed_names = {
                 "node_modules",
@@ -320,7 +379,18 @@ class RunResources:
                 root = Path(raw_root)
                 if entry["kind"] not in {"checkout", "gate"}:
                     continue
-                if not any(path == root / name for name in allowed_names):
+                names = set(allowed_names)
+                if (path.name == '.venv' and path.is_relative_to(root)
+                        and self.spec['policy'].get('host_sandbox') == 'trusted-local'):
+                    if root.exists():
+                        from .delivery_plan_checks import planned_projects
+
+                        names.update((project / '.venv').relative_to(root).as_posix()
+                                     for project in planned_projects(self.spec, root))
+                    elif finalizing and ownership.get(str(path), {}).get(
+                            'accepted_plan_sha256') == digest(self.spec['accepted_plan']):
+                        names.add(path.relative_to(root).as_posix())
+                if not any(path == root / name for name in names):
                     continue
                 self._allowed(root, entry["kind"], finalizing=finalizing)
                 if os.path.lexists(root) and _identity(root) != entry["identity"]:
@@ -357,6 +427,9 @@ class RunResources:
             if os.path.lexists(path):
                 raise ValueError("cannot adopt an existing unregistered resource")
             manifest["roots"][str(path)] = {"kind": kind, "state": "allocated", "identity": None}
+            if kind == 'generated' and path.name == '.venv':
+                manifest['roots'][str(path)]['accepted_plan_sha256'] = digest(
+                    self.spec['accepted_plan'])
             write_private(self.manifest, manifest)
 
     def created(self, path: Path) -> None:

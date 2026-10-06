@@ -377,6 +377,10 @@ class DeliveryStore:
                 )"""
             )
 
+            from .delivery_dashboard import initialize
+
+            initialize(db)
+
     def policy_recovery_precheck(self, run_id: str) -> dict:
         from .delivery_policy_recovery import precheck
 
@@ -579,6 +583,10 @@ class DeliveryStore:
                     timestamp,
                 ),
             )
+            from .delivery_dashboard import runtime_identity
+
+            db.execute("INSERT INTO delivery_dashboard_state(run_id,identity_json) VALUES (?,?)",
+                       (run_id, canonical_json(runtime_identity())))
             db.execute(
                 "INSERT INTO delivery_outbox(run_id,state,updated_at) VALUES (?,'pending',?)",
                 (run_id, timestamp),
@@ -596,10 +604,27 @@ class DeliveryStore:
             )
             return response
 
+    def owns_execution(self, spec: dict[str, Any]) -> bool:
+        """Shared database visibility does not grant another service's transport."""
+        frozen = DeliveryConfig.load(Path(spec["config_path"]))
+        if digest(frozen.raw) != spec["config_digest"]:
+            raise ValueError("frozen service configuration changed")
+
+        def binding(config: DeliveryConfig) -> tuple:
+            return (
+                config.tracking_db.resolve(), config.state_root.resolve(),
+                config.temporal_address, config.raw.get("temporal_namespace", "default"),
+                config.queue, config.dashboard_url.rstrip("/"),
+            )
+
+        return binding(frozen) == binding(self.config)
+
     def _completed_temporal_result(
         self, run_id: str, *, workflow_id: str | None = None
     ) -> dict[str, Any]:
         """Read a closed workflow from Temporal, never from caller-authored JSON."""
+        if not self.owns_execution(self.effective_spec(run_id)):
+            raise ValueError("continuation service transport ownership differs from frozen run")
 
         async def read() -> dict[str, Any]:
             client = await Client.connect(
@@ -641,6 +666,10 @@ class DeliveryStore:
         Git and GitHub are checked twice: before this transaction and by the
         read-only recovery activity before any downstream gate can start.
         """
+        if isinstance(supplied, dict) and supplied.get('expected_pr_number') == 0:
+            from .delivery_pending_publication import admit
+
+            return admit(self, run_id, supplied)
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))
@@ -984,6 +1013,18 @@ class DeliveryStore:
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
         if (isinstance(supplied, dict)
+                and supplied.get('continuation_kind') == 'stopped_delivery_resume'):
+            from .delivery_stopped_resume import admit
+
+            return admit(self, run_id, supplied, preflight=preflight)
+        if (isinstance(supplied, dict)
+                and supplied.get('continuation_kind') in {
+                    'published_gate_retry', 'prepublication_gate_retry',
+                    'published_check_prelaunch_retry', 'published_ci_retry'}):
+            from .delivery_gate_retry import admit
+
+            return admit(self, run_id, supplied, preflight=preflight)
+        if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') == 'abandon_pending_resource_closure'):
             from .delivery_resource_closure import abandon_pending
 
@@ -1067,8 +1108,11 @@ class DeliveryStore:
             raise ValueError("run ID not found")
         if granted:
             raise ValueError("this run already received its one repair grant")
-        spec = self.effective_spec(run_id) if cause_specific else self.spec(run_id)
-        if digest(DeliveryConfig.load(self.config.path).raw) != spec["config_digest"]:
+        spec = self.effective_spec(run_id)
+        finalized = (not cause_specific and spec.get("resource_cleanup_version") == 1
+                     and row["cleanup"] == "confirmed")
+        stopped_claim = cause_specific or finalized
+        if digest(DeliveryConfig.load(Path(spec["config_path"])).raw) != spec["config_digest"]:
             raise ValueError("frozen service configuration changed before repair grant")
         current_workflow_id = row["workflow_id"] or f"delivery-{run_id}"
         previous_recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
@@ -1090,7 +1134,7 @@ class DeliveryStore:
             or state.get("phase") != "blocked"
             or state.get("outcome") != "blocked"
             or state.get("execution_state") != "blocked"
-            or state.get("cleanup") not in ({"none", "confirmed"} if cause_specific else {"none"})
+            or state.get("cleanup") not in ({"none", "confirmed"} if stopped_claim else {"none"})
             or state.get("revision") != supplied["expected_revision"]
             or type(iteration) is not int
             or iteration != supplied["expected_iteration"]
@@ -1184,19 +1228,41 @@ class DeliveryStore:
             "authorized_through_iteration": recovery["maximum_iteration"],
             "existing": False,
         }
+        if finalized:
+            recovery.update(original_recovery=previous_recovery, predecessor_spec=spec,
+                            finalized_checkpoint=True, cleanup_digest=cleanup_digest)
         if preflight:
             from .delivery_policy_recovery import work_binding
 
             with self._connect() as db:
                 work_binding(self, spec, db)
                 claim = self.state.claim_for(db, spec["work_id"])
-                if (claim is not None if cause_specific else
+                if (claim is not None if stopped_claim else
                         claim is None or claim["owner"] != f"external:devflow:{run_id}"):
                     raise ValueError("repair preflight claim authority changed")
             return {**response, "preflight": True, "diagnostics": findings,
                     "title_constraint_sha256": (
                         digest(title_constraint) if title_constraint else None
                     )}
+        if finalized:
+            from .delivery_gate_retry import prepare_runtime
+            from .delivery_metadata_recovery import _immutable, preserve_resources
+            from .delivery_resources import private_directory
+
+            root = Path(spec["state_dir"]) / "repair-continuation"
+            private_directory(root)
+            prepared = prepare_runtime(spec, root, command_digest, digest(recovery))
+            # Resume the original implementation home; independent gates get new namespaces.
+            original_home = self.spec(run_id).get("role_home_generation")
+            if original_home is None:
+                prepared.pop("role_home_generation", None)
+            else:
+                prepared["role_home_generation"] = original_home
+            recovery["execution_spec"] = prepared
+            recovery["execution_candidate"] = {**candidate,
+                                                 "policy_digest": prepared["policy_digest"]}
+            _immutable(root / "admission.json", recovery)
+            preserve_resources(root, spec)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             prior = db.execute(
@@ -1227,7 +1293,7 @@ class DeliveryStore:
                 or current["outcome"] != "blocked"
                 or current["execution_state"] != "blocked"
                 or current["cleanup"] not in (
-                    {"none", "confirmed"} if cause_specific else {"none"}
+                    {"none", "confirmed"} if stopped_claim else {"none"}
                 )
                 or current["error"] != state["error"]
                 or current["protocol_revision"] != state["revision"]
@@ -1238,7 +1304,7 @@ class DeliveryStore:
                 or db.execute(
                     "SELECT 1 FROM delivery_repair_grants WHERE run_id=?", (run_id,)
                 ).fetchone()
-                or (claim is not None if cause_specific else
+                or (claim is not None if stopped_claim else
                     claim is None or claim["owner"] != f"external:devflow:{run_id}")
                 or len(attempts) != len(roles)
                 or any(
@@ -1260,7 +1326,7 @@ class DeliveryStore:
                 )
             ):
                 raise ValueError("repair continuation lost its frozen run or ownership")
-            if cause_specific:
+            if stopped_claim:
                 from .delivery_policy_recovery import work_binding
 
                 work_binding(self, spec, db)
@@ -1999,6 +2065,11 @@ class DeliveryStore:
             or any(item["state"] != "complete" for item in effects)
         ):
             raise ValueError("repair grant or owned resources changed before resume")
+        if original.get("finalized_checkpoint"):
+            if (self.effective_spec(run_id) != spec
+                    or original.get("execution_spec") != spec
+                    or confirmed_native_cleanup(spec) != original["cleanup_digest"]):
+                raise ValueError("finalized repair source or cleanup authority changed")
         if original.get("title_constraint"):
             from .delivery_policy_recovery import work_binding
             from .delivery_title_repair import validate_source
@@ -2040,7 +2111,7 @@ class DeliveryStore:
                 raise ValueError("failed prelaunch attempt changed before retry")
         published_identity(
             DeliveryBroker(self, spec),
-            recovery["candidate"],
+            recovery.get("execution_candidate", recovery["candidate"]),
             recovery["state"]["pull_request"],
         )
         confirmed_native_cleanup(spec)
@@ -2501,6 +2572,25 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            if recovery and recovery.get('kind') == 'stopped_delivery_resume':
+                from .delivery_stopped_resume import effective_spec
+
+                return effective_spec(self, recovery)
+            if recovery and recovery.get('kind') == 'pending_publication_retry':
+                from .delivery_pending_publication import effective_spec
+
+                return effective_spec(self, original, recovery)
+            if recovery and recovery.get('kind') == 'repair_continuation' and recovery.get(
+                    'finalized_checkpoint'):
+                from .delivery_gate_retry import effective_repair
+
+                return effective_repair(self, recovery)
+            if recovery and recovery.get('kind') in {
+                    'published_gate_retry', 'prepublication_gate_retry',
+                    'published_check_prelaunch_retry', 'published_ci_retry'}:
+                from .delivery_gate_retry import effective_spec
+
+                return effective_spec(self, original, recovery)
             renewals = []
 
             def renewed(spec):
@@ -3048,10 +3138,12 @@ class DeliveryStore:
                 (command_id,),
             )
 
-    def list_runs(self) -> list[dict[str, Any]]:
+    def list_runs(self, archived: bool = False) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM delivery_runs ORDER BY updated_at DESC LIMIT 100"
+                "SELECT r.* FROM delivery_runs r LEFT JOIN delivery_dashboard_state d "
+                "ON r.run_id=d.run_id WHERE COALESCE(d.archived,0)=? ORDER BY r.updated_at DESC",
+                (int(archived),),
             ).fetchall()
             return [self._compact(dict(row)) for row in rows]
 
@@ -3079,6 +3171,9 @@ class DeliveryStore:
         from .delivery_resources import projected_cleanup
 
         with self._connect() as db:
+            from .delivery_dashboard import presentation
+
+            dashboard_state = presentation(db, row["run_id"])
             active = db.execute(
                 "SELECT COUNT(*) FROM delivery_attempts WHERE run_id=? "
                 "AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
@@ -3090,6 +3185,7 @@ class DeliveryStore:
             }),
         )
         return {
+            **dashboard_state,
             "id": row["run_id"],
             "run_id": row["run_id"],
             "work_id": row["work_id"],
@@ -3128,6 +3224,11 @@ class DeliveryStore:
                 )
             ]
         compact = self._compact(row)
+        from .delivery_dashboard import steering_history, steering_open
+
+        with self._connect() as db:
+            steering = steering_history(db, run_id)
+            can_steer = not compact["execution_retired"] and steering_open(db, row)
         spec = self.effective_spec(run_id)
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         adjudication = (recovery if recovery and recovery.get("kind")
@@ -3169,6 +3270,7 @@ class DeliveryStore:
             roles.append(
                 {
                     "role": attempt["role"],
+                    "attempt_id": attempt["job_key"],
                     "iteration": attempt["iteration"],
                     "state": attempt["state"],
                     "session_id": attempt["session_id"],
@@ -3357,6 +3459,8 @@ class DeliveryStore:
             "preparation": spec.get("preparation"),
             "checks": checks,
             "tracker": tracker,
+            "steering": steering,
+            "can_steer": can_steer,
             "usage": json.loads(row["usage_json"]) if row["usage_json"] else {},
             "decisions": [json.loads(row["decision_json"])]
             if row["decision_json"] and json.loads(row["decision_json"]) is not None
@@ -3441,7 +3545,7 @@ class DeliveryStore:
         with self._connect() as db:
             attempts = db.execute(
                 """SELECT job_key,role,iteration,process_identity,result_json
-                   FROM delivery_attempts WHERE run_id=?""",
+                   FROM delivery_attempts WHERE run_id=? ORDER BY rowid""",
                 (run_id,),
             ).fetchall()
             browser_effects = {
@@ -3453,7 +3557,12 @@ class DeliveryStore:
                     (run_id,),
                 )
             }
+        role_ids: set[str] = set()
         for attempt in attempts:
+            role_id = f"role-{attempt['role']}-{attempt['iteration']}"
+            evidence_id = (role_id if role_id not in role_ids
+                           else f"{role_id}-{attempt['job_key']}")
+            role_ids.add(role_id)
             folder = root / "attempts" / attempt["job_key"]
             result = json.loads(attempt["result_json"]) if attempt["result_json"] else {}
             contained_log = folder / "container" / "container.log"
@@ -3469,7 +3578,7 @@ class DeliveryStore:
             if path.is_file():
                 indexed.append(
                     {
-                        "id": f"role-{attempt['role']}-{attempt['iteration']}",
+                        "id": evidence_id,
                         "label": f"{attempt['role']} log, attempt {attempt['iteration']}",
                         "path": path,
                         "expected_sha256": result.get("container_log_sha256")
@@ -3478,6 +3587,21 @@ class DeliveryStore:
                         "limit": 20 * 1024 * 1024 if path == contained_log else 1024 * 1024,
                     }
                 )
+            if result.get("role_artifacts"):
+                from .delivery_role_evidence import validate_handoff
+
+                reference = result["role_artifacts"]
+                manifest = validate_handoff(reference, root)
+                indexed.append({"id": evidence_id + "-artifacts",
+                                "label": "Retained original role probes and outputs",
+                                "path": Path(reference["path"]),
+                                "expected_sha256": reference["sha256"],
+                                "limit": 4 * 1024 * 1024})
+                for index, item in enumerate(manifest["artifacts"]):
+                    indexed.append({"id": evidence_id + "-artifact-" + str(index),
+                                    "label": item["relative_path"], "path": Path(item["path"]),
+                                    "expected_sha256": item["sha256"],
+                                    "limit": 50 * 1024 * 1024})
         details = self.detail(run_id)
         for result in details.get("checks", {}).get("local", {}).get("results", []):
             path = Path(result["log"])

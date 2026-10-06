@@ -35,6 +35,19 @@ controller check. Existing PR titles must also be conventional. Invalid already
 published history is refused; the read-only publication recovery command cannot
 rewrite it or reuse gate evidence for a different head.
 
+Repositories can select `baseline_check_ids` from their existing
+`prepublish_checks`, in recipe order, for shared project prerequisites such as
+dependency installation, docs build and rendered browser regressions. New
+admissions run these checks in an isolated clean checkout of the frozen base
+before intake or implementation. A failed or unresolved baseline stops the run
+with its original logs and base identity, without consuming feature repair
+turns. Source-specific checks which require the proposed feature belong in the
+normal candidate gates. Baseline success never replaces candidate checks:
+every prepublication and verification recipe still runs on the feature result.
+Historical inputs without the baseline marker keep their recorded behavior.
+Resolve upstream defects through their owning change, then admit work against
+the verified corrected base; never silently rewrite an existing frozen input.
+
 New terminal runs synchronize tracker status and read back assignment, Project
 and claim through the existing tracker helper. Blocked/cancelled outcomes select
 Blocked; delivered outcomes select In review. Claims release only after proven
@@ -433,3 +446,53 @@ bounded structured regex matches and owned full-log provenance independently
 of diagnostic truncation, while retaining the original log and reject policy.
 
 Implementation and repair roles leave source changes uncommitted. The controller owns commit creation and validates author sign-off and Conventional Commit metadata before publication.
+
+Implementer probe evidence has an explicit controller-owned allocation per attempt.
+The prompt names that writable directory; complete probe source, synthetic inputs,
+stdout/stderr, failed attempts, timestamps and provenance hashes can be retained
+without expanding feature source paths. After process cleanup the controller seals
+an immutable manifest and copies of the original files. Independent roles receive
+read-only copies authenticated against the implementation content, and the public
+evidence index exposes the sealed outputs after temporary resource cleanup.
+
+Before a trusted implementer starts, the controller prepares only locked Python
+projects selected by its accepted test plan and the frozen pnpm dependency recipe
+needed by selected Vitest tests. A plan with no such prerequisite receives an
+explicit successful no-op receipt. Preparation failures retain their real logs and
+stop before a provider turn; they do not masquerade as unknown process ownership.
+The role uses the prepared project interpreter for normally imported probes.
+
+Repairs receive authenticated copies of earlier broker logs, receipts and artifact
+files instead of instructions to read private controller state. Copies identify
+original candidate/iteration provenance; earlier and baseline passes do not certify
+an edited candidate. Original frozen scopes, checks and independent gates still
+apply. Native-profile homes created before this permission contract require an
+explicit fresh native preparation generation when resumed; immutable historical
+profiles are not silently rewritten. Trusted-local homes retain their existing
+permission mode.
+
+For historical SHA-only inputs already published by the controller, recovery binds
+the unchanged PR target to a completed owned publication, complete paginated GitHub
+target-change history and the actual current target tip's ancestry. Advancing main
+alone does not invalidate that published feature's immutable implementation base.
+Retargeting, rewritten ancestry, mismatched ownership or incomplete readbacks stop
+recovery. First publication still requires the original exact branch resolution.
+
+
+Stopped implementation recovery uses the public `continue-repair` operation with
+`continuation_kind: stopped_delivery_resume`. The command binds the stopped
+protocol revision, iteration, actual retained candidate ID and head, and grants
+one or two further implementation iterations. It may be used again after a later
+verified stop: each distinct command is finite, idempotent, and retains the
+original failed execution and all previous admissions. A consumed grant is never
+reset or replaced. Unchanged-source gate retries remain separate operations.
+
+Admission requires a closed Temporal result, released ownership, confirmed native
+cleanup, an accepted plan, and a passed mandatory immutable baseline for runs
+that were admitted with baseline checks. It authenticates partial implementation
+source against the original supervisor receipt, preserves the original provider
+session, and allows a first session only for an authenticated failure before any
+provider launch. The source, configuration, attempt inventory and effects are
+read again after runtime preparation and before launch. An unpublished feature
+branch must still be absent remotely. Resumed work runs the ordinary publication,
+independent review, verification, configured checks and exact-head CI gates.

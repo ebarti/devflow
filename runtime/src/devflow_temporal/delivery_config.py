@@ -38,6 +38,25 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def publication_base_ref(source: Path, base_ref: str, base_sha: str) -> str:
+    """Bind GitHub's branch primitive independently of the pinned Git object."""
+    try:
+        ref = _git(source, "rev-parse", "--symbolic-full-name", base_ref)
+        if not ref and re.fullmatch(r"[0-9a-fA-F]{40}", base_ref):
+            ref = _git(source, "symbolic-ref", "refs/remotes/origin/HEAD")
+        if _git(source, "rev-parse", ref) != base_sha:
+            raise ValueError("publication branch does not identify the frozen base commit")
+        for prefix in ("refs/remotes/origin/", "refs/heads/"):
+            if ref.startswith(prefix):
+                branch = ref.removeprefix(prefix)
+                if branch != "HEAD":
+                    _git(source, "check-ref-format", "refs/heads/" + branch)
+                    return branch
+    except subprocess.CalledProcessError as exc:
+        raise ValueError("publication base requires a resolvable branch") from exc
+    raise ValueError("publication base requires a branch, not a tag or ambiguous commit")
+
+
 @dataclass(frozen=True)
 class DeliveryConfig:
     path: Path
@@ -105,6 +124,7 @@ class DeliveryConfig:
                     "base_ref": value["base_ref"],
                     "base_sha": value.get("expected_base_sha"),
                     "recovery_keys": sorted(value.get("recovery", {})),
+                    "baseline_check_ids": value.get("baseline_check_ids", []),
                 }
                 for key, value in sorted(self.raw["repositories"].items())
             ],
@@ -200,6 +220,10 @@ class DeliveryConfig:
         expected = repository.get("expected_base_sha")
         if expected and base_sha != expected:
             raise ValueError("base ref moved from the accepted plan")
+        publication_branch = (
+            publication_base_ref(source, supplied["base_ref"], base_sha)
+            if self.raw.get("provider", "codex") == "codex" else None
+        )
         state_dir = self.state_root / "runs" / supplied["run_id"]
         checkout = self.state_root / "checkouts" / supplied["run_id"]
         policy = {
@@ -227,6 +251,17 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
+        baseline_ids = repository.get("baseline_check_ids", [])
+        if (not isinstance(baseline_ids, list)
+                or any(not isinstance(item, str) for item in baseline_ids)
+                or len(set(baseline_ids)) != len(baseline_ids)):
+            raise ValueError("baseline check IDs must be a unique list")
+        if baseline_ids:
+            recipes = policy["prepublish_checks"]
+            selected = [check for check in recipes if check.get("id") in baseline_ids]
+            if len(selected) != len(baseline_ids):
+                raise ValueError("baseline checks must name existing prepublication checks")
+            policy["baseline_checks"] = selected
         if self.raw.get("execution_backend", "native-macos") != "native-macos":
             raise ValueError("Docker execution is retired; only native-macos is supported")
         if self.raw.get("provider", "codex") == "codex":
@@ -428,6 +463,7 @@ class DeliveryConfig:
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
+            **({"baseline_checks_version": 1} if baseline_ids else {}),
             **(
                 {"preparation_version": 1}
                 if self.raw.get("provider", "codex") == "codex"
@@ -445,6 +481,7 @@ class DeliveryConfig:
             "origin_url": actual_remote,
             "github_repo": owner_repo,
             "base_sha": base_sha,
+            **({"publication_base_ref": publication_branch} if publication_branch else {}),
             "state_dir": str(state_dir),
             "checkout": str(checkout),
             "policy": policy,

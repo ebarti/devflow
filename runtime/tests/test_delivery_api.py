@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -122,7 +123,7 @@ async def test_public_policy_recovery_requires_csrf_and_reports_unavailable_read
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks])
-async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch):
+async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch, tmp_path):
     started = threading.Event()
     release = threading.Event()
 
@@ -135,9 +136,13 @@ async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkey
         run_checks = run_prechecks
 
     monkeypatch.setattr(
-        "devflow_temporal.delivery_activities._context", lambda _spec: (None, Broker())
+        "devflow_temporal.delivery_activities._context", lambda _spec: (
+            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()
+        )
     )
-    task = asyncio.create_task(activity_fn({"spec": {}, "iteration": 0, "candidate": {}}))
+    task = asyncio.create_task(activity_fn(
+        {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {}}
+    ))
     try:
         beginning = time.monotonic()
         assert await asyncio.to_thread(started.wait, 1)
@@ -152,7 +157,7 @@ async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkey
 @pytest.mark.asyncio
 @pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks, delivery_browser_qa])
 async def test_native_effect_uncertainty_is_returned_for_durable_projection(
-    activity_fn, monkeypatch
+    activity_fn, monkeypatch, tmp_path
 ):
     class Broker:
         def run_prechecks(self, _iteration, _candidate):
@@ -162,7 +167,9 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
         run_browser_qa = run_prechecks
 
     monkeypatch.setattr(
-        "devflow_temporal.delivery_activities._context", lambda _spec: (None, Broker())
+        "devflow_temporal.delivery_activities._context", lambda _spec: (
+            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()
+        )
     )
     result = await activity_fn(
         {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {"id": "candidate"}}
@@ -173,6 +180,32 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
         "candidate_id": "candidate",
         "reason": "NativeProcessUnknown",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('activity_fn', [delivery_precheck, delivery_checks])
+async def test_check_preparation_failure_keeps_diagnostics_without_claiming_a_launch(
+    activity_fn, monkeypatch, tmp_path,
+):
+    from devflow_temporal.delivery_broker import CheckPreparationFailure
+
+    class Broker:
+        def run_prechecks(self, _iteration, _candidate):
+            raise CheckPreparationFailure('planned-dependencies', ValueError('owned root rejected'))
+
+        run_checks = run_prechecks
+
+        def candidate(self):
+            return {'id': 'candidate'}
+
+    monkeypatch.setattr('devflow_temporal.delivery_activities._context', lambda _: (
+        SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()))
+    result = await activity_fn({'spec': {'provider': 'codex'}, 'iteration': 0,
+                               'candidate': {'id': 'candidate'}})
+    assert result['state'] == 'failed' and result['cleanup'] == 'confirmed'
+    assert result['source_unchanged'] is True
+    assert result['results'][0]['launched'] is False
+    assert result['diagnostic'] == 'owned root rejected'
 
 
 @pytest.fixture
@@ -226,6 +259,100 @@ def api_fixture(tmp_path: Path) -> tuple[Path, dict]:
         "authorized_endpoint": "published_unmerged",
     }
     return path, request
+
+
+def _foreign_queued_service(api_fixture, key, value):
+    path, request = api_fixture
+    owner = create_app(path).state.delivery
+    raw = json.loads(path.read_text())
+    raw[key] = value
+    foreign_path = path.with_name("foreign-service.json")
+    foreign_path.write_text(json.dumps(raw))
+    foreign = create_app(foreign_path).state.delivery
+    foreign.store.submit(request)
+    return owner, foreign, request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key,value", [
+    ("temporal_address", "127.0.0.1:17399"),
+    ("temporal_namespace", "another-namespace"),
+    ("queue", "another-queue"),
+    ("dashboard_url", "http://127.0.0.1:18799"),
+])
+async def test_shared_database_cannot_dispatch_another_service_run(
+    api_fixture, monkeypatch, key, value,
+):
+    owner, foreign, request = _foreign_queued_service(api_fixture, key, value)
+    before = foreign.store.detail(request["run_id"])
+
+    async def wrong_transport():
+        pytest.fail("foreign outbox selected the wrong service transport")
+
+    monkeypatch.setattr(owner, "healthy_client", wrong_transport)
+    await owner.dispatch_once()
+    assert foreign.store.detail(request["run_id"]) == before
+    assert len(foreign.store.pending_starts()) == 1
+
+
+def test_foreign_predecessor_readback_rejected_before_temporal_connection(
+    api_fixture, monkeypatch,
+):
+    owner, _foreign, request = _foreign_queued_service(
+        api_fixture, "temporal_address", "127.0.0.1:17399",
+    )
+
+    async def wrong_transport(*_args, **_kwargs):
+        pytest.fail("foreign predecessor was queried through this service transport")
+
+    monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", wrong_transport)
+    with pytest.raises(ValueError, match="service transport ownership"):
+        owner.store._completed_temporal_result(request["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_does_not_acknowledge_foreign_outbox(
+    api_fixture, monkeypatch,
+):
+    owner, foreign, request = _foreign_queued_service(
+        api_fixture, "temporal_address", "127.0.0.1:17399",
+    )
+    own_request = {**request, "command_id": "own-submit", "run_id": "own-run",
+                   "work_id": "own-work", "branch": "feat/own-run",
+                   "issue_url": "https://github.com/example/fixture/issues/4"}
+    owner.store.submit(own_request)
+
+    async def unavailable():
+        raise ConnectionError("own transport unavailable")
+
+    async def stop_loop(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(owner, "healthy_client", unavailable)
+    monkeypatch.setattr("devflow_temporal.delivery_api.asyncio.sleep", stop_loop)
+    with pytest.raises(asyncio.CancelledError):
+        await owner.dispatch_loop()
+    with foreign.store._connect() as db:
+        assert db.execute("SELECT state FROM delivery_outbox WHERE run_id=?",
+                          (request["run_id"],)).fetchone()[0] == "pending"
+        assert db.execute("SELECT state FROM delivery_outbox WHERE run_id=?",
+                          (own_request["run_id"],)).fetchone()[0] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_same_transport_config_snapshot_remains_dispatchable(api_fixture, monkeypatch):
+    path, _request = api_fixture
+    owner, _peer, _ = _foreign_queued_service(
+        api_fixture, "temporal_address", "127.0.0.1:17333",
+    )
+    assert "temporal_address" not in json.loads(path.read_text())
+
+    async def selected():
+        raise RuntimeError("same-owner transport selected")
+
+    monkeypatch.setattr(owner, "healthy_client", selected)
+    with pytest.raises(RuntimeError, match="same-owner transport selected"):
+        await owner.dispatch_once()
 
 
 @pytest.mark.asyncio
@@ -594,6 +721,43 @@ async def test_public_evidence_keeps_historical_codex_logs(api_fixture):
         assert qa["text"] == "historical browser QA\n"
         assert (await browser.get("/api/runs/run-1/evidence/role-review-0")).status_code == 404
         assert (await browser.get("/api/runs/run-1/evidence/browser-qa-1-log")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_repeated_gate_attempts_have_distinct_stable_evidence(api_fixture):
+    path, request = api_fixture
+    app = create_app(path)
+    store = app.state.delivery.store
+    store.submit(request)
+    root = Path(store.spec("run-1")["state_dir"])
+    with store._connect() as db:
+        for job_key, text in (("original-review", "old finding"), ("fresh-review", "fresh pass")):
+            folder = root / "attempts" / job_key
+            folder.mkdir(parents=True)
+            (folder / "process.log").write_text(text)
+            db.execute(
+                """INSERT INTO delivery_attempts
+                   (job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup)
+                   VALUES (?,?,'review',0,'candidate','finished','{}','confirmed')""",
+                (job_key, "run-1"),
+            )
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
+        detail = (await browser.get("/api/runs/run-1")).json()
+        assert {role["attempt_id"] for role in detail["run"]["roles"]} == {
+            "original-review", "fresh-review"}
+        ids = [item["id"] for item in detail["evidence"] if item["id"].startswith("role-review-")]
+        assert ids == ["role-review-0", "role-review-0-fresh-review"]
+        for evidence_id, expected in zip(ids, ("old finding", "fresh pass"), strict=True):
+            response = await browser.get(f"/api/runs/run-1/evidence/{evidence_id}")
+            assert response.status_code == 200
+            assert response.json()["text"] == expected
+        # Removing an older log must not reassign its stable URL to the retry.
+        (root / "attempts" / "original-review" / "process.log").unlink()
+        assert (await browser.get("/api/runs/run-1/evidence/role-review-0")).status_code == 404
+        response = await browser.get("/api/runs/run-1/evidence/role-review-0-fresh-review")
+        assert response.status_code == 200
+        assert response.json()["text"] == "fresh pass"
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +17,9 @@ from temporalio.exceptions import ApplicationError
 
 from .candidate import candidate_for
 from .contracts import digest
-from .delivery_broker import DeliveryBroker
+from .delivery_broker import CheckPreparationFailure, DeliveryBroker
 from .delivery_config import DeliveryConfig
+from .delivery_preparation import _lock
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
@@ -245,6 +247,23 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
                 or request.get("resume_session") != saved["session_id"]):
             raise ValueError("title repair role does not match its sealed single turn")
         validate_source(request["spec"], constraint, completed=False)
+    if (role == "implement" and request["spec"].get("provider") == "codex"
+            and request["spec"]["policy"].get("host_sandbox") == "trusted-local"):
+        prerequisites = await asyncio.to_thread(
+            broker.run_implementation_preparation, iteration, candidate,
+        )
+        if prerequisites.get("state") != "passed":
+            return {"status": "blocked", "role": role, "iteration": iteration,
+                    "candidate": candidate, "cleanup": prerequisites.get("cleanup", "unknown"),
+                    "summary": "Controller dependency preparation failed before the role",
+                    "findings": ["Required locked execution prerequisites are unavailable"],
+                    "session_id": None, "implementation_preparation": prerequisites}
+        from .delivery_role_evidence import historical_context
+
+        context = {**historical_context(store, request["spec"]),
+                   **(request.get("evidence_context") or {}),
+                   "implementation_preparation": prerequisites}
+        request = {**request, "evidence_context": context}
     result = await get_supervisor(store).run(
         {**request, "workspace": str(workspace), "review_diff": review_diff}
     )
@@ -330,7 +349,14 @@ async def delivery_metadata_readback(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_gates_readback")
 async def delivery_gates_readback(request: dict[str, Any]) -> dict[str, Any]:
     def execute():
-        from .delivery_gates_admission import readback
+        if request["recovery"].get("kind") == "pending_publication_retry":
+            from .delivery_pending_publication import readback
+        elif request["recovery"].get("kind") in {
+                "published_gate_retry", "prepublication_gate_retry",
+                "published_check_prelaunch_retry", "published_ci_retry"}:
+            from .delivery_gate_retry import readback
+        else:
+            from .delivery_gates_admission import readback
 
         store, _ = _context(request["spec"])
         return readback(store, request["spec"], request["recovery"])
@@ -343,6 +369,10 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
         try:
             store, _ = _context(request["spec"])
+            if request["recovery"].get("kind") == "stopped_delivery_resume":
+                from .delivery_stopped_resume import readback
+
+                return readback(store, request["spec"], request["recovery"])
             if request["recovery"].get("kind") == "execution_policy_recovery":
                 from .delivery_policy_recovery import resume_preflight
 
@@ -365,9 +395,16 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_checks")
 async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        _, broker = _context(request["spec"])
+        store, broker = _context(request["spec"])
         try:
-            return broker.run_checks(request["iteration"], request["candidate"])
+            with (_lock(store.config.state_root / "check-execution")
+                  if request["spec"]["provider"] == "codex" else nullcontext()):
+                return broker.run_checks(request["iteration"], request["candidate"])
+        except CheckPreparationFailure as exc:
+            return {'state': 'failed', 'cleanup': 'confirmed',
+                    'candidate_id': request['candidate']['id'],
+                    'source_unchanged': broker.candidate()['id'] == request['candidate']['id'],
+                    'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
             if request["spec"]["provider"] != "codex":
                 raise
@@ -384,9 +421,11 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_browser_qa")
 async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        _, broker = _context(request["spec"])
+        store, broker = _context(request["spec"])
         try:
-            return broker.run_browser_qa(request["iteration"], request["candidate"])
+            with (_lock(store.config.state_root / "check-execution")
+                  if request["spec"]["provider"] == "codex" else nullcontext()):
+                return broker.run_browser_qa(request["iteration"], request["candidate"])
         except Exception as exc:
             if request["spec"]["provider"] != "codex":
                 raise
@@ -406,9 +445,16 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_precheck")
 async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        _, broker = _context(request["spec"])
+        store, broker = _context(request["spec"])
         try:
-            return broker.run_prechecks(request["iteration"], request["candidate"])
+            with (_lock(store.config.state_root / "check-execution")
+                  if request["spec"]["provider"] == "codex" else nullcontext()):
+                return broker.run_prechecks(request["iteration"], request["candidate"])
+        except CheckPreparationFailure as exc:
+            return {'state': 'failed', 'cleanup': 'confirmed',
+                    'candidate_id': request['candidate']['id'],
+                    'source_unchanged': broker.candidate()['id'] == request['candidate']['id'],
+                    'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
             if request["spec"]["provider"] != "codex":
                 raise
@@ -418,6 +464,23 @@ async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
                 "candidate_id": request["candidate"]["id"],
                 "reason": type(exc).__name__,
             }
+
+    return await asyncio.to_thread(execute)
+
+
+@activity.defn(name="delivery_baseline_checks")
+async def delivery_baseline_checks(request: dict[str, Any]) -> dict[str, Any]:
+    def execute() -> dict[str, Any]:
+        from .delivery_baseline import run_baseline_checks
+
+        store, broker = _context(request["spec"])
+        with (_lock(store.config.state_root / "check-execution")
+              if request["spec"]["provider"] == "codex" else nullcontext()):
+            try:
+                return run_baseline_checks(broker)
+            except CheckPreparationFailure as exc:
+                return {"state": "failed", "results": exc.results, "diagnostic": str(exc),
+                        "base_sha": request["spec"]["base_sha"]}
 
     return await asyncio.to_thread(execute)
 
@@ -689,6 +752,7 @@ DELIVERY_ACTIVITIES = [
     delivery_terminal_tracker,
     delivery_project,
     delivery_prepare,
+    delivery_baseline_checks,
     delivery_finalize_resources,
     delivery_intake,
     delivery_accept_plan,

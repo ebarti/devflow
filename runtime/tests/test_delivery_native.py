@@ -111,6 +111,35 @@ def native_store(native_configuration):
     return store, request
 
 
+def test_native_checks_share_browser_assets_without_sharing_private_homes(
+    native_store, tmp_path, monkeypatch
+):
+    from devflow_temporal.delivery_sandbox import prepare_native_check
+
+    store, request = native_store
+    spec = store.spec(request["run_id"])
+    checkout = Path(spec["checkout"])
+    checkout.mkdir(parents=True)
+    original_home = tmp_path / "original-home"
+    browser_cache = original_home / "Library/Caches/ms-playwright"
+    browser_cache.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: original_home)
+    environments = []
+    for name in ("browser-a", "browser-b"):
+        profile, environment = prepare_native_check(
+            spec, checkout, Path(spec["state_dir"]) / "checks",
+            {"id": name, "argv": ["node", "browser.cjs"]},
+        )
+        environments.append(environment)
+        assert environment["PLAYWRIGHT_BROWSERS_PATH"] == str(browser_cache)
+        assert Path(environment["HOME"]) != original_home
+        lines = (Path(environment["CODEX_HOME"]) / "config.toml").read_text()
+        assert f'{json.dumps(str(browser_cache.resolve()))} = "read"' in lines
+        assert f'{json.dumps(str(original_home.resolve()))} = "read"' not in lines
+        assert profile == "devflow-check"
+    assert environments[0]["HOME"] != environments[1]["HOME"]
+
+
 def test_native_admission_has_no_docker_policy_and_bounds_nested_launches(
     native_store, monkeypatch
 ):

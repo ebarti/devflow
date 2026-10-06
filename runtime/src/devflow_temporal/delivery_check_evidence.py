@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from .delivery_resources import private_directory, write_private
@@ -70,3 +71,29 @@ def verify_manifest(reference: dict, candidate_id: str, state_dir: Path) -> dict
                 or hashlib.sha256(file.read_bytes()).hexdigest() != item['sha256']):
             raise ValueError('retained synthetic check artifact changed')
     return manifest
+
+
+def junit_counts(reference: dict, candidate_id: str, state_dir: Path) -> dict:
+    """Count actual cases in an authenticated retained report, never log summaries."""
+    manifest = verify_manifest(reference, candidate_id, state_dir)
+    reports = [item for item in manifest['artifacts'] if item['relative_path'] == 'junit.xml']
+    if len(reports) != 1:
+        raise ValueError('required owned JUnit report is missing')
+    content = Path(reports[0]['path']).read_bytes()
+    if (len(content) > 50 * 1024 * 1024 or b'<!DOCTYPE' in content.upper()
+            or b'<!ENTITY' in content.upper()):
+        raise ValueError('JUnit report contains unsupported declarations or exceeds its bound')
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as exc:
+        raise ValueError('JUnit report is malformed') from exc
+    if root.tag not in {'testsuites', 'testsuite'}:
+        raise ValueError('JUnit report has no test suite')
+    cases = list(root.iter('testcase'))
+    counts = {'tests': len(cases), 'failures': 0, 'errors': 0, 'skipped': 0, 'passed': 0}
+    for case in cases:
+        outcome = next((tag for tag in ('failure', 'error', 'skipped')
+                        if case.find(tag) is not None), None)
+        counts[{'failure': 'failures', 'error': 'errors', 'skipped': 'skipped'}.get(
+            outcome, 'passed')] += 1
+    return counts

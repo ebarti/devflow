@@ -52,7 +52,19 @@ def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
                    """,
                 (spec["run_id"],) * 3,
             ).fetchall()
-        maximum = max([maximum, *(row[0] for row in grants)])
+            row = db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
+                             (spec['run_id'],)).fetchone()
+            import json
+
+            recovery = json.loads(row[0]) if row and row[0] else None
+            if recovery and recovery.get('kind') == 'stopped_delivery_resume':
+                from .delivery_stopped_resume import custody
+
+                if custody(db, recovery) != spec:
+                    raise ValueError('native stopped resume policy changed')
+                maximum = recovery['maximum_iteration']
+            else:
+                maximum = max([maximum, *(grant[0] for grant in grants)])
     if (
         role not in spec["policy"]["roles"]
         or type(iteration) is not int

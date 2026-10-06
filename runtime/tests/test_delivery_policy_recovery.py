@@ -470,7 +470,10 @@ def test_policy_preparation_failure_preserves_predecessor_and_same_command_retry
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_at_tracker", [False, True])
-async def test_new_failed_gate_is_required_before_one_same_session_repair(cancel_at_tracker):
+async def test_new_failed_gate_is_required_before_one_same_session_repair(
+    cancel_at_tracker, monkeypatch,
+):
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     controller = DeliveryWorkflow()
     candidate = {'id': 'preserved', 'head': 'a' * 40}
     controller.state = {'run_id': 'same-run', 'candidate': candidate, 'candidate_revision': 3,

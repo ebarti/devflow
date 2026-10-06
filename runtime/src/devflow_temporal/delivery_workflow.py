@@ -21,6 +21,8 @@ def _preparation_failure(result: dict[str, Any]) -> str | None:
     for item in result.get("results", []):
         if not isinstance(item, dict) or item.get("passed"):
             continue
+        if item.get('failure_kind') == 'preparation' and item.get('launched') is False:
+            return str(item.get('id', 'check preparation'))[:128]
         argv = item.get("argv", [])
         if not isinstance(argv, list):
             continue
@@ -29,7 +31,8 @@ def _preparation_failure(result: dict[str, Any]) -> str | None:
             for command in (("pnpm", "install"), ("playwright", "install"))
             for i in range(len(argv))
         )
-        preparation |= "uv" in argv and "sync" in argv and "run" not in argv
+        preparation |= (bool(argv) and argv[0].rsplit('/', 1)[-1] == 'uv'
+                        and 'sync' in argv and 'run' not in argv)
         if preparation:
             return str(item.get("id", "dependency installer"))[:128]
     return None
@@ -685,6 +688,13 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         if recovery is not None:
+            if recovery.get("kind") == "stopped_delivery_resume":
+                return await self._resume_stopped(spec, recovery)
+            if recovery.get("kind") == "pending_publication_retry":
+                return await self._resume_pending_publication(spec, recovery)
+            if recovery.get("kind") in {"published_gate_retry", "prepublication_gate_retry",
+                                       "published_check_prelaunch_retry", "published_ci_retry"}:
+                return await self._resume_published_gates(spec, recovery)
             if recovery.get("kind") == "terminal_tracker_recovery":
                 return await self._resume_terminal_tracker(spec, recovery)
             if recovery.get("kind") == "published_metadata_recovery":
@@ -739,6 +749,31 @@ class DeliveryWorkflow:
             return await self._cancelled(spec)
         self.state["candidate"] = prepared["candidate"]
         self.state["candidate_revision"] += 1
+        # Frozen legacy inputs omit this marker, preserving recorded histories.
+        # A shared baseline defect must not consume a feature repair turn.
+        if spec.get("baseline_checks_version") == 1:
+            self.state["phase"] = "baseline_checks"
+            self.state["revision"] += 1
+            await self._project(spec, "baseline_checks", "Checking the immutable project baseline")
+            try:
+                baseline = await self._activity("delivery_baseline_checks", {"spec": spec})
+            except Exception as exc:
+                return await self._stop(
+                    spec, f"baseline check execution unresolved: {type(exc).__name__}"
+                )
+            self.state["checks"]["baseline"] = baseline
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            if baseline.get("state") != "passed":
+                failed = [str(item.get("id", "unknown")) for item in baseline.get("results", [])
+                          if not item.get("passed")]
+                return await self._stop(
+                    spec, "project baseline failed before feature work: " + ", ".join(failed)
+                )
+            self.state["revision"] += 1
+            await self._project(
+                spec, "baseline_passed", "Project baseline passed; starting feature work"
+            )
         if spec.get("intake_required"):
             accepted_spec = await self._run_intake(spec)
             if accepted_spec is None:
@@ -855,6 +890,124 @@ class DeliveryWorkflow:
             continuation=None,
             recovery=recovery,
         )
+
+    async def _resume_pending_publication(self, spec, recovery):
+        self.state = deepcopy(recovery["state"])
+        self.state.update(phase="publishing", execution_state="running", outcome=None,
+                          error=None, cleanup="none")
+        self.state["checks"].pop("terminal_tracker_checkpoint", None)
+        try:
+            await self._activity("delivery_gates_readback", {"spec": spec, "recovery": recovery})
+            tracker = await self._activity("delivery_tracker_start", {
+                "spec": spec, "repair_continuation": True,
+            })
+            self.state["tracker"] = tracker
+            if tracker.get("state") != "consistent":
+                return await self._stop(spec, "pending publication tracker readback pending")
+            if self.cancel_requested:
+                return await self._stop(spec, "cancelled")
+            published = await self._activity("delivery_publish", {
+                "spec": spec, "iteration": self.state["iteration"],
+                "candidate": self.state["candidate"],
+            })
+            if published.get("state") == "pending":
+                published = await self._published_result(
+                    spec, self.state["iteration"], self.state["candidate"], published,
+                    expected_head=recovery["seal"]["candidate"]["head"],
+                )
+            if self.state.get("outcome") == "cancelled":
+                return self.state
+            self.state.update(candidate=published["candidate"], pull_request=published)
+            self.state["candidate_revision"] += 1
+            self.state["revision"] += 1
+            await self._project(spec, "published", "Pending controller publication completed")
+        except Exception as exc:
+            return await self._stop(spec, "publication retry failed: " + type(exc).__name__)
+        implementation = next(r for r in reversed(self.state["roles"])
+                              if r.get("role") == "implement")
+        return await self._run_iterations(
+            spec, start_iteration=self.state["iteration"],
+            prior_implementer_session=implementation.get("session_id"), repair_findings=[],
+            continuation=None, recovery=None, authorized_max_iteration=self.state["iteration"],
+            published_checkpoint=True,
+        )
+
+    async def _resume_published_gates(self, spec, recovery):
+        if recovery.get('kind') == 'published_ci_retry':
+            return await self._resume_ci(spec, recovery)
+        published = recovery.get("kind") in {
+            "published_gate_retry", "published_check_prelaunch_retry", "published_ci_retry"}
+        if (recovery.get("execution_spec") != spec
+                or recovery.get("command", {}).get("additional_iterations") != 0):
+            raise ValueError("gate retry changed its zero-repair authority")
+        self.state = deepcopy(recovery["state"])
+        self.state.update(phase="gates_retry", execution_state="running", outcome=None,
+                          error=None, cleanup="none", checks={}, findings=[],
+                          candidate=recovery["candidate"], pull_request=recovery["publication"])
+        try:
+            await self._activity("delivery_gates_readback", {"spec": spec, "recovery": recovery})
+            tracker = await self._activity("delivery_tracker_start", {
+                "spec": spec, "repair_continuation": True,
+            })
+            self.state["tracker"] = tracker
+            if tracker.get("state") != "consistent":
+                return await self._stop(spec, "gate retry tracker readback remains pending")
+        except Exception as exc:
+            return await self._stop(spec, "gate retry preflight failed: " + type(exc).__name__)
+        self.state["revision"] += 1
+        await self._project(spec, "gates_retry_started",
+                            "Rechecking preserved code with fresh gates, review and QA")
+        return await self._run_iterations(
+            spec, start_iteration=self.state["iteration"],
+            prior_implementer_session=next((role.get("session_id") for role in reversed(
+                self.state["roles"]) if role.get("role") == "implement"), None),
+            repair_findings=[], continuation=None, recovery=None,
+            authorized_max_iteration=self.state["iteration"],
+            resume_prechecks=True, published_checkpoint=published,
+        )
+
+    async def _resume_ci(self, spec, recovery):
+        if (recovery.get('execution_spec') != spec
+                or recovery.get('command', {}).get('additional_iterations') != 0):
+            raise ValueError('CI continuation changed its zero-repair authority')
+        self.state = deepcopy(recovery['state'])
+        self.state.update(phase='waiting_ci', execution_state='running', outcome=None,
+                          error=None, cleanup='none', candidate=recovery['candidate'],
+                          pull_request=recovery['publication'])
+        for key in ('terminal_tracker_checkpoint', 'resource_cleanup'):
+            self.state['checks'].pop(key, None)
+        try:
+            await self._activity('delivery_gates_readback', {'spec': spec, 'recovery': recovery})
+            tracker = await self._activity('delivery_tracker_start', {
+                'spec': spec, 'repair_continuation': True})
+            self.state['tracker'] = tracker
+            if tracker.get('state') != 'consistent':
+                return await self._stop(spec, 'CI continuation tracker readback remains pending')
+            self.state['revision'] += 1
+            await self._project(spec, 'ci_retry_started',
+                                'Observing required CI on the independently passed candidate')
+            ci = await self._activity('delivery_ci', {
+                'spec': spec, 'pull_request': self.state['pull_request']}, hours=1)
+            self.state['checks']['ci'] = ci
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            if ci.get('state') != 'passed':
+                return await self._stop(spec, 'required CI did not confirm this PR head')
+            if spec.get('terminal_tracker_version') != 1:
+                tracker = await self._activity('delivery_tracker', {
+                    'spec': spec, 'pr': self.state['pull_request']})
+                self.state['tracker'] = tracker
+                if tracker.get('state') != 'consistent':
+                    return await self._stop(spec, 'tracker readback remains pending or conflicting')
+        except Exception as exc:
+            return await self._stop(spec, 'CI continuation failed: ' + type(exc).__name__)
+        if self.cancel_requested:
+            return await self._cancelled(spec)
+        self.state.update(phase='delivered', execution_state='terminal', outcome='delivered')
+        self.state['revision'] += 1
+        await self._project(spec, 'delivered',
+                            'Passed independent candidate delivered after fresh required CI')
+        return self.state
 
     async def _resume_metadata(self, spec, recovery):
         self.state = deepcopy(recovery["state"])
@@ -1048,6 +1201,68 @@ class DeliveryWorkflow:
             authorized_max_iteration=self.state["iteration"], resume_prechecks=True,
         )
 
+    async def _resume_stopped(self, spec, recovery):
+        if (recovery['execution_spec'] != spec
+                or recovery['maximum_iteration'] != (recovery['state']['iteration']
+                    + recovery['command']['additional_iterations'])):
+            raise ValueError('stopped resume changed its finite command authority')
+        self.state = deepcopy(recovery['state'])
+        self.state.update(phase='repair_preflight', execution_state='running', outcome=None,
+                          error=None, cleanup='none', candidate=recovery['execution_candidate'])
+        for key in ('resource_cleanup', 'terminal_tracker_checkpoint'):
+            self.state['checks'].pop(key, None)
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        tracker_pending_projected = False
+        delay = 5
+        while True:
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            try:
+                tracker = await self._activity(
+                    "delivery_tracker_start",
+                    {"spec": spec, "repair_continuation": True},
+                )
+            except Exception as exc:
+                return await self._stop(
+                    spec, f"repair tracker authority failed: {type(exc).__name__}"
+                )
+            self.state["tracker"] = tracker
+            if self.cancel_requested:
+                return await self._cancelled(spec)
+            if tracker.get("state") == "consistent":
+                break
+            if tracker.get("state") != "pending" or tracker.get("conflict"):
+                return await self._stop(spec, "repair tracker readback conflicts with authority")
+            if not await self._confirm_repair_preflight(spec, recovery):
+                return self.state
+            if not tracker_pending_projected:
+                self.state["revision"] += 1
+                await self._project(
+                    spec,
+                    "tracker_start_pending",
+                    "Waiting for issue and claim readback before the repair role",
+                )
+                tracker_pending_projected = True
+            await self._wait_repair_readback(delay)
+            delay = min(delay * 2, 30)
+        if not await self._confirm_repair_preflight(spec, recovery):
+            return self.state
+        self.state['revision'] += 1
+        await self._project(spec, 'stopped_resume_started',
+                            'Resuming original delivery with earlier failures retained')
+        return await self._run_iterations(
+            spec, start_iteration=recovery['state']['iteration'] + 1,
+            prior_implementer_session=recovery['session_id'],
+            repair_findings=[recovery['state']['error'], *[
+                finding for role in recovery['state'].get('roles', [])
+                if role.get('iteration') == recovery['state']['iteration']
+                for finding in role.get('findings', [])]],
+            operator_brief=None, continuation=None, recovery=None,
+            authorized_max_iteration=recovery['maximum_iteration'],
+            allow_first_session=recovery['session_id'] is None,
+        )
+
     async def _resume_repair(
         self, spec: dict[str, Any], recovery: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1071,7 +1286,8 @@ class DeliveryWorkflow:
             or previous.get("phase") != "blocked"
             or previous.get("outcome") != "blocked"
             or previous.get("cleanup") not in (
-                {"none", "confirmed"} if recovery.get("title_constraint") else {"none"}
+                {"none", "confirmed"} if recovery.get("title_constraint") or recovery.get(
+                    "finalized_checkpoint") else {"none"}
             )
             or recovery.get("candidate") != previous.get("candidate")
             or recovery.get("session_id") != previous_implementer
@@ -1123,6 +1339,8 @@ class DeliveryWorkflow:
             "error": None,
             "cleanup": "none",
         }
+        if recovery.get("execution_candidate"):
+            self.state["candidate"] = recovery["execution_candidate"]
         self.state.get("checks", {}).pop("terminal_tracker_checkpoint", None)
         self.state["revision"] += 1
         await self._project(
@@ -1340,6 +1558,7 @@ class DeliveryWorkflow:
         recovery: dict[str, Any] | None,
         authorized_max_iteration: int | None = None,
         attempt_generation: int = 0,
+        allow_first_session: bool = False,
         resume_prechecks: bool = False,
         published_checkpoint: bool = False,
         title_constraint: dict[str, Any] | None = None,
@@ -1356,6 +1575,7 @@ class DeliveryWorkflow:
             if operator_brief else None
         )
         for iteration in range(start_iteration, max_repairs + 1):
+            evidence_iteration = self.state["iteration"]
             self.state["iteration"] = iteration
             if published_checkpoint and iteration == start_iteration:
                 published = self.state['pull_request']
@@ -1403,7 +1623,17 @@ class DeliveryWorkflow:
                 )
             else:
                 if not (resume_prechecks and iteration == start_iteration):
-                    self.state["checks"] = {}
+                    evidence_context = None
+                    if workflow.patched("role-evidence-handoff-v1"):
+                        evidence_context = {
+                            "candidate": self.state["candidate"],
+                            "iteration": evidence_iteration,
+                            "checks": deepcopy(self.state["checks"]),
+                        }
+                    self.state["checks"] = {
+                        key: value for key, value in self.state["checks"].items()
+                        if key == "baseline"
+                    }
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                     self.state["phase"] = "implement" if iteration == 0 else "repair"
@@ -1417,6 +1647,8 @@ class DeliveryWorkflow:
                                 "role": "implement",
                                 "iteration": iteration,
                                 "candidate": self.state["candidate"],
+                                **({"evidence_context": evidence_context}
+                                   if evidence_context else {}),
                                 "findings": [
                                     *repair_findings,
                                     *([acceptance_note] if acceptance_note else []),
@@ -1448,7 +1680,9 @@ class DeliveryWorkflow:
                         return await self._stop(
                             spec, "continuation did not resume the original implementer"
                         )
-                    if iteration and implementation.get("session_id") != prior_implementer_session:
+                    if (iteration
+                            and not (allow_first_session and prior_implementer_session is None)
+                            and implementation.get("session_id") != prior_implementer_session):
                         return await self._stop(
                             spec, "repair did not resume the original implementer"
                         )
@@ -1458,7 +1692,10 @@ class DeliveryWorkflow:
                     self.state["candidate"] = implementation["candidate"]
                     self.state["candidate_revision"] += 1
                 else:
-                    self.state["checks"] = {}
+                    self.state["checks"] = {
+                        key: value for key, value in self.state["checks"].items()
+                        if key == "baseline"
+                    }
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                 self.state["phase"] = "prepublish_checks"
@@ -1548,10 +1785,9 @@ class DeliveryWorkflow:
             for role in (("verify",) if verify_only else ("review", "verify")):
                 if self.cancel_requested:
                     return await self._cancelled(spec)
-                if role == "verify":
-                    # The broker installs/builds the disposable gate checkout
-                    # before browser QA and before the independent verifier
-                    # inspects either source or receipts.
+                if role == ("verify" if verify_only else "review"):
+                    # Exact-head broker checks must be ready before either independent
+                    # role assesses required evidence. Browser QA still precedes verify.
                     self.state["phase"] = "checks"
                     self.state["revision"] += 1
                     await self._project(spec, "checks_started", "Executing required local checks")
@@ -1642,9 +1878,13 @@ class DeliveryWorkflow:
                             "findings": [acceptance_note] if acceptance_note else [],
                             "resume_session": None,
                             "qa_evidence": qa_evidence if role == "verify" else None,
+                            **({"evidence_context": {"role_artifacts": [
+                                r["role_artifacts"] for r in self.state["roles"]
+                                if r.get("role_artifacts") and r.get("role") == "implement"
+                                and r.get("iteration") == iteration
+                            ]}} if workflow.patched("role-evidence-handoff-v1") else {}),
                             **({"check_evidence": self.state["checks"].get("local")}
-                               if role == "verify"
-                               and spec["policy"].get("host_sandbox") == "trusted-local" else {}),
+                               if spec["policy"].get("host_sandbox") == "trusted-local" else {}),
                         },
                     )
                 except Exception as exc:

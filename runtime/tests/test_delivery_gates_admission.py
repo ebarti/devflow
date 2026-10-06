@@ -432,6 +432,7 @@ def test_gates_only_admission_refuses_changed_provenance_without_claim_or_roles(
 def test_same_iteration_workflow_skips_implementation_and_cannot_spend_another_turn(
     stopped, monkeypatch, failed
 ):
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, broker, _closed, command = stopped
     store.admit_gates_only("run-1", command)
     with store._connect() as db:

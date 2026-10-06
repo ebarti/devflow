@@ -554,3 +554,21 @@ def test_controller_selected_qa_effort_does_not_rewrite_historical_policy(native
                   'execution_role_policy': {'model': 'gpt-6.1-sol', 'effort': 'high'}})
     assert task.model == 'gpt-6.1-sol' and task.reasoning_effort == 'high'
     assert spec == frozen and spec['policy']['roles']['verify']['effort'] == 'max'
+
+
+@pytest.mark.parametrize('role', ['review', 'verify'])
+def test_independent_roles_receive_same_candidate_receipts_and_reject_stale_evidence(
+    native_configuration, role,
+):
+    config, request = native_configuration
+    config.raw['execution_mode'] = 'trusted-local'
+    store = DeliveryStore(config)
+    store.submit(request)
+    spec = store.spec(request['run_id'])
+    evidence = {'state': 'passed', 'candidate_id': '0' * 64, 'results': []}
+    body = {'spec': spec, 'role': role, 'iteration': 0,
+            'candidate': {'id': '0' * 64, 'head': '0' * 40},
+            'workspace': spec['checkout'], 'check_evidence': evidence}
+    assert 'Broker local check receipts' in _task(body).goal
+    with pytest.raises(ValueError, match='another candidate'):
+        _task({**body, 'check_evidence': {**evidence, 'candidate_id': '1' * 64}})

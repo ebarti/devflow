@@ -3,6 +3,7 @@ import { api, ApiError, safeWebUrl } from './api'
 import { CheckIcon, ExternalIcon } from './icons'
 import { display, time, timelineTime, titleCase, tokens, tone } from './format'
 import type { ActivityEvent, CheckState, Decision, PhaseGate, RoleState, RunDetail } from './model'
+import { RunControls } from './RunControls'
 
 function State({ value }: { value: string | null | undefined }) {
   return <span className={`state state--${tone(value)}`}><span className="state__mark" aria-hidden="true">{tone(value) === 'good' ? <CheckIcon /> : null}</span>{titleCase(value)}</span>
@@ -47,7 +48,7 @@ function RoleTable({ roles }: { roles: RoleState[] | null | undefined }) {
     <h2 id="roles-heading">Roles</h2>
     <div className="table-scroll"><table>
       <thead><tr><th>Role</th><th>State</th><th>Session</th><th>Tokens</th></tr></thead>
-      <tbody>{roles?.length ? roles.map((role, index) => <tr key={`${role.role}-${role.iteration ?? role.attempt_id ?? index}`}>
+      <tbody>{roles?.length ? roles.map((role, index) => <tr key={`${role.role}-${role.attempt_id ?? index}`}>
         <td>{titleCase(role.role)}</td>
         <td><State value={role.state} /></td>
         <td className="mono">{display(role.session_id, 'Unknown')}</td>
@@ -72,6 +73,21 @@ function Activity({ events }: { events: ActivityEvent[] | null | undefined }) {
 
 function QualityRow({ label, value }: { label: string; value: CheckState | null | undefined }) {
   return <div className="quality-row"><span>{label}</span><State value={value?.state} /><span className="quality-row__detail">{display(value?.detail, 'Evidence not available')}</span></div>
+}
+
+function BlockingFindings({ run }: { run: RunDetail }) {
+  if (!run.error) return null
+  const findings = ['review', 'verify'].flatMap(name => {
+    const gate = run.checks?.[name === 'review' ? 'review' : 'qa']
+    const role = [...(run.roles ?? [])].reverse().find(item => item.role === name)
+    return gate?.state === 'failed' ? role?.findings ?? [] : []
+  })
+  if (!findings.length) return null
+  return <section className="inline-alert" aria-label="Blocking findings">
+    <strong>What blocked this run</strong>
+    <ul>{findings.map((finding, index) => <li key={index}>{finding}</li>)}</ul>
+    {run.error === 'repair limit exhausted' ? <p>The allowed repair budget ended before these findings were resolved.</p> : null}
+  </section>
 }
 
 function EvidenceAndQuality({ run }: { run: RunDetail }) {
@@ -126,7 +142,7 @@ function Operations({ run }: { run: RunDetail }) {
       <div><dt>Environment digest</dt><dd className="mono">{display(run.candidate?.environment_digest)}</dd></div>
       <div><dt>Protocol revision</dt><dd>{display(run.protocol_revision)}</dd></div>
     </dl>
-    {run.roles?.length ? <div className="role-provenance"><h3>Role provenance</h3><ul>{run.roles.map((role, index) => <li key={`${role.role}-${role.iteration ?? role.attempt_id ?? index}`}><strong>{titleCase(role.role)}</strong><span>Model {display(role.model, 'unobserved')} · Effort {display(role.effort, 'unobserved')} · Iteration {display(role.iteration, 'unknown')} · Cleanup {display(role.cleanup)} · Last activity {time(role.last_activity_at)}{role.summary ? ` · ${role.summary}` : ''}{role.findings?.length ? ` · Findings: ${role.findings.join('; ')}` : ''}</span></li>)}</ul></div> : null}
+    {run.roles?.length ? <div className="role-provenance"><h3>Role provenance</h3><ul>{run.roles.map((role, index) => <li key={`${role.role}-${role.attempt_id ?? index}`}><strong>{titleCase(role.role)}</strong><span>Model {display(role.model, 'unobserved')} · Effort {display(role.effort, 'unobserved')} · Iteration {display(role.iteration, 'unknown')} · Cleanup {display(role.cleanup)} · Last activity {time(role.last_activity_at)}{role.summary ? ` · ${role.summary}` : ''}{role.findings?.length ? ` · Findings: ${role.findings.join('; ')}` : ''}</span></li>)}</ul></div> : null}
     {run.tracker?.conflict ? <p className="inline-alert">Tracker conflict: {run.tracker.conflict}</p> : null}
   </section>
 }
@@ -294,9 +310,11 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     </header>
     {run.execution_retired ? <p className="inline-alert">Historical run · read-only. Its execution backend is retired.</p> : null}
     {run.error ? <p className="inline-alert" role="alert">{run.error}</p> : null}
+    <BlockingFindings run={run} />
     <PhaseStrip gates={run.phase_gates} />
     {decisions.map(decision => <DecisionCard key={`${decision.id}:${decision.revision}`} run={run} decision={decision} onRefresh={onRefresh} />)}
     <IntakeHistory run={run} />
+    <RunControls run={run} onRefresh={onRefresh} />
     <Facts run={run} />
     <RoleTable roles={run.roles} />
     <Activity events={run.events} />

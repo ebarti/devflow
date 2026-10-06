@@ -17,6 +17,7 @@ from typing import Any
 from .candidate import candidate_for
 from .contracts import canonical_json
 from .delivery_browser_qa import run_browser_qa as execute_browser_qa
+from .delivery_config import publication_base_ref
 from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
 from .delivery_output import observed_test_count, rejection_causes, visible_output
 from .delivery_store import DeliveryStore, _now
@@ -71,8 +72,30 @@ def _conventional_subject(subject: str) -> bool:
     return bool(re.fullmatch(r"[a-z][a-z0-9-]*(?:\([^()\r\n]+\))?!?: \S.*", subject))
 
 
+def publication_title(goal: str) -> str:
+    """Bound PR metadata without shortening the admitted commit subject or goal."""
+    subject = conventional_subject(goal)
+    if len(subject) <= 256:
+        return subject
+    title = subject[:253].rsplit(" ", 1)[0].rstrip() + "..."
+    if not _conventional_subject(title):
+        raise ValueError("publication subject prefix exceeds the PR title limit")
+    return title
+
+
 class BrokerReadbackUnavailable(RuntimeError):
     """A remote PR query failed before its authority could be inspected."""
+
+
+class CheckPreparationFailure(ValueError):
+    """Preparation failed before this check's NativeProcess could launch."""
+
+    def __init__(self, check_id: str, cause: Exception, results: list | None = None):
+        super().__init__(str(cause)[:500])
+        self.results = [*(results or []), {
+            'id': check_id, 'passed': False, 'cleanup': 'confirmed',
+            'launched': False, 'failure_kind': 'preparation', 'diagnostic': str(self),
+        }]
 
 
 class DeliveryBroker:
@@ -448,13 +471,18 @@ class DeliveryBroker:
                 from .delivery_sandbox import native_check_argv, prepare_native_check
 
                 verify_prepared_spec(self.spec)
-                profile, environment = prepare_native_check(
-                    self.spec, checkout, evidence_dir, check,
-                    dependency_store=(
-                        Path(native_dependencies["store"]) if native_dependencies else None
-                    ),
-                )
-                generated = self._register_generated(checkout, ["node_modules"])
+                try:
+                    profile, environment = prepare_native_check(
+                        self.spec, checkout, evidence_dir, check,
+                        dependency_store=(
+                            Path(native_dependencies["store"]) if native_dependencies else None
+                        ),
+                    )
+                    generated = self._register_generated(
+                        checkout, ["node_modules", *check.get("generated_directories", [])]
+                    )
+                except (ValueError, OSError) as exc:
+                    raise CheckPreparationFailure(check['id'], exc, results) from exc
                 # The same frozen lock populates an owned store before offline
                 # installation. Candidate commands may read, never mutate it.
                 command = [
@@ -514,6 +542,19 @@ class DeliveryBroker:
             count = None
             if check.get("test_count_regex"):
                 count = observed_test_count(output, check["test_count_regex"])
+            junit = None
+            if check.get("junit_required"):
+                from .delivery_check_evidence import junit_counts
+
+                try:
+                    if not check_evidence:
+                        raise ValueError('required owned JUnit report was not retained')
+                    junit = junit_counts(check_evidence, candidate['id'], self.state_dir)
+                    count = junit['passed']
+                    if junit['failures'] or junit['errors']:
+                        raise ValueError('required JUnit report records failed test cases')
+                except (ValueError, OSError) as exc:
+                    evidence_failure = str(exc)
             rejected_causes = rejection_causes(
                 parsed_output, [check["reject_regex"]] if check.get("reject_regex") else [],
                 test_results=check.get("kind") == "test",
@@ -532,12 +573,15 @@ class DeliveryBroker:
                     "cwd": str(cwd),
                     "exit_code": exit_code,
                     "test_count": count,
+                    **({"junit": junit} if junit is not None else {}),
                     "rejected_output": rejected_output,
                     "rejection_causes": rejected_causes,
                     "passed": passed,
                     "diagnostic": parsed_output[-2000:] if not passed else None,
                     "log": str(artifact),
                     "log_sha256": _sha256(artifact),
+                    **({"plan_provenance": check["plan_provenance"]}
+                       if check.get("plan_provenance") else {}),
                     **({"artifacts": check_evidence} if check_evidence else {}),
                     **({"evidence_failure": evidence_failure} if evidence_failure else {}),
                     "cleanup": "confirmed",
@@ -578,6 +622,9 @@ class DeliveryBroker:
         resources = RunResources(self.spec)
         roots = []
         for name in names:
+            if (not isinstance(name, str) or Path(name).is_absolute()
+                    or ".." in Path(name).parts):
+                raise ValueError("generated directory left its owned checkout")
             root = checkout / name
             if _git(checkout, "ls-files", "--", name):
                 raise ValueError("configured generated directory contains tracked source")
@@ -670,6 +717,29 @@ class DeliveryBroker:
         return result
 
 
+    def run_implementation_preparation(self, iteration: int, candidate: dict) -> dict:
+        """Prepare only accepted locked dependencies before a role executes probes."""
+        if self.candidate() != candidate:
+            raise ValueError("implementation preparation candidate is stale")
+        from .delivery_plan_checks import planned_checks
+
+        folder = self.evidence_dir / "implementation-preparation" / str(iteration)
+        planned = planned_checks(self.spec, self.checkout, folder)
+        dependencies = [c for c in planned if c['id'].startswith('planned-python-dependencies-')]
+        if any(c['id'].startswith('planned-vitest-') for c in planned):
+            dependencies = [c for c in self.spec['policy'].get('prepublish_checks', [])
+                            if '/store' in c['argv']] + dependencies
+        result = (self._run_check_list(self.checkout, dependencies, folder, candidate)
+                  if dependencies else {'state': 'passed', 'results': [],
+                                        'candidate_id': candidate['id'],
+                                        'source_unchanged': True})
+        result['cleanup'] = ('unknown' if result.get('cleanup') == 'unknown'
+                             or any(r.get('cleanup') != 'confirmed'
+                                    for r in result.get('results', [])) else 'confirmed')
+        if self.candidate() != candidate:
+            raise ValueError("locked dependency preparation changed feature source")
+        return result
+
     def run_prechecks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         if self.spec["policy"].get("execution_backend") == "native-macos":
             from .delivery_native_guard import validate_native_turn
@@ -686,9 +756,20 @@ class DeliveryBroker:
 
     def run_checks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         checkout = self.gate_checkout("verify", iteration, candidate)
+        checks = list(self.spec["policy"].get("checks", []))
+        if self.spec["provider"] == "codex" and (
+                self.spec["policy"].get("host_sandbox") == "trusted-local"):
+            from .delivery_plan_checks import planned_checks
+
+            try:
+                checks.extend(planned_checks(
+                    self.spec, checkout, self.evidence_dir / "checks" / str(iteration)
+                ))
+            except (ValueError, OSError) as exc:
+                raise CheckPreparationFailure('accepted-plan-recipes', exc) from exc
         return self._run_check_list(
             checkout,
-            self.spec["policy"].get("checks", []),
+            checks,
             self.evidence_dir / "checks" / str(iteration),
             candidate,
         )
@@ -696,7 +777,136 @@ class DeliveryBroker:
     def run_browser_qa(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         return execute_browser_qa(self, iteration, candidate)
 
-    def _existing_pr(self, *, validate_metadata: bool = True) -> dict[str, Any] | None:
+    def _legacy_published_base(self, found: dict[str, Any]) -> str:
+        """Authenticate an unchanged published target independently of its tip."""
+        with self.store._connect() as db:
+            receipts = db.execute(
+                "SELECT observed_json FROM delivery_effects "
+                "WHERE run_id=? AND kind='publish' AND state='complete'",
+                (self.spec["run_id"],),
+            ).fetchall()
+        published = [json.loads(row[0]) for row in receipts if row[0]]
+        if not any(
+            isinstance(receipt, dict)
+            and receipt.get("number") == found.get("number")
+            and receipt.get("url") == found.get("url")
+            and receipt.get("base") == self.spec["base_sha"]
+            and receipt.get("state") == "OPEN"
+            and re.fullmatch(r"[0-9a-f]{40}", receipt.get("head", ""))
+            for receipt in published
+        ):
+            raise ValueError("legacy target has no completed owned publication")
+        owner, name = self.spec["github_repo"].split("/", 1)
+        query = (
+            "query($owner:String!,$name:String!,$number:Int!,$after:String){"
+            "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+            "number url state isDraft baseRefName headRefName headRefOid "
+            "baseRef{name target{oid}} "
+            "timelineItems(first:100,after:$after){totalCount pageInfo{hasNextPage endCursor} "
+            "nodes{__typename}}}}}"
+        )
+        deadline = time.monotonic() + 60
+        cursor = None
+        cursors = set()
+        count = 0
+        total = None
+        live_ref = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BrokerReadbackUnavailable("legacy published target history timed out")
+            try:
+                response = json.loads(_run([
+                    "gh", "api", "graphql", "-f", "query=" + query,
+                    "-F", "owner=" + owner, "-F", "name=" + name,
+                    "-F", "number=" + str(found["number"]),
+                    *(["-f", "after=" + cursor] if cursor else []),
+                ], timeout=remaining))
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+                raise BrokerReadbackUnavailable(
+                    "legacy published target history unavailable"
+                ) from exc
+            try:
+                observed = response["data"]["repository"]["pullRequest"]
+                timeline = observed["timelineItems"]
+                nodes = timeline["nodes"]
+                if total is None:
+                    total = timeline["totalCount"]
+                    live_ref = observed['baseRef']
+                if (
+                    response.get("errors")
+                    or any(observed[key] != found[key] for key in (
+                        "number", "url", "state", "isDraft", "baseRefName",
+                        "headRefName", "headRefOid",
+                    ))
+                    or not isinstance(nodes, list)
+                    or type(total) is not int or total < 0
+                    or timeline["totalCount"] != total
+                    or observed['baseRef'] != live_ref
+                    or any(not isinstance(node, dict) or not node.get("__typename")
+                           or node["__typename"] == "BaseRefChangedEvent" for node in nodes)
+                ):
+                    raise ValueError("legacy published target history changed or is incomplete")
+                count += len(nodes)
+                if count > total:
+                    raise ValueError("legacy published target history count changed")
+                if timeline["pageInfo"]["hasNextPage"] is False:
+                    if count != total:
+                        raise ValueError("legacy published target history is incomplete")
+                    break
+                next_cursor = timeline['pageInfo'].get('endCursor')
+                if (timeline['pageInfo']['hasNextPage'] is not True or not nodes
+                        or not isinstance(next_cursor, str) or not next_cursor
+                        or next_cursor in cursors):
+                    raise ValueError("legacy published target history pagination is incomplete")
+                cursors.add(next_cursor)
+                cursor = next_cursor
+            except (KeyError, TypeError, AttributeError) as exc:
+                raise ValueError("legacy published target history unavailable") from exc
+        branch = found["baseRefName"]
+        try:
+            live_tip = live_ref["target"]["oid"]
+            if (live_ref["name"] != branch
+                    or not re.fullmatch(r"[0-9a-f]{40}", live_tip)):
+                raise ValueError("legacy published target branch identity changed")
+            _git(self.source, "check-ref-format", "refs/heads/" + branch)
+            try:
+                _git(self.source, "cat-file", "-e", live_tip + "^{commit}")
+            except RuntimeError:
+                if _git(self.source, "remote", "get-url", "origin") != self.spec["origin_url"]:
+                    raise ValueError("legacy published source origin changed") from None
+                # Fetch objects for the authenticated live SHA without moving refs or FETCH_HEAD.
+                _run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(self.source),
+                      "fetch", "--no-write-fetch-head", "--no-tags", "--refmap=",
+                      "origin", live_tip], timeout=max(1, deadline - time.monotonic()))
+            _git(self.source, "merge-base", "--is-ancestor", self.spec["base_sha"], live_tip)
+        except (KeyError, TypeError, RuntimeError) as exc:
+            raise ValueError("legacy published target ancestry unavailable") from exc
+        return branch
+
+    def _publication_base_ref(self, *, found: dict[str, Any] | None = None) -> str:
+        frozen = self.spec.get("publication_base_ref")
+        if frozen:
+            return frozen
+        # First publication stays exact-match. An authenticated completed
+        # publication may retain its unchanged target while upstream advances.
+        raw = self.spec["base_ref"]
+        if re.fullmatch(r"[0-9a-fA-F]{40}", raw):
+            with self.store._connect() as db:
+                published = db.execute(
+                    "SELECT 1 FROM delivery_effects WHERE run_id=? "
+                    "AND kind='publish' AND state='complete' LIMIT 1",
+                    (self.spec["run_id"],),
+                ).fetchone()
+            if published:
+                found = found or self._read_owned_pr()
+                if found is None:
+                    raise ValueError("legacy published PR identity is unavailable")
+                return self._legacy_published_base(found)
+            return publication_base_ref(self.source, raw, self.spec["base_sha"])
+        return raw.removeprefix("origin/")
+
+    def _read_owned_pr(self) -> dict[str, Any] | None:
         try:
             output = _run(
                 [
@@ -724,10 +934,17 @@ class DeliveryBroker:
         found = matches[0]
         if (
             found["headRefName"] != self.spec["branch"]
-            or found["baseRefName"] != self.spec["base_ref"].removeprefix("origin/")
             or found["isDraft"]
             or found["state"] != "OPEN"
         ):
+            raise RuntimeError("owned branch PR is not the authorized open regular PR")
+        return found
+
+    def _existing_pr(self, *, validate_metadata: bool = True) -> dict[str, Any] | None:
+        found = self._read_owned_pr()
+        if found is None:
+            return None
+        if found["baseRefName"] != self._publication_base_ref(found=found):
             raise RuntimeError("owned branch PR is not the authorized open regular PR")
         if validate_metadata and not _conventional_subject(found.get("title", "")):
             raise ValueError("owned PR title does not satisfy Conventional Commits")
@@ -752,6 +969,7 @@ class DeliveryBroker:
                 raise ValueError("owned commit lacks its author Signed-off-by trailer: " + commit)
 
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        publication_branch = self._publication_base_ref()
         self._validate_publication_commits()
         key = f"publish:{self.spec['run_id']}:{iteration}"
         before = self.candidate()
@@ -819,7 +1037,7 @@ class DeliveryBroker:
                     raise RuntimeError("remote feature branch diverged")
             _git(self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}")
         if existing is None:
-            title = conventional_subject(self.spec["goal"])
+            title = publication_title(self.spec["goal"])
             body = self.state_dir / "pull-request.md"
             body.write_text(
                 self.spec["policy"].get("pr_body")
@@ -841,7 +1059,7 @@ class DeliveryBroker:
                     "--head",
                     self.spec["branch"],
                     "--base",
-                    self.spec["base_ref"].removeprefix("origin/"),
+                    publication_branch,
                     "--title",
                     title,
                     "--body-file",

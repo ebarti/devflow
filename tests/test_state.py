@@ -1,5 +1,7 @@
 """Contracts of the state helper: exclusive claims, creation replay, schema migration."""
+import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +11,66 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "skills" / "devflow" / "scripts"))
 
 import state  # noqa: E402
+
+
+class CreationPermissionsTests(unittest.TestCase):
+    def test_overlapping_connections_preserve_child_permissions_and_private_state(self):
+        # Isolate the process-wide mask, and force the restore ordering that used
+        # to leave the worker at 077 while creating one database at 0644.
+        probe = r'''
+import json, os, sqlite3, sys, threading
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import state
+root = Path(sys.argv[2])
+os.umask(0o022)
+original = sqlite3.connect
+second_entered = threading.Event()
+first_finished = threading.Event()
+errors = []
+def overlap(path, *args, **kwargs):
+    if Path(path).stem == 'a':
+        if not second_entered.wait(5):
+            raise RuntimeError('second connection did not overlap')
+    else:
+        second_entered.set()
+        if not first_finished.wait(5):
+            raise RuntimeError('first connection did not finish')
+    return original(path, *args, **kwargs)
+sqlite3.connect = overlap
+def connect(name):
+    try:
+        state.connect(root / 'private' / 'nested' / (name + '.sqlite3')).close()
+    except BaseException as exc:
+        errors.append(str(exc))
+    finally:
+        if name == 'a':
+            first_finished.set()
+first = threading.Thread(target=connect, args=('a',))
+second = threading.Thread(target=connect, args=('b',))
+first.start(); second.start()
+first.join(10); second.join(10)
+import subprocess
+subprocess.run([sys.executable, '-c',
+    'from pathlib import Path; import sys; Path(sys.argv[1]).write_text("child")',
+    str(root / 'child')], check=True)
+print(json.dumps({'mask': os.umask(0o022), 'errors': errors,
+    'modes': {str(p.relative_to(root)): p.stat().st_mode & 0o777
+              for p in root.rglob('*')}}))
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, "-c", probe, str(ROOT / "skills/devflow/scripts"), directory],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+        observed = json.loads(result.stdout)
+        self.assertEqual(observed["errors"], [])
+        self.assertEqual(observed["mask"], 0o022)
+        self.assertEqual(observed["modes"], {
+            "private": 0o700, "private/nested": 0o700,
+            "private/nested/a.sqlite3": 0o600, "private/nested/b.sqlite3": 0o600,
+            "child": 0o644,
+        })
 
 
 class StateCase(unittest.TestCase):
