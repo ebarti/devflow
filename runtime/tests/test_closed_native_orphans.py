@@ -15,6 +15,9 @@ from temporalio.client import WorkflowFailureError
 from temporalio.testing import WorkflowEnvironment
 from test_delivery_activity_liveness import CHECK_PROGRAM, WORKER_DRIVER
 from test_delivery_api import api_fixture as api_fixture
+from test_delivery_intake import intake_fixture as intake_fixture
+from test_delivery_native import native_configuration as native_configuration
+from test_delivery_policy_recovery import preserved as preserved
 from test_delivery_role_reattach import FIXED_NATIVE_PROVIDER
 
 from devflow_temporal.delivery_api import DeliveryService
@@ -150,8 +153,22 @@ async def test_closed_native_role_is_reconciled_after_worker_sigkill_without_rep
                 assert after['session_id'] == 'fixed-native-session'
                 assert run['outcome'] == 'blocked' and run['error'] == 'Original worker was killed'
                 assert run['cleanup'] == 'confirmed'
-                cleanup = json.loads(run['checks_json'])['resource_cleanup']
-                assert cleanup['original_attempts'] == [original_unknown]
+                import httpx
+
+                from devflow_temporal.delivery_api import create_app
+
+                transport = httpx.ASGITransport(app=create_app(path), client=("127.0.0.1", 10001))
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://127.0.0.1:18770"
+                ) as browser:
+                    listed = (await browser.get("/api/runs")).json()["runs"][0]
+                    detailed = (await browser.get("/api/runs/" + spec["run_id"])).json()["run"]
+                for projected in (listed, detailed):
+                    assert projected["cleanup"] == projected["cleanup_recorded"] == "confirmed"
+                assert any(
+                    event["payload"].get("original_attempts") == [original_unknown]
+                    for event in store.events(spec["run_id"])
+                )
                 assert original_unknown['state'] == 'unknown'
                 assert original_unknown['result_json'] is None
                 assert original_unknown['cleanup'] == 'unknown'
@@ -315,7 +332,7 @@ def test_uncertain_effect_preserves_cleanup_and_claim(api_fixture, monkeypatch, 
 
     monkeypatch.setattr(delivery_orphans, 'RunResources', Resources)
     delivery_orphans._reconcile(store, original, spec, {'status': 'TERMINATED'})
-    assert observed == [('blocked', True)]
+    assert observed == []
     with store._connect() as db:
         run = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
         assert run['cleanup'] == 'unknown' and run['error'] == 'Original failure'
@@ -323,7 +340,7 @@ def test_uncertain_effect_preserves_cleanup_and_claim(api_fixture, monkeypatch, 
         assert [dict(row) for row in db.execute('SELECT * FROM claims')] == claims
         assert db.execute(f'SELECT state FROM {table}').fetchone()[0] == state
         assert db.execute("SELECT COUNT(*) FROM delivery_events "
-                          "WHERE type='resource_cleanup_reconciled'").fetchone()[0] == 1
+                          "WHERE type='resource_cleanup_reconciled'").fetchone()[0] == 0
 
 
 def test_cleanup_cannot_apply_a_previous_execution_snapshot(api_fixture):
@@ -386,12 +403,11 @@ def test_finished_historical_role_is_not_completed_again(api_fixture, monkeypatc
     monkeypatch.setattr(delivery_orphans, '_observe_registered_process',
                         lambda spec, path: observed.append(('observe', str(path))))
     delivery_orphans._reconcile(store, original, spec, {'status': 'TERMINATED'})
-    assert observed == ([('observe', 'historical-process.json'),
-                         ('finalize', 'blocked', False)] if cleanup == 'confirmed' else [])
+    assert observed == []
     with store._connect() as db:
         assert dict(db.execute('SELECT * FROM delivery_attempts').fetchone()) == attempt
         run = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
-        assert run['cleanup'] == cleanup
+        assert run == original
         assert run['outcome'] == 'blocked' and run['error'] == 'Original failure'
 
 
@@ -418,7 +434,7 @@ def test_missing_native_resource_ownership_remains_unknown(api_fixture, retained
             write_private(resources.manifest, manifest)
     delivery_orphans._reconcile(store, original, spec, {'status': 'TERMINATED'})
     with store._connect() as db:
-        assert db.execute('SELECT cleanup FROM delivery_runs').fetchone()[0] == 'unknown'
+        assert dict(db.execute('SELECT * FROM delivery_runs').fetchone()) == original
 
 
 def test_registered_monitor_cannot_claim_cleanup_while_its_owned_child_is_alive(
@@ -455,3 +471,212 @@ def test_registered_monitor_cannot_claim_cleanup_while_its_owned_child_is_alive(
     finally:
         child.terminate()
         child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("attempt_state", ["finished", "unknown"])
+def test_closed_maintenance_keeps_legacy_confirmed_projection(api_fixture, attempt_state):
+    from devflow_temporal import delivery_orphans
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_resources import RunResources
+
+    path, submission = api_fixture
+    store = DeliveryStore(DeliveryConfig.load(path))
+    store.submit(submission)
+    spec = store.effective_spec(submission["run_id"])
+    folder = Path(spec["state_dir"]) / "attempts" / "legacy"
+    write_private(folder / "launch.json", {"argv": ["legacy"], "environment": {}})
+    write_private(
+        folder / "native-process.json",
+        {  # pre-#70 shape: no 'monitor'
+            "intent": {
+                "run_id": spec["run_id"],
+                "policy_digest": spec["policy_digest"],
+                "argv": ["legacy"],
+                "cwd": "/",
+                "environment_sha256": digest({}),
+                "timeout": 60,
+                "ports": [],
+            },
+            "phase": "finished",
+            "monitoring_complete": True,
+            "ports": [],
+            "result": {},
+            "owned": {
+                "999999": {
+                    "ppid": 1,
+                    "pgid": 999999,
+                    "stat": "S",
+                    "identity": "Thu Oct  2 10:00:00 2026",
+                }
+            },
+        },
+    )
+    resources = RunResources(spec)
+    resources.process(folder / "native-process.json")
+    receipt = resources.finalize("blocked")
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO delivery_attempts "
+            "(job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup) "
+            "VALUES ('legacy',?,'implement',0,'original',?,'{}','confirmed')",
+            (spec["run_id"], attempt_state),
+        )
+    store.project(
+        spec["run_id"],
+        phase="blocked",
+        execution_state="blocked",
+        event_type="blocked",
+        message="implementer did not establish a pass",
+        outcome="blocked",
+        cleanup="none",
+        checks={"resource_cleanup": receipt},
+        error="implementer did not establish a pass",
+    )
+    initial_cleanup = "confirmed" if attempt_state == "finished" else "none"
+    assert store.list_runs()[0]["cleanup"] == initial_cleanup
+    with store._connect() as db:
+        before = dict(db.execute("SELECT * FROM delivery_runs").fetchone())
+    events = store.events(spec["run_id"])
+    delivery_orphans._reconcile(store, before, spec, {"status": "COMPLETED"})
+    with store._connect() as db:
+        after = dict(db.execute("SELECT * FROM delivery_runs").fetchone())
+    assert after == before
+    assert store.events(spec["run_id"]) == events
+    assert store.list_runs()[0]["cleanup"] == initial_cleanup
+
+
+@pytest.mark.asyncio
+async def test_closed_maintenance_keeps_policy_recovery_preflight(preserved):
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from temporalio.client import WorkflowExecutionStatus
+
+    from devflow_temporal.delivery_orphans import reconcile_closed_native
+
+    store, spec, _payload, _state = preserved
+    run_id = spec["run_id"]
+    precheck = store.policy_recovery_precheck(run_id)
+    events = store.events(run_id)
+    with store._connect() as db:
+        before = dict(
+            db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+        )
+
+    class Handle:
+        def __init__(self, workflow_id):
+            self.id = workflow_id
+
+        async def describe(self):
+            async def memo_value(name, default):
+                return before["request_digest"] if name == "request_digest" else default
+
+            return SimpleNamespace(
+                id=self.id,
+                run_id="closed-execution",
+                memo_value=memo_value,
+                status=WorkflowExecutionStatus.COMPLETED,
+                close_time=datetime.now(UTC),
+            )
+
+    client = SimpleNamespace(
+        get_workflow_handle=Handle,
+        namespace=store.config.raw.get("temporal_namespace", "default"),
+        service_client=SimpleNamespace(
+            config=SimpleNamespace(target_host=store.config.temporal_address)
+        ),
+    )
+    await reconcile_closed_native(store, client)
+    with store._connect() as db:
+        after = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone())
+    assert after == before
+    assert store.events(run_id) == events
+    assert store.policy_recovery_precheck(run_id) == precheck
+
+
+@pytest.mark.parametrize("interruption", [None, "acknowledgement", "changed-execution"])
+def test_prior_unknown_attempt_survives_second_unresolved_pass(
+    api_fixture, monkeypatch, interruption,
+):
+    from contextlib import contextmanager
+
+    from devflow_temporal import delivery_orphans
+
+    path, submission = api_fixture
+    store = DeliveryStore(DeliveryConfig.load(path))
+    store.submit(submission)
+    spec = store.effective_spec(submission["run_id"])
+    store.project(
+        spec["run_id"],
+        phase="blocked",
+        execution_state="blocked",
+        event_type="blocked",
+        message="Original failure",
+        outcome="blocked",
+        error="Original failure",
+        cleanup="unknown",
+    )
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO delivery_attempts "
+            "(job_key,run_id,role,iteration,candidate_id,state,cleanup) "
+            "VALUES ('orphan',?,'implement',0,'input','unknown','unknown')",
+            (spec["run_id"],),
+        )
+        db.execute(
+            "INSERT INTO delivery_mutations (command_id,run_id,kind,request_digest,state) "
+            "VALUES ('pending-write',?,'publish','original','pending')",
+            (spec["run_id"],),
+        )
+        unknown = dict(db.execute("SELECT * FROM delivery_attempts").fetchone())
+
+    def complete(store, spec, row, observed):  # authenticated observation precedes transition
+        observed({"cleanup": "observed-native-confirmed"})
+        assert any(event["payload"].get("original_attempts") == [unknown]
+                   for event in store.events(spec["run_id"]))
+        with store._connect() as db:
+            db.execute(
+                "UPDATE delivery_attempts SET state='finished',cleanup='confirmed',"
+                "result_json='{}' "
+                "WHERE job_key=?",
+                (row["job_key"],),
+            )
+        if interruption == "acknowledgement":
+            raise RuntimeError("Completion acknowledgement lost after commit")
+        if interruption == "changed-execution":
+            with store._connect() as db:
+                db.execute("UPDATE delivery_runs SET protocol_revision=1")
+        return {"cleanup": "observed-native-confirmed"}
+
+    class Resources:
+        def __init__(self, _spec, *, read_only):
+            self.manifest = path
+
+        @contextmanager
+        def locked(self):
+            yield {"processes": ["registered.json"]}
+
+        def finalize(self, outcome, *, uncertain):
+            return {"state": "unknown", "resource_cleanup": "unknown", "process_cleanup": "unknown"}
+
+    monkeypatch.setattr(delivery_orphans, "_complete_attempt", complete)
+    monkeypatch.setattr(delivery_orphans, "RunResources", Resources)
+    monkeypatch.setattr(
+        delivery_orphans, "_observe_registered_process", lambda s, p: {"journal": str(p)}
+    )
+    for _ in range(2):  # the run stays selected while cleanup is unknown
+        with store._connect() as db:
+            original = dict(db.execute("SELECT * FROM delivery_runs").fetchone())
+        if interruption == "changed-execution" and _ == 0:
+            with pytest.raises(ValueError, match="execution changed"):
+                delivery_orphans._reconcile(store, original, spec, {"status": "TERMINATED"})
+        else:
+            delivery_orphans._reconcile(store, original, spec, {"status": "TERMINATED"})
+    with store._connect() as db:
+        payloads = [
+            json.loads(r[0])
+            for r in db.execute(
+                "SELECT payload_json FROM delivery_events WHERE type='resource_cleanup_reconciled'"
+            )
+        ]
+    assert any(p.get("original_attempts") == [unknown] for p in payloads)

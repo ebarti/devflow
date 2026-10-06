@@ -28,7 +28,7 @@ def _unchanged(store, original):
     return dict(row)
 
 
-def _complete_attempt(store, spec, row):
+def _complete_attempt(store, spec, row, on_observed=None):
     supervisor = get_supervisor(store)
     folder = Path(spec['state_dir']) / 'attempts' / row['job_key']
     if not folder.is_absolute() or folder.resolve() != folder:
@@ -76,6 +76,10 @@ def _complete_attempt(store, spec, row):
     receipt = reconcile_process(journal_path)
     if receipt['cleanup'] != 'observed-native-confirmed':
         raise ValueError('original native cleanup remains unknown')
+    if journal['result'].get('cleanup') != 'observed-native-confirmed':
+        raise ValueError('original provider cleanup remains ambiguous')
+    if on_observed is not None:
+        on_observed(receipt)
     supervisor._complete_native(request, request,
         SimpleNamespace(folder=folder, journal=journal_path), row['job_key'], journal['result'])
     return receipt
@@ -110,6 +114,27 @@ def _observe_registered_process(spec, path):
         raise ValueError('registered native cleanup remains unknown')
     return receipt
 
+def _retain_observation(store, original, attempt, closed, observation):
+    # Persist the original row before completion can commit, including when its
+    # acknowledgement or the later run projection is lost. This is an observation,
+    # not a successful role verdict or permission to release the claim.
+    payload = {'closed_workflow': closed, 'native_observations': [observation],
+               'original_attempts': [attempt]}
+    payload['key'] = digest(payload)
+    with store._connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        current = db.execute('SELECT * FROM delivery_attempts WHERE job_key=?',
+                             (attempt['job_key'],)).fetchone()
+        if current is None or dict(current) != attempt:
+            raise ValueError('original native attempt changed during observation')
+        if not any(json.loads(row[0]).get('key') == payload['key'] for row in db.execute(
+            "SELECT payload_json FROM delivery_events WHERE run_id=? "
+            "AND type='resource_cleanup_reconciled'", (original['run_id'],))):
+            store._event(db, original['run_id'], original['revision'],
+                'resource_cleanup_reconciled',
+                'Original native cleanup observed before attempt completion', payload)
+
+
 def _reconcile(store, original, spec, closed):
     current = _unchanged(store, original)
     with store._connect() as db:
@@ -120,15 +145,26 @@ def _reconcile(store, original, spec, closed):
             (spec['run_id'],)).fetchone() is not None for table in (
                 'delivery_effects', 'delivery_mutations'))
     observations = []
+    resolved = []
     try:
         for attempt in attempts:
             if attempt['state'] == 'finished':
-                if attempt['cleanup'] != 'confirmed':
-                    raise ValueError('completed original role cleanup remains unknown')
-                # Its immutable result may predate the current accepted plan. Observe its
-                # registered processes below without recompleting or rewriting the role.
                 continue
-            observations.append(_complete_attempt(store, spec, attempt))
+            observation = _complete_attempt(store, spec, attempt,
+                lambda receipt, attempt=attempt: _retain_observation(
+                    store, original, attempt, closed, receipt))
+            with store._connect() as db:
+                completed = db.execute(
+                    'SELECT state,cleanup FROM delivery_attempts WHERE job_key=?',
+                    (attempt['job_key'],)).fetchone()
+            if completed['state'] == 'finished' and completed['cleanup'] == 'confirmed':
+                resolved.append(attempt)
+                observations.append(observation)
+        if not resolved:
+            return
+        if any(item['state'] == 'finished' and item['cleanup'] != 'confirmed'
+               for item in attempts):
+            raise ValueError('completed original role cleanup remains unknown')
         outcome = current['outcome']
         if outcome not in {'delivered', 'blocked', 'cancelled'}:
             uncertain = uncertain or closed['status'] == 'COMPLETED'
@@ -145,16 +181,17 @@ def _reconcile(store, original, spec, closed):
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         receipt = {'state': 'unknown', 'resource_cleanup': 'unknown',
                    'process_cleanup': 'unknown', 'reason': str(exc)[:300]}
+    if not resolved:
+        return
     current = _unchanged(store, original)
-    receipt = {**receipt, 'closed_workflow': closed, 'native_observations': observations,
-               'original_attempts': [item for item in attempts if item['state'] != 'finished']}
     checks = {**json.loads(current['checks_json'] or '{}'), 'resource_cleanup': receipt}
     store.project(spec['run_id'], phase=current['phase'],
         execution_state=current['execution_state'], outcome=current['outcome'],
         error=current['error'], checks=checks, cleanup=receipt['resource_cleanup'],
         event_type='resource_cleanup_reconciled',
         message='Owner maintenance observed native cleanup after workflow closure',
-        key=digest(receipt))
+        key=digest({'closed_workflow': closed, 'native_observations': observations,
+                    'resource_cleanup': receipt}))
 
 
 async def reconcile_closed_native(store, client):
@@ -164,8 +201,7 @@ async def reconcile_closed_native(store, client):
     with store._connect() as db:
         rows = [dict(row) for row in db.execute(
             "SELECT r.* FROM delivery_runs r WHERE EXISTS (SELECT 1 FROM delivery_attempts a "
-            "WHERE a.run_id=r.run_id AND (a.state!='finished' OR a.cleanup!='confirmed' "
-            "OR r.cleanup!='confirmed'))")]
+            "WHERE a.run_id=r.run_id AND a.state!='finished')")]
     for row in rows:
         try:
             spec = store.effective_spec(row['run_id'])
