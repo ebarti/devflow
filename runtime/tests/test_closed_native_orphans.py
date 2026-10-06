@@ -324,6 +324,62 @@ def test_cleanup_cannot_apply_a_previous_execution_snapshot(api_fixture):
         _unchanged(store, original)
 
 
+@pytest.mark.parametrize('cleanup', ['confirmed', 'unknown'])
+def test_finished_historical_role_is_not_completed_again(api_fixture, monkeypatch, cleanup):
+    from contextlib import contextmanager
+
+    from devflow_temporal import delivery_orphans
+
+    path, submission = api_fixture
+    store = DeliveryStore(DeliveryConfig.load(path))
+    store.submit(submission)
+    spec = store.effective_spec(submission['run_id'])
+    store.project(spec['run_id'], phase='blocked', execution_state='blocked',
+                  event_type='blocked', message='Original failure', outcome='blocked',
+                  error='Original failure', cleanup='unknown')
+    original_result = json.dumps({'status': 'failed', 'error': 'Retained role failure'})
+    with store._connect() as db:
+        db.execute('INSERT INTO delivery_attempts '
+                   '(job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup) '
+                   'VALUES (?,?,?,?,?,?,?,?)',
+                   ('historical', spec['run_id'], 'intake', 0, 'original', 'finished',
+                    original_result, cleanup))
+        original = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
+        attempt = dict(db.execute('SELECT * FROM delivery_attempts').fetchone())
+    # A later accepted plan must not cause immutable earlier role results to be reprocessed.
+    spec = {**spec, 'accepted_plan': {'text': 'Current accepted plan'}}
+    observed = []
+
+    def repeat_completion(*_):
+        raise ValueError('historical original request differs from current accepted plan')
+
+    class Resources:
+        def __init__(self, _spec):
+            pass
+
+        @contextmanager
+        def locked(self):
+            yield {'processes': ['historical-process.json']}
+
+        def finalize(self, outcome, *, uncertain):
+            observed.append(('finalize', outcome, uncertain))
+            return {'state': 'confirmed', 'resource_cleanup': 'confirmed',
+                    'process_cleanup': 'confirmed'}
+
+    monkeypatch.setattr(delivery_orphans, '_complete_attempt', repeat_completion)
+    monkeypatch.setattr(delivery_orphans, 'RunResources', Resources)
+    monkeypatch.setattr(delivery_orphans, '_observe_registered_process',
+                        lambda spec, path: observed.append(('observe', str(path))))
+    delivery_orphans._reconcile(store, original, spec, {'status': 'TERMINATED'})
+    assert observed == ([('observe', 'historical-process.json'),
+                         ('finalize', 'blocked', False)] if cleanup == 'confirmed' else [])
+    with store._connect() as db:
+        assert dict(db.execute('SELECT * FROM delivery_attempts').fetchone()) == attempt
+        run = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
+        assert run['cleanup'] == cleanup
+        assert run['outcome'] == 'blocked' and run['error'] == 'Original failure'
+
+
 def test_registered_monitor_cannot_claim_cleanup_while_its_owned_child_is_alive(
     api_fixture, monkeypatch, tmp_path,
 ):

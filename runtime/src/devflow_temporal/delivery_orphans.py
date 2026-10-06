@@ -122,6 +122,12 @@ def _reconcile(store, original, spec, closed):
     observations = []
     try:
         for attempt in attempts:
+            if attempt['state'] == 'finished':
+                if attempt['cleanup'] != 'confirmed':
+                    raise ValueError('completed original role cleanup remains unknown')
+                # Its immutable result may predate the current accepted plan. Observe its
+                # registered processes below without recompleting or rewriting the role.
+                continue
             observations.append(_complete_attempt(store, spec, attempt))
         outcome = current['outcome']
         if outcome not in {'delivered', 'blocked', 'cancelled'}:
