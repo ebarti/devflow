@@ -438,6 +438,19 @@ class DeliverySupervisor:
             try:
                 outcome = await asyncio.shield(pending)
             except asyncio.CancelledError:
+                from temporalio import activity
+
+                details = activity.cancellation_details() if activity.in_activity() else None
+                if details and not details.cancel_requested and (
+                    details.timed_out or details.not_found or details.worker_shutdown
+                ):
+                    # Temporal replaced this activity, not its durable provider turn.
+                    # The bounded monitor remains available to the next attempt;
+                    # its cancellation callback still observes a cancelled run.
+                    pending.add_done_callback(
+                        lambda task: task.exception() if not task.cancelled() else None
+                    )
+                    raise
                 stopped.set()
                 outcome = await asyncio.shield(pending)
                 self._mark_unknown(

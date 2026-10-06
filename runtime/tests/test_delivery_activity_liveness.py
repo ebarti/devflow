@@ -97,7 +97,8 @@ async def test_legacy_history_keeps_original_activity_options(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_replay_actual_previous_activity_history():
-    path = Path(__file__).parent / 'fixtures/activity-liveness-previous-history.json'
+    path = (Path(__file__).parent / 'fixtures/activity_liveness'
+            / 'activity-liveness-previous-history.json')
     history = WorkflowHistory.from_json('record-activity-liveness', path.read_text())
     await Replayer(workflows=[ActivityLivenessWorkflow]).replay_workflow(history)
 
@@ -200,7 +201,7 @@ WORKER_DRIVER = NATIVE_DRIVER.split('async def execute():')[0].replace(
     "options['argv']=[sys.executable,'-I',str(provider),str(folder/'request.json')]",
     "if request.get('role'): "
     "options['argv']=[sys.executable,'-I',str(provider),str(folder/'request.json')]",
-) + '''
+).replace("options['timeout']=20", "options['timeout']=90") + '''
 from devflow_temporal import delivery_sandbox
 def check_profile(spec,checkout,folder,check,**kwargs):
     return 'fixture',{'PATH':'/usr/bin:/bin'}
@@ -214,28 +215,41 @@ import devflow_temporal.delivery_browser_qa as browser
 browser.prepare_browser_qa=browser_profile
 sys.path.insert(0,sys.argv[4])
 from fixtures.activity_liveness_workflow import ActivityLivenessWorkflow
+from temporalio import activity
 from temporalio.client import Client
 from temporalio.worker import Worker
-from devflow_temporal.delivery_activities import delivery_checks,delivery_precheck
+from devflow_temporal.delivery_activities import delivery_checks,delivery_precheck,delivery_intake
+@activity.defn(name='blocking_loop_probe')
+async def block_loop(_request):
+    (state/'stall-started').touch()
+    import time
+    time.sleep(20)
+    (state/'stall-finished').touch()
+    return {}
 from devflow_temporal.delivery_activities import delivery_baseline_checks,delivery_browser_qa
 async def main():
     client=await Client.connect(sys.argv[3])
     async with Worker(client,task_queue='activity-worker-loss',
         workflows=[ActivityLivenessWorkflow],activities=[delivery_role,delivery_checks,
-            delivery_precheck,delivery_baseline_checks,delivery_browser_qa]):
+            delivery_precheck,delivery_baseline_checks,delivery_browser_qa,delivery_intake,block_loop]):
         await asyncio.Event().wait()
 asyncio.run(main())
 '''
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('stage', [
-    'implement', 'review', 'verify', 'checks', 'precheck', 'baseline_checks',
-    pytest.param('browser_qa', marks=pytest.mark.skipif(
+@pytest.mark.parametrize('stage,interruption', [
+    (stage, 'worker_loss') for stage in [
+        'implement', 'review', 'verify', 'checks', 'precheck', 'baseline_checks'
+    ]
+] + [
+    pytest.param('browser_qa', 'worker_loss', marks=pytest.mark.skipif(
         sys.platform != 'darwin', reason='actual macOS TCP listener inspection required')),
+    ('implement', 'loop_stall'), ('review', 'loop_stall'), ('verify', 'loop_stall'),
+    ('intake', 'loop_stall'), ('implement', 'cancel'),
 ])
 async def test_real_temporal_worker_loss_reuses_original_native_command(
-    api_fixture, tmp_path, stage,
+    api_fixture, tmp_path, stage, interruption,
 ):
     from devflow_temporal.delivery_native_process import stop_observed
     from devflow_temporal.delivery_resources import RunResources, read_private
@@ -245,6 +259,8 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
     raw.update(provider='codex', execution_mode='trusted-local', codex_bin=str(
         distribution('openai-codex-cli-bin').locate_file('codex_cli_bin/bin/codex')))
     raw['roles'] = {role: {'model': 'gpt-6.1-sol', 'effort': 'high'} for role in raw['roles']}
+    if stage == 'intake':
+        raw['roles']['intake'] = {'model': 'gpt-6.1-sol', 'effort': 'high'}
     repository = raw['repositories']['fixture']
     source = Path(repository['source_path'])
     program = source / 'liveness.py'
@@ -283,7 +299,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                         'test: published candidate fixture'], check=True)
     request = {'spec': spec, 'iteration': 0, 'candidate': broker.candidate()}
     name = 'delivery_role' if stage in {'implement', 'review', 'verify'} else 'delivery_'+stage
-    if name == 'delivery_role':
+    if name in {'delivery_role', 'delivery_intake'}:
         request['role'] = stage
     driver, provider = tmp_path / 'worker.py', tmp_path / 'provider.py'
     driver.write_text(WORKER_DRIVER)
@@ -313,10 +329,44 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                 assert workers[0].poll() is None, (tmp_path / 'first-worker.log').read_text()
                 assert time.monotonic()<deadline, (tmp_path / 'first-worker.log').read_text()
                 await asyncio.sleep(0.05)
-            workers[0].kill()
-            await asyncio.to_thread(workers[0].wait, 5)
+            if interruption == 'worker_loss':
+                workers[0].kill()
+                await asyncio.to_thread(workers[0].wait, 5)
+            elif interruption == 'loop_stall':
+                stall = await environment.client.start_workflow(
+                    ActivityLivenessWorkflow.run, {
+                        'activity_name': 'blocking_loop_probe', 'request': request,
+                    }, id='loop-stall', task_queue='activity-worker-loss',
+                )
+                deadline = time.monotonic()+10
+                while not (state / 'stall-started').exists():
+                    assert time.monotonic()<deadline
+                    await asyncio.sleep(0.05)
+            else:
+                store.project(spec['run_id'], phase='cancelling', execution_state='cancelling',
+                              event_type='cancel_requested', message='Fixture user cancellation')
+                await handle.cancel()
+                with pytest.raises(WorkflowFailureError):
+                    await asyncio.wait_for(handle.result(), 15)
+                deadline = time.monotonic()+15
+                while True:
+                    paths = list(state.rglob('native-process.json'))
+                    if paths and read_private(paths[0]).get('phase') == 'finished':
+                        break
+                    assert time.monotonic()<deadline
+                    await asyncio.sleep(0.05)
+                assert read_private(paths[0])['result']['cancelled'] is True
+                assert not (paths[0].parent / 'result.json').exists()
+                assert (state / 'invocations').read_text().splitlines() == ['one']
+                assert RunResources(spec).finalize('cancelled')['resource_cleanup'] == 'confirmed'
+                return
             logs.append((tmp_path / 'replacement-worker.log').open('wb'))
             workers.append(subprocess.Popen(argv, stdout=logs[1], stderr=subprocess.STDOUT))
+            if interruption == 'loop_stall':
+                await asyncio.wait_for(stall.result(), 30)
+                # Let rejected heartbeats cancel the live first attempt before releasing its child.
+                await asyncio.sleep(2)
+                assert workers[0].poll() is None
             (state / 'release').touch()
             try:
                 result = await asyncio.wait_for(handle.result(), 40)
@@ -331,8 +381,9 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             assert (state / 'invocations').read_text().splitlines() == ['one']
             if stage == 'implement':
                 assert (state / 'preparation-calls').read_text().splitlines() == ['one']
-            if name == 'delivery_role':
+            if name in {'delivery_role', 'delivery_intake'}:
                 assert result['session_id'] == 'fixed-native-session'
+                assert result['native_process']['cancelled'] is False
             elif stage == 'browser_qa':
                 assert result['cleanup'] == 'confirmed'
             else:
