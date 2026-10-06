@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
 import re
 import stat
-import subprocess
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -18,7 +16,7 @@ from .delivery_broker import DeliveryBroker, _git
 from .delivery_config import DeliveryConfig
 from .delivery_continuation import session_state_digest
 from .delivery_metadata_recovery import _identity, _immutable
-from .delivery_native_process import listeners, process_table
+from .delivery_native_process import process_table
 from .delivery_policy_recovery import _rows, work_binding
 from .delivery_resources import RunResources, _ancestors, read_private
 from .delivery_resources import _identity as root_identity
@@ -283,101 +281,9 @@ def _source_readiness(spec, payload, authority, predecessor):
 
 
 def _observe_resources(spec, *, unknown_allowed):
-    """Fresh read-only actor, port, lease and inode observation, never teardown."""
-    state = Path(spec["state_dir"])
-    _ancestors(state / "resources/manifest.json")
-    manifest_path, final_path = (
-        state / "resources" / name for name in ("manifest.json", "finalization.json")
-    )
-    manifest, finalization = read_private(manifest_path), read_private(final_path)
-    if (
-        manifest.get("run_id") != spec["run_id"]
-        or manifest.get("state_identity") != root_identity(state)
-        or finalization.get("state")
-        not in ({"confirmed", "unknown"} if unknown_allowed else {"confirmed"})
-        or finalization.get("process_cleanup")
-        not in (
-            {"observed-native-confirmed", "unknown"}
-            if unknown_allowed
-            else {"observed-native-confirmed"}
-        )
-        or any(
-            item.get("cleanup") != "observed-native-confirmed"
-            for item in finalization.get("processes", [])
-        )
-    ):
-        raise ValueError("technical predecessor process/root custody is unconfirmed")
-    table = process_table()
-    journals, roots = {}, {}
-    registry = RunResources(spec, read_only=True)
-    receipts = {item["journal"]: item for item in finalization.get("processes", [])}
-    if set(receipts) != set(manifest["processes"]):
-        raise ValueError("technical predecessor finalized actor inventory changed")
-    for raw in manifest["processes"]:
-        path = Path(raw)
-        if not path.is_relative_to(state) or path.resolve(strict=True) != path:
-            raise ValueError("technical predecessor journal escaped its original root")
-        _ancestors(path)
-        value = read_private(path)
-        receipt = receipts[raw]
-        if (
-            receipt.get("monitoring_complete") is not True
-            or receipt.get("owned_ports_clear") is not True
-            or sorted(receipt.get("observed_pids", [])) != sorted(map(int, value.get("owned", {})))
-        ):
-            raise ValueError(
-                "technical predecessor actor identities lost their finalized inventory"
-            )
-        lock_path = path.with_name("native-process.lock")
-        descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ValueError("technical predecessor still owns a native launch lease") from exc
-        finally:
-            os.close(descriptor)
-        if (
-            value.get("phase") != "finished"
-            or value.get("monitoring_complete") is not True
-            or any(
-                table.get(int(pid), {}).get("identity") == actor["identity"]
-                and not table[int(pid)]["stat"].startswith("Z")
-                for pid, actor in value.get("owned", {}).items()
-            )
-            or any(listeners(port) for port in value.get("ports", []))
-        ):
-            raise ValueError("technical predecessor still has a live actor or port")
-        journals[raw] = hashlib.sha256(path.read_bytes()).hexdigest()
-    for raw, entry in manifest["roots"].items():
-        path = Path(raw)
-        registry._allowed(path, entry["kind"], finalizing=True)
-        _ancestors(path, allow_missing=True)
-        if os.path.lexists(path):
-            if entry["identity"] != root_identity(path):
-                raise ValueError("technical predecessor root identity changed")
-            if entry.get("receipt", {}).get("state") in {"removed", "already_absent"}:
-                raise ValueError("technical predecessor finalized root was recreated")
-            observed = subprocess.run(
-                ["/usr/sbin/lsof", "-nP", "-F", "p", "+D", str(path)],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if observed.returncode not in (0, 1) or any(
-                line.startswith("p") and line[1:].isdecimal()
-                for line in observed.stdout.splitlines()
-            ):
-                raise ValueError("technical predecessor has a live root user or unreadable lease")
-            roots[raw] = entry["identity"]
-        else:
-            roots[raw] = None
-    return {
-        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-        "finalization_sha256": hashlib.sha256(final_path.read_bytes()).hexdigest(),
-        "journal_sha256": journals,
-        "roots": roots,
-    }
+    from .delivery_resources import observe_finalized_resources
 
+    return observe_finalized_resources(spec, unknown_allowed=unknown_allowed)
 
 def _quiescent(store, spec):
     with store._connect() as db:

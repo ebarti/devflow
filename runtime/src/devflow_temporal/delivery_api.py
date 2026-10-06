@@ -174,6 +174,15 @@ class DeliveryService:
                 # Any interrupted dispatching record becomes visible unknown on
                 # the next exclusive pump, without repeating its external effect.
                 pass
+            try:
+                from .delivery_automatic_retry import retry_once
+
+                await asyncio.to_thread(retry_once, self.store)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Unknown successor eligibility never authorizes another attempt.
+                pass
             await asyncio.sleep(5)
 
     async def dispatch_questions_once(self) -> None:
