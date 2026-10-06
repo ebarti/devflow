@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .candidate import candidate_for
-from .contracts import canonical_json
+from .contracts import canonical_json, digest
 from .delivery_native_process import NativeProcessUnknown
 from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
@@ -128,8 +128,27 @@ class DeliverySupervisor:
                 raise NativeProcessUnknown('role request changed across a durable attempt')
         if row['state'] == 'finished':
             result = json.loads(row['result_json'])
-            expected = result.get('candidate', request['candidate'])
-            if candidate_for(Path(request['workspace'])) != expected:
+            journal_path = folder / 'native-process.json'
+            if journal_path.exists():
+                journal = read_private(journal_path)
+                intent = journal['intent']
+                if (not journal.get('owned')
+                        or intent['run_id'] != request['spec']['run_id']
+                        or intent['policy_digest'] != request['spec']['policy_digest']
+                        or intent['cwd'] != request['workspace']):
+                    raise NativeProcessUnknown('completed role process ownership changed')
+                metadata = journal.get('provider_session', {})
+            else:
+                start_path = folder / 'start.json'
+                metadata = read_private(start_path) if start_path.exists() else {}
+            expected = metadata.get('output_candidate') or request['candidate']
+            if metadata.get('output_candidate') and (
+                    not isinstance(expected, dict)
+                    or set(expected) != {'id', 'head', 'content_sha256'}):
+                raise NativeProcessUnknown('completed role output binding is malformed')
+            if metadata.get('output_candidate') and metadata.get('result_digest') != digest(result):
+                raise NativeProcessUnknown('completed role result changed after its output binding')
+            if candidate_for(Path(request['workspace']))['id'] != expected['id']:
                 raise ValueError('completed role candidate changed after its result')
         else:
             journal_path = folder / 'native-process.json'
@@ -304,7 +323,12 @@ class DeliverySupervisor:
             if not result_path.is_file():
                 return self._mark_unknown(job_key, "role child exited without a final receipt")
             result = json.loads(result_path.read_text(encoding="utf-8"))
-            result['candidate'] = candidate_for(Path(request['workspace']))
+            from .delivery_resources import read_private, write_private
+
+            output_candidate = self._completed_candidate(request, result)
+            metadata = read_private(start_path)
+            metadata.update(output_candidate=output_candidate, result_digest=digest(result))
+            write_private(start_path, metadata)
             with self.store._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 db.execute(
@@ -450,14 +474,16 @@ class DeliverySupervisor:
                 process_cleanup=outcome["cleanup"],
                 resource_cleanup="pending_workflow_finalization",
                 native_process=outcome,
-                candidate=candidate_for(Path(request['workspace'])),
             )
+            output_candidate = self._completed_candidate(request, result)
             journal = read_private(process.journal)
             journal["provider_session"] = {
                 "session_id": result.get("session_id"),
                 "resumed_from": request.get("resume_session"),
                 "role": request["role"],
                 "iteration": request["iteration"],
+                "output_candidate": output_candidate,
+                "result_digest": digest(result),
             }
             write_private(process.journal, journal)
             with self.store._connect() as db:
@@ -482,6 +508,16 @@ class DeliverySupervisor:
             if not (folder / "native-process.json").exists():
                 return self._mark_prelaunch_blocked(job_key, str(exc)[:300])
             return self._mark_unknown(job_key, f"native launch failed: {type(exc).__name__}")
+
+    @staticmethod
+    def _completed_candidate(request: dict[str, Any], result: dict[str, Any]) -> dict | None:
+        """Source rejection does not undo independently confirmed process teardown."""
+        try:
+            return candidate_for(Path(request['workspace']))
+        except (ValueError, OSError) as exc:
+            result['status'] = 'blocked'
+            result.setdefault('findings', []).append(str(exc))
+            return None
 
 
 

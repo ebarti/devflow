@@ -92,10 +92,65 @@ async def test_legacy_result_without_output_candidate_stays_fail_closed(role_fix
     with store._connect() as db:
         row = db.execute('SELECT job_key,result_json FROM delivery_attempts').fetchone()
         legacy = json.loads(row['result_json'])
-        legacy.pop('candidate')
+        legacy.pop('candidate', None)
         db.execute('UPDATE delivery_attempts SET result_json=? WHERE job_key=?',
                    (json.dumps(legacy), row['job_key']))
+    start = Path(request['spec']['state_dir']) / 'attempts' / row['job_key'] / 'start.json'
+    metadata = json.loads(start.read_text())
+    metadata.pop('output_candidate', None)
+    metadata.pop('result_digest', None)
+    start.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match='candidate changed'):
+        await delivery_role(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('role', ['review', 'verify'])
+async def test_unchanged_legacy_finished_gate_replays(role_fixture, role):
+    store, broker, request = role_fixture
+    request = {**request, 'role': role, 'workspace': str(broker.checkout)}
+    supervisor = get_supervisor(store)
+    first = await supervisor.run(request)
+    with store._connect() as db:
+        row = db.execute('SELECT job_key,result_json FROM delivery_attempts').fetchone()
+        legacy = json.loads(row['result_json'])
+        legacy.pop('candidate', None)
+        db.execute('UPDATE delivery_attempts SET result_json=? WHERE job_key=?',
+                   (json.dumps(legacy), row['job_key']))
+    # No output binding existed before reattachment was introduced.
+    start = Path(request['spec']['state_dir']) / 'attempts' / row['job_key'] / 'start.json'
+    metadata = json.loads(start.read_text())
+    metadata.pop('output_candidate', None)
+    start.write_text(json.dumps(metadata))
+    assert await supervisor.run(request) == {k: v for k, v in first.items() if k != 'candidate'}
+    (broker.checkout / 'README.md').write_text('Later gate edit\n')
+    with pytest.raises(ValueError, match='candidate changed'):
+        await supervisor.run(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drift', ['result', 'metadata', 'shape'])
+async def test_completed_output_binding_rejects_stale_or_malformed_metadata(role_fixture, drift):
+    from devflow_temporal.delivery_resources import read_private, write_private
+
+    store, _, request = role_fixture
+    await delivery_role(request)
+    with store._connect() as db:
+        row = db.execute('SELECT job_key,result_json FROM delivery_attempts').fetchone()
+        if drift == 'result':
+            result = json.loads(row['result_json'])
+            result['summary'] = 'Different completed result'
+            db.execute('UPDATE delivery_attempts SET result_json=? WHERE job_key=?',
+                       (json.dumps(result), row['job_key']))
+    start = Path(request['spec']['state_dir']) / 'attempts' / row['job_key'] / 'start.json'
+    if drift != 'result':
+        metadata = read_private(start)
+        if drift == 'metadata':
+            metadata['result_digest'] = 'stale'
+        else:
+            metadata['output_candidate'] = {'unexpected': 'shape'}
+        write_private(start, metadata)
+    with pytest.raises(RuntimeError, match='output binding'):
         await delivery_role(request)
 
 
@@ -145,6 +200,76 @@ write_private(Path(request['result_path']),{'status':'pass','summary':'Fixed pro
     'findings':[],'session_id':'fixed-native-session','usage':None,'finish_reason':'fixture'})
 print('completed',flush=True)
 '''
+
+
+@pytest.mark.parametrize('invalid_source', [False, True])
+def test_real_supervisor_completion_preserves_receipt_and_releases_capacity(
+        api_fixture, tmp_path, invalid_source):
+    from devflow_temporal.delivery_resources import RunResources, read_private
+    from devflow_temporal.delivery_stopped_resume import _candidate
+
+    path, submission = api_fixture
+    raw = json.loads(path.read_text())
+    raw.update(provider='codex', execution_mode='trusted-local', codex_bin=str(
+        distribution('openai-codex-cli-bin').locate_file('codex_cli_bin/bin/codex')))
+    raw['roles'] = {role: {'model': 'gpt-6.1-sol', 'effort': 'high'}
+                    for role in raw['roles']}
+    check = {'id': 'fixture-check', 'argv': [str(Path(sys.executable).resolve()),
+             '-c', "print('1 passed')"], 'test_count_regex': r'(\d+) passed', 'min_tests': 1}
+    raw['repositories']['fixture'].update(prepublish_checks=[check], checks=[check],
+        required_ci=['test'], project_url='https://github.com/users/example/projects/1',
+        assignee='example')
+    path.write_text(json.dumps(raw))
+    store = DeliveryStore(DeliveryConfig.load(path))
+    store.submit(submission)
+    spec = store.spec(submission['run_id'])
+    broker = DeliveryBroker(store, spec)
+    request = {'spec': spec, 'role': 'implement', 'iteration': 0,
+               'candidate': broker.prepare()['candidate']}
+    state = Path(spec['state_dir'])
+    driver, provider, input_path = (tmp_path / name for name in (
+        'worker.py', 'provider.py', 'input.json'))
+    driver.write_text(NATIVE_DRIVER)
+    provider_text = FIXED_NATIVE_PROVIDER.replace("'status':'pass'", "'status':'blocked'")
+    if invalid_source:
+        provider_text = provider_text.replace("print('started',flush=True)",
+            "(Path(request['workspace'])/'unsafe-link').symlink_to('/missing-target')\n"
+            "print('started',flush=True)")
+    provider.write_text(provider_text)
+    input_path.write_text(json.dumps(request))
+    (state / 'release').touch()
+    try:
+        completed = subprocess.run([sys.executable, '-I', str(driver), str(input_path),
+            str(provider), 'finish'], capture_output=True, text=True, timeout=30)
+        with store._connect() as db:
+            attempts = [dict(row) for row in db.execute('SELECT * FROM delivery_attempts')]
+        assert len(attempts) == 1
+        assert attempts[0]['state'] == 'finished'
+        assert attempts[0]['cleanup'] == 'confirmed'
+        raw_result = json.loads(attempts[0]['result_json'])
+        assert raw_result['status'] == 'blocked'
+        assert 'candidate' not in raw_result
+        if invalid_source:
+            assert any('symlink' in finding for finding in raw_result['findings'])
+        else:
+            assert completed.returncode == 0, completed.stderr
+            result = read_private(state / 'activity-result.json')
+            actual, session = _candidate(broker, {'roles': [result]}, attempts)
+            assert actual == result['candidate']
+            assert session == result['session_id']
+            from devflow_temporal.delivery_resources import write_private
+
+            journal_path = state / 'attempts' / attempts[0]['job_key'] / 'native-process.json'
+            journal = read_private(journal_path)
+            journal['intent']['run_id'] = 'foreign-run'
+            write_private(journal_path, journal)
+            with pytest.raises(RuntimeError, match='ownership changed'):
+                get_supervisor(store).retained_request(
+                    {**request, 'workspace': str(broker.checkout)})
+            journal['intent']['run_id'] = spec['run_id']
+            write_private(journal_path, journal)
+    finally:
+        assert RunResources(spec).finalize('blocked')['resource_cleanup'] == 'confirmed'
 
 
 @pytest.mark.parametrize('checkpoint', ['running', 'completed'])
