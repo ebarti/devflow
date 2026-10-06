@@ -282,8 +282,8 @@ def test_uncertain_effect_preserves_cleanup_and_claim(api_fixture, monkeypatch, 
     observed = []
 
     class Resources:
-        def __init__(self, _spec):
-            pass
+        def __init__(self, _spec, *, read_only):
+            self.manifest = path
 
         def locked(self):
             from contextlib import contextmanager
@@ -354,8 +354,8 @@ def test_finished_historical_role_is_not_completed_again(api_fixture, monkeypatc
         raise ValueError('historical original request differs from current accepted plan')
 
     class Resources:
-        def __init__(self, _spec):
-            pass
+        def __init__(self, _spec, *, read_only):
+            self.manifest = path
 
         @contextmanager
         def locked(self):
@@ -378,6 +378,32 @@ def test_finished_historical_role_is_not_completed_again(api_fixture, monkeypatc
         run = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
         assert run['cleanup'] == cleanup
         assert run['outcome'] == 'blocked' and run['error'] == 'Original failure'
+
+
+@pytest.mark.parametrize('retained_manifest', [False, True])
+def test_missing_native_resource_ownership_remains_unknown(api_fixture, retained_manifest):
+    from devflow_temporal import delivery_orphans
+    from devflow_temporal.delivery_resources import RunResources
+
+    path, submission = api_fixture
+    store = DeliveryStore(DeliveryConfig.load(path))
+    store.submit(submission)
+    spec = store.effective_spec(submission['run_id'])
+    with store._connect() as db:
+        db.execute('INSERT INTO delivery_attempts '
+                   '(job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup) '
+                   'VALUES (?,?,?,?,?,?,?,?)',
+                   ('completed', spec['run_id'], 'implement', 0, 'original', 'finished',
+                    '{"status":"failed"}', 'confirmed'))
+        original = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
+    resources = RunResources(spec)
+    assert not resources.manifest.exists()
+    if retained_manifest:
+        with resources.locked() as manifest:
+            write_private(resources.manifest, manifest)
+    delivery_orphans._reconcile(store, original, spec, {'status': 'TERMINATED'})
+    with store._connect() as db:
+        assert db.execute('SELECT cleanup FROM delivery_runs').fetchone()[0] == 'unknown'
 
 
 def test_registered_monitor_cannot_claim_cleanup_while_its_owned_child_is_alive(

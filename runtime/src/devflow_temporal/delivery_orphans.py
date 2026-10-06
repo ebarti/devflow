@@ -133,9 +133,13 @@ def _reconcile(store, original, spec, closed):
         if outcome not in {'delivered', 'blocked', 'cancelled'}:
             uncertain = uncertain or closed['status'] == 'COMPLETED'
             outcome = 'cancelled' if closed['status'] == 'CANCELED' else 'blocked'
-        resources = RunResources(spec)
+        resources = RunResources(spec, read_only=True)
+        if not resources.manifest.is_file():
+            raise ValueError('original native resource ownership manifest is missing')
         with resources.locked() as manifest:
             processes = list(manifest['processes'])
+        if attempts and not processes:
+            raise ValueError('original native process ownership is missing')
         observations.extend(_observe_registered_process(spec, Path(path)) for path in processes)
         receipt = resources.finalize(outcome, uncertain=uncertain)
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
