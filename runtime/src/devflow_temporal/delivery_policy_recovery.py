@@ -109,6 +109,8 @@ def _issue(spec):
 
 
 def precheck(store, run_id):
+    if store.submitted_spec(run_id).get('retry_budget_version') == 1:
+        raise ValueError('a fixed repair budget cannot receive policy recovery iterations')
     original = store.intake_execution_spec(run_id)
     require_native_execution(original)
     if (original.get('provider') != 'codex'
@@ -278,6 +280,8 @@ def _prepare(original, config, intent, intent_path):
 
 
 def recover(store, run_id, supplied):
+    if store.submitted_spec(run_id).get('retry_budget_version') == 1:
+        raise ValueError('a fixed repair budget cannot receive policy recovery iterations')
     original = store.intake_execution_spec(run_id)
     with _lock(Path(original['state_dir']) / 'policy-recovery'):
         return _recover_locked(store, run_id, supplied)
