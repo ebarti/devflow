@@ -202,14 +202,12 @@ def apply(migration, source, skills, agents, rollback, backup):
         stage = skills / (".devflow-helper-pointer-" + str(os.getpid()))
         try:
             stage.symlink_to(helper)
-            rollback.remember(backup, compatibility, rollback.identity(stage))
-            os.replace(stage, compatibility)
+            rollback.effect(backup, compatibility, stage)
         finally:
             stage.unlink(missing_ok=True)
     for target in migration["links"]:
         if target != compatibility:
-            rollback.remember(backup, target, {"type": "absent"})
-            target.unlink()
+            rollback.effect(backup, target)
     updated = (json.dumps(migration["updated"], indent=2) + "\n").encode()
     if json.loads(migration["raw"]) != migration["updated"]:
         mode = stat.S_IMODE(migration["hooks"].stat().st_mode)
@@ -217,5 +215,4 @@ def apply(migration, source, skills, agents, rollback, backup):
         agents.atomic_write(migration["hooks"], updated, mode)
     for key in ("hook", "pin"):
         if migration[key]:
-            rollback.remember(backup, migration[key], {"type": "absent"})
-            migration[key].unlink()
+            rollback.effect(backup, migration[key])

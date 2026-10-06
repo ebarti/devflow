@@ -95,6 +95,83 @@ class UpgradeInstallation(unittest.TestCase):
         self.assertEqual(len(list((self.home / "agents").glob("*.toml"))), 4)
         self.assertTrue(all(not p.is_symlink() for p in (self.home / "agents").glob("*.toml")))
 
+    def assert_forward_drift_preserved(self, boundary):
+        self.historical(GUARDED)
+        modules = {}
+        for name in ("install-rollback", "install-service-entry"):
+            spec = importlib.util.spec_from_file_location(name, self.source / "scripts" / (name + ".py"))
+            modules[name] = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(modules[name])
+        rollback, service = modules["install-rollback"], modules["install-service-entry"]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rollback.capture(self.source, self.skills, self.home)
+        backup = Path(output.getvalue().strip())
+        self.addCleanup(shutil.rmtree, backup, True)
+        target = {"pointer": self.skills / "devflow", "retired": self.skills / "devflow-reviewing",
+                  "hooks": self.hooks}[boundary]
+        payload = ("foreign forward bytes at " + boundary).encode()
+        injected = []
+        unlink, replace, exchange, load = Path.unlink, os.replace, rollback.exchange, service.load
+
+        def inject(path):
+            if path == target and not injected:
+                unlink(target)
+                target.write_bytes(payload)
+                injected.append(rollback.identity(target))
+
+        def before_unlink(path, *args, **kwargs):
+            inject(path)
+            return unlink(path, *args, **kwargs)
+
+        def before_replace(stage, destination):
+            inject(stage if boundary == "retired" else destination)
+            return replace(stage, destination)
+
+        def before_exchange(stage, destination):
+            inject(destination)
+            return exchange(stage, destination)
+
+        def owning_load(name):
+            if name == "install-rollback":
+                return rollback
+            module = load(name)
+            if name == "install-agents":
+                module.rollback_module = lambda: rollback
+            return module
+
+        error = None
+        with mock.patch.object(service, "load", owning_load), \
+                mock.patch.object(Path, "unlink", before_unlink), \
+                mock.patch.object(os, "replace", before_replace), \
+                mock.patch.object(rollback, "exchange", before_exchange):
+            try:
+                service.install(self.skills, self.home, False, backup)
+            except ValueError as exc:
+                error = exc
+        self.assertTrue(injected, "actual forward mutation boundary was not exercised")
+        self.assertIsNotNone(error, "forward migration accepted and deleted concurrent foreign bytes")
+        self.assertIn(str(target), str(error))
+        self.assertIn(str(backup), str(error))
+        with self.assertRaisesRegex(ValueError, "retained backup"):
+            rollback.restore(backup)
+        preserved = [p for p in backup.rglob("*") if not p.is_symlink() and p.is_file()
+                     and p.read_bytes() == payload]
+        self.assertTrue(preserved, "foreign bytes and full backup were not retained after rollback")
+        self.assertEqual(preserved[0].lstat().st_ino, injected[0]["node"][1])
+        self.assertTrue((backup / "snapshot.json").is_file())
+        self.assertTrue((self.skills / "devflow/scripts/state.py").is_file())
+        self.assertEqual(self.data.read_bytes(), b"user data, never an installer migration target")
+
+    def test_forward_pointer_exchange_preserves_concurrent_foreign_bytes(self):
+        self.assert_forward_drift_preserved("pointer")
+
+    def test_forward_retired_link_capture_preserves_concurrent_foreign_bytes(self):
+        self.assert_forward_drift_preserved("retired")
+
+    def test_forward_hook_write_exchange_preserves_concurrent_foreign_bytes(self):
+        self.assert_forward_drift_preserved("hooks")
+
     def test_true_v022_install_upgrade_and_idempotent_replay(self):
         self.historical(V022)
         self.assertFalse((self.home / ".devflow-install.json").exists())
