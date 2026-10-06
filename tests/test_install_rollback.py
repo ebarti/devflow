@@ -162,6 +162,19 @@ class InstallRollback(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"foreign concurrently created agent")
         self.assertTrue((self.backup / "snapshot.json").is_file())
 
+    def test_agent_apply_without_snapshot_refuses_before_effects(self):
+        spec = importlib.util.spec_from_file_location("unbound_agents", ROOT / "scripts/install-agents.py")
+        agents = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(agents)
+        before = list(self.home.iterdir())
+        arguments = [str(ROOT / "scripts/install-agents.py"), "apply", str(ROOT),
+                     str(self.skills), str(self.home), "false"]
+        with mock.patch.object(sys, "argv", arguments):
+            with self.assertRaisesRegex(ValueError, "installer snapshot; run scripts/install.sh"):
+                agents.main()
+        self.assertEqual(list(self.home.iterdir()), before)
+        self.assertFalse((self.home / "agents").exists())
+
     def test_unsupported_host_refuses_without_replacement_fallback(self):
         before = os.readlink(self.compatibility)
         with mock.patch.object(sys, "platform", "unsupported"):

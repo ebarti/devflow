@@ -144,17 +144,15 @@ def hook_pin(codex_home, source_root, force):
 
 
 def atomic_write(path, content, mode=0o644):
+    if ROLLBACK is None:
+        fail("Agent writes require the installer snapshot; run scripts/install.sh with the original locations")
     descriptor, name = tempfile.mkstemp(prefix=".devflow-agent-", dir=path.parent)
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(content)
         temporary.chmod(mode)
-        if ROLLBACK:
-            rollback = rollback_module()
-            rollback.effect(ROLLBACK, path, temporary)
-        else:
-            os.replace(temporary, path)
+        rollback_module().effect(ROLLBACK, path, temporary)
     finally:
         if exists(temporary):
             temporary.unlink()
@@ -223,7 +221,7 @@ def plan(source_root, skills, codex_home, force):
 def main():
     global ROLLBACK
     if len(sys.argv) not in {6, 7} or sys.argv[1] not in {"preflight", "apply"}:
-        fail("usage: install-agents.py preflight|apply SOURCE_ROOT SKILLS CODEX_HOME FORCE")
+        fail("usage: install-agents.py preflight|apply SOURCE_ROOT SKILLS CODEX_HOME FORCE [BACKUP]")
     mode, source_root, skills, codex_home, force = sys.argv[1:6]
     ROLLBACK = Path(sys.argv[6]) if len(sys.argv) == 7 else None
     check_skills_destination(skills)
@@ -233,12 +231,11 @@ def main():
     sources, hashes, actions, obsolete, manifest_path = plan(source_root, skills, codex_home, force == "true")
     if mode == "preflight":
         return 0
+    if ROLLBACK is None:
+        fail("Agent application requires the installer snapshot; run scripts/install.sh with the original locations")
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     for target in obsolete:
-        if ROLLBACK:
-            rollback_module().effect(ROLLBACK, target)
-        else:
-            target.unlink()
+        rollback_module().effect(ROLLBACK, target)
     for name, action in actions.items():
         if action == "copy":
             source = sources[name]
