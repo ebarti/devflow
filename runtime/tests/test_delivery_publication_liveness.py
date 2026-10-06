@@ -175,7 +175,9 @@ async def test_untouched_c04_publication_history_replays_with_changed_workflow()
         WorkflowHistory.from_json('publication-probe', path.read_text()))
 
 
-def published_broker(service, monkeypatch, *, lost_completion=False, precommitted=False):
+def published_broker(
+    service, monkeypatch, *, lost_completion=False, precommitted=False, inflight_push=False,
+):
     store, request = service
     store.submit(request)
     spec = store.spec(request['run_id'])
@@ -195,6 +197,8 @@ def published_broker(service, monkeypatch, *, lost_completion=False, precommitte
 
     def run(argv, **kwargs):
         state['calls'].append(list(argv))
+        if inflight_push and 'push' in argv:
+            subprocess.run([sys.executable, '-c', 'import time; time.sleep(2)'], timeout=.02)
         if argv[:3] == ['gh', 'pr', 'create']:
             state['created'] = True
             if lost_completion:
@@ -216,8 +220,9 @@ def published_broker(service, monkeypatch, *, lost_completion=False, precommitte
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(delivery_broker, '_run', run)
-    if lost_completion:
-        with pytest.raises(BrokerReadbackUnavailable):
+    if lost_completion or inflight_push:
+        error_type = subprocess.TimeoutExpired if inflight_push else BrokerReadbackUnavailable
+        with pytest.raises(error_type):
             broker.publish(0, checked)
         published = None
     else:
@@ -380,25 +385,14 @@ def test_lost_completion_freezes_head_before_remote_mutation(service, monkeypatc
 
 def test_inflight_original_push_waits_without_repeating_mutation(service, monkeypatch):
     broker, checked, _published, state = published_broker(
-        service, monkeypatch, lost_completion=True
+        service, monkeypatch, inflight_push=True
     )
-    real_run = delivery_broker._run
-
-    def inflight(argv, **kwargs):
-        if 'ls-remote' in argv:
-            return ''
-        return real_run(argv, **kwargs)
-
-    monkeypatch.setattr(delivery_broker, '_run', inflight)
     previous = len(state['calls'])
     result = broker.reconcile_publish(0, checked)
     assert result == {'state': 'pending', 'reason': 'original_push_readback',
                       'head': delivery_broker._git(broker.checkout, 'rev-parse', 'HEAD')}
     assert not any('push' in args or 'commit' in args or args[:3] == ['gh', 'pr', 'create']
                    for args in state['calls'][previous:])
-    monkeypatch.setattr(delivery_broker, '_run', real_run)
-    state['unavailable'] = False
-    assert broker.reconcile_publish(0, checked)['number'] == 1
 
 
 def test_precommitted_original_candidate_readback_completes(service, monkeypatch):
@@ -409,3 +403,39 @@ def test_precommitted_original_candidate_readback_completes(service, monkeypatch
     published = broker.reconcile_publish(0, checked)
     assert published['state'] == 'OPEN'
     assert published['head'] == checked['head']
+
+
+def test_original_push_already_accepted_then_remote_rewind_is_terminal(service, monkeypatch):
+    broker, checked, _published, state = published_broker(
+        service, monkeypatch, lost_completion=True
+    )
+    real_run = delivery_broker._run
+
+    def rewound(argv, **kwargs):
+        if 'ls-remote' in argv:
+            return checked['head'] + '\trefs/heads/' + broker.spec['branch']
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(delivery_broker, '_run', rewound)
+    state['unavailable'] = False
+    with pytest.raises(ValueError, match='remote feature branch differs'):
+        broker.reconcile_publish(0, checked)
+
+
+def test_original_completion_can_arrive_during_readonly_reconciliation(service, monkeypatch):
+    broker, checked, published, _state = published_broker(service, monkeypatch)
+    with broker.store._connect() as db:
+        db.execute("UPDATE delivery_effects SET state='pending',observed_json=? "
+                   "WHERE effect_key='publish:run-1:0'",
+                   (json.dumps({'head': published['head'], 'number': published['number'],
+                                'remote_confirmed': True}),))
+    real_run = delivery_broker._run
+
+    def acknowledge_original(argv, **kwargs):
+        result = real_run(argv, **kwargs)
+        if 'ls-remote' in argv:
+            broker._finish_effect('publish:run-1:0', published)
+        return result
+
+    monkeypatch.setattr(delivery_broker, '_run', acknowledge_original)
+    assert broker.reconcile_publish(0, checked) == published
