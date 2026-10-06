@@ -1,8 +1,11 @@
 """Observe rollback's real filesystem boundaries without running a service."""
 
+import base64
 import contextlib
+import hashlib
 import importlib.util
 import io
+import json
 import os
 import shutil
 import sys
@@ -174,6 +177,71 @@ class InstallRollback(unittest.TestCase):
                 agents.main()
         self.assertEqual(list(self.home.iterdir()), before)
         self.assertFalse((self.home / "agents").exists())
+
+    def test_capture_binds_saved_file_bytes_and_identity_to_one_observation(self):
+        target = self.home / "hooks.json"
+        target.write_text('{"hooks": {}}')
+        inode = target.lstat().st_ino
+        read, fdopen, mkdtemp = Path.read_bytes, os.fdopen, tempfile.mkdtemp
+        injected, backups = [], []
+
+        def update_after_read(raw):
+            if not injected:
+                updated = json.loads(raw)
+                updated["foreign_capture_note"] = "ordinary update during capture"
+                target.write_text(json.dumps(updated))
+                injected.append(True)
+            return raw
+
+        def path_read(path):
+            raw = read(path)
+            return update_after_read(raw) if path == target else raw
+
+        class Reader:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def read(self):
+                raw = self.stream.read()
+                return update_after_read(raw) if os.fstat(self.fileno()).st_ino == inode else raw
+
+        def opened(descriptor, *args, **kwargs):
+            return Reader(fdopen(descriptor, *args, **kwargs))
+
+        def private_directory(*args, **kwargs):
+            directory = mkdtemp(*args, **kwargs)
+            backups.append(Path(directory))
+            self.addCleanup(shutil.rmtree, directory, True)
+            return directory
+
+        error = None
+        output = io.StringIO()
+        with mock.patch.object(Path, "read_bytes", path_read), \
+                mock.patch.object(os, "fdopen", opened), \
+                mock.patch.object(tempfile, "mkdtemp", private_directory), \
+                contextlib.redirect_stdout(output):
+            try:
+                self.rollback.capture(ROOT, self.skills, self.home)
+            except ValueError as exc:
+                error = exc
+        self.assertTrue(injected, "ordinary update at the actual byte observation was not exercised")
+        if error:
+            self.assertIn(str(target), str(error))
+        else:
+            saved = json.loads((backups[0] / "snapshot.json").read_text())[str(target)]
+            self.assertEqual(hashlib.sha256(base64.b64decode(saved["bytes"])).hexdigest(),
+                             saved["before"]["sha256"], "old bytes were bound to a newer file identity")
+        self.assertEqual(json.loads(target.read_text())["foreign_capture_note"], "ordinary update during capture")
+        self.assertTrue((self.compatibility / "scripts/state.py").is_file())
 
     def test_unsupported_host_refuses_without_replacement_fallback(self):
         before = os.readlink(self.compatibility)

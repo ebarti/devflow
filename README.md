@@ -76,7 +76,9 @@ The updater fetches that tag, checks out its commit and reruns installation. Reu
 
 Installation rollback requires the native Linux/macOS atomic exchange interface;
 unsupported hosts refuse before installation effects. Private rollback snapshots
-bind the installer's actual file/link/directory identities. Rollback atomically
+bind the installer's actual file/link/directory identities. File bytes, mode and
+identity come from one opened-file observation; a write during that read refuses
+capture before installation effects. Rollback atomically
 restores helper pointers, captures cleanup targets into that existing private
 backup and deletes only matching installer objects. Changed or foreign objects
 remain with actionable original/captured locations and the complete backup;

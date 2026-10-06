@@ -41,7 +41,7 @@ def exchange(left, right):
         raise OSError(error, os.strerror(error), str(right))
 
 
-def identity(path):
+def identity(path, *, saved=None):
     if not os.path.lexists(path):
         return {"type": "absent"}
     info = path.lstat()
@@ -51,12 +51,21 @@ def identity(path):
     elif stat.S_ISREG(info.st_mode):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, "rb") as stream:
-            if os.fstat(stream.fileno()).st_ino != info.st_ino:
+            fields = ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink",
+                      "st_size", "st_mtime_ns", "st_ctime_ns")
+            observation = tuple(getattr(info, field) for field in fields)
+            opened = os.fstat(stream.fileno())
+            if tuple(getattr(opened, field) for field in fields) != observation:
                 raise ValueError("installer path changed while reading: " + str(path))
-            result.update(type="file", sha256=hashlib.sha256(stream.read()).hexdigest(),
-                          version=[info.st_nlink, info.st_size, info.st_mtime_ns])
-            if os.fstat(stream.fileno()).st_mtime_ns != info.st_mtime_ns:
+            info = opened
+            raw = stream.read()
+            after = os.fstat(stream.fileno())
+            if tuple(getattr(after, field) for field in fields) != observation:
                 raise ValueError("installer file changed while reading: " + str(path))
+            result.update(type="file", sha256=hashlib.sha256(raw).hexdigest(),
+                          version=[info.st_nlink, info.st_size, info.st_mtime_ns])
+            if saved is not None:
+                saved.update(bytes=base64.b64encode(raw).decode(), mode=stat.S_IMODE(info.st_mode))
     elif stat.S_ISDIR(info.st_mode):
         result["type"] = "directory"
     else:
@@ -171,16 +180,12 @@ def capture(source, skills, codex):
     directory.chmod(0o700)
     entries = {}
     for path in target_paths(source, skills, codex):
-        if path.is_symlink():
-            entries[str(path)] = {"type": "link", "target": os.readlink(path)}
-        elif path.is_file():
-            entries[str(path)] = {"type": "file", "bytes": base64.b64encode(path.read_bytes()).decode(),
-                                  "mode": stat.S_IMODE(path.stat().st_mode)}
-        elif path.is_dir():
-            entries[str(path)] = {"type": "directory"}
-        else:
-            entries[str(path)] = {"type": "absent"}
-        entries[str(path)]["before"] = identity(path)
+        saved = {}
+        before = identity(path, saved=saved)
+        saved.update(type=before["type"], before=before)
+        if before["type"] == "link":
+            saved["target"] = before["target"]
+        entries[str(path)] = saved
     (directory / "snapshot.json").write_text(json.dumps(entries, sort_keys=True))
     (directory / "snapshot.json").chmod(0o600)
     # Pre-marker failures can occur when an older updater has already switched
