@@ -27,7 +27,8 @@ jobs:
       - run: python3.12 -B -m unittest discover -s tests -v
   temporal-runtime:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # A passing 723.78s suite exceeded the former 12-minute job deadline.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3.12 -m venv /tmp/devflow-uv
@@ -41,8 +42,8 @@ jobs:
         working-directory: runtime
   temporal-runtime-macos:
     runs-on: macos-latest
-    # Native subprocess, sandbox and cleanup cases add work skipped on Linux.
-    timeout-minutes: 20
+    # The observed native macOS job took 17m39s; reserve runner/cleanup headroom.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
