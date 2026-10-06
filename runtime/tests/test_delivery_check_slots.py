@@ -3,18 +3,37 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from temporalio import workflow
+from temporalio.client import WorkflowFailureError
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_resources import spec
+from test_delivery_store import service as service
 
 from devflow_temporal import delivery_activities as activities
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_native_process import NativeProcess, process_table
+from devflow_temporal.delivery_config import DeliveryConfig
+from devflow_temporal.delivery_native_process import NativeProcess, process_table, reconcile_process
+from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+
+@workflow.defn
+class CheckSlotCancellationFixture:
+    @workflow.run
+    async def run(self, request: dict) -> dict:
+        return await DeliveryWorkflow()._activity(
+            "delivery_checks", request, hours=request.get("hours", 2),
+        )
 
 
 @pytest.fixture
@@ -24,6 +43,8 @@ def owned_checks(tmp_path, monkeypatch):
     lock = threading.Lock()
     brokers = {}
     hearts = []
+    in_activity = activities.activity.in_activity
+    heartbeat = activities.activity.heartbeat
     config = SimpleNamespace(state_root=tmp_path, raw={"check_concurrency": 2})
     database = tmp_path / "fixture.sqlite3"
     with sqlite3.connect(database) as db:
@@ -94,6 +115,7 @@ def owned_checks(tmp_path, monkeypatch):
     return SimpleNamespace(
         request=request, brokers=brokers, hearts=hearts, config=config,
         maximum=lambda: maximum,
+        in_activity=in_activity, heartbeat=heartbeat,
     )
 
 
@@ -182,3 +204,225 @@ async def test_cancelled_waiter_never_launches(owned_checks):
     if launched:
         await wait_until(owned_checks.brokers["queued"].finished.is_set)
     assert not launched
+
+
+@pytest.mark.parametrize("slots", [0, -1, 33, True, 1.5, "2", None])
+def test_configuration_rejects_nonfinite_or_invalid_slots(service, slots):
+    store, _ = service
+    raw = {**store.config.raw, "check_concurrency": slots}
+    store.config.path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="check_concurrency"):
+        DeliveryConfig.load(store.config.path)
+
+
+async def test_slot_lock_is_shared_with_another_worker_process(owned_checks, tmp_path):
+    root = tmp_path / "check-execution"
+    root.mkdir()
+    ready = tmp_path / "worker-ready"
+    code = (
+        "import os,fcntl,pathlib,sys; "
+        "fd=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR,0o600); "
+        "fcntl.flock(fd,fcntl.LOCK_EX); pathlib.Path(sys.argv[2]).touch(); sys.stdin.read()"
+    )
+    worker = subprocess.Popen(
+        [sys.executable, "-c", code, str(root / "slot-0.lock"), str(ready)],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        await wait_until(ready.exists)
+        await asyncio.gather(
+            activities.delivery_checks(owned_checks.request("one")),
+            activities.delivery_precheck(owned_checks.request("two")),
+        )
+        assert owned_checks.maximum() == 1
+    finally:
+        worker.communicate(timeout=5)
+
+
+async def test_slot_is_held_until_real_monitor_confirms_cleanup(owned_checks, monkeypatch):
+    import devflow_temporal.delivery_native_process as native
+
+    owned_checks.config.raw["check_concurrency"] = 1
+    stopped = threading.Event()
+    release = threading.Event()
+    original = native.stop_observed
+
+    def pause_after_stop(owned):
+        result = original(owned)
+        if not stopped.is_set():
+            stopped.set()
+            assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(native, "stop_observed", pause_after_stop)
+    first = asyncio.create_task(activities.delivery_checks(owned_checks.request("first", 0.3)))
+    await wait_until(stopped.is_set)
+    following = asyncio.create_task(activities.delivery_checks(owned_checks.request("following")))
+    first.cancel()
+    try:
+        await asyncio.sleep(0.15)
+        assert not first.done()
+        assert not owned_checks.brokers["following"].started.is_set()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await following
+    assert_stopped(owned_checks.brokers["first"])
+
+
+async def test_unknown_cleanup_does_not_release_occupied_slot(owned_checks, monkeypatch):
+    owned_checks.config.raw["check_concurrency"] = 1
+    original = NativeProcess.run
+    retained = len(activities._UNCLEAN_CHECK_SLOTS)
+
+    def unknown(process):
+        result = original(process)
+        result["cleanup"] = "unknown"  # Simulate uncertain evidence after real teardown.
+        return result
+
+    monkeypatch.setattr(NativeProcess, "run", unknown)
+    try:
+        result = await activities.delivery_checks(owned_checks.request("uncertain"))
+        assert result == {"state": "unknown", "cleanup": "unknown"}
+        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained + 1
+        task = asyncio.create_task(activities.delivery_checks(owned_checks.request("queued")))
+        await asyncio.sleep(0.15)
+        assert not owned_checks.brokers["queued"].started.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        for descriptor in activities._UNCLEAN_CHECK_SLOTS[retained:]:
+            os.close(descriptor)
+        del activities._UNCLEAN_CHECK_SLOTS[retained:]
+
+
+async def test_native_timeout_confirms_tree_cleanup_and_releases_slot(owned_checks):
+    owned_checks.config.raw["check_concurrency"] = 1
+    first = asyncio.create_task(
+        activities.delivery_checks(owned_checks.request("timeout", seconds=3, timeout=1))
+    )
+    await wait_until(owned_checks.brokers["timeout"].started.is_set)
+    second = asyncio.create_task(activities.delivery_checks(owned_checks.request("following")))
+    await asyncio.gather(first, second)
+    broker = owned_checks.brokers["timeout"]
+    assert broker.result["timed_out"] is True
+    assert_stopped(broker)
+    assert owned_checks.maximum() == 1
+
+
+async def test_broker_native_runner_tracks_cleanup_and_owned_cancellation(owned_checks, tmp_path):
+    request = owned_checks.request("broker-callback")
+    broker = owned_checks.brokers["broker-callback"]
+    cancelled = threading.Event()
+    broker.check_cancelled = cancelled.is_set
+    process = NativeProcess(
+        request["spec"], Path(request["spec"]["state_dir"]) / "native",
+        argv=[sys.executable, "-c", "import subprocess,sys,time; "
+              "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);time.sleep(30)"],
+        cwd=tmp_path, environment={"PATH": os.environ["PATH"]}, timeout=60,
+        cancelled=broker._native_cancelled,
+    )
+    pending = asyncio.create_task(asyncio.to_thread(broker._run_native_check, process))
+    await wait_until(process.journal.exists)
+    await asyncio.sleep(0.2)
+    assert broker.native_cleanup_confirmed is False
+    cancelled.set()
+    broker.result = await pending
+    assert broker.native_cleanup_confirmed is True
+    assert broker.result["cancelled"] is True
+    assert_stopped(broker)
+
+
+async def test_physical_worker_death_releases_os_slot_before_orphan_cleanup(tmp_path):
+    """Document B4's boundary: OS locks cannot establish orphan reconciliation."""
+    owned = spec(tmp_path, "dead-worker")
+    input_path = tmp_path / "owned-spec.json"
+    input_path.write_text(json.dumps(owned))
+    slot = tmp_path / "slot.lock"
+    folder = Path(owned["state_dir"]) / "native"
+    code = (
+        "import fcntl,json,os,pathlib,sys; "
+        "from devflow_temporal.delivery_native_process import NativeProcess; "
+        "spec=json.loads(pathlib.Path(sys.argv[1]).read_text()); "
+        "fd=os.open(sys.argv[2],os.O_CREAT|os.O_RDWR,0o600); fcntl.flock(fd,fcntl.LOCK_EX); "
+        "NativeProcess(spec,pathlib.Path(sys.argv[3]),argv=[sys.executable,'-c',"
+        "\"import subprocess,sys,time;subprocess.Popen([sys.executable,'-c',"
+        "'import time;time.sleep(30)']);time.sleep(30)\"], "
+        "cwd=pathlib.Path(sys.argv[3]).parent,environment={'PATH':os.environ['PATH']},"
+        "timeout=60).run()"
+    )
+    worker = subprocess.Popen([sys.executable, "-c", code, str(input_path), str(slot), str(folder)])
+    journal = folder / "native-process.json"
+
+    def observed_tree():
+        return journal.exists() and len(json.loads(journal.read_text())["owned"]) >= 2
+
+    descriptor = None
+    try:
+        await wait_until(observed_tree)
+        worker.kill()
+        worker.wait(timeout=5)
+        import fcntl
+
+        descriptor = os.open(slot, os.O_RDWR)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        owned_pids = json.loads(journal.read_text())["owned"]
+        table = process_table()
+        assert any(table.get(int(pid), {}).get("identity") == entry["identity"]
+                   and not table[int(pid)]["stat"].startswith("Z")
+                   for pid, entry in owned_pids.items())
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=5)
+        if descriptor is not None:
+            os.close(descriptor)
+        if journal.exists():
+            cleanup = reconcile_process(journal)
+            assert cleanup["observed_owned_stopped"]
+            assert cleanup["cleanup"] == "unknown"  # Interrupted monitor remains honest.
+
+
+@pytest.mark.parametrize("stop", ["cancel", "timeout"])
+async def test_temporal_stop_reaches_native_monitor_and_frees_slot(
+    owned_checks, monkeypatch, tmp_path, stop,
+):
+    monkeypatch.setattr(activities.activity, "in_activity", owned_checks.in_activity)
+    monkeypatch.setattr(activities.activity, "heartbeat", owned_checks.heartbeat)
+    owned_checks.config.raw["check_concurrency"] = 1
+    request = owned_checks.request("temporal-stopped", seconds=5, timeout=10)
+    if stop == "timeout":
+        request["hours"] = 0.5 / 3600
+    broker = owned_checks.brokers["temporal-stopped"]
+    async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=shutil.which("temporal"),
+        dev_server_database_filename=str(tmp_path / "isolated-temporal.sqlite3"),
+    ) as environment:
+        async with Worker(
+            environment.client, task_queue="check-slots-cancel",
+            workflows=[CheckSlotCancellationFixture],
+            workflow_runner=UnsandboxedWorkflowRunner(), activities=[activities.delivery_checks],
+            max_heartbeat_throttle_interval=timedelta(seconds=0.1),
+            default_heartbeat_throttle_interval=timedelta(seconds=0.1),
+        ):
+            handle = await environment.client.start_workflow(
+                CheckSlotCancellationFixture.run, request, id=f"check-slots-{stop}",
+                task_queue="check-slots-cancel",
+            )
+            await wait_until(broker.started.is_set)
+            await asyncio.sleep(0.2)
+            following = asyncio.create_task(
+                activities.delivery_precheck(owned_checks.request("following"))
+            )
+            if stop == "cancel":
+                await handle.cancel()
+            with pytest.raises(WorkflowFailureError):
+                await asyncio.wait_for(handle.result(), 10)
+            await wait_until(broker.finished.is_set)
+            await following
+    assert broker.result["cancelled"] is True
+    assert broker.result["timed_out"] is False
+    assert_stopped(broker)
+    assert owned_checks.maximum() == 1

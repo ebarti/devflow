@@ -68,7 +68,10 @@ async def _execute_check(request: dict[str, Any], execute) -> dict[str, Any]:
                     if cancelled.is_set() or broker._native_cancelled():
                         raise asyncio.CancelledError
                     admitted.set()
-                    return execute(broker)
+                    result = execute(broker)
+                    if not broker.native_cleanup_confirmed:
+                        result = {**result, "state": "unknown", "cleanup": "unknown"}
+                    return result
                 cancelled.wait(0.1)
             raise asyncio.CancelledError
         finally:
