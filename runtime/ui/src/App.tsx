@@ -13,6 +13,11 @@ import type { RunDetail, RunSummary, ServiceInfo } from './model'
 type Page = 'runs' | 'new' | 'settings' | 'statistics'
 type Connection = 'connecting' | 'connected' | 'disconnected'
 
+function retainRows(preferred: RunSummary[], other: RunSummary[]): RunSummary[] {
+  const known = new Set(preferred.map(run => run.id))
+  return [...preferred, ...other.filter(run => !known.has(run.id))]
+}
+
 function route(): { page: Page; id: string | null } {
   const path = window.location.pathname
   if (path === '/statistics') return { page: 'statistics', id: null }
@@ -30,14 +35,15 @@ export function App() {
   const [showArchived, setShowArchived] = useState(false)
   const listRequest = useRef(0)
   const [runs, setRuns] = useState<RunSummary[]>([])
-  const [olderRuns, setOlderRuns] = useState<RunSummary[]>([])
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [olderLoading, setOlderLoading] = useState(false)
   const [olderError, setOlderError] = useState('')
   const olderLoaded = useRef(false)
   const olderRequest = useRef(0)
-  const recentIds = new Set(runs.map(run => run.id))
-  const allRuns = [...runs, ...olderRuns.filter(old => !recentIds.has(old.id))]
+  const recentIds = useRef(new Set<string>())
+  const pagingGeneration = useRef(0)
+  const [pagingNotice, setPagingNotice] = useState('')
+  const allRuns = runs.filter(run => Boolean(run.archived) === showArchived)
   const [runsLoading, setRunsLoading] = useState(true)
   const [runsError, setRunsError] = useState('')
   const [detail, setDetail] = useState<RunDetail | null>(null)
@@ -68,8 +74,17 @@ export function App() {
     try {
       const page = await api.listRunsPage(showArchived)
       if (requestId !== listRequest.current) return
-      setRuns(page.runs)
+      // Once paging starts, keep observations that leave the recent page.
+      setRuns(current => olderLoaded.current ? retainRows(page.runs, current) : page.runs)
       if (!olderLoaded.current) setNextCursor(page.next_cursor)
+      else if (page.next_cursor && recentIds.current.size && !page.runs.some(run => recentIds.current.has(run.id))) {
+        // A whole-page turnover can hide unobserved rows. Restart explicit
+        // paging from this boundary, without fetching more pages on each poll.
+        ++pagingGeneration.current
+        setNextCursor(page.next_cursor)
+        setPagingNotice('Recent page changed completely; load older tasks to check for skipped rows.')
+      }
+      recentIds.current = new Set(page.runs.map(run => run.id))
       setRunsError('')
       setRunsLoading(false)
     } catch (cause) {
@@ -84,18 +99,19 @@ export function App() {
   const loadOlder = async () => {
     if (!nextCursor || olderLoading) return
     const requestId = ++olderRequest.current
+    const generation = pagingGeneration.current
+    olderLoaded.current = true
     setOlderLoading(true)
     setOlderError('')
     try {
       const page = await api.listRunsPage(showArchived, nextCursor)
       if (requestId !== olderRequest.current) return
-      olderLoaded.current = true
-      setOlderRuns(current => {
-        const merged = new Map(current.map(run => [run.id, run]))
-        for (const run of page.runs) merged.set(run.id, run)
-        return [...merged.values()]
-      })
-      setNextCursor(page.next_cursor)
+      // A pending older response must not overwrite newer poll/detail data.
+      setRuns(current => retainRows(current, page.runs))
+      if (generation === pagingGeneration.current) {
+        setNextCursor(page.next_cursor)
+        if (!page.next_cursor) setPagingNotice('')
+      }
     } catch (cause) {
       if (requestId === olderRequest.current) setOlderError(cause instanceof Error ? cause.message : 'Could not load older tasks.')
     } finally {
@@ -107,7 +123,9 @@ export function App() {
     ++listRequest.current
     ++olderRequest.current
     olderLoaded.current = false
-    setOlderRuns([])
+    recentIds.current = new Set()
+    ++pagingGeneration.current
+    setPagingNotice('')
     setNextCursor(null)
     setOlderLoading(false)
     setOlderError('')
@@ -139,14 +157,19 @@ export function App() {
     void refreshService()
   }, [refreshRuns, refreshService])
 
+  const reconcileDetail = useCallback((snapshot: RunDetail) => {
+    setRuns(current => current.map(run => run.id === snapshot.id ? snapshot : run))
+  }, [])
+
   const loadDetail = useCallback(async (id: string) => {
     const snapshot = await api.getRun(id)
+    reconcileDetail(snapshot)
     setDetail(snapshot)
     setDetailError('')
     setDetailLoading(false)
     setLastGoodAt(new Date().toISOString())
     return snapshot
-  }, [])
+  }, [reconcileDetail])
 
   useEffect(() => {
     const id = location.page === 'runs' ? location.id : null
@@ -158,11 +181,13 @@ export function App() {
     setConnection('connecting')
     void api.getRun(id).then(snapshot => {
       if (!alive) return
+      reconcileDetail(snapshot)
       setDetail(snapshot); setDetailError(''); setDetailLoading(false)
       setLastGoodAt(new Date().toISOString())
       unsubscribe = subscribeRun(id, snapshot, {
         onSnapshot: next => {
           if (!alive) return
+          reconcileDetail(next)
           setDetail(next); setDetailError(''); setLastGoodAt(new Date().toISOString())
           void refreshRuns()
         },
@@ -180,7 +205,7 @@ export function App() {
       setStaleSince(current => current ?? new Date().toISOString())
     })
     return () => { alive = false; unsubscribe?.() }
-  }, [location.page, location.id, detailRetry, refreshRuns])
+  }, [location.page, location.id, detailRetry, refreshRuns, reconcileDetail])
 
   const refreshCurrent = useCallback(async () => {
     if (!location.id) return
@@ -237,7 +262,7 @@ export function App() {
         {connection === 'connecting' && detail ? <div className="connection-banner" role="status">Reconnecting · showing last observed state from {time(lastGoodAt)}.</div> : null}
         {detailLoading && !detail ? <div className="empty-state"><h2>Loading run…</h2><p>Reading the local service projection.</p></div> : null}
         {!detailLoading && !detail && location.id ? <div className="empty-state"><h2>Run unavailable</h2><p>{detailError || 'The service has not returned this run.'}</p><button className="outline-button" onClick={() => void refreshCurrent()}>Retry</button></div> : null}
-        {!location.id ? <>{runsError ? <p className="inline-alert" role="alert">Run board is stale. {runsError}</p> : null}{runsLoading ? <p>Loading tasks…</p> : <RunBoard runs={allRuns.filter(run => Boolean(run.archived) === showArchived)} archived={showArchived} onSelect={id => navigate('runs', id)} onToggle={toggleArchive} onRefresh={() => void refreshRuns()} />}{olderError ? <p role="alert">{olderError}</p> : null}{nextCursor ? <button className="outline-button" disabled={olderLoading} onClick={() => void loadOlder()}>{olderLoading ? 'Loading older tasks…' : 'Load older tasks'}</button> : null}</> : null}
+        {!location.id ? <>{runsError ? <p className="inline-alert" role="alert">Run board is stale. {runsError}</p> : null}{runsLoading ? <p>Loading tasks…</p> : <RunBoard runs={allRuns} archived={showArchived} onSelect={id => navigate('runs', id)} onToggle={toggleArchive} onRefresh={() => void refreshRuns()} />}{pagingNotice ? <p role="status">{pagingNotice}</p> : null}{olderError ? <p role="alert">{olderError}</p> : null}{nextCursor ? <button className="outline-button" disabled={olderLoading} onClick={() => void loadOlder()}>{olderLoading ? 'Loading older tasks…' : 'Load older tasks'}</button> : null}</> : null}
         {detail ? <RunDetails key={detail.id} run={detail} onRefresh={refreshCurrent} /> : null}
       </> : null}
     </main>

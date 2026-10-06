@@ -34,7 +34,7 @@ describe('tokenless local dashboard', () => {
 
   it('restores event subscription when Retry succeeds after the first detail read failed', async () => {
     window.history.replaceState(null, '', `/runs/${mockRun.id}`)
-    vi.spyOn(api, 'listRunsPage').mockResolvedValue({ runs: [mockRun], next_cursor: null })
+    const list = vi.spyOn(api, 'listRunsPage').mockResolvedValue({ runs: [mockRun], next_cursor: null })
     vi.spyOn(api, 'getService').mockResolvedValue(mockService)
     const read = vi.spyOn(api, 'getRun').mockRejectedValueOnce(new Error('API reloading')).mockResolvedValue(mockRun)
     const subscribe = vi.mocked(subscribeRun)
@@ -46,13 +46,15 @@ describe('tokenless local dashboard', () => {
     await user.click(screen.getAllByRole('button', { name: 'Retry' })[0])
     await waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1))
     expect(read).toHaveBeenCalledTimes(2)
-    act(() => {
+    const updated = { ...mockRun, title: 'Live update after retry', goal: 'Live update after retry' }
+    list.mockResolvedValue({ runs: [updated], next_cursor: null })
+    await act(async () => {
       const hooks = subscribe.mock.calls[0][2]
       hooks.onConnection('connected')
-      hooks.onSnapshot({ ...mockRun, title: 'Live update after retry', goal: 'Live update after retry' })
+      hooks.onSnapshot(updated)
     })
     expect(screen.getByText('Connected')).toBeTruthy()
-    expect(screen.getByText('Live update after retry')).toBeTruthy()
+    expect(screen.getAllByText('Live update after retry')).toHaveLength(2)
   })
 })
 
