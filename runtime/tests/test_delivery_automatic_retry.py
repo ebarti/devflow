@@ -32,7 +32,8 @@ def stopped(service, monkeypatch):
               'phase': 'blocked', 'execution_state': 'blocked',
               'cleanup': 'confirmed', 'checks': checks}}
     monkeypatch.setattr(DeliveryStore, '_completed_temporal_result', lambda *_a, **_k: closed)
-    monkeypatch.setattr(retry, 'observe_finalized_resources', lambda *_a, **_k: {'finalization_sha256': 'fixture-finalization'})
+    monkeypatch.setattr(retry, 'observe_finalized_resources',
+                        lambda *_a, **_k: {'finalization_sha256': 'fixture-finalization'})
     monkeypatch.setattr(retry, 'fresh_unpublished_base', lambda *_a: spec['base_sha'])
     return store, request, closed
 
