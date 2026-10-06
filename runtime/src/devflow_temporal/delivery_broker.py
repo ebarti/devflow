@@ -33,7 +33,8 @@ def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 120) -> str
             f"command failed ({result.returncode}): {argv[0]} {argv[1]}: "
             + (result.stderr.strip() or result.stdout.strip())[:500]
         )
-    return result.stdout.strip()
+    # NUL-delimited paths must retain leading/trailing whitespace verbatim.
+    return result.stdout if '\0' in result.stdout else result.stdout.strip()
 
 
 def _git(path: Path, *args: str) -> str:
@@ -325,11 +326,37 @@ class DeliveryBroker:
         return hashlib.sha256(canonical_json(relevant).encode()).hexdigest()
 
     def _changed_paths(self, base_ref: str = "HEAD") -> set[str]:
-        changed = set(_git(self.checkout, "diff", "--name-only", base_ref).splitlines())
+        changed = set(_git(
+            self.checkout, "diff", "--no-renames", "--name-only", "-z", base_ref, "--"
+        ).split('\0'))
+        changed.update(_git(
+            self.checkout, 'diff', '--cached', '--no-renames', '--name-only', '-z', base_ref, '--'
+        ).split('\0'))
         changed.update(
-            _git(self.checkout, "ls-files", "--others", "--exclude-standard").splitlines()
+            _git(self.checkout, "ls-files", "--others", "--exclude-standard", "-z").split('\0')
         )
         return {item for item in changed if item}
+
+    def validate_candidate_scope(self) -> set[str]:
+        changed = self._changed_paths(self.spec['base_sha'])
+        escaped = changed - set(self.spec['policy'].get('allowed_paths', []))
+        if escaped:
+            raise ValueError(
+                'candidate changed outside allowed paths: ' + ', '.join(sorted(escaped))
+            )
+        return changed
+
+    def admit_implementation(self, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        """Retain source/index, but leave every new commit to publication."""
+        expected = input_candidate['head']
+        try:
+            _git(self.checkout, 'merge-base', '--is-ancestor', expected, 'HEAD')
+        except RuntimeError as exc:
+            raise ValueError('implementation commit ancestry changed during its role') from exc
+        self.validate_candidate_scope()
+        if _git(self.checkout, 'rev-parse', 'HEAD') != expected:
+            _git(self.checkout, 'reset', '--soft', expected)
+        return self.candidate()
 
     def gate_checkout(self, role: str, iteration: int, candidate: dict[str, Any]) -> Path:
         if role not in {"review", "verify"}:
@@ -1247,6 +1274,7 @@ class DeliveryBroker:
                 raise ValueError("owned commit lacks its author Signed-off-by trailer: " + commit)
 
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        self.validate_candidate_scope()
         publication_branch = self._publication_base_ref()
         self._validate_publication_commits()
         key = f"publish:{self.spec['run_id']}:{iteration}"

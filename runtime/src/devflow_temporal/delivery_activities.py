@@ -274,6 +274,14 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
             result["status"] = "blocked"
             result.setdefault("findings", []).append(str(exc))
     if role == "implement":
+        try:
+            broker.validate_candidate_scope()
+            if result.get('role_artifacts') and broker.candidate()['head'] != candidate['head']:
+                raise ValueError('implementation moved HEAD after role artifacts were bound')
+            broker.admit_implementation(candidate)
+        except (ValueError, RuntimeError, OSError) as exc:
+            result['status'] = 'blocked'
+            result.setdefault('findings', []).append(str(exc))
         after = broker.candidate()
         if result.get("status") == "pass":
             changed = broker._changed_paths(request["spec"]["base_sha"])
