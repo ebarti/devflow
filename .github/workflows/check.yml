@@ -15,7 +15,8 @@ concurrency:
 jobs:
   install:
     runs-on: macos-latest
-    timeout-minutes: 2
+    # Mac installer checks passed, but the job exceeded its former two-minute deadline.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -26,7 +27,8 @@ jobs:
       - run: sh scripts/check-install.sh
   test:
     runs-on: macos-latest
-    timeout-minutes: 2
+    # The passing Mac source tests took 122.123s before setup and cleanup.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
