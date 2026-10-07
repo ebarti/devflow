@@ -1,25 +1,106 @@
-"""Public same-run recovery seals failures instead of forging implementation acceptance."""
+"""Previously admitted policy rows and queued execution retain their recorded contract."""
 from __future__ import annotations
 
 import hashlib
 import json
 import sys
-from copy import deepcopy
 from pathlib import Path
 
 import pytest
 from temporalio.service import RPCError, RPCStatusCode
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
+from test_delivery_store import submit_historical_admission
 
+from devflow_temporal import delivery_policy_recovery
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_api import DeliveryService
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_policy_recovery import amended_config, resume_preflight
+from devflow_temporal.delivery_config import DeliveryConfig
+from devflow_temporal.delivery_continuation import copy_session_state, session_state_digest
+from devflow_temporal.delivery_policy_recovery import (
+    _prepare,
+    _remote,
+    _rows,
+    amended_config,
+    resume_preflight,
+    work_binding,
+)
 from devflow_temporal.delivery_preparation import prepare_authority
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+
+@pytest.mark.parametrize('observation,refused', [
+    ('live-pid', True), ('listening-port', True), ('unfinished', True),
+    ('unmonitored', True), ('stopped', False), ('reused-pid', False), ('zombie', False),
+])
+def test_retained_stopped_cleanup_observes_without_state_effects(
+    intake_fixture, monkeypatch, observation, refused,
+):
+    path, request = intake_fixture
+    store = DeliveryStore(DeliveryConfig.load(path))
+    store.submit(request)
+    spec = store.spec(request['run_id'])
+    resources = RunResources(spec)
+    journal_path = Path(spec['state_dir']) / 'attempts' / 'recorded' / 'native-process.json'
+    recorded_identity, pid, port = 'recorded-start-identity', 424242, 18777
+    journal = {
+        'phase': 'starting' if observation == 'unfinished' else 'finished',
+        'monitoring_complete': observation != 'unmonitored',
+        'owned': {str(pid): {'identity': recorded_identity}}, 'ports': [port],
+    }
+    write_private(journal_path, journal)
+    with resources.locked() as manifest:
+        manifest['processes'].append(str(journal_path))
+        write_private(resources.manifest, manifest)
+    write_private(resources.root / 'finalization.json', {
+        'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+        'resource_cleanup': 'confirmed',
+        'roots': [{'path': str(Path(spec['state_dir']) / 'transient'), 'state': 'removed'}],
+    })
+    table = {}
+    if observation in {'live-pid', 'reused-pid', 'zombie'}:
+        table[pid] = {
+            'identity': 'different-start-identity' if observation == 'reused-pid'
+            else recorded_identity,
+            'stat': 'Z' if observation == 'zombie' else 'S',
+        }
+    observed = []
+
+    def processes():
+        observed.append('process-table')
+        return table
+
+    def listening(recorded_port):
+        assert recorded_port == port
+        observed.append('recorded-port')
+        return {pid} if observation == 'listening-port' else set()
+
+    monkeypatch.setattr(delivery_policy_recovery, 'process_table', processes)
+    monkeypatch.setattr(delivery_policy_recovery, 'listeners', listening)
+    with store._connect() as db:
+        before_db = list(db.iterdump())
+    before_files = {item.relative_to(store.config.state_root):
+                    (item.read_bytes(), item.stat().st_mode)
+                    for item in store.config.state_root.rglob('*') if item.is_file()}
+    if refused:
+        with pytest.raises(ValueError, match='process identity or port is still live or unknown'):
+            delivery_policy_recovery._stopped_cleanup(spec)
+    else:
+        result = delivery_policy_recovery._stopped_cleanup(spec)
+        assert result['journal_sha256'] == {
+            str(journal_path): hashlib.sha256(journal_path.read_bytes()).hexdigest(),
+        }
+    assert observed[0] == 'process-table'
+    if observation == 'listening-port':
+        assert 'recorded-port' in observed
+    with store._connect() as db:
+        assert list(db.iterdump()) == before_db
+    assert before_files == {item.relative_to(store.config.state_root):
+                            (item.read_bytes(), item.stat().st_mode)
+                            for item in store.config.state_root.rglob('*') if item.is_file()}
 
 
 @pytest.fixture
@@ -30,8 +111,9 @@ def preserved(native_configuration, monkeypatch):
     config.raw['max_repairs'] = 2
     config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
-    store.submit({**request, 'accepted_plan':
-                  'Change the owned README and verify the exact candidate'})
+    submit_historical_admission(
+        store, {**request, 'accepted_plan':
+                'Change the owned README and verify the exact candidate'}, monkeypatch)
     spec = prepare_authority(store, store.spec(request['run_id']))
     broker = DeliveryBroker(store, spec)
     broker.prepare()
@@ -70,23 +152,44 @@ def preserved(native_configuration, monkeypatch):
                   message=state['error'], candidate=candidate, checks=state['checks'],
                   protocol_revision=13, iteration=2, outcome='blocked', cleanup='none',
                   error=state['error'])
-    closed = {'workflow_id': f"delivery-{spec['run_id']}", 'execution_run_id': 'closed-execution',
-              'closed_at': '2026-10-03T10:00:00+00:00', 'result': state,
-              'request_digest': spec['request_digest'], 'recovery_digest': None}
-    monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_kw: deepcopy(closed))
+    # Historical row fixture: seed the existing schema rather than invoke a
+    # retired admission. Native preparation and resume validators stay real.
     monkeypatch.setattr(store, '_ensure_no_remote_pr', lambda *_a: None)
-    monkeypatch.setattr('devflow_temporal.delivery_policy_recovery._issue', lambda original: {
-        'issue': {'url': original['issue_url'], 'body': 'Original required observable outcome'},
-        'sha256': digest('Original required observable outcome'),
-    })
     path = config.state_root / 'trusted-local.json'
-    raw = {**config.raw, 'execution_mode': 'trusted-local'}
-    write_private(path, raw)
-    payload = {'command_id': 'policy-recovery-1',
-               'expected_precheck_sha256': store.policy_recovery_precheck(spec['run_id'])[
-                   'precheck_sha256'], 'config_path': str(path),
-               'config_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
-               'additional_iterations': 2}
+    write_private(path, {**config.raw, 'execution_mode': 'trusted-local'})
+    config_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    payload = {'config_path': str(path), 'config_sha256': config_hash}
+    intent_path = Path(spec['state_dir']) / 'policy-recovery' / 'intent.json'
+    intent = {'preparation_attempts': [], 'effective_spec': None}
+    predecessor = Path(spec['state_dir']) / 'policy-recovery' / 'predecessor'
+    for name in ('manifest.json', 'finalization.json'):
+        write_private(predecessor / name, read_private(RunResources(spec).root / name))
+    effective = _prepare(spec, amended_config(spec, path, config_hash), intent, intent_path)
+    copy_session_state(home.parent.parent, home.parent.parent.with_name('implement-policy-1'),
+                       session, session_state_digest(home.parent.parent, session))
+    row, attempts, effects, _claim = _rows(store, spec['run_id'])
+    effective_candidate = DeliveryBroker(store, effective).candidate()
+    with store._connect() as db:
+        binding = work_binding(store, spec, db)
+    seal = {'precheck_sha256': 'a' * 64, 'work_binding': binding,
+            'attempts_digest': digest(attempts), 'effects_digest': digest(effects),
+            'remote_digest': digest(_remote(DeliveryBroker(store, effective)))}
+    recovery = {'kind': 'execution_policy_recovery', 'state': state, 'seal': seal,
+                'effective_spec': effective, 'candidate': effective_candidate,
+                'session_id': session,
+                'config_sha256': config_hash, 'original_spec_digest': digest(spec),
+                'maximum_iteration': 4, 'start_iteration': 3,
+                'issue_evidence': {'issue': {'url': spec['issue_url']}},
+                'predecessor_workflow_id': row['workflow_id'],
+                'predecessor_execution_run_id': 'closed-execution'}
+    workflow_id = f"delivery-{spec['run_id']}-execution-policy-1"
+    with store._connect() as db:
+        db.execute('INSERT INTO delivery_policy_recoveries VALUES (?,?,?,?,?)',
+                   (spec['run_id'], 'historical-policy-grant', digest(spec), digest(recovery), 4))
+        store.state.claim_work(db, spec['work_id'], f"external:devflow:{spec['run_id']}")
+        db.execute("UPDATE delivery_runs SET phase='execution_policy_recovery_queued',"
+                   "execution_state='queued',outcome=NULL,error=NULL,workflow_id=?,recovery_json=? "
+                   'WHERE run_id=?', (workflow_id, canonical_json(recovery), spec['run_id']))
     return store, spec, payload, state
 
 
@@ -98,67 +201,21 @@ def test_native_raw_results_are_preserved_without_a_candidate_field(preserved):
         before = [dict(row) for row in db.execute(
             'SELECT * FROM delivery_attempts ORDER BY job_key')]
     assert all('candidate' not in json.loads(a['result_json']) for a in before)
-    assert store.policy_recovery_precheck(run_id)['candidate'] == state['candidate']
+    observed = store.detail(run_id)['candidate']
+    assert {key: observed[key] for key in state['candidate']} == state['candidate']
     with store._connect() as db:
         assert before == [dict(row) for row in db.execute(
             'SELECT * FROM delivery_attempts ORDER BY job_key')]
-        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
+        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 1
 
 
-@pytest.mark.parametrize('change', [
-    'raw-null', 'raw-wrong', 'raw-type', 'closed-role-missing', 'closed-role-wrong',
-    'closed-input', 'closed-candidate-missing', 'closed-candidate-wrong',
-])
-def test_native_result_compatibility_requires_frozen_controller_provenance(preserved, change):
+def test_historical_policy_row_preserves_candidate_session_failures_and_cleanup(preserved):
     store, original, _payload, state = preserved
-    if change.startswith('raw-'):
-        with store._connect() as db:
-            raw = json.loads(db.execute(
-                "SELECT result_json FROM delivery_attempts WHERE iteration=2").fetchone()[0])
-            raw['candidate'] = (None if change == 'raw-null' else 'invalid'
-                                if change == 'raw-type' else
-                                {**state['candidate'], 'content_sha256': 'f' * 64})
-            db.execute('UPDATE delivery_attempts SET result_json=? WHERE iteration=2',
-                       (canonical_json(raw),))
-    elif change == 'closed-role-missing':
-        state['roles'][-1].pop('candidate')
-    elif change == 'closed-role-wrong':
-        state['roles'][-1]['candidate'] = {**state['candidate'], 'content_sha256': 'f' * 64}
-    elif change == 'closed-input':
-        state['roles'][-1]['input_candidate_id'] = 'unrelated-input'
-    elif change == 'closed-candidate-missing':
-        state.pop('candidate')
-    else:
-        state['candidate'] = {**state['candidate'], 'content_sha256': 'f' * 64}
-    with pytest.raises(ValueError):
-        store.policy_recovery_precheck(original['run_id'])
-    with store._connect() as db:
-        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
-        assert store.state.claim_for(db, original['work_id']) is None
-
-
-def test_present_matching_raw_candidate_remains_supported(preserved):
-    store, original, _payload, state = preserved
-    with store._connect() as db:
-        raw = json.loads(db.execute(
-            "SELECT result_json FROM delivery_attempts WHERE iteration=2").fetchone()[0])
-        raw['candidate'] = state['candidate']
-        db.execute('UPDATE delivery_attempts SET result_json=? WHERE iteration=2',
-                   (canonical_json(raw),))
-    assert store.policy_recovery_precheck(original['run_id'])['candidate'] == state['candidate']
-
-
-def test_policy_recovery_preserves_candidate_session_failures_and_repeat_effects(preserved):
-    store, original, payload, state = preserved
     run_id = original['run_id']
     before = store.submitted_spec(run_id)
     original_candidate = DeliveryBroker(store, original).candidate()
     original_receipt = Path(original['state_dir']) / 'resources' / 'finalization.json'
     original_bytes = original_receipt.read_bytes()
-    response = store.recover_execution(run_id, payload)
-    assert store.recover_execution(run_id, payload) == response
-    assert response['authorized_through_iteration'] == 4
-    assert store.submitted_spec(run_id) == before
     effective = store.effective_spec(run_id)
     assert effective['policy']['host_sandbox'] == 'trusted-local'
     assert effective['preparation']['fingerprint'] != original['preparation']['fingerprint']
@@ -178,19 +235,15 @@ def test_policy_recovery_preserves_candidate_session_failures_and_repeat_effects
     archived = Path(original['state_dir']) / 'policy-recovery' / 'predecessor' / 'finalization.json'
     assert archived.read_bytes() == original_bytes
     resume_preflight(store, effective, recovery)
-    with pytest.raises(ValueError, match='already belongs'):
-        store.recover_execution(run_id, {**payload, 'additional_iterations': 1})
-    with pytest.raises(ValueError, match='one policy recovery'):
-        store.recover_execution(run_id, {**payload, 'command_id': 'second-grant'})
     detail = store.detail(run_id)
     assert detail['execution_policy_recovery']['session_id'] == recovery['session_id']
     assert detail['execution_policy_recovery']['preserved_checks'] == state['checks']
+    assert store.submitted_spec(run_id) == before
 
 
 def test_public_policy_provenance_survives_terminal_only_wrapper(preserved):
-    store, original, payload, _state = preserved
+    store, original, _payload, _state = preserved
     run_id = original['run_id']
-    store.recover_execution(run_id, payload)
     before = store.detail(run_id)['execution_policy_recovery']
     effective = store.effective_spec(run_id)
     with store._connect() as db:
@@ -218,54 +271,12 @@ def test_public_policy_provenance_survives_terminal_only_wrapper(preserved):
                                   'original_recovery': amendment}) == amendment
 
 
-@pytest.mark.parametrize('field', ['issue', 'repository'])
-def test_policy_recovery_rejects_supported_reassignment_before_claim_or_probe(preserved, field):
-    store, original, payload, _state = preserved
-    receipt = Path(original['state_dir']) / 'resources/finalization.json'
-    before = receipt.read_bytes()
-    replacement = ('https://github.com/example/fixture/issues/999' if field == 'issue'
-                   else 'github.com/example/replacement')
-    with store._connect() as db:
-        store.state.update(db, 'work', {'id': original['work_id'], field: replacement}, None)
-    with pytest.raises(ValueError, match='frozen authority'):
-        store.policy_recovery_precheck(original['run_id'])
-    with pytest.raises(ValueError, match='frozen authority'):
-        store.recover_execution(original['run_id'], payload)
-    with store._connect() as db:
-        assert store.state.claim_for(db, original['work_id']) is None
-        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
-    assert receipt.read_bytes() == before
-    assert not (Path(original['state_dir']) / 'policy-recovery/intent.json').exists()
-
-
-def test_policy_atomic_grant_rechecks_reassignment_after_local_preparation(preserved, monkeypatch):
-    import devflow_temporal.delivery_policy_recovery as module
-
-    store, original, payload, _state = preserved
-    prepare = module._prepare
-
-    def reassigned(*args):
-        result = prepare(*args)
-        with store._connect() as db:
-            store.state.update(db, 'work', {'id': original['work_id'],
-                'issue': 'https://github.com/example/fixture/issues/999'}, None)
-        return result
-
-    monkeypatch.setattr(module, '_prepare', reassigned)
-    with pytest.raises(ValueError, match='frozen authority'):
-        store.recover_execution(original['run_id'], payload)
-    with store._connect() as db:
-        assert store.state.claim_for(db, original['work_id']) is None
-        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
-
-
 def test_policy_resume_and_tracker_start_refuse_a_reclaimed_reassigned_issue(
     preserved, monkeypatch,
 ):
     from devflow_temporal.delivery_activities import _tracker_sync
 
-    store, original, payload, _state = preserved
-    store.recover_execution(original['run_id'], payload)
+    store, original, _payload, _state = preserved
     effective = store.effective_spec(original['run_id'])
     with store._connect() as db:
         row = db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
@@ -291,8 +302,8 @@ def test_policy_resume_and_tracker_start_refuse_a_reclaimed_reassigned_issue(
 @pytest.mark.asyncio
 async def test_uncertain_policy_workflow_start_reads_memo_without_duplicate_start(preserved,
                                                                                 monkeypatch):
-    store, original, payload, _ = preserved
-    queued = store.recover_execution(original['run_id'], payload)
+    store, original, _payload, _ = preserved
+    queued = store.pending_starts()[0]
     service = object.__new__(DeliveryService)
     service.store, service.config = store, store.config
 
@@ -326,48 +337,12 @@ async def test_uncertain_policy_workflow_start_reads_memo_without_duplicate_star
     monkeypatch.setattr(service, 'healthy_client', healthy)
     with pytest.raises(TimeoutError):
         await service.dispatch_once()
-    assert store.recover_execution(original['run_id'], payload) == queued
     await service.dispatch_once()
     assert temporal.starts == 1
     with store._connect() as db:
         assert db.execute('SELECT state FROM delivery_outbox').fetchone()[0] == 'sent'
         assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 1
         assert db.execute('SELECT COUNT(*) FROM delivery_attempts').fetchone()[0] == 3
-
-
-@pytest.mark.parametrize('change', [
-    'candidate', 'claim', 'unknown-effect', 'live-process', 'config',
-])
-def test_policy_recovery_refuses_changed_or_uncertain_authority_before_grant(preserved, change,
-                                                                          monkeypatch):
-    store, original, payload, _ = preserved
-    run_id = original['run_id']
-    if change == 'candidate':
-        Path(original['checkout'], 'README.md').write_text('Other candidate')
-    elif change == 'claim':
-        with store._connect() as db:
-            store.state.claim_work(db, original['work_id'], 'other-owner')
-    elif change == 'unknown-effect':
-        DeliveryBroker(store, original)._effect('uncertain', 'publish', {'unknown': True})
-    elif change == 'live-process':
-        manifest = read_private(RunResources(original).manifest)
-        journal = read_private(Path(manifest['processes'][0]))
-        pid, item = next(iter(journal['owned'].items()))
-        monkeypatch.setattr('devflow_temporal.delivery_policy_recovery.process_table', lambda: {
-            int(pid): {**item, 'stat': 'S'},
-        })
-    else:
-        config = json.loads(Path(payload['config_path']).read_bytes())
-        config['roles']['implement']['effort'] = 'low'
-        write_private(Path(payload['config_path']), config)
-        payload['config_sha256'] = hashlib.sha256(
-            Path(payload['config_path']).read_bytes(),
-        ).hexdigest()
-    with pytest.raises(ValueError):
-        store.recover_execution(run_id, payload)
-    with store._connect() as db:
-        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
-        assert db.execute('SELECT phase FROM delivery_runs').fetchone()[0] == 'blocked'
 
 
 @pytest.mark.asyncio
@@ -409,7 +384,7 @@ async def test_policy_recovery_runs_gates_before_any_implementation():
 
 
 def test_policy_config_change_is_only_explicit_trust_mode(preserved):
-    store, original, payload, _ = preserved
+    _store, original, payload, _ = preserved
     assert amended_config(original, Path(payload['config_path']), payload['config_sha256']).raw[
         'execution_mode'] == 'trusted-local'
     config = json.loads(Path(payload['config_path']).read_bytes())
@@ -418,54 +393,6 @@ def test_policy_config_change_is_only_explicit_trust_mode(preserved):
     with pytest.raises(ValueError, match='only execution_mode'):
         amended_config(original, Path(payload['config_path']),
                        hashlib.sha256(Path(payload['config_path']).read_bytes()).hexdigest())
-
-
-@pytest.mark.parametrize('failure', ['prepare', 'remote'])
-def test_policy_preparation_failure_preserves_predecessor_and_same_command_retry(
-    preserved, monkeypatch, failure,
-):
-    from devflow_temporal import delivery_native_preparation, delivery_policy_recovery
-
-    store, original, payload, _ = preserved
-    resources = RunResources(original)
-    before = {name: (resources.root / name).read_bytes()
-              for name in ('manifest.json', 'finalization.json')}
-    measure, remote = delivery_native_preparation._measure, delivery_policy_recovery._remote
-    calls = {'prepare': 0, 'remote': 0}
-
-    def measured(*args, **kwargs):
-        calls['prepare'] += 1
-        proof = measure(*args, **kwargs)
-        if failure == 'prepare' and calls['prepare'] == 1:
-            raise RuntimeError('interrupted before trusted proof persistence')
-        return proof
-
-    def readback(broker):
-        calls['remote'] += 1
-        if failure == 'remote' and calls['remote'] == 2:
-            raise RuntimeError('post-preparation GitHub readback temporarily unavailable')
-        return remote(broker)
-
-    monkeypatch.setattr(delivery_native_preparation, '_measure', measured)
-    monkeypatch.setattr(delivery_policy_recovery, '_remote', readback)
-    with pytest.raises(RuntimeError):
-        store.recover_execution(original['run_id'], payload)
-    intent_path = Path(original['state_dir']) / 'policy-recovery' / 'intent.json'
-    intent = read_private(intent_path)
-    assert intent['command_id'] == payload['command_id']
-    assert intent['last_error']
-    assert intent['preparation_attempts'][0]['cleanup']['state'] == 'confirmed'
-    assert all((resources.root / name).read_bytes() == value for name, value in before.items())
-    assert not (Path(original['state_dir']) / 'transient').exists()
-    assert 'execution-policy-recovery-intent' in {
-        item['id'] for item in store.evidence_index(original['run_id'])}
-    with store._connect() as db:
-        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 0
-        assert store.state.claim_for(db, original['work_id']) is None
-    queued = store.recover_execution(original['run_id'], payload)
-    assert store.recover_execution(original['run_id'], payload) == queued
-    assert calls['prepare'] == (2 if failure == 'prepare' else 1)
-    assert all((resources.root / name).read_bytes() == value for name, value in before.items())
 
 
 @pytest.mark.asyncio

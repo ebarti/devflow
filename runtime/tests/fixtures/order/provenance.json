@@ -1,0 +1,8 @@
+{
+  "source_commit": "c04f00eb43eb225728b63c82026ffe97a41cafc2",
+  "source_archive_sha256": "cc9b1479c7c568d04970b0a610bd24db28f08f850aad3d83644f2894ed960958",
+  "history_sha256": {
+    "c04-gates-only-history.json": "8bf1d3f40406ad87b5f062614f7b7caffb7bf0f80668d826654b86b39fef635e",
+    "pre66-gates-only-history.json": "b86228db3d2300e620e490748dba41e0a91959c3521b3279c808221cd8f90ff4"
+  }
+}

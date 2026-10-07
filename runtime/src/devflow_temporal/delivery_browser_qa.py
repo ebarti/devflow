@@ -58,7 +58,7 @@ def _artifacts(checkout: Path, configured: list[str]) -> list[dict[str, Any]]:
 
 def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
     from .delivery_native_guard import validate_native_turn
-    from .delivery_native_process import NativeProcess, reconcile_process
+    from .delivery_native_process import NativeProcess
     from .delivery_preparation import verify_prepared_spec
     from .delivery_resources import RunResources, private_directory, read_private, write_private
 
@@ -100,7 +100,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
             or any(_hash(Path(item["path"])) != item["sha256"] for item in saved["artifacts"])
         ):
             raise ValueError("pending native browser receipt authority changed")
-        process_receipt = reconcile_process(folder / "native" / "native-process.json")
+        process_receipt = broker._reconcile_native_check(folder / "native" / "native-process.json")
         if process_receipt["cleanup"] == "unknown":
             return {
                 "state": "unknown",
@@ -117,7 +117,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     scratch = RunResources(spec).browser_scratch()
     profile, environment = prepare_browser_qa(spec, checkout, folder, scratch, qa)
     generated = broker._register_generated(checkout, qa.get("artifact_paths", []))
-    process = NativeProcess(
+    process = broker._run_native_check(NativeProcess(
         spec,
         folder / "native",
         argv=(list(qa["argv"]) if trusted_local(spec)
@@ -127,7 +127,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         timeout=qa["timeout_seconds"],
         ports=ports,
         cancelled=broker._native_cancelled,
-    ).run()
+    ))
     broker._record_generated(generated)
     if process["cleanup"] == "unknown":
         return {

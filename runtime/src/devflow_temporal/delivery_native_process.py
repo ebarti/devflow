@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -108,7 +110,20 @@ def reconcile_process(path: Path) -> dict:
         }
     journal = read_private(path)
     owned = {int(pid): entry for pid, entry in journal.get("owned", {}).items()}
-    stopped = stop_observed(owned)
+    all_owned = dict(owned)
+    if journal.get("monitor"):
+        monitor = journal["monitor"]
+        all_owned[monitor["pid"]] = monitor
+        owned.pop(monitor["pid"], None)
+    # An interrupted monitor must be allowed to collect its child's exit and
+    # flush output. A finished monitor has no remaining command work to lose.
+    stopped = stop_observed(all_owned if journal.get("phase") == "finished" else owned)
+    table = process_table()
+    stopped = stopped and not any(
+        table.get(pid, {}).get("identity") == entry["identity"]
+        and not table[pid]["stat"].startswith("Z")
+        for pid, entry in all_owned.items()
+    )
     ports_clear = all(not listeners(port) for port in journal.get("ports", []))
     clean = (
         journal.get("phase") == "finished"
@@ -119,7 +134,7 @@ def reconcile_process(path: Path) -> dict:
     return {
         "journal": str(path),
         "cleanup": "observed-native-confirmed" if clean else "unknown",
-        "observed_pids": sorted(owned),
+        "observed_pids": sorted(all_owned),
         "observed_owned_stopped": stopped,
         "owned_ports_clear": ports_clear,
         "monitoring_complete": journal.get("monitoring_complete", False),
@@ -127,6 +142,17 @@ def reconcile_process(path: Path) -> dict:
         if clean
         else "interrupted or ambiguous monitoring cannot certify native teardown",
     }
+
+
+def _cancel_requested(folder: Path) -> bool:
+    try:
+        info = (folder / "cancel").lstat()
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1 or info.st_size != 0):
+        raise ValueError("native cancellation signal is not a private owned file")
+    return True
 
 
 class NativeProcess:
@@ -152,28 +178,127 @@ class NativeProcess:
         self.timeout, self.ports, self.cancelled = timeout, ports, cancelled
         private_directory(folder)
         self.journal = folder / "native-process.json"
+        self.launch_absent = False
         if not self.journal.exists() and any(listeners(port) for port in ports):
             raise ValueError("native fixture port belongs to another process")
-        RunResources(spec).process(self.journal)
+        if self.journal.exists() or self.journal.is_symlink():
+            RunResources(spec).process(self.journal)
 
     def run(self) -> dict:
+        # The monitor owns stdio and teardown independently of the activity
+        # worker. Its inherited lock survives worker loss, so a replacement
+        # waits for the same invocation instead of launching it again.
+        lock = os.open(
+            self.folder / "native-monitor.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+        )
+        monitor = None
+        spawning = False
+        reattaching = False
+        self.launch_absent = False
+        try:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    self._request_cancel()
+                    time.sleep(0.03)
+            if self.journal.exists() or self.journal.is_symlink():
+                reattaching = True
+                return self._run()
+            descriptor = os.open(
+                self.folder / "monitor.log", os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                info = os.fstat(descriptor)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                    raise ValueError("native monitor log is not a private owned file")
+                spawning = True
+                monitor = subprocess.Popen(
+                    [sys.executable, "-I", "-m", __name__],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=descriptor,
+                    pass_fds=(lock,), start_new_session=True,
+                )
+            finally:
+                os.close(descriptor)
+            assert monitor.stdin is not None
+            try:
+                monitor.stdin.write(json.dumps({
+                    "spec": self.spec, "folder": str(self.folder), "argv": self.argv,
+                    "cwd": str(self.cwd), "environment": self.environment,
+                    "timeout": self.timeout, "ports": self.ports,
+                }).encode())
+            finally:
+                monitor.stdin.close()
+            while monitor.poll() is None:
+                self._request_cancel()
+                time.sleep(0.03)
+            monitor.wait()
+            if not self.journal.exists():
+                raise RuntimeError("native monitor failed before recording its invocation")
+            return self._run()
+        except Exception as exc:
+            # The monitor journals its intent before any provider child starts.
+            # A live or unjoined monitor, or an existing journal, never proves
+            # launch absence. The caller must still authenticate its DB owner.
+            if not reattaching and not os.path.lexists(self.journal) and (
+                (monitor is None and (not spawning or isinstance(exc, OSError)))
+                or (monitor is not None and monitor.poll() is not None)
+            ):
+                if monitor is not None:
+                    monitor.wait()
+                self.launch_absent = True
+            raise
+        finally:
+            # Do not LOCK_UN: the detached monitor shares this open file
+            # description and must retain the lock if the worker disappears.
+            os.close(lock)
+
+    def _intent(self) -> dict:
+        return {
+            "run_id": self.spec["run_id"], "policy_digest": self.spec["policy_digest"],
+            "argv": self.argv, "cwd": str(self.cwd),
+            "environment_sha256": digest(self.environment),
+            "timeout": self.timeout, "ports": list(self.ports),
+        }
+
+    def _request_cancel(self) -> None:
+        if self.journal.exists():
+            if read_private(self.journal)["intent"] != self._intent():
+                raise ValueError("native attempt authority changed")
+            if self.cancelled():
+                try:
+                    descriptor = os.open(
+                        self.folder / "cancel",
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600,
+                    )
+                except FileExistsError:
+                    _cancel_requested(self.folder)
+                else:
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    directory = os.open(self.folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+
+    def _run(self, *, monitor: bool = False) -> dict:
         lock = os.open(
             self.folder / "native-process.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
         )
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            intent = {
-                "run_id": self.spec["run_id"],
-                "policy_digest": self.spec["policy_digest"],
-                "argv": self.argv,
-                "cwd": str(self.cwd),
-                "environment_sha256": digest(self.environment),
-                "timeout": self.timeout,
-                "ports": self.ports,
-            }
-            if self.journal.exists():
+            intent = self._intent()
+            if self.journal.exists() or self.journal.is_symlink():
+                # Custody also covers journals appearing after construction.
+                RunResources(self.spec).process(self.journal)
                 old = read_private(self.journal)
-                if old["intent"] != {**intent, "ports": list(self.ports)}:
+                if old["intent"] != intent:
                     raise ValueError("native attempt authority changed")
                 receipt = reconcile_process(self.journal)
                 if receipt["cleanup"] == "observed-native-confirmed":
@@ -188,14 +313,25 @@ class NativeProcess:
             for port in self.ports:
                 if listeners(port):
                     raise ValueError("native fixture port belongs to another process")
+            from .delivery_dashboard import runtime_identity
+            from .payload import payload_digest
+
             journal = {
                 "intent": intent,
+                "runtime_identity": {
+                    **runtime_identity(),
+                    "source_root": str(Path(__file__).resolve().parents[3]),
+                    "runtime_payload_sha256": payload_digest(Path(__file__).parent),
+                },
                 "phase": "allocated",
                 "owned": {},
                 "ports": self.ports,
                 "monitoring_complete": False,
             }
+            if monitor:
+                journal["monitor"] = {"pid": os.getpid(), **process_table()[os.getpid()]}
             write_private(self.journal, journal)
+            RunResources(self.spec).process(self.journal)
             write_private(
                 self.folder / "launch.json", {"argv": self.argv, "environment": self.environment}
             )
@@ -273,6 +409,9 @@ class NativeProcess:
                     write_private(self.journal, journal)
                     for port in self.ports:
                         for pid in listeners(port):
+                            # A descendant may start between the process and listener snapshots.
+                            if pid not in owned:
+                                sample(owned)
                             if (
                                 pid not in owned
                                 or process_table().get(pid, {}).get("identity")
@@ -313,15 +452,19 @@ class NativeProcess:
                     if monitoring_complete and stopped and ports_clear and pipe_eof
                     else "unknown"
                 )
+                finalized_owned = dict(owned)
+                if "monitor" in journal:
+                    finalized_owned[journal["monitor"]["pid"]] = journal["monitor"]
                 result = {
                     "state": "finished" if cleanup != "unknown" else "unknown",
+                    "runtime_identity": journal["runtime_identity"],
                     "exit_code": process.returncode if process else None,
                     "cleanup": cleanup,
                     "timed_out": timed_out,
                     "cancelled": cancelled,
                     "listener_conflict": conflict,
                     "observed_listeners": observed_ports,
-                    "observed_owned_pids": sorted(owned),
+                    "observed_owned_pids": sorted(finalized_owned),
                     "monitoring_complete": monitoring_complete,
                     "stdio_drained": pipe_eof,
                     "log": str(log_path),
@@ -331,7 +474,7 @@ class NativeProcess:
                 }
                 journal.update(
                     phase="finished" if cleanup != "unknown" else "unknown",
-                    owned={str(pid): value for pid, value in owned.items()},
+                    owned={str(pid): value for pid, value in finalized_owned.items()},
                     monitoring_complete=monitoring_complete,
                     result=result,
                 )
@@ -339,3 +482,15 @@ class NativeProcess:
             return result
         finally:
             os.close(lock)
+
+
+if __name__ == "__main__":
+    request = json.load(sys.stdin)
+    folder = Path(request.pop("folder"))
+    specification = request.pop("spec")
+    request["cwd"] = Path(request["cwd"])
+    request["ports"] = tuple(request["ports"])
+    NativeProcess(
+        specification, folder, **request,
+        cancelled=lambda: _cancel_requested(folder),
+    )._run(monitor=True)

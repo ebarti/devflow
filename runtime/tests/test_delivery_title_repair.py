@@ -4,8 +4,9 @@ import copy
 import hashlib
 import json
 
+import httpx
 import pytest
-from test_delivery_metadata_recovery import published
+from test_delivery_metadata_recovery import published, restore_admitted_metadata
 from test_delivery_store import _git
 from test_delivery_store import service as service
 
@@ -104,7 +105,7 @@ def title_repair(service, monkeypatch):
         cleanup="none",
         error="repair limit exhausted",
     )
-    store.reconcile_published_metadata("run-1", metadata_command)
+    restore_admitted_metadata(store, broker, state, closed, metadata_command, _title)
     with store._connect() as db:
         recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
     original_closed = copy.deepcopy(closed)
@@ -193,28 +194,72 @@ def title_repair(service, monkeypatch):
     return store, broker, command, closed, recovery
 
 
-def test_metadata_first_existing_repair_preflight_one_grant_reacquires_and_preserves_history(
-    title_repair,
-):
-    store, broker, command, _closed, predecessor = title_repair
+@pytest.fixture
+def admitted_title_repair(title_repair):
+    """Existing row/payload fixture, not a new admission or recorded workflow history."""
+    from pathlib import Path
+
+    from devflow_temporal.delivery_repair import confirmed_native_cleanup
+
+    store, broker, command, closed, predecessor = title_repair
+    original = (broker.checkout / "browser.spec.ts").read_text()
+    title = "stale results, version conflicts, and failed requests leave manual edits available"
+    start = original.index(title)
+    constraint = {
+        "authority_path": command["authority_path"],
+        "authority_sha256": command["authority_sha256"],
+        "authority": json.loads(Path(command["authority_path"]).read_text()),
+        "path": "browser.spec.ts", "original": original,
+        "sha256": hashlib.sha256(original.encode()).hexdigest(),
+        "start": start, "end": start + len(title), "title": title,
+        "pattern": broker.spec["policy"]["browser_qa"]["reject_regex"],
+        "candidate": closed["result"]["candidate"],
+        "browser_receipt_sha256": digest(closed["result"]["checks"]["browser_qa"]),
+        "new_implementation_turns": 1, "maximum_iteration": 5,
+    }
+    recovery = {
+        "kind": "repair_continuation",
+        "predecessor_workflow_id": closed["workflow_id"],
+        "predecessor_execution_run_id": closed["execution_run_id"],
+        "predecessor_closed_at": closed["closed_at"],
+        "predecessor_result_digest": digest(closed["result"]),
+        "state": closed["result"], "candidate": closed["result"]["candidate"],
+        "pull_request": closed["result"]["pull_request"],
+        "session_id": "original-session", "findings": {"browser_qa": "rejected title"},
+        "additional_iterations": 1, "maximum_iteration": 5,
+        "original_recovery": predecessor, "effective_spec": broker.spec,
+        "title_constraint": constraint,
+        "cleanup_digest": confirmed_native_cleanup(broker.spec),
+    }
+    response = {
+        "run_id": "run-1", "dashboard_url": f"{store.config.dashboard_url}/runs/run-1",
+        "phase": "repair_continuation_queued",
+        "workflow_id": "delivery-run-1-repair-continuation-1",
+        "authorized_through_iteration": 5, "existing": False,
+    }
     with store._connect() as db:
-        original = db.execute("SELECT request_json FROM delivery_runs").fetchone()[0]
-        attempts = list(db.execute("SELECT * FROM delivery_attempts"))
-    observed = store.repair_admission_preflight("run-1", command)
-    assert observed["preflight"] and "failed" in str(observed["diagnostics"])
+        db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                   (command["command_id"], "run-1", digest({"run_id": "run-1", **command}),
+                    canonical_json(response)))
+        db.execute("INSERT INTO delivery_repair_grants VALUES (?,?,?,?,?,?,?,?)",
+                   ("run-1", command["command_id"], closed["workflow_id"],
+                    closed["execution_run_id"], digest(closed["result"]),
+                    1, 5, closed["closed_at"]))
+        db.execute("UPDATE delivery_runs SET phase='repair_continuation_queued', "
+                   "execution_state='queued',outcome=NULL,error=NULL,workflow_id=?,recovery_json=?",
+                   (response["workflow_id"], canonical_json(recovery)))
+        store.state.claim_work(db, "work-1", "external:devflow:run-1", store.config.dashboard_url)
+    return store, broker, command, recovery, response
+
+
+def test_previously_admitted_title_repair_remains_readable_and_strict(admitted_title_repair):
+    store, broker, command, recovery, response = admitted_title_repair
     with store._connect() as db:
-        assert store.state.claim_for(db, "work-1") is None
-        assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 0
-    response = store.continue_repair("run-1", command)
-    assert response["authorized_through_iteration"] == 5
+        before = list(db.iterdump())
     assert store.continue_repair("run-1", command) == response
+    assert store.repair_admission_preflight("run-1", command) == response
     with store._connect() as db:
-        row = db.execute("SELECT * FROM delivery_runs").fetchone()
-        recovery = json.loads(row["recovery_json"])
-        assert row["request_json"] == original
-        assert list(db.execute("SELECT * FROM delivery_attempts")) == attempts
-        assert store.state.claim_for(db, "work-1")["owner"] == "external:devflow:run-1"
-    assert recovery["original_recovery"] == predecessor
+        assert list(db.iterdump()) == before
     assert store.effective_spec("run-1") == broker.spec
     store.repair_preflight(broker.spec, recovery)
     constraint = recovery["title_constraint"]
@@ -222,21 +267,35 @@ def test_metadata_first_existing_repair_preflight_one_grant_reacquires_and_prese
     target = broker.checkout / constraint["path"]
     target.write_text(target.read_text().replace("failed requests", "request errors"))
     validate_source(broker.spec, constraint, completed=True)
-    with pytest.raises(ValueError, match="one repair grant"):
+    with pytest.raises(ValueError, match="fields do not match"):
         store.continue_repair("run-1", {**command, "command_id": "title-2"})
+
+
+@pytest.mark.parametrize("change", ["digest", "run"])
+def test_previously_admitted_title_command_cannot_be_rebound(admitted_title_repair, change):
+    store, _broker, command, _recovery, _response = admitted_title_repair
+    if change == "digest":
+        command["additional_iterations"] = 2
+    else:
+        with store._connect() as db:
+            row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+            row["run_id"] = "foreign"
+            db.execute(f"INSERT INTO delivery_runs ({','.join(row)}) "
+                       f"VALUES ({','.join('?' for _ in row)})", tuple(row.values()))
+            db.execute("UPDATE delivery_commands SET run_id='foreign' WHERE command_id='title-1'")
+    with pytest.raises(ValueError, match="different inputs"):
+        store.continue_repair("run-1", command)
 
 
 @pytest.mark.parametrize(
     "change",
     ["assertion", "other-file", "unchanged", "bad-title", "another-title", "head", "authority"],
 )
-def test_literal_only_controller_rejects_source_or_authority_expansion(title_repair, change):
-    store, broker, command, _closed, _predecessor = title_repair
-    store.continue_repair("run-1", command)
-    with store._connect() as db:
-        constraint = json.loads(
-            db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0]
-        )["title_constraint"]
+def test_literal_only_controller_rejects_source_or_authority_expansion(
+    admitted_title_repair, change,
+):
+    _store, broker, command, recovery, _response = admitted_title_repair
+    constraint = recovery["title_constraint"]
     target = broker.checkout / constraint["path"]
     text = target.read_text().replace("failed requests", "request errors")
     if change == "assertion":
@@ -260,37 +319,39 @@ def test_literal_only_controller_rejects_source_or_authority_expansion(title_rep
         validate_source(broker.spec, constraint, completed=True)
 
 
-@pytest.mark.parametrize(
-    "change", ["grant", "session", "lineage", "candidate", "claim", "cleanup", "log", "pattern"]
-)
-def test_cause_specific_admission_rejects_unproven_or_changed_authority_without_claim(
-    title_repair, change
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["repair-admission-preflight", "continue-repair"])
+async def test_public_title_repair_new_admissions_are_retired_without_effects(
+    title_repair, endpoint,
 ):
-    store, broker, command, closed, _predecessor = title_repair
-    if change == "grant":
-        command["additional_iterations"] = 2
-    elif change == "session":
-        closed["result"]["roles"][0]["session_id"] = "foreign"
-    elif change == "lineage":
-        with store._connect() as db:
-            db.execute("UPDATE delivery_runs SET recovery_json=NULL")
-        closed["recovery_digest"] = None
-    elif change == "candidate":
-        (broker.checkout / "browser.spec.ts").write_text("Changed source")
-    elif change == "claim":
-        with store._connect() as db:
-            store.state.claim_work(db, "work-1", "external:foreign", "foreign")
-    elif change == "cleanup":
-        closed["result"]["cleanup"] = "unknown"
-    elif change == "log":
-        from pathlib import Path
+    from devflow_temporal.delivery_api import create_app
 
-        Path(closed["result"]["checks"]["browser_qa"]["log"]).write_text("changed")
-    else:
-        closed["result"]["checks"]["browser_qa"]["rejected_output"] = False
-    with pytest.raises(ValueError):
-        store.continue_repair("run-1", command)
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 0
-        claim = store.state.claim_for(db, "work-1")
-        assert claim is None or claim["owner"] == "external:foreign"
+    store, broker, command, _closed, _predecessor = title_repair
+    def snapshot():
+        with store._connect() as db:
+            return {
+                table: [tuple(row) for row in db.execute(f"SELECT * FROM {table}")]
+                for table in ("delivery_runs", "delivery_attempts", "delivery_commands",
+                              "delivery_repair_grants", "delivery_outbox", "delivery_effects",
+                              "delivery_events", "claims")
+            }
+
+    before = snapshot()
+    files = {str(path): path.read_bytes() for path in broker.state_dir.rglob("*")
+             if path.is_file()}
+    source = _git(broker.checkout, "status", "--porcelain", "--untracked-files=all")
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    async with httpx.AsyncClient(transport=transport,
+                                base_url=store.config.dashboard_url) as browser:
+        session = await browser.get("/api/session")
+        response = await browser.post(f"/api/runs/run-1/{endpoint}", json=command,
+                                      headers={"Origin": store.config.dashboard_url,
+                                               "X-Devflow-CSRF": session.json()["csrf_token"]})
+    assert response.status_code == 409, response.text
+    assert "fields do not match the contract" in response.json()["detail"]
+    assert snapshot() == before
+    assert {str(path): path.read_bytes() for path in broker.state_dir.rglob("*")
+            if path.is_file()} == files
+    assert _git(broker.checkout, "status", "--porcelain", "--untracked-files=all") == source

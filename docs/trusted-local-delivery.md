@@ -24,8 +24,51 @@ deadlines, owned process/port cleanup, synthetic fixture QA and the
 separate mode-bound proof and confirms the launcher and ancestry guard; it does
 not claim constrained sandbox denials.
 
-Publication keeps a conventional goal subject, or prefixes a plain goal with
-`chore:`, for both the commit and new PR title. The controller uses `git commit
+An owner-controlled update of the installed controller Python source may change
+the current runtime payload hash for a run already frozen as `trusted-local`.
+The replacement must match the committed payload of its clean installed Git tree;
+dirty, untracked, ignored extra Python files and a non-installed copy are refused.
+Every other native identity field must still match, including the interpreter,
+OS/architecture, bundled CLI, locked dependencies, sandbox overrides and tool
+roots. Verification authenticates the original private proof, evidence hashes,
+measurements, fingerprint, policy and run binding against its frozen identity.
+It preserves that specification and proof; the old observations remain historical
+measurements rather than measurements of the replacement source. `native-profile`
+retains its existing strict update checks.
+
+The native launch journal and process result retain the actual controller revision
+and payload at launch. Reattachment preserves that launch identity; later roles
+and checks record their own controller. Run statistics cohorts still describe the
+admission-time version, not every controller used during execution. Later gate
+retries compare against authenticated consumed process identities, so installing
+P2 while a P1-prepared retry is queued cannot earn another retry when P2 fails.
+The existing two-generation and zero-implementation bounds remain unchanged.
+
+Operator steps: before deployment, inspect queued and running executions through
+public status and indexed evidence. Finish executions whose recorded activities have one attempt
+and special legacy PID-bound recoveries, plus continuations that already consumed
+a native preparation renewal, under their matching previous runtime
+before upgrading. An update does not retrofit heartbeat or retry options into recorded
+histories. Stop the original delivery worker through the existing `stop` control
+before changing installed source. Confirm its recorded ready PID/start identity
+has drained and the owned worker is stopped; do not update while it can launch roles
+or gates. Install the clean committed replacement, then use the existing `start`
+control and confirm the replacement worker is ready before dispatching.
+Retry-capable ordinary trusted executions can reattach to the same
+owned native invocation after worker replacement and start their remaining
+authorized roles and gates. Changed configuration, source candidate, scope,
+models, dependencies or interpreter require their existing authority checks;
+unknown effects or cleanup still require inspection. Never rewrite a frozen
+specification, proof or private state to force continuation.
+
+New admissions freeze `publication_summary` separately from the unchanged execution
+`goal`, and use the summary for commits and PR titles. Detailed or multi-sentence
+goals require an explicit single-line Conventional Commit subject, at most 120
+characters including its type, without extra sentences or control/bidi characters.
+A short single-sentence goal may omit the field; a plain goal receives `chore:`.
+Superseding submissions follow the same rule and preserve the predecessor's goal.
+Historical frozen runs without the field keep their original goal-derived commit
+subject and bounded title behavior. The controller uses `git commit
 --signoff` with the existing configured Git identity; it requires the author and
 sign-off identity to agree. Before staging, pushing or accepting a publication
 receipt it checks every commit after the frozen base for a Conventional Commit
@@ -128,96 +171,48 @@ acknowledges it. Authorized development continuations instead remove the active
 terminal checkpoint before their first live projection, while retaining the
 predecessor history; cancellation can then stop the newly authorized work.
 
-## Preserved-candidate execution recovery
+## Previously admitted execution-policy recoveries
 
-An operator can grant one explicit recovery for a stopped, unpublished native
-run whose constrained implementation or prepublication gates exhausted their
-budget. This supports multiple completed attempts with one original implementer
-session. It retains the same work ID, run ID, branch, source bytes and provider
-session. The original accepted plan, submitted configuration, closed Temporal
-tail, attempt results, process logs and cleanup evidence remain unchanged.
-Native attempt results are recorded before the role activity adds its controller
-candidate envelope. Recovery authenticates the retained source against both the
-frozen controller projection and that closed role envelope, including its input
-candidate and session identity. A missing raw-result candidate is supported;
-a present conflicting candidate or missing controller evidence is rejected.
-Current GitHub issue requirements are read, hashed and supplied as requirements
-data to the managed roles; they are not accepted results or new authority.
+New execution-policy recovery admission is retired. The CLI commands
+`recovery-preflight` and `recover-execution`, their HTTP routes, MCP tools and
+client/store grant methods are no longer available.
 
-The public preflight binds the original specification, authentic closed Temporal
-result/execution, every stopped attempt, current candidate, same-session state,
-confirmed process/resource cleanup, released claim, completed effects, absence
-of the branch/PR on the remote and original issue evidence. Any changed or
-unavailable readback rejects admission. It observes PID/start identities and
-ports; it never kills a process to manufacture stopped evidence. An unknown or
-pending external effect cannot be retried through this operation.
-Canonical work issue/repository and claim resource are bound to the frozen issue
-before preparation, inside the atomic claim grant, during resume preflight and
-before/after tracker-start effects and readback. Supported reassignment of a
-released work item conflicts; it cannot redirect recovery to another issue. This
-uses the existing owning helper contract without modifying installed helpers.
+Operator steps before deployment:
 
-Create a private, owned configuration under the existing service state root by
-copying the original JSON and changing only `execution_mode` to `trusted-local`.
-The original file stays untouched. Model, effort, capacity, source scope, checks,
-deadlines and all other raw configuration must match exactly. The new preparation
-proof binds the actual installed trusted runtime/SDK/CLI and has a separate
-identity; it cannot reuse the constrained proof. The same implementation
-session's conversation/database state is copied into a new isolated role-home
-generation; credentials and permission files are regenerated.
+1. Cease new calls to the retired operations. Inspect both current and archived
+   runs using `GET /api/runs?archived=false` and `GET /api/runs?archived=true`, or
+   the dashboard's active and archive views. The default run list omits archived
+   runs; a blocked or archived row does not prove preparation has finished.
+2. Read each run's indexed `execution-policy-recovery-intent` evidence, including
+   every nested preparation attempt and its cleanup receipt. An intent whose
+   state is anything other than `queued`, or any preparation attempt without
+   confirmed cleanup, is unfinished. Follow the retained policy recovery summary
+   even when it is nested in a later recovery. Include unknown or pending effects
+   and dispatches; an empty queue does not prove these operations are finished.
+3. Under the matching previous installed runtime, finish or cancel unfinished
+   operations and admitted queued/running legacy policy recoveries. Before
+   deploying, verify a terminal run state and confirmed preparation, process and
+   resource cleanup, with no unknown effects or pending dispatch. A terminal row
+   alone does not establish those receipts. If the previous release cannot
+   establish them, keep it available and postpone deployment. Do not blindly
+   retry commands or edit private records to manufacture completion.
 
-After separately authorized installation and chosen-mode verification:
+Already admitted queued inputs remain supported by dispatch and workflow code.
+Their existing durable grant and original/effective configuration validation,
+candidate/session custody, sealed attempt/effect/remote checks, a claim held by
+the run's owner, stopped recorded process identities, bounded gates-first
+execution and activity registrations remain unchanged. Native launches still
+require the frozen installed-runtime identity; history replay and retained outbox support do not
+authorize an old native execution to continue under a changed runtime payload.
+Completed and suspended workflow histories retain their recorded ordering. Old
+rows, command receipts, preparation intents, cleanup archives and public recovery
+provenance remain readable; this retirement does not delete their tables or
+rewrite historical failures.
 
-```sh
-devflow-delivery --config /private/state/trusted-local.json recovery-preflight --id RUN_ID
-devflow-delivery --config /private/state/trusted-local.json recover-execution --id RUN_ID --request /private/state/recovery.json
-devflow-delivery --config /private/state/trusted-local.json run --id RUN_ID
-```
-
-`recovery.json` is a private JSON object with exactly these fields:
-
-```json
-{
-  "command_id": "stable-operator-command-id",
-  "expected_precheck_sha256": "SHA256_FROM_THE_FRESH_PUBLIC_PREFLIGHT",
-  "config_path": "/private/state/trusted-local.json",
-  "config_sha256": "SHA256_OF_EXACT_PRIVATE_CONFIG_BYTES",
-  "additional_iterations": 2
-}
-```
-
-`additional_iterations: 1` authorizes only the preserved candidate's gates;
-`2` also permits one same-session implementation repair after a newly observed
-gate failure. The controller runs original prepublication checks first, then
-normal publication, independent review, checks, browser QA when configured,
-independent verification, required CI and terminal reconciliation. It does not
-blindly call implementation or turn historical failures into a pass. The
-endpoint remains `published_unmerged`.
-
-A private command/preparation intent is durable before any new probe. Preparation
-uses at most two separately owned resource generations, finalized independently
-of the predecessor; neither a failed cache-miss probe nor unavailable subsequent
-remote readback can rewrite its cleanup manifest or recreate its transient root.
-A stable-ID retry observes interrupted probe ownership/cleanup before any new
-probe, preserves failed logs, and reuses the new proof when already established.
-Unknown probe cleanup blocks additional execution. The intent/failures are
-publicly indexed, and prepared history is frozen in the eventual grant.
-
-Admission atomically seals one durable grant, reacquires the released claim for
-the same managed owner, and queues a new Temporal execution for the same run.
-The original failure remains in the event timeline and recovery summary. A
-repeat of identical command bytes returns the recorded receipt; changed bytes
-under that ID or a second grant conflict. After an uncertain transport response,
-read the run/receipt with the same command ID. Outbox dispatch inspects the exact
-request/recovery memo before acknowledging an already started execution, without
-starting a duplicate. No private database mutation or model-capacity retry is
-part of this recovery.
-
-HTTP exposes `GET /api/runs/{id}/recovery-preflight` and same-origin,
-CSRF-protected `POST /api/runs/{id}/recover-execution`. The official MCP server
-exposes `recovery_preflight` and `recover_execution` over that same client. The
-dashboard status/evidence and existing plugin discovery, submission, status and
-decision tools continue to read the shared service.
+Use the existing run and indexed evidence reads to follow an admitted recovery.
+An original run's supported automatic retry policy is independent of these
+historical grants and does not replace every published, uncertain or manual
+recovery path.
 
 ## Durable synthetic check evidence
 
@@ -246,27 +241,17 @@ directory scan, manual copying race or shared cache cleanup is required.
 Installation, service restart and managed recovery require the separately
 assigned operational verification. This repair does not merge or deploy.
 
-Stopped published metadata has a separate bounded reconciliation. The public
-`metadata-preflight --id RUN --request REQUEST.json` command authenticates the
-closed workflow, exact clean local/remote/PR head, controller publication range,
-source scope, configured existing signer and resource cleanup. A gates-first
-publication binds the exact retained implementation through its durable policy
-recovery, controller-held input candidate and copied closed role envelope; it
-does not require an implementation at that publication iteration or infer one
-from proximity. The same request
-is used by `reconcile-published-metadata`. Its fields are `command_id`,
-`expected_revision`, `expected_candidate_id`, `expected_head`,
-`expected_pr_number`, `expected_signer`, `authority_path`, and
-`authority_sha256`. The authority receipt permits one command per admitted
-original run and at most two admitted run IDs. The controller retains every old
-commit object and preservation ref, each tree/author/author date, the original
-receipts and an immutable old-to-new mapping. It changes commit subjects and
-actual author sign-off, with an exact remote force-with-lease; a changed remote,
-foreign commit, source edit, merged PR or unknown identity is refused. Replay
-uses the same command and request after a known interrupted effect.
+Published metadata reconciliation is retired for new commands. The API, client,
+tools, CLI and store no longer expose `metadata-preflight` or
+`reconcile-published-metadata`; the commit rewrite, force-with-lease and PR-title
+writer are removed. Existing admitted metadata inputs and their evidence remain
+readable. An interrupted write must finish under the previous runtime before
+updating: replaying its old command on the new runtime cannot finish it. Follow
+the [metadata deployment drain instructions](temporal-runtime.md#retired-published-metadata-admissions),
+including pending commands, archived runs and nested recoveries.
 
-Metadata validation runs no implementation, review or QA provider turn. It runs
-fresh native gates and retains explicit source-identical applicability for a
+Already-admitted metadata validation runs no implementation, review or QA provider
+turn. It runs fresh native gates and retains explicit source-identical applicability for a
 prior genuine independent PASS. A missing QA assessment remains incomplete.
 A failed gate remains blocked with its fresh evidence. Neither an old CI result
 nor an old head assessment is presented as a new head rerun.
@@ -340,56 +325,46 @@ Caller roots and symlink aliases refuse before allocation or
 read-scope expansion. Generated-child cleanup and gate finalization use the same
 owned namespace. Native process and lease roots remain in the original run.
 
-An already admitted original that stops at an authenticated controller boundary
-can use the existing `repair-admission-preflight` and `continue-repair` JSON
-surfaces with `continuation_kind: "accepted_technical_successor"` and
-`additional_iterations: 0`. The complete request includes `command_id`,
-`expected_revision` (the closed protocol revision), `expected_iteration`,
-`expected_candidate_id`, `expected_pr_number`, `expected_pr_head`,
-`expected_source_revision`, and the main-task `authority_path`/`authority_sha256`.
-The explicitly authorized integration also supplies
-`prospective_path`/`prospective_sha256`. Public preflight validates the whole
-authority, exact closed failure, consumed admission and immediate native
-generation, clean installed source/configuration, stopped actor/port/lease/root
-inventory and owning claim before an immutable intent or preparation effect.
-Missing, changed, aliased, foreign or stale inputs refuse first.
+### Technical-successor admission retirement
 
-This technical successor spends no feature grant or implementation iteration.
-It retains consumed admissions and generation journals, archives the original
-resource bytes (including UNKNOWN), and appends a fresh observation and supported
-cleanup closure. Its one child native generation has a separate journal and a
-two-attempt ceiling. Only the installed runtime payload may change in native
-identity. A failed borrowing of a released claim rolls back that owning claim;
-a previously retained original claim stays bound. Exact request replay checks
-actual partial effects and resumes their journals.
+`continuation_kind: "accepted_technical_successor"` is unsupported by the current
+`repair-admission-preflight` and `continue-repair` surfaces. This includes exact
+request replay: the retired writer cannot finish a pending or orphan pre-workflow
+intent. Historical technical-successor records, effective-spec and native
+predecessor readers, integration readback, workflow bodies and activities remain
+retained. That preservation does not authorize a new technical admission. See
+[technical-successor retirement](technical-continuation-retirement.md).
 
-An exclusive intent whose SQLite transaction did not commit is recovered by the
-same command only after fresh whole-request validation under its owning lock.
-The original seal and controller identity remain byte-for-byte historical;
-separate append-only observations bind each resume controller. Complete sealed
-failure rows have a dedicated 4 MiB read limit with exact hash, run identity,
-private ownership and no-follow custody; ordinary authority receipts retain
-their smaller limit. A resumed workflow drops the inherited active terminal
-checkpoint while preserving the frozen predecessor and its passed checks.
-A newly initiated terminal transition still freezes cancellation.
+Before deploying the changed runtime, cease new technical-successor requests and
+keep the previous release available to finish its existing work:
 
-The review launch boundary resumes review and QA of the unchanged published
-candidate at iteration 4. It preserves prior source-applicable checks and never
-repeats publication. The separately authorized integration computes the entire
-prospective tree read-only from the frozen base, owned head and exact current
-main. All six overlap outputs and every remaining entry must match; the sole
-conflict preserves the coaching insertion bytes and accepts the main inventory
-title/counts. The one signed merge preserves both parents and old history and
-checks the exact owned remote before pushing. Its explicit base, candidate,
-accepted-plan and preparation-input mapping is separate from native payload
-renewal. Nested worker preparation inputs are compared as typed TOML alongside
-all package manifests and locks. Fresh checks, browser QA, independent review
-and current CI run at existing iteration 4. The existing title-only iteration 5
-remains a separate admission after its fresh exact browser rejection; there is
-no iteration 6. None of these source contracts authorizes an installation or
-public continuation before independent review and current CI pass.
-After a separate title admission changes the current head, replay of an older
-technical command may refuse stale source identity rather than repeat effects.
+1. Inventory both unarchived and archived runs (`GET /api/runs` and
+   `GET /api/runs?archived=true`) and known original run IDs. Where accessible,
+   `GET /api/runs/{id}` exposes the retained technical-successor projection and
+   evidence index; the existing evidence read exposes indexed intent, closure,
+   integration, native-generation, predecessor-resource and resume-actor files.
+   Include nested recovery chains; a summary, missing projection or failed read
+   does not establish that no technical successor exists.
+2. The owner must also inspect the previous runtime's owned state read-only.
+   Check `delivery_technical_successors` for pending rows and the original run
+   roots for `technical-successor/intent.json`, closure/integration effects,
+   native-generation journals and predecessor-resource archives. Include orphan
+   intents without a committed row, archived runs, nested records and queued
+   outbox dispatches. Public run/evidence reads are not a complete orphan scan.
+   Use existing ownership/custody checks and preserve the original evidence;
+   do not rewrite database rows, seals or cleanup results to bypass recovery.
+3. Under the previous release, finish matching queued/running native executions
+   or cancel them through its supported controls, and resolve pending/orphan
+   pre-workflow intents through that release's supported procedure. An exact
+   command resume belongs to the previous writer, not the retired current route.
+   Confirm terminal execution and cleanup of actors, ports, leases and resources
+   before deployment. An accepted cancellation alone does not prove cleanup.
+   If any intent, dispatch or effect remains uncertain, retain the previous
+   release and defer deployment rather than retrying the retired admission.
+
+Native executions retain their runtime-source binding. Preserved outbox decoding
+and replay of the three captured minimal c04 fixtures do not prove execution
+across runtime hashes, every historical input, worker restart or lifecycle upgrade.
 
 Resource roots stay under their original
 registered ownership. For trusted pytest checks, the unchanged frozen argv runs
@@ -403,20 +378,19 @@ PDFs, six source HTML files, six bbox HTML files, measurements and every page
 image. Calibration PDFs are additional evidence. The expected new page count
 comes from the actual rerun rather than a historical removed-file count.
 
-The existing `continue-repair` command accepts its original seven fields. A
-cause-specific title correction additionally requires `authority_path` and
-`authority_sha256`, and can be inspected with `repair-admission-preflight` using
-the same request. This narrow route requires the authenticated effective policy,
-completed metadata reconciliation and a fresh failed browser receipt whose
-frozen regex matches the exact title. It atomically reacquires a released claim
-with grant/outbox persistence, rolling back acquisition on admission failure.
-The admitted original session receives the bounded exact match, pattern and
-owned log/hash provenance. The controller permits one title literal change
-only; every surrounding byte, all five cases/assertions and other source files
-must remain identical. This grant admits exactly iteration5 under an existing
-max_repairs3 ceiling, with no iteration6 or automatic renewal. Metadata repair
-must precede this source correction. No generic old failed run gains this
-released-claim or effective-policy exception.
+The existing `continue-repair` command retains its ordinary seven-field contract.
+The former browser-test-name correction variant, identified by additional
+`authority_path` and `authority_sha256` fields, no longer admits new work through
+preflight or continuation. An exact previously persisted command can still return
+its saved response without effects. Previously admitted `title_constraint`
+payloads and their nested lineage remain readable; their strict literal-only
+source validation continues before and after the original provider turn.
+
+Before deploying this retirement, finish or cancel queued/running title-constrained
+repairs, including nested continuations, using the prior runtime. Also finish
+pre-workflow admission effects and resolve any uncertain command acknowledgement
+under that runtime. Generic continuation routes and the existing historical table
+reads are unchanged. This retirement concerns browser test names, not PR titles.
 
 Implementation admission measures the net file diff against the frozen base,
 including untracked files. A committed, clean feature proceeds to the same

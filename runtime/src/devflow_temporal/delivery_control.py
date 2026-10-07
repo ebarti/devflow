@@ -7,6 +7,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -24,16 +25,18 @@ from temporalio.api.enums.v1 import TaskQueueType
 from temporalio.api.taskqueue.v1 import TaskQueue
 from temporalio.api.workflowservice.v1 import DescribeTaskQueueRequest
 from temporalio.client import Client
-from temporalio.worker import Worker
+from temporalio.common import VersioningBehavior
+from temporalio.worker import Worker, WorkerDeploymentConfig, WorkerDeploymentVersion
 
 from .delivery_activities import DELIVERY_ACTIVITIES
 from .delivery_api import create_app
-from .delivery_client import DeliveryClient, ServiceUnavailable
+from .delivery_client import DeliveryClient, ServiceUnavailable, read_only_client
 from .delivery_client import client as api_client
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
 from .delivery_store import DeliveryStore, _private_directory
 from .delivery_workflow import DeliveryWorkflow
+from .payload import payload_digest
 from .supervisor import _process_identity
 
 
@@ -59,12 +62,42 @@ def _read_manifest(config: DeliveryConfig) -> dict | None:
     return value
 
 
-def _write_manifest(config: DeliveryConfig, processes: dict) -> None:
+def _recorded_deployment(manifest: dict) -> dict | None:
+    worker = manifest.get("processes", {}).get("worker", {}).get("deployment")
+    recorded = manifest.get("worker_deployment", worker)
+    if "worker_deployment" in manifest and recorded is None:
+        raise ValueError("recorded worker deployment is invalid")
+    if worker is not None and recorded != worker:
+        raise ValueError("worker deployment differs from its lifecycle selection")
+    return recorded
+
+
+def _validated_deployment(recorded: dict, *, same_payload: bool = True):
+    if (not isinstance(recorded, dict)
+            or not re.fullmatch(r"[a-f0-9]{64}", str(recorded.get("runtime_payload_sha256", "")))
+            or (same_payload and recorded["runtime_payload_sha256"]
+                != payload_digest(Path(__file__).resolve().parent))):
+        raise ValueError(
+            "recorded worker source payload differs or is unknown; "
+            "retain the original artifact and drain it before changing")
+    selected = _worker_deployment(recorded.get("name"), recorded.get("build_id"))
+    if selected is None:
+        raise ValueError("recorded worker deployment is invalid")
+    return selected
+
+
+def _write_manifest(
+    config: DeliveryConfig, processes: dict, *, deployment: dict | None = None,
+) -> None:
     path = _manifest(config)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps({"config_path": str(config.path), "processes": processes}, indent=2) + "\n"
-    )
+    if deployment is None:
+        deployment = (processes.get("worker", {}).get("deployment")
+                      or _recorded_deployment(_read_manifest(config) or {}))
+    value = {"config_path": str(config.path), "processes": processes}
+    if deployment is not None:
+        value["worker_deployment"] = deployment
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
 
@@ -177,6 +210,11 @@ def _launch(config: DeliveryConfig, name: str, argv: list[str]) -> dict:
 
 
 def _stop(config: DeliveryConfig, manifest: dict) -> dict:
+    recorded = _recorded_deployment(manifest)
+    if recorded is None:
+        recorded = _recorded_deployment(_read_manifest(config) or {})
+    if recorded is not None:
+        _validated_deployment(recorded)
     results = {}
     for name in ("api", "worker", "temporal"):
         process = manifest.get("processes", {}).get(name)
@@ -209,7 +247,10 @@ def _stop(config: DeliveryConfig, manifest: dict) -> dict:
                 time.sleep(0.05)
         results[name] = "stopped" if not _owned(process) else "termination_pending"
     if all(not _owned(process) for process in manifest.get("processes", {}).values()):
-        _manifest(config).unlink(missing_ok=True)
+        if recorded is None:
+            _manifest(config).unlink(missing_ok=True)
+        else:
+            _write_manifest(config, {}, deployment=recorded)
         (config.state_root / "worker-ready.json").unlink(missing_ok=True)
     return results
 
@@ -245,11 +286,15 @@ def _ready(config: DeliveryConfig, manifest: dict, deadline: float) -> bool:
             "pid": processes["worker"]["pid"],
             "identity": processes["worker"]["identity"],
             "config_path": str(config.path),
+            **({"deployment": processes["worker"]["deployment"]}
+               if "deployment" in processes["worker"] else {}),
         }
     )
 
 
-def ensure_service_running(config: DeliveryConfig) -> dict:
+def ensure_service_running(
+    config: DeliveryConfig, *, deployment: WorkerDeploymentConfig | None = None,
+) -> dict:
     deadline = _deadline(config)
     try:
         _ports(config)
@@ -260,8 +305,29 @@ def ensure_service_running(config: DeliveryConfig) -> dict:
                     _owned(process) for process in existing["processes"].values()
                 ):
                     raise ValueError("state root has a running service for another configuration")
+                recorded = _recorded_deployment(existing)
+                if recorded is not None:
+                    different = isinstance(recorded, dict) and deployment is not None and (
+                        deployment.version.deployment_name != recorded.get("name")
+                        or deployment.version.build_id != recorded.get("build_id"))
+                    replace = different and not existing["processes"]
+                    selected = _validated_deployment(recorded, same_payload=not replace)
+                    if different and not replace:
+                        raise ValueError(
+                            "running worker deployment differs; drain it before changing")
+                    if not replace:
+                        deployment = selected
+                    else:
+                        # Explicit owner selection only after the prior lifecycle was stopped.
+                        existing = {**existing,
+                                    "worker_deployment": _deployment_identity(deployment)}
+                        _write_manifest(config, {}, deployment=existing["worker_deployment"])
                 while True:
                     if _ready(config, existing, deadline):
+                        if (deployment is not None and existing["processes"]["worker"].get(
+                                "deployment") != _deployment_identity(deployment)):
+                            raise ValueError(
+                                "running worker deployment differs; drain it before changing")
                         return {"dashboard_url": config.dashboard_url, **existing}
                     processes = existing["processes"]
                     if set(processes) != {"temporal", "worker", "api"} or not all(
@@ -274,7 +340,11 @@ def ensure_service_running(config: DeliveryConfig) -> dict:
                 _stop(config, existing)
                 if any(_owned(process) for process in existing["processes"].values()):
                     raise ValueError("owned service termination is pending; inspect service status")
-            return _start(config, deadline)
+            if deployment is not None:
+                # Selection outlives PIDs, including failure before the first worker launch.
+                _write_manifest(config, {}, deployment=_deployment_identity(deployment))
+            return (_start(config, deadline, deployment=deployment) if deployment
+                    else _start(config, deadline))
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(
             f"local service startup failed: {exc}; logs: "
@@ -284,15 +354,20 @@ def ensure_service_running(config: DeliveryConfig) -> dict:
         ) from None
 
 
-def service_start(config: DeliveryConfig) -> dict:
-    return ensure_service_running(config)
+def service_start(
+    config: DeliveryConfig, *, deployment: WorkerDeploymentConfig | None = None,
+) -> dict:
+    return (ensure_service_running(config, deployment=deployment) if deployment
+            else ensure_service_running(config))
 
 
 def _dashboard_bundle() -> Path:
     return Path(__file__).resolve().parents[2] / "ui" / "dist" / "index.html"
 
 
-def _start(config: DeliveryConfig, deadline: float) -> dict:
+def _start(
+    config: DeliveryConfig, deadline: float, *, deployment: WorkerDeploymentConfig | None = None,
+) -> dict:
     bundle = _dashboard_bundle()
     if not bundle.is_file():
         raise ValueError("dashboard bundle is missing; build runtime/ui before service start")
@@ -337,8 +412,14 @@ def _start(config: DeliveryConfig, deadline: float) -> dict:
                 "--config",
                 str(config.path),
                 "worker",
+                *([] if deployment is None else [
+                    "--deployment-name", deployment.version.deployment_name,
+                    "--deployment-build-id", deployment.version.build_id,
+                ]),
             ],
         )
+        if deployment is not None:
+            processes["worker"]["deployment"] = _deployment_identity(deployment)
         _write_manifest(config, processes)
         processes["api"] = _launch(
             config,
@@ -364,7 +445,28 @@ def _start(config: DeliveryConfig, deadline: float) -> dict:
     return {"dashboard_url": config.dashboard_url, "processes": processes}
 
 
-async def worker(config: DeliveryConfig) -> None:
+def _deployment_identity(deployment: WorkerDeploymentConfig) -> dict:
+    return {"name": deployment.version.deployment_name, "build_id": deployment.version.build_id,
+            "runtime_payload_sha256": payload_digest(Path(__file__).resolve().parent)}
+
+
+def _worker_deployment(name: str | None, build_id: str | None) -> WorkerDeploymentConfig | None:
+    if name is None and build_id is None:
+        return None
+    if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name)
+            or not isinstance(build_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", build_id)):
+        raise ValueError(
+            "deployment name and build ID must be supplied together as bounded identifiers")
+    return WorkerDeploymentConfig(
+        WorkerDeploymentVersion(name, build_id), use_worker_versioning=True,
+        default_versioning_behavior=VersioningBehavior.PINNED,
+    )
+
+
+async def worker(
+    config: DeliveryConfig, *, deployment: WorkerDeploymentConfig | None = None,
+) -> None:
     identity = f"devflow-{os.getpid()}-{time.time_ns()}"
     client = await Client.connect(
         config.temporal_address,
@@ -377,6 +479,7 @@ async def worker(config: DeliveryConfig) -> None:
         workflows=[DeliveryWorkflow],
         activities=DELIVERY_ACTIVITIES,
         identity=identity,
+        **({"deployment_config": deployment} if deployment is not None else {}),
     ):
         # Registration of both pollers proves readiness without starting a workflow.
         deadline = _deadline(config)
@@ -402,6 +505,8 @@ async def worker(config: DeliveryConfig) -> None:
             "identity": _process_identity(os.getpid()),
             "config_path": str(config.path),
         }
+        if deployment is not None:
+            readiness["deployment"] = _deployment_identity(deployment)
         descriptor = os.open(marker, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(readiness, stream)
@@ -412,44 +517,45 @@ async def worker(config: DeliveryConfig) -> None:
                 marker.unlink()
 
 
+_COMMANDS = (
+    "start",
+    "status",
+    "stop",
+    "token",
+    "worker",
+    "api",
+    "submit",
+    "runs",
+    "run",
+    "evidence",
+    "decision",
+    "cancel",
+    "reconcile-tracker",
+    "recover-publication",
+    "repair-admission-preflight",
+    "gates-only-preflight",
+    "admit-gates-only",
+    "continue-repair",
+    "retry-prelaunch",
+    "amend-scope",
+)
+
+
 def main() -> None:
     from .delivery_native_guard import reject_nested_controller
 
     reject_nested_controller()
     parser = argparse.ArgumentParser(prog="devflow-delivery")
     parser.add_argument("--config", required=True)
-    parser.add_argument(
-        "command",
-        choices=(
-            "start",
-            "status",
-            "stop",
-            "token",
-            "worker",
-            "api",
-            "submit",
-            "runs",
-            "run",
-            "evidence",
-            "decision",
-            "cancel",
-            "reconcile-tracker",
-            "recover-publication",
-            "reconcile-published-metadata",
-            "metadata-preflight",
-            "repair-admission-preflight",
-            "gates-only-preflight",
-            "admit-gates-only",
-            "continue-repair",
-            "recover-execution",
-            "recovery-preflight",
-            "retry-prelaunch",
-            "amend-scope",
-        ),
-    )
+    parser.add_argument("command", choices=_COMMANDS)
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
     parser.add_argument("--id", help="run ID")
     parser.add_argument("--evidence-id", help="indexed evidence ID")
+    parser.add_argument("--deployment-name", help="explicit Temporal worker deployment")
+    parser.add_argument("--deployment-build-id", help="immutable retained source artifact version")
+    parser.add_argument("--limit", type=int, default=50, help="run page size (1-100)")
+    parser.add_argument("--cursor", help="next_cursor from a previous run page")
+    parser.add_argument("--archived", action="store_true", help="list archived runs")
     args = parser.parse_args()
     try:
         _run(args, parser)
@@ -458,9 +564,21 @@ def main() -> None:
 
 
 def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    config = _config(args.config)
+    if args.command not in _COMMANDS:
+        parser.error(f"invalid choice: {args.command!r}")
+    deployment = _worker_deployment(
+        getattr(args, "deployment_name", None), getattr(args, "deployment_build_id", None))
+    if deployment is not None and args.command not in {"start", "worker"}:
+        parser.error("worker deployment options apply only to start or worker")
+    read_commands = {
+        "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
+    }
+    if args.command in read_commands | {"status", "token"}:
+        config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
+    else:
+        config = _config(args.config)
     if args.command == "worker":
-        asyncio.run(worker(config))
+        asyncio.run(worker(config, deployment=deployment))
         return
     if args.command == "api":
         host, port, _, _ = _ports(config)
@@ -478,14 +596,10 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "cancel",
         "reconcile-tracker",
         "recover-publication",
-        "reconcile-published-metadata",
-        "metadata-preflight",
         "repair-admission-preflight",
         "gates-only-preflight",
         "admit-gates-only",
         "continue-repair",
-        "recover-execution",
-        "recovery-preflight",
         "retry-prelaunch",
         "amend-scope",
     }:
@@ -496,12 +610,9 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "cancel",
             "reconcile-tracker",
             "recover-publication",
-            "reconcile-published-metadata",
-            "metadata-preflight",
             "repair-admission-preflight",
             "admit-gates-only",
             "continue-repair",
-            "recover-execution",
             "retry-prelaunch",
             "amend-scope",
         } and not isinstance(request, dict):
@@ -515,14 +626,10 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "cancel",
                 "reconcile-tracker",
                 "recover-publication",
-                "reconcile-published-metadata",
-                "metadata-preflight",
                 "repair-admission-preflight",
                 "gates-only-preflight",
                 "admit-gates-only",
                 "continue-repair",
-                "recover-execution",
-                "recovery-preflight",
                 "retry-prelaunch",
                 "amend-scope",
             }
@@ -536,26 +643,24 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 from .delivery_origin import bind_origin
 
                 request = bind_origin(request, os.environ.get("CODEX_THREAD_ID"))
-            caller = api_client(config.path)
+            factory = read_only_client if args.command in read_commands else api_client
+            caller = factory(config.path)
             result = {
                 "submit": lambda: caller.submit(request),
-                "runs": caller.runs,
+                "runs": lambda: caller.runs(limit=getattr(args, "limit", 50),
+                                            cursor=getattr(args, "cursor", None),
+                                            archived=getattr(args, "archived", False)),
                 "run": lambda: caller.status(args.id),
                 "evidence": lambda: caller.evidence(args.id, args.evidence_id),
                 "decision": lambda: caller.decision(args.id, request),
                 "cancel": lambda: caller.cancel(args.id, request),
                 "reconcile-tracker": lambda: caller.reconcile_tracker(args.id, request),
                 "recover-publication": lambda: caller.recover_publication(args.id, request),
-                "metadata-preflight": lambda: caller.metadata_preflight(args.id, request),
                 "repair-admission-preflight": lambda: caller.repair_admission_preflight(
-                    args.id, request),
-                "reconcile-published-metadata": lambda: caller.reconcile_published_metadata(
                     args.id, request),
                 "gates-only-preflight": lambda: caller.gates_only_preflight(args.id),
                 "admit-gates-only": lambda: caller.admit_gates_only(args.id, request),
                 "continue-repair": lambda: caller.continue_repair(args.id, request),
-                "recover-execution": lambda: caller.recover_execution(args.id, request),
-                "recovery-preflight": lambda: caller.recovery_preflight(args.id),
                 "retry-prelaunch": lambda: caller.retry_prelaunch(args.id, request),
                 "amend-scope": lambda: caller.amend_scope(args.id, request),
             }[args.command]()
@@ -564,7 +669,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         print(json.dumps(result, sort_keys=True, indent=2))
         return
     if args.command == "start":
-        print(json.dumps(service_start(config), sort_keys=True))
+        print(json.dumps(service_start(config, deployment=deployment), sort_keys=True))
         return
     manifest = _read_manifest(config)
     if args.command == "status":

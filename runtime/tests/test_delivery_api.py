@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import subprocess
 import threading
 import time
@@ -11,8 +12,9 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 
 from devflow_temporal.delivery_activities import (
@@ -78,56 +80,17 @@ async def test_idle_dispatch_reports_actual_temporal_health(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_public_policy_recovery_requires_csrf_and_reports_unavailable_readback(
-    api_fixture, monkeypatch,
-):
-    path, _ = api_fixture
-    app = create_app(path)
-    store = app.state.delivery.store
-    calls = []
-
-    def preflight(run_id):
-        calls.append(('read', run_id))
-        return {'precheck_sha256': 'a' * 64}
-
-    def recover(run_id, payload):
-        calls.append(('write', run_id, payload))
-        return {'phase': 'execution_policy_recovery_queued'}
-
-    monkeypatch.setattr(store, 'policy_recovery_precheck', preflight)
-    monkeypatch.setattr(store, 'recover_execution', recover)
-    transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
-    async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1:18770') as browser:
-        assert (await browser.get('/api/runs/stopped/recovery-preflight')).json() == {
-            'precheck_sha256': 'a' * 64,
-        }
-        payload = {'command_id': 'same-grant'}
-        assert (await browser.post('/api/runs/stopped/recover-execution', json=payload,
-                                  headers={'Origin': 'http://127.0.0.1:18770'})).status_code == 403
-        assert calls == [('read', 'stopped')]
-        session = await browser.get('/api/session')
-        headers = {'Origin': 'http://127.0.0.1:18770',
-                   'X-Devflow-CSRF': session.json()['csrf_token']}
-        response = await browser.post('/api/runs/stopped/recover-execution',
-                                      json=payload, headers=headers)
-        assert response.json()['phase'] == 'execution_policy_recovery_queued'
-        assert calls[-1] == ('write', 'stopped', payload)
-
-        def unavailable(_run_id):
-            raise subprocess.TimeoutExpired(['git', 'ls-remote'], 30)
-
-        monkeypatch.setattr(store, 'policy_recovery_precheck', unavailable)
-        assert (await browser.get('/api/runs/stopped/recovery-preflight')).status_code == 409
-        assert len(calls) == 2
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks])
 async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch, tmp_path):
     started = threading.Event()
     release = threading.Event()
 
     class Broker:
+        native_cleanup_confirmed = True
+
+        def _native_cancelled(self):
+            return False
+
         def run_prechecks(self, _iteration, _candidate):
             started.set()
             assert release.wait(2)
@@ -137,7 +100,7 @@ async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkey
 
     monkeypatch.setattr(
         "devflow_temporal.delivery_activities._context", lambda _spec: (
-            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()
+            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()
         )
     )
     task = asyncio.create_task(activity_fn(
@@ -160,7 +123,13 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
     activity_fn, monkeypatch, tmp_path
 ):
     class Broker:
+        native_cleanup_confirmed = True
+
+        def _native_cancelled(self):
+            return False
+
         def run_prechecks(self, _iteration, _candidate):
+            self.native_cleanup_confirmed = False
             raise NativeProcessUnknown("Native process inspection became unavailable")
 
         run_checks = run_prechecks
@@ -168,12 +137,21 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
 
     monkeypatch.setattr(
         "devflow_temporal.delivery_activities._context", lambda _spec: (
-            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()
+            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()
         )
     )
-    result = await activity_fn(
-        {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {"id": "candidate"}}
-    )
+    from devflow_temporal.delivery_activities import _UNCLEAN_CHECK_SLOTS
+
+    retained = len(_UNCLEAN_CHECK_SLOTS)
+    try:
+        result = await activity_fn(
+            {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {"id": "candidate"}}
+        )
+        assert len(_UNCLEAN_CHECK_SLOTS) == retained + 1
+    finally:
+        for descriptor in _UNCLEAN_CHECK_SLOTS[retained:]:
+            os.close(descriptor)
+        del _UNCLEAN_CHECK_SLOTS[retained:]
     assert result == {
         "state": "unknown",
         "cleanup": "unknown",
@@ -190,6 +168,11 @@ async def test_check_preparation_failure_keeps_diagnostics_without_claiming_a_la
     from devflow_temporal.delivery_broker import CheckPreparationFailure
 
     class Broker:
+        native_cleanup_confirmed = True
+
+        def _native_cancelled(self):
+            return False
+
         def run_prechecks(self, _iteration, _candidate):
             raise CheckPreparationFailure('planned-dependencies', ValueError('owned root rejected'))
 
@@ -199,7 +182,7 @@ async def test_check_preparation_failure_keeps_diagnostics_without_claiming_a_la
             return {'id': 'candidate'}
 
     monkeypatch.setattr('devflow_temporal.delivery_activities._context', lambda _: (
-        SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()))
+        SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()))
     result = await activity_fn({'spec': {'provider': 'codex'}, 'iteration': 0,
                                'candidate': {'id': 'candidate'}})
     assert result['state'] == 'failed' and result['cleanup'] == 'confirmed'
@@ -271,6 +254,59 @@ def _foreign_queued_service(api_fixture, key, value):
     foreign = create_app(foreign_path).state.delivery
     foreign.store.submit(request)
     return owner, foreign, request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["edit", "delete", "spec"])
+async def test_invalid_foreign_row_does_not_block_owned_dispatch(
+    api_fixture, monkeypatch, caplog, mutation,
+):
+    owner, foreign, request = _foreign_queued_service(
+        api_fixture, "temporal_address", "127.0.0.1:17399",
+    )
+    own = {**request, "command_id": "own-submit", "run_id": "own-run",
+           "work_id": "own-work", "branch": "feat/own-run",
+           "issue_url": "https://github.com/example/fixture/issues/4"}
+    owner.store.submit(own)
+    before = foreign.store.detail(request["run_id"])
+    if mutation == "edit":
+        raw = json.loads(foreign.config.path.read_text())
+        raw["label"] = "changed after admission"
+        foreign.config.path.write_text(json.dumps(raw))
+    elif mutation == "delete":
+        foreign.config.path.unlink()
+    else:
+        original = owner.store.effective_spec
+
+        def invalid_spec(run_id):
+            if run_id == request["run_id"]:
+                raise ValueError("invalid foreign specification")
+            return original(run_id)
+
+        monkeypatch.setattr(owner.store, "effective_spec", invalid_spec)
+    started = []
+
+    async def missing():
+        raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+
+    class Temporal:
+        def get_workflow_handle(self, _workflow_id):
+            return SimpleNamespace(describe=missing)
+
+        async def start_workflow(self, _workflow, **kwargs):
+            started.append(kwargs["id"])
+
+    async def healthy():
+        owner.temporal_status = "connected"
+        return Temporal()
+
+    monkeypatch.setattr(owner, "healthy_client", healthy)
+    await owner.dispatch_once()
+    assert started == ["delivery-own-run"]
+    assert owner.temporal_status == "connected"
+    assert foreign.store.detail(request["run_id"]) == before
+    assert [row["run_id"] for row in owner.store.pending_starts()] == [request["run_id"]]
+    assert request["run_id"] in caplog.text
 
 
 @pytest.mark.asyncio
@@ -361,7 +397,7 @@ async def test_tokenless_local_api_csrf_submit_replay_and_conflict(api_fixture):
     app = create_app(path)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        assert (await browser.get("/api/runs")).json() == {"runs": []}
+        assert (await browser.get("/api/runs")).json() == {"runs": [], "next_cursor": None}
         token_path = Path(json.loads(path.read_text())["state_root"]) / "service-token"
         assert not token_path.exists()
         assert (
@@ -848,8 +884,9 @@ async def test_public_supersede_requires_new_branch_and_preserves_prior_checkout
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("project_delay", [0, 6])
 async def test_public_decision_and_cancel_use_temporal_revision_after_worker_restart(
-    api_fixture, tmp_path
+    api_fixture, tmp_path, project_delay
 ):
     path, request = api_fixture
     config = json.loads(path.read_text())
@@ -866,8 +903,19 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
     async def role_stub(payload):
         return {"status": "blocked", "candidate": payload["candidate"]}
 
-    activities = [delivery_project, delivery_prepare, tracker_start_stub, role_stub]
-    async with await WorkflowEnvironment.start_local(
+    delayed_runs = set()
+
+    @activity.defn(name="delivery_project")
+    async def project_fixture(payload):
+        # Exercise scheduling beyond the former five-second readiness budget.
+        run_id = payload["spec"]["run_id"]
+        if run_id not in delayed_runs:
+            delayed_runs.add(run_id)
+            await asyncio.sleep(project_delay)
+        return await delivery_project(payload)
+
+    activities = [project_fixture, delivery_prepare, tracker_start_stub, role_stub]
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "public-decision.sqlite3")
     ) as environment:
 
@@ -909,11 +957,12 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
                         task_queue=queue,
                     )
                     store.mark_start(submitted["run_id"], accepted=True)
-                    for _ in range(100):
-                        if store.detail(submitted["run_id"])["decisions"]:
-                            break
-                        await asyncio.sleep(0.05)
-                    assert store.detail(submitted["run_id"])["decisions"]
+
+                    async def pending_decision(run_id):
+                        while not store.detail(run_id)["decisions"]:
+                            await asyncio.sleep(0.05)
+
+                    await asyncio.wait_for(pending_decision(submitted["run_id"]), 15)
                 # The public command is sent after a worker restart, using the
                 # HTTP revision rather than the unrelated SQLite event revision.
                 async with Worker(
@@ -959,8 +1008,9 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("browser_entry_delay", [0, 6])
 async def test_public_cancel_remains_responsive_during_blocking_browser_activity(
-    api_fixture, tmp_path, monkeypatch
+    api_fixture, tmp_path, monkeypatch, browser_entry_delay
 ):
     path, request = api_fixture
     config = json.loads(path.read_text())
@@ -972,6 +1022,7 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
     release = threading.Event()
 
     def blocking_browser(_broker, _iteration, candidate):
+        time.sleep(browser_entry_delay)
         entered.set()
         assert release.wait(timeout=10)
         return {"state": "passed", "cleanup": "confirmed", "candidate_id": candidate["id"]}
@@ -1002,7 +1053,7 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
     async def checks_stub(_payload):
         return {"state": "passed"}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "browser-cancel.sqlite3")
     ) as environment:
 
@@ -1043,8 +1094,12 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
                     task_queue="public-browser-cancel",
                 )
                 store.mark_start(request["run_id"], accepted=True)
-                assert await asyncio.wait_for(asyncio.to_thread(entered.wait), 5)
                 try:
+                    async def browser_entered():
+                        while not entered.is_set():
+                            await asyncio.sleep(0.05)
+
+                    await asyncio.wait_for(browser_entered(), 15)
                     detail = (await browser.get("/api/runs/run-1")).json()["run"]
                     assert detail["phase"] == "browser_qa"
                     cancelled = await asyncio.wait_for(

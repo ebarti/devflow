@@ -9,11 +9,34 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, ServerError
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from .contracts import digest
 from .delivery_metadata_contract import evidence_applicability
 from .delivery_questions import valid_blocking_questions
+
+
+def _failure_classification(cause: Exception | None, controller_cause: str | None) -> dict:
+    """Classify controller observations, never human or model diagnostic text."""
+    result = {"classification": "terminal"}
+    if controller_cause in {"ci_deadline", "tracker_readback", "publication_deadline"}:
+        return {"classification": "transient", "cause_type": controller_cause}
+    if not isinstance(cause, ActivityError):
+        return result
+    failure = cause.cause
+    if isinstance(failure, ActivityTimeoutError):
+        return {"classification": "transient", "cause_type": "ActivityTimeoutError"}
+    if isinstance(failure, ServerError) and not failure.non_retryable:
+        return {"classification": "transient", "cause_type": "ServerError"}
+    if isinstance(failure, ApplicationError):
+        result["cause_type"] = (failure.type or "ApplicationError")[:128]
+        if not failure.non_retryable and failure.type in {
+            "ConnectionError", "TimeoutError", "TimeoutExpired", "GitHubTransientError",
+            "BrokerReadbackUnavailable", "ResourceCleanupTransient",
+        }:
+            result["classification"] = "transient"
+    return result
 
 
 def _preparation_failure(result: dict[str, Any]) -> str | None:
@@ -129,6 +152,7 @@ class DeliveryWorkflow:
         self.terminal_reconciliation_only = False
         self.controller_only_adjudication = False
         self.controller_only_resource_closure = False
+        self.original_execution = True
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
         if self.controller_only_resource_closure and name not in {
@@ -153,6 +177,8 @@ class DeliveryWorkflow:
             name == "delivery_finalize_resources"
             and request["spec"].get("resource_cleanup_version") == 1
         )
+        patient_ci = (name == "delivery_ci"
+                      and "ci_wait_seconds" in request["spec"].get("policy", {}))
         options = {}
         if automatic_preparation or resource_finalization:
             options = {
@@ -176,6 +202,36 @@ class DeliveryWorkflow:
                     maximum_interval=timedelta(seconds=10),
                 )
             }
+        elif (name in {'delivery_intake', 'delivery_role', 'delivery_checks',
+                       'delivery_precheck', 'delivery_baseline_checks', 'delivery_browser_qa'}
+              and request['spec'].get('policy', {}).get('execution_backend') == 'native-macos'
+              and workflow.patched('delivery-activity-liveness-v1')):
+            options = {
+                'heartbeat_timeout': timedelta(seconds=15),
+                'schedule_to_close_timeout': timedelta(hours=hours),
+                'retry_policy': RetryPolicy(
+                    maximum_attempts=3,
+                    initial_interval=timedelta(seconds=1),
+                    maximum_interval=timedelta(seconds=10),
+                    non_retryable_error_types=[
+                        'ValueError', 'TypeError', 'PermissionError', 'NativeProcessUnknown',
+                    ],
+                ),
+            }
+        elif patient_ci:
+            options = {
+                "heartbeat_timeout": timedelta(seconds=30),
+                "retry_policy": RetryPolicy(maximum_attempts=3),
+            }
+        elif (name == "delivery_project"
+              and request["spec"].get("projection_retry_version") == 1):
+            options = {
+                "schedule_to_close_timeout": timedelta(minutes=3),
+                "retry_policy": RetryPolicy(
+                    maximum_attempts=3, initial_interval=timedelta(seconds=2),
+                    maximum_interval=timedelta(seconds=10),
+                ),
+            }
         elif name in {
             "delivery_metadata_readback", "delivery_gates_readback", "delivery_technical_readback",
         }:
@@ -190,8 +246,28 @@ class DeliveryWorkflow:
         else:
             options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         timeout = timedelta(hours=hours)
-        if name in {"delivery_terminal_tracker", "delivery_terminal_preflight"}:
+        if name == "delivery_project" and request["spec"].get("projection_retry_version") == 1:
+            timeout = timedelta(seconds=45)
+        if patient_ci:
+            timeout = timedelta(seconds=request["spec"]["policy"]["ci_wait_seconds"] + 120)
+            options["schedule_to_close_timeout"] = timeout
+        if name in {"delivery_terminal_tracker", "delivery_terminal_preflight"} or (
+            name == "delivery_tracker_start" and "timeout_seconds" in request
+        ):
             timeout = timedelta(seconds=min(request.get("timeout_seconds", 180), 180))
+            options["schedule_to_close_timeout"] = timeout
+        if name in {
+            "delivery_checks", "delivery_browser_qa", "delivery_precheck",
+            "delivery_baseline_checks",
+        } and workflow.patched("delivery-check-slots-v1"):
+            options["heartbeat_timeout"] = timedelta(seconds=30)
+            options["cancellation_type"] = (
+                workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+            )
+        if (name in {"delivery_publish", "delivery_reconcile_publish"}
+                and request["spec"].get("publication_readback_version") == 1):
+            limit = 180 if name == "delivery_publish" else 60
+            timeout = timedelta(seconds=min(request.get("timeout_seconds", limit), limit))
             options["schedule_to_close_timeout"] = timeout
         return await workflow.execute_activity(
             name,
@@ -304,7 +380,10 @@ class DeliveryWorkflow:
                 "status": "in-review" if event == "delivered" else "blocked",
                 "release": release, "reason": self.state.get("error") or message,
                 "cycles": 0, "attempts": 0, "waiting": False,
-                "deadline": (workflow.now() + timedelta(minutes=10)).isoformat(),
+                "deadline": (workflow.now() + timedelta(seconds=(
+                    spec["policy"]["tracker_retry_seconds"]
+                    if spec.get("tracker_retry_version") == 1 else 600
+                ))).isoformat(),
             }
             self.state["checks"]["terminal_tracker_checkpoint"] = checkpoint
             if not await self._finish_terminal_tracker(spec, checkpoint):
@@ -354,7 +433,10 @@ class DeliveryWorkflow:
                     )
                 except Exception as exc:
                     self.state["tracker"] = {"state": "pending", "pending": True,
-                                             "reason": type(exc).__name__}
+                                             "reason": type(exc).__name__,
+                                             **({"retryable": isinstance(exc, ActivityError)
+                                                 and isinstance(exc.cause, ActivityTimeoutError)}
+                                                if spec.get("tracker_retry_version") == 1 else {})}
                 if self.state["tracker"].get("state") == "consistent":
                     checkpoint["state"] = "confirmed"
                     self.state.update({key: checkpoint[key] for key in (
@@ -362,13 +444,42 @@ class DeliveryWorkflow:
                     )})
                     self.state["revision"] += 1
                     return True
+                if (spec.get("tracker_retry_version") == 1
+                        and not self.state["tracker"].get("retryable")):
+                    checkpoint.update(state="conflicted", waiting=False, closed=True)
+                    self.state.update(
+                        phase="blocked", execution_state="blocked", outcome="blocked",
+                        error="terminal tracker synchronization conflicted",
+                    )
+                    return False
                 self.state.update(phase="waiting_tracker", execution_state="waiting_tracker",
                                   outcome=None, error="terminal tracker readback is pending")
                 self.state["revision"] += 1
                 await self._project(spec, "tracker_pending",
                                     "Terminal tracker reconciliation is pending")
                 if attempt < 2:
-                    await workflow.sleep(timedelta(seconds=2 ** (attempt + 1)))
+                    delay = min(2 ** (attempt + 1), max(0, (
+                        datetime.fromisoformat(checkpoint["deadline"]) - workflow.now()
+                    ).total_seconds())) if spec.get("tracker_retry_version") == 1 else (
+                        2 ** (attempt + 1)
+                    )
+                    await workflow.sleep(timedelta(seconds=delay))
+            if spec.get("tracker_retry_version") == 1:
+                remaining = datetime.fromisoformat(checkpoint["deadline"]) - workflow.now()
+                if remaining.total_seconds() <= 0:
+                    checkpoint.update(state="pending", waiting=False, closed=True)
+                    return False
+                # Reuse the same owned intent. A durable timer replaces the manual
+                # update wait; no new feature role or repair iteration is admitted.
+                try:
+                    await workflow.wait_condition(
+                        lambda: self.tracker_retry_requested,
+                        timeout=min(remaining, timedelta(seconds=30)),
+                    )
+                except TimeoutError:
+                    pass
+                self.tracker_retry_requested = False
+                continue
             checkpoint.update(state="pending", waiting=True)
             self.state["revision"] += 1
             await self._project(spec, "tracker_retry_required",
@@ -382,7 +493,42 @@ class DeliveryWorkflow:
                 return False
             self.tracker_retry_requested = False
 
-    async def _stop(self, spec: dict[str, Any], reason: str) -> dict[str, Any]:
+    async def _start_tracker(self, spec: dict[str, Any]) -> dict[str, Any]:
+        if spec.get("tracker_retry_version") != 1:
+            return await self._activity("delivery_tracker_start", {"spec": spec})
+        deadline = workflow.now() + timedelta(seconds=spec["policy"]["tracker_retry_seconds"])
+        progress = {"attempts": 0, "deadline": deadline.isoformat()}
+        self.state["checks"]["tracker_retry"] = progress
+        delay = 2
+        while True:
+            if self.cancel_requested:
+                return {"state": "cancelled", "retryable": False}
+            remaining = (deadline - workflow.now()).total_seconds()
+            if remaining <= 0:
+                return self.state["tracker"]
+            progress["attempts"] += 1
+            try:
+                result = await self._activity("delivery_tracker_start", {
+                    "spec": spec, "timeout_seconds": max(1, min(180, int(remaining))),
+                })
+            except ActivityError as exc:
+                if not isinstance(exc.cause, ActivityTimeoutError):
+                    raise
+                result = {"state": "pending", "retryable": True,
+                          "reason": "tracker activity timed out"}
+            self.state["tracker"] = result
+            if result.get("state") == "consistent" or not result.get("retryable"):
+                return result
+            self.state["revision"] += 1
+            await self._project(spec, "tracker_pending", "Waiting for owned tracker readback")
+            remaining = max(0, (deadline - workflow.now()).total_seconds())
+            await self._wait_repair_readback(min(delay, remaining))
+            delay = min(delay * 2, 30)
+
+    async def _stop(
+        self, spec: dict[str, Any], reason: str, *, cause: Exception | None = None,
+        controller_cause: str | None = None,
+    ) -> dict[str, Any]:
         if any(
             role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
             for role in self.state["roles"]
@@ -395,6 +541,11 @@ class DeliveryWorkflow:
         if self.cancel_requested:
             self.state["cleanup"] = "unknown"
             return await self._cancelled(spec)
+        if self.original_execution and spec.get("automatic_retry_version") == 1:
+            self.state["checks"]["failure"] = {
+                **_failure_classification(cause, controller_cause),
+                "stage": self.state["phase"], "reason": reason[:600],
+            }
         self.state["phase"] = "blocked"
         self.state["execution_state"] = "blocked"
         self.state["outcome"] = "blocked"
@@ -430,6 +581,76 @@ class DeliveryWorkflow:
         )
         return self.state
 
+    async def _publish_original(self, spec, iteration, candidate):
+        """Invoke mutation once; a lost completion can only inspect its existing effect."""
+        self.state["cleanup"] = "unknown"
+        try:
+            initial = await self._activity("delivery_publish", {
+                "spec": spec, "iteration": iteration, "candidate": candidate,
+            })
+        except ActivityError as exc:
+            if (spec.get("publication_readback_version") == 1
+                    and isinstance(exc.cause, ApplicationError)
+                    and exc.cause.type == "PublicationRejected" and exc.cause.non_retryable):
+                self.state["cleanup"] = "none"
+                raise
+            initial = None
+        previous = self.state.get("pull_request") or {}
+        return await self._published_result(
+            spec, iteration, candidate, initial,
+            expected_head=initial.get("head") if initial else None,
+            expected_pr_number=previous.get("number"),
+        )
+
+    @staticmethod
+    def _publication_transport_failure(exc):
+        cause = exc.cause if isinstance(exc, ActivityError) else exc
+        return (isinstance(cause, ActivityTimeoutError)
+                or isinstance(cause, ApplicationError) and cause.type in {
+                    "BrokerReadbackUnavailable", "TimeoutExpired", "TimeoutError",
+                    "ConnectionError",
+                })
+
+    async def _bounded_published_result(self, spec, request, initial):
+        if initial is not None and initial.get("state") != "pending":
+            self.state["cleanup"] = "none"
+            return initial
+        deadline = workflow.now() + timedelta(seconds=spec["publication_readback_seconds"])
+        delay = 5
+        result = initial
+        self.state["cleanup"] = "unknown"
+        while True:
+            if self.cancel_requested:
+                self.state["cleanup"] = "unknown"
+                await self._cancelled(spec)
+                return {"state": "cancelled"}
+            remaining = (deadline - workflow.now()).total_seconds()
+            if remaining <= 0:
+                raise ApplicationError("original publication readback deadline exhausted")
+            if result is None:
+                try:
+                    result = await self._activity("delivery_reconcile_publish", {
+                        **request, "timeout_seconds": max(1, int(remaining)),
+                    })
+                except Exception as exc:
+                    if not self._publication_transport_failure(exc):
+                        raise
+                    result = {"state": "pending"}
+            if result.get("state") != "pending":
+                self.state["cleanup"] = "none"
+                return result
+            if result.get("head"):
+                request["expected_head"] = request["expected_head"] or result["head"]
+            self.state["phase"] = "publishing_pending"
+            self.state["revision"] += 1
+            await self._project(
+                spec, "publication_pending", "Waiting for original publication readback"
+            )
+            remaining = (deadline - workflow.now()).total_seconds()
+            await self._wait_repair_readback(min(delay, max(0, remaining)))
+            delay = min(delay * 2, 30)
+            result = None
+
     async def _published_result(
         self,
         spec: dict[str, Any],
@@ -447,6 +668,8 @@ class DeliveryWorkflow:
             "expected_head": expected_head,
             "expected_pr_number": expected_pr_number,
         }
+        if spec.get("publication_readback_version") == 1:
+            return await self._bounded_published_result(spec, request, initial)
         result = initial or await self._activity("delivery_reconcile_publish", request)
         delay = 5
         while result.get("state") == "pending":
@@ -498,7 +721,7 @@ class DeliveryWorkflow:
                     },
                 )
             except Exception as exc:
-                await self._stop(spec, f"intake activity failed: {type(exc).__name__}")
+                await self._stop(spec, f"intake activity failed: {type(exc).__name__}", cause=exc)
                 return None
             self.state["roles"].append(result)
             self.state["usage"][f"intake:{turn}"] = result.get("usage")
@@ -606,7 +829,9 @@ class DeliveryWorkflow:
                              "authorization": authorization},
                         )
                     except Exception as exc:
-                        await self._stop(spec, f"plan acceptance failed: {type(exc).__name__}")
+                        await self._stop(
+                            spec, f"plan acceptance failed: {type(exc).__name__}", cause=exc,
+                        )
                         return None
                     plan_record["state"] = "accepted"
                     intake["accepted_plan"] = {
@@ -669,7 +894,9 @@ class DeliveryWorkflow:
                          "plan_digest": plan_record["digest"], "plan": plan},
                     )
                 except Exception as exc:
-                    await self._stop(spec, f"plan acceptance failed: {type(exc).__name__}")
+                    await self._stop(
+                        spec, f"plan acceptance failed: {type(exc).__name__}", cause=exc,
+                    )
                     return None
                 plan_record["state"] = "accepted"
                 intake["accepted_plan"] = {
@@ -687,6 +914,7 @@ class DeliveryWorkflow:
     async def run(
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        self.original_execution = recovery is None
         if recovery is not None:
             if recovery.get("kind") == "stopped_delivery_resume":
                 return await self._resume_stopped(spec, recovery)
@@ -704,7 +932,7 @@ class DeliveryWorkflow:
             if recovery.get("kind") == "stopped_resource_closure":
                 return await self._resume_resource_closure(spec, recovery)
             if recovery.get("kind") == "investigation_assessment_adjudication":
-                return await self._resume_adjudication(spec, recovery)
+                return await self._replay_legacy_adjudication(spec, recovery)
             if recovery.get("kind") == "accepted_technical_successor":
                 return await self._resume_technical(spec, recovery)
             if recovery.get("kind") == "execution_policy_recovery":
@@ -743,7 +971,7 @@ class DeliveryWorkflow:
         except Exception as exc:
             cause = getattr(exc, "cause", None)
             reason = str(cause)[:600] if cause else type(exc).__name__
-            return await self._stop(spec, f"preparation failed: {reason}")
+            return await self._stop(spec, f"preparation failed: {reason}", cause=exc)
         spec = prepared.get("spec", spec)
         if self.cancel_requested:
             return await self._cancelled(spec)
@@ -759,7 +987,8 @@ class DeliveryWorkflow:
                 baseline = await self._activity("delivery_baseline_checks", {"spec": spec})
             except Exception as exc:
                 return await self._stop(
-                    spec, f"baseline check execution unresolved: {type(exc).__name__}"
+                    spec, f"baseline check execution unresolved: {type(exc).__name__}",
+                    cause=exc,
                 )
             self.state["checks"]["baseline"] = baseline
             if self.cancel_requested:
@@ -783,14 +1012,21 @@ class DeliveryWorkflow:
         self.state["revision"] += 1
         await self._project(spec, "tracker_start", "Claimed issue entering In progress")
         try:
-            started_tracker = await self._activity("delivery_tracker_start", {"spec": spec})
+            started_tracker = await self._start_tracker(spec)
         except Exception as exc:
             return await self._stop(
-                spec, f"initial tracker synchronization pending: {type(exc).__name__}"
+                spec, f"initial tracker synchronization pending: {type(exc).__name__}",
+                cause=exc,
             )
         self.state["tracker"] = started_tracker
+        if spec.get("tracker_retry_version") == 1 and self.cancel_requested:
+            return await self._cancelled(spec)
         if started_tracker.get("state") != "consistent":
-            return await self._stop(spec, "initial tracker readback remains pending")
+            return await self._stop(
+                spec, "initial tracker readback remains pending",
+                controller_cause=("tracker_readback" if started_tracker.get("retryable") is True
+                                  else None),
+            )
         prompt = spec["policy"].get("initial_decision_prompt")
         if prompt:
             self.state["phase"] = "waiting_decision"
@@ -906,15 +1142,21 @@ class DeliveryWorkflow:
                 return await self._stop(spec, "pending publication tracker readback pending")
             if self.cancel_requested:
                 return await self._stop(spec, "cancelled")
-            published = await self._activity("delivery_publish", {
-                "spec": spec, "iteration": self.state["iteration"],
-                "candidate": self.state["candidate"],
-            })
-            if published.get("state") == "pending":
+            if spec.get("publication_readback_version") == 1:
                 published = await self._published_result(
-                    spec, self.state["iteration"], self.state["candidate"], published,
+                    spec, self.state["iteration"], self.state["candidate"], None,
                     expected_head=recovery["seal"]["candidate"]["head"],
                 )
+            else:
+                published = await self._activity("delivery_publish", {
+                    "spec": spec, "iteration": self.state["iteration"],
+                    "candidate": self.state["candidate"],
+                })
+                if published.get("state") == "pending":
+                    published = await self._published_result(
+                        spec, self.state["iteration"], self.state["candidate"], published,
+                        expected_head=recovery["seal"]["candidate"]["head"],
+                    )
             if self.state.get("outcome") == "cancelled":
                 return self.state
             self.state.update(candidate=published["candidate"], pull_request=published)
@@ -1095,7 +1337,7 @@ class DeliveryWorkflow:
             authorized_max_iteration=4, published_checkpoint=True, verify_only=True,
         )
 
-    async def _resume_adjudication(self, spec, recovery):
+    async def _replay_legacy_adjudication(self, spec, recovery):
         if (recovery.get('execution_spec') != spec or recovery.get('maximum_iteration') != 4
                 or recovery.get('command', {}).get('additional_iterations') != 0
                 or recovery.get('state', {}).get('iteration') != 4):
@@ -1129,6 +1371,11 @@ class DeliveryWorkflow:
         except Exception as exc:
             return await self._stop(spec, 'adjudication final gate failed: '
                                     + type(exc).__name__)
+        # The legacy body exists only so already recorded histories can replay.
+        # An old execution paused at CI has not reached this patch yet, so its
+        # next live terminal transition is blocked along with new executions.
+        if workflow.patched("qa-findings-require-passing-assessment-v1"):
+            return await self._stop(spec, 'QA findings require repair and a passing QA assessment')
         self.state.update(phase='delivered', execution_state='terminal', outcome='delivered')
         self.state['revision'] += 1
         await self._project(spec, 'delivered',
@@ -1280,7 +1527,9 @@ class DeliveryWorkflow:
             None,
         )
         original = recovery.get("original_recovery") if prelaunch_retry else None
-        authorized_limit = spec["policy"]["max_repairs"] + 2
+        authorized_limit = spec["policy"]["max_repairs"] + (
+            0 if spec.get("retry_budget_version") == 1 else 2
+        )
         if (
             previous.get("run_id") != spec["run_id"]
             or previous.get("phase") != "blocked"
@@ -1569,6 +1818,9 @@ class DeliveryWorkflow:
             if authorized_max_iteration is not None
             else spec["policy"]["max_repairs"]
         )
+        if (spec.get("retry_budget_version") == 1
+                and max_repairs > spec["policy"]["max_repairs"]):
+            raise ValueError("workflow continuation exceeded its fixed repair budget")
         acceptance_note = (
             "Operator acceptance criteria (requirements to assess, not evidence of success): "
             + json.dumps(operator_brief, sort_keys=True)
@@ -1590,7 +1842,7 @@ class DeliveryWorkflow:
                     except Exception as exc:
                         self.state['cleanup'] = 'unknown'
                         return await self._stop(spec, 'technical prepublication checks failed: '
-                                                + type(exc).__name__)
+                                                + type(exc).__name__, cause=exc)
                     self.state['checks']['prepublish'] = checked
                     if checked.get('state') != 'passed' or checked.get('cleanup') == 'unknown':
                         return await self._stop(spec, 'technical prepublication checks failed')
@@ -1609,7 +1861,8 @@ class DeliveryWorkflow:
                     )
                 except Exception as exc:
                     return await self._stop(
-                        spec, f"publication reconciliation unresolved: {type(exc).__name__}"
+                        spec, f"publication reconciliation unresolved: {type(exc).__name__}",
+                        cause=exc,
                     )
                 if published.get("state") == "cancelled":
                     return self.state
@@ -1664,7 +1917,8 @@ class DeliveryWorkflow:
                         )
                     except Exception as exc:
                         return await self._stop(
-                            spec, f"implementer activity failed: {type(exc).__name__}"
+                            spec, f"implementer activity failed: {type(exc).__name__}",
+                            cause=exc,
                         )
                     self.state["roles"].append(implementation)
                     self.state["usage"][f"implement:{iteration}"] = implementation.get("usage")
@@ -1718,7 +1972,8 @@ class DeliveryWorkflow:
                 except Exception as exc:
                     self.state["cleanup"] = "unknown"
                     return await self._stop(
-                        spec, f"prepublication checks failed: {type(exc).__name__}"
+                        spec, f"prepublication checks failed: {type(exc).__name__}",
+                        cause=exc,
                     )
                 self.state["checks"]["prepublish"] = prechecked
                 if prechecked.get("state") == "unknown" or prechecked.get("cleanup") == "unknown":
@@ -1745,29 +2000,36 @@ class DeliveryWorkflow:
                 self.state["revision"] += 1
                 await self._project(spec, "candidate_ready", "Candidate ready for publication")
                 try:
-                    published = await self._activity(
-                        "delivery_publish",
-                        {
-                            "spec": spec,
-                            "iteration": iteration,
-                            "candidate": self.state["candidate"],
-                        },
-                    )
-                    if published.get("state") == "pending":
-                        published = await self._published_result(
-                            spec,
-                            iteration,
-                            self.state["candidate"],
-                            published,
-                            expected_head=published["head"],
-                            expected_pr_number=(
-                                self.state["pull_request"]["number"]
-                                if self.state["pull_request"]
-                                else None
-                            ),
+                    if spec.get("publication_readback_version") == 1:
+                        published = await self._publish_original(
+                            spec, iteration, self.state["candidate"]
                         )
+                    else:
+                        published = await self._activity(
+                            "delivery_publish",
+                            {
+                                "spec": spec,
+                                "iteration": iteration,
+                                "candidate": self.state["candidate"],
+                            },
+                        )
+                        if published.get("state") == "pending":
+                            published = await self._published_result(
+                                spec,
+                                iteration,
+                                self.state["candidate"],
+                                published,
+                                expected_head=published["head"],
+                                expected_pr_number=(
+                                    self.state["pull_request"]["number"]
+                                    if self.state["pull_request"]
+                                    else None
+                                ),
+                            )
                 except Exception as exc:
-                    return await self._stop(spec, f"publication unresolved: {type(exc).__name__}")
+                    return await self._stop(
+                        spec, f"publication unresolved: {type(exc).__name__}", cause=exc,
+                    )
                 if published.get("state") == "cancelled":
                     return self.state
                 if published["candidate"]["id"] != self.state["candidate"]["id"]:
@@ -1782,12 +2044,13 @@ class DeliveryWorkflow:
                 )
             repair_findings = []
             qa_evidence = None
+            checks_before_review = workflow.patched("local-checks-before-review-v1")
             for role in (("verify",) if verify_only else ("review", "verify")):
                 if self.cancel_requested:
                     return await self._cancelled(spec)
-                if role == ("verify" if verify_only else "review"):
-                    # Exact-head broker checks must be ready before either independent
-                    # role assesses required evidence. Browser QA still precedes verify.
+                if role == ("review" if checks_before_review and not verify_only else "verify"):
+                    # New runs check before review; old histories retain the QA order.
+                    # Browser QA follows these checks and still precedes verify.
                     self.state["phase"] = "checks"
                     self.state["revision"] += 1
                     await self._project(spec, "checks_started", "Executing required local checks")
@@ -1803,7 +2066,8 @@ class DeliveryWorkflow:
                     except Exception as exc:
                         self.state["cleanup"] = "unknown"
                         return await self._stop(
-                            spec, f"checks activity failed: {type(exc).__name__}"
+                            spec, f"checks activity failed: {type(exc).__name__}",
+                            cause=exc,
                         )
                     self.state["checks"]["local"] = checked
                     if checked.get("state") == "unknown" or checked.get("cleanup") == "unknown":
@@ -1839,7 +2103,8 @@ class DeliveryWorkflow:
                     except Exception as exc:
                         self.state["cleanup"] = "unknown"
                         return await self._stop(
-                            spec, f"browser QA activity failed: {type(exc).__name__}"
+                            spec, f"browser QA activity failed: {type(exc).__name__}",
+                            cause=exc,
                         )
                     self.state["checks"]["browser_qa"] = browser_qa
                     if self.cancel_requested:
@@ -1884,11 +2149,14 @@ class DeliveryWorkflow:
                                 and r.get("iteration") == iteration
                             ]}} if workflow.patched("role-evidence-handoff-v1") else {}),
                             **({"check_evidence": self.state["checks"].get("local")}
-                               if spec["policy"].get("host_sandbox") == "trusted-local" else {}),
+                               if (role == "verify" or checks_before_review)
+                               and spec["policy"].get("host_sandbox") == "trusted-local" else {}),
                         },
                     )
                 except Exception as exc:
-                    return await self._stop(spec, f"{role} activity failed: {type(exc).__name__}")
+                    return await self._stop(
+                        spec, f"{role} activity failed: {type(exc).__name__}", cause=exc,
+                    )
                 self.state["roles"].append(result)
                 self.state["usage"][f"{role}:{iteration}"] = result.get("usage")
                 if self.cancel_requested:
@@ -1923,12 +2191,17 @@ class DeliveryWorkflow:
                     "delivery_ci", {"spec": spec, "pull_request": published}, hours=1
                 )
             except Exception as exc:
-                return await self._stop(spec, f"CI observation failed: {type(exc).__name__}")
+                return await self._stop(
+                    spec, f"CI observation failed: {type(exc).__name__}", cause=exc,
+                )
             self.state["checks"]["ci"] = ci
             if self.cancel_requested:
                 return await self._cancelled(spec)
             if ci.get("state") != "passed":
-                return await self._stop(spec, "required CI did not confirm this PR head")
+                return await self._stop(
+                    spec, "required CI did not confirm this PR head",
+                    controller_cause="ci_deadline" if ci.get("state") == "pending" else None,
+                )
             self.state["phase"] = "tracker"
             self.state["revision"] += 1
             await self._project(spec, "tracker_started", "Reconciling issue and claim")
@@ -1939,7 +2212,8 @@ class DeliveryWorkflow:
                     )
                 except Exception as exc:
                     return await self._stop(
-                        spec, f"tracker synchronization pending: {type(exc).__name__}"
+                        spec, f"tracker synchronization pending: {type(exc).__name__}",
+                        cause=exc,
                     )
                 self.state["tracker"] = tracker
                 if self.cancel_requested:

@@ -226,14 +226,19 @@ def test_outer_role_boundary_blocks_state_and_child_writes(tmp_path: Path, monke
     config.write_text("{}")
     database = tmp_path / "workflow.sqlite3"
     database.write_text("SAFE")
+    original_codex_auth = tmp_path / "credential-home" / ".codex" / "auth.json"
+    original_codex_auth.parent.mkdir(parents=True)
+    original_codex_auth.write_text("owned fixture credential")
     spec = {
         "provider": "fake",
         "state_dir": str(state_dir),
         "config_path": str(config),
-        "policy": {"tracking_db": str(database)},
+        "policy": {
+            "tracking_db": str(database),
+            "codex_auth_path": str(original_codex_auth),
+        },
     }
     monkeypatch.setenv("GH_TOKEN", "owned-fixture-secret")
-    original_codex_auth = Path.home() / ".codex" / "auth.json"
     profile, env = prepare_sandbox(
         {"spec": spec, "role": "implement", "workspace": str(workspace)}, attempt
     )
@@ -268,13 +273,13 @@ except PermissionError:
 results['inherited_gh_token']='GH_TOKEN' in os.environ
 gh=subprocess.run(['gh','auth','status'],capture_output=True,text=True)
 results['gh_authenticated']=gh.returncode==0
-child=subprocess.run(['/usr/bin/python3','-c',{child_code!r}],capture_output=True,text=True)
+child=subprocess.run([{sys.executable!r},'-c',{child_code!r}],capture_output=True,text=True)
 results['child_write_exit']=child.returncode
 (workspace/'allowed.txt').write_text('OK')
 print(json.dumps(results))
 """
     result = subprocess.run(
-        ["/usr/bin/sandbox-exec", "-f", str(profile), "/usr/bin/python3", "-c", program],
+        ["/usr/bin/sandbox-exec", "-f", str(profile), sys.executable, "-c", program],
         cwd=workspace,
         env=env,
         text=True,
@@ -293,4 +298,5 @@ print(json.dumps(results))
         "child_write_exit": 1,
     }
     assert secret.read_text() == external.read_text() == "SAFE"
+    assert original_codex_auth.read_text() == "owned fixture credential"
     assert (workspace / "allowed.txt").read_text() == "OK"

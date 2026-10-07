@@ -5,6 +5,7 @@ import copy
 import json
 
 import pytest
+from temporal_test_server import local_temporal
 from test_delivery_gate_retry import unpublished as unpublished
 from test_delivery_store import _git
 from test_delivery_store import service as service
@@ -285,7 +286,6 @@ async def test_public_resume_runs_normal_gates_in_real_temporal_and_replays(
 
     import httpx
     from temporalio import activity
-    from temporalio.testing import WorkflowEnvironment
     from temporalio.worker import Replayer, Worker
 
     from devflow_temporal.delivery_activities import delivery_project, delivery_repair_preflight
@@ -340,7 +340,7 @@ async def test_public_resume_runs_normal_gates_in_real_temporal_and_replays(
         calls.append('tracker')
         return {'state': 'consistent'}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which('temporal'),
         dev_server_database_filename=str(tmp_path / 'resume-temporal.sqlite3'),
     ) as environment:

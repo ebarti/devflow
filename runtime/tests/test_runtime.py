@@ -14,10 +14,10 @@ from uuid import uuid4
 
 import pytest
 from agent_runtime_kit import AgentResult
+from temporal_test_server import local_temporal
 from temporalio import activity
 from temporalio.client import WorkflowUpdateFailedError
 from temporalio.common import RetryPolicy, WorkflowIDConflictPolicy, WorkflowIDReusePolicy
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from devflow_temporal import bridge, cli
@@ -84,7 +84,7 @@ async def start_run(client, spec: dict, queue: str):
 
 @pytest.mark.asyncio
 async def test_real_temporal_wait_restart_idempotency_and_role_gates(tmp_path, monkeypatch, capsys):
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "temporal.sqlite3")
     ) as env:
         queue = f"devflow-test-{uuid4().hex}"
@@ -162,7 +162,7 @@ async def test_real_temporal_wait_restart_idempotency_and_role_gates(tmp_path, m
 
 @pytest.mark.asyncio
 async def test_real_temporal_findings_and_candidate_mutation_block(tmp_path):
-    async with await WorkflowEnvironment.start_local() as env:
+    async with local_temporal() as env:
         queue = f"devflow-test-{uuid4().hex}"
         async with Worker(
             env.client, task_queue=queue, workflows=[IssueWorkflow], activities=[run_role]
@@ -182,7 +182,7 @@ async def test_real_temporal_findings_and_candidate_mutation_block(tmp_path):
 
 @pytest.mark.asyncio
 async def test_real_temporal_cancellation_cannot_become_success(tmp_path):
-    async with await WorkflowEnvironment.start_local() as env:
+    async with local_temporal() as env:
         queue = f"devflow-test-{uuid4().hex}"
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -238,7 +238,7 @@ async def test_new_temporal_history_cannot_reuse_receipts_for_different_inputs(t
     second["input_digest"] = digest(public_inputs(second))
     assert candidate_for(other_repo) == first["initial_candidate"]
 
-    async with await WorkflowEnvironment.start_local() as first_env:
+    async with local_temporal() as first_env:
         queue = f"devflow-test-{uuid4().hex}"
         async with Worker(
             first_env.client, task_queue=queue, workflows=[IssueWorkflow], activities=[run_role]
@@ -248,7 +248,7 @@ async def test_new_temporal_history_cannot_reuse_receipts_for_different_inputs(t
 
     invocation_file = Path(first["state_dir"]) / "fake-invocations.jsonl"
     assert len(invocation_file.read_text().splitlines()) == 3
-    async with await WorkflowEnvironment.start_local() as second_env:
+    async with local_temporal() as second_env:
         queue = f"devflow-test-{uuid4().hex}"
         async with Worker(
             second_env.client, task_queue=queue, workflows=[IssueWorkflow], activities=[run_role]

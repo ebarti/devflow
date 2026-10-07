@@ -18,10 +18,8 @@ from devflow_temporal.delivery_client import DeliveryClient
 @pytest.mark.parametrize(
     "method,endpoint,store_method,mutation",
     [
-        ("POST", "metadata-preflight", "metadata_preflight", False),
         ("POST", "repair-admission-preflight", "repair_admission_preflight", False),
         ("GET", "gates-only-preflight", "gates_only_preflight", False),
-        ("POST", "reconcile-published-metadata", "reconcile_published_metadata", True),
         ("POST", "admit-gates-only", "admit_gates_only", True),
         ("POST", "continue-repair", "continue_repair", True),
     ],
@@ -78,10 +76,8 @@ async def test_stopped_reconciliation_api_authentication_and_exact_request_forwa
 @pytest.mark.parametrize(
     "command",
     [
-        "metadata-preflight",
         "repair-admission-preflight",
         "gates-only-preflight",
-        "reconcile-published-metadata",
         "admit-gates-only",
         "continue-repair",
     ],
@@ -101,7 +97,14 @@ def test_cli_preserves_stable_request_and_client_encodes_run_identity(
         return {"command_id": body["command_id"] if body else None}
 
     monkeypatch.setattr(caller, "_request", request)
-    monkeypatch.setattr(delivery_control, "api_client", lambda _path: caller)
+    factories = []
+
+    def client(factory):
+        factories.append(factory)
+        return caller
+
+    monkeypatch.setattr(delivery_control, "api_client", lambda _path: client("write"))
+    monkeypatch.setattr(delivery_control, "read_only_client", lambda _path: client("read"))
     payload = {"command_id": "same-command", "expected_head": "a" * 40}
     request_path = path.parent / "reconciliation-request.json"
     request_path.write_text(json.dumps(payload))
@@ -113,6 +116,9 @@ def test_cli_preserves_stable_request_and_client_encodes_run_identity(
         evidence_id=None,
     )
     delivery_control._run(args, argparse.ArgumentParser())
+    assert factories == ["read" if command in {
+        "metadata-preflight", "repair-admission-preflight", "gates-only-preflight",
+    } else "write"]
     method = "GET" if command == "gates-only-preflight" else "POST"
     assert calls == [
         (

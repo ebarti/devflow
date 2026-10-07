@@ -7,11 +7,11 @@ import os
 from datetime import timedelta
 
 import pytest
-from test_delivery_store import _git
+from test_delivery_store import _git, submit_historical_admission
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_metadata_recovery as metadata
-from devflow_temporal.contracts import canonical_json
+from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
@@ -32,7 +32,7 @@ def published(service, monkeypatch):
     ]
     repository["checks"] = repository["prepublish_checks"]
     store.config.path.write_text(json.dumps(store.config.raw))
-    store.submit(request)
+    submit_historical_admission(store, request, monkeypatch)
     spec = store.spec("run-1")
     broker = DeliveryBroker(store, spec)
     broker.prepare()
@@ -141,15 +141,6 @@ def published(service, monkeypatch):
         }
 
     monkeypatch.setattr(DeliveryBroker, "_existing_pr", existing)
-    original_run = metadata._run
-
-    def run(argv, **kw):
-        if argv[:3] == ["gh", "pr", "edit"]:
-            title["value"] = argv[argv.index("--title") + 1]
-            return ""
-        return original_run(argv, **kw)
-
-    monkeypatch.setattr(metadata, "_run", run)
     authority = {
         "decision_owner": "main task",
         "new_user_approval_required": False,
@@ -177,227 +168,57 @@ def published(service, monkeypatch):
     }
     return store, broker, state, closed, command, title
 
-
-def test_public_metadata_reconciliation_preserves_each_tree_author_and_original_history(published):
-    store, broker, state, _closed, command, title = published
-    with store._connect() as db:
-        attempts = list(db.execute("SELECT * FROM delivery_attempts"))
-        effects = list(db.execute("SELECT * FROM delivery_effects"))
-    response = store.reconcile_published_metadata("run-1", command)
-    assert response["phase"] == "metadata_validation_queued"
-    assert response == store.reconcile_published_metadata("run-1", command)
-    assert response["head"] != state["candidate"]["head"]
-    grant = metadata.read_private(broker.state_dir / "metadata-reconciliation/intent.json")
-    assert len(grant["mapping"]) == 2
-    for item in grant["mapping"]:
-        for field in ("%T", "%an <%ae>", "%at", "%ai"):
-            assert _git(broker.checkout, "show", "-s", "--format=" + field, item["old"]) == (
-                _git(broker.checkout, "show", "-s", "--format=" + field, item["new"])
-            )
-        assert (
-            _git(broker.checkout, "cat-file", "commit", item["old"]) + "\n"
-            == (item["original_object"])
-        )
-        assert (
-            _git(broker.checkout, "show", "-s", "--format=%s", item["new"]) == broker.spec["goal"]
-        )
-    broker._validate_publication_commits()
-    assert title["value"] == broker.spec["goal"]
-    assert (
-        _git(broker.checkout, "rev-parse", "refs/devflow/metadata/run-1/original")
-        == (state["candidate"]["head"])
-    )
-    assert broker.candidate()["content_sha256"] == state["candidate"]["content_sha256"]
-    with store._connect() as db:
-        assert list(db.execute("SELECT * FROM delivery_attempts")) == attempts
-        assert list(db.execute("SELECT * FROM delivery_effects")) == effects
-        assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 0
-        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
-    assert recovery["state"] == state
-    assert store.effective_spec("run-1") == broker.spec
-    assert metadata.validation_readback(store, broker.spec, recovery)["head"] == response["head"]
-
-
-@pytest.mark.parametrize('change', [None, 'missing-recovery', 'missing-role', 'wrong-candidate',
-                                    'changed-role', 'wrong-start', 'typed-start'])
-def test_published_range_binds_exact_gates_first_retained_implementation(published, change):
+def restore_admitted_metadata(store, broker, state, closed, command, title):
+    """Fixture rows for an already-admitted predecessor; never an admission API or history."""
     from copy import deepcopy
 
-    store, broker, state, _closed, _command, _title = published
+    from devflow_temporal.delivery_resources import private_directory
+
+    spec = broker.spec
+    row, attempts, effects, claim = metadata._rows(store, spec['run_id'])
+    mapping = []
+    parent = spec['base_sha']
+    # Construct fixture objects directly. No production reconciliation or remote writer.
+    for old in _git(broker.checkout, 'rev-list', '--reverse', parent + '..HEAD').splitlines():
+        tree = _git(broker.checkout, 'show', '-s', '--format=%T', old)
+        subject = spec['goal'] + '\n\nSigned-off-by: Delivery Test <delivery@example.invalid>'
+        new = _git(broker.checkout, 'commit-tree', tree, '-p', parent, '-m', subject)
+        mapping.append({'old': old, 'new': new, 'tree': tree,
+                        'original_object': _git(broker.checkout, 'cat-file', 'commit', old) + '\n',
+                        'new_object': _git(broker.checkout, 'cat-file', 'commit', new) + '\n'})
+        parent = new
+    grant = {'kind': 'published_metadata_recovery', 'command': command, 'spec': spec,
+             'state': deepcopy(state), 'closed': deepcopy(closed), 'original_recovery': None,
+             'original_row': row, 'attempts': attempts, 'effects': effects, 'claim': claim,
+             'authority': metadata._authority(command, spec), 'mapping': mapping,
+             'old_head': state['candidate']['head'], 'new_head': parent}
+    root = broker.state_dir / 'metadata-reconciliation'
+    private_directory(root)
+    metadata._immutable(root / 'intent.json', grant)
+    for kind, head in (('original', grant['old_head']), ('rewritten', parent)):
+        ref = f"refs/devflow/metadata/{spec['run_id']}/{kind}"
+        _git(broker.checkout, 'update-ref', ref, head)
+        metadata._immutable(root / (kind + '-ref.json'), {'ref': ref, 'head': head})
+    _git(broker.checkout, 'reset', '--hard', parent)
+    # Only the fixture's private bare repository; no network or force push.
+    origin = store.config.raw['repositories']['fixture']['origin_url']
+    _git(origin, 'fetch', str(broker.checkout), parent)
+    _git(origin, 'update-ref', 'refs/heads/' + spec['branch'], parent)
+    title['value'] = spec['goal']
+    candidate = broker.candidate()
+    publication = {**state['pull_request'], 'head': parent, 'candidate': candidate}
+    recovery = {**grant, 'candidate': candidate, 'publication': publication,
+                'grant_digest': digest(grant), 'execution_spec': spec,
+                'native_preparation_renewal': None}
     with store._connect() as db:
-        effects = [dict(row) for row in db.execute(
-            "SELECT * FROM delivery_effects WHERE kind='publish' ORDER BY effect_key")]
-    request = json.loads(effects[0]['request_json'])
-    request['iteration'] = 1
-    effects[0]['request_json'] = canonical_json(request)
-    # No IMPLEMENT1 for this first publication: reuse exact IMPLEMENT0 custody.
-    state = deepcopy(state)
-    state['roles'][1]['iteration'] = 2
-    second = json.loads(effects[1]['request_json'])
-    second['iteration'] = 2
-    effects[1]['request_json'] = canonical_json(second)
-    retained = deepcopy(state['roles'][0])
-    recovery = {'kind': 'execution_policy_recovery', 'start_iteration': 1,
-                'state': {'iteration': 0, 'roles': [retained]},
-                'candidate': deepcopy(retained['candidate'])}
-    if change == 'missing-recovery':
-        recovery = None
-    elif change == 'missing-role':
-        state['roles'].pop(0)
-    elif change == 'wrong-candidate':
-        recovery['candidate']['content_sha256'] = '0' * 64
-    elif change == 'changed-role':
-        recovery['state']['roles'][0]['summary'] = 'Changed custody'
-    elif change == 'wrong-start':
-        recovery['start_iteration'] = 2
-    elif change == 'typed-start':
-        recovery['start_iteration'] = True
-    signer, committer = metadata._identity(broker)
-    if change:
-        with pytest.raises(ValueError, match='authentic controller candidate'):
-            metadata._range(broker, state, effects, signer, committer, recovery)
-    else:
-        assert len(metadata._range(broker, state, effects, signer, committer, recovery)) == 2
-
-
-@pytest.mark.parametrize("window", ["objects", "local", "push", "title", "receipt"])
-def test_same_command_resumes_known_interrupted_metadata_effects(published, monkeypatch, window):
-    store, broker, state, _closed, command, title = published
-    seen = []
-    original_git, original_run, original_immutable = (
-        metadata._git,
-        metadata._run,
-        metadata._immutable,
-    )
-
-    def git(path, *args):
-        result = original_git(path, *args)
-        target = (
-            (
-                window == "objects"
-                and args[:2] == ("update-ref", "refs/devflow/metadata/run-1/rewritten")
-            )
-            or (window == "local" and args[:2] == ("update-ref", "refs/heads/feat/fixture"))
-            or (window == "push" and args[0] == "push")
-        )
-        if target and not seen:
-            seen.append(True)
-            raise RuntimeError("uncertain metadata completion")
-        return result
-
-    def run(argv, **kw):
-        result = original_run(argv, **kw)
-        if window == "title" and argv[:3] == ["gh", "pr", "edit"] and not seen:
-            seen.append(True)
-            raise RuntimeError("uncertain metadata completion")
-        return result
-
-    def immutable(path, value):
-        result = original_immutable(path, value)
-        if window == "receipt" and path.name == "publication.json" and not seen:
-            seen.append(True)
-            raise RuntimeError("uncertain metadata completion")
-        return result
-
-    if window == "title":
-        title["value"] = "Implement legacy PR title"
-    monkeypatch.setattr(metadata, "_git", git)
-    monkeypatch.setattr(metadata, "_run", run)
-    monkeypatch.setattr(metadata, "_immutable", immutable)
-    with pytest.raises(RuntimeError, match="uncertain"):
-        store.reconcile_published_metadata("run-1", command)
-    response = store.reconcile_published_metadata("run-1", command)
-    assert seen and response == store.reconcile_published_metadata("run-1", command)
-    assert (
-        _git(broker.checkout, "rev-parse", "refs/devflow/metadata/run-1/original")
-        == (state["candidate"]["head"])
-    )
-    assert (
-        len(_git(broker.checkout, "rev-list", broker.spec["base_sha"] + "..HEAD").splitlines()) == 2
-    )
-
-
-@pytest.mark.parametrize(
-    "drift",
-    [
-        "active",
-        "candidate",
-        "remote",
-        "pr",
-        "signer",
-        "authority",
-        "foreign_commit",
-        "changed_receipt",
-        "merged",
-        "issue",
-    ],
-)
-def test_metadata_precheck_rejects_drift_without_rewrite(published, monkeypatch, drift):
-    store, broker, state, closed, command, _title = published
-    if drift == "active":
-        closed["result"]["outcome"] = None
-    elif drift == "candidate":
-        (broker.checkout / "README.md").write_text("Unauthorized later edit\n")
-    elif drift == "remote":
-        _git(
-            broker.source,
-            "push",
-            "--force",
-            "origin",
-            broker.spec["base_sha"] + ":refs/heads/feat/fixture",
-        )
-    elif drift == "pr":
-        command["expected_pr_number"] = 8
-    elif drift == "signer":
-        command["expected_signer"] = "Other <other@example.invalid>"
-    elif drift == "authority":
-        command["authority_sha256"] = "a" * 64
-    elif drift == "foreign_commit":
-        _git(broker.checkout, "commit", "--allow-empty", "-qm", "Foreign commit")
-        candidate = broker.candidate()
-        state["candidate"] = candidate
-        command.update(expected_head=candidate["head"], expected_candidate_id=candidate["id"])
-    elif drift == "changed_receipt":
-        with store._connect() as db:
-            db.execute("UPDATE delivery_effects SET observed_json='{}' WHERE kind='publish'")
-    elif drift == "merged":
-        original = DeliveryBroker._existing_pr
-
-        def existing(self, **kw):
-            value = original(self, **kw)
-            value["state"] = "MERGED"
-            return value
-
-        monkeypatch.setattr(DeliveryBroker, "_existing_pr", existing)
-    elif drift == "issue":
-        with store._connect() as db:
-            db.execute("UPDATE works SET issue='https://github.com/example/fixture/issues/999'")
-    old_head = _git(broker.checkout, "rev-parse", "HEAD")
-    with pytest.raises((ValueError, KeyError)):
-        store.reconcile_published_metadata("run-1", command)
-    assert _git(broker.checkout, "rev-parse", "HEAD") == old_head
-    assert not _git(broker.checkout, "for-each-ref", "refs/devflow/metadata")
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_metadata_recoveries").fetchone()[0] == 0
-
-
-@pytest.mark.parametrize(
-    "field,value", [("command_id", 1), ("expected_revision", True), ("expected_pr_number", 7.0)]
-)
-def test_metadata_request_rejects_untyped_identity_without_effects(published, field, value):
-    store, broker, _state, _closed, command, _title = published
-    with pytest.raises(ValueError, match="fields or identity"):
-        store.reconcile_published_metadata("run-1", {**command, field: value})
-    assert not _git(broker.checkout, "for-each-ref", "refs/devflow/metadata")
-
-
-def test_metadata_effect_guard_rejects_numeric_type_change_in_sealed_attempt(published):
-    store, broker, _state, _closed, command, _title = published
-    grant = metadata._snapshot(store, "run-1", command)
-    grant["attempts"][0]["iteration"] = float(grant["attempts"][0]["iteration"])
-    with pytest.raises(ValueError, match="stopped run history changed"):
-        metadata._guard(store, grant)
-    assert not _git(broker.checkout, "for-each-ref", "refs/devflow/metadata")
+        db.execute("INSERT INTO delivery_metadata_recoveries VALUES (?,?,?,?,'queued')",
+                   (spec['run_id'], command['command_id'], digest(command), canonical_json(grant)))
+        db.execute("UPDATE delivery_runs SET recovery_json=?,workflow_id=?,"
+                   "phase='metadata_validation_queued',execution_state='queued',outcome=NULL,"
+                   "error=NULL WHERE run_id=?",
+                   (canonical_json(recovery), 'delivery-' + spec['run_id'] + '-metadata-1',
+                    spec['run_id']))
+    return recovery
 
 
 def test_explicit_command_bound_and_immutable_staged_receipt_recovery(published, monkeypatch):
@@ -424,206 +245,6 @@ def test_explicit_command_bound_and_immutable_staged_receipt_recovery(published,
     os.link(path, root / "foreign-hardlink")
     with pytest.raises(ValueError):
         metadata._immutable(path, value)
-    store.reconcile_published_metadata("run-1", command)
-    with pytest.raises(ValueError, match="already received"):
-        store.reconcile_published_metadata("run-1", {**command, "command_id": "metadata-2"})
-    with pytest.raises(ValueError, match="different inputs"):
-        store.reconcile_published_metadata("run-1", {**command, "expected_revision": 14})
-
-
-@pytest.mark.parametrize("failed_gate", [False, True])
-def test_metadata_workflow_runs_deterministic_gates_without_any_provider_turn(
-    published, monkeypatch, failed_gate
-):
-    store, broker, _state, _closed, command, _title = published
-    store.reconcile_published_metadata("run-1", command)
-    with store._connect() as db:
-        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
-    flow = DeliveryWorkflow()
-    called = []
-
-    async def project(*_args):
-        return None
-
-    async def execute(name, request, **kwargs):
-        called.append(name)
-        assert name != "delivery_role"
-        if name == "delivery_tracker_start":
-            return {"state": "consistent"}
-        return {"state": "failed" if failed_gate and name == "delivery_checks" else "passed"}
-
-    monkeypatch.setattr(flow, "_project", project)
-    monkeypatch.setattr(flow, "_activity", execute)
-    result = asyncio.run(flow._resume_metadata(broker.spec, recovery))
-    assert result["roles"] == recovery["state"]["roles"]
-    assert result["outcome"] == "blocked"
-    assert result["iteration"] == 1
-    assert called == [
-        "delivery_metadata_readback",
-        "delivery_tracker_start",
-        "delivery_precheck",
-        "delivery_checks",
-    ]
-    assert result["error"] == (
-        "repair limit exhausted"
-        if failed_gate
-        else "metadata reconciled; independent source assessment remains incomplete"
-    )
-
-
-def test_pending_intent_survives_interrupted_admission_without_recapturing_mapping(
-    published, monkeypatch
-):
-    store, broker, _state, _closed, command, _title = published
-    root = broker.state_dir / "metadata-reconciliation"
-    root.mkdir(mode=0o700)
-    original = metadata._snapshot(store, "run-1", command)
-    metadata._immutable(root / "intent.json", original)
-    monkeypatch.setattr(
-        metadata, "_snapshot", lambda *_a: pytest.fail("must retain pending intent")
-    )
-    response = store.reconcile_published_metadata("run-1", command)
-    assert response["head"] == original["new_head"]
-    assert metadata.read_private(root / "intent.json") == original
-
-
-@pytest.mark.asyncio
-async def test_real_temporal_metadata_successor_uses_production_activities_and_zero_provider_roles(
-    published,
-):
-    from temporalio.testing import WorkflowEnvironment
-    from temporalio.worker import Worker
-
-    from devflow_temporal.delivery_activities import (
-        delivery_checks,
-        delivery_metadata_readback,
-        delivery_precheck,
-        delivery_project,
-        delivery_tracker_start,
-    )
-
-    store, broker, _state, _closed, command, _title = published
-    response = store.reconcile_published_metadata("run-1", command)
-    with store._connect() as db:
-        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
-        before = db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0]
-    async with await WorkflowEnvironment.start_time_skipping() as environment:
-        async with Worker(
-            environment.client,
-            task_queue="metadata-real",
-            workflows=[DeliveryWorkflow],
-            activities=[
-                delivery_metadata_readback,
-                delivery_tracker_start,
-                delivery_precheck,
-                delivery_checks,
-                delivery_project,
-            ],
-        ):
-            result = await environment.client.execute_workflow(
-                DeliveryWorkflow.run,
-                args=[broker.spec, recovery],
-                id=response["workflow_id"],
-                task_queue="metadata-real",
-                execution_timeout=timedelta(seconds=45),
-            )
-    assert result["outcome"] == "blocked"
-    assert (
-        result["error"] == "metadata reconciled; independent source assessment remains incomplete"
-    )
-    assert result["checks"]["local"]["state"] == "passed"
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == before
-    assert store.detail("run-1")["metadata_reconciliation"]["provider_turns"] == 0
-
-
-@pytest.mark.parametrize('change', ['head', 'content_sha256'])
-def test_metadata_successor_refuses_late_changed_source_instead_of_adopting_it(
-    published, monkeypatch, change,
-):
-    from devflow_temporal import delivery_native_renewal
-
-    store, broker, _state, _closed, command, _title = published
-    original = DeliveryBroker.candidate
-    monkeypatch.setattr(delivery_native_renewal, 'renew',
-                        lambda spec, *_args: ({**spec, 'controlled_successor': True}, None))
-
-    def observed(self):
-        value = original(self)
-        if self.spec.get('controlled_successor'):
-            value[change] = '0' * len(value[change])
-        return value
-
-    monkeypatch.setattr(DeliveryBroker, 'candidate', observed)
-    with pytest.raises(ValueError, match='identical feature source custody'):
-        store.reconcile_published_metadata('run-1', command)
-    with store._connect() as db:
-        row = db.execute('SELECT phase FROM delivery_runs WHERE run_id="run-1"').fetchone()
-        assert row['phase'] == 'blocked'
-        assert db.execute('SELECT COUNT(*) FROM delivery_repair_grants').fetchone()[0] == 0
-    assert (broker.state_dir / 'metadata-reconciliation/intent.json').is_file()
-
-
-@pytest.mark.parametrize('bad', ['missing', 'wrong-hash'])
-def test_required_native_authority_refusal_does_not_freeze_metadata_request(
-    published, monkeypatch, bad,
-):
-    from devflow_temporal import delivery_native_renewal as renewal
-    from devflow_temporal.delivery_resources import write_private
-
-    store, broker, _state, _closed, command, _title = published
-    trigger = store.config.state_root / 'controlled-native-delta.json'
-    write_private(trigger, {'controlled': 'installed payload-only requirement'})
-    authority = store.config.state_root / 'controlled-native-authority.json'
-    write_private(authority, {
-        'decision_owner': 'main task', 'authority_source': 'Controlled renewal fixture',
-        'new_user_approval_required': False, 'runs': ['run-1'],
-        'max_generations_per_run': 1, 'max_total_generations': 2,
-        'provider_turns_for_renewal': 0, 'implementation_turns_for_renewal': 0,
-        'new_repair_grants_for_renewal': 0, 'trigger_path': str(trigger),
-        'trigger_sha256': hashlib.sha256(trigger.read_bytes()).hexdigest(),
-    })
-    corrected = {**command, 'preparation_authority_path': str(authority),
-                 'preparation_authority_sha256': hashlib.sha256(authority.read_bytes()).hexdigest()}
-    supplied = command if bad == 'missing' else {
-        **corrected, 'preparation_authority_sha256': '0' * 64,
-    }
-    # Only the native dependency requirement is controlled. Production immutable
-    # metadata admission, real authority reader, Git/closed range and replay run.
-    def validate(spec, payload):
-        renewal._authority(spec, payload)
-        return {'required': True}
-
-    def renew(spec, payload, _digest):
-        validate(spec, payload)
-        return spec, None
-
-    monkeypatch.setattr(renewal, 'readiness', validate, raising=False)
-    monkeypatch.setattr(renewal, 'renew', renew)
-    old = _git(broker.checkout, 'rev-parse', 'HEAD')
-    refs = _git(broker.checkout, 'for-each-ref', '--format=%(refname) %(objectname)')
-    remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + broker.spec['branch'])
-    with store._connect() as db:
-        baseline_claim = canonical_json(store.state.claim_for(db, 'work-1'))
-    with pytest.raises(ValueError):
-        store.reconcile_published_metadata('run-1', supplied)
-    assert not (broker.state_dir / 'metadata-reconciliation/intent.json').exists()
-    assert not (broker.state_dir / 'metadata-reconciliation/predecessor-resources').exists()
-    with pytest.raises(ValueError):
-        store.metadata_preflight('run-1', supplied)
-    with store._connect() as db:
-        assert db.execute('SELECT COUNT(*) FROM delivery_metadata_recoveries').fetchone()[0] == 0
-        assert db.execute('SELECT COUNT(*) FROM delivery_commands WHERE command_id=?',
-                          (command['command_id'],)).fetchone()[0] == 0
-        assert canonical_json(store.state.claim_for(db, 'work-1')) == baseline_claim
-    assert _git(broker.checkout, 'rev-parse', 'HEAD') == old
-    assert _git(broker.checkout, 'for-each-ref', '--format=%(refname) %(objectname)') == refs
-    assert _git(broker.source, 'ls-remote', 'origin',
-                'refs/heads/' + broker.spec['branch']) == remote
-    assert store.metadata_preflight('run-1', corrected)['native_preparation_required'] is True
-    result = store.reconcile_published_metadata('run-1', corrected)
-    assert result == store.reconcile_published_metadata('run-1', corrected)
-    assert result['phase'] == 'metadata_validation_queued'
 
 
 def test_metadata_gate_namespace_preserves_retained_old_head_and_artifacts(published):
@@ -641,7 +262,7 @@ def test_metadata_gate_namespace_preserves_retained_old_head_and_artifacts(publi
     resources.created(old)
     old_patch = broker.gate_diff('verify', 1, state['candidate'])
     retained = Path(old_patch['path']).read_bytes()
-    store.reconcile_published_metadata('run-1', command)
+    restore_admitted_metadata(store, broker, state, _closed, command, _title)
     spec = store.effective_spec('run-1')
     _store, successor = _context(spec)
     candidate = successor.candidate()
@@ -683,7 +304,7 @@ def test_metadata_gate_namespace_refuses_foreign_alias_or_changed_custody(publis
     from devflow_temporal.delivery_resources import write_private
 
     store, original, state, _closed, command, _title = published
-    store.reconcile_published_metadata('run-1', command)
+    restore_admitted_metadata(store, original, state, _closed, command, _title)
     spec = store.effective_spec('run-1')
     _store, broker = _context(spec)
     candidate = broker.candidate()
@@ -714,3 +335,136 @@ def test_metadata_gate_namespace_refuses_foreign_alias_or_changed_custody(publis
     if change in {'foreign', 'alias', 'raw-spec', 'seal'}:
         assert not expected.exists()
     assert original.state_dir == broker.state_dir
+
+
+@pytest.mark.parametrize("failed_stage", [None, "prepublish", "local"])
+def test_metadata_workflow_runs_deterministic_gates_without_any_provider_turn(
+    published, monkeypatch, failed_stage,
+):
+    store, broker, state, closed, command, title = published
+    recovery = restore_admitted_metadata(store, broker, state, closed, command, title)
+    flow = DeliveryWorkflow()
+    called, projections = [], []
+    before = broker.spec["policy"]["max_repairs"]
+
+    async def project(_spec, event, _message):
+        projections.append(event)
+
+    async def execute(name, request, **_kwargs):
+        called.append(name)
+        assert name != "delivery_role"
+        if name == "delivery_tracker_start":
+            return {"state": "consistent"}
+        stage = {"delivery_precheck": "prepublish", "delivery_checks": "local"}.get(name)
+        if stage and stage == failed_stage:
+            return {"state": "failed", "candidate_id": recovery["candidate"]["id"],
+                    "cleanup": "confirmed", "results": [
+                        {"id": "retained-check", "passed": False, "exit_code": 1},
+                    ]}
+        return {"state": "passed", "cleanup": "confirmed"}
+
+    monkeypatch.setattr(flow, "_project", project)
+    monkeypatch.setattr(flow, "_activity", execute)
+    result = asyncio.run(flow._resume_metadata(broker.spec, recovery))
+    assert result["roles"] == recovery["state"]["roles"]
+    assert result["outcome"] == "blocked"
+    assert result["iteration"] == recovery["state"]["iteration"] == 1
+    assert broker.spec["policy"]["max_repairs"] == before
+    expected = ["delivery_metadata_readback", "delivery_tracker_start", "delivery_precheck"]
+    if failed_stage != "prepublish":
+        expected.append("delivery_checks")
+    assert called == expected
+    assert projections == ["metadata_validation_started", "blocked"]
+    assert result["error"] == (
+        "repair limit exhausted" if failed_stage
+        else "metadata reconciled; independent source assessment remains incomplete"
+    )
+    assert result["findings"][:1] == state["findings"]
+    if failed_stage:
+        assert result["checks"][failed_stage]["state"] == "failed"
+        assert len(result["findings"]) == len(state["findings"]) + 1
+        assert failed_stage in result["findings"][-1]
+        assert recovery["candidate"]["id"] in result["findings"][-1]
+        assert "retained-check" in result["findings"][-1]
+    else:
+        assert result["findings"] == state["findings"]
+        assert result["checks"]["local"]["state"] == "passed"
+
+
+def test_prequeue_metadata_intent_is_visible_without_a_detail_phase(published):
+    store, broker, _state, _closed, _command, _title = published
+    root = broker.state_dir / "metadata-reconciliation"
+    root.mkdir(mode=0o700)
+    metadata._immutable(root / "intent.json", {"kind": "published_metadata_recovery"})
+    detail = store.detail("run-1")
+    assert detail["phase"] == "blocked"
+    assert detail["metadata_reconciliation"] is None
+    indexed = {item["id"] for item in store.evidence_index("run-1")}
+    assert "metadata-reconciliation-intent" in indexed
+    assert store.evidence("run-1", "metadata-reconciliation-intent")["sha256"] == (
+        hashlib.sha256((root / "intent.json").read_bytes()).hexdigest()
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_temporal_metadata_successor_uses_production_activities_and_zero_provider_roles(
+    published,
+):
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    from devflow_temporal.delivery_activities import (
+        delivery_checks,
+        delivery_metadata_readback,
+        delivery_precheck,
+        delivery_project,
+        delivery_tracker_start,
+    )
+
+    store, broker, state, closed, command, title = published
+    recovery = restore_admitted_metadata(store, broker, state, closed, command, title)
+    expected = {"old_head": recovery["old_head"], "new_head": recovery["new_head"],
+                "mapping_sha256": digest(recovery["mapping"]), "provider_turns": 0}
+    queued = store.detail("run-1")
+    assert queued["phase"] == "metadata_validation_queued"
+    assert queued["queued"]
+    assert queued["metadata_reconciliation"] == expected
+    with store._connect() as db:
+        before = db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0]
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="metadata-real",
+            workflows=[DeliveryWorkflow],
+            activities=[delivery_metadata_readback, delivery_tracker_start, delivery_precheck,
+                        delivery_checks, delivery_project],
+        ):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run, args=[broker.spec, recovery],
+                id="delivery-run-1-metadata-1", task_queue="metadata-real",
+                execution_timeout=timedelta(seconds=45),
+            )
+            result = await handle.result()
+            history = await handle.fetch_history()
+    scheduled = [
+        event.activity_task_scheduled_event_attributes.activity_type.name
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+    assert "delivery_role" not in scheduled
+    assert [name for name in scheduled if name != "delivery_project"] == [
+        "delivery_metadata_readback", "delivery_tracker_start",
+        "delivery_precheck", "delivery_checks",
+    ]
+    assert result["outcome"] == "blocked"
+    assert result["error"] == (
+        "metadata reconciled; independent source assessment remains incomplete"
+    )
+    assert result["checks"]["local"]["state"] == "passed"
+    assert result["roles"] == recovery["state"]["roles"]
+    assert result["findings"] == state["findings"]
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == before
+    final = store.detail("run-1")
+    assert final["phase"] == "blocked"
+    assert final["metadata_reconciliation"] == expected

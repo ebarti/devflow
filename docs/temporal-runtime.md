@@ -1,5 +1,14 @@
 # Local Temporal delivery runtime
 
+New admissions retry an exact keyed local phase projection up to three times over
+three minutes. A database lock or lost activity completion does not launch another
+role, publication or tracker effect: the existing transaction deduplicates the
+same event and key. Database work runs outside the shared worker event loop.
+Malformed state, missing runs, changed configuration and database corruption are
+terminal. Previously admitted inputs keep their recorded projection options;
+scope amendments preserve that choice. No database migration or operator retry
+is needed after an ordinary deployment.
+
 The runtime under `runtime/` is a single-host, local development service. It accepts a raw goal with an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. A read-only intake role investigates repository evidence, asks only blocking questions, and records a scoped plan before autonomous implementation. The managed path then owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. Its endpoint is a **published, unmerged PR**. It does not merge, release, deploy, or update personal production data.
 
 The older `devflow-temporal` CLI remains a disposable role-ordering demonstration. It does not publish a PR or reconcile an issue. Use the managed `devflow-delivery` service for an end-to-end delivery.
@@ -20,7 +29,9 @@ cd ..
 
 The real provider declares `agent-runtime-kit[codex]>=0.5.3,<0.6`; the public-index `runtime/uv.lock` resolves kit 0.5.3 and SDK/CLI 0.160.0. Native preparation verifies the installed versions, frozen lock, runtime payload, Python and bundled SDK CLI identities. Set `codex_bin` to that installed `openai-codex-cli-bin` executable. A standalone CLI compatibility check does not establish managed kit execution or same-session resume.
 
-The private service JSON owns absolute paths for `state_root`, `tracking_db`, `helpers_dir`, and `codex_bin`, fixed ports, explicit role models/efforts, and allowlisted repositories. A repository fixes its source/origin, Git base, Project/assignee, exact editable files, recovery manifest, check argv/cwd, optional browser fixture and required CI. Clients cannot supply these authorities. The default `execution_mode: "native-profile"` constrains toolchain/browser read roots to canonical directories outside controller state and credentials and checks to exact configured domains; role commands have no network access. A trusted single-user Mac can explicitly select `execution_mode: "trusted-local"` for noninteractive full host access without additional path or domain allowlists. This mode is an explicit trust tradeoff and retains controller budgets, ancestry/source checks and owned cleanup, not hostile-code isolation. See [trusted local execution and bounded preserved-candidate recovery](trusted-local-delivery.md). A service migration changes the execution policy and necessary tool locations with a private backup, digest guard and no live-run conflict; it never rewrites historical authority.
+The private service JSON owns absolute paths for `state_root`, `tracking_db`, `helpers_dir`, and `codex_bin`, fixed ports, explicit role models/efforts, and allowlisted repositories. A repository fixes its source/origin, Git base, Project/assignee, exact editable files, recovery manifest, check argv/cwd, optional browser fixture and required CI. Clients cannot supply these authorities. The default `execution_mode: "native-profile"` constrains toolchain/browser read roots to canonical directories outside controller state and credentials and checks to exact configured domains; role commands have no network access. A trusted single-user Mac can explicitly select `execution_mode: "trusted-local"` for noninteractive full host access without additional path or domain allowlists. This mode is an explicit trust tradeoff and retains controller budgets, ancestry/source checks and owned cleanup, not hostile-code isolation. See [trusted local execution and historical policy recovery](trusted-local-delivery.md). A service migration changes the execution policy and necessary tool locations with a private backup, digest guard and no live-run conflict; it never rewrites historical authority.
+
+New admissions freeze `tracker_retry_seconds` (default 600; integer 60–3600). Recognized GitHub transport failures and local database lock timeouts retry the existing owned tracker intent on durable timers, without another feature turn or operator signal. Initial retries back off from two to thirty seconds; terminal reconciliation continues automatically after its first three attempts. Cancellation wakes initial waits. Ownership, mapping, permission and unknown errors remain conflicts; a deadline cannot make pending tracker state consistent or establish claim release. Previously admitted specs keep their original manual checkpoint behavior, including after a worker restart. Changing this setting affects only future admissions.
 
 Valid raw requests are durable in `preparing` without caller-authored proof. Temporal's existing preparation activity measures deterministic parent/child filesystem and network denials through the actual named Codex command sandbox, including owned scratch writes, unrelated temp denials and nested provider attempts. The private cache records measured logs and runtime identity. Missing, changed or failed observations block execution. Each run separately freezes its repository, scope, branch, checkout/state paths, checks, model selection and endpoint binding. Cache reuse never grants a different run that binding. Preparation heartbeats every five seconds and may make up to three attempts within two hours after worker loss. Authority/probe conflicts fail explicitly; a published proof or frozen result can be recovered without manufacturing observations. Candidate-project and real managed model/resume checks remain separate evidence.
 
@@ -32,11 +43,22 @@ Valid raw requests are durable in `preparing` without caller-authored proof. Tem
   "issue_url": "https://github.com/OWNER/REPO/issues/123",
   "repository_key": "configured-repository",
   "goal": "Add the requested behavior to the configured repository",
+  "publication_summary": "feat: add the requested repository behavior",
   "base_ref": "main",
   "branch": "feat/issue-123",
   "authorized_endpoint": "published_unmerged"
 }
 ```
+
+`goal` holds execution instructions and remains immutable. `publication_summary`
+is a separate Conventional Commit subject describing the actual change, including
+its type (for example, `docs: investigate source completeness` for a design
+document). It must be one line and at most 120 characters, with no extra sentences
+or control characters. The controller freezes it and uses it for both commits and
+the PR title. A short single-sentence goal can supply the summary when this field
+is omitted; detailed goals require an explicit summary before admission. Existing
+frozen runs retain their original publication metadata behavior. This change does
+not rename existing PRs or rewrite historical commits.
 
 New admissions freeze optional `plan_approval: "automatic"` by default. Read-only intake investigates and uses reasonable reversible assumptions for routine choices and asks only unresolved blocking questions. Once those answers are complete, it records and binds the exact plan revision and digest with provenance from the run authorization, then starts implementation without a human `proceed` answer. Set `plan_approval: "required"` only when the caller explicitly requests human plan review; that mode waits for `proceed`, `change` or `cancel`, bound to the current plan revision and digest. Invalid values and a required-review request combined with `accepted_plan` are rejected before claiming work. Historical stored inputs without the field retain their required gate and original Temporal replay ordering. Neither policy permits broader paths, checks or endpoints. No model runs while waiting. Intake is limited to eight turns; other roles retain `max_repairs` and separately recorded finite operator grants. Roles and checks have bounded deadlines and shared durable capacity. Older requests may still carry an explicit `accepted_plan`. An identical submit reuses the run; changed inputs under that run ID conflict. The outbox records intent before Temporal start and verifies the remote memo on recovery.
 
@@ -45,6 +67,9 @@ New admissions freeze `blocking_questions_version: 1`. Every question must expla
 An optional canonical UUID `origin_thread_id` is bound at admission and preserved through preparation, scope amendments and continuations. MCP captures the native top-level `threadId` from each request’s metadata, or `x-codex-turn-metadata` (object or JSON string with `thread_id`) or `openai/threadId`/`openai/thread_id` metadata; conflicting or malformed destinations are rejected before a work claim. `sessionId` and the daemon environment are never reply destinations. CLI submission may use its caller’s `CODEX_THREAD_ID`. Role output cannot choose a target. Standalone submissions without a thread retain dashboard questions and an explicit `unavailable` callback status.
 
 The question projection transaction creates one notification for its decision ID/revision and frozen destination. Services sharing a tracking database claim and recover only notifications bound to their frozen configuration path and state root. The deterministic local service serializes senders with an OS lock, commits `dispatching` before invoking the configured installed `codex queue --thread UUID --message TEXT` with separate argv, and commits `queued` only after an acknowledgement for that target. It rechecks pending question, answer/cancellation mutations and supersession immediately before dispatch. Duplicate projections, concurrent pumps and restarts do not resend; crash, timeout or uncertain output becomes visible `unknown` without blind retry. A failure before launching is `failed`; obsolete callbacks are `suppressed`. Sender events update projection revisions without altering Temporal protocol revisions.
+
+Blocking-question callbacks use a fixed owner-message template. Repository/issue-derived agent text, including the agent-derived decision ID, appears only as single-line JSON strings in a delimited quoted block. Whitespace is flattened and hidden controls/formatting characters are rendered as visible Unicode code-point markers. Preview limits are 1000 characters for the question, 600 each for the unknown and why no safe default exists, 240 for each of up to eight evidence entries/options, and 384 for the derived decision ID. Truncated fields are marked; full question data stays unchanged on the dashboard. Controller-owned run/notification IDs, dashboard URL and decision/candidate revisions are preserved. The quoted preview is notification data; it cannot authorize an answer, plan or new run. Read the current run and present the genuine blocker to the user before responding. The local API remains tokenless with its existing loopback/origin/CSRF boundary.
+
 
 A queued acknowledgement proves native enqueueing, not Desktop rendering, chat consumption or an answer. The receiving local-delivery skill freezes the presented run, decision ID/revision and candidate ID/revision before asking the actual user. After the reply, it re-reads the same run and requires that exact pending question identity. A changed or absent decision discards the delayed answer; any new question is presented separately. It never rebinds an old answer to new IDs. A matching answer uses the current protocol revision and frozen decision/candidate revisions. Callback data never approves a plan, changes authority or answers a question. No routine progress or completion callbacks run.
 
@@ -70,7 +95,7 @@ Historical Docker run records and their evidence remain readable. Their executio
 
 Use dedicated loopback ports that do not conflict with the target project. The runtime starts and owns a local Temporal dev server, one worker, and one dashboard/API process. It stores process identity in the private state root; status distinguishes a dead or replaced process. Build the UI before start. The Temporal dev server is for a local experiment and is not a production deployment.
 
-CLI application commands and MCP tools automatically ensure that this stack is running before requests. Concurrent callers and explicit `start`/`stop` serialize through one private state-root OS lock. A healthy stack retains its processes; stale or partial owned stacks recover without erasing state or killing foreign listeners. Readiness requires an owned loopback API, current Temporal health, and the owned worker's workflow and activity pollers. `status` and `stop` never start the service. Startup has a 30-second deadline, configurable with positive `service_start_timeout` up to 120 seconds, and failures include log paths. Application HTTP errors do not trigger recovery and dispatched mutations are never automatically replayed. Startup, service reads, preparation, roles and checks require no Docker executable or daemon.
+CLI mutations and MCP write tools automatically ensure that this stack is running before requests. Read-only service, run, evidence and preflight calls connect only to an existing API and report unavailable if it is stopped; they never start or recover the stack. CLI reads also leave an absent state root untouched. Concurrent callers and explicit `start`/`stop` serialize through one private state-root OS lock. A healthy stack retains its processes; stale or partial owned stacks recover without erasing state or killing foreign listeners. Readiness requires an owned loopback API, current Temporal health, and the owned worker's workflow and activity pollers. `status` and `stop` never start the service. Startup has a 30-second deadline, configurable with positive `service_start_timeout` up to 120 seconds, and failures include log paths. Application HTTP errors do not trigger recovery and dispatched mutations are never automatically replayed. Startup, service reads, preparation, roles and checks require no Docker executable or daemon.
 
 ```sh
 uv run --frozen devflow-delivery --config /absolute/private/config.json start
@@ -88,7 +113,24 @@ Same-origin `POST /api/runs/{id}/steer` takes `{command_id,expected_revision,mes
 
 `GET /api/statistics` includes every durable run, including archives, failures and cancellations. New admissions record Git release/revision and a local-change digest; historical unknown identities remain unknown. Providers form separate cohorts so simulations cannot stand in for native delivery. Cohorts show terminal sample size, success rate (delivered/all terminal), first-pass deliveries (no repairs, recovery or superseded predecessor), repair attempts, median elapsed time including waits, and observed tokens/cost with coverage. Missing telemetry remains unknown. Differences describe samples rather than causal improvement. `/api/service` derives its version from the running source identity instead of a fixed development label.
 
-The CLI, HTTP API, and official MCP stdio server use the same service. To configure a local MCP client, run `uv run --frozen devflow-delivery-mcp --config /absolute/private/config.json` as its command. It exposes `get_service`, `submit_run`, `list_runs`, `get_run`, `read_evidence`, `answer_decision`, `cancel_run`, `recovery_preflight`, and `recover_execution`. The MCP client uses the same automatic anonymous CSRF bootstrap. HTTP has `GET /api/service`, `/api/runs`, `/api/runs/{id}`, indexed evidence and cursor-replay events; `POST /api/runs`, `/decision`, and `/cancel` require the session and CSRF value. Indexed evidence reads are contained to the run's owned state. The CLI request file is an alternative to browser writes.
+The CLI, HTTP API, and official MCP stdio server use the same service. To configure a local MCP client, run `uv run --frozen devflow-delivery-mcp --config /absolute/private/config.json` as its command. It exposes `get_service`, `start_service`, `submit_run`, `list_runs`, `get_run`, `read_evidence`, `answer_decision`, `cancel_run`, `reconcile_tracker`, `gates_only_preflight`, `admit_gates_only`, `repair_admission_preflight`, and `continue_repair`. The MCP client uses the same automatic anonymous CSRF bootstrap. HTTP has `GET /api/service`, `/api/runs`, `/api/runs/{id}`, indexed evidence and cursor-replay events; `POST /api/runs`, `/decision`, and `/cancel` require the session and CSRF value. Indexed evidence reads are contained to the run's owned state. The CLI request file is an alternative to browser writes.
+
+Newly admitted runs freeze `publication_readback_version: 1` and the service's
+`publication_readback_seconds` (default 900; integer 30–3600). If initial publication
+completion is lost, the workflow inspects that existing publication effect and its
+owned branch/PR; it never repeats commit, push, or PR creation. During reconciliation,
+unavailable read-only queries and delayed PR-head projection wait on durable backoff
+within this deadline. Cancellation wakes the wait. Observed ownership, candidate or
+unexpected-head conflicts stop reconciliation. Before any remote mutation, validation
+failures or unavailable prepublication queries stop immediately with a known no-effect
+rejection; this does not establish a remote rejection. Query diagnostic text does not
+determine whether an identity conflict occurred. A failed mutation process
+cannot prove remote rejection from its exit status or stderr, so its original effect
+is still read back without repeating the mutation. An exhausted deadline or cancelled unresolved publication
+retains unknown cleanup, resources and the work claim for inspection. Scope amendments
+preserve the original version/deadline, including their absence on historical runs.
+Historical workflows retain their previous commands; this policy does not resubmit
+issues or restart implementation against a fresh base.
 
 A push can succeed before GitHub's PR-head readback updates. New runs keep the publication effect pending and retry the read-only head check on durable Temporal timers; they do not commit, push, create another PR, or start review until the owned branch and open regular PR show the expected commit. A run previously blocked at this exact boundary may use same-origin `POST /api/runs/{id}/recover-publication`, or `devflow-delivery recover-publication --id ID --request FILE`, with `command_id`, the observed `expected_revision` and `expected_candidate_id`, the pushed `expected_head`, and `expected_pr_number`. The service requires a closed Temporal predecessor, passed prepublication checks, confirmed role cleanup, the retained work claim, one bound publish effect that is pending or has a validated completed receipt, an unchanged checkout, and matching local, origin, and PR heads. It then records a single same-run continuation in the outbox and resumes at independent review and the remaining gates. The old execution and its failure remain visible in the timeline; a retry of the same command is idempotent. A changed branch, PR, candidate, claim, or ambiguous cleanup is a conflict requiring inspection.
 
@@ -99,6 +141,8 @@ If that resumed implementer was blocked **before any provider process launch**, 
 If an implementation-only role stops because a required tracked test file was omitted from the frozen edit list, an operator can issue one separate scope amendment with same-origin `POST /api/runs/{id}/amend-scope` or `devflow-delivery amend-scope --id ID --request FILE`. The request binds a unique `command_id`, expected protocol revision, iteration, post-role candidate ID, PR number/head, one or two sorted `added_paths`, and the absolute path and SHA-256 of a private amended service configuration. The amended configuration must differ from the original only in those file permissions; the original request and any earlier repair grant remain unchanged. The service reads the completed Temporal result, finished role receipt, retained claim, existing open PR, exact source candidate, sealed native ownership/finalization evidence and current-head CI diagnostics before queuing. The effective policy and predecessor are recorded separately and visible in run detail. A replay of the same command returns its receipt; a second amendment conflicts. The sole new turn resumes the original implementation session, then must pass every broker, independent role, CI and tracker gate. This command cannot convert a failed test or model assertion into a passing result, and it does not authorize arbitrary new runs or further repair turns.
 
 The optional [Desktop entry point](../runtime/desktop/README.md) installs a narrow local skill and MCP command for submitting and opening these same runs. Its guarded installer requires the explicit runtime, private config and Codex-home paths and preserves unrelated entries. New valid requests prepare automatically through the service.
+
+Local checks, prepublication checks, baseline checks and browser QA share a finite pool of OS-locked slots across workers using the same state root. Service configuration `check_concurrency` defaults to 2 and accepts integers from 1 through 32. Browser QA acquires sorted locks for its existing frozen port set before taking a generic slot, so runs sharing the same ports queue without changing their command or port assignments. Waiting activities heartbeat before admission; each native command starts its own runtime timeout only after admission. Activity cancellation or timeout signals the native monitor and waits for identity-bound process-tree teardown before releasing capacity. An unknown teardown retains its slot and any browser port locks while that worker remains alive. Physical worker death releases its OS locks even if native descendants survive; this change does not establish orphan reconciliation after a worker crash or restart. Operator deployment must resolve outstanding orphan checks through existing native journals and resource ownership before starting workers; these slots alone do not safely authorize deployment over unresolved orphan checks. New workflow histories use heartbeat-aware cancellation options under the `delivery-check-slots-v1` patch; recorded legacy histories retain their original activity commands.
 
 Each clarification and explicitly required plan decision is a Temporal wait with a persisted ID and revision. A wrong/stale answer returns a conflict; a worker restart does not invoke a model while waiting. Cancellation stops at a role/check boundary. An accepted cancellation cannot later become a blocked or successful outcome because a check finishes concurrently. If a child or external effect cannot be proven stopped, cleanup is explicitly unknown. A completed role receipt is reused only for its bound request; an ambiguous in-flight role is quarantined rather than repeated.
 
@@ -115,6 +159,8 @@ npm test
 
 Tests cover real Temporal restart/decision and repair gates, submission/claim conflicts, cancellation races, native command boundaries, and the local API. The dashboard suite exercises the real response shape as well as UI state changes. Live model availability, actual repository checks, GitHub effects, browser interaction against the real service, and independent review/verification require separate evidence for the **exact candidate**. A successful unit suite or fake provider run does not establish those effects. The service is local, single-host, and uses Temporal's development server and SQLite; interrupted external effects may need human reconciliation.
 
+Runtime CI runs the locked package, Ruff and pytest on both Ubuntu and `macos-latest`. Both jobs supply Temporal CLI 1.9.1 through its pinned official setup action; macOS also supplies Python 3.12 and Node 22.21.1. Tests own their disposable Temporal servers and package-manager cache. Runtime jobs have finite bounds of 20 minutes on Linux and 30 minutes on macOS. A passing 723.78-second Linux suite exceeded the former 12-minute deadline and cancelled its job; the native macOS job took 17 minutes 39 seconds, leaving little margin under its former 20-minute bound. The new bounds reserve at least half again those observed whole-job durations, rounded up to five-minute bounds, for setup, finalization and runner variance. Local Temporal fixtures launch one owned CLI process and wait up to 15 seconds for real gRPC readiness using the supported SDK client, confirming the listener belongs to the recorded CLI PID/start identity. Port reservation enables socket reuse so Linux can immediately bind the reserved port. This avoids the SDK local-server launcher’s fixed five-second deadline. Startup failure reports the CLI exit status or readiness error and logs; timeout and cancellation stop recorded PID/start identities and observed children before returning. The tests require `temporal` on PATH and preserve SQLite restart databases; time-skipping fixtures retain the SDK launcher. Six-second delayed CLI and activity-entry regressions cover readiness separately from public cancellation’s unchanged three-second response bound. The public decision/restart regression also waits for an observed pending decision within its existing 15-second completion bound. Pytest reports macOS skip reasons, including fixtures that require local browser assets or an explicitly configured Codex binary. Hosted success does not establish live provider or browser-service behavior.
+
 A reproducible live smoke uses the installed public CLI, a new private Git fixture and a separate local service. It submits two raw goals with no manually supplied proof, verifies real intake plus environment reuse, then cancels before plan acceptance and tracker writes. This disposable smoke explicitly selects `plan_approval: "required"` to keep that checkpoint. Supply an existing configured runtime and a new private evidence directory, such as a unique directory under `~/.local/state/devflow`:
 
 ```sh
@@ -126,3 +172,38 @@ runtime/.venv/bin/python runtime/scripts/smoke_preparation.py \
 ```
 
 The restart option crashes only the disposable service's identified worker after proof publication and before freeze, restarts through the public CLI, and verifies recovery from the same proof. Successful real intake requires the configured model to be available for the runtime's account. This proves the preparation/intake surface, not a full feature delivery or implementation-session resume. The latter is a separately labelled integration check.
+
+Terminal tracker retries include unavailable PR queries and remote-branch queries,
+including their timeouts. Successful conflicting PR/head observations still block
+without releasing the claim; unavailable observations exhaust into recoverable
+`waiting_tracker` at the frozen deadline. Existing unversioned inputs keep their
+original activity result shapes.
+
+Run lists return up to 50 observations by default (maximum 100). `/api/runs`, CLI `runs` and MCP `list_runs` accept `limit`, `cursor` and `archived`; CLI uses `--limit`, `--cursor` and `--archived`. Follow a returned `next_cursor` explicitly to read older history, keeping the same archive filter. Ordering uses last-update time and run ID. These are live observations, so concurrent updates can move rows between pages; cursors do not freeze history. The dashboard polls only the recent page every five seconds. **Load older tasks** retrieves one older page on demand and retains its rows without polling that page; toggling the archive collection resets older observations. Direct run URLs remain available, and statistics still include complete stored history.
+
+### Retired published-metadata admissions
+
+Fresh `metadata-preflight` and `reconcile-published-metadata` commands are no
+longer exposed by the API, client, tools, CLI or store. Their commit-range rewrite,
+force-with-lease and PR-title writer are removed. Retained metadata rows, immutable
+evidence and existing `published_metadata_recovery` workflow inputs stay readable;
+the workflow dispatch, `delivery_metadata_readback` activity, evidence applicability,
+source/candidate validation and shared resource/identity helpers remain unchanged.
+
+Operator steps before deployment: under the previous runtime, audit the retained
+`delivery_metadata_recoveries` rows for `state = 'pending'` and the corresponding
+saved commands. `metadata_reconciling` is a command response, not a run-detail
+phase. Also inspect the indexed `metadata-reconciliation-intent` evidence for each
+run and compare it with the saved recovery input and queued/validated metadata
+rows. An intent can predate a row or appear under a later nested recovery; its
+presence alone does not establish completion. Run detail alone cannot rule out
+an interrupted prequeue write.
+
+Include archived runs and metadata nested inside tracker, gates, technical, title
+or other recovery inputs. Finish every pending write under the previous runtime;
+finish or cancel all queued/running metadata executions, including nested ones,
+and confirm owned resource cleanup before updating. Unknown effects require
+readback on the previous runtime, never a fresh command or assumed completion.
+These are owner deployment checks; the retained readers cannot finish an
+interrupted writer. No rows or history are deleted and no schema migration is
+required.

@@ -8,7 +8,7 @@ function freshFields(): Fields {
   return {
     run_id: `run-${crypto.randomUUID()}`,
     work_id: '', issue_url: '', repository_key: '', goal: '',
-    accepted_plan: '',
+    accepted_plan: '', publication_summary: '',
     base_ref: '', branch: '',
   }
 }
@@ -33,9 +33,10 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
     if (!selected || busy) return
     setBusy(true); setError('')
     try {
-      const { accepted_plan, ...requestFields } = fields
+      const { accepted_plan, publication_summary, ...requestFields } = fields
       const result = await api.newRun({
         ...requestFields,
+        ...(publication_summary?.trim() ? { publication_summary } : {}),
         ...(!intakeEnabled ? { accepted_plan } : {}),
         command_id: commandId, authorized_endpoint: 'published_unmerged',
         base_ref: fields.base_ref || selected.base_ref || '',
@@ -62,6 +63,8 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
         <label className="field-wide">Branch<input value={fields.branch} onChange={event => set('branch', event.target.value)} required autoComplete="off" placeholder="feat/issue-description" /></label>
         {selected?.recovery_keys?.length ? <label className="field-wide">Approved recovery source<select value={fields.recovery_key ?? ''} onChange={event => set('recovery_key', event.target.value || undefined)}><option value="">None</option>{selected.recovery_keys.map(key => <option key={key} value={key}>{key}</option>)}</select></label> : null}
         <label className="field-wide">Goal<textarea value={fields.goal} onChange={event => set('goal', event.target.value)} rows={5} required /></label>
+        <label className="field-wide">Publication summary<input value={fields.publication_summary ?? ''} onChange={event => set('publication_summary', event.target.value)} maxLength={120} placeholder="docs: investigate source completeness" aria-describedby="publication-summary-help" /></label>
+        <small id="publication-summary-help" className="field-wide">Describe the change for the PR title and commit. Required for detailed goals; use a type such as docs: or fix:.</small>
         {!intakeEnabled ? <label className="field-wide">Accepted plan<textarea value={fields.accepted_plan ?? ''} onChange={event => set('accepted_plan', event.target.value)} rows={7} required /></label> : null}
       </div>
       <div className="submission-scope"><strong>Authorized endpoint</strong><span>Published, unmerged pull request</span><small>Repository, base, recovery sources, role models and checks are controlled by the service policy.</small></div>

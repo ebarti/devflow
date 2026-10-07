@@ -8,14 +8,16 @@ import json
 import os
 import shutil
 import socket
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 import uvicorn
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from temporal_test_server import local_temporal
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 from test_delivery_intake import intake_fixture as source_intake_fixture
 
@@ -80,6 +82,37 @@ def test_discovery_canonical_skill_explicit_paths_and_idempotency(package_fixtur
                      for p in root.rglob("*") if p.is_file()}
 
 
+@pytest.mark.parametrize("package_format", ["portable", "codex"])
+def test_package_root_resolves_ancestor_alias_before_descendant_checks(
+    package_fixture, tmp_path, package_format,
+):
+    _root, runtime, config = package_fixture
+    physical = tmp_path / "physical parent"
+    physical.mkdir()
+    alias = tmp_path / "parent alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    selected = alias / "new marketplace"
+    target = packager.package(selected, runtime, config, package_format=package_format)
+    assert target == physical / "new marketplace/plugins/devflow"
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns)
+              for p in target.parent.parent.rglob("*") if p.is_file()}
+    assert packager.package(selected, runtime, config, package_format=package_format) == target
+    assert packager.package(selected.resolve(), runtime, config,
+                            package_format=package_format) == target
+    assert before == {p: (p.read_bytes(), p.stat().st_mtime_ns)
+                      for p in target.parent.parent.rglob("*") if p.is_file()}
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='native macOS temporary-root spelling')
+@pytest.mark.parametrize("directory", [None, "/tmp"])
+def test_native_temporary_package_root_uses_physical_path(package_fixture, directory):
+    _root, runtime, config = package_fixture
+    with tempfile.TemporaryDirectory(prefix='devflow-package-alias-', dir=directory) as temporary:
+        selected = Path(temporary) / 'marketplace'
+        target = packager.package(selected, runtime, config)
+        assert target == selected.resolve() / 'plugins/devflow'
+
+
 @pytest.mark.parametrize("first,second", [("portable", "codex"), ("codex", "portable")])
 def test_package_selection_never_rewrites_an_existing_other_layout(package_fixture, first, second):
     root, runtime, config = package_fixture
@@ -136,6 +169,39 @@ def test_symlink_destinations_never_escape_root(package_fixture, tmp_path, compo
     with pytest.raises(ValueError, match="symlink"):
         packager.package(root, runtime, config)
     assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("package_format", ["portable", "codex"])
+@pytest.mark.parametrize("spelling", ["direct", "missing", "file"])
+@pytest.mark.parametrize("dangling", [False, True])
+@pytest.mark.parametrize("ancestor_alias", [False, True])
+def test_named_root_symlink_spellings_preserve_target(
+    package_fixture, tmp_path, package_format, spelling, dangling, ancestor_alias,
+):
+    _root, runtime, config = package_fixture
+    physical = tmp_path / "selected parent"
+    physical.mkdir()
+    (physical / "file").write_text("an intermediate regular file")
+    outside = tmp_path / "outside target"
+    if not dangling:
+        outside.mkdir()
+        (outside / "user.txt").write_text("existing target must remain untouched")
+    before = {path.relative_to(outside): (path.read_bytes(), path.stat().st_mtime_ns)
+              for path in outside.rglob("*") if path.is_file()}
+    link = physical / "named marketplace"
+    link.symlink_to(outside, target_is_directory=True)
+    parent = physical
+    if ancestor_alias:
+        parent = tmp_path / "ancestor alias"
+        parent.symlink_to(physical, target_is_directory=True)
+    selected = parent / link.name if spelling == "direct" else (
+        parent / spelling / ".." / link.name)
+    with pytest.raises(ValueError, match="destination is a symlink"):
+        packager.package(selected, runtime, config, package_format=package_format)
+    assert link.is_symlink()
+    assert outside.exists() is not dangling
+    assert before == {path.relative_to(outside): (path.read_bytes(), path.stat().st_mtime_ns)
+                      for path in outside.rglob("*") if path.is_file()}
 
 
 @pytest.mark.parametrize("missing", ["runtime", "executable", "config", "nonexecutable"])
@@ -215,7 +281,7 @@ async def test_generated_stdio_command_raw_goal_question_auto_plan_and_evidence(
         command=command["command"], args=command["args"],
         env={"PYTHONPATH": str(shim), "PATH": os.environ["PATH"]},
     )
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "temporal.sqlite3"),
     ) as environment:
@@ -291,3 +357,22 @@ async def test_generated_stdio_command_raw_goal_question_auto_plan_and_evidence(
             server.should_exit = True
             await asyncio.wait_for(serving, 5)
             listener.close()
+
+
+def test_packaged_handoff_example_admits_detailed_goal(package_fixture, tmp_path):
+    import re
+
+    from test_delivery_store import service as store_fixture
+
+    root, runtime, config = package_fixture
+    target = packager.package(root, runtime, config)
+    skill = (target / 'skills/devflow-local-delivery/SKILL.md').read_text()
+    assert 'publication_summary' in skill and 'supersed' in skill
+    example = json.loads(re.search(r'```json\n(.*?)\n```', skill, re.S).group(1))
+    fixture_root = tmp_path / 'admission'
+    fixture_root.mkdir()
+    store, request = store_fixture.__wrapped__(fixture_root)
+    store.submit({**request, **example})
+    spec = store.spec(request['run_id'])
+    assert spec['goal'] == example['goal']
+    assert spec['publication_summary'] == example['publication_summary']

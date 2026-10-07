@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from .delivery_config import DeliveryConfig
 
@@ -69,8 +69,16 @@ class DeliveryClient:
     def service(self) -> dict:
         return self._request("GET", "/api/service")
 
-    def runs(self) -> dict:
-        return self._request("GET", "/api/runs")
+    def runs(self, *, limit: int = 50, cursor: str | None = None, archived: bool = False) -> dict:
+        parameters: dict[str, str | int] = {}
+        if limit != 50:
+            parameters["limit"] = limit
+        if archived:
+            parameters["archived"] = "true"
+        if cursor is not None:
+            parameters["cursor"] = cursor
+        suffix = "?" + urlencode(parameters) if parameters else ""
+        return self._request("GET", "/api/runs" + suffix)
 
     def status(self, run_id: str) -> dict:
         return self._request("GET", "/api/runs/" + quote(run_id, safe=""))
@@ -99,11 +107,6 @@ class DeliveryClient:
             payload,
         )
 
-    def reconcile_published_metadata(self, run_id: str, payload: dict[str, Any]) -> dict:
-        return self._request(
-            "POST", "/api/runs/" + quote(run_id, safe="") + "/reconcile-published-metadata",
-            payload, timeout=180,
-        )
 
     def gates_only_preflight(self, run_id: str) -> dict:
         return self._request(
@@ -115,21 +118,6 @@ class DeliveryClient:
             "POST", "/api/runs/" + quote(run_id, safe="") + "/admit-gates-only", payload,
             timeout=120,
         )
-
-    def recovery_preflight(self, run_id: str) -> dict:
-        return self._request(
-            "GET", "/api/runs/" + quote(run_id, safe="") + "/recovery-preflight", timeout=120,
-        )
-
-    def recover_execution(self, run_id: str, payload: dict[str, Any]) -> dict:
-        return self._request(
-            "POST", "/api/runs/" + quote(run_id, safe="") + "/recover-execution", payload,
-            timeout=180,
-        )
-
-    def metadata_preflight(self, run_id, request):
-        return self._request("POST", "/api/runs/" + quote(run_id, safe="")
-                             + "/metadata-preflight", request, timeout=120)
 
     def repair_admission_preflight(self, run_id, request):
         return self._request("POST", "/api/runs/" + quote(run_id, safe="")
@@ -157,11 +145,16 @@ class DeliveryClient:
         )
 
 
+def read_only_client(config_path: Path) -> DeliveryClient:
+    """Connect to an existing service without starting it or creating local state."""
+    return DeliveryClient(DeliveryConfig.load(config_path))
+
+
 def client(config_path: Path) -> DeliveryClient:
     # The lifecycle controller also uses DeliveryClient for loopback readiness.
     from .delivery_control import ensure_service_running
 
-    caller = DeliveryClient(DeliveryConfig.load(config_path))
+    caller = read_only_client(config_path)
     ensure_service_running(caller.config)
     caller.login()
     return caller

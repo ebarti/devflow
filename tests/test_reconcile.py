@@ -1,18 +1,15 @@
 """Controlled CLI, hook, and service replay without real GitHub mutation."""
 import json
 import hashlib
-import io
 import os
 from pathlib import Path
 import plistlib
 import select
-import shlex
 import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import unittest
 
@@ -605,137 +602,121 @@ p.write_text(json.dumps(s))
 
     def exercise_full_upgrade(self, baseline):
         if sys.platform != "darwin":
-            self.skipTest("launchd upgrade activation is a macOS entry point")
+            self.skipTest("default-location updater replay is a macOS entry point")
         if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", baseline + "^{commit}"],
                           capture_output=True).returncode:
             self.skipTest("historical installed checkout is absent from this shallow clone")
-        origin, checkout = self.root / "origin", self.root / "checkout"
-        origin.mkdir()
-        archive = subprocess.check_output(["git", "-C", str(ROOT), "archive", "--format=tar", baseline])
-        with tarfile.open(fileobj=io.BytesIO(archive)) as packed:
-            packed.extractall(origin, filter="data")
-        subprocess.run(["git", "init", "-q", str(origin)], check=True)
-        for key, value in (("user.name", "Test"), ("user.email", "test@example.invalid")):
+        fixture = self.root.resolve()
+        origin, checkout = fixture / "origin", fixture / "checkout"
+        # Preserve the historical Git objects and ancestry used by migration.
+        subprocess.run(["git", "clone", "--quiet", "--shared", str(ROOT), str(origin)], check=True)
+        subprocess.run(["git", "-C", str(origin), "checkout", "--quiet", "--detach", baseline], check=True)
+        # Keep this disposable origin stable across commit and the local clone.
+        fixture_git = (("maintenance.auto", "false"), ("gc.auto", "0"),
+                       ("core.hooksPath", "/dev/null"), ("commit.gpgSign", "false"))
+        for key, value in (*fixture_git, ("user.name", "Test"),
+                           ("user.email", "test@example.invalid")):
             subprocess.run(["git", "-C", str(origin), "config", key, value], check=True)
-        subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(origin), "commit", "-qm", "old release"], check=True)
         subprocess.run(["git", "-C", str(origin), "tag", "v1"], check=True)
         tracked = subprocess.check_output(["git", "-C", str(ROOT), "ls-files", "-z"]).decode().split("\0")
-        for name in set(filter(None, tracked)) | {"scripts/install-rollback.py", "scripts/install-service-entry.py"}:
+        for name in filter(None, tracked):
             target = origin / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, target)
         subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(origin), "commit", "-qm", "new release"], check=True)
+        subprocess.run(["git", "-C", str(origin), "commit", "-qm", "new fixture release"], check=True)
         subprocess.run(["git", "-C", str(origin), "tag", "v2"], check=True)
+        candidate = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "v2"], text=True).strip()
         subprocess.run(["git", "clone", "-q", str(origin), str(checkout)], check=True)
+        # Fetches must not leave a background packer running during fixture cleanup.
+        for key, value in fixture_git:
+            subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
         subprocess.run(["git", "-C", str(checkout), "checkout", "-q", "--detach", "v1"], check=True)
-        home = self.root / "home"
+        home = fixture / "home"
         codex = home / ".codex"
-        temporary = self.root / "temporary"
+        codex.mkdir(parents=True)
+        foreign = {"matcher": "foreign", "hooks": [{"type": "command", "command": "foreign hook"}]}
+        (codex / "hooks.json").write_text(json.dumps({"custom": 42, "hooks": {"Stop": [foreign]}}))
+        (codex / "config.toml").write_text('model = "foreign"\n')
+        temporary = fixture / "temporary"
         temporary.mkdir()
-        launch_state = self.root / "launch.json"
-        launch_state.write_text(json.dumps({"calls": [], "observed": None}))
-        launchctl = self.root / "launchctl"
-        launchctl.write_text('''#!/usr/bin/env python3
-import json, os, plistlib, subprocess, sys
-from pathlib import Path
-p = Path(os.environ["FAKE_LAUNCH_STATE"])
-s = json.loads(p.read_text())
-a = sys.argv[1:]
-s["calls"].append(a[0])
-if a[0] == "print":
-    p.write_text(json.dumps(s)); print("Could not find service", file=sys.stderr); sys.exit(1)
-if a[0] == "bootstrap":
-    arguments = plistlib.loads(Path(a[-1]).read_bytes())["ProgramArguments"]
-    if os.environ.get("FAKE_BOOTSTRAP_OK") == "1":
-        s["program"] = arguments
-        s["loaded"] = True
-        p.write_text(json.dumps(s)); sys.exit(0)
-    child = subprocess.Popen(arguments, env=os.environ, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        s["observed"] = json.loads(child.stdout.readline())["state"]
-    finally:
-        child.terminate(); child.communicate(timeout=5)
-    p.write_text(json.dumps(s)); print("uncertain bootstrap failure", file=sys.stderr); sys.exit(1)
-p.write_text(json.dumps(s))
-''')
+        launch_state = fixture / "launch.json"
+        launch_state.write_text(json.dumps({"calls": []}))
+        launchctl = fixture / "launchctl"
+        launchctl.write_text('#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\np = Path(os.environ["FAKE_LAUNCH_STATE"])\ns = json.loads(p.read_text())\ns["calls"].append(sys.argv[1:])\np.write_text(json.dumps(s))\nprint("unexpected background activation", file=sys.stderr)\nsys.exit(1)\n')
         launchctl.chmod(0o755)
         env = dict(self.env, HOME=str(home), CODEX_HOME=str(codex),
-                   XDG_STATE_HOME=str(self.root / "state"), DEVFLOW_PYTHON=sys.executable,
+                   XDG_STATE_HOME=str(fixture / "state"), DEVFLOW_PYTHON=sys.executable,
                    DEVFLOW_LAUNCHCTL=str(launchctl), FAKE_LAUNCH_STATE=str(launch_state),
-                   TMPDIR=str(temporary))
+                   TMPDIR=str(temporary), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
         old_install = subprocess.run(["sh", str(checkout / "scripts/install.sh")], env=env,
                                      text=True, capture_output=True, timeout=30)
         self.assertEqual(old_install.returncode, 0, old_install.stderr)
-        database = self.root / "state/devflow/workflow.sqlite3"
+        database = fixture / "state/devflow/workflow.sqlite3"
         seed = subprocess.run([sys.executable, "-B", "-c", "import state; state.connect(__import__('sys').argv[1]).close()",
                                str(database)], env=dict(env, PYTHONPATH=str(checkout / "skills/devflow/scripts")),
                               text=True, capture_output=True, timeout=15)
         self.assertEqual(seed.returncode, 0, seed.stderr)
         with sqlite3.connect(database) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
-        prior_head = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "v1"], text=True).strip()
-        logs_target = self.root / "logs-target"
+        prior_data = database.read_bytes()
+        logs_target = fixture / "logs-target"
         logs_target.mkdir()
         (codex / "logs").symlink_to(logs_target)
-        late = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"], env=env,
-                              text=True, capture_output=True, timeout=90)
-        self.assertNotEqual(late.returncode, 0, late.stdout + late.stderr)
-        self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(),
-                         prior_head)
-        self.assertTrue((codex / "logs").is_symlink())
-        self.assertEqual(list(temporary.glob("devflow-install-rollback-*")), [])
-        with sqlite3.connect(database) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
-        (codex / "logs").unlink()
-        before = {str(path.relative_to(codex)): path.read_bytes() for path in codex.rglob("*") if path.is_file()}
-        failed = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"], env=env,
-                                text=True, capture_output=True, timeout=90)
-        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-        self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(),
-                         prior_head)
-        self.assertIsNone(json.loads(launch_state.read_text())["observed"],
-                          "Legacy registrations must refuse before daemon activation")
-        self.assertEqual(list(temporary.glob("devflow-install-rollback-*")), [])
-        for name, expected in before.items():
-            actual = (codex / name).read_bytes()
-            if name == ".devflow-install.json" and actual != expected:
-                original, restored = json.loads(expected), json.loads(actual)
-                changed = {key for key in original["files"] | restored["files"]
-                           if original["files"].get(key) != restored["files"].get(key)}
-                self.fail(f"manifest changed files: {changed}; checkout status: " +
-                          subprocess.check_output(["git", "-C", str(checkout), "status", "--short"], text=True) +
-                          "\nupdate output:\n" + failed.stdout + failed.stderr)
-            self.assertEqual(actual, expected, name)
-        self.assertFalse((codex / ".devflow-reconcile-active.json").exists())
-        with sqlite3.connect(database) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
-        installed_guard = codex / ".devflow-hook.py"
-        if installed_guard.exists():
-            guard = subprocess.run([sys.executable, "-B", str(installed_guard), "--check"],
-                                   env=env, text=True, capture_output=True, timeout=15)
-            self.assertEqual(guard.returncode, 0, guard.stdout + guard.stderr)
-        else:
-            hooks = json.loads((codex / "hooks.json").read_text())
-            command = hooks["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
-            self.assertEqual(Path(shlex.split(command)[-2]).resolve(),
-                             (checkout / "skills/devflow/scripts/telemetry.py").resolve())
-        # Service migration requires explicit retirement of old registrations;
-        # a legacy updater must refuse and restore, even when bootstrap could succeed.
-        rejected_again = subprocess.run(
-            ["sh", str(checkout / "scripts/update.sh"), "v2"],
-            env=dict(env, FAKE_BOOTSTRAP_OK="1"), text=True, capture_output=True, timeout=90)
-        self.assertEqual(rejected_again.returncode, 1, rejected_again.stdout + rejected_again.stderr)
-        self.assertIn("retire inspected", rejected_again.stderr)
-        self.assertEqual(subprocess.check_output(
-            ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(), prior_head)
-        self.assertEqual(list(temporary.glob("devflow-install-rollback-*")), [])
+        original_hooks = (codex / "hooks.json").read_bytes()
+        hooks = json.loads(original_hooks)
+        hooks["hooks"]["Stop"][-1]["hooks"][0]["statusMessage"] = "User customized metrics"
+        (codex / "hooks.json").write_text(json.dumps(hooks))
+        skills = home / ".agents/skills"
 
-    def test_legacy_updater_refuses_service_migration_and_restores_checkout(self):
+        def registrations():
+            return {str(path): ("link", os.readlink(path)) if path.is_symlink()
+                    else ("file", path.read_bytes(), path.stat().st_mode)
+                    for folder in (skills, codex) for path in folder.rglob("*")
+                    if path.is_symlink() or path.is_file()}
+
+        before = registrations()
+        rejected = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"], env=env,
+                                  text=True, capture_output=True, timeout=90)
+        self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
+        self.assertIn(str(codex / "hooks.json"), rejected.stderr)
+        self.assertIn("modified registration", rejected.stderr)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(), baseline)
+        self.assertEqual(registrations(), before)
+        self.assertEqual(database.read_bytes(), prior_data)
+        self.assertEqual(json.loads(launch_state.read_text())["calls"], [])
+        (codex / "hooks.json").write_bytes(original_hooks)
+        for _ in range(2):
+            upgraded = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"], env=env,
+                                      text=True, capture_output=True, timeout=90)
+            self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
+            self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(), candidate)
+            self.assertTrue((skills / "devflow-local-delivery/SKILL.md").is_file())
+            self.assertFalse((skills / "devflow/SKILL.md").exists())
+            self.assertTrue((skills / "devflow/scripts/state.py").is_file())
+            for name in (checkout / "skills").iterdir():
+                if name.name != "devflow":
+                    self.assertFalse(os.path.lexists(skills / name.name))
+            self.assertFalse((codex / ".devflow-hook.py").exists())
+            self.assertFalse((codex / ".devflow-install.json").exists())
+            hooks = json.loads((codex / "hooks.json").read_text())
+            self.assertEqual(hooks["custom"], 42)
+            self.assertIn(foreign, hooks["hooks"]["Stop"])
+            self.assertNotIn("Record Devflow metrics", (codex / "hooks.json").read_text())
+            self.assertEqual((codex / "config.toml").read_text(), 'model = "foreign"\n')
+            self.assertTrue((codex / "logs").is_symlink())
+            self.assertEqual(database.read_bytes(), prior_data)
+            self.assertEqual(json.loads(launch_state.read_text())["calls"], [])
+            self.assertFalse(list(codex.glob("devflow-install-rollback-*")))
+            self.assertFalse(list(temporary.glob("devflow-install-rollback-*")))
+            self.assertFalse((codex / ".devflow-reconcile-active.json").exists())
+            with sqlite3.connect(database) as db:
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+
+    def test_legacy_updater_migrates_owned_install_and_preserves_data(self):
         self.exercise_full_upgrade("e966cf89e057abc9a2629faf957a2ec175599b53")
 
-    def test_lifecycle_updater_refuses_service_migration_and_restores_checkout(self):
+    def test_lifecycle_updater_migrates_owned_install_and_preserves_data(self):
         self.exercise_full_upgrade("60de52a37c9774f188376904517fb6318246adf9")
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import subprocess
 import sys
 from copy import deepcopy
 from importlib.metadata import distribution, version
@@ -335,14 +336,35 @@ def verify_native_spec(spec: dict) -> None:
         {k: v for k, v in identity.items() if k != "runtime_payload_sha256"}
         == {k: v for k, v in frozen.items() if k != "runtime_payload_sha256"}
     ):
-        from .delivery_transport_adoption import transport_adoption
+        if spec["policy"].get("host_sandbox") == "trusted-local":
+            from .delivery_broker import _git
+            from .delivery_transport_adoption import _historical_payload
 
-        try:
-            transport_adoption(spec, frozen["runtime_payload_sha256"])
-        except (OSError, ValueError, KeyError) as exc:
-            raise PreparationError(
-                "native transport update has no valid installation receipt"
-            ) from exc
+            source = PACKAGE.parents[2]
+            try:
+                revision = _git(source, "rev-parse", "HEAD")
+                if (
+                    Path(_git(source, "rev-parse", "--show-toplevel")).resolve() != source
+                    or _git(source, "status", "--porcelain", "--untracked-files=all")
+                    or _historical_payload(str(source), revision)
+                    != identity["runtime_payload_sha256"]
+                ):
+                    raise ValueError("installed source differs from its committed tree")
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                raise PreparationError(
+                    "native update requires clean installed runtime source"
+                ) from exc
+        else:
+            from .delivery_transport_adoption import transport_adoption
+
+            try:
+                transport_adoption(spec, frozen["runtime_payload_sha256"])
+            except (OSError, ValueError, KeyError) as exc:
+                raise PreparationError(
+                    "native transport update has no valid installation receipt"
+                ) from exc
+        # Owner-controlled trusted source may change; its original measurements
+        # and per-run authority must still authenticate against the frozen identity.
         identity = frozen
     if (
         spec["policy"].get("native_identity") != identity

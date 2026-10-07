@@ -31,39 +31,34 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
     seen = []
     policy = {"policy": {"repositories": [{"key": "fixture", "base_ref": "main"}]}}
 
-    def client(path):
-        seen.append(path)
+    def client(path, factory):
+        seen.append((factory, path))
         return SimpleNamespace(
             service=lambda: policy,
-            recovery_preflight=lambda run_id: {"run_id": run_id, "precheck_sha256": "a" * 64},
-            recover_execution=lambda run_id, request: {"run_id": run_id, **request},
             reconcile_tracker=lambda run_id, request: {"run_id": run_id, **request},
-            reconcile_published_metadata=lambda run_id, request: {"run_id": run_id, **request},
             gates_only_preflight=lambda run_id: {"run_id": run_id},
             admit_gates_only=lambda run_id, request: {"run_id": run_id, **request},
-            metadata_preflight=lambda run_id, request: {"run_id": run_id, **request},
             repair_admission_preflight=lambda run_id, request: {"run_id": run_id, **request},
             continue_repair=lambda run_id, request: {"run_id": run_id, **request},
         )
 
-    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", client)
+    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", lambda path: client(path, "write"))
+    monkeypatch.setattr("devflow_temporal.delivery_mcp.read_only_client",
+                        lambda path: client(path, "read"))
     async with create_connected_server_and_client_session(build_server(config)) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
         assert set(tools) == {
             "get_service",
+            "start_service",
             "submit_run",
             "list_runs",
             "get_run",
             "read_evidence",
             "answer_decision",
             "cancel_run",
-            "recovery_preflight",
-            "recover_execution",
             "reconcile_tracker",
-            "reconcile_published_metadata",
             "gates_only_preflight",
             "admit_gates_only",
-            "metadata_preflight",
             "repair_admission_preflight",
             "continue_repair",
         }
@@ -72,21 +67,18 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "list_runs",
             "get_run",
             "read_evidence",
-            "recovery_preflight",
             "gates_only_preflight",
-            "metadata_preflight",
             "repair_admission_preflight",
         ):
             assert tools[name].annotations.readOnlyHint is True
             assert tools[name].annotations.destructiveHint is False
             assert tools[name].annotations.openWorldHint is False
         for name in (
+            "start_service",
             "submit_run",
             "answer_decision",
             "cancel_run",
-            "recover_execution",
             "reconcile_tracker",
-            "reconcile_published_metadata",
             "admit_gates_only",
             "continue_repair",
         ):
@@ -96,21 +88,10 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         assert tools["cancel_run"].annotations.destructiveHint is True
         assert tools["submit_run"].inputSchema["required"] == ["request_json"]
         assert tools["get_service"].inputSchema.get("required", []) == []
+        assert tools["start_service"].inputSchema.get("required", []) == []
+        assert tools["start_service"].annotations.destructiveHint is False
         result = await session.call_tool("get_service")
         assert not result.isError and json.loads(result.content[0].text) == policy
-        preflight = await session.call_tool("recovery_preflight", {"run_id": "same-run"})
-        assert json.loads(preflight.content[0].text)["precheck_sha256"] == "a" * 64
-        recovered = await session.call_tool(
-            "recover_execution",
-            {
-                "run_id": "same-run",
-                "request_json": '{"command_id":"same-grant"}',
-            },
-        )
-        assert json.loads(recovered.content[0].text) == {
-            "run_id": "same-run",
-            "command_id": "same-grant",
-        }
         reconciled = await session.call_tool(
             "reconcile_tracker",
             {
@@ -124,9 +105,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "expected_revision": 13,
         }
         for name in (
-            "reconcile_published_metadata",
             "admit_gates_only",
-            "metadata_preflight",
             "repair_admission_preflight",
             "continue_repair",
         ):
@@ -140,4 +119,19 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             }
         result = await session.call_tool("gates_only_preflight", {"run_id": "same-run"})
         assert not result.isError and json.loads(result.content[0].text) == {"run_id": "same-run"}
-        assert seen == [config] * 10
+        assert seen == [(factory, config) for factory in (
+            "read", "write", "write", "read", "write", "read",
+        )]
+
+
+@pytest.mark.asyncio
+async def test_mcp_discovery_explains_detailed_and_superseding_goal_summary():
+    server = build_server(Path('/fixture/service.json'))
+    async with create_connected_server_and_client_session(server) as session:
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+        for text in (server.instructions, tools['submit_run'].description):
+            assert 'publication_summary' in text
+            assert '120' in text
+            assert 'Conventional Commit' in text
+            assert 'single line' in text
+            assert 'supersed' in text

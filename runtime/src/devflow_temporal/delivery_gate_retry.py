@@ -22,6 +22,44 @@ PRELAUNCH_KIND = 'published_check_prelaunch_retry'
 CI_KIND = 'published_ci_retry'
 
 
+def _consumed_payloads(spec, state, previous):
+    """Follow actual gate launches; old journals retain their preparation identity."""
+    records = [role for role in state.get('roles', [])
+               if role.get('role') in {'review', 'verify'}
+               and role.get('iteration') == state.get('iteration')]
+    for stage in ('prepublish', 'local', 'browser_qa'):
+        check = state.get('checks', {}).get(stage, {})
+        records.extend(check.get('results', []))
+        records.append(check)
+    policies = {spec['policy_digest']}
+    while previous:
+        for key in ('original_spec', 'execution_spec'):
+            policy = previous.get(key, {}).get('policy_digest')
+            if policy:
+                policies.add(policy)
+        previous = previous.get('original_recovery')
+    payloads = set()
+    for record in records:
+        process = record.get('native_process', {})
+        if not process.get('journal'):
+            continue
+        path = Path(process['journal'])
+        if not path.is_relative_to(Path(spec['state_dir'])) or path.resolve(strict=True) != path:
+            raise ValueError('gate controller journal left its original run')
+        journal = read_private(path)
+        identity = journal.get('runtime_identity')
+        if identity is None and process.get('runtime_identity') is None:
+            continue  # Historical monitors predate execution-version metadata.
+        payload = identity.get('runtime_payload_sha256') if isinstance(identity, dict) else None
+        if (journal.get('result') != process or identity != process.get('runtime_identity')
+                or journal['intent']['run_id'] != spec['run_id']
+                or journal['intent']['policy_digest'] not in policies
+                or not isinstance(payload, str) or not re.fullmatch(r'[0-9a-f]{64}', payload)):
+            raise ValueError('gate consumed controller evidence changed')
+        payloads.add(payload)
+    return payloads or {spec['policy']['native_identity']['runtime_payload_sha256']}
+
+
 def missing_planned_report(spec, state, broker):
     """Prove a delegated report recipe was omitted from a passed local assessment."""
     from .delivery_check_evidence import verify_manifest
@@ -83,8 +121,8 @@ def snapshot(store, run_id, kind=KIND):
     if ((renewed or published_after_recovery or prelaunch or report_retry)
             and spec['provider'] != 'fake'):
         from .delivery_native_preparation import native_identity
-        old_payload = spec['policy']['native_identity']['runtime_payload_sha256']
-        if native_identity(spec)['runtime_payload_sha256'] == old_payload:
+        if native_identity(spec)['runtime_payload_sha256'] in _consumed_payloads(
+                spec, state, previous):
             raise ValueError('a later gate retry requires a repaired measured runtime')
     broker = DeliveryBroker(store, spec)
     candidate = broker.candidate()

@@ -6,6 +6,7 @@ import json
 import pytest
 from test_delivery_metadata_recovery import published as published
 from test_delivery_store import service as service
+from test_delivery_store import submit_historical_admission
 
 from devflow_temporal.contracts import canonical_json
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -17,7 +18,7 @@ from devflow_temporal.delivery_workflow import DeliveryWorkflow
 @pytest.fixture
 def unpublished(service, monkeypatch):
     store, request = service
-    store.submit(request)
+    submit_historical_admission(store, request, monkeypatch)
     spec = store.spec('run-1')
     broker = DeliveryBroker(store, spec)
     broker.prepare()
@@ -601,3 +602,64 @@ def test_second_prepublication_retry_preserves_history_and_has_no_third_grant(un
     third = finalize(spec, recovery, 29)
     with pytest.raises(ValueError, match='closed, finalized'):
         store.continue_repair('run-1', third)
+
+
+@pytest.mark.parametrize('change', [None, 'projection', 'missing-projection', 'journal',
+                                  'run', 'policy', 'path', 'malformed'])
+def test_consumed_gate_controller_requires_its_private_run_and_policy_journal(tmp_path, change):
+    from copy import deepcopy
+
+    from devflow_temporal.delivery_gate_retry import _consumed_payloads
+    from devflow_temporal.delivery_resources import read_private, write_private
+
+    state_dir = tmp_path / 'runs/original'
+    path = state_dir / 'gates-admission/evidence/prechecks/native/native-process.json'
+    spec = {'run_id': 'original', 'state_dir': str(state_dir), 'policy_digest': 'a' * 64,
+            'policy': {'native_identity': {'runtime_payload_sha256': '1' * 64}}}
+    process = {'journal': str(path), 'exit_code': 1, 'cleanup': 'observed-native-confirmed',
+               'runtime_identity': {'revision': '2' * 40, 'runtime_payload_sha256': '2' * 64}}
+    journal = {'intent': {'run_id': 'original', 'policy_digest': 'b' * 64},
+               'runtime_identity': deepcopy(process['runtime_identity']),
+               'result': deepcopy(process)}
+    previous = {'original_spec': {'policy_digest': 'b' * 64},
+                'execution_spec': {'policy_digest': 'a' * 64}}
+    if change == 'projection':
+        process['runtime_identity']['runtime_payload_sha256'] = '3' * 64
+    elif change == 'missing-projection':
+        del process['runtime_identity']
+    elif change == 'journal':
+        journal['runtime_identity']['runtime_payload_sha256'] = '3' * 64
+    elif change == 'run':
+        journal['intent']['run_id'] = 'other'
+    elif change == 'policy':
+        journal['intent']['policy_digest'] = 'c' * 64
+    elif change == 'path':
+        process['journal'] = str(tmp_path / 'other/native-process.json')
+    elif change == 'malformed':
+        process['runtime_identity']['runtime_payload_sha256'] = True
+        journal['runtime_identity'] = deepcopy(process['runtime_identity'])
+        journal['result'] = deepcopy(process)
+    write_private(path, journal)
+    before = path.read_bytes()
+    state = {'checks': {'prepublish': {'results': [{'native_process': process}]}}}
+    if change:
+        with pytest.raises(ValueError, match='gate .*controller'):
+            _consumed_payloads(spec, state, previous)
+    else:
+        assert _consumed_payloads(spec, state, previous) == {'2' * 64}
+        assert read_private(path)['intent']['policy_digest'] != spec['policy_digest']
+    assert path.read_bytes() == before
+
+
+def test_historical_gate_processes_keep_their_frozen_runtime_comparison(tmp_path):
+    from devflow_temporal.delivery_gate_retry import _consumed_payloads
+    from devflow_temporal.delivery_resources import write_private
+
+    path = tmp_path / 'runs/original/native-process.json'
+    process = {'journal': str(path), 'exit_code': 1, 'cleanup': 'observed-native-confirmed'}
+    write_private(path, {'intent': {'run_id': 'original', 'policy_digest': 'a' * 64},
+                         'result': process})
+    spec = {'run_id': 'original', 'state_dir': str(path.parent), 'policy_digest': 'a' * 64,
+            'policy': {'native_identity': {'runtime_payload_sha256': '1' * 64}}}
+    assert _consumed_payloads(spec, {'roles': [], 'checks': {
+        'prepublish': {'results': [{'native_process': process}]}}}, None) == {'1' * 64}

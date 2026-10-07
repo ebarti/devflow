@@ -21,19 +21,24 @@ from .delivery_browser_qa import run_browser_qa as execute_browser_qa
 from .delivery_config import publication_base_ref
 from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
 from .delivery_output import observed_test_count, rejection_causes, visible_output
+from .delivery_publication import conventional, publication_summary
 from .delivery_store import DeliveryStore, _now
 
 
 def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 120) -> str:
+    nul_output = argv[0] == 'git' and '-z' in argv
     result = subprocess.run(
-        argv, cwd=cwd, text=True, capture_output=True, timeout=timeout, check=False
+        argv, cwd=cwd, text=not nul_output, capture_output=True, timeout=timeout, check=False
     )
+    stdout = result.stdout.decode('utf-8', 'surrogateescape') if nul_output else result.stdout
+    stderr = result.stderr.decode('utf-8', 'surrogateescape') if nul_output else result.stderr
     if result.returncode:
         raise RuntimeError(
             f"command failed ({result.returncode}): {argv[0]} {argv[1]}: "
-            + (result.stderr.strip() or result.stdout.strip())[:500]
+            + (stderr.strip() or stdout.strip())[:500]
         )
-    return result.stdout.strip()
+    # Preserve exact filenames, including CR/LF and leading/trailing whitespace.
+    return stdout if nul_output else stdout.strip()
 
 
 def _git(path: Path, *args: str) -> str:
@@ -70,7 +75,14 @@ def conventional_subject(goal: str) -> str:
 
 
 def _conventional_subject(subject: str) -> bool:
-    return bool(re.fullmatch(r"[a-z][a-z0-9-]*(?:\([^()\r\n]+\))?!?: \S.*", subject))
+    return conventional(subject)
+
+
+def publication_subject(spec: dict[str, Any]) -> str:
+    """Use frozen summary metadata; preserve old goals for historical specs."""
+    if "publication_summary" in spec:
+        return publication_summary(spec["goal"], spec["publication_summary"])
+    return conventional_subject(spec["goal"])
 
 
 def publication_title(goal: str) -> str:
@@ -99,6 +111,10 @@ class CheckPreparationFailure(ValueError):
         }]
 
 
+class CheckCancelledBeforeLaunch(RuntimeError):
+    """Cancellation was observed before entering the next native process."""
+
+
 class DeliveryBroker:
     def __init__(self, store: DeliveryStore, spec: dict[str, Any]) -> None:
         from .delivery_preparation import require_native_execution
@@ -113,6 +129,9 @@ class DeliveryBroker:
 
         self.evidence_dir = _gate_evidence_root(spec)
         self.effect_namespace = ""
+        self.check_cancelled = lambda: False
+        self.native_cleanup_confirmed = True
+        self.publication_may_have_effect = True
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -324,12 +343,40 @@ class DeliveryBroker:
                 relevant.append((name, _sha256(file)))
         return hashlib.sha256(canonical_json(relevant).encode()).hexdigest()
 
-    def _changed_paths(self, base_ref: str = "HEAD") -> set[str]:
-        changed = set(_git(self.checkout, "diff", "--name-only", base_ref).splitlines())
+    def _changed_paths(self, base_ref: str = "HEAD", *, include_index: bool = False) -> set[str]:
+        changed = set(_git(
+            self.checkout, "diff", "--no-renames", "--name-only", "-z", base_ref, "--"
+        ).split('\0'))
+        if include_index:
+            changed.update(_git(
+                self.checkout, 'diff', '--cached', '--no-renames', '--name-only', '-z',
+                base_ref, '--'
+            ).split('\0'))
         changed.update(
-            _git(self.checkout, "ls-files", "--others", "--exclude-standard").splitlines()
+            _git(self.checkout, "ls-files", "--others", "--exclude-standard", "-z").split('\0')
         )
         return {item for item in changed if item}
+
+    def validate_candidate_scope(self) -> set[str]:
+        changed = self._changed_paths(self.spec['base_sha'], include_index=True)
+        escaped = changed - set(self.spec['policy'].get('allowed_paths', []))
+        if escaped:
+            raise ValueError(
+                'candidate changed outside allowed paths: ' + ', '.join(sorted(escaped))
+            )
+        return changed
+
+    def admit_implementation(self, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        """Retain source/index, but leave every new commit to publication."""
+        expected = input_candidate['head']
+        try:
+            _git(self.checkout, 'merge-base', '--is-ancestor', expected, 'HEAD')
+        except RuntimeError as exc:
+            raise ValueError('implementation commit ancestry changed during its role') from exc
+        self.validate_candidate_scope()
+        if _git(self.checkout, 'rev-parse', 'HEAD') != expected:
+            _git(self.checkout, 'reset', '--soft', expected)
+        return self.candidate()
 
     def gate_checkout(self, role: str, iteration: int, candidate: dict[str, Any]) -> Path:
         if role not in {"review", "verify"}:
@@ -522,7 +569,7 @@ class DeliveryBroker:
                 command = [
                     native_dependencies["store"] if item == "/store" else item for item in argv
                 ]
-                native_result = NativeProcess(
+                native_result = self._run_native_check(NativeProcess(
                     self.spec,
                     evidence_dir / check["id"] / "native",
                     argv=native_check_argv(self.spec, profile, cwd, command),
@@ -530,7 +577,7 @@ class DeliveryBroker:
                     environment=environment,
                     timeout=int(check.get("timeout_seconds", 600)),
                     cancelled=self._native_cancelled,
-                ).run()
+                ))
                 self._record_generated(generated)
                 if native_result["cleanup"] == "unknown":
                     return {
@@ -755,8 +802,6 @@ class DeliveryBroker:
         tools["native_builder"] = builder
         receipt = evidence / "native-addon-preparation.json"
         if receipt.exists():
-            from .delivery_native_process import reconcile_process
-
             old = read_private(receipt)
             if old["candidate_id"] != candidate["id"] or old["native_addon_authority"] != authority:
                 raise ValueError("native addon preparation receipt has stale source authority")
@@ -777,7 +822,8 @@ class DeliveryBroker:
             for row in old["results"]:
                 if (
                     _sha256(Path(row["log"])) != row["log_sha256"]
-                    or reconcile_process(Path(row["native_process"]["journal"]))["cleanup"]
+                    or self._reconcile_native_check(
+                        Path(row["native_process"]["journal"]))["cleanup"]
                     != "observed-native-confirmed"
                 ):
                     raise ValueError("native addon process/log readback changed across replay")
@@ -860,11 +906,29 @@ class DeliveryBroker:
         return result
 
     def _native_cancelled(self) -> bool:
+        if self.check_cancelled():
+            return True
         with self.store._connect() as db:
             row = db.execute(
                 "SELECT phase FROM delivery_runs WHERE run_id=?", (self.spec["run_id"],)
             ).fetchone()
         return row is not None and row["phase"] == "cancelling"
+
+    def _run_native_check(self, process) -> dict:
+        if self._native_cancelled():
+            raise CheckCancelledBeforeLaunch("native check cancelled before launch")
+        self.native_cleanup_confirmed = False
+        result = process.run()
+        self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
+        return result
+
+    def _reconcile_native_check(self, journal: Path) -> dict:
+        from .delivery_native_process import reconcile_process
+
+        self.native_cleanup_confirmed = False
+        result = reconcile_process(journal)
+        self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
+        return result
 
     def _register_generated(self, checkout: Path, names: list[str]) -> list[Path]:
         from .delivery_resources import RunResources
@@ -934,14 +998,14 @@ class DeliveryBroker:
         environment.update({
             "COREPACK_ENABLE_NETWORK": "0", "npm_config_registry": "https://" + REGISTRY + "/",
         })
-        process = NativeProcess(
+        process = self._run_native_check(NativeProcess(
             self.spec, folder / "process",
             argv=native_check_argv(self.spec, profile, staging, [
                 "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
                 "--ignore-pnpmfile", "--store-dir", str(dependencies),
             ]),
             cwd=staging, environment=environment, timeout=1800, cancelled=self._native_cancelled,
-        ).run()
+        ))
         unchanged = hashes == write_frozen_inputs(staging, inputs)
         passed = (
             process["exit_code"] == 0
@@ -1246,7 +1310,43 @@ class DeliveryBroker:
             if author not in signers:
                 raise ValueError("owned commit lacks its author Signed-off-by trailer: " + commit)
 
+    def _bind_pending_publication(
+        self, key: str, head: str, number: int | None, *, remote_confirmed: bool = False,
+    ) -> None:
+        """Freeze observed identity in the existing effect before remote mutation."""
+        with self.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = db.execute(
+                "SELECT state,observed_json FROM delivery_effects WHERE effect_key=?", (key,),
+            ).fetchone()
+            if saved is None or saved["state"] not in {"pending", "complete"}:
+                raise ValueError("original publication effect is no longer recoverable")
+            previous = json.loads(saved["observed_json"] or "null")
+            if previous:
+                if (previous["head"] != head
+                        or number is not None and previous.get("number") not in {None, number}):
+                    raise ValueError("original publication identity changed")
+                number = previous.get("number") or number
+                remote_confirmed |= previous.get("remote_confirmed", False)
+            if saved["state"] == "complete":
+                # The original activity may acknowledge while this read is in flight.
+                # Preserve its completed result rather than replacing it with a partial observation.
+                return
+            db.execute(
+                "UPDATE delivery_effects SET observed_json=? WHERE effect_key=?",
+                (canonical_json({"head": head, "number": number,
+                                 "remote_confirmed": remote_confirmed}), key),
+            )
+
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        # Only this invocation's confirmed pre-mutation failure can release uncertainty.
+        # Any retained original effect may belong to an earlier lost completion.
+        if self.spec.get("publication_readback_version") == 1:
+            with self.store._connect() as db:
+                prior = db.execute("SELECT 1 FROM delivery_effects WHERE effect_key=?",
+                                   (f"publish:{self.spec['run_id']}:{iteration}",)).fetchone()
+            self.publication_may_have_effect = prior is not None
+        self.validate_candidate_scope()
         publication_branch = self._publication_base_ref()
         self._validate_publication_commits()
         key = f"publish:{self.spec['run_id']}:{iteration}"
@@ -1258,9 +1358,9 @@ class DeliveryBroker:
             if found is None or found["headRefOid"] != done["head"]:
                 return {"state": "pending", "reason": "pr_head_readback", "head": done["head"]}
             return done
-        if before["id"] != input_candidate["id"] and self._changed_paths():
+        if before["id"] != input_candidate["id"] and self._changed_paths(include_index=True):
             raise RuntimeError("candidate changed during publication recovery")
-        changed = self._changed_paths()
+        changed = self._changed_paths(include_index=True)
         allowed = set(self.spec["policy"].get("allowed_paths", []))
         if changed - allowed:
             raise ValueError(
@@ -1278,7 +1378,13 @@ class DeliveryBroker:
                     ": filter: unset"
                 ):
                     raise ValueError("candidate path would invoke a Git clean filter")
-            _git(self.checkout, "add", "--", *sorted(changed))
+            indexed = set(_git(self.checkout, 'ls-files', '-z').split('\0'))
+            stageable = sorted(path for path in changed
+                               if path in indexed or os.path.lexists(self.checkout / path))
+            # Already-staged removals are absent from both index and worktree;
+            # preserve them without passing an unmatched pathspec to git add.
+            if stageable:
+                _git(self.checkout, '--literal-pathspecs', 'add', '--all', '--', *stageable)
             if _git(self.checkout, "diff", "--cached", "--name-only"):
                 _git(
                     self.checkout,
@@ -1287,12 +1393,14 @@ class DeliveryBroker:
                     "commit",
                     "--signoff",
                     "-m",
-                    conventional_subject(self.spec["goal"]),
+                    publication_subject(self.spec),
                 )
         self._validate_publication_commits()
         head = _git(self.checkout, "rev-parse", "HEAD")
         if head == self.spec["base_sha"]:
             raise ValueError("no meaningful commit is available for publication")
+        if self.spec.get("publication_readback_version") == 1:
+            self._bind_pending_publication(key, head, existing["number"] if existing else None)
         remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
         if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
             raise RuntimeError("Git push destination changed from the admitted origin")
@@ -1313,20 +1421,26 @@ class DeliveryBroker:
                 )
                 if ancestry.returncode != 0:
                     raise RuntimeError("remote feature branch diverged")
+            self.publication_may_have_effect = True
             _git(self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}")
+        if self.spec.get("publication_readback_version") == 1:
+            self._bind_pending_publication(
+                key, head, existing["number"] if existing else None, remote_confirmed=True,
+            )
         if existing is None:
-            title = publication_title(self.spec["goal"])
+            title = publication_title(publication_subject(self.spec))
             body = self.state_dir / "pull-request.md"
             body.write_text(
                 self.spec["policy"].get("pr_body")
                 or (
                     f"{title}\n\n"
-                    f"Implements issue {self.spec['issue_url']} under the accepted local plan. "
+                    f"Addresses {self.spec['issue_url']} under the accepted local plan. "
                     "This PR is published for review and remains unmerged.\n"
                 ),
                 encoding="utf-8",
             )
             os.chmod(body, 0o600)
+            self.publication_may_have_effect = True
             _run(
                 [
                     "gh",
@@ -1397,6 +1511,24 @@ class DeliveryBroker:
             or saved["request_json"] != canonical_json(request)
         ):
             raise ValueError("publication effect does not match this candidate")
+        if saved["state"] == "complete" and self.spec.get("publication_readback_version") == 1:
+            done = json.loads(saved["observed_json"])
+            if expected_head is not None and expected_head != done["head"]:
+                raise ValueError("publication expected head differs from original effect")
+            if expected_pr_number is not None and expected_pr_number != done["number"]:
+                raise ValueError("publication expected PR differs from original effect")
+            expected_head, expected_pr_number = done["head"], done["number"]
+        elif self.spec.get("publication_readback_version") == 1:
+            original = json.loads(saved["observed_json"] or "null")
+            if not original or not original.get("head"):
+                raise ValueError("original publication head has not been observed")
+            if expected_head is not None and expected_head != original["head"]:
+                raise ValueError("publication expected head differs from original effect")
+            if (expected_pr_number is not None and original.get("number") is not None
+                    and expected_pr_number != original["number"]):
+                raise ValueError("publication expected PR differs from original effect")
+            expected_head = original["head"]
+            expected_pr_number = original.get("number") or expected_pr_number
         current = self.candidate()
         head = current["head"]
         if expected_head is not None and head != expected_head:
@@ -1415,10 +1547,32 @@ class DeliveryBroker:
             raise ValueError("published commit does not descend directly from checked candidate")
         if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
             raise ValueError("published Git destination changed")
-        remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        try:
+            remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+            if self.spec.get("publication_readback_version") == 1:
+                raise BrokerReadbackUnavailable("published branch readback unavailable") from exc
+            raise
+        if (self.spec.get("publication_readback_version") == 1 and saved["state"] == "pending"
+                and not original.get("remote_confirmed")
+                and (not remote or (remote.split()[0] != head
+                                    and remote.split()[0] == input_candidate["head"]))):
+            return {"state": "pending", "reason": "original_push_readback", "head": head}
         if not remote or remote.split()[0] != head:
             raise ValueError("remote feature branch differs from the published checkout")
+        if saved["state"] == "pending" and self.spec.get("publication_readback_version") == 1:
+            self._bind_pending_publication(key, head, expected_pr_number, remote_confirmed=True)
         found = self._existing_pr()
+        if found is not None:
+            if (self.spec.get("publication_readback_version") == 1
+                    and expected_pr_number is not None and found["number"] != expected_pr_number):
+                raise ValueError("publication resolved to a different PR")
+            if (self.spec.get("publication_readback_version") == 1
+                    and found["headRefOid"] not in {head, input_candidate["head"]}):
+                raise ValueError("owned PR head changed from the original publication")
+        if (found is not None and saved["state"] == "pending"
+                and self.spec.get("publication_readback_version") == 1):
+            self._bind_pending_publication(key, head, found["number"], remote_confirmed=True)
         if found is None or found["headRefOid"] != head:
             return {"state": "pending", "reason": "pr_head_readback", "head": head}
         if expected_pr_number is not None and found["number"] != expected_pr_number:
@@ -1450,27 +1604,38 @@ class DeliveryBroker:
             self._finish_effect(key, result)
         return result
 
-    async def checks(self, pr: dict[str, Any], *, timeout_seconds: int = 1200) -> dict[str, Any]:
+    async def checks(
+        self, pr: dict[str, Any], *, timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
         required = set(self.spec["policy"].get("required_ci", []))
         if not required:
             return {"state": "unverified", "reason": "no required CI checks configured"}
+        patient = "ci_wait_seconds" in self.spec["policy"]
+        if timeout_seconds is None:
+            timeout_seconds = self.spec["policy"].get("ci_wait_seconds", 1200)
         deadline = asyncio.get_running_loop().time() + timeout_seconds
+        delay, checks, diagnostic = 15, {}, None
+        argv = ["gh", "pr", "view", str(pr["number"]), "--repo", self.spec["github_repo"],
+                "--json", "headRefOid,statusCheckRollup"]
         while True:
-            found = json.loads(
-                _run(
-                    [
-                        "gh",
-                        "pr",
-                        "view",
-                        str(pr["number"]),
-                        "--repo",
-                        self.spec["github_repo"],
-                        "--json",
-                        "headRefOid,statusCheckRollup",
-                    ],
-                    timeout=60,
-                )
-            )
+            try:
+                if patient:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    found = json.loads(await asyncio.to_thread(
+                        _run, argv, timeout=max(1, min(60, remaining))))
+                else:
+                    found = json.loads(_run(argv, timeout=60))
+            except (RuntimeError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
+                if not patient:
+                    raise
+                diagnostic = str(exc)[:500]
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return {"state": "pending", "checks": checks, "reason": "CI deadline reached",
+                            "diagnostic": diagnostic}
+                await asyncio.sleep(min(delay, remaining))
+                delay = min(delay * 2, 60)
+                continue
             if found["headRefOid"] != pr["head"]:
                 return {"state": "stale", "reason": "PR head changed while checks were pending"}
             checks = {
@@ -1489,4 +1654,7 @@ class DeliveryBroker:
                 return {"state": "passed", "checks": checks, "head": pr["head"]}
             if asyncio.get_running_loop().time() >= deadline:
                 return {"state": "pending", "checks": checks, "reason": "CI deadline reached"}
-            await asyncio.sleep(15)
+            remaining = deadline - asyncio.get_running_loop().time()
+            await asyncio.sleep(min(delay, remaining) if patient else 15)
+            if patient:
+                delay = min(delay * 2, 60)

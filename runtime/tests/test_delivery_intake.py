@@ -13,10 +13,10 @@ from pathlib import Path
 import httpx
 import pytest
 from agent_runtime_kit import FilesystemAccess
+from temporal_test_server import local_temporal
 from temporalio import activity
 from temporalio.client import WorkflowHistory
 from temporalio.exceptions import ApplicationError
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 from devflow_temporal.contracts import digest
@@ -297,7 +297,7 @@ async def test_raw_goal_questions_revision_restart_plan_change_and_acceptance(
         delivery_project, delivery_prepare, delivery_intake, delivery_accept_plan,
         tracker_start, role_stub,
     ]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "intake-temporal.sqlite3"),
     ) as environment:
@@ -449,7 +449,7 @@ async def test_cancellation_while_waiting_for_intake(intake_fixture, tmp_path, r
         calls.append(payload)
         return {"status": "blocked", "candidate": payload["candidate"]}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "cancel-temporal.sqlite3"),
     ) as environment:
@@ -624,7 +624,7 @@ async def test_automatic_intake_reaches_implementation_without_plan_answer(
 
     activities = [delivery_project, delivery_prepare, delivery_intake, accept_plan,
                   tracker, implement]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "automatic-temporal.sqlite3"),
     ) as environment:
@@ -718,8 +718,9 @@ async def test_pre_policy_intake_history_replays_with_original_human_gate():
 
 
 @pytest.mark.parametrize("approval", ["automatic", "required", None])
+@pytest.mark.parametrize("provider_limit", [None, 1, 3])
 def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
-    intake_fixture, approval
+    intake_fixture, approval, provider_limit
 ):
     path, request = intake_fixture
     if approval is not None:
@@ -728,10 +729,20 @@ def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
     store = create_app(path).state.delivery.store
     store.submit(request)
     spec = store.spec("run-1")
+    if provider_limit is None:
+        spec["policy"].pop("provider_max_attempts")
+    else:
+        spec["policy"]["provider_max_attempts"] = provider_limit
+    spec["policy_digest"] = digest(spec["policy"])
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'",
+                   (json.dumps(spec),))
     if approval is None:
         # Historical durable input, not a new public submission.
         spec.pop("plan_approval")
         spec.pop("blocking_questions_version")
+        spec.pop("publication_summary")
+        spec["goal"] += ". Preserve the existing detailed execution instructions."
         with store._connect() as db:
             db.execute("UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'",
                        (json.dumps(spec),))
@@ -750,8 +761,14 @@ def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
                                    hashlib.sha256(amended_path.read_bytes()).hexdigest(),
                                    ["tests/fixture.py"])
     assert effective.get("plan_approval") == original.get("plan_approval")
+    assert effective["policy"].get("provider_max_attempts") == original["policy"].get(
+        "provider_max_attempts")
+    assert ("provider_max_attempts" in effective["policy"]) == (
+        "provider_max_attempts" in original["policy"])
     assert ("plan_approval" in effective) == ("plan_approval" in original)
     assert effective.get("origin_thread_id") == original.get("origin_thread_id")
+    assert effective.get("publication_summary") == original.get("publication_summary")
+    assert ("publication_summary" in effective) == ("publication_summary" in original)
     assert effective.get("blocking_questions_version") == original.get("blocking_questions_version")
     assert ("blocking_questions_version" in effective) == ("blocking_questions_version" in original)
     assert effective["accepted_plan"] == original["accepted_plan"]

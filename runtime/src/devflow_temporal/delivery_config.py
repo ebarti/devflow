@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from .contracts import RUN_ID_RE, digest
 from .delivery_native_guard import NATIVE_OVERRIDES
 from .delivery_origin import thread_uuid
+from .delivery_publication import publication_summary
 from .delivery_sandbox import validate_network_domain
 from .runtime_dependencies import locked_dependency_identity
 
@@ -88,6 +89,15 @@ class DeliveryConfig:
             raise ValueError("unsupported configured role provider")
         if value.get("execution_mode", "native-profile") not in {"native-profile", "trusted-local"}:
             raise ValueError("unsupported local execution mode")
+        slots = value.get("check_concurrency", 2)
+        if type(slots) is not int or not 1 <= slots <= 32:
+            raise ValueError("check_concurrency must be an integer between 1 and 32")
+        attempts = value.get("provider_max_attempts", 3)
+        if type(attempts) is not int or not 1 <= attempts <= 3:
+            raise ValueError("provider_max_attempts must be between 1 and 3")
+        ci_wait = value.get("ci_wait_seconds", 10800)
+        if type(ci_wait) is not int or not 60 <= ci_wait <= 43200:
+            raise ValueError("ci_wait_seconds must be between 60 and 43200")
         return cls(path=path.resolve(), raw=value)
 
     @property
@@ -117,6 +127,8 @@ class DeliveryConfig:
     def public_policy(self) -> dict[str, Any]:
         return {
             "roles": self.raw["roles"],
+            "provider_max_attempts": self.raw.get("provider_max_attempts", 3),
+            "ci_wait_seconds": self.raw.get("ci_wait_seconds", 10800),
             "repositories": [
                 {
                     "key": key,
@@ -132,9 +144,15 @@ class DeliveryConfig:
             "intake_enabled": "intake" in self.raw["roles"],
             "execution_backend": self.raw.get("execution_backend", "native-macos"),
             "execution_mode": self.raw.get("execution_mode", "native-profile"),
+            "max_attempts": self.raw.get("max_attempts", 3),
+            "max_repairs": self.raw.get("max_repairs", 2),
+            "tracker_retry_seconds": self.raw.get("tracker_retry_seconds", 600),
         }
 
-    def admit(self, supplied: dict[str, Any]) -> dict[str, Any]:
+    def admit(
+        self, supplied: dict[str, Any], *, _base_ref: str | None = None,
+        legacy_publication: bool = False,
+    ) -> dict[str, Any]:
         required = {
             "command_id",
             "run_id",
@@ -148,12 +166,21 @@ class DeliveryConfig:
         }
         optional = {
             "accepted_plan", "recovery_key", "supersedes_run_id",
-            "plan_approval", "origin_thread_id"
+            "plan_approval", "origin_thread_id", "publication_summary"
         }
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
             raise ValueError("required submit fields must be non-empty strings")
+        if "publication_summary" in supplied and supplied["publication_summary"] is None:
+            raise ValueError("publication_summary must be a non-empty conventional summary")
+        summary = (
+            {} if legacy_publication else {
+                "publication_summary": publication_summary(
+                    supplied["goal"], supplied.get("publication_summary")
+                )
+            }
+        )
         accepted_plan = supplied.get("accepted_plan")
         if "origin_thread_id" in supplied:
             thread_uuid(supplied["origin_thread_id"])
@@ -213,7 +240,13 @@ class DeliveryConfig:
         actual_remote = _git(source, "remote", "get-url", "origin")
         if actual_remote != repository["origin_url"]:
             raise ValueError("configured Git origin changed")
-        base_sha = _git(source, "rev-parse", supplied["base_ref"])
+        resolved_ref = supplied["base_ref"]
+        if _base_ref is not None:
+            branch = _base_ref.removeprefix("refs/remotes/origin/")
+            if resolved_ref not in {branch, "refs/heads/" + branch, "origin/" + branch, _base_ref}:
+                raise ValueError("fresh base changed the configured named branch")
+            resolved_ref = _base_ref
+        base_sha = _git(source, "rev-parse", resolved_ref)
         base_paths = _git(source, "ls-tree", "-r", "--name-only", base_sha).splitlines()
         if any(path == ".codex" or path.startswith(".codex/") for path in base_paths):
             raise ValueError("project Codex configuration is not admitted")
@@ -221,13 +254,15 @@ class DeliveryConfig:
         if expected and base_sha != expected:
             raise ValueError("base ref moved from the accepted plan")
         publication_branch = (
-            publication_base_ref(source, supplied["base_ref"], base_sha)
+            publication_base_ref(source, resolved_ref, base_sha)
             if self.raw.get("provider", "codex") == "codex" else None
         )
         state_dir = self.state_root / "runs" / supplied["run_id"]
         checkout = self.state_root / "checkouts" / supplied["run_id"]
         policy = {
             "roles": self.raw["roles"],
+            "provider_max_attempts": self.raw.get("provider_max_attempts", 3),
+            "ci_wait_seconds": self.raw.get("ci_wait_seconds", 10800),
             "checks": repository.get("checks", []),
             "prepublish_checks": repository.get("prepublish_checks", []),
             "browser_qa": repository.get("browser_qa"),
@@ -251,7 +286,15 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
+        maximum = self.raw.get("max_attempts", 3)
+        if type(maximum) is not int or not 1 <= maximum <= 10:
+            raise ValueError("max_attempts must be an integer between 1 and 10")
+        policy["max_attempts"] = maximum
         baseline_ids = repository.get("baseline_check_ids", [])
+        duration = self.raw.get("tracker_retry_seconds", 600)
+        if type(duration) is not int or not 60 <= duration <= 3600:
+            raise ValueError("tracker_retry_seconds must be an integer from 60 to 3600")
+        policy["tracker_retry_seconds"] = duration
         if (not isinstance(baseline_ids, list)
                 or any(not isinstance(item, str) for item in baseline_ids)
                 or len(set(baseline_ids)) != len(baseline_ids)):
@@ -456,13 +499,23 @@ class DeliveryConfig:
                     or not 30 <= qa["timeout_seconds"] <= 1800
                 ):
                     raise ValueError("browser QA requires positive count and bounded timeout")
+        publication_seconds = self.raw.get("publication_readback_seconds", 900)
+        if type(publication_seconds) is not int or not 30 <= publication_seconds <= 3600:
+            raise ValueError("publication_readback_seconds must be an integer from 30 to 3600")
         return {
             **supplied,
+            "publication_readback_version": 1,
+            "publication_readback_seconds": publication_seconds,
+            **summary,
             "plan_approval": plan_approval,
             "blocking_questions_version": 1,
+            "projection_retry_version": 1,
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
+            "automatic_retry_version": 1,
+            **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
+            "tracker_retry_version": 1,
             **({"baseline_checks_version": 1} if baseline_ids else {}),
             **(
                 {"preparation_version": 1}
@@ -552,6 +605,7 @@ def scope_amended_spec(
         "recovery_key", "supersedes_run_id",
         "plan_approval",
         "origin_thread_id",
+        "publication_summary",
     }
     from .delivery_preparation import require_native_execution
 
@@ -561,7 +615,17 @@ def scope_amended_spec(
         # Re-admit the original raw goal; its separately bound plan is immutable.
         supplied.pop("accepted_plan", None)
         supplied["plan_approval"] = original.get("plan_approval", "required")
-    effective = amended.admit(supplied)
+    # Re-admission of a historical frozen spec must not acquire new metadata.
+    effective = amended.admit(supplied, legacy_publication="publication_summary" not in original)
+    if "provider_max_attempts" in original["policy"]:
+        effective["policy"]["provider_max_attempts"] = original["policy"]["provider_max_attempts"]
+    else:
+        effective["policy"].pop("provider_max_attempts", None)
+    effective["policy_digest"] = digest(effective["policy"])
+    if "projection_retry_version" in original:
+        effective["projection_retry_version"] = original["projection_retry_version"]
+    else:
+        effective.pop("projection_retry_version", None)
     effective["accepted_plan"] = original["accepted_plan"]
     if "plan_approval" in original:
         effective["plan_approval"] = original["plan_approval"]
@@ -569,6 +633,33 @@ def scope_amended_spec(
         effective.pop("plan_approval")
     if "blocking_questions_version" not in original:
         effective.pop("blocking_questions_version")
+    for marker in ("automatic_retry_version", "retry_budget_version"):
+        if marker in original:
+            effective[marker] = original[marker]
+        else:
+            effective.pop(marker, None)
+    if "ci_wait_seconds" in original["policy"]:
+        effective["policy"]["ci_wait_seconds"] = original["policy"]["ci_wait_seconds"]
+    else:
+        effective["policy"].pop("ci_wait_seconds", None)
+    if "max_attempts" in original["policy"]:
+        effective["policy"]["max_attempts"] = original["policy"]["max_attempts"]
+    else:
+        effective["policy"].pop("max_attempts", None)
+    if "tracker_retry_version" in original:
+        effective["tracker_retry_version"] = original["tracker_retry_version"]
+    else:
+        effective.pop("tracker_retry_version", None)
+    if "tracker_retry_seconds" in original["policy"]:
+        effective["policy"]["tracker_retry_seconds"] = original["policy"]["tracker_retry_seconds"]
+    else:
+        effective["policy"].pop("tracker_retry_seconds", None)
+    effective["policy_digest"] = digest(effective["policy"])
+    for key in ("publication_readback_version", "publication_readback_seconds"):
+        if key in original:
+            effective[key] = original[key]
+        else:
+            effective.pop(key, None)
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
@@ -579,6 +670,8 @@ def scope_amended_spec(
             raise ValueError("scope amendment changed the admitted run identity")
     if effective.get("origin_thread_id") != original.get("origin_thread_id"):
         raise ValueError("scope amendment changed the originating thread")
+    if effective.get("publication_summary") != original.get("publication_summary"):
+        raise ValueError("scope amendment changed the publication summary")
     effective["request_digest"] = original["request_digest"]
     if "continuation" in original:
         effective["continuation"] = original["continuation"]

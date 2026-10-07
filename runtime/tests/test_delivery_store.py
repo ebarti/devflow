@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
 from temporalio.converter import DataConverter
@@ -130,9 +131,21 @@ def test_submit_claim_and_temporal_outbox_are_atomic_and_idempotent(service):
         store.submit({**request, "command_id": "command-3", "goal": "A different change"})
 
 
+def submit_historical_admission(store, request, monkeypatch):
+    """Set up a pre-budget admission for tests of retained legacy continuations."""
+    spec = store.config.admit(request)
+    spec.pop("automatic_retry_version", None)
+    spec.pop("retry_budget_version", None)
+    spec["policy"].pop("max_attempts", None)
+    spec["policy_digest"] = digest(spec["policy"])
+    with monkeypatch.context() as historical:
+        historical.setattr(DeliveryConfig, "admit", lambda *_args: copy.deepcopy(spec))
+        return store.submit(request)
+
+
 def _failed_published_repair_fixture(store, request, monkeypatch):
     """One published failed gate with sealed role/PR/cleanup evidence."""
-    store.submit(request)
+    submit_historical_admission(store, request, monkeypatch)
     store.mark_start(request["run_id"], accepted=True)
     spec = store.spec(request["run_id"])
     broker = DeliveryBroker(store, spec)
@@ -736,7 +749,7 @@ async def test_public_scope_amendment_dispatches_one_original_session_temporal_r
     service, monkeypatch, image_outage
 ):
     store, request = service
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
         store.config.raw["queue"] = "scope-amendment-public-test"
         store.config.path.write_text(json.dumps(store.config.raw))
@@ -843,7 +856,7 @@ async def test_public_prelaunch_retry_without_required_ci_reaches_temporal_role(
     service, monkeypatch
 ):
     store, request = service
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
         store.config.raw["queue"] = "prelaunch-retry-public-test"
         store.config.path.write_text(json.dumps(store.config.raw))
@@ -1885,7 +1898,7 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     assert not (copied / "codex" / "config.toml").exists()
     assert (home / "codex" / "auth.json").read_text() == "old-auth-must-not-copy\n"
 
-    class ReadySupervisor:
+    class ReadySupervisor(DeliverySupervisor):
         async def run(self, role_request):
             assert role_request["resume_session"] == session_id
             assert role_request["continuation"] is True
@@ -1899,7 +1912,7 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
 
     monkeypatch.setattr(
         "devflow_temporal.delivery_activities.get_supervisor",
-        lambda _store: ReadySupervisor(),
+        lambda _store: ReadySupervisor(_store, capacity=2),
     )
     ready = asyncio.run(
         delivery_role(
@@ -2146,7 +2159,7 @@ async def test_implementer_admits_net_feature_diff_against_frozen_base(
     broker = DeliveryBroker(store, spec)
     before = broker.prepare()["candidate"]
 
-    class ReadySupervisor:
+    class ReadySupervisor(DeliverySupervisor):
         async def run(self, _request):
             if change in {"committed", "uncommitted", "reverted"}:
                 (broker.checkout / "README.md").write_text("Feature\n")
@@ -2158,7 +2171,7 @@ async def test_implementer_admits_net_feature_diff_against_frozen_base(
             return {"status": "pass", "summary": "Ready for controller checks", "findings": []}
 
     monkeypatch.setattr("devflow_temporal.delivery_activities.get_supervisor",
-                        lambda _store: ReadySupervisor())
+                        lambda _store: ReadySupervisor(_store, capacity=2))
     result = await delivery_role({"spec": spec, "role": "implement", "iteration": 0,
                                   "candidate": before})
     assert result["status"] == ("pass" if change in {"committed", "uncommitted"} else "blocked")
@@ -2295,6 +2308,10 @@ async def test_role_capacity_is_shared_across_original_and_amended_config_paths(
 @pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS Seatbelt required")
 async def test_supervisor_launches_one_sandboxed_fake_role_and_replays_receipt(service):
     store, request = service
+    config = json.loads(store.config.path.read_text())
+    config["repositories"]["fixture"]["allowed_paths"].append("devflow-fake-change.txt")
+    store.config.path.write_text(json.dumps(config))
+    store = DeliveryStore(DeliveryConfig.load(store.config.path))
     store.submit(request)
     spec = store.spec(request["run_id"])
     broker = DeliveryBroker(store, spec)
@@ -2629,7 +2646,7 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
             workflows=[DeliveryWorkflow],
             activities=activities,
         ):
-            service_runtime.store.submit(request)
+            submit_historical_admission(service_runtime.store, request, monkeypatch)
             await service_runtime.dispatch_once()
             blocked = await asyncio.wait_for(
                 client.get_workflow_handle("delivery-run-1").result(), timeout=35
@@ -2688,11 +2705,13 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
                         transport=httpx.ASGITransport(app=app), base_url=origin_url
                     ) as browser:
                         login = await browser.get("/api/session")
+                        # Pending events are durable projections, not a live mutation version.
+                        current = await repair_handle.query("status")
                         cancelled = await browser.post(
                             "/api/runs/run-1/cancel",
                             json={
                                 "command_id": "cancel-pending-repair",
-                                "expected_revision": detail["protocol_revision"],
+                                "expected_revision": current["revision"],
                                 "reason": "operator cancelled unavailable readback",
                             },
                             headers={
@@ -2754,6 +2773,16 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
     service, monkeypatch, failure_window
 ):
     original, request = service
+    # This test exercises historical manual continuation, frozen without automatic readback.
+    real_admit = DeliveryConfig.admit
+
+    def legacy_admit(config, supplied):
+        admitted = real_admit(config, supplied)
+        admitted.pop("publication_readback_version", None)
+        admitted.pop("publication_readback_seconds", None)
+        return admitted
+
+    monkeypatch.setattr(DeliveryConfig, "admit", legacy_admit)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -3228,7 +3257,7 @@ async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure
     async def tracker_stub(_payload):
         return {"state": "consistent"}
 
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         async with Worker(
             environment.client,
             task_queue=f"browser-qa-{qa_state}",
@@ -3306,7 +3335,7 @@ async def test_managed_check_unknown_keeps_terminal_cleanup_quarantined(unknown_
     async def checks_stub(_payload):
         return {"state": "unknown", "cleanup": "unknown"}
 
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         async with Worker(
             environment.client,
             task_queue=spec["run_id"],
@@ -3354,7 +3383,7 @@ async def test_managed_decision_wait_survives_worker_restart(service, tmp_path):
         return {"status": "blocked", "candidate": payload["candidate"]}
 
     activities = [delivery_project, delivery_prepare, tracker_start_stub, role_stub]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "decision-temporal.sqlite3")
     ) as environment:
         queue = "managed-decision-restart"
@@ -3451,7 +3480,7 @@ async def test_managed_cancel_wins_over_overlapping_failed_precheck(service, tmp
         tracker_start_stub,
         failing_precheck,
     ]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "cancel-temporal.sqlite3")
     ) as environment:
         async with Worker(
@@ -3521,7 +3550,7 @@ async def test_cancelled_role_with_unknown_teardown_retains_unknown_cleanup(serv
             "finish_reason": "recovery_unknown",
         }
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "unknown-cancel.sqlite3")
     ) as environment:
         async with Worker(

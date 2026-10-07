@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from temporalio.testing import WorkflowEnvironment
+from temporal_test_server import local_temporal
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import ControlledNativeTerminalFixture, controlled_terminal_tracker
@@ -147,7 +148,7 @@ def test_frozen_lock_external_sources_rejected_before_launch(tmp_path, target):
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS PNPM fetch required")
 @pytest.mark.asyncio
 async def test_fresh_native_registry_fetch_offline_install_check_and_resource_removal(
-    native_configuration,
+    native_configuration, tmp_path,
 ):
     config, request = native_configuration
     repo = config.raw["repositories"]["fixture"]
@@ -191,10 +192,27 @@ async def test_fresh_native_registry_fetch_offline_install_check_and_resource_re
         },
     ]
     repo.update(checks=checks, prepublish_checks=checks)
-    config.raw.update(
-        toolchain_roots=["/Users/eloibarti/.nvm/versions/node/v22.21.1"],
-        package_manager_cache="/Users/eloibarti/.cache/node/corepack",
+    corepack = shutil.which("corepack")
+    assert corepack, "native registry fixture requires Node with Corepack"
+    toolchain = Path(corepack).parent.parent.resolve(strict=True)
+    assert (toolchain / "bin/node").is_file()
+    cache = tmp_path / "corepack-cache"
+    cache.mkdir(mode=0o700)
+    # Bootstrap only the fixture's fixed package manager into an owned cache;
+    # the broker's actual frozen registry fetch still runs with network disabled
+    # for Corepack and retains every native boundary/cleanup assertion below.
+    subprocess.run(
+        [corepack, "install", "--global", "--cache-only", "pnpm@10.24.0"],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": str(toolchain / "bin") + os.pathsep + os.environ["PATH"],
+            "COREPACK_HOME": str(cache),
+            "COREPACK_ENABLE_NETWORK": "1",
+        },
+        check=True, timeout=60,
     )
+    config.raw.update(toolchain_roots=[str(toolchain)], package_manager_cache=str(cache))
     config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
     store.submit(request)
@@ -220,7 +238,7 @@ async def test_fresh_native_registry_fetch_offline_install_check_and_resource_re
         assert replay == dependency  # durable receipt, not another network fetch
         outcome = "delivered"
     finally:
-        async with await WorkflowEnvironment.start_local(
+        async with local_temporal(
             dev_server_existing_path=shutil.which("temporal"),
         ) as environment:
             async with Worker(

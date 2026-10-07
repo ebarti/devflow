@@ -13,10 +13,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import activity, workflow
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_intake import intake_fixture as intake_fixture
+from test_delivery_store import submit_historical_admission
 
 from devflow_temporal.delivery_activities import (
     delivery_finalize_resources,
@@ -203,7 +204,7 @@ def test_actual_native_preparation_cache_and_check_cleanup(native_store, monkeyp
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native grant/check boundary required")
 def test_authorized_gate_beyond_original_budget_runs_check_then_retries_cleanup(
-    native_configuration,
+    native_configuration, monkeypatch,
 ):
     config, request = native_configuration
     repo = config.raw["repositories"]["fixture"]
@@ -224,7 +225,7 @@ def test_authorized_gate_beyond_original_budget_runs_check_then_retries_cleanup(
         )
     config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
-    store.submit(request)
+    submit_historical_admission(store, request, monkeypatch)
     prepared = prepare_authority(store, store.submitted_spec(request["run_id"]))
     broker = DeliveryBroker(store, prepared)
     candidate = broker.prepare()["candidate"]
@@ -403,7 +404,7 @@ async def test_real_terminal_workflow_removes_owned_temps_before_projection(
     scratch.joinpath("owned-temp").write_text("temporary")
     evidence = Path(submitted["state_dir"]) / "durable-fixture.txt"
     evidence.write_text("controlled evidence; no model, tracker or PR publication")
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
     ) as environment:
         async with Worker(
@@ -460,7 +461,7 @@ async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(nati
             "cleanup": "confirmed",
         }
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
     ) as environment:
         async with Worker(
@@ -520,7 +521,7 @@ async def test_early_preparation_error_finalizes_registered_temporary_resources(
     submitted = store.submitted_spec(request["run_id"])
     scratch = RunResources(submitted).scratch("preparation", "allocated-before-failure")
     scratch.joinpath("owned-temp").write_text("temporary")
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
     ) as environment:
         async with Worker(
@@ -593,7 +594,7 @@ async def main():
         await asyncio.Event().wait()
 asyncio.run(main())
 """)
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "temporal-restart.sqlite3"),
     ) as environment:
@@ -741,7 +742,10 @@ main().catch(error=>{console.error(error);process.exit(1)});
     repository["browser_qa"] = qa
     config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
-    store.submit(request)
+    if iteration == 2:
+        submit_historical_admission(store, request, monkeypatch)
+    else:
+        store.submit(request)
     if iteration == 2:
         with store._connect() as db:
             db.execute(

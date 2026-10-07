@@ -9,7 +9,7 @@ from pathlib import Path
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
-from .delivery_client import client
+from .delivery_client import client, read_only_client
 from .delivery_origin import bind_origin, metadata_origin
 
 
@@ -20,7 +20,16 @@ def build_server(config_path: Path) -> FastMCP:
             "Discover configured repository keys and base refs with get_service before submission. "
             "The local service owns roles, planning and authorized GitHub delivery through an "
             "unmerged PR. Use status/evidence on request; dashboard SSE supplies progress. "
-            "Keep mutation IDs stable after uncertain responses; inspect the run before retrying."
+            "Preserve the original goal. Detailed or multi-sentence goals require a separate "
+            "publication_summary describing the actual change: a single line, at most 120 "
+            "characters including its Conventional Commit type, without extra sentences or "
+            "control/bidi characters. Include it on superseding submissions too. "
+            "Read tools require an already running service and never start it. "
+            "For an authorized delivery or mutation, use start_service if a prerequisite "
+            "read reports transport unavailable, then repeat the required reads. "
+            "Status/evidence requests and callbacks alone do not authorize startup. "
+            "Keep mutation IDs and the complete request stable after uncertain responses; "
+            "inspect the run before retrying."
         ),
     )
     read = ToolAnnotations(
@@ -32,12 +41,26 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool(annotations=read)
     def get_service() -> dict:
-        """Read local service health and public repository/role policy; starts it if stopped."""
+        """Read local health and public policy; report unavailable if stopped."""
+        return read_only_client(config_path).service()
+
+    @server.tool(annotations=write)
+    def start_service() -> dict:
+        """Start for an authorized delivery or mutation; may activate pending work."""
         return client(config_path).service()
 
     @server.tool(annotations=write)
     def submit_run(request_json: str, ctx: Context) -> dict:
-        """Submit a raw goal; plan_approval=required opts into human plan review."""
+        """Submit a goal with publication_summary for detailed execution instructions.
+
+        Preserve the original goal; detailed or multi-sentence instructions require
+        publication_summary describing the actual change as a single line, at most
+        120 characters including its Conventional Commit type, without extra
+        sentences or control/bidi characters. Include it on superseding submissions
+        too, preserving the predecessor's goal. A short single-sentence goal may
+        omit it; the service prefixes a plain goal with chore:. Keep the whole request
+        stable on retries. plan_approval=required opts into human plan review.
+        """
         value = json.loads(request_json)
         if not isinstance(value, dict):
             raise ValueError("submit request must be a JSON object")
@@ -46,19 +69,19 @@ def build_server(config_path: Path) -> FastMCP:
         return client(config_path).submit(bind_origin(value, metadata_origin(metadata)))
 
     @server.tool(annotations=read)
-    def list_runs() -> dict:
-        """List compact, factual status for recent local delivery runs."""
-        return client(config_path).runs()
+    def list_runs(limit: int = 50, cursor: str | None = None, archived: bool = False) -> dict:
+        """Read one bounded run page; pass next_cursor to explicitly read older history."""
+        return read_only_client(config_path).runs(limit=limit, cursor=cursor, archived=archived)
 
     @server.tool(annotations=read)
     def get_run(run_id: str) -> dict:
         """Read a run's current state, evidence index, and durable event timeline."""
-        return client(config_path).status(run_id)
+        return read_only_client(config_path).status(run_id)
 
     @server.tool(annotations=read)
     def read_evidence(run_id: str, evidence_id: str) -> dict:
         """Read one indexed, contained evidence artifact for a run."""
-        return client(config_path).evidence(run_id, evidence_id)
+        return read_only_client(config_path).evidence(run_id, evidence_id)
 
     @server.tool(annotations=write)
     def answer_decision(run_id: str, request_json: str) -> dict:
@@ -72,30 +95,16 @@ def build_server(config_path: Path) -> FastMCP:
         """Request a role-boundary cancellation with command ID and expected revision."""
         return client(config_path).cancel(run_id, json.loads(request_json))
 
-    @server.tool(annotations=read)
-    def recovery_preflight(run_id: str) -> dict:
-        """Inspect a stopped unpublished candidate and seal its policy recovery preconditions."""
-        return client(config_path).recovery_preflight(run_id)
-
-    @server.tool(annotations=write)
-    def recover_execution(run_id: str, request_json: str) -> dict:
-        """Grant one bounded trusted-local recovery using an explicit fresh preflight hash."""
-        return client(config_path).recover_execution(run_id, json.loads(request_json))
-
     @server.tool(annotations=write)
     def reconcile_tracker(run_id: str, request_json: str) -> dict:
         """Resume three terminal readback attempts; no candidate or model authority changes."""
         return client(config_path).reconcile_tracker(run_id, json.loads(request_json))
 
-    @server.tool(annotations=write)
-    def reconcile_published_metadata(run_id: str, request_json: str) -> dict:
-        """Explicit stopped-owned-range metadata correction, followed only by fresh gates."""
-        return client(config_path).reconcile_published_metadata(run_id, json.loads(request_json))
 
     @server.tool(annotations=read)
     def gates_only_preflight(run_id: str) -> dict:
         """Inspect authentic stopped investigation custody without admitting a role or effect."""
-        return client(config_path).gates_only_preflight(run_id)
+        return read_only_client(config_path).gates_only_preflight(run_id)
 
     @server.tool(annotations=write)
     def admit_gates_only(run_id: str, request_json: str) -> dict:
@@ -103,14 +112,10 @@ def build_server(config_path: Path) -> FastMCP:
         return client(config_path).admit_gates_only(run_id, json.loads(request_json))
 
     @server.tool(annotations=read)
-    def metadata_preflight(run_id: str, request_json: str) -> dict:
-        """Observe stopped owned publication authority before metadata reconciliation."""
-        return client(config_path).metadata_preflight(run_id, json.loads(request_json))
-
-    @server.tool(annotations=read)
     def repair_admission_preflight(run_id: str, request_json: str) -> dict:
         """Read the exact failed gate, effective lineage and bounded repair authority."""
-        return client(config_path).repair_admission_preflight(run_id, json.loads(request_json))
+        return read_only_client(config_path).repair_admission_preflight(
+            run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
     def continue_repair(run_id: str, request_json: str) -> dict:

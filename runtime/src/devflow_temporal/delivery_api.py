@@ -7,9 +7,11 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import subprocess
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -17,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
@@ -31,6 +33,8 @@ from .delivery_config import DeliveryConfig
 from .delivery_preparation import execution_retired
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
+
+logger = logging.getLogger(__name__)
 
 
 class LocalSession:
@@ -96,8 +100,16 @@ class DeliveryService:
         pending = self.store.pending_starts()
         starts = []
         for item in pending:
-            spec = self.store.effective_spec(item["run_id"])
-            if not execution_retired(spec) and self.store.owns_execution(spec):
+            try:
+                spec = self.store.effective_spec(item["run_id"])
+                owned = not execution_retired(spec) and self.store.owns_execution(spec)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                logger.warning(
+                    "Run %s skipped: execution specification unavailable (%s)",
+                    item["run_id"], type(exc).__name__,
+                )
+                continue
+            if owned:
                 starts.append((item, spec))
         # Retired and foreign outbox entries cannot authorize this service's transport.
         if pending and not starts:
@@ -150,6 +162,16 @@ class DeliveryService:
             self.store.mark_start(spec["run_id"], accepted=True)
 
     async def dispatch_loop(self) -> None:
+        self._retry_stopped = threading.Event()
+        self._retry_task = None
+        try:
+            await self._dispatch_loop()
+        finally:
+            self._retry_stopped.set()
+            if self._retry_task:
+                await asyncio.gather(self._retry_task, return_exceptions=True)
+
+    async def _dispatch_loop(self) -> None:
         while True:
             try:
                 await self.dispatch_once()
@@ -174,7 +196,34 @@ class DeliveryService:
                 # Any interrupted dispatching record becomes visible unknown on
                 # the next exclusive pump, without repeating its external effect.
                 pass
+            try:
+                await self.reconcile_closed_native_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Failed maintenance never acknowledges starts or releases claims.
+                pass
+            try:
+                from .delivery_automatic_retry import retry_once
+
+                if self._retry_task is None or self._retry_task.done():
+                    previous, self._retry_task = self._retry_task, None
+                    if previous:
+                        previous.result()
+                    self._retry_task = asyncio.create_task(asyncio.to_thread(
+                        retry_once, self.store, stopped=self._retry_stopped.is_set))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Unknown successor eligibility never authorizes another attempt.
+                pass
             await asyncio.sleep(5)
+
+    async def reconcile_closed_native_once(self) -> None:
+        from .delivery_orphans import reconcile_closed_native
+
+        client = await self.healthy_client()
+        await reconcile_closed_native(self.store, client)
 
     async def dispatch_questions_once(self) -> None:
         from .delivery_question_sender import pump_blocking_questions
@@ -277,9 +326,16 @@ def create_app(config_path: Path) -> FastAPI:
         }
 
     @app.get("/api/runs")
-    async def list_runs(request: Request, archived: bool = False) -> dict[str, Any]:
+    async def list_runs(
+        request: Request, archived: bool = False, limit: int = Query(50, ge=1, le=100),
+        cursor: str | None = Query(None, max_length=2048),
+    ) -> dict[str, Any]:
         _host(request)
-        return {"runs": service.store.list_runs(archived)}
+        try:
+            return await asyncio.to_thread(
+                service.store.list_runs_page, archived, limit=limit, cursor=cursor)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/statistics")
     async def statistics(request: Request) -> dict[str, Any]:
@@ -325,15 +381,6 @@ def create_app(config_path: Path) -> FastAPI:
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
-    @app.post("/api/runs/{run_id}/reconcile-published-metadata")
-    async def reconcile_published_metadata(request: Request, run_id: str) -> dict[str, Any]:
-        _mutation(request)
-        try:
-            return await asyncio.to_thread(
-                service.store.reconcile_published_metadata, run_id, await request.json(),
-            )
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/runs/{run_id}/gates-only-preflight")
     async def gates_only_preflight(request: Request, run_id: str) -> dict[str, Any]:
@@ -350,33 +397,6 @@ def create_app(config_path: Path) -> FastAPI:
             return await asyncio.to_thread(
                 service.store.admit_gates_only, run_id, await request.json(),
             )
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.get("/api/runs/{run_id}/recovery-preflight")
-    async def recovery_preflight(request: Request, run_id: str) -> dict[str, Any]:
-        _host(request)
-        try:
-            return await asyncio.to_thread(service.store.policy_recovery_precheck, run_id)
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/runs/{run_id}/recover-execution")
-    async def recover_execution(request: Request, run_id: str) -> dict[str, Any]:
-        _mutation(request)
-        try:
-            return await asyncio.to_thread(
-                service.store.recover_execution, run_id, await request.json(),
-            )
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/runs/{run_id}/metadata-preflight")
-    async def metadata_preflight(request: Request, run_id: str) -> dict[str, Any]:
-        _host(request)
-        try:
-            return await asyncio.to_thread(service.store.metadata_preflight,
-                                           run_id, await request.json())
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise HTTPException(409, str(exc)) from exc
 

@@ -1,3 +1,78 @@
+See [worker deployment migration](../docs/worker-versioning.md) for ordering
+compatibility, optional pinned worker registration and required owner steps.
+
+
+### Native provider turn retries
+
+New admissions freeze `provider_max_attempts` from the service configuration
+(default 3; allowed range 1–3). A finalized typed provider rate limit, overload or
+connection failure retries in the same owned session with backoff, within the
+original role deadline. An explicitly rejected overload at turn start shares
+that limit. Original failed turns, tool effects and token usage remain retained.
+Unknown completion, lost transport, cancellation, authentication or budget errors,
+collaboration conflicts and assessment findings never authorize another turn.
+Existing frozen runs without this setting retain their one-attempt behavior.
+
+### Fixed retry budgets
+
+New admissions use a fixed `max_attempts` ceiling of 3. Set `max_attempts`
+(1–10) in the service configuration to choose a different ceiling. The first budgeted admission freezes the issue's
+attempt ceiling; all previous admissions, including archived and failed runs,
+consume it. Changing run IDs, work IDs, or later configuration cannot reset that
+ceiling. Replaying an accepted command does not consume another attempt.
+
+These runs also keep their original `max_repairs` ceiling. Public continuations
+cannot add implementation iterations, and native roles cannot use historical
+grant rows to exceed it. Policy recovery also cannot grant positive iterations.
+Already-admitted histories without the frozen budget version retain their original
+behavior; new admissions from existing configurations use the new default.
+Budgets are scoped to one authoritative tracking database; separate databases cannot enforce a shared limit.
+These admission bounds also apply to automatic fresh attempts after safely closed transient failures.
+
+### Failure classification
+
+New original runs freeze `automatic_retry_version: 1` at admission. When they
+stop, `checks.failure` records a bounded reason, the controller phase and a
+`terminal` or `transient` classification. The default is terminal. Only typed
+activity transport failures/timeouts and recognized controller deadline results
+are transient; model findings, invalid inputs, scope violations and failed or
+changed-head CI remain terminal. Returned provider findings also remain terminal.
+
+This is a diagnostic, not permission to execute again. Unknown cleanup and
+publication effects retain their existing guards. The service may schedule one
+fresh successor for the latest safely closed, unpublished issue attempt, within
+its original total ceiling. Unknown observations wait with bounded backoff;
+unresolved operator effects prevent another admission. Classification never
+extends a budget. Scope amendments preserve the original version markers and
+attempt ceiling. Existing workflows and historical continuation paths keep their
+original payloads. Operator steps: deploy through the usual service update when
+ready. No database schema migration is needed, but review issue attempt counts
+before deploying: archived, failed and superseded prior admissions all count.
+Choose `max_attempts` (1–10) before the first post-deploy admission if additional
+headroom is needed. Issues with three prior admissions exhaust the default; ten
+prior admissions exhaust every supported setting. Once frozen, the ceiling cannot
+be raised by changing configuration. New runs cannot receive positive-iteration
+continuations, including stopped resumes, repair grants, title repair or policy
+recovery. Existing admitted histories keep their original frozen behavior.
+
+### QA findings require a passing assessment
+
+New investigation assessment adjudication requests are rejected. A disposition
+cannot turn failed QA into a delivered result; repair the findings and obtain a
+passing assessment. Already consumed command responses remain readable without
+creating another admission. Historical completed results are preserved for replay.
+
+Before deploying, check every owning dashboard's run details for
+`investigation_adjudication` and unfinished `investigation_adjudication_queued`,
+`adjudication_preflight`, or `waiting_ci` executions. Finish or cancel those legacy
+paths through the normal controls first. If an unfinished legacy tail nevertheless
+reaches its terminal transition after upgrade, it blocks, retains its original
+QA/findings, and performs normal cleanup and tracker reconciliation.
+
+The two `delivery-adjudication*-history.json` fixtures were recorded from
+`c04f00eb43eb225728b63c82026ffe97a41cafc2` on an isolated in-memory Temporal server using synthetic inputs
+and a fixed fixture worker identity. They cover both completed and waiting-CI
+histories; the legacy workflow body is retained solely for replay compatibility.
 
 ### Rerun gates after a runtime repair
 
@@ -17,6 +92,11 @@ executes that recipe with `{report_path}` bound to an owned artifact path. The
 controller retains the real report, metadata and plan hashes, and counts actual
 test cases. Missing, malformed, empty, changed or failing reports cannot pass.
 Existing configured checks continue to run unchanged.
+
+Named JUnit and static recipes come from the admitted base commit in the source
+repository. Candidate edits to `scripts/checks.toml` cannot change those commands;
+a recipe update takes effect for runs admitted after it merges. Metadata hashes
+refer to the exact base blob, while the checks still execute against the candidate.
 
 A finalized published candidate whose passed local assessment omitted such a
 requested report may receive one report assessment through `published_gate_retry`
@@ -70,7 +150,9 @@ independent review, QA, CI, tracker and cleanup stages proceed. The historical
 failure remains recorded and the delivery cannot count as a first-pass success.
 
 A second prepublication admission is available only after the first one finalized
-another failed gate and the installed native runtime payload has changed. It
+another failed gate and the installed native runtime payload differs from the
+controller payloads that actually executed its gates. Queued preparation is not
+treated as the consumed runtime after an owner source update. It
 retains the first admission and check evidence in separate namespaces, keeps the
 same feature candidate and grants zero implementation iterations. A third
 admission, an unchanged runtime, or any changed feature authority is rejected.
@@ -99,3 +181,11 @@ command can now continue a finalized native run: it authenticates the stopped
 result and cleanup, reacquires the same issue, preserves historical evidence,
 refreshes runtime preparation and resumes the original implementation session.
 It keeps the existing PR and allows only the explicitly requested repair grant.
+### Required CI waiting
+
+New admissions freeze `ci_wait_seconds` from service configuration (default
+10,800 seconds; range 60–43,200). Pending checks and unavailable GitHub readbacks
+use bounded backoff while the activity heartbeats. GitHub reads run off the
+worker loop, and required success must still match the exact PR head. A failed
+check or changed head stops immediately; the deadline leaves CI pending.
+Older frozen specifications keep their original twenty-minute waiting behavior.

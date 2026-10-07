@@ -324,7 +324,8 @@ def test_target_only_build_still_requires_frozen_allowlist(addon, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "drift", [None, "source", "binary", "tools", "environment", "log", "process"]
+    "drift", [None, "source", "binary", "tools", "environment", "log", "process",
+              "process-exception"]
 )
 def test_native_receipt_replay_readback_refuses_drift_without_launch(
     addon, tmp_path, monkeypatch, drift
@@ -360,13 +361,15 @@ def test_native_receipt_replay_readback_refuses_drift_without_launch(
         },
     )
     monkeypatch.setattr(delivery_resources.RunResources, "register", lambda *a: None)
-    monkeypatch.setattr(
-        delivery_native_process,
-        "reconcile_process",
-        lambda _: {"cleanup": "unknown" if drift == "process" else "observed-native-confirmed"},
-    )
+    def reconcile(_):
+        if drift == "process-exception":
+            raise RuntimeError("owned fixture readback unavailable")
+        return {"cleanup": "unknown" if drift == "process" else "observed-native-confirmed"}
+
+    monkeypatch.setattr(delivery_native_process, "reconcile_process", reconcile)
     broker = object.__new__(DeliveryBroker)
     broker.spec, broker.state_dir = spec, state
+    broker.native_cleanup_confirmed = True
     candidate = {"id": "candidate"}
     evidence = state / "checks"
     evidence.mkdir()
@@ -422,13 +425,17 @@ def test_native_receipt_replay_readback_refuses_drift_without_launch(
             == first
         )
     else:
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, RuntimeError)):
             broker._prepare_native_addon(
                 checkout, ["apps/api"], evidence, candidate, {"store": str(store)}
             )
     assert len(builds) == 1
     assert (evidence / "native-addon-preparation.json").read_bytes() == original_receipt
     assert first["state"] == "passed"  # Controlled unit fixture, not an actual native load.
+    if drift in {"process", "process-exception"}:
+        assert broker.native_cleanup_confirmed is False
+    elif drift is None:
+        assert broker.native_cleanup_confirmed is True
 
 
 def test_candidate_setup_refuses_before_original_install_or_registry_fetch(

@@ -7,6 +7,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -31,6 +32,8 @@ from .delivery_continuation import (
     session_state_digest,
 )
 from .delivery_preparation import execution_retired
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -381,16 +384,6 @@ class DeliveryStore:
 
             initialize(db)
 
-    def policy_recovery_precheck(self, run_id: str) -> dict:
-        from .delivery_policy_recovery import precheck
-
-        return precheck(self, run_id)[0]
-
-    def recover_execution(self, run_id: str, supplied: dict) -> dict:
-        from .delivery_policy_recovery import recover
-
-        return recover(self, run_id, supplied)
-
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         db = self.state.connect(self.config.tracking_db)
@@ -418,7 +411,7 @@ class DeliveryStore:
         )
         return int(cursor.lastrowid)
 
-    def submit(self, supplied: dict[str, Any]) -> dict[str, Any]:
+    def submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None) -> dict[str, Any]:
         run_id = supplied.get("run_id")
         command_id = supplied.get("command_id")
         if not isinstance(run_id, str) or not isinstance(command_id, str):
@@ -450,11 +443,18 @@ class DeliveryStore:
                     "existing": True,
                     "phase": prior_run[1],
                 }
-        spec = self.config.admit(supplied)
+        reference = None
+        if _automatic is not None:
+            old = json.loads(_automatic['row']['request_json'])
+            branch = old.get('publication_base_ref')
+            if branch and not re.fullmatch(r'[0-9a-fA-F]{40}', old['base_ref']):
+                reference = 'refs/remotes/origin/' + branch
+        spec = (self.config.admit(supplied, _base_ref=reference) if reference
+                else self.config.admit(supplied))
         spec["request_digest"] = request_digest
         temporal_result = None
         superseded = spec.get("supersedes_run_id")
-        if superseded:
+        if superseded and _automatic is None:
             from .delivery_preparation import require_native_execution
 
             require_native_execution(self.spec(superseded))
@@ -494,6 +494,7 @@ class DeliveryStore:
                     (command_id, run_id, request_digest, canonical_json(response)),
                 )
                 return response
+            self._freeze_issue_budget(db, spec)
             work = self.state.row(db, "works", spec["work_id"])
             if work is None:
                 self.state.record(
@@ -512,7 +513,11 @@ class DeliveryStore:
                 != self.state.issue_resource(spec["issue_url"])
             ):
                 raise ValueError("work ID is bound to another issue")
-            if superseded:
+            if superseded and _automatic is not None:
+                from .delivery_automatic_retry import validate_transaction
+
+                validate_transaction(self, db, spec, _automatic)
+            elif superseded:
                 previous = db.execute(
                     """SELECT work_id,issue_url,repository_key,phase,outcome,execution_state,
                               cleanup,error,pr_json,checks_json,request_digest,request_json,
@@ -604,11 +609,35 @@ class DeliveryStore:
             )
             return response
 
+    def _freeze_issue_budget(self, db: sqlite3.Connection, spec: dict[str, Any]) -> None:
+        """Use all admissions, not the dashboard's visible subset, under the claim transaction."""
+        issue = self.state.issue_resource(spec["issue_url"])
+        previous = [json.loads(row["request_json"]) for row in db.execute(
+            "SELECT issue_url,request_json FROM delivery_runs ORDER BY created_at,run_id"
+        ) if self.state.issue_resource(row["issue_url"]) == issue]
+        frozen = next((item["policy"]["max_attempts"] for item in previous
+                       if item.get("retry_budget_version") == 1), None)
+        maximum = frozen if frozen is not None else spec["policy"].get("max_attempts")
+        if maximum is None:
+            return
+        if len(previous) >= maximum:
+            raise ValueError("issue attempt budget is exhausted")
+        spec["retry_budget_version"] = 1
+        spec["policy"]["max_attempts"] = maximum
+        spec["policy_digest"] = digest(spec["policy"])
+
     def owns_execution(self, spec: dict[str, Any]) -> bool:
         """Shared database visibility does not grant another service's transport."""
-        frozen = DeliveryConfig.load(Path(spec["config_path"]))
-        if digest(frozen.raw) != spec["config_digest"]:
-            raise ValueError("frozen service configuration changed")
+        try:
+            frozen = DeliveryConfig.load(Path(spec["config_path"]))
+            if digest(frozen.raw) != spec["config_digest"]:
+                raise ValueError("frozen service configuration changed")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning(
+                "Run %s skipped: frozen execution configuration unavailable (%s)",
+                spec.get("run_id", "unknown"), type(exc).__name__,
+            )
+            return False
 
         def binding(config: DeliveryConfig) -> tuple:
             return (
@@ -885,18 +914,10 @@ class DeliveryStore:
             )
         return response
 
-    def metadata_preflight(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
-        from .delivery_metadata_recovery import reconcile
-
-        return reconcile(self, run_id, supplied, preflight=True)
 
     def repair_admission_preflight(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
         return self.continue_repair(run_id, supplied, preflight=True)
 
-    def reconcile_published_metadata(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
-        from .delivery_metadata_recovery import reconcile
-
-        return reconcile(self, run_id, supplied)
 
     def gates_only_preflight(self, run_id: str) -> dict[str, Any]:
         from .delivery_gates_admission import preflight
@@ -1012,6 +1033,14 @@ class DeliveryStore:
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
+        if (isinstance(supplied, dict) and 'continuation_kind' in supplied
+                and not isinstance(supplied['continuation_kind'], str)):
+            raise ValueError("unsupported repair continuation kind")
+        if (self.submitted_spec(run_id).get("retry_budget_version") == 1
+                and isinstance(supplied, dict)
+                and type(supplied.get("additional_iterations")) is int
+                and supplied["additional_iterations"] > 0):
+            raise ValueError("a fixed repair budget cannot receive additional iterations")
         if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') == 'stopped_delivery_resume'):
             from .delivery_stopped_resume import admit
@@ -1040,19 +1069,10 @@ class DeliveryStore:
 
             return admit(self, run_id, supplied, preflight=preflight)
         if isinstance(supplied, dict) and 'continuation_kind' in supplied:
-            from .delivery_technical_continuation import continue_technical
-
-            return continue_technical(self, run_id, supplied, preflight=preflight)
+            raise ValueError("unsupported repair continuation kind")
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))
-        from .delivery_broker import DeliveryBroker
-        from .delivery_repair import (
-            confirmed_native_cleanup,
-            failed_gate_diagnostics,
-            published_identity,
-        )
-
         required = {
             "command_id",
             "expected_revision",
@@ -1062,11 +1082,30 @@ class DeliveryStore:
             "expected_pr_head",
             "additional_iterations",
         }
-        cause_specific = isinstance(supplied, dict) and set(supplied) == required | {
-            "authority_path", "authority_sha256",
-        }
-        if not isinstance(supplied, dict) or (set(supplied) != required and not cause_specific):
+        if not isinstance(supplied, dict) or set(supplied) != required:
+            # Earlier versions admitted this specialized request. Reading an exact
+            # saved response is idempotent; an unseen request cannot admit work.
+            if (isinstance(supplied, dict)
+                    and set(supplied) == required | {"authority_path", "authority_sha256"}
+                    and isinstance(supplied.get("command_id"), str)):
+                with self._connect() as db:
+                    prior = db.execute(
+                        "SELECT run_id,request_digest,response_json FROM delivery_commands "
+                        "WHERE command_id=?", (supplied["command_id"],),
+                    ).fetchone()
+                if prior:
+                    if (prior["run_id"] != run_id
+                            or prior["request_digest"] != digest({"run_id": run_id, **supplied})):
+                        raise ValueError("command ID already belongs to different inputs")
+                    return json.loads(prior["response_json"])
             raise ValueError("repair continuation fields do not match the contract")
+        from .delivery_broker import DeliveryBroker
+        from .delivery_repair import (
+            confirmed_native_cleanup,
+            failed_gate_diagnostics,
+            published_identity,
+        )
+
         command_id = supplied["command_id"]
         if (
             not isinstance(command_id, str)
@@ -1109,9 +1148,9 @@ class DeliveryStore:
         if granted:
             raise ValueError("this run already received its one repair grant")
         spec = self.effective_spec(run_id)
-        finalized = (not cause_specific and spec.get("resource_cleanup_version") == 1
+        finalized = (spec.get("resource_cleanup_version") == 1
                      and row["cleanup"] == "confirmed")
-        stopped_claim = cause_specific or finalized
+        stopped_claim = finalized
         if digest(DeliveryConfig.load(Path(spec["config_path"])).raw) != spec["config_digest"]:
             raise ValueError("frozen service configuration changed before repair grant")
         current_workflow_id = row["workflow_id"] or f"delivery-{run_id}"
@@ -1195,13 +1234,6 @@ class DeliveryStore:
         broker = DeliveryBroker(self, spec)
         observed_pr = published_identity(broker, candidate, pr)
         cleanup_digest = confirmed_native_cleanup(spec)
-        title_constraint = None
-        if cause_specific:
-            from .delivery_title_repair import prepare
-
-            title_constraint = prepare(
-                self, spec, state, previous_recovery, supplied, implementation["session_id"],
-            )
         workflow_id = f"delivery-{run_id}-repair-continuation-1"
         recovery = {
             "kind": "repair_continuation",
@@ -1217,9 +1249,6 @@ class DeliveryStore:
             "additional_iterations": supplied["additional_iterations"],
             "maximum_iteration": iteration + supplied["additional_iterations"],
         }
-        if cause_specific:
-            recovery.update(original_recovery=previous_recovery, effective_spec=spec,
-                            title_constraint=title_constraint, cleanup_digest=cleanup_digest)
         response = {
             "run_id": run_id,
             "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
@@ -1241,9 +1270,7 @@ class DeliveryStore:
                         claim is None or claim["owner"] != f"external:devflow:{run_id}"):
                     raise ValueError("repair preflight claim authority changed")
             return {**response, "preflight": True, "diagnostics": findings,
-                    "title_constraint_sha256": (
-                        digest(title_constraint) if title_constraint else None
-                    )}
+                    "title_constraint_sha256": None}
         if finalized:
             from .delivery_gate_retry import prepare_runtime
             from .delivery_metadata_recovery import _immutable, preserve_resources
@@ -3139,13 +3166,42 @@ class DeliveryStore:
             )
 
     def list_runs(self, archived: bool = False) -> list[dict[str, Any]]:
+        return self.list_runs_page(archived)["runs"]
+
+    def list_runs_page(
+        self, archived: bool = False, *, limit: int = 50, cursor: str | None = None,
+    ) -> dict[str, Any]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("run page limit must be between 1 and 100")
+        boundary = ""
+        parameters: list[Any] = [int(archived)]
+        if cursor:
+            try:
+                if len(cursor) > 2048:
+                    raise ValueError()
+                value = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+                if (not isinstance(value, list) or len(value) != 3
+                        or type(value[0]) is not bool or value[0] != archived
+                        or not all(isinstance(part, str) and part for part in value[1:])):
+                    raise ValueError()
+            except (ValueError, TypeError, UnicodeError) as exc:
+                raise ValueError("invalid run page cursor for archive filter") from exc
+            boundary = " AND (r.updated_at,r.run_id) < (?,?)"
+            parameters.extend(value[1:])
         with self._connect() as db:
             rows = db.execute(
                 "SELECT r.* FROM delivery_runs r LEFT JOIN delivery_dashboard_state d "
-                "ON r.run_id=d.run_id WHERE COALESCE(d.archived,0)=? ORDER BY r.updated_at DESC",
-                (int(archived),),
+                "ON r.run_id=d.run_id WHERE COALESCE(d.archived,0)=?" + boundary +
+                " ORDER BY r.updated_at DESC,r.run_id DESC LIMIT ?",
+                (*parameters, limit + 1),
             ).fetchall()
-            return [self._compact(dict(row)) for row in rows]
+        next_cursor = None
+        if len(rows) > limit:
+            last = rows[limit - 1]
+            encoded = json.dumps([archived, last["updated_at"], last["run_id"]]).encode()
+            next_cursor = base64.urlsafe_b64encode(encoded).decode().rstrip("=")
+        return {"runs": [self._compact(dict(row)) for row in rows[:limit]],
+                "next_cursor": next_cursor}
 
     def _compact(self, row: dict[str, Any]) -> dict[str, Any]:
         spec = json.loads(row["request_json"])

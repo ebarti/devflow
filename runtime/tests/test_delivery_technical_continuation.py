@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import hashlib
-import json
-import os
-import subprocess
 import sys
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from temporalio import workflow
@@ -21,79 +16,18 @@ from test_delivery_native import native_configuration as native_configuration
 from test_delivery_native_renewal import payload_update as payload_update
 from test_delivery_resources import spec as resource_spec
 from test_delivery_store import service as service
-from test_delivery_title_repair import title_repair as title_repair
+from test_delivery_store import submit_historical_admission
 
 from devflow_temporal import delivery_native_renewal as renewal
 from devflow_temporal import delivery_technical_continuation as technical
-from devflow_temporal import delivery_technical_integration as integration
-from devflow_temporal import delivery_title_repair as title_repair_module
-from devflow_temporal.contracts import canonical_json, digest
-from devflow_temporal.delivery_broker import DeliveryBroker, _git
-from devflow_temporal.delivery_resources import read_private, write_private
+from devflow_temporal.contracts import digest
+from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
-
-
-@pytest.mark.parametrize("size", [1358726, 1894818])
-def test_complete_authentic_row_sizes_have_private_bounded_readback(tmp_path, size):
-    empty = json.dumps({"run_id": "run-1", "padding": ""}, separators=(",", ":")).encode()
-    raw = json.dumps(
-        {"run_id": "run-1", "padding": "x" * (size - len(empty))}, separators=(",", ":")
-    ).encode()
-    path = tmp_path / "sealed-row.json"
-    path.write_bytes(raw)
-    path.chmod(0o600)
-    binding = {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}
-    assert len(raw) == size
-    assert technical._sealed_row(binding, "run-1")["run_id"] == "run-1"
-    with pytest.raises(ValueError, match="unsafe"):
-        integration.reference(str(path), binding["sha256"])
-    assert path.read_bytes() == raw and path.stat().st_mode & 0o777 == 0o600
-
-
-@pytest.mark.parametrize(
-    "adverse",
-    ["size", "hash", "alias", "parent-alias", "hardlink", "mode", "owner", "foreign-run", "type"],
-)
-def test_sealed_row_refuses_oversize_alias_hash_foreign_or_nonprivate_before_effects(
-    tmp_path,
-    monkeypatch,
-    adverse,
-):
-    value = (
-        ["run-1"]
-        if adverse == "type"
-        else {"run_id": "other" if adverse == "foreign-run" else "run-1", "payload": "retained"}
-    )
-    raw = json.dumps(value).encode()
-    if adverse == "size":
-        raw = b" " * (technical.SEALED_ROW_LIMIT + 1)
-    root = tmp_path / "rows"
-    root.mkdir()
-    path = root / "sealed.json"
-    path.write_bytes(raw)
-    path.chmod(0o600)
-    binding = {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}
-    if adverse == "hash":
-        binding["sha256"] = "f" * 64
-    elif adverse in {"alias", "parent-alias"}:
-        alias = tmp_path / "alias"
-        alias.symlink_to(path if adverse == "alias" else root)
-        binding["path"] = str(alias if adverse == "alias" else alias / path.name)
-    elif adverse == "hardlink":
-        os.link(path, root / "other")
-    elif adverse == "mode":
-        path.chmod(0o644)
-    elif adverse == "owner":
-        monkeypatch.setattr(technical.os, "getuid", lambda: path.stat().st_uid + 1)
-    before = path.read_bytes()
-    with pytest.raises(ValueError):
-        technical._sealed_row(binding, "run-1")
-    assert path.read_bytes() == before
 
 
 def request():
     return {
-        "continuation_kind": technical.KIND,
+        "continuation_kind": "accepted_technical_successor",
         "command_id": "technical-1",
         "expected_revision": 27,
         "expected_iteration": 4,
@@ -107,357 +41,6 @@ def request():
     }
 
 
-@pytest.fixture
-def accepted_gate_boundary(stopped, monkeypatch):
-    """Production admission/Git/resources; only native installation is a controlled seam."""
-    store, broker, old_closed, gate_command = stopped
-    store.admit_gates_only("run-1", gate_command)
-    _git(broker.checkout, "add", ".")
-    _git(broker.checkout, "commit", "-qm", "feat: preserve accepted source")
-    _git(broker.checkout, "push", "origin", broker.spec["branch"])
-    candidate = broker.candidate()
-    publication = {
-        "number": 7,
-        "url": "https://example.invalid/pull/7",
-        "state": "OPEN",
-        "head": candidate["head"],
-        "base": broker.spec["base_sha"],
-        "candidate": candidate,
-    }
-    broker._effect("publish:run-1:4", "publish", {"iteration": 4})
-    broker._finish_effect("publish:run-1:4", publication)
-    monkeypatch.setattr(
-        DeliveryBroker,
-        "_existing_pr",
-        lambda *_a, **_kw: {
-            "number": 7,
-            "url": publication["url"],
-            "headRefOid": candidate["head"],
-            "state": "OPEN",
-            "isDraft": False,
-        },
-    )
-    failed = {
-        "role": "review",
-        "iteration": 4,
-        "status": "blocked",
-        "finish_reason": "prelaunch",
-        "session_id": None,
-        "usage": None,
-        "cleanup": "confirmed",
-        "candidate": candidate,
-    }
-    with store._connect() as db:
-        previous = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
-        db.execute(
-            "INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,"
-            "state,result_json,cleanup) VALUES ('failed-review','run-1','review',4,?,"
-            "'finished',?,'confirmed')",
-            (candidate["id"], canonical_json(failed)),
-        )
-        store.state.release_work(db, "work-1", "external:devflow:run-1")
-    resources = technical.RunResources(broker.spec)
-    cleanup = resources.finalize("blocked")
-    state = {
-        **old_closed["result"],
-        "candidate": candidate,
-        "pull_request": publication,
-        "roles": [*old_closed["result"]["roles"], failed],
-        "revision": 27,
-        "checks": {
-            "prepublish": {"state": "passed", "cleanup": "confirmed"},
-            "resource_cleanup": cleanup,
-        },
-        "cleanup": "confirmed",
-        "error": "repair limit exhausted",
-    }
-    store.project(
-        "run-1",
-        phase="blocked",
-        execution_state="blocked",
-        event_type="blocked",
-        message=state["error"],
-        candidate=candidate,
-        pull_request=publication,
-        checks=state["checks"],
-        iteration=4,
-        protocol_revision=27,
-        outcome="blocked",
-        cleanup="confirmed",
-        error=state["error"],
-    )
-    with store._connect() as db:
-        row = dict(db.execute("SELECT * FROM delivery_runs").fetchone())
-    closed = {
-        **old_closed,
-        "workflow_id": row["workflow_id"],
-        "recovery_digest": digest(previous),
-        "result": state,
-    }
-    monkeypatch.setattr(store, "_completed_temporal_result", lambda *_a, **_kw: closed)
-    root = store.config.state_root
-
-    def retain(name, value):
-        path = root / name
-        write_private(path, value)
-        return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-
-    row_reference = retain("stopped-row.json", row)
-    final = Path(cleanup["receipt"])
-    manifest = final.with_name("manifest.json")
-    failure = retain(
-        "technical-failure.json",
-        {
-            "runs": {
-                "run-1": {
-                    "row": row_reference,
-                    "resources": {
-                        "resources/manifest.json": {
-                            "sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()
-                        },
-                        "resources/finalization.json": {
-                            "sha256": hashlib.sha256(final.read_bytes()).hexdigest()
-                        },
-                    },
-                }
-            }
-        },
-    )
-    marker = retain("controlled-native-prerequisite.json", {"fixture": True})
-    authority = {
-        "decision_owner": "main task",
-        "new_user_approval_required": False,
-        "authority_source": "Controlled public custody regression; no native success claim",
-        "technical_limits": {
-            "max_successor_commands_per_run": 1,
-            "max_additional_native_preparation_generations_per_run": 1,
-            "max_total_additional_native_preparation_generations": 2,
-            "max_owned_probe_attempts_per_additional_generation": 2,
-            "native_renewal_provider_turns": 0,
-            "native_renewal_implementation_turns": 0,
-            "additional_feature_repair_grants": 0,
-            "907_implementation_turns": 0,
-            "907_iteration_ceiling": 4,
-            "1005_iteration_ceiling": 5,
-        },
-        "907": {
-            "run_id": "run-1",
-            "work_id": "work-1",
-            "frozen_base": broker.spec["base_sha"],
-            "published_head": candidate["head"],
-            "published_pr": publication["url"],
-            "original_implementer_session": "original-session",
-            "allowed_source_change": False,
-        },
-        "1005_integration": {"run_id": "other"},
-        "trigger_bindings": {
-            "sealed_actual_failures": failure,
-            "consumed_native_renewal_authority": marker,
-            "consumed907_gates_only_authority": {
-                "path": gate_command["authority_path"],
-                "sha256": gate_command["authority_sha256"],
-            },
-            "consumed1005_metadata_authority": marker,
-            "1005_conflict_classification": marker,
-            "1005_three_tree_inputs": marker,
-        },
-    }
-    authority_reference = retain("technical-authority.json", authority)
-    payload = {
-        **request(),
-        "expected_candidate_id": candidate["id"],
-        "expected_pr_number": 7,
-        "expected_pr_head": candidate["head"],
-        "authority_path": authority_reference["path"],
-        "authority_sha256": authority_reference["sha256"],
-    }
-    monkeypatch.setattr(
-        technical, "_source_readiness", lambda *_a: {"controlled_native_seam": True}
-    )
-    return store, broker, payload
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual owned macOS root observation")
-@pytest.mark.parametrize(
-    "adverse", [None, "command", "authority", "source", "closed-history", "proof", "controller"]
-)
-def test_orphan_exclusive_intent_recovers_same_bytes_after_transaction_and_actor_loss(
-    accepted_gate_boundary,
-    monkeypatch,
-    adverse,
-):
-    store, broker, payload = accepted_gate_boundary
-    root = broker.state_dir / "technical-successor"
-    original = technical._immutable
-    actor = {
-        "pid": 111,
-        "identity": "original birth",
-        "source_revision": payload["expected_source_revision"],
-    }
-    monkeypatch.setattr(technical, "_controller", lambda _payload: dict(actor))
-
-    def lost_commit(path, *args, **kwargs):
-        original(path, *args, **kwargs)
-        if path.name == "intent.json":
-            raise RuntimeError("lost after exclusive intent before SQLite commit")
-
-    monkeypatch.setattr(technical, "_immutable", lost_commit)
-    with pytest.raises(RuntimeError, match="exclusive intent"):
-        store.continue_repair("run-1", payload)
-    before = (root / "intent.json").read_bytes()
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_technical_successors").fetchone()[0] == 0
-        assert store.state.claim_for(db, "work-1") is None
-    assert not (root / "predecessor-resources").exists()
-    actor.update(pid=222, identity="fresh birth")
-    monkeypatch.setattr(technical, "_immutable", original)
-    proposed = dict(payload)
-    if adverse == "command":
-        proposed["command_id"] = "foreign-command"
-    elif adverse == "authority":
-        proposed["authority_sha256"] = "f" * 64
-    elif adverse == "source":
-        (broker.checkout / "README.md").write_text("unaccepted source drift")
-    elif adverse == "closed-history":
-        closed = store._completed_temporal_result("run-1")
-        monkeypatch.setattr(
-            store,
-            "_completed_temporal_result",
-            lambda *_a, **_kw: {**closed, "request_digest": "f" * 64},
-        )
-    elif adverse == "proof":
-        monkeypatch.setattr(
-            technical,
-            "_source_readiness",
-            lambda *_a: (_ for _ in ()).throw(ValueError("consumed native proof drift")),
-        )
-    elif adverse == "controller":
-        forged = read_private(root / "intent.json")
-        forged["controller"]["source_revision"] = "e" * 40
-        write_private(root / "intent.json", forged)
-        before = (root / "intent.json").read_bytes()
-    if adverse:
-        for operation in (store.repair_admission_preflight, store.continue_repair):
-            with pytest.raises(ValueError):
-                operation("run-1", proposed)
-        with store._connect() as db:
-            assert (
-                db.execute("SELECT COUNT(*) FROM delivery_technical_successors").fetchone()[0] == 0
-            )
-            assert store.state.claim_for(db, "work-1") is None
-        assert not (root / "predecessor-resources").exists()
-    else:
-        observed = store.repair_admission_preflight("run-1", payload)
-        assert observed["preflight"] and observed["additional_iterations"] == 0
-        monkeypatch.setattr(
-            renewal,
-            "renew",
-            lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("next native boundary")),
-        )
-        for _ in range(2):
-            with pytest.raises(RuntimeError, match="next native"):
-                store.continue_repair("run-1", payload)
-        resumes = list((root / "resume-actors").glob("*.json"))
-        assert len(resumes) == 1
-        recorded = read_private(resumes[0])
-        assert recorded["original_controller"]["pid"] == 111
-        assert recorded["observed_controller"] == actor
-        with store._connect() as db:
-            assert (
-                db.execute("SELECT COUNT(*) FROM delivery_technical_successors").fetchone()[0] == 1
-            )
-            assert store.state.claim_for(db, "work-1") is None
-            assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 0
-    assert (root / "intent.json").read_bytes() == before
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual owned macOS root observation")
-def test_corrected_same_request_preflight_and_pending_interruption_keep_history_and_release_claim(
-    accepted_gate_boundary,
-    monkeypatch,
-):
-    store, broker, payload = accepted_gate_boundary
-    root = broker.state_dir / "technical-successor"
-    for invalid in (
-        {k: v for k, v in payload.items() if k != "authority_path"},
-        {**payload, "authority_sha256": "f" * 64},
-    ):
-        with pytest.raises(ValueError):
-            store.continue_repair("run-1", invalid)
-        assert not root.exists()
-    preflight = store.repair_admission_preflight("run-1", payload)
-    assert preflight["additional_iterations"] == 0 and preflight["resume_stage"] == "review"
-    assert not root.exists()
-    predecessor = {
-        name: (broker.state_dir / "resources" / name).read_bytes()
-        for name in ("manifest.json", "finalization.json")
-    }
-    calls = []
-
-    def interrupted(*_a, **_kw):
-        calls.append("native-child")
-        raise RuntimeError("controlled child preparation interruption")
-
-    monkeypatch.setattr(renewal, "renew", interrupted)
-    with pytest.raises(RuntimeError, match="interruption"):
-        store.continue_repair("run-1", payload)
-    assert len(calls) == 1
-    assert read_private(root / "closure.json")["state"] == "confirmed"
-    for name, raw in predecessor.items():
-        assert (root / "predecessor-resources" / name).read_bytes() == raw
-    with store._connect() as db:
-        assert store.state.claim_for(db, "work-1") is None
-        assert db.execute("SELECT COUNT(*) FROM delivery_technical_successors").fetchone()[0] == 1
-        assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 0
-    monkeypatch.setattr(
-        technical, "_snapshot", lambda *_a: pytest.fail("accepted intent must not be recaptured")
-    )
-    with pytest.raises(RuntimeError, match="interruption"):
-        store.continue_repair("run-1", payload)
-    assert len(calls) == 2
-    with store._connect() as db:
-        assert store.state.claim_for(db, "work-1") is None
-    with pytest.raises(ValueError, match="one technical successor"):
-        store.continue_repair("run-1", {**payload, "command_id": "other"})
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual owned macOS root observation")
-def test_lost_closure_response_reads_retained_cleanup_without_rewriting_history(
-    accepted_gate_boundary,
-    monkeypatch,
-):
-    store, broker, payload = accepted_gate_boundary
-    root = broker.state_dir / "technical-successor"
-    original = technical._immutable
-
-    def lost_response(path, *args, **kwargs):
-        original(path, *args, **kwargs)
-        if path.name == "closure-finalization.json":
-            raise RuntimeError("lost retained closure response")
-
-    monkeypatch.setattr(technical, "_immutable", lost_response)
-    with pytest.raises(RuntimeError, match="lost retained"):
-        store.continue_repair("run-1", payload)
-    retained = (root / "closure-finalization.json").read_bytes()
-    monkeypatch.setattr(technical, "_immutable", original)
-    monkeypatch.setattr(
-        technical.RunResources,
-        "finalize",
-        lambda *_a, **_kw: pytest.fail("completed closure must be read without finalizing again"),
-    )
-    monkeypatch.setattr(
-        renewal,
-        "renew",
-        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("next native boundary")),
-    )
-    with pytest.raises(RuntimeError, match="next native"):
-        store.continue_repair("run-1", payload)
-    assert (root / "closure-finalization.json").read_bytes() == retained
-    assert read_private(root / "closure.json")["state"] == "confirmed"
-    with store._connect() as db:
-        assert store.state.claim_for(db, "work-1") is None
-
-
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native process/lease observation")
 @pytest.mark.parametrize("adverse", [None, "unknown", "lease", "actor-inventory", "journal-alias"])
 def test_unknown_closure_observes_real_closed_native_actor_without_normalizing_history(
@@ -467,7 +50,7 @@ def test_unknown_closure_observes_real_closed_native_actor_without_normalizing_h
     from devflow_temporal.delivery_native_process import NativeProcess
 
     spec = resource_spec(tmp_path)
-    registry = technical.RunResources(spec)
+    registry = RunResources(spec)
     scratch = registry.scratch("check", "retained")
     actor = NativeProcess(
         spec,
@@ -503,246 +86,12 @@ def test_unknown_closure_observes_real_closed_native_actor_without_normalizing_h
             assert {
                 p.name: p.read_bytes() for p in (registry.manifest, Path(receipt["receipt"]))
             } == before
-            root = Path(spec["state_dir"]) / "technical-successor"
-            seal = {"spec": spec, "resources": observed}
-            for name, raw in before.items():
-                original = root / "predecessor-resources" / name
-                original.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-                original.write_bytes(raw)
-                original.chmod(0o600)
-            write_private(root / "closure-intent.json", {"predecessor_resources": observed})
-            fresh = technical._closure_cleanup(seal, root)
-            assert fresh["state"] == "confirmed" and not scratch.exists()
-            assert (
-                read_private(root / "predecessor-resources/finalization.json")["state"] == "unknown"
-            )
-            assert all(
-                (root / "predecessor-resources" / name).read_bytes() == raw
-                for name, raw in before.items()
-            )
+
     finally:
         if lock:
             lock.close()
 
 
-@pytest.mark.parametrize("adverse", [None, "base", "roles", "iteration", "source"])
-def test_title_literal_guard_preserves_original_base_after_authenticated_technical_readback(
-    title_repair,
-    monkeypatch,
-    adverse,
-):
-    store, broker, command, closed, metadata = title_repair
-    spec = {**broker.spec, "base_sha": "e" * 40}
-    state = deepcopy(closed["result"])
-    previous = {
-        "kind": technical.KIND,
-        "spec": broker.spec,
-        "execution_spec": spec,
-        "original_recovery": metadata,
-        "candidate": state["candidate"],
-        "state": {"roles": state["roles"][:]},
-        "integration": {"original_base": broker.spec["base_sha"], "main": spec["base_sha"]},
-    }
-    observed = []
-
-    def authenticated(_store, actual_spec, actual_previous, *, require_claim):
-        # This unit isolates the title consumer AFTER the independently tested
-        # technical readback boundary; it claims no integration/native completion.
-        assert _store is store and actual_spec == spec and actual_previous is previous
-        assert require_claim is False
-        observed.append("readback")
-
-    monkeypatch.setattr(technical, "readback", authenticated)
-    if adverse == "base":
-        previous["integration"]["original_base"] = "f" * 40
-    elif adverse == "roles":
-        state["roles"].append({"role": "implement", "iteration": 4, "cleanup": "confirmed"})
-    elif adverse == "iteration":
-        state["iteration"] = 5
-    elif adverse == "source":
-        previous["candidate"] = {**state["candidate"], "id": "f" * 64}
-    if adverse:
-        with pytest.raises(ValueError):
-            title_repair_module.prepare(store, spec, state, previous, command, "original-session")
-    else:
-        constraint = title_repair_module.prepare(
-            store,
-            spec,
-            state,
-            previous,
-            command,
-            "original-session",
-        )
-        assert constraint["maximum_iteration"] == 5 and constraint["new_implementation_turns"] == 1
-        assert (
-            constraint["sha256"]
-            == hashlib.sha256((broker.checkout / "browser.spec.ts").read_bytes()).hexdigest()
-        )
-        assert constraint["title"].endswith("failed requests leave manual edits available")
-    assert observed == ["readback"]
-
-
-def test_complete_prospective_tree_and_signed_one_merge_replay_use_only_owned_fixture_git(tmp_path):
-    repo, remote = tmp_path / "source", tmp_path / "remote.git"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.name", "Integration Fixture")
-    _git(repo, "config", "user.email", "fixture@example.invalid")
-    for i in range(6):
-        (repo / f"overlap-{i}.txt").write_text(
-            "".join(f"context {n}\n" for n in range(10))
-            + ("138-member\n" if i == 0 else "left base\n")
-            + "".join(f"middle {n}\n" for n in range(10))
-            + "right base\n"
-        )
-    worker = repo / "workers/automation/pyproject.toml"
-    worker.parent.mkdir(parents=True)
-    worker.write_text(
-        '[project]\nname="fixture"\ndependencies=[]\n'
-        '[tool.hatch.build]\nartifacts=["asset.txt", "migrations/*.sql"]\n'
-        '[tool.pytest.ini_options]\naddopts="-q"\n'
-    )
-    (repo / "package.json").write_text('{"name":"fixture"}\n')
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "test: original source")
-    base = _git(repo, "rev-parse", "HEAD")
-    _git(repo, "checkout", "-qb", "fix/owned")
-    for i in range(6):
-        path = repo / f"overlap-{i}.txt"
-        path.write_text(
-            path.read_text().replace(
-                "138-member\n" if i == 0 else "left base\n",
-                "COACHING ASSERTION PRESERVED\n138-member\n" if i == 0 else "left owned\n",
-            )
-        )
-    (repo / "owned-only.txt").write_text("preserved owned source\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "feat: original coaching source")
-    owned = _git(repo, "rev-parse", "HEAD")
-    _git(repo, "checkout", "-q", "main")
-    for i in range(6):
-        path = repo / f"overlap-{i}.txt"
-        path.write_text(
-            path.read_text().replace(
-                "138-member\n" if i == 0 else "right base\n",
-                "143-member\n" if i == 0 else "right main\n",
-            )
-        )
-    worker.write_text(
-        worker.read_text().replace(
-            '"migrations/*.sql"', '"src/jobctrl/assets/interview/*.json", "migrations/*.sql"'
-        )
-        + 'tmp_path_retention_policy="failed"\n'
-    )
-    (repo / "main-only.txt").write_text("retained current main\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "feat: current main inputs")
-    main = _git(repo, "rev-parse", "HEAD")
-    _git(repo, "checkout", "-q", "fix/owned")
-    _git(tmp_path, "init", "--bare", "-q", str(remote))
-    _git(repo, "remote", "add", "origin", str(remote))
-    _git(repo, "push", "-q", "origin", "main", "fix/owned")
-    scopes = {
-        "frozen_original_base": base,
-        "owned_predecessor_head": owned,
-        "authorized_current_main": main,
-        "conflict_path": "overlap-0.txt",
-    }
-    base_index, owned_index, main_index = [
-        integration._index(repo, sha) for sha in (base, owned, main)
-    ]
-    classified, expected = [], dict(main_index)
-    expected["owned-only.txt"] = owned_index["owned-only.txt"]
-    for i in range(6):
-        path = f"overlap-{i}.txt"
-        raw = integration._merged(
-            *(
-                integration._blob(repo, index[path]["oid"])
-                for index in (base_index, owned_index, main_index)
-            ),
-            conflict=i == 0,
-        )
-        oid = integration._object("blob", raw)
-        expected[path] = {"mode": "100644", "oid": oid}
-        classified.append(
-            {
-                "path": path,
-                "bytes": len(raw),
-                "expected_blob_sha1": oid,
-                "content_sha256": hashlib.sha256(raw).hexdigest(),
-            }
-        )
-    packet = {
-        "authority_sha256": "a" * 64,
-        "original_base": base,
-        "owned_head": owned,
-        "authorized_main": main,
-        "classified_merged_paths": classified,
-        "expected_file_count": len(expected),
-        "index": expected,
-        "expected_complete_tree_sha1": integration.tree_id(expected),
-    }
-    spec = {
-        "checkout": str(repo),
-        "base_sha": base,
-        "source_path": str(repo),
-        "run_id": "run",
-        "branch": "fix/owned",
-        "origin_url": str(remote),
-    }
-    objects_before = set((repo / ".git/objects").rglob("*"))
-    bad = deepcopy(packet)
-    bad["index"]["main-only.txt"] = owned_index["owned-only.txt"]
-    with pytest.raises(ValueError, match="complete prospective"):
-        integration.prospective(spec, scopes, bad, "a" * 64)
-    observed = integration.prospective(spec, scopes, packet, "a" * 64)
-    assert set((repo / ".git/objects").rglob("*")) == objects_before
-    assert _git(repo, "rev-parse", "HEAD") == owned
-    delta = [
-        item
-        for item in observed["preparation_inputs"]
-        if item["before_sha256"] != item["after_sha256"]
-    ]
-    assert [item["path"] for item in delta] == ["workers/automation/pyproject.toml"]
-    key = tmp_path / "signing-key"
-    subprocess.run(
-        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
-        check=True,
-        capture_output=True,
-    )
-    allowed = tmp_path / "allowed-signers"
-    allowed.write_text("fixture@example.invalid " + key.with_suffix(".pub").read_text())
-    _git(repo, "config", "gpg.format", "ssh")
-    _git(repo, "config", "user.signingkey", str(key))
-    _git(repo, "config", "gpg.ssh.allowedSignersFile", str(allowed))
-    broker = SimpleNamespace(checkout=repo, source=repo, spec=spec)
-    broker._existing_pr = lambda **_kw: {
-        "number": 7,
-        "state": "OPEN",
-        "isDraft": False,
-        "headRefOid": _git(repo, "ls-remote", "origin", "refs/heads/fix/owned").split()[0],
-    }
-    grant = {
-        "integration": {
-            "tree": observed["tree"],
-            "old_head": owned,
-            "main": main,
-            "subject": "chore: integrate preserved source",
-            "signer": "Integration Fixture <fixture@example.invalid>",
-        },
-        "state": {"pull_request": {"number": 7}},
-    }
-    root = tmp_path / "receipt"
-    root.mkdir(mode=0o700)
-    head = integration.integrate(broker, grant, observed, root)
-    assert _git(repo, "show", "-s", "--format=%P", head).split() == [owned, main]
-    assert _git(repo, "show", "-s", "--format=%G?", head) == "G"
-    assert _git(repo, "rev-parse", "HEAD^{tree}") == packet["expected_complete_tree_sha1"]
-    assert "COACHING ASSERTION PRESERVED\n143-member" in (repo / "overlap-0.txt").read_text()
-    receipt = (root / "integration.json").read_bytes()
-    assert integration.integrate(broker, grant, observed, root) == head
-    assert (root / "integration.json").read_bytes() == receipt
-    assert _git(repo, "rev-list", "--count", main + "..HEAD") == "2"
 
 
 @pytest.mark.parametrize(
@@ -794,7 +143,7 @@ def test_inherited_confirmed_blocked_checkpoint_does_not_freeze_fresh_technical_
 ):
     monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, submitted = service
-    store.submit(submitted)
+    submit_historical_admission(store, submitted, monkeypatch)
     spec = store.spec("run-1")
     candidate = {"id": "a" * 64, "head": "b" * 40}
     published = {"number": 7, "head": candidate["head"], "candidate": candidate}
@@ -827,7 +176,7 @@ def test_inherited_confirmed_blocked_checkpoint_does_not_freeze_fresh_technical_
         "checks": {"prepublish": {"state": "passed"}, "terminal_tracker_checkpoint": checkpoint},
     }
     recovery = {
-        "kind": technical.KIND,
+        "kind": "accepted_technical_successor",
         "execution_spec": spec,
         "maximum_iteration": 4,
         "command": {"additional_iterations": 0},
@@ -940,7 +289,7 @@ def test_published_technical_checkpoint_never_implements_or_republishes(
 ):
     monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, submitted = service
-    store.submit(submitted)
+    submit_historical_admission(store, submitted, monkeypatch)
     spec = store.spec("run-1")
     spec["policy"]["browser_qa"] = {"argv": ["fixture"]}
     candidate = {"id": "a" * 64, "head": "b" * 40}
@@ -963,7 +312,7 @@ def test_published_technical_checkpoint_never_implements_or_republishes(
         "cleanup": "confirmed",
     }
     recovery = {
-        "kind": technical.KIND,
+        "kind": "accepted_technical_successor",
         "execution_spec": spec,
         "maximum_iteration": 4,
         "command": {"additional_iterations": 0},
@@ -1055,14 +404,15 @@ def test_one_native_child_preserves_consumed_generation_and_explicit_base_lineag
             "native_preparation_renewal": predecessor_reference,
         },
     }
-    monkeypatch.setattr(technical, "_git", renewal._git)
     next_payload = {
         **request(),
         "expected_source_revision": renewal._git(controlled, "rev-parse", "HEAD"),
         "preparation_authority_path": payload["preparation_authority_path"],
         "preparation_authority_sha256": payload["preparation_authority_sha256"],
     }
-    observed = technical._source_readiness(predecessor_spec, next_payload, authority, predecessor)
+    assert technical.native_predecessor(predecessor, authority) == before_receipt
+    observed = renewal.readiness(predecessor_spec, next_payload)
+    observed["authority"] = authority
     proposed = deepcopy(predecessor_spec)
     proposed["base_sha"] = (
         "e" * 40
@@ -1103,38 +453,3 @@ def test_one_native_child_preserves_consumed_generation_and_explicit_base_lineag
     with store._connect() as db:
         assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 0
-
-
-def test_complete_tree_hash_and_byte_preserving_single_conflict(tmp_path):
-    repo = tmp_path / "fixture"
-    repo.mkdir()
-    subprocess = __import__("subprocess")
-    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
-    (repo / "one").write_bytes(b"ONE")
-    (repo / "nested").mkdir()
-    (repo / "nested/two").write_bytes(b"TWO")
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    tree = subprocess.check_output(["git", "-C", str(repo), "write-tree"]).decode().strip()
-    index = {
-        path: {"mode": "100644", "oid": integration._object("blob", raw)}
-        for path, raw in [("one", b"ONE"), ("nested/two", b"TWO")]
-    }
-    assert integration.tree_id(index) == tree
-    prefix = b'describe("DemoLocalCommandExecutor", () => {\n'
-    title = (
-        b'  it("keeps the 138-member capability manifest exhaustive '
-        b'with exact class counts", () => {\n'
-    )
-    coaching = (
-        b'  it("accepted coaching", () => {\n    expect(persistence).toEqual(before);\n  });\n\n'
-    )
-    base = prefix + title + b"    // unchanged context\n" * 10
-    base += b"    expect(count).toBe(138);\n  });\n});\n"
-    owned = prefix + coaching + base[len(prefix) :]
-    main = base.replace(b"138-member", b"143-member").replace(b"toBe(138)", b"toBe(143)")
-    result = integration._merged(base, owned, main, conflict=True)
-    assert result == prefix + coaching + main[len(prefix) :]
-    assert coaching in result
-    with pytest.raises(ValueError, match="adjacent inventory title"):
-        integration._merged(base, owned, main.replace(b"143-member", b"144-member"), conflict=True)
-    assert hashlib.sha256(result).hexdigest() != hashlib.sha256(owned).hexdigest()

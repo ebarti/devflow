@@ -365,11 +365,12 @@ async def test_pinned_sdk_automatically_discovers_selected_primary_skill_and_all
             assert len(servers) == 1 and servers[0]['pluginId'] == module.PLUGIN
             assert servers[0]['toolsError'] is None
             assert set(servers[0]['tools']) == {
-                'get_service', 'submit_run', 'list_runs', 'get_run', 'read_evidence',
-                'answer_decision', 'cancel_run', 'recovery_preflight', 'recover_execution',
+                'get_service', 'start_service', 'submit_run', 'list_runs', 'get_run',
+                'read_evidence',
+                'answer_decision', 'cancel_run',
                 'reconcile_tracker',
-                'reconcile_published_metadata', 'gates_only_preflight', 'admit_gates_only',
-                'metadata_preflight', 'repair_admission_preflight', 'continue_repair',
+                'gates_only_preflight', 'admit_gates_only',
+                'repair_admission_preflight', 'continue_repair',
             }
         finally:
             process.stdin.close()

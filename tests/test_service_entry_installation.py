@@ -1,5 +1,9 @@
 """The normal installer exposes one service entry and preserves retired helpers."""
 
+import contextlib
+import importlib.util
+import io
+import json
 import os
 import shutil
 import subprocess
@@ -7,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -86,6 +91,267 @@ class ServiceEntryInstallation(unittest.TestCase):
         snapshot = self.snapshot()
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(self.snapshot(), snapshot)
+
+    def historical_helper(self, *, current_state=True):
+        old = self.root / "retained-git-source"
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
+                "clone",
+                "--no-local",
+                "--no-checkout",
+                str(ROOT),
+                str(old),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        for key, value in (("gc.auto", "0"), ("maintenance.auto", "false"),
+                           ("core.hooksPath", "/dev/null"), ("commit.gpgsign", "false")):
+            subprocess.run(["git", "-C", str(old), "config", key, value], check=True)
+        revision = "a9a2c07d086c466e94d4fd6eb73c7b7250f090f3"
+        subprocess.run(
+            ["git", "-C", str(old), "checkout", "--detach", revision],
+            check=True,
+            capture_output=True,
+        )
+        origin = subprocess.check_output(
+            ["git", "-C", str(ROOT), "config", "--get", "remote.origin.url"],
+            text=True,
+        ).strip()
+        subprocess.run(["git", "-C", str(old), "remote", "set-url", "origin", origin], check=True)
+        if current_state:
+            shutil.copyfile(
+                ROOT / "skills/devflow/scripts/state.py", old / "skills/devflow/scripts/state.py"
+            )
+        compatibility = self.root / "owned-compat/devflow"
+        compatibility.mkdir(parents=True)
+        for name in ("scripts", "references"):
+            (compatibility / name).symlink_to(old / "skills/devflow" / name)
+        self.skills.mkdir()
+        (self.skills / "devflow").symlink_to(compatibility)
+        cache = self.home / "plugins/cache/devflow-local/devflow/current/skills"
+        shutil.copytree(
+            ROOT / "runtime/desktop/devflow-local-delivery", cache / "devflow-local-delivery"
+        )
+        return old, compatibility
+
+    def test_owned_symlinked_historical_helper_upgrade_and_replay(self):
+        old, compatibility = self.historical_helper()
+        prior = {p.name: p.read_bytes() for p in (old / "skills/devflow/scripts").iterdir()}
+        reference = os.readlink(compatibility / "references")
+        root_link = os.readlink(self.skills / "devflow")
+        hooks, config = self.hooks.read_bytes(), self.config.read_bytes()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.skills / "devflow/scripts").resolve(), ROOT / "skills/devflow/scripts"
+        )
+        self.assertEqual(os.readlink(compatibility / "references"), reference)
+        self.assertEqual(os.readlink(self.skills / "devflow"), root_link)
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in (old / "skills/devflow/scripts").iterdir()}, prior
+        )
+        self.assertEqual(self.hooks.read_bytes(), hooks)
+        self.assertEqual(self.config.read_bytes(), config)
+        before = self.snapshot()
+        replay = self.install()
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_complete_old_git_helper_upgrade_preserves_old_files(self):
+        old, compatibility = self.historical_helper(current_state=False)
+        before = {p.name: p.read_bytes() for p in (old / "skills/devflow/scripts").iterdir()}
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            os.readlink(compatibility / "scripts"), str(ROOT / "skills/devflow/scripts")
+        )
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in (old / "skills/devflow/scripts").iterdir()}, before
+        )
+
+    def test_unknown_modified_helper_refuses_with_path_before_effects(self):
+        old, _ = self.historical_helper()
+        changed = old / "skills/devflow/scripts/github.py"
+        changed.write_text("user-owned edits must remain")
+        before = self.snapshot()
+        result = self.install()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(str(changed), result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_foreign_origin_extra_file_and_aliased_helper_refuse(self):
+        old, compatibility = self.historical_helper()
+        original = (old / "skills/devflow/scripts/github.py").read_bytes()
+        scripts = old / "skills/devflow/scripts"
+        for adverse in ("origin", "extra", "alias", "hardlink", "references", "real-directory"):
+            with self.subTest(adverse=adverse):
+                if adverse == "origin":
+                    subprocess.run(
+                        ["git", "-C", str(old), "remote", "set-url", "origin", "foreign"],
+                        check=True,
+                    )
+                elif adverse == "extra":
+                    (scripts / "user.py").write_text("preserved foreign file")
+                elif adverse in ("alias", "hardlink"):
+                    (scripts / "github.py").unlink()
+                    donor = self.root / "foreign-github.py"
+                    donor.write_bytes(original)
+                    if adverse == "alias":
+                        (scripts / "github.py").symlink_to(donor)
+                    else:
+                        os.link(donor, scripts / "github.py")
+                elif adverse == "references":
+                    (compatibility / "references").unlink()
+                    (compatibility / "references").symlink_to(ROOT / "skills/devflow/references")
+                else:
+                    (compatibility / "scripts").unlink()
+                    shutil.copytree(scripts, compatibility / "scripts")
+                before = self.snapshot()
+                result = self.install()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("preserved", result.stderr)
+                self.assertEqual(self.snapshot(), before)
+                if adverse == "origin":
+                    origin = subprocess.check_output(
+                        ["git", "-C", str(ROOT), "config", "--get", "remote.origin.url"], text=True
+                    ).strip()
+                    subprocess.run(
+                        ["git", "-C", str(old), "remote", "set-url", "origin", origin], check=True
+                    )
+                elif adverse == "extra":
+                    (scripts / "user.py").unlink()
+                elif adverse in ("alias", "hardlink"):
+                    (scripts / "github.py").unlink()
+                    (scripts / "github.py").write_bytes(original)
+                    donor.unlink()
+                elif adverse == "references":
+                    (compatibility / "references").unlink()
+                    (compatibility / "references").symlink_to(old / "skills/devflow/references")
+                else:
+                    shutil.rmtree(compatibility / "scripts")
+                    (compatibility / "scripts").symlink_to(scripts)
+
+    def service_modules(self):
+        spec = importlib.util.spec_from_file_location(
+            "helper_service", ROOT / "scripts/install-service-entry.py"
+        )
+        service = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(service)
+        rollback = service.load("install-rollback")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rollback.capture(ROOT, self.skills, self.home)
+        return service, rollback, Path(output.getvalue().strip())
+
+    def test_migration_staging_collision_preserves_foreign_path(self):
+        spec = importlib.util.spec_from_file_location(
+            "stage_migration", ROOT / "scripts/install-migration.py"
+        )
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        self.skills.mkdir()
+        stage = self.skills / (".devflow-helper-pointer-" + str(os.getpid()))
+        for kind in ("file", "symlink"):
+            with self.subTest(kind=kind):
+                if kind == "file":
+                    stage.write_bytes(b"foreign staging bytes")
+                else:
+                    stage.symlink_to("foreign-target")
+                helper = self.skills / (".owned-helper-" + kind)
+                rollback = mock.Mock()
+                with self.assertRaises(FileExistsError):
+                    migration.apply(
+                        {"links": [self.skills / "devflow"], "helper": helper},
+                        ROOT, self.skills, mock.Mock(), rollback, "unused-backup",
+                    )
+                rollback.effect.assert_not_called()
+                self.assertTrue(os.path.lexists(stage), "foreign staging path was removed")
+                if kind == "file":
+                    self.assertEqual(stage.read_bytes(), b"foreign staging bytes")
+                else:
+                    self.assertEqual(os.readlink(stage), "foreign-target")
+                stage.unlink()
+                shutil.rmtree(helper)
+
+    def test_helper_exchange_rolls_back_without_missing_helper_interval(self):
+        _, compatibility = self.historical_helper()
+        before = self.snapshot()
+        service, rollback, backup = self.service_modules()
+        path = compatibility / "scripts"
+        snapshot = json.loads((backup / "snapshot.json").read_text())
+        self.assertIn(str(path), snapshot)
+        original_load, original_run, original_exchange = (
+            service.load,
+            subprocess.run,
+            rollback.exchange,
+        )
+        observations = []
+
+        def exchange(left, right):
+            self.assertTrue((self.skills / "devflow/scripts/state.py").is_file())
+            original_exchange(left, right)
+            self.assertTrue((self.skills / "devflow/scripts/state.py").is_file())
+            observations.append(str(right))
+
+        def run(args, **kwargs):
+            if "apply" in args and any(str(a).endswith("install-agents.py") for a in args):
+                raise subprocess.CalledProcessError(1, args)
+            return original_run(args, **kwargs)
+
+        with (
+            mock.patch.object(
+                service,
+                "load",
+                side_effect=lambda name: (
+                    rollback if name == "install-rollback" else original_load(name)
+                ),
+            ),
+            mock.patch.object(subprocess, "run", side_effect=run),
+            mock.patch.object(rollback, "exchange", side_effect=exchange),
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                service.install(self.skills, self.home, False, backup)
+            rollback.restore(backup)
+        self.assertEqual(observations, [str(path), str(path)])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_concurrent_helper_pointer_replacement_preserves_foreign_bytes(self):
+        _, compatibility = self.historical_helper()
+        service, rollback, backup = self.service_modules()
+        path = compatibility / "scripts"
+        original_load, original_exchange = service.load, rollback.exchange
+        foreign = b"foreign replacement at native exchange"
+
+        def exchange(left, right):
+            path.unlink()
+            path.write_bytes(foreign)
+            original_exchange(left, right)
+
+        with (
+            mock.patch.object(
+                service,
+                "load",
+                side_effect=lambda name: (
+                    rollback if name == "install-rollback" else original_load(name)
+                ),
+            ),
+            mock.patch.object(rollback, "exchange", side_effect=exchange),
+        ):
+            with self.assertRaisesRegex(ValueError, "forward installer drift preserved"):
+                service.install(self.skills, self.home, False, backup)
+        with self.assertRaisesRegex(ValueError, "retained backup"):
+            rollback.restore(backup)
+        self.assertTrue(backup.exists())
+        captured = list(backup.glob("forward-*"))
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].read_bytes(), foreign)
+        self.assertTrue((self.skills / "devflow/scripts/state.py").is_file())
 
     def test_legacy_registration_and_foreign_helpers_refuse_before_effects(self):
         for adverse in ("old-skill", "pin", "helper", "service"):
