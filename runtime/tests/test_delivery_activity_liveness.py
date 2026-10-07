@@ -221,6 +221,7 @@ import os,sys,time,threading,urllib.request
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,HTTPServer
 state=Path(sys.argv[1])
+print('fixture-child-entered',flush=True)
 servers=[]
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -228,7 +229,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
 for key in ['QA_API_PORT','QA_WEB_PORT']:
     if key in os.environ:
+        print('fixture-child-binding:'+key,flush=True)
         server=HTTPServer(('127.0.0.1',int(os.environ[key])),Handler)
+        print('fixture-child-bound:'+key,flush=True)
         servers.append(server)
         threading.Thread(target=server.serve_forever,daemon=True).start()
 with (state/'invocations').open('a') as stream: stream.write('one\\n')
@@ -246,12 +249,29 @@ else:
 '''
 
 
-WORKER_DRIVER = 'import os\n' + NATIVE_DRIVER.split('async def execute():')[0].replace(
+WORKER_DRIVER = 'import os,time\n' + NATIVE_DRIVER.split('async def execute():')[0].replace(
     "options['argv']=[sys.executable,'-I',str(provider),str(folder/'request.json')]",
     "if request.get('role'): "
     "options['argv']=[sys.executable,'-I',str(provider),str(folder/'request.json')]",
 ).replace("options['timeout']=20", "options['timeout']=90") + '''
 from devflow_temporal import delivery_sandbox
+
+def trace_fixture_boundary(name, execute):
+    def observed(*args, **kwargs):
+        print(json.dumps({'boundary':name,'event':'enter','time':time.monotonic()}),flush=True)
+        try:
+            result=execute(*args,**kwargs)
+        except Exception as exc:
+            print(json.dumps({'boundary':name,'event':'error','type':type(exc).__name__,
+                'message':str(exc)[:700],'time':time.monotonic()}),flush=True)
+            raise
+        details=({k:result.get(k) for k in ['state','cleanup','reason']} if isinstance(result,dict)
+                 else {})
+        print(json.dumps({'boundary':name,'event':'complete',**details,
+            'time':time.monotonic()}),flush=True)
+        return result
+    return observed
+
 def check_profile(spec,checkout,folder,check,**kwargs):
     return 'fixture',{'PATH':'/usr/bin:/bin'}
 def browser_profile(spec,checkout,folder,scratch,qa):
@@ -261,10 +281,26 @@ def browser_profile(spec,checkout,folder,scratch,qa):
 delivery_sandbox.prepare_native_check=check_profile
 delivery_sandbox.native_check_argv=lambda spec,profile,cwd,argv: argv
 import devflow_temporal.delivery_browser_qa as browser
-browser.prepare_browser_qa=browser_profile
+browser.prepare_browser_qa=trace_fixture_boundary('browser-profile',browser_profile)
+browser._ports_free=trace_fixture_boundary('browser-ports-free',browser._ports_free)
+resources=__import__('devflow_temporal.delivery_resources',fromlist=['RunResources'])
+resources.RunResources.browser_scratch=trace_fixture_boundary(
+    'browser-scratch',resources.RunResources.browser_scratch)
+for method in ['run_browser_qa','gate_checkout','_run_native_check']:
+    setattr(delivery_broker.DeliveryBroker,method,trace_fixture_boundary(
+        method,getattr(delivery_broker.DeliveryBroker,method)))
+delivery_native_process.NativeProcess=trace_fixture_boundary(
+    'native-construction',delivery_native_process.NativeProcess)
 sys.path.insert(0,sys.argv[4])
 from fixtures.activity_liveness_workflow import ActivityLivenessWorkflow
 from temporalio import activity
+original_heartbeat=activity.heartbeat
+def observed_heartbeat(*details):
+    if details and isinstance(details[0],dict):
+        print(json.dumps({'boundary':'heartbeat','stage':details[0].get('stage'),
+            'time':time.monotonic()}),flush=True)
+    return original_heartbeat(*details)
+activity.heartbeat=observed_heartbeat
 from temporalio.client import Client
 from temporalio.worker import Worker
 from devflow_temporal.delivery_activities import delivery_checks,delivery_precheck,delivery_intake
@@ -276,6 +312,21 @@ async def block_loop(_request):
     (state/'stall-finished').touch()
     return {}
 from devflow_temporal.delivery_activities import delivery_baseline_checks,delivery_browser_qa
+from devflow_temporal import delivery_activities
+delivery_activities._context=trace_fixture_boundary('activity-context',delivery_activities._context)
+original_execute_check=delivery_activities._execute_check
+async def observed_execute_check(*args,**kwargs):
+    print(json.dumps({'boundary':'check-executor','event':'enter','time':time.monotonic()}),flush=True)
+    try:
+        result=await original_execute_check(*args,**kwargs)
+    except Exception as exc:
+        print(json.dumps({'boundary':'check-executor','event':'error','type':type(exc).__name__,
+            'message':str(exc)[:700],'time':time.monotonic()}),flush=True)
+        raise
+    print(json.dumps({'boundary':'check-executor','event':'complete','time':time.monotonic(),
+        **{k:result.get(k) for k in ['state','cleanup','reason']}}),flush=True)
+    return result
+delivery_activities._execute_check=observed_execute_check
 async def main():
     client=await Client.connect(sys.argv[3])
     async with Worker(client,task_queue='activity-worker-loss',
@@ -303,6 +354,41 @@ async def _wait_for_fixture_worker_ready(worker, log_path):
             return
         assert time.monotonic()<deadline, f'fixture worker initialization timed out:\n{diagnostic}'
         await asyncio.sleep(0.05)
+
+
+def _fixture_native_start_diagnostic(log_path, state):
+    # These are retained synthetic fixture outputs, never a claim about missing journals.
+    logs = {'worker': log_path.read_text()[-12000:]}
+    for name in ('process.log', 'monitor.log'):
+        for path in sorted(state.rglob(name))[:4]:
+            if path.is_symlink() or not path.is_relative_to(state):
+                continue
+            logs[str(path.relative_to(state))] = path.read_text()[-4000:]
+    return logs
+
+
+async def _wait_for_fixture_native_start(worker, log_path, state, handle):
+    completion = asyncio.create_task(handle.result())
+    deadline = time.monotonic()+20
+    try:
+        while not (state / 'started').exists():
+            assert worker.poll() is None, _fixture_native_start_diagnostic(log_path, state)
+            if completion.done():
+                try:
+                    result = completion.result()
+                except Exception as exc:
+                    raise AssertionError(('workflow failed before native start', str(exc),
+                        _fixture_native_start_diagnostic(log_path, state))) from exc
+                raise AssertionError(('workflow completed before native start', result,
+                    _fixture_native_start_diagnostic(log_path, state)))
+            assert time.monotonic()<deadline, (
+                'native command did not start within 20 seconds after worker readiness',
+                _fixture_native_start_diagnostic(log_path, state))
+            await asyncio.sleep(0.05)
+    finally:
+        # Stop only the local result observer, never the workflow or original command.
+        completion.cancel()
+        await asyncio.gather(completion, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -394,12 +480,10 @@ async def test_fixture_worker_cold_start_is_separate_from_native_start(monkeypat
     # Native startup retains its own 20s allowance, not the spent bootstrap clock.
     fixture = next(node for node in ast.parse(Path(__file__).read_text()).body
                    if isinstance(node, ast.AsyncFunctionDef)
-                   and node.name == 'test_real_temporal_worker_loss_reuses_original_native_command')
-    native_wait = next(node for node in ast.walk(fixture) if isinstance(node, ast.While)
-                       and isinstance(node.test, ast.UnaryOp)
-                       and "'started'" in ast.unparse(node.test))
+                   and node.name == '_wait_for_fixture_native_start')
     deadline = next(node for node in ast.walk(fixture) if isinstance(node, ast.Assign)
-                    and node.lineno == native_wait.lineno-1)
+                    and any(isinstance(target, ast.Name) and target.id == 'deadline'
+                            for target in node.targets))
     assert ast.unparse(deadline.value) == 'time.monotonic() + 20'
 
 
@@ -431,6 +515,141 @@ async def test_fixture_worker_readiness_rejects_exited_worker_with_signal(tmp_pa
     log.write_text('fixture-worker-ready:123\n')
     with pytest.raises(AssertionError, match=r'initialization exited \(0\)'):
         await _wait_for_fixture_worker_ready(SimpleNamespace(pid=123, poll=lambda: 0), log)
+
+
+def test_fixture_browser_profile_exposes_owned_startup_boundary():
+    output = []
+    profile = SimpleNamespace(write_text=lambda _text: None)
+
+    class Folder:
+        def __truediv__(self, _name):
+            return profile
+
+    tree = ast.parse(WORKER_DRIVER)
+    definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name in {'browser_profile', 'trace_fixture_boundary'}]
+    assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                      and any(ast.unparse(target) == 'browser.prepare_browser_qa'
+                              for target in node.targets))
+    browser = SimpleNamespace()
+    namespace = {'browser': browser, 'print': lambda text, *, flush: output.append(text),
+                 'time': SimpleNamespace(monotonic=lambda: 1), 'json': json}
+    exec(compile(ast.Module(body=[*definitions, assignment], type_ignores=[]),
+                 '<browser-profile-boundary>', 'exec'), namespace)
+    result = browser.prepare_browser_qa({}, None, Folder(), None, {'ports': {'PORT': 123}})
+    assert result == (profile, {'PATH': '/usr/bin:/bin', 'PORT': '123'})
+    assert output and 'browser-profile' in output[0] and 'enter' in output[0]
+    assert 'complete' in output[-1]
+
+
+def test_fixture_observes_terminal_workflow_during_native_start_wait():
+    fixture = next(node for node in ast.parse(Path(__file__).read_text()).body
+                   if isinstance(node, ast.AsyncFunctionDef)
+                   and node.name == 'test_real_temporal_worker_loss_reuses_original_native_command')
+    calls = [node for node in ast.walk(fixture) if isinstance(node, ast.Await)
+             and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+             and node.value.func.id == '_wait_for_fixture_native_start']
+    assert len(calls) == 1, 'native-start waiter ignores early returned gate outcomes'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [False, True])
+async def test_fixture_native_start_reports_early_gate_result(tmp_path, failure):
+    log = tmp_path / 'worker.log'
+    log.write_text('fixture-worker-ready:123\n')
+    state = tmp_path / 'state'
+    state.mkdir()
+
+    async def result():
+        if failure:
+            raise RuntimeError('opaque gate rejection')
+        return {'state': 'unknown', 'reason': 'ValueError'}
+
+    handle = SimpleNamespace(result=result)
+    worker = SimpleNamespace(poll=lambda: None)
+    with pytest.raises(AssertionError, match=(
+        'workflow failed before native start' if failure
+        else 'workflow completed before native start'
+    )) as error:
+        await _wait_for_fixture_native_start(worker, log, state, handle)
+    assert ('opaque gate rejection' if failure else 'ValueError') in str(error.value)
+    assert 'fixture-worker-ready:123' in str(error.value)
+    assert list(state.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('started', [False, True])
+async def test_fixture_native_start_keeps_deadline_and_only_cancels_observer(
+    monkeypatch, tmp_path, started,
+):
+    clock, cancelled = [0], []
+    log, state = tmp_path / 'worker.log', tmp_path / 'state'
+    log.write_text('fixture-worker-ready:123\n')
+    state.mkdir()
+    native = state / 'browser-qa' / 'native'
+    native.mkdir(parents=True)
+    (native / 'process.log').write_text('fixture-child-binding:QA_API_PORT\n')
+    (native / 'monitor.log').write_text('opaque monitor diagnostic\n')
+    yielded = asyncio.sleep
+
+    async def sleep(_seconds):
+        clock[0] += 1
+        if started and clock[0] == 3:
+            (state / 'started').touch()
+        await yielded(0)
+
+    async def result():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append('observer')
+
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(asyncio, 'sleep', sleep)
+    # There is deliberately no workflow cancel method available to this helper.
+    handle = SimpleNamespace(result=result)
+    worker = SimpleNamespace(poll=lambda: None)
+    if started:
+        await _wait_for_fixture_native_start(worker, log, state, handle)
+        assert clock[0] == 3
+    else:
+        with pytest.raises(AssertionError, match='within 20 seconds') as error:
+            await _wait_for_fixture_native_start(worker, log, state, handle)
+        assert 'fixture-child-binding:QA_API_PORT' in str(error.value)
+        assert 'opaque monitor diagnostic' in str(error.value)
+        assert clock[0] == 20
+    assert cancelled == ['observer']
+    assert (native / 'process.log').read_text() == 'fixture-child-binding:QA_API_PORT\n'
+
+
+def test_fixture_boundary_diagnostics_preserve_original_result_and_exception():
+    tree = ast.parse(WORKER_DRIVER)
+    definition = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == 'trace_fixture_boundary')
+    output = []
+    namespace = {'json': json, 'time': SimpleNamespace(monotonic=lambda: 1),
+                 'print': lambda text, *, flush: output.append(json.loads(text))}
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), '<boundary>', 'exec'), namespace)
+    expected, calls = {'state': 'unknown', 'reason': 'ValueError'}, []
+
+    def execute(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    observed = namespace['trace_fixture_boundary']('owned-boundary', execute)
+    assert observed('original', candidate='unchanged') is expected
+    assert calls == [(('original',), {'candidate': 'unchanged'})]
+    assert [row['event'] for row in output] == ['enter', 'complete']
+    assert output[-1]['state'] == 'unknown' and output[-1]['reason'] == 'ValueError'
+    original = ValueError('original rejection')
+
+    def reject():
+        raise original
+
+    with pytest.raises(ValueError) as error:
+        namespace['trace_fixture_boundary']('owned-boundary', reject)()
+    assert error.value is original
+    assert output[-1]['event'] == 'error' and output[-1]['type'] == 'ValueError'
 
 
 @pytest.mark.asyncio
@@ -538,13 +757,8 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                     **({'hours': 40/3600} if interruption == 'deadline' else {})},
                 id='worker-loss', task_queue='activity-worker-loss',
             )
-            deadline = time.monotonic()+20
-            while not (state / 'started').exists():
-                assert workers[0].poll() is None, (tmp_path / 'first-worker.log').read_text()
-                assert time.monotonic()<deadline, (
-                    'native command did not start within 20 seconds after worker readiness',
-                    (tmp_path / 'first-worker.log').read_text())
-                await asyncio.sleep(0.05)
+            await _wait_for_fixture_native_start(
+                workers[0], tmp_path / 'first-worker.log', state, handle)
             if interruption == 'worker_loss':
                 workers[0].kill()
                 await asyncio.to_thread(workers[0].wait, 5)
