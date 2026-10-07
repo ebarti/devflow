@@ -9,11 +9,34 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, ServerError
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from .contracts import digest
 from .delivery_metadata_contract import evidence_applicability
 from .delivery_questions import valid_blocking_questions
+
+
+def _failure_classification(cause: Exception | None, controller_cause: str | None) -> dict:
+    """Classify controller observations, never human or model diagnostic text."""
+    result = {"classification": "terminal"}
+    if controller_cause in {"ci_deadline", "tracker_readback", "publication_deadline"}:
+        return {"classification": "transient", "cause_type": controller_cause}
+    if not isinstance(cause, ActivityError):
+        return result
+    failure = cause.cause
+    if isinstance(failure, ActivityTimeoutError):
+        return {"classification": "transient", "cause_type": "ActivityTimeoutError"}
+    if isinstance(failure, ServerError) and not failure.non_retryable:
+        return {"classification": "transient", "cause_type": "ServerError"}
+    if isinstance(failure, ApplicationError):
+        result["cause_type"] = (failure.type or "ApplicationError")[:128]
+        if not failure.non_retryable and failure.type in {
+            "ConnectionError", "TimeoutError", "TimeoutExpired", "GitHubTransientError",
+            "BrokerReadbackUnavailable", "ResourceCleanupTransient",
+        }:
+            result["classification"] = "transient"
+    return result
 
 
 def _preparation_failure(result: dict[str, Any]) -> str | None:
@@ -129,6 +152,7 @@ class DeliveryWorkflow:
         self.terminal_reconciliation_only = False
         self.controller_only_adjudication = False
         self.controller_only_resource_closure = False
+        self.original_execution = True
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
         if self.controller_only_resource_closure and name not in {
@@ -406,7 +430,10 @@ class DeliveryWorkflow:
                 return False
             self.tracker_retry_requested = False
 
-    async def _stop(self, spec: dict[str, Any], reason: str) -> dict[str, Any]:
+    async def _stop(
+        self, spec: dict[str, Any], reason: str, *, cause: Exception | None = None,
+        controller_cause: str | None = None,
+    ) -> dict[str, Any]:
         if any(
             role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
             for role in self.state["roles"]
@@ -419,6 +446,11 @@ class DeliveryWorkflow:
         if self.cancel_requested:
             self.state["cleanup"] = "unknown"
             return await self._cancelled(spec)
+        if self.original_execution and spec.get("automatic_retry_version") == 1:
+            self.state["checks"]["failure"] = {
+                **_failure_classification(cause, controller_cause),
+                "stage": self.state["phase"], "reason": reason[:600],
+            }
         self.state["phase"] = "blocked"
         self.state["execution_state"] = "blocked"
         self.state["outcome"] = "blocked"
@@ -522,7 +554,7 @@ class DeliveryWorkflow:
                     },
                 )
             except Exception as exc:
-                await self._stop(spec, f"intake activity failed: {type(exc).__name__}")
+                await self._stop(spec, f"intake activity failed: {type(exc).__name__}", cause=exc)
                 return None
             self.state["roles"].append(result)
             self.state["usage"][f"intake:{turn}"] = result.get("usage")
@@ -630,7 +662,9 @@ class DeliveryWorkflow:
                              "authorization": authorization},
                         )
                     except Exception as exc:
-                        await self._stop(spec, f"plan acceptance failed: {type(exc).__name__}")
+                        await self._stop(
+                            spec, f"plan acceptance failed: {type(exc).__name__}", cause=exc,
+                        )
                         return None
                     plan_record["state"] = "accepted"
                     intake["accepted_plan"] = {
@@ -693,7 +727,9 @@ class DeliveryWorkflow:
                          "plan_digest": plan_record["digest"], "plan": plan},
                     )
                 except Exception as exc:
-                    await self._stop(spec, f"plan acceptance failed: {type(exc).__name__}")
+                    await self._stop(
+                        spec, f"plan acceptance failed: {type(exc).__name__}", cause=exc,
+                    )
                     return None
                 plan_record["state"] = "accepted"
                 intake["accepted_plan"] = {
@@ -711,6 +747,7 @@ class DeliveryWorkflow:
     async def run(
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        self.original_execution = recovery is None
         if recovery is not None:
             if recovery.get("kind") == "stopped_delivery_resume":
                 return await self._resume_stopped(spec, recovery)
@@ -767,7 +804,7 @@ class DeliveryWorkflow:
         except Exception as exc:
             cause = getattr(exc, "cause", None)
             reason = str(cause)[:600] if cause else type(exc).__name__
-            return await self._stop(spec, f"preparation failed: {reason}")
+            return await self._stop(spec, f"preparation failed: {reason}", cause=exc)
         spec = prepared.get("spec", spec)
         if self.cancel_requested:
             return await self._cancelled(spec)
@@ -783,7 +820,8 @@ class DeliveryWorkflow:
                 baseline = await self._activity("delivery_baseline_checks", {"spec": spec})
             except Exception as exc:
                 return await self._stop(
-                    spec, f"baseline check execution unresolved: {type(exc).__name__}"
+                    spec, f"baseline check execution unresolved: {type(exc).__name__}",
+                    cause=exc,
                 )
             self.state["checks"]["baseline"] = baseline
             if self.cancel_requested:
@@ -810,11 +848,16 @@ class DeliveryWorkflow:
             started_tracker = await self._activity("delivery_tracker_start", {"spec": spec})
         except Exception as exc:
             return await self._stop(
-                spec, f"initial tracker synchronization pending: {type(exc).__name__}"
+                spec, f"initial tracker synchronization pending: {type(exc).__name__}",
+                cause=exc,
             )
         self.state["tracker"] = started_tracker
         if started_tracker.get("state") != "consistent":
-            return await self._stop(spec, "initial tracker readback remains pending")
+            return await self._stop(
+                spec, "initial tracker readback remains pending",
+                controller_cause=("tracker_readback" if started_tracker.get("retryable") is True
+                                  else None),
+            )
         prompt = spec["policy"].get("initial_decision_prompt")
         if prompt:
             self.state["phase"] = "waiting_decision"
@@ -1619,7 +1662,7 @@ class DeliveryWorkflow:
                     except Exception as exc:
                         self.state['cleanup'] = 'unknown'
                         return await self._stop(spec, 'technical prepublication checks failed: '
-                                                + type(exc).__name__)
+                                                + type(exc).__name__, cause=exc)
                     self.state['checks']['prepublish'] = checked
                     if checked.get('state') != 'passed' or checked.get('cleanup') == 'unknown':
                         return await self._stop(spec, 'technical prepublication checks failed')
@@ -1638,7 +1681,8 @@ class DeliveryWorkflow:
                     )
                 except Exception as exc:
                     return await self._stop(
-                        spec, f"publication reconciliation unresolved: {type(exc).__name__}"
+                        spec, f"publication reconciliation unresolved: {type(exc).__name__}",
+                        cause=exc,
                     )
                 if published.get("state") == "cancelled":
                     return self.state
@@ -1693,7 +1737,8 @@ class DeliveryWorkflow:
                         )
                     except Exception as exc:
                         return await self._stop(
-                            spec, f"implementer activity failed: {type(exc).__name__}"
+                            spec, f"implementer activity failed: {type(exc).__name__}",
+                            cause=exc,
                         )
                     self.state["roles"].append(implementation)
                     self.state["usage"][f"implement:{iteration}"] = implementation.get("usage")
@@ -1747,7 +1792,8 @@ class DeliveryWorkflow:
                 except Exception as exc:
                     self.state["cleanup"] = "unknown"
                     return await self._stop(
-                        spec, f"prepublication checks failed: {type(exc).__name__}"
+                        spec, f"prepublication checks failed: {type(exc).__name__}",
+                        cause=exc,
                     )
                 self.state["checks"]["prepublish"] = prechecked
                 if prechecked.get("state") == "unknown" or prechecked.get("cleanup") == "unknown":
@@ -1796,7 +1842,9 @@ class DeliveryWorkflow:
                             ),
                         )
                 except Exception as exc:
-                    return await self._stop(spec, f"publication unresolved: {type(exc).__name__}")
+                    return await self._stop(
+                        spec, f"publication unresolved: {type(exc).__name__}", cause=exc,
+                    )
                 if published.get("state") == "cancelled":
                     return self.state
                 if published["candidate"]["id"] != self.state["candidate"]["id"]:
@@ -1833,7 +1881,8 @@ class DeliveryWorkflow:
                     except Exception as exc:
                         self.state["cleanup"] = "unknown"
                         return await self._stop(
-                            spec, f"checks activity failed: {type(exc).__name__}"
+                            spec, f"checks activity failed: {type(exc).__name__}",
+                            cause=exc,
                         )
                     self.state["checks"]["local"] = checked
                     if checked.get("state") == "unknown" or checked.get("cleanup") == "unknown":
@@ -1869,7 +1918,8 @@ class DeliveryWorkflow:
                     except Exception as exc:
                         self.state["cleanup"] = "unknown"
                         return await self._stop(
-                            spec, f"browser QA activity failed: {type(exc).__name__}"
+                            spec, f"browser QA activity failed: {type(exc).__name__}",
+                            cause=exc,
                         )
                     self.state["checks"]["browser_qa"] = browser_qa
                     if self.cancel_requested:
@@ -1919,7 +1969,9 @@ class DeliveryWorkflow:
                         },
                     )
                 except Exception as exc:
-                    return await self._stop(spec, f"{role} activity failed: {type(exc).__name__}")
+                    return await self._stop(
+                        spec, f"{role} activity failed: {type(exc).__name__}", cause=exc,
+                    )
                 self.state["roles"].append(result)
                 self.state["usage"][f"{role}:{iteration}"] = result.get("usage")
                 if self.cancel_requested:
@@ -1954,12 +2006,17 @@ class DeliveryWorkflow:
                     "delivery_ci", {"spec": spec, "pull_request": published}, hours=1
                 )
             except Exception as exc:
-                return await self._stop(spec, f"CI observation failed: {type(exc).__name__}")
+                return await self._stop(
+                    spec, f"CI observation failed: {type(exc).__name__}", cause=exc,
+                )
             self.state["checks"]["ci"] = ci
             if self.cancel_requested:
                 return await self._cancelled(spec)
             if ci.get("state") != "passed":
-                return await self._stop(spec, "required CI did not confirm this PR head")
+                return await self._stop(
+                    spec, "required CI did not confirm this PR head",
+                    controller_cause="ci_deadline" if ci.get("state") == "pending" else None,
+                )
             self.state["phase"] = "tracker"
             self.state["revision"] += 1
             await self._project(spec, "tracker_started", "Reconciling issue and claim")
@@ -1970,7 +2027,8 @@ class DeliveryWorkflow:
                     )
                 except Exception as exc:
                     return await self._stop(
-                        spec, f"tracker synchronization pending: {type(exc).__name__}"
+                        spec, f"tracker synchronization pending: {type(exc).__name__}",
+                        cause=exc,
                     )
                 self.state["tracker"] = tracker
                 if self.cancel_requested:

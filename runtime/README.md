@@ -15,18 +15,42 @@ Existing frozen runs without this setting retain their one-attempt behavior.
 
 ### Fixed retry budgets
 
-Set `max_attempts` (1–10, for example 3) in the service configuration to enable
-fixed budgets for new admissions. The first budgeted admission freezes the issue's
+New admissions use a fixed `max_attempts` ceiling of 3. Set `max_attempts`
+(1–10) in the service configuration to choose a different ceiling. The first budgeted admission freezes the issue's
 attempt ceiling; all previous admissions, including archived and failed runs,
 consume it. Changing run IDs, work IDs, or later configuration cannot reset that
 ceiling. Replaying an accepted command does not consume another attempt.
 
 These runs also keep their original `max_repairs` ceiling. Public continuations
 cannot add implementation iterations, and native roles cannot use historical
-grant rows to exceed it. Existing configurations and histories without the frozen
-budget version retain their original behavior. Budgets are scoped to one
-authoritative tracking database; separate databases cannot enforce a shared limit.
+grant rows to exceed it. Policy recovery also cannot grant positive iterations.
+Already-admitted histories without the frozen budget version retain their original
+behavior; new admissions from existing configurations use the new default.
+Budgets are scoped to one authoritative tracking database; separate databases cannot enforce a shared limit.
 This supplies admission bounds for automatic retries; it does not add resubmission.
+
+### Failure classification
+
+New original runs freeze `automatic_retry_version: 1` at admission. When they
+stop, `checks.failure` records a bounded reason, the controller phase and a
+`terminal` or `transient` classification. The default is terminal. Only typed
+activity transport failures/timeouts and recognized controller deadline results
+are transient; model findings, invalid inputs, scope violations and failed or
+changed-head CI remain terminal. Returned provider findings also remain terminal.
+
+This is a diagnostic, not permission to execute again. Unknown cleanup and
+publication effects retain their existing guards. It does not schedule a retry
+or extend a budget. Scope amendments preserve the original version markers and
+attempt ceiling. Existing workflows and historical continuation paths keep their
+original payloads. Operator steps: deploy through the usual service update when
+ready. No database schema migration is needed, but review issue attempt counts
+before deploying: archived, failed and superseded prior admissions all count.
+Choose `max_attempts` (1–10) before the first post-deploy admission if additional
+headroom is needed. Issues with three prior admissions exhaust the default; ten
+prior admissions exhaust every supported setting. Once frozen, the ceiling cannot
+be raised by changing configuration. New runs cannot receive positive-iteration
+continuations, including stopped resumes, repair grants, title repair or policy
+recovery. Existing admitted histories keep their original frozen behavior.
 
 ### Rerun gates after a runtime repair
 

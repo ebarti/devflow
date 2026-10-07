@@ -10,7 +10,8 @@ from temporalio.client import WorkflowHistory
 from temporalio.worker import Replayer
 from test_delivery_store import service as service
 
-from devflow_temporal import delivery_stopped_resume
+from devflow_temporal import delivery_policy_recovery, delivery_stopped_resume
+from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_guard import validate_native_turn
 from devflow_temporal.delivery_store import DeliveryStore
@@ -110,9 +111,17 @@ def test_command_replays_and_different_issues_do_not_spend_another_attempt(servi
     assert store.submit(other)['existing'] is False
 
 
-def test_enabling_budgets_counts_original_legacy_admissions(service):
+def test_enabling_budgets_counts_original_legacy_admissions(service, monkeypatch):
     store, request = service
-    store.submit(request)
+    # Retained pre-budget input, rather than a new admission under today's defaults.
+    legacy = store.config.admit(request)
+    legacy.pop('automatic_retry_version', None)
+    legacy.pop('retry_budget_version', None)
+    legacy['policy'].pop('max_attempts', None)
+    legacy['policy_digest'] = digest(legacy['policy'])
+    with monkeypatch.context() as historical:
+        historical.setattr(DeliveryConfig, 'admit', lambda *_args: copy.deepcopy(legacy))
+        store.submit(request)
     assert 'retry_budget_version' not in store.submitted_spec(request['run_id'])
     finish(store, request, archived=True)
     store = configured(store, max_attempts=1)
@@ -202,3 +211,43 @@ async def test_previous_admission_history_keeps_its_original_workflow_path():
     path = Path(__file__).parent / 'fixtures' / 'intake-required-history.json'
     await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(
         WorkflowHistory.from_json('delivery-run-1', path.read_text()))
+
+
+@pytest.mark.parametrize('entry', ['precheck', 'recover'])
+@pytest.mark.parametrize('maximum', [None, 5])
+def test_policy_recovery_rejects_frozen_budget_before_any_effect(
+    service, monkeypatch, entry, maximum,
+):
+    store, request = service
+    if maximum is not None:
+        store = configured(store, max_attempts=maximum)
+    store.submit(request)
+    original = store.submitted_spec(request['run_id'])
+    assert original['retry_budget_version'] == 1
+    assert original['policy']['max_attempts'] == (3 if maximum is None else maximum)
+    # Later config changes cannot erase the admitted marker.
+    store.config.raw.pop('max_attempts', None)
+    store.config.path.write_text(json.dumps(store.config.raw))
+    before_files = {str(path): path.read_bytes() for path in store.config.state_root.rglob('*')
+                    if path.is_file()}
+    with store._connect() as db:
+        before = '\n'.join(db.iterdump())
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('policy budget rejection must precede inspection or preparation')
+
+    monkeypatch.setattr(delivery_policy_recovery, 'require_native_execution', unexpected)
+    monkeypatch.setattr(delivery_policy_recovery, '_lock', unexpected)
+    with pytest.raises(ValueError, match='fixed repair budget'):
+        if entry == 'precheck':
+            store.policy_recovery_precheck(request['run_id'])
+        else:
+            store.recover_execution(request['run_id'], {
+                'command_id': 'extend-policy-budget', 'additional_iterations': 1,
+                'expected_precheck_sha256': 'a' * 64, 'config_path': 'unused.json',
+                'config_sha256': 'b' * 64,
+            })
+    with store._connect() as db:
+        assert '\n'.join(db.iterdump()) == before
+    assert {str(path): path.read_bytes() for path in store.config.state_root.rglob('*')
+            if path.is_file()} == before_files

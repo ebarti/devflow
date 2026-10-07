@@ -6,6 +6,7 @@ import json
 import pytest
 from test_delivery_metadata_recovery import published as published
 from test_delivery_store import service as service
+from test_delivery_store import submit_historical_admission
 
 from devflow_temporal.contracts import canonical_json
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -17,7 +18,7 @@ from devflow_temporal.delivery_workflow import DeliveryWorkflow
 @pytest.fixture
 def unpublished(service, monkeypatch):
     store, request = service
-    store.submit(request)
+    submit_historical_admission(store, request, monkeypatch)
     spec = store.spec('run-1')
     broker = DeliveryBroker(store, spec)
     broker.prepare()
