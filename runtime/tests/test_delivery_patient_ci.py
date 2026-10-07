@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -14,7 +15,8 @@ from temporalio.worker import Replayer
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_activities, delivery_broker
-from devflow_temporal.delivery_config import DeliveryConfig
+from devflow_temporal.contracts import digest
+from devflow_temporal.delivery_config import DeliveryConfig, scope_amended_spec
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -212,3 +214,25 @@ async def test_previous_code_history_through_ci_still_replays():
     path = Path(__file__).parent / "fixtures" / "required_ci" / "c04-ci-previous-history.json"
     history = WorkflowHistory.from_json("delivery-run-1-stopped-resume-1", path.read_text())
     await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_scope_amendment_preserves_frozen_ci_policy(service, legacy):
+    store, request = service
+    original = store.config.admit(request)
+    original["request_digest"] = digest(request)
+    if legacy:
+        original["policy"].pop("ci_wait_seconds")
+        original["policy_digest"] = digest(original["policy"])
+    raw = json.loads(store.config.path.read_text())
+    raw["repositories"]["fixture"]["allowed_paths"].append("tests/extra.py")
+    path = store.config.state_root / "ci-amendment.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(json.dumps(raw))
+    path.chmod(0o600)
+    effective = scope_amended_spec(
+        original, path, hashlib.sha256(path.read_bytes()).hexdigest(), ["tests/extra.py"]
+    )
+    assert ("ci_wait_seconds" in effective["policy"]) == ("ci_wait_seconds" in original["policy"])
+    assert effective["policy"].get("ci_wait_seconds") == original["policy"].get("ci_wait_seconds")
+    assert effective["policy_digest"] == digest(effective["policy"])

@@ -638,6 +638,10 @@ def scope_amended_spec(
             effective[marker] = original[marker]
         else:
             effective.pop(marker, None)
+    if "ci_wait_seconds" in original["policy"]:
+        effective["policy"]["ci_wait_seconds"] = original["policy"]["ci_wait_seconds"]
+    else:
+        effective["policy"].pop("ci_wait_seconds", None)
     if "max_attempts" in original["policy"]:
         effective["policy"]["max_attempts"] = original["policy"]["max_attempts"]
     else:
