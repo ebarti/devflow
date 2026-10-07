@@ -94,6 +94,9 @@ class DeliveryConfig:
         attempts = value.get("provider_max_attempts", 3)
         if type(attempts) is not int or not 1 <= attempts <= 3:
             raise ValueError("provider_max_attempts must be between 1 and 3")
+        ci_wait = value.get("ci_wait_seconds", 10800)
+        if type(ci_wait) is not int or not 60 <= ci_wait <= 43200:
+            raise ValueError("ci_wait_seconds must be between 60 and 43200")
         return cls(path=path.resolve(), raw=value)
 
     @property
@@ -124,6 +127,7 @@ class DeliveryConfig:
         return {
             "roles": self.raw["roles"],
             "provider_max_attempts": self.raw.get("provider_max_attempts", 3),
+            "ci_wait_seconds": self.raw.get("ci_wait_seconds", 10800),
             "repositories": [
                 {
                     "key": key,
@@ -244,6 +248,7 @@ class DeliveryConfig:
         policy = {
             "roles": self.raw["roles"],
             "provider_max_attempts": self.raw.get("provider_max_attempts", 3),
+            "ci_wait_seconds": self.raw.get("ci_wait_seconds", 10800),
             "checks": repository.get("checks", []),
             "prepublish_checks": repository.get("prepublish_checks", []),
             "browser_qa": repository.get("browser_qa"),

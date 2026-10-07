@@ -684,7 +684,17 @@ async def delivery_baseline_checks(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_ci")
 async def delivery_ci(request: dict[str, Any]) -> dict[str, Any]:
     _, broker = _context(request["spec"])
-    return await broker.checks(request["pull_request"])
+    if "ci_wait_seconds" not in request["spec"].get("policy", {}):
+        return await broker.checks(request["pull_request"])
+    pending = asyncio.create_task(broker.checks(request["pull_request"]))
+    try:
+        while not pending.done():
+            activity.heartbeat({"run_id": request["spec"]["run_id"], "stage": "required_ci"})
+            await asyncio.wait({pending}, timeout=5)
+        return await pending
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
 
 
 def _terminal_receipt(store, spec, status, release, project, assignee, desired):
