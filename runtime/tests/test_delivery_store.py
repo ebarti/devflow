@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
 from temporalio.converter import DataConverter
@@ -736,7 +737,7 @@ async def test_public_scope_amendment_dispatches_one_original_session_temporal_r
     service, monkeypatch, image_outage
 ):
     store, request = service
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
         store.config.raw["queue"] = "scope-amendment-public-test"
         store.config.path.write_text(json.dumps(store.config.raw))
@@ -843,7 +844,7 @@ async def test_public_prelaunch_retry_without_required_ci_reaches_temporal_role(
     service, monkeypatch
 ):
     store, request = service
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         store.config.raw["temporal_address"] = environment.client.service_client.config.target_host
         store.config.raw["queue"] = "prelaunch-retry-public-test"
         store.config.path.write_text(json.dumps(store.config.raw))
@@ -3228,7 +3229,7 @@ async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure
     async def tracker_stub(_payload):
         return {"state": "consistent"}
 
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         async with Worker(
             environment.client,
             task_queue=f"browser-qa-{qa_state}",
@@ -3306,7 +3307,7 @@ async def test_managed_check_unknown_keeps_terminal_cleanup_quarantined(unknown_
     async def checks_stub(_payload):
         return {"state": "unknown", "cleanup": "unknown"}
 
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         async with Worker(
             environment.client,
             task_queue=spec["run_id"],
@@ -3354,7 +3355,7 @@ async def test_managed_decision_wait_survives_worker_restart(service, tmp_path):
         return {"status": "blocked", "candidate": payload["candidate"]}
 
     activities = [delivery_project, delivery_prepare, tracker_start_stub, role_stub]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "decision-temporal.sqlite3")
     ) as environment:
         queue = "managed-decision-restart"
@@ -3451,7 +3452,7 @@ async def test_managed_cancel_wins_over_overlapping_failed_precheck(service, tmp
         tracker_start_stub,
         failing_precheck,
     ]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "cancel-temporal.sqlite3")
     ) as environment:
         async with Worker(
@@ -3521,7 +3522,7 @@ async def test_cancelled_role_with_unknown_teardown_retains_unknown_cleanup(serv
             "finish_reason": "recovery_unknown",
         }
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "unknown-cancel.sqlite3")
     ) as environment:
         async with Worker(

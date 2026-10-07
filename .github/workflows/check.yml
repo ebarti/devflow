@@ -27,9 +27,14 @@ jobs:
       - run: python3.12 -B -m unittest discover -s tests -v
   temporal-runtime:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # A passing 723.78s suite exceeded the former 12-minute job deadline.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: temporalio/setup-temporal@1059a504f87e7fa2f385e3fa40d1aa7e62f1c6ca # v0
+        with:
+          version: '1.9.1'
+      - run: temporal --version
       - run: python3.12 -m venv /tmp/devflow-uv
       - run: /tmp/devflow-uv/bin/pip install uv==0.12.17
       - run: echo '/tmp/devflow-uv/bin' >> "$GITHUB_PATH"
@@ -38,6 +43,31 @@ jobs:
       - run: /tmp/devflow-uv/bin/uv run --frozen ruff check src tests
         working-directory: runtime
       - run: /tmp/devflow-uv/bin/uv run --frozen pytest -q
+        working-directory: runtime
+  temporal-runtime-macos:
+    runs-on: macos-latest
+    # The observed native macOS job took 17m39s; reserve runner/cleanup headroom.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.21.1'
+      - uses: temporalio/setup-temporal@1059a504f87e7fa2f385e3fa40d1aa7e62f1c6ca # v0
+        with:
+          version: '1.9.1'
+      - run: temporal --version
+      - run: python -m venv "$RUNNER_TEMP/devflow-uv"
+      - run: '"$RUNNER_TEMP/devflow-uv/bin/pip" install uv==0.12.17'
+      - run: echo "$RUNNER_TEMP/devflow-uv/bin" >> "$GITHUB_PATH"
+      - run: uv sync --locked --python python
+        working-directory: runtime
+      - run: uv run --frozen ruff check src tests
+        working-directory: runtime
+      - run: uv run --frozen pytest -q -ra
         working-directory: runtime
   temporal-dashboard:
     runs-on: ubuntu-latest

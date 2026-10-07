@@ -13,8 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import activity, workflow
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_intake import intake_fixture as intake_fixture
 
@@ -403,7 +403,7 @@ async def test_real_terminal_workflow_removes_owned_temps_before_projection(
     scratch.joinpath("owned-temp").write_text("temporary")
     evidence = Path(submitted["state_dir"]) / "durable-fixture.txt"
     evidence.write_text("controlled evidence; no model, tracker or PR publication")
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
     ) as environment:
         async with Worker(
@@ -460,7 +460,7 @@ async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(nati
             "cleanup": "confirmed",
         }
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
     ) as environment:
         async with Worker(
@@ -520,7 +520,7 @@ async def test_early_preparation_error_finalizes_registered_temporary_resources(
     submitted = store.submitted_spec(request["run_id"])
     scratch = RunResources(submitted).scratch("preparation", "allocated-before-failure")
     scratch.joinpath("owned-temp").write_text("temporary")
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
     ) as environment:
         async with Worker(
@@ -593,7 +593,7 @@ async def main():
         await asyncio.Event().wait()
 asyncio.run(main())
 """)
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "temporal-restart.sqlite3"),
     ) as environment:

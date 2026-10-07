@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from devflow_temporal.delivery_activities import (
@@ -848,8 +848,9 @@ async def test_public_supersede_requires_new_branch_and_preserves_prior_checkout
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("project_delay", [0, 6])
 async def test_public_decision_and_cancel_use_temporal_revision_after_worker_restart(
-    api_fixture, tmp_path
+    api_fixture, tmp_path, project_delay
 ):
     path, request = api_fixture
     config = json.loads(path.read_text())
@@ -866,8 +867,19 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
     async def role_stub(payload):
         return {"status": "blocked", "candidate": payload["candidate"]}
 
-    activities = [delivery_project, delivery_prepare, tracker_start_stub, role_stub]
-    async with await WorkflowEnvironment.start_local(
+    delayed_runs = set()
+
+    @activity.defn(name="delivery_project")
+    async def project_fixture(payload):
+        # Exercise scheduling beyond the former five-second readiness budget.
+        run_id = payload["spec"]["run_id"]
+        if run_id not in delayed_runs:
+            delayed_runs.add(run_id)
+            await asyncio.sleep(project_delay)
+        return await delivery_project(payload)
+
+    activities = [project_fixture, delivery_prepare, tracker_start_stub, role_stub]
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "public-decision.sqlite3")
     ) as environment:
 
@@ -909,11 +921,12 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
                         task_queue=queue,
                     )
                     store.mark_start(submitted["run_id"], accepted=True)
-                    for _ in range(100):
-                        if store.detail(submitted["run_id"])["decisions"]:
-                            break
-                        await asyncio.sleep(0.05)
-                    assert store.detail(submitted["run_id"])["decisions"]
+
+                    async def pending_decision(run_id):
+                        while not store.detail(run_id)["decisions"]:
+                            await asyncio.sleep(0.05)
+
+                    await asyncio.wait_for(pending_decision(submitted["run_id"]), 15)
                 # The public command is sent after a worker restart, using the
                 # HTTP revision rather than the unrelated SQLite event revision.
                 async with Worker(
@@ -959,8 +972,9 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("browser_entry_delay", [0, 6])
 async def test_public_cancel_remains_responsive_during_blocking_browser_activity(
-    api_fixture, tmp_path, monkeypatch
+    api_fixture, tmp_path, monkeypatch, browser_entry_delay
 ):
     path, request = api_fixture
     config = json.loads(path.read_text())
@@ -972,6 +986,7 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
     release = threading.Event()
 
     def blocking_browser(_broker, _iteration, candidate):
+        time.sleep(browser_entry_delay)
         entered.set()
         assert release.wait(timeout=10)
         return {"state": "passed", "cleanup": "confirmed", "candidate_id": candidate["id"]}
@@ -1002,7 +1017,7 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
     async def checks_stub(_payload):
         return {"state": "passed"}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "browser-cancel.sqlite3")
     ) as environment:
 
@@ -1043,8 +1058,12 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
                     task_queue="public-browser-cancel",
                 )
                 store.mark_start(request["run_id"], accepted=True)
-                assert await asyncio.wait_for(asyncio.to_thread(entered.wait), 5)
                 try:
+                    async def browser_entered():
+                        while not entered.is_set():
+                            await asyncio.sleep(0.05)
+
+                    await asyncio.wait_for(browser_entered(), 15)
                     detail = (await browser.get("/api/runs/run-1")).json()["run"]
                     assert detail["phase"] == "browser_qa"
                     cancelled = await asyncio.wait_for(

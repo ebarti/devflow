@@ -13,10 +13,10 @@ from pathlib import Path
 import httpx
 import pytest
 from agent_runtime_kit import FilesystemAccess
+from temporal_test_server import local_temporal
 from temporalio import activity
 from temporalio.client import WorkflowHistory
 from temporalio.exceptions import ApplicationError
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 from devflow_temporal.contracts import digest
@@ -297,7 +297,7 @@ async def test_raw_goal_questions_revision_restart_plan_change_and_acceptance(
         delivery_project, delivery_prepare, delivery_intake, delivery_accept_plan,
         tracker_start, role_stub,
     ]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "intake-temporal.sqlite3"),
     ) as environment:
@@ -449,7 +449,7 @@ async def test_cancellation_while_waiting_for_intake(intake_fixture, tmp_path, r
         calls.append(payload)
         return {"status": "blocked", "candidate": payload["candidate"]}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "cancel-temporal.sqlite3"),
     ) as environment:
@@ -624,7 +624,7 @@ async def test_automatic_intake_reaches_implementation_without_plan_answer(
 
     activities = [delivery_project, delivery_prepare, delivery_intake, accept_plan,
                   tracker, implement]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "automatic-temporal.sqlite3"),
     ) as environment:
