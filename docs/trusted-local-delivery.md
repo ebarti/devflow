@@ -134,20 +134,33 @@ New execution-policy recovery admission is retired. The CLI commands
 `recovery-preflight` and `recover-execution`, their HTTP routes, MCP tools and
 client/store grant methods are no longer available.
 
-Before deploying this release, cease new calls to these operations. Let every
-existing pre-workflow policy intent and its preparation or other effects finish
-under the previous release. Also let admitted queued and running legacy policy
-recoveries finish under the matching installed runtime before deployment. Inspect
-their public run status and indexed evidence, including unknown effects and
-pending dispatches; do not blindly retry commands, edit private records or infer
-that an empty queue proves every intent or execution is finished.
+Operator steps before deployment:
+
+1. Cease new calls to the retired operations. Inspect both current and archived
+   runs using `GET /api/runs?archived=false` and `GET /api/runs?archived=true`, or
+   the dashboard's active and archive views. The default run list omits archived
+   runs; a blocked or archived row does not prove preparation has finished.
+2. Read each run's indexed `execution-policy-recovery-intent` evidence, including
+   every nested preparation attempt and its cleanup receipt. An intent whose
+   state is anything other than `queued`, or any preparation attempt without
+   confirmed cleanup, is unfinished. Follow the retained policy recovery summary
+   even when it is nested in a later recovery. Include unknown or pending effects
+   and dispatches; an empty queue does not prove these operations are finished.
+3. Under the matching previous installed runtime, finish or cancel unfinished
+   operations and admitted queued/running legacy policy recoveries. Before
+   deploying, verify a terminal run state and confirmed preparation, process and
+   resource cleanup, with no unknown effects or pending dispatch. A terminal row
+   alone does not establish those receipts. If the previous release cannot
+   establish them, keep it available and postpone deployment. Do not blindly
+   retry commands or edit private records to manufacture completion.
 
 Already admitted queued inputs remain supported by dispatch and workflow code.
-Their existing durable grant, original/effective configuration, candidate and
-session custody checks, bounded gates-first execution and activity registrations
-remain unchanged. Native launches still require the frozen installed-runtime
-identity; history replay and retained outbox support do not authorize an old
-native execution to continue under a changed runtime payload.
+Their existing durable grant and original/effective configuration validation,
+candidate/session custody, sealed attempt/effect/remote checks, a claim held by
+the run's owner, stopped recorded process identities, bounded gates-first
+execution and activity registrations remain unchanged. Native launches still
+require the frozen installed-runtime identity; history replay and retained outbox support do not
+authorize an old native execution to continue under a changed runtime payload.
 Completed and suspended workflow histories retain their recorded ordering. Old
 rows, command receipts, preparation intents, cleanup archives and public recovery
 provenance remain readable; this retirement does not delete their tables or

@@ -12,9 +12,11 @@ from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 from test_delivery_store import submit_historical_admission
 
+from devflow_temporal import delivery_policy_recovery
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_api import DeliveryService
 from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_continuation import copy_session_state, session_state_digest
 from devflow_temporal.delivery_policy_recovery import (
     _prepare,
@@ -28,6 +30,77 @@ from devflow_temporal.delivery_preparation import prepare_authority
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+
+@pytest.mark.parametrize('observation,refused', [
+    ('live-pid', True), ('listening-port', True), ('unfinished', True),
+    ('unmonitored', True), ('stopped', False), ('reused-pid', False), ('zombie', False),
+])
+def test_retained_stopped_cleanup_observes_without_state_effects(
+    intake_fixture, monkeypatch, observation, refused,
+):
+    path, request = intake_fixture
+    store = DeliveryStore(DeliveryConfig.load(path))
+    store.submit(request)
+    spec = store.spec(request['run_id'])
+    resources = RunResources(spec)
+    journal_path = Path(spec['state_dir']) / 'attempts' / 'recorded' / 'native-process.json'
+    recorded_identity, pid, port = 'recorded-start-identity', 424242, 18777
+    journal = {
+        'phase': 'starting' if observation == 'unfinished' else 'finished',
+        'monitoring_complete': observation != 'unmonitored',
+        'owned': {str(pid): {'identity': recorded_identity}}, 'ports': [port],
+    }
+    write_private(journal_path, journal)
+    with resources.locked() as manifest:
+        manifest['processes'].append(str(journal_path))
+        write_private(resources.manifest, manifest)
+    write_private(resources.root / 'finalization.json', {
+        'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+        'resource_cleanup': 'confirmed',
+        'roots': [{'path': str(Path(spec['state_dir']) / 'transient'), 'state': 'removed'}],
+    })
+    table = {}
+    if observation in {'live-pid', 'reused-pid', 'zombie'}:
+        table[pid] = {
+            'identity': 'different-start-identity' if observation == 'reused-pid'
+            else recorded_identity,
+            'stat': 'Z' if observation == 'zombie' else 'S',
+        }
+    observed = []
+
+    def processes():
+        observed.append('process-table')
+        return table
+
+    def listening(recorded_port):
+        assert recorded_port == port
+        observed.append('recorded-port')
+        return {pid} if observation == 'listening-port' else set()
+
+    monkeypatch.setattr(delivery_policy_recovery, 'process_table', processes)
+    monkeypatch.setattr(delivery_policy_recovery, 'listeners', listening)
+    with store._connect() as db:
+        before_db = list(db.iterdump())
+    before_files = {item.relative_to(store.config.state_root):
+                    (item.read_bytes(), item.stat().st_mode)
+                    for item in store.config.state_root.rglob('*') if item.is_file()}
+    if refused:
+        with pytest.raises(ValueError, match='process identity or port is still live or unknown'):
+            delivery_policy_recovery._stopped_cleanup(spec)
+    else:
+        result = delivery_policy_recovery._stopped_cleanup(spec)
+        assert result['journal_sha256'] == {
+            str(journal_path): hashlib.sha256(journal_path.read_bytes()).hexdigest(),
+        }
+    assert observed[0] == 'process-table'
+    if observation == 'listening-port':
+        assert 'recorded-port' in observed
+    with store._connect() as db:
+        assert list(db.iterdump()) == before_db
+    assert before_files == {item.relative_to(store.config.state_root):
+                            (item.read_bytes(), item.stat().st_mode)
+                            for item in store.config.state_root.rglob('*') if item.is_file()}
 
 
 @pytest.fixture
