@@ -333,6 +333,15 @@ async def test_run_cancel_before_implementation_preparation_retains_cleanup_trut
     broker.checkout = tmp_path
     broker.native_cleanup_confirmed = cleanup_confirmed
     monkeypatch.setattr(broker, "candidate", lambda: request["candidate"])
+
+    class UnlaunchedRole:
+        def retained_request(self, _request):
+            return None
+
+        async def run(self, _request):
+            pytest.fail("cancelled preparation must not launch a role")
+
+    monkeypatch.setattr(activities, "get_supervisor", lambda _store: UnlaunchedRole())
     process = NativeProcess(
         request["spec"], Path(broker.spec["state_dir"]) / "native",
         argv=[sys.executable, "-c", "raise AssertionError('must not launch')"],
