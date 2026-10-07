@@ -409,6 +409,9 @@ class NativeProcess:
                     write_private(self.journal, journal)
                     for port in self.ports:
                         for pid in listeners(port):
+                            # A descendant may start between the process and listener snapshots.
+                            if pid not in owned:
+                                sample(owned)
                             if (
                                 pid not in owned
                                 or process_table().get(pid, {}).get("identity")

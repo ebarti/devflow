@@ -219,7 +219,7 @@ async def test_browser_port_wait_cancels_without_taking_generic_capacity(browser
     with pytest.raises(asyncio.CancelledError):
         await queued
     assert not (browser_checks.brokers["queued"].evidence_dir / "browser-qa").exists()
-    assert (await first)["state"] == "passed"
+    assert (await first)["state"] == "passed", first.result()
 
 
 @pytest.mark.parametrize("failure", ["interrupted", "exception"])
