@@ -57,7 +57,7 @@ async def test_worker_uses_explicit_pinned_deployment_without_changing_config(
         assert created[0]["deployment_config"] == deployment
         ready = json.loads(marker.read_text())
         assert ready["pid"] == os.getpid()
-        assert ready["deployment"] == {"name": "delivery", "build_id": "candidate"}
+        assert ready["deployment"] == control._deployment_identity(deployment)
         assert json.dumps(config.raw, sort_keys=True) == before
     finally:
         task.cancel()
@@ -85,8 +85,8 @@ async def test_real_deployment_worker_registers_both_pollers_before_ready(tmp_pa
                     if task.done():
                         await task
                     await asyncio.sleep(0.01)
-            assert json.loads(marker.read_text())["deployment"] == {
-                "name": "delivery-readiness", "build_id": "fixture-v1"}
+            assert json.loads(marker.read_text())["deployment"] == control._deployment_identity(
+                deployment)
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -203,7 +203,8 @@ def test_starting_different_version_preserves_ready_worker(tmp_path, monkeypatch
         "service_start_timeout": 1})
     deployment = control._worker_deployment("delivery", "new")
     existing = {"config_path": str(config.path), "processes": {"worker": {
-        "pid": 1, "identity": "fixture", "deployment": {"name": "delivery", "build_id": "old"}}}}
+        "pid": 1, "identity": "fixture", "deployment": control._deployment_identity(
+            control._worker_deployment("delivery", "old"))}}}
     monkeypatch.setattr(control, "_ports", lambda _config: None)
     monkeypatch.setattr(control, "_read_manifest", lambda _config: existing)
     monkeypatch.setattr(control, "_owned", lambda _process: True)
@@ -214,3 +215,66 @@ def test_starting_different_version_preserves_ready_worker(tmp_path, monkeypatch
     with pytest.raises(ValueError, match="running worker deployment differs"):
         control.ensure_service_running(config, deployment=deployment)
     assert existing["processes"]["worker"]["deployment"]["build_id"] == "old"
+
+
+def test_cold_crash_restart_preserves_explicit_version_only_for_same_payload(
+    tmp_path, monkeypatch,
+):
+    import subprocess
+    import sys
+
+    from devflow_temporal.delivery_config import DeliveryConfig
+    from devflow_temporal.payload import payload_digest
+
+    config = DeliveryConfig(tmp_path / "config.json", {"state_root": str(tmp_path),
+        "service_start_timeout": 1})
+    frozen_config = json.dumps(config.raw, sort_keys=True)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             start_new_session=True)
+    try:
+        identity = control._process_identity(child.pid)
+        assert identity
+        worker = {"pid": child.pid, "identity": identity, "deployment": {
+            "name": "delivery", "build_id": "retained",
+            "runtime_payload_sha256": payload_digest(control.Path(control.__file__).parent)}}
+        control._write_manifest(config, {"worker": worker})
+        assert control._owned(worker)
+        child.kill()
+        child.wait()
+        assert not control._owned(worker)
+        calls = []
+        monkeypatch.setattr(control, "_ports", lambda _config: None)
+        monkeypatch.setattr(control, "_start", lambda *_args, **kwargs: calls.append(kwargs))
+        control.ensure_service_running(config)
+        selected = calls[0].get("deployment")
+        assert selected is not None, "cold restart dropped the explicit pinned version"
+        assert selected == control._worker_deployment("delivery", "retained")
+        assert json.dumps(config.raw, sort_keys=True) == frozen_config
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+@pytest.mark.parametrize("recorded_digest", [None, "0" * 64])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_restart_rejects_unknown_or_changed_source_before_lifecycle_effects(
+    tmp_path, monkeypatch, recorded_digest, explicit,
+):
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    config = DeliveryConfig(tmp_path / "config.json", {"state_root": str(tmp_path),
+        "service_start_timeout": 1})
+    selected = {"name": "delivery", "build_id": "retained"}
+    if recorded_digest is not None:
+        selected["runtime_payload_sha256"] = recorded_digest
+    control._write_manifest(config, {"worker": {
+        "pid": 1, "identity": "dead-fixture", "deployment": selected}})
+    before = control._manifest(config).read_bytes()
+    monkeypatch.setattr(control, "_ports", lambda _config: None)
+    monkeypatch.setattr(control, "_stop", lambda *_args: pytest.fail("signalled a process"))
+    monkeypatch.setattr(control, "_start", lambda *_args, **_kwargs: pytest.fail("launched"))
+    with pytest.raises(ValueError, match="recorded worker source payload"):
+        control.ensure_service_running(config, deployment=(
+            control._worker_deployment("delivery", "retained") if explicit else None))
+    assert control._manifest(config).read_bytes() == before

@@ -21,7 +21,14 @@ worker registration is unchanged. These options do not change admission specs,
 configuration files, ownership hashes, repair budgets, or historical preparations.
 The version appears in the process manifest and readiness record. Readiness still
 requires both registered pollers and the owned process identity. Starting another
-version while the recorded worker is ready fails without restarting it.
+version while a worker is recorded fails without restarting it. A cold restart
+reuses the explicit selection only when the recorded `runtime_payload_sha256`
+matches the current package. Missing or changed source identity rejects startup
+before any process is signalled or launched. This prevents silently registering
+changed source under a pinned version or losing versioning after a crash.
+Unversioned historical manifests keep their original behavior; they are not
+upgraded by a restart. To change an artifact, the owner must first drain and stop
+its existing lifecycle, then explicitly select the new version.
 
 A version name denotes one immutable, replay-qualified source/dependency artifact.
 Never reuse it for different bytes. These flags register the worker; they do not

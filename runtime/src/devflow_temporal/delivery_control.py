@@ -36,6 +36,7 @@ from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
 from .delivery_store import DeliveryStore, _private_directory
 from .delivery_workflow import DeliveryWorkflow
+from .payload import payload_digest
 from .supervisor import _process_identity
 
 
@@ -266,6 +267,18 @@ def ensure_service_running(
                     _owned(process) for process in existing["processes"].values()
                 ):
                     raise ValueError("state root has a running service for another configuration")
+                recorded = existing["processes"].get("worker", {}).get("deployment")
+                if recorded is not None:
+                    if (not isinstance(recorded, dict) or recorded.get("runtime_payload_sha256")
+                            != payload_digest(Path(__file__).resolve().parent)):
+                        raise ValueError(
+                            "recorded worker source payload differs or is unknown; "
+                            "retain the original artifact and drain it before changing")
+                    selected = _worker_deployment(recorded.get("name"), recorded.get("build_id"))
+                    if selected is None or (deployment is not None and deployment != selected):
+                        raise ValueError(
+                            "running worker deployment differs; drain it before changing")
+                    deployment = selected
                 while True:
                     if _ready(config, existing, deadline):
                         if (deployment is not None and existing["processes"]["worker"].get(
@@ -387,7 +400,8 @@ def _start(
 
 
 def _deployment_identity(deployment: WorkerDeploymentConfig) -> dict:
-    return {"name": deployment.version.deployment_name, "build_id": deployment.version.build_id}
+    return {"name": deployment.version.deployment_name, "build_id": deployment.version.build_id,
+            "runtime_payload_sha256": payload_digest(Path(__file__).resolve().parent)}
 
 
 def _worker_deployment(name: str | None, build_id: str | None) -> WorkerDeploymentConfig | None:
