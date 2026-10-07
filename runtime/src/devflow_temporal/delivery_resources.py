@@ -178,6 +178,7 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 'accepted_technical_successor', 'published_gate_retry', 'prepublication_gate_retry',
                 'pending_publication_retry',
                 'published_check_prelaunch_retry', 'published_ci_retry',
+                'published_controller_retry',
                 'repair_continuation',
             }:
                 if first and canonical_json(recovery.get('execution_spec')) != canonical_json(spec):

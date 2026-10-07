@@ -921,7 +921,8 @@ class DeliveryWorkflow:
             if recovery.get("kind") == "pending_publication_retry":
                 return await self._resume_pending_publication(spec, recovery)
             if recovery.get("kind") in {"published_gate_retry", "prepublication_gate_retry",
-                                       "published_check_prelaunch_retry", "published_ci_retry"}:
+                                       "published_check_prelaunch_retry", "published_ci_retry",
+                                       "published_controller_retry"}:
                 return await self._resume_published_gates(spec, recovery)
             if recovery.get("kind") == "terminal_tracker_recovery":
                 return await self._resume_terminal_tracker(spec, recovery)
@@ -1178,7 +1179,8 @@ class DeliveryWorkflow:
         if recovery.get('kind') == 'published_ci_retry':
             return await self._resume_ci(spec, recovery)
         published = recovery.get("kind") in {
-            "published_gate_retry", "published_check_prelaunch_retry", "published_ci_retry"}
+            "published_gate_retry", "published_check_prelaunch_retry", "published_ci_retry",
+                                       "published_controller_retry"}
         if (recovery.get("execution_spec") != spec
                 or recovery.get("command", {}).get("additional_iterations") != 0):
             raise ValueError("gate retry changed its zero-repair authority")
