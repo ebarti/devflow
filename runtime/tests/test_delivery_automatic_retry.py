@@ -198,8 +198,14 @@ async def test_service_loop_admits_closed_transient_successor_without_an_operato
     app.store = store
     async def idle():
         pass
+    real_sleep = asyncio.sleep
     async def end(_seconds):
-        raise asyncio.CancelledError
+        for _ in range(100):
+            with store._connect() as db:
+                if db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 2:
+                    raise asyncio.CancelledError
+            await real_sleep(.01)
+        raise AssertionError('background retry did not admit its eligible successor')
     monkeypatch.setattr(app, 'dispatch_once', idle)
     monkeypatch.setattr(app, 'dispatch_questions_once', idle)
     monkeypatch.setattr(asyncio, 'sleep', end)
@@ -218,3 +224,291 @@ def test_actual_cleanup_must_match_closed_controller_finalization_hash(service, 
     assert retry.retry_once(store) == []
     with store._connect() as db:
         assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('outcome', ['delivered', 'blocked', None])
+def test_newer_canonical_issue_admission_prevents_stale_retry(service, monkeypatch, outcome):
+    store, request, _ = stopped(service, monkeypatch)
+    store.submit({**request, 'command_id': 'new', 'run_id': 'new', 'branch': 'fix/new',
+                  'issue_url': request['issue_url'].replace('/3', '/03')})
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET outcome=? WHERE run_id='new'", (outcome,))
+        store.state.release_work(db, request['work_id'], 'external:devflow:new')
+    monkeypatch.setattr(DeliveryStore, '_completed_temporal_result',
+                        lambda *_a, **_k: pytest.fail('stale issue reached readback'))
+    assert retry.retry_once(store) == []
+
+
+@pytest.mark.parametrize('obstacle', ['mutation_pending', 'mutation_unknown', 'cancel_complete',
+                                     'effect_pending', 'effect_unknown', 'attempt', 'outbox',
+                                     'missing_plan', 'continuation'])
+def test_unsafe_state_is_filtered_before_remote_observation(service, monkeypatch, obstacle):
+    store, request, _ = stopped(service, monkeypatch)
+    with store._connect() as db:
+        if obstacle.startswith('mutation') or obstacle == 'cancel_complete':
+            state = (obstacle.removeprefix('mutation_')
+                     if obstacle.startswith('mutation') else 'complete')
+            db.execute('INSERT INTO delivery_mutations '
+                       '(command_id,run_id,kind,request_digest,state) '
+                       'VALUES (?,?,?,?,?)',
+                       ('intent', request['run_id'], 'cancel', 'digest', state))
+        elif obstacle.startswith('effect'):
+            db.execute('INSERT INTO delivery_effects VALUES (?,?,?,?,?,?,?)',
+                       ('tracker', request['run_id'], 'tracker', '{}',
+                        obstacle.removeprefix('effect_'), None, 'now'))
+        elif obstacle == 'outbox':
+            db.execute("UPDATE delivery_outbox SET state='pending'")
+        elif obstacle == 'attempt':
+            # Reuse the real supervisor's ordinary attempt record shape.
+            from devflow_temporal.supervisor import DeliverySupervisor
+            DeliverySupervisor(store, capacity=1)._claim({
+                'spec': store.spec(request['run_id']), 'role': 'implement', 'iteration': 0,
+                'candidate': {'id': 'fixture', 'head': 'fixture', 'worktree_sha256': 'fixture'}})
+        else:
+            spec = store.spec(request['run_id'])
+            if obstacle == 'missing_plan':
+                spec['accepted_plan'] = ''
+            else:
+                spec['continuation'] = {'original': 'fixture'}
+            db.execute('UPDATE delivery_runs SET request_json=?', (json.dumps(spec),))
+    monkeypatch.setattr(DeliveryStore, '_completed_temporal_result',
+                        lambda *_a, **_k: pytest.fail('unsafe row reached expensive readback'))
+    assert retry.retry_once(store) == []
+
+
+@pytest.mark.parametrize('change', ['newer_issue', 'mutation_unknown', 'effect_pending'])
+def test_transaction_rechecks_late_issue_and_operator_effects(service, monkeypatch, change):
+    store, request, _ = stopped(service, monkeypatch)
+    def race(_store, spec):
+        if change == 'newer_issue':
+            store.submit({**request, 'command_id': 'new', 'run_id': 'new', 'branch': 'fix/new'})
+            with store._connect() as db:
+                store.state.release_work(db, request['work_id'], 'external:devflow:new')
+        else:
+            with store._connect() as db:
+                if change == 'mutation_unknown':
+                    db.execute('INSERT INTO delivery_mutations '
+                               '(command_id,run_id,kind,request_digest,state) '
+                               "VALUES ('cancel',?,'cancel','digest','unknown')",
+                               (request['run_id'],))
+                else:
+                    db.execute('INSERT INTO delivery_effects VALUES (?,?,?,?,?,?,?)',
+                               ('late', request['run_id'], 'tracker', '{}', 'pending', None, 'now'))
+        return spec['base_sha']
+    monkeypatch.setattr(retry, 'fresh_unpublished_base', race)
+    assert retry.retry_once(store) == []
+    with store._connect() as db:
+        assert not any(json.loads(row[0]).get('supersedes_run_id') == request['run_id']
+                       for row in db.execute('SELECT request_json FROM delivery_runs'))
+
+
+def test_unknown_readbacks_have_bounded_per_run_backoff(service, monkeypatch):
+    store, _request, _ = stopped(service, monkeypatch)
+    clock = [0]
+    calls = []
+    from types import SimpleNamespace
+    monkeypatch.setattr(retry, 'time', SimpleNamespace(monotonic=lambda: clock[0]), raising=False)
+    def unknown(*_a, **_k):
+        calls.append(clock[0])
+        raise ValueError('unavailable')
+    monkeypatch.setattr(DeliveryStore, '_completed_temporal_result', unknown)
+    for _ in range(4):
+        assert retry.retry_once(store) == []
+    assert calls == [0]
+    for delay in [5, 10, 20, 40, 80, 160, 300, 300]:
+        clock[0] += delay
+        assert retry.retry_once(store) == []
+        retry.retry_once(store)
+    assert calls == [0, 5, 15, 35, 75, 155, 315, 615, 915]
+
+
+@pytest.mark.asyncio
+async def test_slow_retry_observer_cannot_block_dispatch_or_outlive_stop(service, monkeypatch):
+    import asyncio
+    import time
+
+    from devflow_temporal.delivery_api import DeliveryService
+    store, request, _ = stopped(service, monkeypatch)
+    app = object.__new__(DeliveryService)
+    app.store = store
+    dispatched = []
+    observers = []
+    def slow(_store, *, stopped=lambda: False):
+        observers.append('started')
+        deadline = time.monotonic() + .15
+        while not stopped() and time.monotonic() < deadline:
+            time.sleep(.005)
+        observers.append('stopped')
+    monkeypatch.setattr(retry, 'retry_once', slow)
+    async def dispatch():
+        dispatched.append(True)
+    async def questions():
+        pass
+    real_sleep = asyncio.sleep
+    async def tick(_seconds):
+        await real_sleep(.01)
+        if len(dispatched) >= 3:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(app, 'dispatch_once', dispatch)
+    monkeypatch.setattr(app, 'dispatch_questions_once', questions)
+    monkeypatch.setattr(asyncio, 'sleep', tick)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(app.dispatch_loop(), timeout=.5)
+    assert len(dispatched) == 3 and observers == ['started', 'stopped']
+    assert app._retry_task.done()
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
+
+
+def test_automatic_generations_spend_one_original_total_ceiling(service, monkeypatch):
+    store, request, closed = stopped(service, monkeypatch)
+    closures = {request['run_id']: closed}
+    monkeypatch.setattr(DeliveryStore, '_completed_temporal_result',
+                        lambda _store, run_id, **_k: closures[run_id])
+    current = request['run_id']
+    for _ in range(2):
+        admitted = retry.retry_once(store)
+        assert len(admitted) == 1
+        current = admitted[0]['run_id']
+        spec = store.spec(current)
+        store.mark_start(current, accepted=True)
+        store.project(current, phase='blocked', execution_state='blocked', outcome='blocked',
+                      event_type='blocked', message='retained transient', cleanup='confirmed',
+                      checks=closed['result']['checks'])
+        with store._connect() as db:
+            store.state.release_work(db, spec['work_id'], 'external:devflow:' + current)
+        closures[current] = {**closed, 'workflow_id': 'delivery-' + current,
+                             'request_digest': spec['request_digest'],
+                             'result': {**closed['result'], 'run_id': current}}
+    assert retry.retry_once(store) == []
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 3
+
+
+@pytest.mark.parametrize('reference', ['main', 'refs/heads/main', 'origin/main', 'sha'])
+def test_moved_named_base_is_fetched_without_moving_local_worktree(service, monkeypatch, reference):
+    from pathlib import Path
+
+    from test_delivery_store import _git
+
+    from devflow_temporal.delivery_config import DeliveryConfig
+    store, request = service
+    source = Path(store.config.raw['repositories']['fixture']['source_path'])
+    _git(source, 'branch', '-M', 'main')
+    _git(source, 'push', 'origin', 'main')
+    old = _git(source, 'rev-parse', 'HEAD')
+    base_ref = old if reference == 'sha' else reference
+    raw = copy.deepcopy(store.config.raw)
+    repository = raw['repositories']['fixture']
+    repository['base_ref'] = base_ref
+    repository.pop('expected_base_sha')
+    store.config.path.write_text(json.dumps(raw))
+    store = DeliveryStore(DeliveryConfig.load(store.config.path))
+    request = {**request, 'base_ref': base_ref}
+    fresh = retry.fresh_unpublished_base
+    store, request, _ = stopped((store, request), monkeypatch)
+    monkeypatch.setattr(retry, 'fresh_unpublished_base', fresh)
+    spec = store.spec(request['run_id'])
+    spec['publication_base_ref'] = 'main'
+    with store._connect() as db:
+        db.execute('UPDATE delivery_runs SET request_json=?', (json.dumps(spec),))
+    monkeypatch.setattr(retry.DeliveryBroker, '_read_owned_pr', lambda _self: None)
+    other = source.parent / 'other'
+    _git(source, 'clone', str(source.parent / 'origin.git'), str(other))
+    _git(other, 'checkout', 'main')
+    (other / 'README.md').write_text('approved updated base\n')
+    _git(other, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+         'commit', '-am', 'updated base')
+    _git(other, 'push', 'origin', 'main')
+    new = _git(other, 'rev-parse', 'HEAD')
+    (source / 'README.md').write_text('precious local uncommitted change\n')
+    if reference == 'sha':
+        with pytest.raises(ValueError):
+            retry.fresh_unpublished_base(store, spec)
+        assert retry.retry_once(store) == []
+        assert not store.pending_starts()
+    else:
+        assert retry.fresh_unpublished_base(store, spec) == new
+        admitted = retry.retry_once(store)
+        assert len(admitted) == 1
+        successor = store.spec(admitted[0]['run_id'])
+        assert successor['base_sha'] == new and successor['base_ref'] == base_ref
+        assert len(store.pending_starts()) == 1
+    assert _git(source, 'rev-parse', 'HEAD') == old
+    assert (source / 'README.md').read_text() == 'precious local uncommitted change\n'
+
+
+def test_retry_observes_real_cleanup_using_accepted_intake_plan(service, monkeypatch):
+    from pathlib import Path
+
+    from test_delivery_store import _git
+
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_broker import DeliveryBroker
+    from devflow_temporal.delivery_config import DeliveryConfig
+    from devflow_temporal.delivery_resources import RunResources
+    observe = retry.observe_finalized_resources
+    fixture_store, _request = service
+    admit = fixture_store.config.admit
+    def trusted_fixture(_self, request, **kwargs):
+        spec = admit(request, **kwargs)
+        spec['policy']['host_sandbox'] = 'trusted-local'
+        spec['policy_digest'] = digest(spec['policy'])
+        return spec
+    monkeypatch.setattr(DeliveryConfig, 'admit', trusted_fixture)
+    store, request, closed = stopped(service, monkeypatch)
+    original = store.spec(request['run_id'])
+    original['accepted_plan'] = ''
+    plan = json.dumps({'verification': ['Run test_owned.py']})
+    with store._connect() as db:
+        db.execute('UPDATE delivery_runs SET request_json=?,accepted_plan_text=?',
+                   (json.dumps(original), plan))
+    execution = store.intake_execution_spec(request['run_id'])
+    root = Path(execution['checkout'])
+    root.parent.mkdir(parents=True, exist_ok=True)
+    resources = RunResources(execution)
+    resources.register(root, 'checkout')
+    root.mkdir()
+    resources.created(root)
+    project = root / 'worker'
+    (project / 'tests').mkdir(parents=True)
+    (project / 'tests/test_owned.py').write_text('def test_owned(): assert True\n')
+    (project / 'pyproject.toml').write_text('[project]\nname="fixture"\nversion="1"\n')
+    (project / 'uv.lock').write_text('version=1\n')
+    _git(root, 'init', '-q')
+    _git(root, 'add', '.')
+    broker = DeliveryBroker.__new__(DeliveryBroker)
+    broker.spec = execution
+    generated = broker._register_generated(root, ['worker/.venv'])
+    (project / '.venv').mkdir()
+    broker._record_generated(generated)
+    final = resources.finalize('blocked')
+    assert final['state'] == 'confirmed'
+    with pytest.raises(ValueError, match='registered run boundary'):
+        observe(original)
+    monkeypatch.setattr(retry, 'observe_finalized_resources', observe)
+    closed['result']['checks']['resource_cleanup'] = final
+    with store._connect() as db:
+        db.execute('UPDATE delivery_runs SET checks_json=?',
+                   (json.dumps(closed['result']['checks']),))
+    admitted = retry.retry_once(store)
+    assert len(admitted) == 1
+    assert store.spec(admitted[0]['run_id'])['accepted_plan'] == plan
+
+
+@pytest.mark.parametrize('reference', ['foreign', 'pin'])
+def test_private_fresh_ref_cannot_change_configured_branch_or_sha_pin(service, reference):
+    from pathlib import Path
+
+    from test_delivery_store import _git
+
+    from devflow_temporal.delivery_config import DeliveryConfig
+    store, request = service
+    source = Path(store.config.raw['repositories']['fixture']['source_path'])
+    _git(source, 'branch', '-M', 'main')
+    ref = _git(source, 'rev-parse', 'HEAD') if reference == 'pin' else 'main'
+    store.config.raw['repositories']['fixture']['base_ref'] = ref
+    store.config.path.write_text(json.dumps(store.config.raw))
+    config = DeliveryConfig.load(store.config.path)
+    with pytest.raises(ValueError, match='configured named branch'):
+        config.admit({**request, 'base_ref': ref}, _base_ref='refs/remotes/origin/foreign')

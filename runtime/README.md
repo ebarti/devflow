@@ -13,7 +13,7 @@ grant rows to exceed it. Policy recovery also cannot grant positive iterations.
 Already-admitted histories without the frozen budget version retain their original
 behavior; new admissions from existing configurations use the new default.
 Budgets are scoped to one authoritative tracking database; separate databases cannot enforce a shared limit.
-This supplies admission bounds for automatic retries; it does not add resubmission.
+These admission bounds also apply to automatic fresh attempts after safely closed transient failures.
 
 ### Failure classification
 
@@ -25,8 +25,11 @@ are transient; model findings, invalid inputs, scope violations and failed or
 changed-head CI remain terminal. Returned provider findings also remain terminal.
 
 This is a diagnostic, not permission to execute again. Unknown cleanup and
-publication effects retain their existing guards. It does not schedule a retry
-or extend a budget. Scope amendments preserve the original version markers and
+publication effects retain their existing guards. The service may schedule one
+fresh successor for the latest safely closed, unpublished issue attempt, within
+its original total ceiling. Unknown observations wait with bounded backoff;
+unresolved operator effects prevent another admission. Classification never
+extends a budget. Scope amendments preserve the original version markers and
 attempt ceiling. Existing workflows and historical continuation paths keep their
 original payloads. Operator steps: deploy through the usual service update when
 ready. No database schema migration is needed, but review issue attempt counts

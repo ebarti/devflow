@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -24,6 +26,28 @@ def eligible(row, spec):
         and cleanup.get('state') == cleanup.get('resource_cleanup') == 'confirmed'
         and cleanup.get('process_cleanup') == 'observed-native-confirmed'
         and bool(row['accepted_plan_text'] or spec.get('accepted_plan'))
+    )
+
+
+def unavailable(store, db, spec):
+    """Cheap eligibility repeated inside the ordinary admission transaction."""
+    issue = store.state.issue_resource(spec['issue_url'])
+    latest = next((row['run_id'] for row in db.execute(
+        'SELECT run_id,issue_url FROM delivery_runs ORDER BY rowid DESC')
+        if store.state.issue_resource(row['issue_url']) == issue), None)
+    return (
+        latest != spec['run_id']
+        or store.state.claim_for(db, spec['work_id']) is not None
+        or db.execute("SELECT 1 FROM delivery_mutations WHERE run_id=? AND "
+                      "(state IN ('pending','unknown') OR (kind='cancel' AND state='complete'))",
+                      (spec['run_id'],)).fetchone() is not None
+        or db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND "
+                      "(kind='publish' OR state != 'complete')",
+                      (spec['run_id'],)).fetchone() is not None
+        or db.execute("SELECT 1 FROM delivery_attempts WHERE run_id=? AND state != 'finished'",
+                      (spec['run_id'],)).fetchone() is not None
+        or db.execute("SELECT 1 FROM delivery_outbox WHERE run_id=? AND state != 'sent'",
+                      (spec['run_id'],)).fetchone() is not None
     )
 
 
@@ -51,10 +75,18 @@ def fresh_unpublished_base(store, spec):
     repository = store.config.raw['repositories'][spec['repository_key']]
     if repository.get('expected_base_sha') not in (None, base):
         raise ValueError('pinned base moved from accepted plan')
-    if spec['base_ref'] in {'origin/' + branch, 'refs/remotes/origin/' + branch}:
+    reference = spec['base_ref']
+    if re.fullmatch(r'[0-9a-fA-F]{40}', reference):
+        if reference.lower() != base:
+            raise ValueError('pinned commit moved from approved current origin branch')
+    elif reference in {branch, 'refs/heads/' + branch, 'origin/' + branch,
+                       'refs/remotes/origin/' + branch}:
+        reference = 'refs/remotes/origin/' + branch
         _git(source, 'fetch', '--no-write-fetch-head', 'origin',
-             'refs/heads/' + branch + ':refs/remotes/origin/' + branch)
-    if _git(source, 'rev-parse', spec['base_ref']) != base:
+             'refs/heads/' + branch + ':' + reference)
+    else:
+        raise ValueError('configured base is not the approved named branch')
+    if _git(source, 'rev-parse', reference) != base:
         raise ValueError('configured base does not equal approved current origin branch')
     return base
 
@@ -67,19 +99,8 @@ def validate_transaction(store, db, spec, expected):
     old = json.loads(previous['request_json'])
     if not eligible(previous, old) or not store.owns_execution(old):
         raise ValueError('predecessor no longer eligible')
-    if any(json.loads(row[0]).get('supersedes_run_id') == old['run_id']
-           for row in db.execute('SELECT request_json FROM delivery_runs')):
-        raise ValueError('predecessor already has a direct successor')
-    if db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND kind='publish'",
-                  (old['run_id'],)).fetchone() or db.execute(
-            "SELECT 1 FROM delivery_attempts WHERE run_id=? AND state != 'finished'",
-            (old['run_id'],)).fetchone():
-        raise ValueError('predecessor effect or actor changed')
-    if db.execute("SELECT 1 FROM delivery_outbox WHERE run_id=? AND state != 'sent'",
-                  (old['run_id'],)).fetchone():
-        raise ValueError('predecessor dispatch is unresolved')
-    if store.state.claim_for(db, old['work_id']) is not None:
-        raise ValueError('predecessor claim has not been released')
+    if unavailable(store, db, old) or expected.get('stopped', lambda: False)():
+        raise ValueError('predecessor is no longer the latest safe issue attempt')
     if spec['policy'] != old['policy']:
         raise ValueError('fresh attempt changed frozen execution policy')
     if spec['base_sha'] != expected['base_sha']:
@@ -88,30 +109,32 @@ def validate_transaction(store, db, spec, expected):
     spec['intake_required'] = False
 
 
-def retry_once(store):
+def retry_once(store, *, stopped=lambda: False):
     """Per-row read-only uncertainty isolation; admissions use the ordinary outbox."""
     with store._connect() as db:
         rows = [dict(row) for row in db.execute(
             "SELECT * FROM delivery_runs WHERE outcome='blocked' AND recovery_json IS NULL")]
+    waits = getattr(store, '_automatic_retry_waits', {})
+    store._automatic_retry_waits = waits
     admitted = []
     for row in rows:
+        if stopped():
+            break
+        delay, due = waits.get(row['run_id'], (5, 0))
+        if time.monotonic() < due:
+            continue
+        waits[row['run_id']] = (min(delay * 2, 300), time.monotonic() + delay)
         try:
             spec = json.loads(row['request_json'])
             if not eligible(row, spec) or not store.owns_execution(spec):
                 continue
             with store._connect() as db:
-                if any(json.loads(item[0]).get('supersedes_run_id') == spec['run_id']
-                       for item in db.execute('SELECT request_json FROM delivery_runs')):
+                if unavailable(store, db, spec):
                     continue
                 issue = store.state.issue_resource(spec['issue_url'])
                 count = sum(store.state.issue_resource(item[0]) == issue for item in db.execute(
                     'SELECT issue_url FROM delivery_runs'))
                 if count >= spec['policy']['max_attempts']:
-                    continue
-                if store.state.claim_for(db, spec['work_id']) is not None:
-                    continue
-                if db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND kind='publish'",
-                              (spec['run_id'],)).fetchone():
                     continue
             closed = store._completed_temporal_result(
                 spec['run_id'], workflow_id=row['workflow_id'])
@@ -131,7 +154,8 @@ def retry_once(store):
                     or result.get('checks', {}).get('resource_cleanup')
                     != checks['resource_cleanup']):
                 continue
-            observed = observe_finalized_resources(spec)
+            execution = store.intake_execution_spec(spec['run_id'])
+            observed = observe_finalized_resources(execution)
             expected_cleanup = checks['resource_cleanup'].get('receipt_sha256')
             if not expected_cleanup or observed['finalization_sha256'] != expected_cleanup:
                 continue
@@ -144,7 +168,8 @@ def retry_once(store):
             supplied.update(command_id='automatic-' + identity, run_id='run-' + identity,
                             supersedes_run_id=spec['run_id'], branch='fix/automatic-' + identity,
                             accepted_plan=row['accepted_plan_text'] or spec['accepted_plan'])
-            admitted.append(store.submit(supplied, _automatic={'row': row, 'base_sha': base}))
+            admitted.append(store.submit(supplied, _automatic={
+                'row': row, 'base_sha': base, 'stopped': stopped}))
         except (ValueError, KeyError, TypeError, OSError, RuntimeError,
                 subprocess.SubprocessError, sqlite3.Error):
             # Wait for conclusive fresh observations; no absence inferred from errors.

@@ -450,7 +450,14 @@ class DeliveryStore:
                     "existing": True,
                     "phase": prior_run[1],
                 }
-        spec = self.config.admit(supplied)
+        reference = None
+        if _automatic is not None:
+            old = json.loads(_automatic['row']['request_json'])
+            branch = old.get('publication_base_ref')
+            if branch and not re.fullmatch(r'[0-9a-fA-F]{40}', old['base_ref']):
+                reference = 'refs/remotes/origin/' + branch
+        spec = (self.config.admit(supplied, _base_ref=reference) if reference
+                else self.config.admit(supplied))
         spec["request_digest"] = request_digest
         temporal_result = None
         superseded = spec.get("supersedes_run_id")

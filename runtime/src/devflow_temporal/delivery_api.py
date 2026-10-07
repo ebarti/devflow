@@ -10,6 +10,7 @@ import json
 import os
 import secrets
 import subprocess
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -150,6 +151,16 @@ class DeliveryService:
             self.store.mark_start(spec["run_id"], accepted=True)
 
     async def dispatch_loop(self) -> None:
+        self._retry_stopped = threading.Event()
+        self._retry_task = None
+        try:
+            await self._dispatch_loop()
+        finally:
+            self._retry_stopped.set()
+            if self._retry_task:
+                await asyncio.gather(self._retry_task, return_exceptions=True)
+
+    async def _dispatch_loop(self) -> None:
         while True:
             try:
                 await self.dispatch_once()
@@ -177,7 +188,12 @@ class DeliveryService:
             try:
                 from .delivery_automatic_retry import retry_once
 
-                await asyncio.to_thread(retry_once, self.store)
+                if self._retry_task is None or self._retry_task.done():
+                    previous, self._retry_task = self._retry_task, None
+                    if previous:
+                        previous.result()
+                    self._retry_task = asyncio.create_task(asyncio.to_thread(
+                        retry_once, self.store, stopped=self._retry_stopped.is_set))
             except asyncio.CancelledError:
                 raise
             except Exception:
