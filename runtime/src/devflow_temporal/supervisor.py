@@ -13,7 +13,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .contracts import canonical_json
+from .candidate import candidate_for
+from .contracts import canonical_json, digest
 from .delivery_native_process import NativeProcessUnknown
 from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
@@ -75,12 +76,9 @@ class DeliverySupervisor:
             # Ambiguous attempts retain their slots until reconciled.
             await asyncio.sleep(1)
 
-    def _claim(self, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    @staticmethod
+    def _job_key(request: dict[str, Any]) -> str:
         spec = request["spec"]
-        if spec["policy"].get("execution_backend") == "native-macos":
-            from .delivery_native_guard import validate_native_turn
-
-            validate_native_turn(spec, request["role"], request["iteration"], self.store)
         generation = request.get("attempt_generation", 0)
         if type(generation) is not int or generation not in (0, 1) or (
             generation and request["role"] != "implement"
@@ -98,7 +96,80 @@ class DeliverySupervisor:
             identity["gate_retry_stage"] = spec.get("gate_retry_stage")
         if generation:
             identity["attempt_generation"] = generation
-        job_key = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
+        return hashlib.sha256(canonical_json(identity).encode()).hexdigest()
+
+    def retained_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
+        """Reuse a launched role, never a queued input or unrelated checkout edit."""
+        from .delivery_resources import read_private
+
+        key = self._job_key(request)
+        with self.store._connect() as db:
+            row = db.execute(
+                'SELECT state,result_json FROM delivery_attempts WHERE job_key=?', (key,),
+            ).fetchone()
+        if row is None or row['state'] == 'queued':
+            return None
+        folder = Path(request['spec']['state_dir']) / 'attempts' / key
+        if not (folder / 'request.json').exists():
+            return None
+        saved = read_private(folder / 'request.json')
+        # These fields are added by the controller after activity admission.
+        enriched = {'native_authorized', 'result_path', 'start_path', 'role_evidence_key',
+                    'artifact_directory', 'artifact_write_root', 'receipt_handoff', 'steering'}
+        for name in saved.keys() | request.keys():
+            if name in enriched and name not in request:
+                continue
+            old, new = saved.get(name), request.get(name)
+            if name == 'evidence_context':
+                generated = {'implementation_preparation', 'previous_iterations'}
+                old = {k: v for k, v in (old or {}).items() if k not in generated}
+                new = {k: v for k, v in (new or {}).items() if k not in generated}
+            if old != new:
+                raise NativeProcessUnknown('role request changed across a durable attempt')
+        if row['state'] == 'finished':
+            result = json.loads(row['result_json'])
+            journal_path = folder / 'native-process.json'
+            if journal_path.exists():
+                journal = read_private(journal_path)
+                intent = journal['intent']
+                if (not journal.get('owned')
+                        or intent['run_id'] != request['spec']['run_id']
+                        or intent['policy_digest'] != request['spec']['policy_digest']
+                        or intent['cwd'] != request['workspace']):
+                    raise NativeProcessUnknown('completed role process ownership changed')
+                metadata = journal.get('provider_session', {})
+            else:
+                start_path = folder / 'start.json'
+                metadata = read_private(start_path) if start_path.exists() else {}
+            expected = metadata.get('output_candidate') or request['candidate']
+            if metadata.get('output_candidate') and (
+                    not isinstance(expected, dict)
+                    or set(expected) != {'id', 'head', 'content_sha256'}):
+                raise NativeProcessUnknown('completed role output binding is malformed')
+            if metadata.get('output_candidate') and metadata.get('result_digest') != digest(result):
+                raise NativeProcessUnknown('completed role result changed after its output binding')
+            if candidate_for(Path(request['workspace']))['id'] != expected['id']:
+                raise ValueError('completed role candidate changed after its result')
+        else:
+            journal_path = folder / 'native-process.json'
+            if not journal_path.exists():
+                return None
+            journal = read_private(journal_path)
+            intent = journal['intent']
+            if (not journal.get('owned')
+                    or intent['run_id'] != request['spec']['run_id']
+                    or intent['policy_digest'] != request['spec']['policy_digest']
+                    or intent['cwd'] != request['workspace']):
+                return None
+        return saved
+
+    def _claim(self, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        spec = request["spec"]
+        if spec["policy"].get("execution_backend") == "native-macos":
+            from .delivery_native_guard import validate_native_turn
+
+            validate_native_turn(spec, request["role"], request["iteration"], self.store)
+        job_key = self._job_key(request)
         folder = Path(spec["state_dir"]) / "attempts" / job_key
         folder.mkdir(parents=True, mode=0o700, exist_ok=True)
         result_path = folder / "result.json"
@@ -108,7 +179,7 @@ class DeliverySupervisor:
                 "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,)
             ).fetchone()
             if row:
-                if row["candidate_id"] != identity["candidate_id"]:
+                if row["candidate_id"] != request['candidate']['id']:
                     raise ValueError("attempt key collision")
                 if row["state"] == "finished":
                     return job_key, json.loads(row["result_json"])
@@ -162,6 +233,7 @@ class DeliverySupervisor:
         from .delivery_preparation import require_native_execution
 
         require_native_execution(request["spec"])
+        self.retained_request(request)
         job_key, existing = self._claim(request)
         if existing is not None:
             return existing
@@ -251,6 +323,12 @@ class DeliverySupervisor:
             if not result_path.is_file():
                 return self._mark_unknown(job_key, "role child exited without a final receipt")
             result = json.loads(result_path.read_text(encoding="utf-8"))
+            from .delivery_resources import read_private, write_private
+
+            output_candidate = self._completed_candidate(request, result)
+            metadata = read_private(start_path)
+            metadata.update(output_candidate=output_candidate, result_digest=digest(result))
+            write_private(start_path, metadata)
             with self.store._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 db.execute(
@@ -397,12 +475,15 @@ class DeliverySupervisor:
                 resource_cleanup="pending_workflow_finalization",
                 native_process=outcome,
             )
+            output_candidate = self._completed_candidate(request, result)
             journal = read_private(process.journal)
             journal["provider_session"] = {
                 "session_id": result.get("session_id"),
                 "resumed_from": request.get("resume_session"),
                 "role": request["role"],
                 "iteration": request["iteration"],
+                "output_candidate": output_candidate,
+                "result_digest": digest(result),
             }
             write_private(process.journal, journal)
             with self.store._connect() as db:
@@ -427,6 +508,16 @@ class DeliverySupervisor:
             if not (folder / "native-process.json").exists():
                 return self._mark_prelaunch_blocked(job_key, str(exc)[:300])
             return self._mark_unknown(job_key, f"native launch failed: {type(exc).__name__}")
+
+    @staticmethod
+    def _completed_candidate(request: dict[str, Any], result: dict[str, Any]) -> dict | None:
+        """Source rejection does not undo independently confirmed process teardown."""
+        try:
+            return candidate_for(Path(request['workspace']))
+        except (ValueError, OSError) as exc:
+            result['status'] = 'blocked'
+            result.setdefault('findings', []).append(str(exc))
+            return None
 
 
 
