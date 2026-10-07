@@ -2705,11 +2705,13 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
                         transport=httpx.ASGITransport(app=app), base_url=origin_url
                     ) as browser:
                         login = await browser.get("/api/session")
+                        # Pending events are durable projections, not a live mutation version.
+                        current = await repair_handle.query("status")
                         cancelled = await browser.post(
                             "/api/runs/run-1/cancel",
                             json={
                                 "command_id": "cancel-pending-repair",
-                                "expected_revision": detail["protocol_revision"],
+                                "expected_revision": current["revision"],
                                 "reason": "operator cancelled unavailable readback",
                             },
                             headers={
