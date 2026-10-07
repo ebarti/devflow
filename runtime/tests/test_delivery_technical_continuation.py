@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import hashlib
 import sys
 from copy import deepcopy
 from datetime import UTC, datetime

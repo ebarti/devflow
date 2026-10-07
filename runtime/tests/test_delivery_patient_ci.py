@@ -223,7 +223,9 @@ def test_scope_amendment_preserves_frozen_ci_policy(service, legacy):
     original["request_digest"] = digest(request)
     if legacy:
         original["policy"].pop("ci_wait_seconds")
-        original["policy_digest"] = digest(original["policy"])
+    else:
+        original["policy"]["ci_wait_seconds"] = 3600
+    original["policy_digest"] = digest(original["policy"])
     raw = json.loads(store.config.path.read_text())
     raw["repositories"]["fixture"]["allowed_paths"].append("tests/extra.py")
     path = store.config.state_root / "ci-amendment.json"
