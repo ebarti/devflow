@@ -298,6 +298,76 @@ class InstallRollback(unittest.TestCase):
                         self.assertEqual(captured.read_bytes(), b"foreign unreadable bytes")
                     self.assertEqual(backup.parent, self.home, "retained data was left in the OS temporary directory")
 
+    def test_displaced_file_write_during_authentication_retains_updated_bytes(self):
+        target = self.home / "agents/devflow-implementer.toml"
+        target.parent.mkdir()
+        target.write_bytes(b"old installed agent")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.rollback.capture(self.source, self.skills, self.home)
+        backup = Path(output.getvalue().strip())
+        self.addCleanup(shutil.rmtree, backup, True)
+        stage = self.home / "stage"
+        stage.write_bytes(b"new installed agent")
+        exchange, fdopen = self.rollback.exchange, os.fdopen
+        foreign_inode, changed = [], []
+        updated = b"foreign bytes updated during authentication"
+
+        def replace_before_exchange(left, right):
+            target.unlink()
+            target.write_bytes(b"foreign original bytes")
+            foreign_inode.append(target.lstat().st_ino)
+            return exchange(left, right)
+
+        class Reader:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def read(self):
+                raw = self.stream.read()
+                if foreign_inode and os.fstat(self.fileno()).st_ino == foreign_inode[0] and not changed:
+                    next(backup.glob("forward-*")).write_bytes(updated)
+                    changed.append(True)
+                return raw
+
+        with mock.patch.object(self.rollback, "exchange", replace_before_exchange), \
+                mock.patch.object(os, "fdopen", lambda *a, **kw: Reader(fdopen(*a, **kw))):
+            with self.assertRaises(ValueError):
+                self.rollback.effect(backup, target, stage)
+        self.assertTrue(changed, "the captured file was not updated through its open descriptor")
+        with self.assertRaisesRegex(ValueError, "captured at.*retained backup"):
+            self.rollback.restore(backup)
+        captured = next(backup.glob("forward-*"))
+        self.assertEqual(captured.read_bytes(), updated)
+        self.assertEqual(captured.lstat().st_ino, foreign_inode[0])
+
+    def test_distinct_target_device_refuses_before_effects(self):
+        original = Path.stat
+        before = sorted(p.name for p in self.home.iterdir())
+
+        def distinct_device(path, *args, **kwargs):
+            info = original(path, *args, **kwargs)
+            if path == self.skills:
+                values = list(info)
+                values[2] += 1
+                return os.stat_result(values)
+            return info
+
+        with mock.patch.object(Path, "stat", distinct_device):
+            with self.assertRaisesRegex(ValueError, "requires one filesystem"):
+                self.rollback.capture(self.source, self.skills, self.home)
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), before)
+        self.assertTrue((self.compatibility / "scripts/state.py").is_file())
+
     def test_cross_filesystem_and_unsupported_exchange_refuse_before_effects(self):
         import errno
         for error in (errno.EXDEV, errno.ENOTSUP):
