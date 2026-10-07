@@ -287,6 +287,36 @@ async def test_maintenance_rejects_foreign_transport_before_observing_any_row(ap
         await reconcile_closed_native(store, client)
 
 
+def _resolved_orphan_fixture(store, spec, monkeypatch):
+    """Isolate post-authentication guards with a real unfinished store row.
+
+    Journal authentication is covered by the real SIGKILL test; this completion
+    double only provides its confirmed transition to the guards under test.
+    """
+    from devflow_temporal import delivery_orphans
+
+    with store._connect() as db:
+        db.execute("INSERT INTO delivery_attempts "
+                   "(job_key,run_id,role,iteration,candidate_id,state,cleanup) "
+                   "VALUES ('orphan',?,'implement',0,'original','unknown','unknown')",
+                   (spec['run_id'],))
+    observed = []
+
+    def complete(actual_store, actual_spec, attempt, on_observed):
+        assert actual_store is store and actual_spec == spec
+        assert attempt['state'] == 'unknown' and attempt['cleanup'] == 'unknown'
+        observed.append(attempt['job_key'])
+        receipt = {'cleanup': 'observed-native-confirmed'}
+        on_observed(receipt)
+        with store._connect() as db:
+            db.execute("UPDATE delivery_attempts SET state='finished',cleanup='confirmed' "
+                       "WHERE job_key=?", (attempt['job_key'],))
+        return receipt
+
+    monkeypatch.setattr(delivery_orphans, '_complete_attempt', complete)
+    return observed
+
+
 @pytest.mark.parametrize('table', ['delivery_effects', 'delivery_mutations'])
 @pytest.mark.parametrize('state', ['pending', 'unknown'])
 def test_uncertain_effect_preserves_cleanup_and_claim(api_fixture, monkeypatch, table, state):
@@ -311,6 +341,7 @@ def test_uncertain_effect_preserves_cleanup_and_claim(api_fixture, monkeypatch, 
                        ('unknown-write', spec['run_id'], 'publish', 'original', state))
         original = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
         claims = [dict(row) for row in db.execute('SELECT * FROM claims')]
+    completed = _resolved_orphan_fixture(store, spec, monkeypatch)
     observed = []
 
     class Resources:
@@ -322,25 +353,28 @@ def test_uncertain_effect_preserves_cleanup_and_claim(api_fixture, monkeypatch, 
 
             @contextmanager
             def manifest():
-                yield {'processes': []}
+                yield {'processes': ['registered.json']}
             return manifest()
 
         def finalize(self, outcome, *, uncertain):
             observed.append((outcome, uncertain))
-            return {'state': 'unknown', 'resource_cleanup': 'unknown',
-                    'process_cleanup': 'unknown'}
+            cleanup = 'unknown' if uncertain else 'confirmed'
+            return {'state': cleanup, 'resource_cleanup': cleanup, 'process_cleanup': cleanup}
 
     monkeypatch.setattr(delivery_orphans, 'RunResources', Resources)
+    monkeypatch.setattr(delivery_orphans, '_observe_registered_process',
+                        lambda spec, path: {'cleanup': 'observed-native-confirmed'})
     delivery_orphans._reconcile(store, original, spec, {'status': 'TERMINATED'})
-    assert observed == []
+    assert completed == ['orphan']
+    assert observed == [('blocked', True)]
     with store._connect() as db:
         run = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
         assert run['cleanup'] == 'unknown' and run['error'] == 'Original failure'
         assert run['outcome'] == 'blocked'
         assert [dict(row) for row in db.execute('SELECT * FROM claims')] == claims
         assert db.execute(f'SELECT state FROM {table}').fetchone()[0] == state
-        assert db.execute("SELECT COUNT(*) FROM delivery_events "
-                          "WHERE type='resource_cleanup_reconciled'").fetchone()[0] == 0
+        assert db.execute("SELECT state,cleanup FROM delivery_attempts "
+                          "WHERE job_key='orphan'").fetchone()[:] == ('finished', 'confirmed')
 
 
 def test_cleanup_cannot_apply_a_previous_execution_snapshot(api_fixture):
@@ -412,7 +446,9 @@ def test_finished_historical_role_is_not_completed_again(api_fixture, monkeypatc
 
 
 @pytest.mark.parametrize('retained_manifest', [False, True])
-def test_missing_native_resource_ownership_remains_unknown(api_fixture, retained_manifest):
+def test_missing_native_resource_ownership_remains_unknown(
+    api_fixture, monkeypatch, retained_manifest,
+):
     from devflow_temporal import delivery_orphans
     from devflow_temporal.delivery_resources import RunResources
 
@@ -420,6 +456,10 @@ def test_missing_native_resource_ownership_remains_unknown(api_fixture, retained
     store = DeliveryStore(DeliveryConfig.load(path))
     store.submit(submission)
     spec = store.effective_spec(submission['run_id'])
+    store.project(spec['run_id'], phase='blocked', execution_state='blocked',
+                  event_type='blocked', message='Original failure', outcome='blocked',
+                  error='Original failure', cleanup='unknown')
+    completed = _resolved_orphan_fixture(store, spec, monkeypatch)
     with store._connect() as db:
         db.execute('INSERT INTO delivery_attempts '
                    '(job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup) '
@@ -427,14 +467,27 @@ def test_missing_native_resource_ownership_remains_unknown(api_fixture, retained
                    ('completed', spec['run_id'], 'implement', 0, 'original', 'finished',
                     '{"status":"failed"}', 'confirmed'))
         original = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
+        claims = [tuple(row) for row in db.execute('SELECT * FROM claims')]
+        retained = dict(db.execute("SELECT * FROM delivery_attempts "
+                                   "WHERE job_key='completed'").fetchone())
     resources = RunResources(spec)
     assert not resources.manifest.exists()
     if retained_manifest:
         with resources.locked() as manifest:
             write_private(resources.manifest, manifest)
     delivery_orphans._reconcile(store, original, spec, {'status': 'TERMINATED'})
+    assert completed == ['orphan']
     with store._connect() as db:
-        assert dict(db.execute('SELECT * FROM delivery_runs').fetchone()) == original
+        current = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
+        assert current['cleanup'] == 'unknown'
+        assert current['outcome'] == original['outcome'] and current['error'] == original['error']
+        receipt = json.loads(current['checks_json'])['resource_cleanup']
+        reason = ('original native process ownership is missing' if retained_manifest
+                  else 'original native resource ownership manifest is missing')
+        assert receipt['reason'] == reason
+        assert [tuple(row) for row in db.execute('SELECT * FROM claims')] == claims
+        assert dict(db.execute("SELECT * FROM delivery_attempts "
+                               "WHERE job_key='completed'").fetchone()) == retained
 
 
 def test_registered_monitor_cannot_claim_cleanup_while_its_owned_child_is_alive(
