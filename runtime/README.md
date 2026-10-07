@@ -70,7 +70,9 @@ independent review, QA, CI, tracker and cleanup stages proceed. The historical
 failure remains recorded and the delivery cannot count as a first-pass success.
 
 A second prepublication admission is available only after the first one finalized
-another failed gate and the installed native runtime payload has changed. It
+another failed gate and the installed native runtime payload differs from the
+controller payloads that actually executed its gates. Queued preparation is not
+treated as the consumed runtime after an owner source update. It
 retains the first admission and check evidence in separate namespaces, keeps the
 same feature candidate and grants zero implementation iterations. A third
 admission, an unchanged runtime, or any changed feature authority is rejected.

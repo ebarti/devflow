@@ -26,6 +26,8 @@ not claim constrained sandbox denials.
 
 An owner-controlled update of the installed controller Python source may change
 the current runtime payload hash for a run already frozen as `trusted-local`.
+The replacement must match the committed payload of its clean installed Git tree;
+dirty, untracked, ignored extra Python files and a non-installed copy are refused.
 Every other native identity field must still match, including the interpreter,
 OS/architecture, bundled CLI, locked dependencies, sandbox overrides and tool
 roots. Verification authenticates the original private proof, evidence hashes,
@@ -34,11 +36,25 @@ It preserves that specification and proof; the old observations remain historica
 measurements rather than measurements of the replacement source. `native-profile`
 retains its existing strict update checks.
 
-Before deployment, inspect queued and running executions through public status
-and indexed evidence. Finish executions whose recorded activities have one attempt
-and special legacy PID-bound recoveries under their matching previous runtime
+The native launch journal and process result retain the actual controller revision
+and payload at launch. Reattachment preserves that launch identity; later roles
+and checks record their own controller. Run statistics cohorts still describe the
+admission-time version, not every controller used during execution. Later gate
+retries compare against authenticated consumed process identities, so installing
+P2 while a P1-prepared retry is queued cannot earn another retry when P2 fails.
+The existing two-generation and zero-implementation bounds remain unchanged.
+
+Operator steps: before deployment, inspect queued and running executions through
+public status and indexed evidence. Finish executions whose recorded activities have one attempt
+and special legacy PID-bound recoveries, plus continuations that already consumed
+a native preparation renewal, under their matching previous runtime
 before upgrading. An update does not retrofit heartbeat or retry options into recorded
-histories. Retry-capable ordinary trusted executions can reattach to the same
+histories. Stop the original delivery worker through the existing `stop` control
+before changing installed source. Confirm its recorded ready PID/start identity
+has drained and the owned worker is stopped; do not update while it can launch roles
+or gates. Install the clean committed replacement, then use the existing `start`
+control and confirm the replacement worker is ready before dispatching.
+Retry-capable ordinary trusted executions can reattach to the same
 owned native invocation after worker replacement and start their remaining
 authorized roles and gates. Changed configuration, source candidate, scope,
 models, dependencies or interpreter require their existing authority checks;

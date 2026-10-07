@@ -291,8 +291,16 @@ class NativeProcess:
             for port in self.ports:
                 if listeners(port):
                     raise ValueError("native fixture port belongs to another process")
+            from .delivery_dashboard import runtime_identity
+            from .payload import payload_digest
+
             journal = {
                 "intent": intent,
+                "runtime_identity": {
+                    **runtime_identity(),
+                    "source_root": str(Path(__file__).resolve().parents[3]),
+                    "runtime_payload_sha256": payload_digest(Path(__file__).parent),
+                },
                 "phase": "allocated",
                 "owned": {},
                 "ports": self.ports,
@@ -423,6 +431,7 @@ class NativeProcess:
                     finalized_owned[journal["monitor"]["pid"]] = journal["monitor"]
                 result = {
                     "state": "finished" if cleanup != "unknown" else "unknown",
+                    "runtime_identity": journal["runtime_identity"],
                     "exit_code": process.returncode if process else None,
                     "cleanup": cleanup,
                     "timed_out": timed_out,
