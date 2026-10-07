@@ -1782,12 +1782,13 @@ class DeliveryWorkflow:
                 )
             repair_findings = []
             qa_evidence = None
+            checks_before_review = workflow.patched("local-checks-before-review-v1")
             for role in (("verify",) if verify_only else ("review", "verify")):
                 if self.cancel_requested:
                     return await self._cancelled(spec)
-                if role == ("verify" if verify_only else "review"):
-                    # Exact-head broker checks must be ready before either independent
-                    # role assesses required evidence. Browser QA still precedes verify.
+                if role == ("review" if checks_before_review and not verify_only else "verify"):
+                    # New runs check before review; old histories retain the QA order.
+                    # Browser QA follows these checks and still precedes verify.
                     self.state["phase"] = "checks"
                     self.state["revision"] += 1
                     await self._project(spec, "checks_started", "Executing required local checks")
@@ -1884,7 +1885,8 @@ class DeliveryWorkflow:
                                 and r.get("iteration") == iteration
                             ]}} if workflow.patched("role-evidence-handoff-v1") else {}),
                             **({"check_evidence": self.state["checks"].get("local")}
-                               if spec["policy"].get("host_sandbox") == "trusted-local" else {}),
+                               if (role == "verify" or checks_before_review)
+                               and spec["policy"].get("host_sandbox") == "trusted-local" else {}),
                         },
                     )
                 except Exception as exc:

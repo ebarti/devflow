@@ -1,3 +1,6 @@
+See [worker deployment migration](../docs/worker-versioning.md) for ordering
+compatibility, optional pinned worker registration and required owner steps.
+
 
 ### Rerun gates after a runtime repair
 
