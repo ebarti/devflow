@@ -43,11 +43,22 @@ Valid raw requests are durable in `preparing` without caller-authored proof. Tem
   "issue_url": "https://github.com/OWNER/REPO/issues/123",
   "repository_key": "configured-repository",
   "goal": "Add the requested behavior to the configured repository",
+  "publication_summary": "feat: add the requested repository behavior",
   "base_ref": "main",
   "branch": "feat/issue-123",
   "authorized_endpoint": "published_unmerged"
 }
 ```
+
+`goal` holds execution instructions and remains immutable. `publication_summary`
+is a separate Conventional Commit subject describing the actual change, including
+its type (for example, `docs: investigate source completeness` for a design
+document). It must be one line and at most 120 characters, with no extra sentences
+or control characters. The controller freezes it and uses it for both commits and
+the PR title. A short single-sentence goal can supply the summary when this field
+is omitted; detailed goals require an explicit summary before admission. Existing
+frozen runs retain their original publication metadata behavior. This change does
+not rename existing PRs or rewrite historical commits.
 
 New admissions freeze optional `plan_approval: "automatic"` by default. Read-only intake investigates and uses reasonable reversible assumptions for routine choices and asks only unresolved blocking questions. Once those answers are complete, it records and binds the exact plan revision and digest with provenance from the run authorization, then starts implementation without a human `proceed` answer. Set `plan_approval: "required"` only when the caller explicitly requests human plan review; that mode waits for `proceed`, `change` or `cancel`, bound to the current plan revision and digest. Invalid values and a required-review request combined with `accepted_plan` are rejected before claiming work. Historical stored inputs without the field retain their required gate and original Temporal replay ordering. Neither policy permits broader paths, checks or endpoints. No model runs while waiting. Intake is limited to eight turns; other roles retain `max_repairs` and separately recorded finite operator grants. Roles and checks have bounded deadlines and shared durable capacity. Older requests may still carry an explicit `accepted_plan`. An identical submit reuses the run; changed inputs under that run ID conflict. The outbox records intent before Temporal start and verifies the remote memo on recovery.
 

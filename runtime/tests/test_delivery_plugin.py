@@ -291,3 +291,22 @@ async def test_generated_stdio_command_raw_goal_question_auto_plan_and_evidence(
             server.should_exit = True
             await asyncio.wait_for(serving, 5)
             listener.close()
+
+
+def test_packaged_handoff_example_admits_detailed_goal(package_fixture, tmp_path):
+    import re
+
+    from test_delivery_store import service as store_fixture
+
+    root, runtime, config = package_fixture
+    target = packager.package(root, runtime, config)
+    skill = (target / 'skills/devflow-local-delivery/SKILL.md').read_text()
+    assert 'publication_summary' in skill and 'supersed' in skill
+    example = json.loads(re.search(r'```json\n(.*?)\n```', skill, re.S).group(1))
+    fixture_root = tmp_path / 'admission'
+    fixture_root.mkdir()
+    store, request = store_fixture.__wrapped__(fixture_root)
+    store.submit({**request, **example})
+    spec = store.spec(request['run_id'])
+    assert spec['goal'] == example['goal']
+    assert spec['publication_summary'] == example['publication_summary']

@@ -106,7 +106,9 @@ For an existing issue in an allowlisted repository, a realistic prompt is:
 
 > Use Devflow local delivery for https://github.com/example/project/issues/123. Fix the issue within its scope and publish an unmerged PR. Do not merge, release or deploy.
 
-The skill first reads `get_service`, matches the repository key and base ref, and generates stable unique routine IDs and a branch when absent. The issue URL and authorization through an unmerged PR must come from the user. It submits the original goal to `submit_run`, returns the run ID and dashboard URL, and ends the handoff without routine model polling. Calls start a stopped configured service using the existing bounded startup path. Service policy determines role models.
+The skill first reads `get_service`, matches the repository key and base ref, and generates stable unique routine IDs and a branch when absent. The issue URL and authorization through an unmerged PR must come from the user. It preserves the original goal and submits it with a separate `publication_summary` when detailed or multi-sentence instructions require one, returns the run ID and dashboard URL, and ends the handoff without routine model polling. Calls start a stopped configured service using the existing bounded startup path. Service policy determines role models.
+
+The publication summary describes the actual authorized change using Conventional Commit syntax, on a single line, at most 120 characters including type/scope, without extra sentences or control/bidi characters. For the prompt above, use a concrete subject such as `fix: correct issue 123 login redirect` only if that is the issue's actual change. A document-only investigation uses a docs subject. Keep the detailed `goal` intact. A short single-sentence goal may omit the field; plain prose receives `chore:`. Include the summary in superseding submissions while preserving the predecessor's exact goal, and keep the entire request stable across uncertain retries. The packaged skill contains an executable JSON field example. Historical runs without the field retain their frozen metadata behavior.
 
 Automatic planning is the default. “Show me the plan for approval before implementing” sets `plan_approval: "required"`; only the user's explicit acceptance of the presented plan can release that gate. Blocking clarification still waits for the user under either policy. Broader endpoint or scope authority is never inferred from a service policy or a callback.
 
@@ -124,7 +126,7 @@ Evaluate the skill with the following requests in a disposable environment, with
 
 | Case | Expected behavior |
 | --- | --- |
-| Direct: “Use Devflow for this linked issue; publish an unmerged PR” | Discover policy, generate routine IDs, submit one raw goal with automatic planning |
+| Direct: “Use Devflow for this linked issue; publish an unmerged PR” | Discover policy, generate routine IDs, submit the original goal plus a summary when detailed, with automatic planning |
 | Indirect: “Hand this linked issue to the configured local delivery service” | Select the delivery skill when the intent and endpoint are clear |
 | Explicit plan review | Set required review and wait for explicit acceptance of the exact plan |
 | Follow-up: “What is happening with that run?” | Read status/evidence without creating a new run or routine polling |

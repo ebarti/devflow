@@ -216,6 +216,7 @@ export interface NewRunRequest {
   issue_url: string
   repository_key: string
   goal: string
+  publication_summary?: string
   accepted_plan?: string
   base_ref: string
   branch: string

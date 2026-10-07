@@ -61,8 +61,14 @@ models, dependencies or interpreter require their existing authority checks;
 unknown effects or cleanup still require inspection. Never rewrite a frozen
 specification, proof or private state to force continuation.
 
-Publication keeps a conventional goal subject, or prefixes a plain goal with
-`chore:`, for both the commit and new PR title. The controller uses `git commit
+New admissions freeze `publication_summary` separately from the unchanged execution
+`goal`, and use the summary for commits and PR titles. Detailed or multi-sentence
+goals require an explicit single-line Conventional Commit subject, at most 120
+characters including its type, without extra sentences or control/bidi characters.
+A short single-sentence goal may omit the field; a plain goal receives `chore:`.
+Superseding submissions follow the same rule and preserve the predecessor's goal.
+Historical frozen runs without the field keep their original goal-derived commit
+subject and bounded title behavior. The controller uses `git commit
 --signoff` with the existing configured Git identity; it requires the author and
 sign-off identity to agree. Before staging, pushing or accepting a publication
 receipt it checks every commit after the frozen base for a Conventional Commit

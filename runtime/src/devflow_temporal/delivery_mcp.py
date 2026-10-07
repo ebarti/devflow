@@ -20,7 +20,12 @@ def build_server(config_path: Path) -> FastMCP:
             "Discover configured repository keys and base refs with get_service before submission. "
             "The local service owns roles, planning and authorized GitHub delivery through an "
             "unmerged PR. Use status/evidence on request; dashboard SSE supplies progress. "
-            "Keep mutation IDs stable after uncertain responses; inspect the run before retrying."
+            "Preserve the original goal. Detailed or multi-sentence goals require a separate "
+            "publication_summary describing the actual change: a single line, at most 120 "
+            "characters including its Conventional Commit type, without extra sentences or "
+            "control/bidi characters. Include it on superseding submissions too. "
+            "Keep mutation IDs and the complete request stable after uncertain responses; "
+            "inspect the run before retrying."
         ),
     )
     read = ToolAnnotations(
@@ -37,7 +42,16 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool(annotations=write)
     def submit_run(request_json: str, ctx: Context) -> dict:
-        """Submit a raw goal; plan_approval=required opts into human plan review."""
+        """Submit a goal with publication_summary for detailed execution instructions.
+
+        Preserve the original goal; detailed or multi-sentence instructions require
+        publication_summary describing the actual change as a single line, at most
+        120 characters including its Conventional Commit type, without extra
+        sentences or control/bidi characters. Include it on superseding submissions
+        too, preserving the predecessor's goal. A short single-sentence goal may
+        omit it; the service prefixes a plain goal with chore:. Keep the whole request
+        stable on retries. plan_approval=required opts into human plan review.
+        """
         value = json.loads(request_json)
         if not isinstance(value, dict):
             raise ValueError("submit request must be a JSON object")

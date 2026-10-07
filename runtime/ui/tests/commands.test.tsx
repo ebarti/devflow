@@ -180,7 +180,7 @@ describe('dashboard commands', () => {
     expect((screen.getByRole('button', { name: 'Cancel run' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
-  it('submits a raw goal with the allowlisted repository and endpoint', async () => {
+  it('submits a detailed goal and separate publication summary with the allowlisted endpoint', async () => {
     const user = userEvent.setup()
     const submit = vi.spyOn(api, 'newRun').mockResolvedValue({ run_id: 'fixture-new', dashboard_url: '/runs/fixture-new', existing: false, phase: 'queued' })
     const onCreated = vi.fn()
@@ -189,15 +189,38 @@ describe('dashboard commands', () => {
     await user.type(screen.getByLabelText('GitHub issue URL'), 'https://github.com/example/repository/issues/1')
     await user.selectOptions(screen.getByLabelText('Repository'), 'fixture-repo')
     await user.type(screen.getByLabelText('Branch'), 'feat/fixture')
-    await user.type(screen.getByLabelText('Goal'), 'Fixture task')
+    const goal = 'Investigate fixture behavior. Preserve evidence and publish only the design document.'
+    await user.type(screen.getByLabelText('Goal'), goal)
+    await user.type(screen.getByLabelText('Publication summary'), 'docs: investigate fixture behavior')
     await user.click(screen.getByRole('button', { name: 'Start investigation' }))
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith('fixture-new'))
     const body = submit.mock.calls[0][0]
-    expect(body).toMatchObject({ repository_key: 'fixture-repo', base_ref: 'main', authorized_endpoint: 'published_unmerged', goal: 'Fixture task' })
+    expect(body).toMatchObject({ repository_key: 'fixture-repo', base_ref: 'main', authorized_endpoint: 'published_unmerged', goal, publication_summary: 'docs: investigate fixture behavior' })
     expect(body).not.toHaveProperty('accepted_plan')
     expect(body).not.toHaveProperty('repo_path')
     expect(body).not.toHaveProperty('state_dir')
     expect(body).not.toHaveProperty('model')
+  })
+
+  it('shows admission errors and keeps the goal and summary available for correction', async () => {
+    const user = userEvent.setup()
+    const message = 'publication_summary must use Conventional Commit syntax'
+    const submit = vi.spyOn(api, 'newRun').mockRejectedValue(new Error(message))
+    const onCreated = vi.fn()
+    render(<NewRun service={mockService} onCreated={onCreated} onBack={vi.fn()} />)
+    await user.type(screen.getByLabelText('Work ID'), 'fixture-work')
+    await user.type(screen.getByLabelText('GitHub issue URL'), 'https://github.com/example/repository/issues/1')
+    await user.selectOptions(screen.getByLabelText('Repository'), 'fixture-repo')
+    await user.type(screen.getByLabelText('Branch'), 'docs/fixture')
+    const goal = 'Investigate fixture behavior. Keep all original execution instructions.'
+    await user.type(screen.getByLabelText('Goal'), goal)
+    await user.type(screen.getByLabelText('Publication summary'), 'Plain prose')
+    await user.click(screen.getByRole('button', { name: 'Start investigation' }))
+    expect((await screen.findByRole('alert')).textContent).toBe(message)
+    expect(submit.mock.calls[0][0]).toMatchObject({ goal, publication_summary: 'Plain prose' })
+    expect((screen.getByLabelText('Goal') as HTMLTextAreaElement).value).toBe(goal)
+    expect((screen.getByLabelText('Publication summary') as HTMLInputElement).value).toBe('Plain prose')
+    expect(onCreated).not.toHaveBeenCalled()
   })
 
   it('requires and submits the accepted plan for a service without intake', async () => {
@@ -217,6 +240,7 @@ describe('dashboard commands', () => {
     expect(submit.mock.calls[0][0]).toMatchObject({
       goal: 'Legacy task', accepted_plan: 'Implement the previously accepted scope',
     })
+    expect(submit.mock.calls[0][0]).not.toHaveProperty('publication_summary')
   })
 
   it('sends a free-text clarification and renders the retained answer', async () => {
