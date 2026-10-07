@@ -400,25 +400,6 @@ def create_app(config_path: Path) -> FastAPI:
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
-    @app.get("/api/runs/{run_id}/recovery-preflight")
-    async def recovery_preflight(request: Request, run_id: str) -> dict[str, Any]:
-        _host(request)
-        try:
-            return await asyncio.to_thread(service.store.policy_recovery_precheck, run_id)
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/runs/{run_id}/recover-execution")
-    async def recover_execution(request: Request, run_id: str) -> dict[str, Any]:
-        _mutation(request)
-        try:
-            return await asyncio.to_thread(
-                service.store.recover_execution, run_id, await request.json(),
-            )
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-
     @app.post("/api/runs/{run_id}/repair-admission-preflight")
     async def repair_admission_preflight(request: Request, run_id: str) -> dict[str, Any]:
         _host(request)

@@ -384,16 +384,6 @@ class DeliveryStore:
 
             initialize(db)
 
-    def policy_recovery_precheck(self, run_id: str) -> dict:
-        from .delivery_policy_recovery import precheck
-
-        return precheck(self, run_id)[0]
-
-    def recover_execution(self, run_id: str, supplied: dict) -> dict:
-        from .delivery_policy_recovery import recover
-
-        return recover(self, run_id, supplied)
-
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         db = self.state.connect(self.config.tracking_db)

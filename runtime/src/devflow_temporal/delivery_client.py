@@ -119,18 +119,6 @@ class DeliveryClient:
             timeout=120,
         )
 
-    def recovery_preflight(self, run_id: str) -> dict:
-        return self._request(
-            "GET", "/api/runs/" + quote(run_id, safe="") + "/recovery-preflight", timeout=120,
-        )
-
-    def recover_execution(self, run_id: str, payload: dict[str, Any]) -> dict:
-        return self._request(
-            "POST", "/api/runs/" + quote(run_id, safe="") + "/recover-execution", payload,
-            timeout=180,
-        )
-
-
     def repair_admission_preflight(self, run_id, request):
         return self._request("POST", "/api/runs/" + quote(run_id, safe="")
                              + "/repair-admission-preflight", request, timeout=120)
