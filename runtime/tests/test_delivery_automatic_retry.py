@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -438,6 +439,7 @@ def test_moved_named_base_is_fetched_without_moving_local_worktree(service, monk
     assert (source / 'README.md').read_text() == 'precious local uncommitted change\n'
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="actual macOS cleanup identity inspection")
 def test_retry_observes_real_cleanup_using_accepted_intake_plan(service, monkeypatch):
     from pathlib import Path
 
