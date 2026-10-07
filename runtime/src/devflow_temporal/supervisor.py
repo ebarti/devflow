@@ -49,21 +49,31 @@ class DeliverySupervisor:
         self.capacity = capacity
         self.job_locks: dict[str, asyncio.Lock] = {}
 
-    def _enter_capacity(self, job_key: str, *, cancelled=None) -> str | None:
+    def _enter_capacity(self, job_key: str, *, cancelled=None, stop_requested=None) -> str | None:
         if cancelled is not None and cancelled():
             raise ValueError("native role cancelled before capacity admission")
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if stop_requested is not None and stop_requested():
+                raise ValueError("native role cancelled before capacity admission")
             row = db.execute(
-                "SELECT state FROM delivery_attempts WHERE job_key=?", (job_key,)
+                "SELECT state,run_id FROM delivery_attempts WHERE job_key=?", (job_key,)
             ).fetchone()
             if row is None or row["state"] != "queued":
                 raise NativeProcessUnknown("role attempt changed while waiting for capacity")
+            if cancelled is not None:
+                run = db.execute(
+                    "SELECT phase FROM delivery_runs WHERE run_id=?", (row["run_id"],),
+                ).fetchone()
+                if run is not None and run["phase"] == "cancelling":
+                    raise ValueError("native role cancelled before capacity admission")
             occupied = db.execute(
                 """SELECT COUNT(*) FROM delivery_attempts
                    WHERE state IN ('starting','running','unknown')"""
             ).fetchone()[0]
             if occupied < self.capacity:
+                if stop_requested is not None and stop_requested():
+                    raise ValueError("native role cancelled before capacity admission")
                 started = _now()
                 updated = db.execute(
                     """UPDATE delivery_attempts SET state='starting',started_at=?
@@ -437,7 +447,9 @@ class DeliverySupervisor:
                 verify_prepared_spec(spec)
                 if expected["state"] == "queued":
                     while True:
-                        started = self._enter_capacity(job_key, cancelled=cancelled)
+                        started = self._enter_capacity(
+                            job_key, cancelled=cancelled, stop_requested=stopped.is_set,
+                        )
                         if started:
                             expected.update(state="starting", started_at=started)
                             break

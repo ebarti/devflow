@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -183,6 +184,7 @@ async def test_actual_monitor_prelaunch_failure_releases_owned_capacity(
     result = await delivery_role(case.request)
     row, _ = _attempt(case)
     created = len(case.created)
+    assert created == 1, 'prelaunch failure bypassed the actual monitor boundary'
     assert await delivery_role(case.request) == result
     assert _attempt(case)[0] == row
     assert len(case.created) == created
@@ -880,3 +882,71 @@ async def test_entered_monitor_missing_original_lock_keeps_unknown_capacity(
     assert len(case.created) == 1 and case.created[0].launch_absent
     assert not (case.folder / 'native-monitor.lock').exists()
     assert not (case.state / 'invocations').exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('checkpoint', ['transaction', 'capacity_count'])
+async def test_queued_replacement_while_admission_transaction_waits(
+        native_role, monkeypatch, checkpoint):
+    case = native_role
+    entered, release = threading.Event(), threading.Event()
+    admitting = threading.local()
+    connect, acquire = case.store._connect, case.owner._enter_capacity
+
+    class AdmissionDB:
+        def __init__(self, db):
+            self.db = db
+
+        def execute(self, sql, *args):
+            boundary = (sql == 'BEGIN IMMEDIATE' if checkpoint == 'transaction'
+                        else 'SELECT COUNT(*) FROM delivery_attempts' in sql)
+            if boundary and getattr(admitting, 'active', False):
+                entered.set()
+                assert release.wait(10), 'waiting admission transaction was not released'
+            return self.db.execute(sql, *args)
+
+    @contextmanager
+    def controlled():
+        with connect() as db:
+            yield AdmissionDB(db)
+
+    def enter(key, **options):
+        admitting.active = True
+        try:
+            return acquire(key, **options)
+        finally:
+            admitting.active = False
+
+    monkeypatch.setattr(case.store, '_connect', controlled)
+    monkeypatch.setattr(case.owner, '_enter_capacity', enter)
+    monkeypatch.setattr(activity, 'in_activity', lambda: True)
+    monkeypatch.setattr(activity, 'heartbeat', lambda *args: None)
+    monkeypatch.setattr(activity, 'cancellation_details', lambda: SimpleNamespace(
+        cancel_requested=False, timed_out=True, not_found=False, worker_shutdown=False))
+    task = asyncio.create_task(delivery_role(case.request))
+    try:
+        await _wait(entered)
+        with sqlite3.connect(f'file:{case.store.config.tracking_db}?mode=ro', uri=True) as db:
+            db.row_factory = sqlite3.Row
+            before = dict(db.execute('SELECT * FROM delivery_attempts WHERE job_key=?',
+                                     (case.key,)).fetchone())
+        assert before['state'] == 'queued' and before['started_at'] is None
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with connect() as db:
+            after = dict(db.execute('SELECT * FROM delivery_attempts WHERE job_key=?',
+                                    (case.key,)).fetchone())
+        (case.state / 'queued-transaction-observation.json').write_text(json.dumps(
+            {'before': before, 'after': after}, indent=2))
+        assert after == before, after
+        assert not (case.state / 'invocations').exists()
+        retry = await delivery_role(case.request)
+        assert retry['finish_reason'] == 'fixture'
+        assert (case.state / 'invocations').read_text().splitlines() == ['one']
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
