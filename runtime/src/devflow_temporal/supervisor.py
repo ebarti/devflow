@@ -328,6 +328,7 @@ class DeliverySupervisor:
             if not result_path.is_file():
                 return self._mark_unknown(job_key, "role child exited without a final receipt")
             result = json.loads(result_path.read_text(encoding="utf-8"))
+            await asyncio.to_thread(self._admit_role_output, request, result)
             from .delivery_resources import read_private, write_private
 
             output_candidate = await asyncio.to_thread(self._completed_candidate, request, result)
@@ -518,6 +519,7 @@ class DeliverySupervisor:
                     "usage": None,
                     "finish_reason": reason,
                 }
+            self._admit_role_output(native_request, result)
             if native_request.get("role_evidence_key"):
                 try:
                     result.update(seal(native_request))
@@ -569,6 +571,17 @@ class DeliverySupervisor:
             result['status'] = 'blocked'
             result.setdefault('findings', []).append(str(exc))
             return None
+
+    def _admit_role_output(self, request: dict[str, Any], result: dict[str, Any]) -> None:
+        if request['role'] != 'implement':
+            return
+        from .delivery_broker import DeliveryBroker
+
+        try:
+            DeliveryBroker(self.store, request['spec']).admit_implementation(request['candidate'])
+        except (ValueError, RuntimeError, OSError) as exc:
+            result['status'] = 'blocked'
+            result.setdefault('findings', []).append(str(exc))
 
 
 

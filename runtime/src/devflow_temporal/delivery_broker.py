@@ -25,15 +25,19 @@ from .delivery_store import DeliveryStore, _now
 
 
 def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 120) -> str:
+    nul_output = argv[0] == 'git' and '-z' in argv
     result = subprocess.run(
-        argv, cwd=cwd, text=True, capture_output=True, timeout=timeout, check=False
+        argv, cwd=cwd, text=not nul_output, capture_output=True, timeout=timeout, check=False
     )
+    stdout = result.stdout.decode('utf-8', 'surrogateescape') if nul_output else result.stdout
+    stderr = result.stderr.decode('utf-8', 'surrogateescape') if nul_output else result.stderr
     if result.returncode:
         raise RuntimeError(
             f"command failed ({result.returncode}): {argv[0]} {argv[1]}: "
-            + (result.stderr.strip() or result.stdout.strip())[:500]
+            + (stderr.strip() or stdout.strip())[:500]
         )
-    return result.stdout.strip()
+    # Preserve exact filenames, including CR/LF and leading/trailing whitespace.
+    return stdout if nul_output else stdout.strip()
 
 
 def _git(path: Path, *args: str) -> str:
@@ -324,12 +328,40 @@ class DeliveryBroker:
                 relevant.append((name, _sha256(file)))
         return hashlib.sha256(canonical_json(relevant).encode()).hexdigest()
 
-    def _changed_paths(self, base_ref: str = "HEAD") -> set[str]:
-        changed = set(_git(self.checkout, "diff", "--name-only", base_ref).splitlines())
+    def _changed_paths(self, base_ref: str = "HEAD", *, include_index: bool = False) -> set[str]:
+        changed = set(_git(
+            self.checkout, "diff", "--no-renames", "--name-only", "-z", base_ref, "--"
+        ).split('\0'))
+        if include_index:
+            changed.update(_git(
+                self.checkout, 'diff', '--cached', '--no-renames', '--name-only', '-z',
+                base_ref, '--'
+            ).split('\0'))
         changed.update(
-            _git(self.checkout, "ls-files", "--others", "--exclude-standard").splitlines()
+            _git(self.checkout, "ls-files", "--others", "--exclude-standard", "-z").split('\0')
         )
         return {item for item in changed if item}
+
+    def validate_candidate_scope(self) -> set[str]:
+        changed = self._changed_paths(self.spec['base_sha'], include_index=True)
+        escaped = changed - set(self.spec['policy'].get('allowed_paths', []))
+        if escaped:
+            raise ValueError(
+                'candidate changed outside allowed paths: ' + ', '.join(sorted(escaped))
+            )
+        return changed
+
+    def admit_implementation(self, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        """Retain source/index, but leave every new commit to publication."""
+        expected = input_candidate['head']
+        try:
+            _git(self.checkout, 'merge-base', '--is-ancestor', expected, 'HEAD')
+        except RuntimeError as exc:
+            raise ValueError('implementation commit ancestry changed during its role') from exc
+        self.validate_candidate_scope()
+        if _git(self.checkout, 'rev-parse', 'HEAD') != expected:
+            _git(self.checkout, 'reset', '--soft', expected)
+        return self.candidate()
 
     def gate_checkout(self, role: str, iteration: int, candidate: dict[str, Any]) -> Path:
         if role not in {"review", "verify"}:
@@ -1247,6 +1279,7 @@ class DeliveryBroker:
                 raise ValueError("owned commit lacks its author Signed-off-by trailer: " + commit)
 
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        self.validate_candidate_scope()
         publication_branch = self._publication_base_ref()
         self._validate_publication_commits()
         key = f"publish:{self.spec['run_id']}:{iteration}"
@@ -1258,9 +1291,9 @@ class DeliveryBroker:
             if found is None or found["headRefOid"] != done["head"]:
                 return {"state": "pending", "reason": "pr_head_readback", "head": done["head"]}
             return done
-        if before["id"] != input_candidate["id"] and self._changed_paths():
+        if before["id"] != input_candidate["id"] and self._changed_paths(include_index=True):
             raise RuntimeError("candidate changed during publication recovery")
-        changed = self._changed_paths()
+        changed = self._changed_paths(include_index=True)
         allowed = set(self.spec["policy"].get("allowed_paths", []))
         if changed - allowed:
             raise ValueError(
@@ -1278,7 +1311,13 @@ class DeliveryBroker:
                     ": filter: unset"
                 ):
                     raise ValueError("candidate path would invoke a Git clean filter")
-            _git(self.checkout, "add", "--", *sorted(changed))
+            indexed = set(_git(self.checkout, 'ls-files', '-z').split('\0'))
+            stageable = sorted(path for path in changed
+                               if path in indexed or os.path.lexists(self.checkout / path))
+            # Already-staged removals are absent from both index and worktree;
+            # preserve them without passing an unmatched pathspec to git add.
+            if stageable:
+                _git(self.checkout, '--literal-pathspecs', 'add', '--all', '--', *stageable)
             if _git(self.checkout, "diff", "--cached", "--name-only"):
                 _git(
                     self.checkout,

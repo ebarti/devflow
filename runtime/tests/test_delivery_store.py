@@ -2296,6 +2296,10 @@ async def test_role_capacity_is_shared_across_original_and_amended_config_paths(
 @pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").is_file(), reason="macOS Seatbelt required")
 async def test_supervisor_launches_one_sandboxed_fake_role_and_replays_receipt(service):
     store, request = service
+    config = json.loads(store.config.path.read_text())
+    config["repositories"]["fixture"]["allowed_paths"].append("devflow-fake-change.txt")
+    store.config.path.write_text(json.dumps(config))
+    store = DeliveryStore(DeliveryConfig.load(store.config.path))
     store.submit(request)
     spec = store.spec(request["run_id"])
     broker = DeliveryBroker(store, spec)
