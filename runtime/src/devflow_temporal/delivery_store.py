@@ -421,7 +421,7 @@ class DeliveryStore:
         )
         return int(cursor.lastrowid)
 
-    def submit(self, supplied: dict[str, Any]) -> dict[str, Any]:
+    def submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None) -> dict[str, Any]:
         run_id = supplied.get("run_id")
         command_id = supplied.get("command_id")
         if not isinstance(run_id, str) or not isinstance(command_id, str):
@@ -453,11 +453,18 @@ class DeliveryStore:
                     "existing": True,
                     "phase": prior_run[1],
                 }
-        spec = self.config.admit(supplied)
+        reference = None
+        if _automatic is not None:
+            old = json.loads(_automatic['row']['request_json'])
+            branch = old.get('publication_base_ref')
+            if branch and not re.fullmatch(r'[0-9a-fA-F]{40}', old['base_ref']):
+                reference = 'refs/remotes/origin/' + branch
+        spec = (self.config.admit(supplied, _base_ref=reference) if reference
+                else self.config.admit(supplied))
         spec["request_digest"] = request_digest
         temporal_result = None
         superseded = spec.get("supersedes_run_id")
-        if superseded:
+        if superseded and _automatic is None:
             from .delivery_preparation import require_native_execution
 
             require_native_execution(self.spec(superseded))
@@ -516,7 +523,11 @@ class DeliveryStore:
                 != self.state.issue_resource(spec["issue_url"])
             ):
                 raise ValueError("work ID is bound to another issue")
-            if superseded:
+            if superseded and _automatic is not None:
+                from .delivery_automatic_retry import validate_transaction
+
+                validate_transaction(self, db, spec, _automatic)
+            elif superseded:
                 previous = db.execute(
                     """SELECT work_id,issue_url,repository_key,phase,outcome,execution_state,
                               cleanup,error,pr_json,checks_json,request_digest,request_json,

@@ -143,7 +143,7 @@ class DeliveryConfig:
             "max_repairs": self.raw.get("max_repairs", 2),
         }
 
-    def admit(self, supplied: dict[str, Any]) -> dict[str, Any]:
+    def admit(self, supplied: dict[str, Any], *, _base_ref: str | None = None) -> dict[str, Any]:
         required = {
             "command_id",
             "run_id",
@@ -222,7 +222,13 @@ class DeliveryConfig:
         actual_remote = _git(source, "remote", "get-url", "origin")
         if actual_remote != repository["origin_url"]:
             raise ValueError("configured Git origin changed")
-        base_sha = _git(source, "rev-parse", supplied["base_ref"])
+        resolved_ref = supplied["base_ref"]
+        if _base_ref is not None:
+            branch = _base_ref.removeprefix("refs/remotes/origin/")
+            if resolved_ref not in {branch, "refs/heads/" + branch, "origin/" + branch, _base_ref}:
+                raise ValueError("fresh base changed the configured named branch")
+            resolved_ref = _base_ref
+        base_sha = _git(source, "rev-parse", resolved_ref)
         base_paths = _git(source, "ls-tree", "-r", "--name-only", base_sha).splitlines()
         if any(path == ".codex" or path.startswith(".codex/") for path in base_paths):
             raise ValueError("project Codex configuration is not admitted")
@@ -230,7 +236,7 @@ class DeliveryConfig:
         if expected and base_sha != expected:
             raise ValueError("base ref moved from the accepted plan")
         publication_branch = (
-            publication_base_ref(source, supplied["base_ref"], base_sha)
+            publication_base_ref(source, resolved_ref, base_sha)
             if self.raw.get("provider", "codex") == "codex" else None
         )
         state_dir = self.state_root / "runs" / supplied["run_id"]

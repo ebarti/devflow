@@ -2646,7 +2646,7 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
             workflows=[DeliveryWorkflow],
             activities=activities,
         ):
-            service_runtime.store.submit(request)
+            submit_historical_admission(service_runtime.store, request, monkeypatch)
             await service_runtime.dispatch_once()
             blocked = await asyncio.wait_for(
                 client.get_workflow_handle("delivery-run-1").result(), timeout=35

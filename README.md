@@ -173,3 +173,7 @@ requires a release tag fetched from its origin. CI fetches history for these
 historical fixtures and separately checks the runtime and dashboard. These
 checks do not perform live installation, model-driven delivery, target-project
 checks, merges or deployment.
+
+[Architecture](docs/architecture.md)
+
+Automatic retries keep the accepted plan and frozen per-issue attempt ceiling. Later cleanup and acknowledged Blocked/claim release can finish after that ceiling is exhausted, but cannot create another attempt. Cleanup maintenance preserves the exact original resource manifest and finalization bytes before updating their canonical latest observations; interrupted maintenance reuses and authenticates the immutable originals. Completed provider journals without the original result binding remain unresolved rather than inferred clean.
