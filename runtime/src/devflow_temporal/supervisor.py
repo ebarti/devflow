@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .contracts import canonical_json
+from .contracts import canonical_json, digest
 from .delivery_native_process import NativeProcessUnknown
 from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
@@ -399,6 +399,7 @@ class DeliverySupervisor:
             )
             journal = read_private(process.journal)
             journal["provider_session"] = {
+                "result_digest": digest(result),
                 "session_id": result.get("session_id"),
                 "resumed_from": request.get("resume_session"),
                 "role": request["role"],

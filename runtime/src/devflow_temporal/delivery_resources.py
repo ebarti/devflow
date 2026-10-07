@@ -634,6 +634,15 @@ class RunResources:
 
 def observe_finalized_resources(spec, *, unknown_allowed=False):
     """Fresh read-only actor, port, lease and inode observation, never teardown."""
+    return _observe_resources(spec, unknown_allowed=unknown_allowed)
+
+
+def observe_completed_resources(spec, attempts):
+    """Authenticate later blocked-run completion without changing historical finalization."""
+    return _observe_resources(spec, freshly_completed=True, attempts=attempts)
+
+
+def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, attempts=()):
     state = Path(spec["state_dir"])
     _ancestors(state / "resources/manifest.json")
     manifest_path, final_path = (
@@ -643,18 +652,19 @@ def observe_finalized_resources(spec, *, unknown_allowed=False):
     if (
         manifest.get("run_id") != spec["run_id"]
         or manifest.get("state_identity") != _identity(state)
+        or (freshly_completed and finalization.get('outcome') != 'blocked')
         or finalization.get("state")
-        not in ({"confirmed", "unknown"} if unknown_allowed else {"confirmed"})
+        not in ({"confirmed", "unknown"} if unknown_allowed or freshly_completed else {"confirmed"})
         or finalization.get("process_cleanup")
         not in (
             {"observed-native-confirmed", "unknown"}
-            if unknown_allowed
+            if unknown_allowed or freshly_completed
             else {"observed-native-confirmed"}
         )
-        or any(
+        or (not freshly_completed and any(
             item.get("cleanup") != "observed-native-confirmed"
             for item in finalization.get("processes", [])
-        )
+        ))
     ):
         raise ValueError("predecessor process/root custody is unconfirmed")
     from .delivery_native_process import listeners, process_table
@@ -665,6 +675,12 @@ def observe_finalized_resources(spec, *, unknown_allowed=False):
     receipts = {item["journal"]: item for item in finalization.get("processes", [])}
     if set(receipts) != set(manifest["processes"]):
         raise ValueError("predecessor finalized actor inventory changed")
+    attempt_journals = {
+        str(state / 'attempts' / item['job_key'] / 'native-process.json'): item
+        for item in attempts
+    }
+    if freshly_completed and not set(attempt_journals).issubset(manifest['processes']):
+        raise ValueError('original completed attempt is not registered')
     for raw in manifest["processes"]:
         path = Path(raw)
         if not path.is_relative_to(state) or path.resolve(strict=True) != path:
@@ -672,7 +688,7 @@ def observe_finalized_resources(spec, *, unknown_allowed=False):
         _ancestors(path)
         value = read_private(path)
         receipt = receipts[raw]
-        if (
+        if not freshly_completed and (
             receipt.get("monitoring_complete") is not True
             or receipt.get("owned_ports_clear") is not True
             or sorted(receipt.get("observed_pids", [])) != sorted(map(int, value.get("owned", {})))
@@ -680,6 +696,55 @@ def observe_finalized_resources(spec, *, unknown_allowed=False):
             raise ValueError(
                 "predecessor actor identities lost their finalized inventory"
             )
+        if freshly_completed:
+            launch = read_private(path.with_name('launch.json'))
+            intent = value['intent']
+            if (intent['run_id'] != spec['run_id']
+                    or intent['policy_digest'] != spec['policy_digest']
+                    or intent['argv'] != launch['argv']
+                    or intent['environment_sha256'] != digest(launch['environment'])
+                    or intent['ports'] != value.get('ports')
+                    or not value.get('owned')):
+                raise ValueError('original native launch binding changed')
+            attempt = attempt_journals.get(raw)
+            if attempt is not None:
+                request = read_private(path.with_name('request.json'))
+                result = json.loads(attempt['result_json'])
+                metadata = value.get('provider_session', {})
+                identity = {'run_id': spec['run_id'], 'role': request['role'],
+                            'iteration': request['iteration'],
+                            'candidate_id': request['candidate']['id'],
+                            'policy_digest': spec['policy_digest']}
+                if request.get('attempt_generation'):
+                    identity['attempt_generation'] = request['attempt_generation']
+                monitor = value.get('monitor', {})
+                if (attempt['state'] != 'finished' or attempt['cleanup'] != 'confirmed'
+                        or request['spec'] != spec or digest(identity) != attempt['job_key']
+                        or request['role'] != attempt['role']
+                        or request['iteration'] != attempt['iteration']
+                        or request['candidate']['id'] != attempt['candidate_id']
+                        or request.get('result_path') != str(path.with_name('result.json'))
+                        or request.get('start_path') != str(path.with_name('start.json'))
+                        or intent['cwd'] != request['workspace']
+                        or type(intent['timeout']) is not int or intent['timeout'] <= 0
+                        or intent['timeout'] > spec['policy']['roles'][request['role']].get(
+                            'timeout_seconds', 7200)
+                        or intent['ports'] != [] or not monitor
+                        or metadata.get('result_digest') != digest(result)
+                        or metadata.get('session_id') != attempt['session_id']
+                        or metadata.get('role') != attempt['role']
+                        or metadata.get('iteration') != attempt['iteration']
+                        or str(attempt['pid']) not in value['owned']
+                        or value['owned'][str(attempt['pid'])]['identity']
+                        != attempt['process_identity']
+                        or value.get('result', {}).get('cleanup') != 'observed-native-confirmed'
+                        or (table.get(monitor['pid'], {}).get('identity') == monitor['identity']
+                            and not table[monitor['pid']]['stat'].startswith('Z'))):
+                    raise ValueError('original completed provider binding is unconfirmed')
+            monitor = value.get('monitor')
+            if (monitor and table.get(monitor['pid'], {}).get('identity') == monitor['identity']
+                    and not table[monitor['pid']]['stat'].startswith('Z')):
+                raise ValueError('registered native monitor remains active')
         lock_path = path.with_name("native-process.lock")
         descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
         try:
