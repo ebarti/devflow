@@ -209,7 +209,9 @@ def target_paths(source, skills, codex):
                      and path.resolve(strict=False).parent == source / "skills")
     for directory in (skills / "devflow", skills / ".devflow-helpers"):
         paths.add(directory)
-        if not directory.is_symlink():
+        if not directory.is_symlink() or directory == skills / "devflow":
+            # A retained compatibility root may itself be a symlink. Capture
+            # the actual child registrations before any authenticated exchange.
             paths.update(directory / item.name for item in (source / "skills/devflow").iterdir()
                          if item.name not in {"SKILL.md", "__pycache__"})
     return sorted({canonical_target(path) for path in paths},
