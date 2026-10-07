@@ -24,7 +24,7 @@ from devflow_temporal import delivery_activities as activities
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_process import NativeProcess, process_table, reconcile_process
-from devflow_temporal.delivery_resources import RunResources
+from devflow_temporal.delivery_resources import RunResources, read_private
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -603,9 +603,30 @@ async def test_physical_worker_death_releases_os_slot_before_orphan_cleanup(tmp_
         if descriptor is not None:
             os.close(descriptor)
         if journal.exists():
+            original = read_private(journal)
+            assert original["intent"]["run_id"] == owned["run_id"]
+            assert original["intent"]["policy_digest"] == owned["policy_digest"]
+            assert original.get("monitor") and original["monitor"]["pid"] != worker.pid
+            reconcile_process(journal)
+
+            def monitor_completed():
+                current = read_private(journal)
+                assert current["intent"] == original["intent"]
+                assert current.get("monitor") == original["monitor"]
+                result = current.get("result", {})
+                return (
+                    current.get("phase") == "finished"
+                    and current.get("monitoring_complete") is True
+                    and result.get("cleanup") == "observed-native-confirmed"
+                    and result.get("stdio_drained") is True
+                )
+
+            # Worker loss leaves the detached monitor responsible for its
+            # terminal journal. Child exit alone does not join that monitor.
+            await wait_until(monitor_completed)
             cleanup = reconcile_process(journal)
             assert cleanup["observed_owned_stopped"]
-            assert cleanup["cleanup"] == "unknown"  # Interrupted monitor remains honest.
+            assert cleanup["cleanup"] == "observed-native-confirmed"
 
 
 @pytest.mark.parametrize("stop", ["cancel", "timeout"])
