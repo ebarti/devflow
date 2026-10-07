@@ -93,12 +93,13 @@ The CLI, HTTP API, and official MCP stdio server use the same service. To config
 Newly admitted runs freeze `publication_readback_version: 1` and the service's
 `publication_readback_seconds` (default 900; integer 30–3600). If initial publication
 completion is lost, the workflow inspects that existing publication effect and its
-owned branch/PR; it never repeats commit, push, or PR creation. Known transport
-failures and delayed PR-head projection wait on durable backoff within this deadline.
-Cancellation wakes the wait. Confirmed validation or permission failures before any
-remote mutation stop immediately with known cleanup. Failed read-only commands remain
-unavailable queries, regardless of their diagnostic text; only observed ownership,
-candidate or unexpected-head conflicts stop reconciliation. A failed mutation process
+owned branch/PR; it never repeats commit, push, or PR creation. During reconciliation,
+unavailable read-only queries and delayed PR-head projection wait on durable backoff
+within this deadline. Cancellation wakes the wait. Observed ownership, candidate or
+unexpected-head conflicts stop reconciliation. Before any remote mutation, validation
+failures or unavailable prepublication queries stop immediately with a known no-effect
+rejection; this does not establish a remote rejection. Query diagnostic text does not
+determine whether an identity conflict occurred. A failed mutation process
 cannot prove remote rejection from its exit status or stderr, so its original effect
 is still read back without repeating the mutation. An exhausted deadline or cancelled unresolved publication
 retains unknown cleanup, resources and the work claim for inspection. Scope amendments
