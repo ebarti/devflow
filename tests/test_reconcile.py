@@ -615,7 +615,12 @@ p.write_text(json.dumps(s))
         with tarfile.open(fileobj=io.BytesIO(archive)) as packed:
             packed.extractall(origin, filter="data")
         subprocess.run(["git", "init", "-q", str(origin)], check=True)
-        for key, value in (("user.name", "Test"), ("user.email", "test@example.invalid")):
+        # This disposable origin must stay stable during the local hardlink clone.
+        # Inherited automatic maintenance can repack/delete objects after commit.
+        fixture_git = (("maintenance.auto", "false"), ("gc.auto", "0"),
+                       ("core.hooksPath", "/dev/null"), ("commit.gpgSign", "false"))
+        for key, value in (*fixture_git, ("user.name", "Test"),
+                           ("user.email", "test@example.invalid")):
             subprocess.run(["git", "-C", str(origin), "config", key, value], check=True)
         subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(origin), "commit", "-qm", "old release"], check=True)
@@ -629,6 +634,9 @@ p.write_text(json.dumps(s))
         subprocess.run(["git", "-C", str(origin), "commit", "-qm", "new release"], check=True)
         subprocess.run(["git", "-C", str(origin), "tag", "v2"], check=True)
         subprocess.run(["git", "clone", "-q", str(origin), str(checkout)], check=True)
+        # Updater fetches must not leave a packer running when fixtures are removed.
+        for key, value in fixture_git:
+            subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
         subprocess.run(["git", "-C", str(checkout), "checkout", "-q", "--detach", "v1"], check=True)
         home = self.root / "home"
         codex = home / ".codex"
