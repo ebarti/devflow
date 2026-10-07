@@ -212,18 +212,37 @@ def target_paths(source, skills, codex):
         if not directory.is_symlink():
             paths.update(directory / item.name for item in (source / "skills/devflow").iterdir()
                          if item.name not in {"SKILL.md", "__pycache__"})
-    return sorted(paths, key=lambda item: (-len(item.parts), str(item)))
+    return sorted({canonical_target(path) for path in paths},
+                  key=lambda item: (-len(item.parts), str(item)))
+
+
+def restore_checkout(previous):
+    if previous:
+        source = Path(previous["source"])
+        if subprocess.run(["git", "-C", str(source), "diff", "--quiet", "HEAD", "--"]).returncode:
+            raise ValueError("checkout changed during failed install; restore previous commit manually")
+        subprocess.run(["git", "-C", str(source), "checkout", "--detach", previous["head"]], check=True)
+
+
+def backup_directory(codex):
+    anchor = codex if codex.exists() else codex.parent
+    while True:
+        while not anchor.exists():
+            anchor = anchor.parent
+        info = anchor.lstat()
+        if (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                and info.st_mode & 0o022 == 0o020 and anchor.parent != anchor):
+            anchor = anchor.parent  # The installer itself may create a mode-0775 Codex directory.
+            continue
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("backup parent must be owned and protected: " + str(anchor))
+        break
+    directory = Path(tempfile.mkdtemp(prefix="devflow-install-rollback-", dir=anchor))
+    directory.chmod(0o700)
+    return directory
 
 
 def capture(source, skills, codex):
-    anchor = codex if codex.exists() else codex.parent
-    while not anchor.exists():
-        anchor = anchor.parent
-    info = anchor.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
-        raise ValueError("backup parent must be owned and protected: " + str(anchor))
-    directory = Path(tempfile.mkdtemp(prefix="devflow-install-rollback-", dir=anchor))
-    directory.chmod(0o700)
     # Pre-marker failures can occur when an older updater has already switched
     # the checkout. That updater may `exec` the new installer and never run
     # again, so retain its previous detached checkout for failure recovery.
@@ -252,9 +271,14 @@ def capture(source, skills, codex):
                 previous = {"source": str(source), "head": prior}
         except subprocess.CalledProcessError:
             pass
-    (directory / "prior-checkout.json").write_text(json.dumps(previous))
-    snapshot = directory / "snapshot.json"
-    save_snapshot(snapshot, {})
+    try:
+        directory = backup_directory(codex)
+        (directory / "prior-checkout.json").write_text(json.dumps(previous))
+        snapshot = directory / "snapshot.json"
+        save_snapshot(snapshot, {})
+    except (OSError, ValueError):
+        restore_checkout(previous)  # No destination effect can precede snapshot preparation.
+        raise
     try:
         paths = target_paths(source, skills, codex)
         preflight(directory, paths)
@@ -275,26 +299,30 @@ def capture(source, skills, codex):
     print(directory)
 
 
-def restore_targets(directory):
+def restore_targets(directory, conflicts):
     entries = json.loads((directory / "snapshot.json").read_text())
-    conflicts = []
-    bound = {}
+    bound, helpers = {}, set()
     for name, saved in entries.items():
         if "installed" not in saved:
             continue  # This installer never mutated the captured path.
-        if identity(Path(name)) != saved["installed"]:
+        try:
+            if identity(Path(name)) == saved["installed"]:
+                bound[name] = saved
+                continue
             conflicts.append(name)
-        else:
-            bound[name] = saved
+        except (OSError, ValueError) as exc:
+            conflicts.append(f"{name}: destination recovery failed: {exc}")
+        if Path(name).name == "devflow" and saved["type"] == "link":
+            helpers.add(Path(name).parent / ".devflow-helpers")
     entries = bound
     # Exchange restores public pointers without a gap and captures their prior
     # inode privately. Cleanup similarly captures before authenticating/deleting.
-    for name, saved in entries.items():
+    def restore_pointer(name, saved):
         if saved["type"] != "link":
-            continue
+            return
         path = Path(name)
         if path.is_symlink() and os.readlink(path) == saved["target"]:
-            continue
+            return
         stage = directory / ("restore-" + hashlib.sha256(name.encode()).hexdigest())
         stage.symlink_to(saved["target"])
         if saved["installed"]["type"] == "absent":
@@ -306,16 +334,17 @@ def restore_targets(directory):
             exchange(stage, path)
             if identity(stage) != saved["installed"]:
                 conflicts.append(f"{name} captured at {stage}")
-                continue
+                return
         stage.unlink()
-    for name in sorted(entries, key=lambda value: (-len(Path(value).parts), value)):
-        saved, path = entries[name], Path(name)
+
+    def restore_object(name, saved):
+        path = Path(name)
         if saved["type"] == "link":
-            continue  # The public pointer has already been restored atomically.
+            return  # The public pointer has already been restored atomically.
         if (saved["type"] == "file" and path.is_file() and not path.is_symlink()
                 and path.read_bytes() == base64.b64decode(saved["bytes"])
                 and stat.S_IMODE(path.stat().st_mode) == saved["mode"]):
-            continue
+            return
         if saved["type"] == "file":
             stage = directory / ("restore-" + hashlib.sha256(name.encode()).hexdigest())
             with stage.open("xb") as stream:
@@ -330,12 +359,12 @@ def restore_targets(directory):
                 exchange(stage, path)
                 if identity(stage) != saved["installed"]:
                     conflicts.append(f"{name} captured at {stage}")
-                    continue
+                    return
             stage.unlink()
         elif saved["type"] == "absent" and os.path.lexists(path):
             if path.is_dir() and not path.is_symlink() and any(path.iterdir()):
                 conflicts.append(name)
-                continue
+                return
             captured = directory / ("captured-" + hashlib.sha256(name.encode()).hexdigest())
             os.replace(path, captured)
             if identity(captured) != saved["installed"]:
@@ -344,11 +373,28 @@ def restore_targets(directory):
                 except OSError:
                     pass  # A recreated path or directory is never overwritten.
                 conflicts.append(f"{name} captured at {captured}")
-                continue
+                return
             try:
                 captured.rmdir() if captured.is_dir() and not captured.is_symlink() else captured.unlink()
             except OSError:
                 conflicts.append(f"{name} captured at {captured}")
+
+    for name, saved in entries.items():
+        count = len(conflicts)
+        try:
+            restore_pointer(name, saved)
+        except (OSError, ValueError, KeyError) as exc:
+            conflicts.append(f"{name}: destination recovery failed: {exc}")
+        if len(conflicts) != count and Path(name).name == "devflow":
+            helpers.add(Path(name).parent / ".devflow-helpers")
+    for name in sorted(entries, key=lambda value: (-len(Path(value).parts), value)):
+        if any(Path(name).is_relative_to(helper) for helper in helpers):
+            conflicts.append(name + ": helper cleanup awaits pointer recovery")
+            continue
+        try:
+            restore_object(name, entries[name])
+        except (OSError, ValueError, KeyError) as exc:
+            conflicts.append(f"{name}: destination recovery failed: {exc}")
     return conflicts
 
 
@@ -357,15 +403,14 @@ def restore(directory, *, checkout_only=False):
     conflicts = [saved["drift"] for saved in entries.values() if "drift" in saved]
     if not checkout_only:
         try:
-            conflicts.extend(restore_targets(directory))
+            restore_targets(directory, conflicts)
         except (OSError, ValueError, KeyError) as exc:
             conflicts.append("destination recovery failed: " + str(exc))
     previous = json.loads((directory / "prior-checkout.json").read_text())
-    if previous:
-        source = Path(previous["source"])
-        if subprocess.run(["git", "-C", str(source), "diff", "--quiet", "HEAD", "--"]).returncode:
-            raise ValueError("checkout changed during failed install; restore previous commit manually")
-        subprocess.run(["git", "-C", str(source), "checkout", "--detach", previous["head"]], check=True)
+    try:
+        restore_checkout(previous)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        conflicts.append("source checkout recovery failed: " + str(exc))
     # Run cleanup in this process: checkout may have replaced this helper on
     # disk, so the invoking shell cannot safely launch it again.
     if conflicts:

@@ -420,6 +420,166 @@ class InstallRollback(unittest.TestCase):
         self.assertTrue((self.root / "fresh-skills/devflow/scripts/state.py").is_file())
         self.assertTrue((self.root / "fresh-skills/devflow-local-delivery/SKILL.md").is_file())
 
+    def test_umask002_install_replay_uses_protected_backup_ancestor(self):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+            shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
+        skills, home = self.root / "fresh-skills", self.root / "fresh-codex"
+        for _ in range(2):
+            installed = subprocess.run(["sh", str(self.source / "scripts/install.sh"), str(skills), str(home)],
+                                       umask=0o002, env=dict(os.environ, DEVFLOW_PYTHON=sys.executable),
+                                       capture_output=True, text=True)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            self.assertEqual(home.stat().st_mode & 0o777, 0o775)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.rollback.capture(self.source, skills, home)
+        backup = Path(output.getvalue().strip())
+        self.addCleanup(shutil.rmtree, backup, True)
+        self.assertEqual(backup.parent, self.root)
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o700)
+        home.chmod(0o777)
+        before = sorted(path.name for path in home.iterdir())
+        with self.assertRaisesRegex(ValueError, "backup parent must be owned and protected"):
+            self.rollback.capture(self.source, skills, home)
+        self.assertEqual(sorted(path.name for path in home.iterdir()), before)
+
+    def test_symlinked_agent_directory_installs_and_refuses_foreign_drift(self):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+            shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
+        skills, home, agents = self.root / "fresh-skills", self.root / "fresh-codex", self.root / "agents-real"
+        home.mkdir()
+        agents.mkdir()
+        (home / "agents").symlink_to(agents)
+        foreign = agents / "custom.toml"
+        foreign.write_bytes(b"foreign agent data")
+        for _ in range(2):
+            installed = subprocess.run(["sh", str(self.source / "scripts/install.sh"), str(skills), str(home)],
+                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable), capture_output=True, text=True)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertEqual(len(list(agents.glob("devflow-*.toml"))), 4)
+        target = agents / "devflow-implementer.toml"
+        target.write_bytes(b"user changed the installed agent")
+        refused = subprocess.run(["sh", str(self.source / "scripts/install.sh"), str(skills), str(home)],
+                                 env=dict(os.environ, DEVFLOW_PYTHON=sys.executable), capture_output=True, text=True)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertEqual(target.read_bytes(), b"user changed the installed agent")
+        self.assertEqual(foreign.read_bytes(), b"foreign agent data")
+        self.assertEqual(os.readlink(home / "agents"), str(agents))
+
+    def test_restore_continues_after_read_or_exchange_error_and_reports_conflicts(self):
+        import errno
+        for failure in ("read", "exchange"):
+            with self.subTest(failure=failure):
+                targets = [self.home / "agents" / ("devflow-" + name + ".toml")
+                           for name in ("coordinator", "implementer", "reviewer")]
+                targets[0].parent.mkdir(exist_ok=True)
+                for target in targets:
+                    target.unlink(missing_ok=True)
+                for target in targets[:2]:
+                    target.write_bytes(b"original agent")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.rollback.capture(self.source, self.skills, self.home)
+                backup = Path(output.getvalue().strip())
+                self.addCleanup(shutil.rmtree, backup, True)
+                for target in targets:
+                    stage = self.root / "agent-stage"
+                    stage.write_bytes(b"new installed agent")
+                    self.rollback.effect(backup, target, stage)
+                    stage.unlink(missing_ok=True)
+                targets[0].write_bytes(b"foreign agent update")
+                if failure == "read":
+                    targets[1].chmod(0o200)
+                exchange = self.rollback.exchange
+
+                def fail_exchange(left, right, target=targets[1], failure=failure, exchange=exchange):
+                    if failure == "exchange" and right == target:
+                        raise OSError(errno.EXDEV, "injected isolated restore error", str(right))
+                    return exchange(left, right)
+
+                with mock.patch.object(self.rollback, "exchange", fail_exchange):
+                    with self.assertRaisesRegex(ValueError, "retained backup") as error:
+                        self.rollback.restore(backup)
+                self.assertIn(str(targets[0]), str(error.exception))
+                self.assertIn(str(targets[1]), str(error.exception))
+                self.assertFalse(targets[2].exists(), "an independent owned path was skipped after recovery failed")
+                self.assertEqual(targets[0].read_bytes(), b"foreign agent update")
+                self.assertTrue((backup / "snapshot.json").exists())
+                targets[1].chmod(0o600)
+
+    def test_pointer_restore_error_preserves_helper_dependencies_and_recovers_agents(self):
+        import errno
+        target = self.home / "agents/devflow-reviewer.toml"
+        target.parent.mkdir()
+        stage = self.root / "agent-stage"
+        stage.write_bytes(b"new installed agent")
+        self.rollback.effect(self.backup, target, stage)
+        stage.unlink(missing_ok=True)
+        exchange = self.rollback.exchange
+
+        def pointer_failure(left, right):
+            if right == self.compatibility:
+                raise OSError(errno.EXDEV, "injected pointer recovery error", str(right))
+            return exchange(left, right)
+
+        with mock.patch.object(self.rollback, "exchange", pointer_failure):
+            with self.assertRaisesRegex(ValueError, "retained backup"):
+                self.rollback.restore(self.backup)
+        self.assertTrue((self.compatibility / "scripts/state.py").is_file())
+        self.assertFalse(target.exists(), "independent owned agents were not recovered")
+        self.assertTrue((self.backup / "snapshot.json").is_file())
+
+    def test_group_backup_recovery_restores_public_old_updater_checkout(self):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+            shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
+        for key, value in (("core.hooksPath", "/dev/null"), ("commit.gpgsign", "false"),
+                           ("gc.auto", "0"), ("maintenance.auto", "false"),
+                           ("user.name", "Test"), ("user.email", "test@example.invalid")):
+            subprocess.run(["git", "-C", str(self.source), "config", key, value], check=True)
+        subprocess.run(["git", "-C", str(self.source), "add", "scripts"], check=True)
+        subprocess.run(["git", "-C", str(self.source), "commit", "--quiet", "--allow-empty", "-m", "private candidate"], check=True)
+        subprocess.run(["git", "-C", str(self.source), "tag", "fixture-candidate"], check=True)
+        checkout = self.root / "old-checkout"
+        subprocess.run(["git", "clone", "--quiet", "--no-local", str(self.source), str(checkout)], check=True)
+        baseline = "e966cf89e057abc9a2629faf957a2ec175599b53"
+        subprocess.run(["git", "-C", str(checkout), "checkout", "--quiet", "--detach", baseline], check=True)
+        skills, home = self.root / "old-skills", self.root / "old-codex"
+        home.mkdir(mode=0o775)
+        home.chmod(0o775)
+        env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        installed = subprocess.run(["sh", str(checkout / "scripts/install.sh"), str(skills), str(home)],
+                                   env=env, capture_output=True, text=True)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        hooks = (home / "hooks.json").read_bytes()
+        user = home / "user.sqlite3"
+        user.write_bytes(b"untouched user data")
+        updated = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "fixture-candidate", str(skills), str(home)],
+                                 env=env, capture_output=True, text=True)
+        self.assertEqual(updated.returncode, 1, updated.stderr)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(), baseline)
+        self.assertEqual((home / "hooks.json").read_bytes(), hooks)
+        self.assertEqual(user.read_bytes(), b"untouched user data")
+        self.assertTrue((skills / "devflow/scripts/state.py").is_file())
+
+    def test_backup_creation_error_recovers_source_without_destination_effects(self):
+        prior = subprocess.check_output(["git", "-C", str(self.source), "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(["git", "-C", str(self.source), "-c", "core.hooksPath=/dev/null",
+                        "-c", "commit.gpgsign=false", "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "commit", "--allow-empty",
+                        "--quiet", "-m", "isolated installer candidate"], check=True)
+        current = subprocess.check_output(["git", "-C", str(self.source), "rev-parse", "HEAD"], text=True).strip()
+        for revision in (prior, current):
+            subprocess.run(["git", "-C", str(self.source), "checkout", "--quiet", "--detach", revision], check=True)
+        self.compatibility.unlink()
+        self.compatibility.symlink_to(self.source / "skills/devflow")
+        before = sorted(path.name for path in self.home.iterdir())
+        with mock.patch.object(tempfile, "mkdtemp", side_effect=PermissionError("private backup creation refused")):
+            with self.assertRaisesRegex(PermissionError, "private backup creation refused"):
+                self.rollback.capture(self.source, self.skills, self.home)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(self.source), "rev-parse", "HEAD"], text=True).strip(), prior)
+        self.assertEqual(sorted(path.name for path in self.home.iterdir()), before)
+        self.assertEqual(os.readlink(self.compatibility), str(self.source / "skills/devflow"))
+
     def test_unsupported_host_refuses_without_replacement_fallback(self):
         before = os.readlink(self.compatibility)
         with mock.patch.object(sys, "platform", "unsupported"):

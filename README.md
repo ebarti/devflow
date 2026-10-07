@@ -76,7 +76,7 @@ The updater fetches that tag, checks out its commit and reruns installation. Reu
 
 Installation rollback requires the native Linux/macOS atomic exchange interface;
 unsupported hosts refuse before installation effects. Private rollback snapshots live in the owned Codex directory (or its nearest
-owned existing parent), outside the OS temporary-directory policy, and bind the installer's actual file/link/directory identities. File bytes, mode and
+owned protected ancestor; group-writable Codex directories use that ancestor without changing their modes), outside the OS temporary-directory policy, and bind the installer's actual file/link/directory identities. File bytes, mode and
 identity come from one opened-file observation; a write during that read refuses
 capture before installation effects. Rollback atomically
 restores helper pointers, captures cleanup targets into that existing private
@@ -85,7 +85,8 @@ remain with actionable original/captured locations and the complete backup;
 preflight and zero-effect capture refusals restore only checkout state, including
 upgrades begun by the historical exec-based updater. Backup/target filesystems and real native exchange are checked before destination
 effects. Failed destination recovery still attempts authenticated source checkout
-recovery, reports unresolved paths and retains the backup until the operator
+recovery. Recovery attempts independent paths after object errors; helper cleanup
+waits for pointer recovery. It reports every conflict and retains the backup until the operator
 recovers it. Public installation refusals return status 1. It never excludes
 other writers.
 Forward installer writes exchange existing targets and authenticate the displaced object in that same private backup; retirement captures targets before deleting them. Concurrent drift refuses installation and retains the foreign bytes and full backup at the reported paths.
