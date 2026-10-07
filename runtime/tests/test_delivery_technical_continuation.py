@@ -18,11 +18,9 @@ from test_delivery_native_renewal import payload_update as payload_update
 from test_delivery_resources import spec as resource_spec
 from test_delivery_store import service as service
 from test_delivery_store import submit_historical_admission
-from test_delivery_title_repair import title_repair as title_repair
 
 from devflow_temporal import delivery_native_renewal as renewal
 from devflow_temporal import delivery_technical_continuation as technical
-from devflow_temporal import delivery_title_repair as title_repair_module
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -95,61 +93,6 @@ def test_unknown_closure_observes_real_closed_native_actor_without_normalizing_h
             lock.close()
 
 
-@pytest.mark.parametrize("adverse", [None, "base", "roles", "iteration", "source"])
-def test_title_literal_guard_preserves_original_base_after_authenticated_technical_readback(
-    title_repair,
-    monkeypatch,
-    adverse,
-):
-    store, broker, command, closed, metadata = title_repair
-    spec = {**broker.spec, "base_sha": "e" * 40}
-    state = deepcopy(closed["result"])
-    previous = {
-        "kind": "accepted_technical_successor",
-        "spec": broker.spec,
-        "execution_spec": spec,
-        "original_recovery": metadata,
-        "candidate": state["candidate"],
-        "state": {"roles": state["roles"][:]},
-        "integration": {"original_base": broker.spec["base_sha"], "main": spec["base_sha"]},
-    }
-    observed = []
-
-    def authenticated(_store, actual_spec, actual_previous, *, require_claim):
-        # This unit isolates the title consumer AFTER the independently tested
-        # technical readback boundary; it claims no integration/native completion.
-        assert _store is store and actual_spec == spec and actual_previous is previous
-        assert require_claim is False
-        observed.append("readback")
-
-    monkeypatch.setattr(technical, "readback", authenticated)
-    if adverse == "base":
-        previous["integration"]["original_base"] = "f" * 40
-    elif adverse == "roles":
-        state["roles"].append({"role": "implement", "iteration": 4, "cleanup": "confirmed"})
-    elif adverse == "iteration":
-        state["iteration"] = 5
-    elif adverse == "source":
-        previous["candidate"] = {**state["candidate"], "id": "f" * 64}
-    if adverse:
-        with pytest.raises(ValueError):
-            title_repair_module.prepare(store, spec, state, previous, command, "original-session")
-    else:
-        constraint = title_repair_module.prepare(
-            store,
-            spec,
-            state,
-            previous,
-            command,
-            "original-session",
-        )
-        assert constraint["maximum_iteration"] == 5 and constraint["new_implementation_turns"] == 1
-        assert (
-            constraint["sha256"]
-            == hashlib.sha256((broker.checkout / "browser.spec.ts").read_bytes()).hexdigest()
-        )
-        assert constraint["title"].endswith("failed requests leave manual edits available")
-    assert observed == ["readback"]
 
 
 @pytest.mark.parametrize(

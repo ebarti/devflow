@@ -1083,13 +1083,6 @@ class DeliveryStore:
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))
-        from .delivery_broker import DeliveryBroker
-        from .delivery_repair import (
-            confirmed_native_cleanup,
-            failed_gate_diagnostics,
-            published_identity,
-        )
-
         required = {
             "command_id",
             "expected_revision",
@@ -1099,11 +1092,30 @@ class DeliveryStore:
             "expected_pr_head",
             "additional_iterations",
         }
-        cause_specific = isinstance(supplied, dict) and set(supplied) == required | {
-            "authority_path", "authority_sha256",
-        }
-        if not isinstance(supplied, dict) or (set(supplied) != required and not cause_specific):
+        if not isinstance(supplied, dict) or set(supplied) != required:
+            # Earlier versions admitted this specialized request. Reading an exact
+            # saved response is idempotent; an unseen request cannot admit work.
+            if (isinstance(supplied, dict)
+                    and set(supplied) == required | {"authority_path", "authority_sha256"}
+                    and isinstance(supplied.get("command_id"), str)):
+                with self._connect() as db:
+                    prior = db.execute(
+                        "SELECT run_id,request_digest,response_json FROM delivery_commands "
+                        "WHERE command_id=?", (supplied["command_id"],),
+                    ).fetchone()
+                if prior:
+                    if (prior["run_id"] != run_id
+                            or prior["request_digest"] != digest({"run_id": run_id, **supplied})):
+                        raise ValueError("command ID already belongs to different inputs")
+                    return json.loads(prior["response_json"])
             raise ValueError("repair continuation fields do not match the contract")
+        from .delivery_broker import DeliveryBroker
+        from .delivery_repair import (
+            confirmed_native_cleanup,
+            failed_gate_diagnostics,
+            published_identity,
+        )
+
         command_id = supplied["command_id"]
         if (
             not isinstance(command_id, str)
@@ -1146,9 +1158,9 @@ class DeliveryStore:
         if granted:
             raise ValueError("this run already received its one repair grant")
         spec = self.effective_spec(run_id)
-        finalized = (not cause_specific and spec.get("resource_cleanup_version") == 1
+        finalized = (spec.get("resource_cleanup_version") == 1
                      and row["cleanup"] == "confirmed")
-        stopped_claim = cause_specific or finalized
+        stopped_claim = finalized
         if digest(DeliveryConfig.load(Path(spec["config_path"])).raw) != spec["config_digest"]:
             raise ValueError("frozen service configuration changed before repair grant")
         current_workflow_id = row["workflow_id"] or f"delivery-{run_id}"
@@ -1232,13 +1244,6 @@ class DeliveryStore:
         broker = DeliveryBroker(self, spec)
         observed_pr = published_identity(broker, candidate, pr)
         cleanup_digest = confirmed_native_cleanup(spec)
-        title_constraint = None
-        if cause_specific:
-            from .delivery_title_repair import prepare
-
-            title_constraint = prepare(
-                self, spec, state, previous_recovery, supplied, implementation["session_id"],
-            )
         workflow_id = f"delivery-{run_id}-repair-continuation-1"
         recovery = {
             "kind": "repair_continuation",
@@ -1254,9 +1259,6 @@ class DeliveryStore:
             "additional_iterations": supplied["additional_iterations"],
             "maximum_iteration": iteration + supplied["additional_iterations"],
         }
-        if cause_specific:
-            recovery.update(original_recovery=previous_recovery, effective_spec=spec,
-                            title_constraint=title_constraint, cleanup_digest=cleanup_digest)
         response = {
             "run_id": run_id,
             "dashboard_url": f"{self.config.dashboard_url}/runs/{run_id}",
@@ -1278,9 +1280,7 @@ class DeliveryStore:
                         claim is None or claim["owner"] != f"external:devflow:{run_id}"):
                     raise ValueError("repair preflight claim authority changed")
             return {**response, "preflight": True, "diagnostics": findings,
-                    "title_constraint_sha256": (
-                        digest(title_constraint) if title_constraint else None
-                    )}
+                    "title_constraint_sha256": None}
         if finalized:
             from .delivery_gate_retry import prepare_runtime
             from .delivery_metadata_recovery import _immutable, preserve_resources
