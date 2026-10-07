@@ -1036,11 +1036,18 @@ class DeliveryStore:
         if (isinstance(supplied, dict) and 'continuation_kind' in supplied
                 and not isinstance(supplied['continuation_kind'], str)):
             raise ValueError("unsupported repair continuation kind")
-        if (self.submitted_spec(run_id).get("retry_budget_version") == 1
+        original_budget = self.submitted_spec(run_id)
+        if (original_budget.get("retry_budget_version") == 1
                 and isinstance(supplied, dict)
                 and type(supplied.get("additional_iterations")) is int
                 and supplied["additional_iterations"] > 0):
-            raise ValueError("a fixed repair budget cannot receive additional iterations")
+            from .delivery_stopped_resume import KIND, fixed_budget_allows
+
+            if (supplied.get('continuation_kind') != KIND
+                    or not fixed_budget_allows(original_budget,
+                                              supplied.get('expected_iteration'),
+                                              supplied['additional_iterations'])):
+                raise ValueError("a fixed repair budget cannot receive additional iterations")
         if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') == 'stopped_delivery_resume'):
             from .delivery_stopped_resume import admit
