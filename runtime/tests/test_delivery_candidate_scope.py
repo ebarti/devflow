@@ -67,6 +67,7 @@ def test_publish_rejects_full_committed_scope_before_remote_push(scope_broker, s
     with pytest.raises(ValueError, match='outside allowed paths'):
         broker.publish(0, broker.candidate())
     assert _git(broker.source, 'ls-remote', 'origin') == remote_before
+    assert broker.publication_may_have_effect is False
 
 
 def test_unsigned_role_commit_already_cannot_be_published(scope_broker):
