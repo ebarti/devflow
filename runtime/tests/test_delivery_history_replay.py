@@ -9,6 +9,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
+from historical_replay import replay_designated_history
 from temporalio.client import WorkflowHistory
 from temporalio.worker import Replayer
 from temporalio.workflow import NondeterminismError
@@ -16,41 +17,13 @@ from temporalio.workflow import NondeterminismError
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
-RETAINED = {"delivery-after-check-order-history.json",
-            "delivery-published-checkpoint-history.json", "c04-gates-only-history.json"}
 HISTORIES = sorted(FIXTURES.glob("*.json")) + sorted((FIXTURES / "order").glob("*history.json"))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", HISTORIES, ids=lambda path: path.stem)
 async def test_recorded_delivery_history_replays_on_designated_artifact(path, tmp_path):
-    history = WorkflowHistory.from_json("delivery-replay", path.read_text())
-    if path.name not in RETAINED:
-        await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
-        return
-    # These unmarked checks-first histories cannot replay on the marker-only worker.
-    # Do not change their events to manufacture a universal compatibility claim.
-    with pytest.raises(NondeterminismError, match="TMPRL1100"):
-        await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
-    archive = FIXTURES / "order/c04-source.tar.gz"
-    provenance = json.loads((FIXTURES / "order/provenance.json").read_text())
-    assert hashlib.sha256(archive.read_bytes()).hexdigest() == provenance["source_archive_sha256"]
-    with tarfile.open(archive) as artifact:
-        artifact.extractall(tmp_path, filter="data")
-    result = subprocess.run(
-        [sys.executable, "-B", "-c", '''
-import asyncio, sys
-from pathlib import Path
-from temporalio.client import WorkflowHistory
-from temporalio.worker import Replayer
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
-asyncio.run(Replayer(workflows=[DeliveryWorkflow]).replay_workflow(
-    WorkflowHistory.from_json("retained-replay", Path(sys.argv[1]).read_text())))
-''', str(path.resolve())],
-        env={**os.environ, "PYTHONPATH": str(tmp_path / "runtime/src")},
-        capture_output=True, text=True, check=False, timeout=30,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    await replay_designated_history(path, tmp_path)
 
 
 def test_original_counterexample_history_bytes_remain_unchanged():

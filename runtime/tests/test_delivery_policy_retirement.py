@@ -14,9 +14,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from historical_replay import replay_designated_history
 from mcp.shared.memory import create_connected_server_and_client_session
-from temporalio.client import WorkflowHistory
-from temporalio.worker import Replayer
 from test_delivery_api import api_fixture as api_fixture
 
 from devflow_temporal import delivery_policy_recovery
@@ -25,7 +24,6 @@ from devflow_temporal.delivery_client import DeliveryClient
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_mcp import build_server
 from devflow_temporal.delivery_store import DeliveryStore
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 @pytest.mark.parametrize("command", ["recovery-preflight", "recover-execution"])
@@ -161,10 +159,9 @@ def test_actual_c04_policy_row_retains_its_durable_validation(monkeypatch, tampe
     ("completed", "29e4e592ab39e77a410ca6dd55177b975d0b173969e0fd9ca35d996ff25ee4bc"),
     ("suspended", "ff5dd1eb650799a79c814296322f2236a5abc9103b817f235a51fbbdab6c1739"),
 ])
-async def test_actual_c04_policy_history_replays_byte_exact(mode, expected_sha256):
+async def test_actual_c04_policy_history_replays_byte_exact(mode, expected_sha256, tmp_path):
     path = Path(__file__).parent / "fixtures" / f"policy-c04-{mode}-history.json.gz"
     content = gzip.decompress(path.read_bytes())
     assert hashlib.sha256(content).hexdigest() == expected_sha256
-    history = WorkflowHistory.from_json("c04-policy-" + mode, content.decode())
-    await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+    await replay_designated_history(path, tmp_path, "c04-policy-" + mode)
     assert hashlib.sha256(content).hexdigest() == expected_sha256

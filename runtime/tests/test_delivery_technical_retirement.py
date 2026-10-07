@@ -7,14 +7,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from temporalio.client import WorkflowHistory
-from temporalio.worker import Replayer
+from historical_replay import replay_designated_history
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_technical_integration as integration
 from devflow_temporal.delivery_broker import _git
 from devflow_temporal.delivery_resources import read_private, write_private
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 def _snapshot(store):
@@ -82,11 +80,12 @@ def test_already_admitted_technical_outbox_keeps_its_inputs_and_start_acknowledg
     ('technical-c04-suspended-history.json', 'technical-review'),
     ('technical-c04-review-completed-history.json', 'technical-review'),
 ])
-async def test_original_completed_and_suspended_technical_histories_replay(name, workflow_id):
+async def test_original_completed_and_suspended_technical_histories_replay(
+    name, workflow_id, tmp_path,
+):
     path = Path(__file__).parent / 'fixtures' / name
     original = path.read_bytes()
-    await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(
-        WorkflowHistory.from_json(workflow_id, original.decode()))
+    await replay_designated_history(path, tmp_path, workflow_id)
     assert path.read_bytes() == original
 
 

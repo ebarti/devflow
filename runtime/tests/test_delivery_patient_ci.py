@@ -10,8 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from temporalio.client import WorkflowHistory
-from temporalio.worker import Replayer
+from historical_replay import replay_designated_history
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_activities, delivery_broker
@@ -210,10 +209,9 @@ async def test_ci_activity_heartbeats_and_cancels_its_readback(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_previous_code_history_through_ci_still_replays():
+async def test_previous_code_history_through_ci_still_replays(tmp_path):
     path = Path(__file__).parent / "fixtures" / "required_ci" / "c04-ci-previous-history.json"
-    history = WorkflowHistory.from_json("delivery-run-1-stopped-resume-1", path.read_text())
-    await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+    await replay_designated_history(path, tmp_path, "delivery-run-1-stopped-resume-1")
 
 
 @pytest.mark.parametrize("legacy", [False, True])

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 
+from historical_replay import replay_designated_history
 from temporalio import activity
-from temporalio.client import WorkflowHistory
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
@@ -46,7 +45,7 @@ def fixture_activities():
     )]
 
 
-async def test_real_workflow_schedules_heartbeat_checks_and_replays_prior_code(tmp_path):
+async def test_real_workflow_schedules_heartbeat_checks_and_replays_current_history(tmp_path):
     spec = {
         "run_id": "check-slots-history", "provider": "fake", "baseline_checks_version": 1,
         "policy": {"max_repairs": 0, "browser_qa": {"id": "browser"},
@@ -74,6 +73,7 @@ async def test_real_workflow_schedules_heartbeat_checks_and_replays_prior_code(t
     assert CHECK_ACTIVITIES <= scheduled.keys()
     assert all(scheduled[name].heartbeat_timeout.seconds == 30 for name in CHECK_ACTIVITIES)
     await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
-    await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(
-        WorkflowHistory.from_json("check-slots-history", json.loads(LEGACY_HISTORY.read_text()))
-    )
+
+
+async def test_prior_checks_history_replays_on_retained_artifact(tmp_path):
+    await replay_designated_history(LEGACY_HISTORY, tmp_path, "check-slots-history")

@@ -6,8 +6,9 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from historical_replay import replay_designated_history
 from temporalio import activity
-from temporalio.client import Client, WorkflowHistory
+from temporalio.client import Client
 from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
@@ -16,7 +17,7 @@ from temporalio.exceptions import (
     TimeoutType,
 )
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Replayer, Worker
+from temporalio.worker import Worker
 from test_delivery_store import service as service
 
 from devflow_temporal.contracts import digest
@@ -217,7 +218,6 @@ async def test_actual_original_workflow_classifies_controller_failure(failure, e
 @pytest.mark.asyncio
 @pytest.mark.parametrize('name', ['delivery-failure-c04-history.json',
                                  'delivery-failure-budget-history.json'])
-async def test_actual_previous_source_original_history_replays(name):
+async def test_actual_previous_source_original_history_replays(name, tmp_path):
     path = Path(__file__).parent / 'fixtures' / name
-    await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(
-        WorkflowHistory.from_json('failure-fixture', path.read_text()))
+    await replay_designated_history(path, tmp_path, 'failure-fixture')
