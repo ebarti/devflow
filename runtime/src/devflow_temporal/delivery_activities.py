@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import fcntl
 import hashlib
 import json
@@ -125,7 +126,14 @@ async def _execute_check(
                 # Unknown teardown cannot supply ports or capacity to another gate.
                 _UNCLEAN_CHECK_SLOTS.extend(port_descriptors)
 
-    pending = asyncio.create_task(asyncio.to_thread(run))
+    execution = asyncio.get_running_loop().run_in_executor(
+        None, contextvars.copy_context().run, run,
+    )
+
+    async def wait_for_executor():
+        return await asyncio.shield(execution)
+
+    pending = asyncio.create_task(wait_for_executor())
     try:
         while not pending.done():
             if activity.in_activity():
@@ -140,17 +148,17 @@ async def _execute_check(
         return await asyncio.shield(pending)
     except BaseException:
         cancelled.set()
-        # Cancelling to_thread only cancels its waiter. Keep that task shielded
-        # and let NativeProcess finish strict identity-bound teardown first.
-        while not pending.done():
+        # The task can be cancelled during shutdown without stopping its
+        # executor. Join that original future before returning cancellation.
+        while not execution.done():
             try:
-                await asyncio.shield(pending)
+                await asyncio.shield(execution)
             except asyncio.CancelledError:
                 continue
             except Exception:
                 break
-        if not pending.cancelled():
-            pending.exception()
+        if not execution.cancelled():
+            execution.exception()
         raise
 
 
