@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_delivery_browser_cleanup_assertions import assert_interrupted_browser_cleanup
 from test_delivery_check_slots import wait_until
 from test_delivery_resources import spec
 from test_delivery_store import _git
@@ -21,7 +22,7 @@ from devflow_temporal import delivery_activities as activities
 from devflow_temporal.candidate import candidate_for
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_native_process import listeners, reconcile_process
+from devflow_temporal.delivery_native_process import listeners, process_table, reconcile_process
 from devflow_temporal.delivery_resources import RunResources, read_private
 
 pytestmark = pytest.mark.skipif(
@@ -191,6 +192,14 @@ def assert_locked(path):
         os.close(descriptor)
 
 
+def assert_unlocked(path):
+    descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(descriptor)
+
+
 async def test_browser_port_wait_cancels_without_taking_generic_capacity(browser_checks):
     first_request = browser_checks.request("first", seconds=2)
     first = asyncio.create_task(activities.delivery_browser_qa(first_request))
@@ -236,6 +245,14 @@ async def test_actual_interrupted_browser_retains_ports_and_generic_capacity(
     try:
         await wait_until(lambda: journal.exists() and len(read_private(journal)["owned"]) >= 2
                          and all(listeners(port) for port in browser_checks.ports))
+        original_journal = read_private(journal)
+        assert original_journal["intent"] == {
+            "run_id": broker.spec["run_id"], "policy_digest": broker.spec["policy_digest"],
+            "argv": broker.spec["policy"]["browser_qa"]["argv"], "cwd": broker.spec["checkout"],
+            "environment_sha256": digest({"PATH": os.environ["PATH"]}), "timeout": 60,
+            "ports": browser_checks.ports,
+        }
+        assert original_journal["monitor"]["pid"] != worker.pid
         worker.kill()
         worker.wait(timeout=5)
         if failure == "exception":
@@ -248,22 +265,32 @@ async def test_actual_interrupted_browser_retains_ports_and_generic_capacity(
             monkeypatch.setattr("devflow_temporal.delivery_native_process.reconcile_process",
                                 failed_readback)
         result = await activities.delivery_browser_qa(request)
-        assert result["cleanup"] == "unknown"
-        assert broker.native_cleanup_confirmed is False
+        # Worker loss leaves the detached monitor supervising this same invocation.
+        # Only its authenticated completion permits the reservations to be reused.
+        assert_interrupted_browser_cleanup(
+            result, broker.native_cleanup_confirmed, original_journal, read_private(journal),
+            process_table(), {port: listeners(port) for port in browser_checks.ports},
+            failure=failure,
+        )
         root = tmp_path / "check-execution"
-        assert_locked(root / "slot-0.lock")
+        assert_reservation = assert_locked if failure == "exception" else assert_unlocked
+        assert_reservation(root / "slot-0.lock")
         for port in browser_checks.ports:
-            assert_locked(root / f"port-{port}.lock")
+            assert_reservation(root / f"port-{port}.lock")
         following = browser_checks.request("following")
         launched = []
         queued = asyncio.create_task(activities._execute_check(
             following, lambda _: (launched.append(True), {"state": "passed"})[1],
         ))
-        await asyncio.sleep(0.15)
-        queued.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await queued
-        assert not launched
+        if failure == "exception":
+            await asyncio.sleep(0.15)
+            queued.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+            assert not launched
+        else:
+            assert await asyncio.wait_for(queued, 5) == {"state": "passed"}
+            assert launched
     finally:
         if worker.poll() is None:
             worker.kill()
