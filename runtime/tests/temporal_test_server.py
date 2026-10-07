@@ -7,6 +7,7 @@ import math
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,6 +16,49 @@ from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 
 from devflow_temporal.delivery_native_process import process_table, sample, stop_observed
+
+
+def _available_port() -> int:
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        # Avoid Linux reallocating this ephemeral port to another bind(:0).
+        listener.listen()
+        with socket.create_connection(listener.getsockname()):
+            connection, _ = listener.accept()
+            connection.close()
+    return port
+
+
+def _owns_listener(pid: int, port: int) -> bool:
+    if sys.platform == "linux":
+        inodes = {
+            fields[9]
+            for line in Path(f"/proc/{pid}/net/tcp").read_text().splitlines()[1:]
+            if (fields := line.split())[1] == f"0100007F:{port:04X}" and fields[3] == "0A"
+        }
+        sockets = {f"socket:[{inode}]" for inode in inodes}
+        for entry in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                if entry.readlink().as_posix() in sockets:
+                    return True
+            except FileNotFoundError:
+                continue
+        return False
+    if sys.platform != "darwin":
+        raise RuntimeError(
+            "Temporal test server listener ownership is unsupported on this platform"
+        )
+    result = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError("Temporal test server listener inspection failed")
+    return str(pid) in result.stdout.splitlines()
 
 
 @asynccontextmanager
@@ -30,14 +74,7 @@ async def local_temporal(
     binary = dev_server_existing_path or shutil.which("temporal")
     if not binary:
         raise RuntimeError("Temporal CLI is required; CI pins version 1.9.1")
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-        # Avoid Linux reallocating this ephemeral port to another bind(:0).
-        listener.listen()
-        with socket.create_connection(listener.getsockname()):
-            connection, _ = listener.accept()
-            connection.close()
+    port = _available_port()
     argv = [
         binary,
         "server",
@@ -104,6 +141,15 @@ async def local_temporal(
                         await asyncio.sleep(
                             min(0.1, max(0, deadline - asyncio.get_running_loop().time()))
                         )
+                if (
+                    process.poll() is not None
+                    or process_table().get(process.pid, {}).get("identity") != identity["identity"]
+                    or not _owns_listener(process.pid, port)
+                ):
+                    raise RuntimeError(
+                        f"Temporal readiness listener does not belong to the owned CLI; "
+                        f"CLI logs: {log_path.read_text()}"
+                    )
                 yield WorkflowEnvironment.from_client(client)
             finally:
 
