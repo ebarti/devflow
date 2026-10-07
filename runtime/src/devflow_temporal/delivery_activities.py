@@ -513,8 +513,12 @@ def _role_result(request, broker, workspace, review_diff, result):
             elif after["id"] == candidate["id"] and not (
                 request.get("continuation") and iteration == 0
             ):
-                result["status"] = "blocked"
-                result.setdefault("findings", []).append("implementer produced no candidate change")
+                from .delivery_role_evidence import repair_payload_progress
+
+                if not repair_payload_progress(broker.store, request, result, workspace):
+                    result["status"] = "blocked"
+                    result.setdefault("findings", []).append(
+                        "implementer produced no candidate change")
     else:
         observed = candidate_for(workspace)
         source = broker.candidate()
