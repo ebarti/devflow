@@ -36,7 +36,7 @@ local-marketplace/
 
 The skill is copied from `runtime/desktop/devflow-local-delivery/SKILL.md`. The generated MCP entry contains an absolute executable path and `--config` argument; it reads no configuration contents and embeds no credentials. The package contains all plugin resources, while the built runtime and service configuration remain external prerequisites. Generate it again for a different host or runtime location.
 
-Packaging performs no host registration, service start, install or update. Identical repetition leaves existing files untouched. A changed same-name plugin or catalog entry is rejected before publishing files. Unrelated catalog entries and fields are retained. Symlink destinations are rejected. Use a new explicit root for a different candidate rather than overwriting an installed or modified package.
+Packaging performs no host registration, service start, install or update. Identical repetition leaves existing files untouched. A changed same-name plugin or catalog entry is rejected before publishing files. Unrelated catalog entries and fields are retained. The explicitly selected root is canonicalized before checking its descendants, so ancestor aliases such as native macOS temporary-directory paths are supported. A symlink at the named root or beneath it is rejected. The printed package path is canonical. Use a new explicit root for a different candidate rather than overwriting an installed or modified package.
 
 The default `portable` output remains unchanged. The pinned Codex SDK CLI 0.160.0
 recognizes its skill but does not import its bundled MCP server, including when

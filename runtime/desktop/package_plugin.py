@@ -92,7 +92,12 @@ def package(marketplace_root: Path, runtime_dir: Path, config_path: Path,
         raise ValueError(
             "build the runtime first; expected executable runtime/.venv/bin/devflow-delivery-mcp"
         )
-    root = Path(os.path.abspath(marketplace_root.expanduser()))
+    selected = Path(os.path.abspath(marketplace_root.expanduser()))
+    if selected.is_symlink():
+        raise ValueError(f"destination is a symlink: {selected}")
+    # Canonicalize the chosen root's ancestors (including temporary-directory
+    # aliases) before checking descendants; named destination links stay denied.
+    root = selected.parent.resolve() / selected.name
     target = root / "plugins" / NAME
     catalog_path = root / ".agents" / "plugins" / "marketplace.json"
     check_path(root)
