@@ -99,11 +99,6 @@ class DeliveryClient:
             payload,
         )
 
-    def reconcile_published_metadata(self, run_id: str, payload: dict[str, Any]) -> dict:
-        return self._request(
-            "POST", "/api/runs/" + quote(run_id, safe="") + "/reconcile-published-metadata",
-            payload, timeout=180,
-        )
 
     def gates_only_preflight(self, run_id: str) -> dict:
         return self._request(
@@ -127,9 +122,6 @@ class DeliveryClient:
             timeout=180,
         )
 
-    def metadata_preflight(self, run_id, request):
-        return self._request("POST", "/api/runs/" + quote(run_id, safe="")
-                             + "/metadata-preflight", request, timeout=120)
 
     def repair_admission_preflight(self, run_id, request):
         return self._request("POST", "/api/runs/" + quote(run_id, safe="")

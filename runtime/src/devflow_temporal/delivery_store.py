@@ -914,18 +914,10 @@ class DeliveryStore:
             )
         return response
 
-    def metadata_preflight(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
-        from .delivery_metadata_recovery import reconcile
-
-        return reconcile(self, run_id, supplied, preflight=True)
 
     def repair_admission_preflight(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
         return self.continue_repair(run_id, supplied, preflight=True)
 
-    def reconcile_published_metadata(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
-        from .delivery_metadata_recovery import reconcile
-
-        return reconcile(self, run_id, supplied)
 
     def gates_only_preflight(self, run_id: str) -> dict[str, Any]:
         from .delivery_gates_admission import preflight

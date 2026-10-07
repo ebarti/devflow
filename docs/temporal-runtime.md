@@ -126,3 +126,24 @@ runtime/.venv/bin/python runtime/scripts/smoke_preparation.py \
 ```
 
 The restart option crashes only the disposable service's identified worker after proof publication and before freeze, restarts through the public CLI, and verifies recovery from the same proof. Successful real intake requires the configured model to be available for the runtime's account. This proves the preparation/intake surface, not a full feature delivery or implementation-session resume. The latter is a separately labelled integration check.
+
+
+### Retired published-metadata admissions
+
+Fresh `metadata-preflight` and `reconcile-published-metadata` commands are no
+longer exposed by the API, client, tools, CLI or store. Their commit-range rewrite,
+force-with-lease and PR-title writer are removed. Retained metadata rows, immutable
+evidence and existing `published_metadata_recovery` workflow inputs stay readable;
+the workflow dispatch, `delivery_metadata_readback` activity, evidence applicability,
+source/candidate validation and shared resource/identity helpers remain unchanged.
+
+Operator steps before deployment: under the previous runtime, inspect the full
+retained run inventory and each run's detail/evidence for pending metadata commands,
+`metadata_reconciling` effects/intents and `metadata_validation_queued` or
+`metadata_validation` executions. Include archived records and metadata nested
+inside tracker, gates, technical, title or other recovery inputs; the outer phase
+alone is insufficient. Finish pending writes under that runtime and finish or cancel
+all nested queued/running executions before updating. Unknown effects require
+readback on the previous runtime, never a fresh command or assumed completion.
+The retained readers replay admitted work; they cannot finish an interrupted writer.
+No rows or history are deleted and no schema migration is required.

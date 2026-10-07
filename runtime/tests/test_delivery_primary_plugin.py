@@ -368,8 +368,8 @@ async def test_pinned_sdk_automatically_discovers_selected_primary_skill_and_all
                 'get_service', 'submit_run', 'list_runs', 'get_run', 'read_evidence',
                 'answer_decision', 'cancel_run', 'recovery_preflight', 'recover_execution',
                 'reconcile_tracker',
-                'reconcile_published_metadata', 'gates_only_preflight', 'admit_gates_only',
-                'metadata_preflight', 'repair_admission_preflight', 'continue_repair',
+                'gates_only_preflight', 'admit_gates_only',
+                'repair_admission_preflight', 'continue_repair',
             }
         finally:
             process.stdin.close()

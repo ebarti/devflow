@@ -5,7 +5,7 @@ import hashlib
 import json
 
 import pytest
-from test_delivery_metadata_recovery import published
+from test_delivery_metadata_recovery import published, restore_admitted_metadata
 from test_delivery_store import _git
 from test_delivery_store import service as service
 
@@ -104,7 +104,7 @@ def title_repair(service, monkeypatch):
         cleanup="none",
         error="repair limit exhausted",
     )
-    store.reconcile_published_metadata("run-1", metadata_command)
+    restore_admitted_metadata(store, broker, state, closed, metadata_command, _title)
     with store._connect() as db:
         recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
     original_closed = copy.deepcopy(closed)

@@ -18,10 +18,8 @@ from devflow_temporal.delivery_client import DeliveryClient
 @pytest.mark.parametrize(
     "method,endpoint,store_method,mutation",
     [
-        ("POST", "metadata-preflight", "metadata_preflight", False),
         ("POST", "repair-admission-preflight", "repair_admission_preflight", False),
         ("GET", "gates-only-preflight", "gates_only_preflight", False),
-        ("POST", "reconcile-published-metadata", "reconcile_published_metadata", True),
         ("POST", "admit-gates-only", "admit_gates_only", True),
         ("POST", "continue-repair", "continue_repair", True),
     ],
@@ -78,10 +76,8 @@ async def test_stopped_reconciliation_api_authentication_and_exact_request_forwa
 @pytest.mark.parametrize(
     "command",
     [
-        "metadata-preflight",
         "repair-admission-preflight",
         "gates-only-preflight",
-        "reconcile-published-metadata",
         "admit-gates-only",
         "continue-repair",
     ],

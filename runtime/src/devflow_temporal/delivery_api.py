@@ -350,15 +350,6 @@ def create_app(config_path: Path) -> FastAPI:
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
-    @app.post("/api/runs/{run_id}/reconcile-published-metadata")
-    async def reconcile_published_metadata(request: Request, run_id: str) -> dict[str, Any]:
-        _mutation(request)
-        try:
-            return await asyncio.to_thread(
-                service.store.reconcile_published_metadata, run_id, await request.json(),
-            )
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/runs/{run_id}/gates-only-preflight")
     async def gates_only_preflight(request: Request, run_id: str) -> dict[str, Any]:
@@ -396,14 +387,6 @@ def create_app(config_path: Path) -> FastAPI:
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
-    @app.post("/api/runs/{run_id}/metadata-preflight")
-    async def metadata_preflight(request: Request, run_id: str) -> dict[str, Any]:
-        _host(request)
-        try:
-            return await asyncio.to_thread(service.store.metadata_preflight,
-                                           run_id, await request.json())
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/repair-admission-preflight")
     async def repair_admission_preflight(request: Request, run_id: str) -> dict[str, Any]:
