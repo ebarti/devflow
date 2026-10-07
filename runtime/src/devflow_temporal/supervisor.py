@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import fcntl
 import hashlib
 import json
@@ -383,6 +384,7 @@ class DeliverySupervisor:
         result_path = folder / "result.json"
         request_path = folder / "request.json"
         stopped = threading.Event()
+        replaced = threading.Event()
 
         def cancelled() -> bool:
             if stopped.is_set():
@@ -442,7 +444,7 @@ class DeliverySupervisor:
                         stopped.wait(1)
                 elif not (folder / "native-process.json").is_file():
                     return {"cleanup": "unknown"}, self._mark_unknown(
-                        job_key, "native prelaunch identity gap",
+                        job_key, "native prelaunch identity gap", expected=expected,
                     )
                 if cancelled():
                     raise ValueError("native role cancelled before monitor entry")
@@ -484,10 +486,20 @@ class DeliverySupervisor:
                     launch_absent=fresh and (
                         not entered_monitor.is_set() or getattr(process, "launch_absent", False)
                     ),
+                    monitor_entered=entered_monitor.is_set(), preserve_queued=replaced.is_set(),
                 )
                 return {"cleanup": result["cleanup"]}, result
 
-        pending = asyncio.create_task(asyncio.to_thread(monitor))
+        # Submit once, independently of the cancellable asyncio waiter. Runner
+        # shutdown can cancel that task without cancelling or hiding its thread.
+        execution = asyncio.get_running_loop().run_in_executor(
+            None, contextvars.copy_context().run, monitor,
+        )
+
+        async def wait_for_monitor():
+            return await asyncio.shield(execution)
+
+        pending = asyncio.create_task(wait_for_monitor())
         try:
             _, result = await asyncio.shield(pending)
             return result
@@ -495,22 +507,28 @@ class DeliverySupervisor:
             from temporalio import activity
 
             details = activity.cancellation_details() if activity.in_activity() else None
-            if entered_monitor.is_set() and details and not details.cancel_requested and (
+            replacement = details and not details.cancel_requested and (
                 details.timed_out or details.not_found or details.worker_shutdown
-            ):
+            )
+            if entered_monitor.is_set() and replacement:
                 # An already entered durable monitor survives replacement of its
                 # Temporal waiter and still observes cancellation of its run.
-                pending.add_done_callback(
-                    lambda task: task.exception() if not task.cancelled() else None
+                execution.add_done_callback(
+                    lambda future: future.exception() if not future.cancelled() else None
                 )
                 raise
+            if replacement:
+                replaced.set()
             stopped.set()
             while True:
                 try:
-                    outcome, result = await asyncio.shield(pending)
+                    outcome, result = await asyncio.shield(execution)
                     break
                 except asyncio.CancelledError:
                     # Repeated cancellation still cannot strand executor work.
+                    if execution.done():
+                        outcome, result = execution.result()
+                        break
                     continue
             if entered_monitor.is_set() and result.get("finish_reason") != "prelaunch":
                 self._mark_unknown(
@@ -519,8 +537,9 @@ class DeliverySupervisor:
                 )
             raise
 
-    def _native_failure(self, request, job_key, expected, reason, *, launch_absent=False):
-        """Finalize only a terminated prelaunch owner, under its monitor lock."""
+    def _native_failure(self, request, job_key, expected, reason, *, launch_absent=False,
+                        monitor_entered=False, preserve_queued=False):
+        """Finalize a joined prelaunch owner, authenticating any entered monitor."""
         import stat
 
         folder = Path(request["spec"]["state_dir"]) / "attempts" / job_key
@@ -569,10 +588,12 @@ class DeliverySupervisor:
                     try:
                         for name in ("native-monitor.lock", "native-process.lock"):
                             path = folder / name
-                            if name == "native-process.lock" and not os.path.lexists(path):
+                            if not os.path.lexists(path):
+                                if name == "native-monitor.lock" and monitor_entered:
+                                    raise ValueError("entered native monitor lost its lock")
                                 continue
                             descriptor = os.open(
-                                path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600,
+                                path, os.O_RDWR | os.O_NOFOLLOW,
                             )
                             descriptors.append(descriptor)
                             info = os.fstat(descriptor)
@@ -589,6 +610,14 @@ class DeliverySupervisor:
                         ))
                     except (OSError, ValueError):
                         confirmed = False
+                if confirmed and preserve_queued and row["state"] == "queued":
+                    run = db.execute(
+                        "SELECT phase FROM delivery_runs WHERE run_id=?", (row["run_id"],),
+                    ).fetchone()
+                    if run is not None and run["phase"] != "cancelling":
+                        # Supersession claimed no slot and produced no launch.
+                        # Its retry remains under Temporal's original deadline.
+                        return unknown
                 result = {
                     **unknown, "status": "blocked", "cleanup": "confirmed",
                     "summary": "role launch failed before any provider process started",
@@ -718,7 +747,7 @@ class DeliverySupervisor:
         return result
 
     def _mark_unknown(
-        self, job_key: str, reason: str, *, cleanup: str = "unknown"
+        self, job_key: str, reason: str, *, cleanup: str = "unknown", expected=None,
     ) -> dict[str, Any]:
         result = {
             "status": "recovery_unknown",
@@ -731,6 +760,17 @@ class DeliverySupervisor:
         }
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if expected is not None:
+                row = db.execute(
+                    "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,),
+                ).fetchone()
+                if row is None or dict(row) != expected:
+                    if (row is not None and row["state"] == "finished" and row["result_json"]
+                            and all(row[name] == value for name, value in expected.items()
+                                    if name not in {"state", "result_json", "cleanup",
+                                                    "finished_at"})):
+                        return json.loads(row["result_json"])
+                    return result
             db.execute(
                 """UPDATE delivery_attempts SET state=?,result_json=?,cleanup=?,finished_at=?
                    WHERE job_key=?""",

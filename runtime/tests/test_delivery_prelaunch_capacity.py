@@ -16,7 +16,13 @@ import pytest
 from temporalio import activity
 from test_delivery_api import api_fixture as api_fixture
 
-from devflow_temporal import delivery_native_process, delivery_preparation, supervisor
+from devflow_temporal import (
+    delivery_activities,
+    delivery_native_process,
+    delivery_preparation,
+    delivery_role_evidence,
+    supervisor,
+)
 from devflow_temporal.delivery_activities import delivery_role
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
@@ -519,6 +525,8 @@ async def test_occupied_native_lock_cannot_certify_prelaunch_absence(
         assert result['cleanup'] == 'unknown'
         assert row['state'] == 'unknown' and occupied == 1
         assert case.created == []
+        descriptor = descriptors[0]
+        assert (case.folder / lock_name).stat().st_ino == os.fstat(descriptor).st_ino
     finally:
         for descriptor in descriptors:
             os.close(descriptor)
@@ -633,3 +641,242 @@ async def test_late_broken_journal_retains_capacity_and_uncertain_resources(
         assert receipt['resource_cleanup'] == 'unknown'
     finally:
         (case.folder / 'native-process.json').unlink()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('replacement', ['timed_out', 'not_found', 'worker_shutdown', 'explicit'])
+async def test_queued_replacement_preserves_retryable_attempt(
+        native_role, monkeypatch, replacement):
+    case = native_role
+    waiting = threading.Event()
+    original = case.owner._enter_capacity
+
+    def enter(job_key, **options):
+        result = original(job_key, **options)
+        if result is None:
+            waiting.set()
+        return result
+
+    with case.store._connect() as db:
+        for index in range(case.owner.capacity):
+            db.execute(
+                'INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,'
+                "state,result_path,started_at) VALUES (?,?,?,?,?,'unknown',?,?)",
+                (f'occupant-{index}', case.request['spec']['run_id'], 'review', 90 + index,
+                 'occupant', f'/nonexistent/{index}', 'occupant'))
+    monkeypatch.setattr(case.owner, '_enter_capacity', enter)
+    monkeypatch.setattr(activity, 'in_activity', lambda: True)
+    monkeypatch.setattr(activity, 'heartbeat', lambda *args: None)
+    monkeypatch.setattr(activity, 'cancellation_details', lambda: SimpleNamespace(
+        cancel_requested=replacement == 'explicit', **{name: name == replacement for name in
+                                                       ('timed_out', 'not_found',
+                                                        'worker_shutdown')}))
+    task = asyncio.create_task(delivery_activities.delivery_role(case.request))
+    try:
+        await _wait(waiting)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with case.store._connect() as db:
+            row = dict(db.execute('SELECT * FROM delivery_attempts WHERE job_key=?',
+                                  (case.key,)).fetchone())
+            db.execute("DELETE FROM delivery_attempts WHERE job_key LIKE 'occupant-%'")
+        retry = await delivery_activities.delivery_role(case.request)
+        (case.state / 'replacement-observation.json').write_text(json.dumps(
+            {'replacement': replacement, 'after_cancel': row, 'retry': retry}, indent=2))
+        if replacement == 'explicit':
+            assert row['state'] == 'finished' and row['cleanup'] == 'confirmed'
+            assert retry['finish_reason'] == 'prelaunch'
+            assert not (case.state / 'invocations').exists()
+            return
+        assert row['state'] == 'queued', row
+        assert row['started_at'] is None and row['result_json'] is None
+        assert row['cleanup'] == 'none'
+        assert retry['finish_reason'] == 'fixture', retry
+        assert (case.state / 'invocations').read_text().splitlines() == ['one']
+    finally:
+        with case.store._connect() as db:
+            db.execute("DELETE FROM delivery_attempts WHERE job_key LIKE 'occupant-%'")
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_actual_prelaunch_receipt_preserves_empty_folder_retry_predicate(
+        native_role, monkeypatch):
+    case = native_role
+
+    def allocate(request, job_key):
+        raise ValueError('fixture evidence handoff rejected after admission')
+
+    monkeypatch.setattr(delivery_role_evidence, 'allocate', allocate)
+    result = await delivery_activities.delivery_role(case.request)
+    row, occupied = _attempt(case)
+    names = sorted(path.name for path in case.folder.iterdir())
+    (case.state / 'retry-folder-observation.json').write_text(json.dumps(
+        {'attempt': row, 'result': result, 'names': names}, indent=2))
+    assert result['finish_reason'] == 'prelaunch' and occupied == 0
+    # retry_prelaunch and its resume readback both require this exact predicate.
+    assert not any(case.folder.iterdir()), names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('foreign_owner', [False, True])
+async def test_stale_observer_preserves_owner_finished_prelaunch_receipt(
+        native_role, monkeypatch, foreign_owner):
+    case = native_role
+    preparing, finish_owner = threading.Event(), threading.Event()
+    observing, finish_observer = threading.Event(), threading.Event()
+    calls = 0
+
+    def allocate(request, job_key):
+        preparing.set()
+        assert finish_owner.wait(10), 'original owner was not released'
+        raise ValueError('fixture original owner failed before request publication')
+
+    def verify(spec):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            observing.set()
+            assert finish_observer.wait(10), 'stale observer was not released'
+
+    monkeypatch.setattr(delivery_role_evidence, 'allocate', allocate)
+    monkeypatch.setattr(delivery_preparation, 'verify_prepared_spec', verify)
+    first = asyncio.create_task(delivery_activities.delivery_role(case.request))
+    second = None
+    try:
+        await _wait(preparing)
+        observer = DeliverySupervisor(case.store, capacity=case.owner.capacity)
+        monkeypatch.setattr(delivery_activities, 'get_supervisor', lambda store: observer)
+        second = asyncio.create_task(delivery_activities.delivery_role(case.request))
+        await _wait(observing)
+        finish_owner.set()
+        result = await first
+        before, occupied = _attempt(case)
+        assert result['finish_reason'] == 'prelaunch' and occupied == 0
+        if foreign_owner:
+            with case.store._connect() as db:
+                db.execute('UPDATE delivery_attempts SET started_at=? WHERE job_key=?',
+                           ('changed-owner', case.key))
+            before, occupied = _attempt(case)
+        finish_observer.set()
+        observed = await second
+        after, occupied = _attempt(case)
+        (case.state / 'stale-observer-observation.json').write_text(json.dumps(
+            {'before': before, 'after': after, 'observer_result': observed}, indent=2))
+        assert after == before, (before, after)
+        assert occupied == 0
+        assert observed['finish_reason'] == ('recovery_unknown' if foreign_owner else 'prelaunch')
+    finally:
+        finish_owner.set()
+        finish_observer.set()
+        await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase', ['preparation', 'before_thread_entry'])
+async def test_cancelled_executor_waiter_joins_actual_native_worker_without_spin(
+        native_role, monkeypatch, phase):
+    case = native_role
+    preparing, release, finished = threading.Event(), threading.Event(), threading.Event()
+    captured = []
+    cancelled_awaits = 0
+    shield = asyncio.shield
+    failure = case.owner._native_failure
+
+    def prepare(request, folder):
+        if phase == 'preparation':
+            preparing.set()
+            assert release.wait(10), 'actual preparation thread was not released'
+        return 'fixture', {'PATH': '/usr/bin:/bin'}
+
+    if phase == 'before_thread_entry':
+        loop = asyncio.get_running_loop()
+        submit = loop.run_in_executor
+
+        def run_in_executor(executor, function, *args):
+            values = (function, *args, *getattr(function, 'args', ()))
+            if any(getattr(value, '__name__', None) == 'monitor' for value in values):
+                def delayed():
+                    preparing.set()
+                    assert release.wait(10), 'actual queued executor work was not released'
+                    return function(*args)
+                return submit(executor, delayed)
+            return submit(executor, function, *args)
+
+        monkeypatch.setattr(loop, 'run_in_executor', run_in_executor)
+
+    def native_failure(*args, **options):
+        try:
+            return failure(*args, **options)
+        finally:
+            finished.set()
+
+    def bounded_shield(future):
+        nonlocal cancelled_awaits
+        if not captured:
+            captured.append(future)
+        if future.cancelled():
+            cancelled_awaits += 1
+            if cancelled_awaits == 30:
+                raise RuntimeError('bounded probe: native cancel-join spins on cancelled waiter')
+        return shield(future)
+
+    from devflow_temporal import supervisor
+    monkeypatch.setattr(supervisor, 'prepare_native_role', prepare)
+    monkeypatch.setattr(case.owner, '_native_failure', native_failure)
+    monkeypatch.setattr(asyncio, 'shield', bounded_shield)
+    task = asyncio.create_task(delivery_activities.delivery_role(case.request))
+    try:
+        await _wait(preparing)
+        assert captured and isinstance(captured[0], asyncio.Task)
+        captured[0].cancel()
+        await asyncio.sleep(0.05)
+        (case.state / 'cancelled-executor-observation.json').write_text(json.dumps(
+            {'cancelled_shield_awaits': cancelled_awaits, 'outer_done': task.done(),
+             'actual_worker_terminal': finished.is_set()}, indent=2))
+        assert not task.done(), 'cancelled proxy abandoned or spun instead of joining actual worker'
+        row, occupied = _attempt(case)
+        assert occupied == (1 if phase == 'preparation' else 0) and not finished.is_set()
+        assert row['state'] == ('starting' if phase == 'preparation' else 'queued')
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set() and cancelled_awaits <= 1
+        row, occupied = _attempt(case)
+        assert row['state'] == 'finished' and row['cleanup'] == 'confirmed' and occupied == 0
+        assert not (case.state / 'invocations').exists()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await _wait(finished)
+
+
+@pytest.mark.asyncio
+async def test_entered_monitor_missing_original_lock_keeps_unknown_capacity(
+        native_role, monkeypatch):
+    case = native_role
+    original_run = case.process_type.run
+    original_popen = subprocess.Popen
+
+    def popen(argv, *args, **options):
+        if len(argv) > 3 and argv[1:4] == ['-I', '-m', delivery_native_process.__name__]:
+            raise OSError('fixture detached monitor spawn rejected')
+        return original_popen(argv, *args, **options)
+
+    def run(process):
+        try:
+            return original_run(process)
+        finally:
+            (process.folder / 'native-monitor.lock').unlink()
+
+    monkeypatch.setattr(subprocess, 'Popen', popen)
+    monkeypatch.setattr(case.process_type, 'run', run)
+    result = await delivery_activities.delivery_role(case.request)
+    row, occupied = _attempt(case)
+    assert result['cleanup'] == 'unknown' and row['state'] == 'unknown' and occupied == 1
+    assert len(case.created) == 1 and case.created[0].launch_absent
+    assert not (case.folder / 'native-monitor.lock').exists()
+    assert not (case.state / 'invocations').exists()
