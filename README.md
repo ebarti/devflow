@@ -75,7 +75,7 @@ sh scripts/update.sh "$RELEASE_TAG" /path/to/host/skills /path/to/codex-home
 ```
 
 The updater fetches the tag, switches to its commit and reruns installation.
-Reuse the original `DEVFLOW_PYTHON` when it was set. Tracked source edits stop
+Use a supported `DEVFLOW_PYTHON`; a retired historical interpreter need not exist. Tracked source edits stop
 an update. No database migration or service activation occurs in this normal
 installation path.
 
@@ -86,7 +86,14 @@ Git inventory, and an unchanged `.devflow-hook.py`. The published v0.2.2 install
 predates these manifests: that case requires its exact verified historical Git
 inventory, owned canonical source and skill symlinks, unchanged current source
 files and all of its exact generated telemetry hook registrations. Arbitrary
-unrecorded registrations are not migration candidates.
+unrecorded registrations are not migration candidates. The exact historical recipe
+must use one consistently serialized canonical absolute Python 3.12 prefix across
+all generated events; its hook target, arguments, item fields and groups must
+match. The retired interpreter is never executed. Old manifests did not record
+its value, so this recognizes the generated recipe with a consistent historical
+interpreter; it cannot cryptographically prove that an unknown old interpreter
+value was never edited. Inconsistent prefixes, quoting, arguments, events and
+modified owned files still refuse before effects.
 
 The migration atomically exchanges the `devflow` pointer for script-only
 helpers under the skills directory, preserving source files and keeping helper
@@ -97,13 +104,19 @@ registration stops installation with its precise path and reason, even with
 registration and retry. Do not delete source helpers or user data to resolve a
 registration conflict.
 
-Snapshot file bytes, mode and identity come from one opened-file observation;
+Private snapshots live in the owned Codex directory or its nearest owned existing
+parent, outside the OS temporary-directory policy. Backup/target filesystems and
+real native exchange are checked before destination effects. Snapshot file bytes,
+mode and identity come from one opened-file observation;
 a write during that read refuses capture before installation effects.
 On preflight or zero-effect capture refusal, destinations are left untouched
 and the authenticated previous checkout is restored, including updates begun
 by the historical exec-based updater. After an installer effect,
 rollback restores only matching recorded object identities; later changed or
 foreign objects remain, with an actionable path and retained private backup.
+Destination recovery failure still attempts authenticated source checkout recovery
+and retains the backup until the operator recovers it. Public refusals return
+status 1; the installer never excludes other writers.
 Owned destination pointers use native atomic exchange on Linux/macOS before
 helper cleanup; unsupported hosts refuse without a replacement fallback.
 Native exchange and capture require the private backup and target on the same

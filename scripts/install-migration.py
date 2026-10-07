@@ -11,7 +11,6 @@ import re
 import shlex
 import stat
 import subprocess
-import sys
 from pathlib import Path
 
 V022 = "e966cf89e057abc9a2629faf957a2ec175599b53"
@@ -133,6 +132,7 @@ def plan(source, skills, home, guard):
         if not isinstance(groups_by_event, dict):
             raise ValueError("hooks must be an object")
         removed = set()
+        interpreter = None
         for event, groups in groups_by_event.items():
             if not isinstance(groups, list):
                 raise ValueError("hook groups must be arrays")
@@ -165,10 +165,16 @@ def plan(source, skills, home, guard):
                             or item["type"] != "command" or type(item["timeout"]) is not int
                             or item["timeout"] != 3
                             or len(command) != len(suffix) + 1
-                            or command[0] != str(Path(sys.executable).resolve())
+                            or not Path(command[0]).is_absolute()
+                            or Path(command[0]).name != "python3.12"
+                            or str(Path(command[0])) != command[0]
+                            or os.path.normpath(command[0]) != command[0]
+                            or command_text != shlex.join(command)
+                            or (interpreter is not None and command[0] != interpreter)
                             or command[1:] != suffix
                             or event in removed):
                         reject(hooks_path, f"modified or ambiguous Devflow hook in {event}")
+                    interpreter = command[0]
                     removed.add(event)
                     changed = True
                 if changed:

@@ -190,6 +190,59 @@ class UpgradeInstallation(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_upgraded()
 
+    def exercise_retired_interpreter_transition(self, revision):
+        python = self.root / "python-old"
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", "--copies", str(python)], check=True)
+        # Relocatable CPython builds need their shared library and stdlib base.
+        for library in (Path(sys.base_prefix) / "lib").glob("libpython3.12*"):
+            destination = python / "lib" / library.name
+            if not destination.exists():
+                destination.symlink_to(library)
+        self.env.update(DEVFLOW_PYTHON=str(python / "bin/python3.12"), PYTHONHOME=sys.base_prefix)
+        self.historical(revision)
+        original = self.hooks.read_bytes()
+        command = json.loads(original)["hooks"]["Stop"][-1]["hooks"][0]["command"]
+        prior_python = Path(shlex.split(command)[0])
+        self.assertNotEqual(prior_python, Path(sys.executable).resolve())
+        python.rename(self.root / "python-retired")
+        self.assertFalse(prior_python.exists())
+        self.env.update(DEVFLOW_PYTHON=sys.executable)
+        self.env.pop("PYTHONHOME")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_upgraded()
+
+    def test_guarded_recipe_accepts_consistent_retired_interpreter(self):
+        self.exercise_retired_interpreter_transition(GUARDED)
+
+    def test_v022_recipe_accepts_consistent_retired_interpreter(self):
+        self.exercise_retired_interpreter_transition(V022)
+
+    def test_changed_recipe_prefix_serialization_arguments_or_events_refuse(self):
+        self.historical(GUARDED)
+        original = self.hooks.read_text()
+        for change in ("prefix", "serialization", "arguments", "event"):
+            with self.subTest(change=change):
+                self.candidate()
+                hooks = json.loads(original)
+                item = hooks["hooks"]["Stop"][-1]["hooks"][0]
+                if change == "prefix":
+                    command = shlex.split(item["command"])
+                    command[0] = "/owned-but-different/bin/python3.12"
+                    item["command"] = shlex.join(command)
+                elif change == "serialization":
+                    item["command"] += " "
+                elif change == "arguments":
+                    item["command"] += " --custom"
+                else:
+                    hooks["hooks"].pop("SessionStart")
+                self.hooks.write_text(json.dumps(hooks))
+                before = self.snapshot()
+                result = self.install()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(str(self.hooks), result.stderr)
+                self.assertEqual(self.snapshot(), before)
+
     def test_modified_hook_refused_before_effects_even_with_force(self):
         self.historical(GUARDED)
         guard = self.home / ".devflow-hook.py"
