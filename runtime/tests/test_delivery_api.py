@@ -244,6 +244,44 @@ def api_fixture(tmp_path: Path) -> tuple[Path, dict]:
     return path, request
 
 
+@pytest.mark.asyncio
+async def test_public_detail_preserves_logless_preparation_failure(api_fixture):
+    from devflow_temporal.delivery_broker import CheckPreparationFailure
+
+    path, request = api_fixture
+    app = create_app(path)
+    store = app.state.delivery.store
+    store.submit(request)
+    root = Path(store.spec('run-1')['state_dir'])
+    log = root / 'checks' / 'completed.log'
+    log.parent.mkdir(parents=True)
+    log.write_text('Earlier check passed\n')
+    completed = {'id': 'completed', 'passed': True, 'log': str(log),
+                 'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest()}
+    failure = CheckPreparationFailure('planned-dependencies',
+                                     ValueError('cannot adopt an existing unregistered resource'),
+                                     [completed])
+    checks = {'local': {'state': 'failed', 'cleanup': 'confirmed',
+                        'results': failure.results}}
+    store.project('run-1', phase='blocked', execution_state='blocked',
+                  event_type='blocked', message='environment preparation failed',
+                  outcome='blocked', error='environment preparation failed', checks=checks)
+    transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url='http://127.0.0.1:18770') as browser:
+        response = await browser.get('/api/runs/run-1')
+        assert response.status_code == 200
+        detail = response.json()
+        assert detail['run']['phase'] == 'blocked'
+        assert detail['run']['checks']['local']['results'] == failure.results
+        assert {item['id'] for item in detail['evidence']} == {'check-completed'}
+        retained = await browser.get('/api/runs/run-1/evidence/check-completed')
+        assert retained.status_code == 200
+        assert retained.json()['text'] == 'Earlier check passed\n'
+        missing = await browser.get('/api/runs/run-1/evidence/check-planned-dependencies')
+        assert missing.status_code == 404
+
+
 def _foreign_queued_service(api_fixture, key, value):
     path, request = api_fixture
     owner = create_app(path).state.delivery

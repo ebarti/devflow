@@ -40,6 +40,68 @@ def test_role_can_retain_complete_original_probe_and_failure_after_scratch_clean
     assert validate_handoff(reference, Path(broker.spec['state_dir'])) == handoff
 
 
+@pytest.mark.parametrize('case', [
+    'restored', 'identical', 'renamed', 'empty', 'tampered', 'stale-input',
+    'foreign-attempt', 'unknown-cleanup', 'wrong-session', 'no-feature-diff',
+    'stale-source', 'source-repair',
+])
+def test_evidence_only_repair_admits_bound_payload_progress(service, case):
+    from devflow_temporal.delivery_activities import _role_result
+    from devflow_temporal.delivery_role_evidence import allocate, seal
+
+    store, broker, request = setup(service)
+    if case != 'no-feature-diff':
+        (broker.checkout / 'README.md').write_text('Reviewed feature\n')
+    candidate = broker.candidate()
+    request.update(candidate=candidate, iteration=1)
+    prior = allocate(request, '1' * 64)
+    (Path(prior['artifact_directory']) / 'original.log').write_text('retained original\n')
+    prior_ref = seal(prior)['role_artifacts']
+    request.update(iteration=2, resume_session='original-session',
+                   findings=['Supply omitted original investigation evidence'])
+    current = allocate(request, '2' * 64)
+    target = Path(current['artifact_directory'])
+    (target / ('renamed.log' if case == 'renamed' else 'original.log')).write_text(
+        'retained original\n')
+    if case not in {'identical', 'renamed'}:
+        (target / 'restored-inputs.json').write_text(
+            '' if case == 'empty' else '{"original_input":42}\n')
+    if case == 'stale-input':
+        current['candidate'] = {**candidate, 'id': 'stale'}
+    if case == 'source-repair':
+        (broker.checkout / 'README.md').write_text('Corrected feature source\n')
+    reference = seal(current)['role_artifacts']
+    if case == 'stale-source':
+        manifest_path = Path(reference['path'])
+        manifest = json.loads(manifest_path.read_text())
+        manifest['source_candidate']['content_sha256'] = 'stale'
+        manifest_path.write_text(json.dumps(manifest))
+        reference['sha256'] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    with store._connect() as db:
+        for key, iteration, ref in [('1' * 64, 1, prior_ref), ('2' * 64, 2, reference)]:
+            db.execute(
+                """INSERT INTO delivery_attempts
+                   (job_key,run_id,role,iteration,candidate_id,state,session_id,result_json,cleanup)
+                   VALUES (?,?,'implement',?,?,'finished','original-session',?,'confirmed')""",
+                (key, broker.spec['run_id'], iteration, candidate['id'],
+                 json.dumps({'role_artifacts': ref})),
+            )
+    if case == 'tampered':
+        manifest = json.loads(Path(reference['path']).read_text())
+        Path(manifest['artifacts'][-1]['path']).write_text('changed after seal\n')
+    if case == 'foreign-attempt':
+        reference = prior_ref
+    result = {'status': 'pass', 'session_id': 'original-session', 'cleanup': 'confirmed',
+              'role_artifacts': reference, 'findings': []}
+    if case == 'unknown-cleanup':
+        result['cleanup'] = 'unknown'
+    if case == 'wrong-session':
+        request['resume_session'] = 'different-session'
+    after = _role_result(request, broker, broker.checkout, None, result)
+    assert after['status'] == ('pass' if case in {'restored', 'source-repair'} else 'blocked')
+    assert (broker.candidate() == candidate) is (case != 'source-repair')
+
+
 @pytest.mark.parametrize('bad', ['symlink', 'hardlink', 'escape'])
 def test_artifact_allocation_and_sealing_reject_foreign_files(service, tmp_path, bad):
     from devflow_temporal.delivery_role_evidence import allocate, seal

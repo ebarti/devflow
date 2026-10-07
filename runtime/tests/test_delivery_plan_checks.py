@@ -175,6 +175,54 @@ def freeze_recipes(spec, checkout, *, stage=True):
     spec.update(source_path=str(checkout), base_sha=_git(checkout, 'rev-parse', 'HEAD'))
 
 
+@pytest.mark.parametrize('foreign_environment', [False, True])
+def test_mixed_recipe_registers_python_environment_before_first_creator(
+    project, foreign_environment,
+):
+    import shutil
+
+    from devflow_temporal.delivery_broker import DeliveryBroker
+    from devflow_temporal.delivery_resources import RunResources, read_private
+
+    spec, source, _, evidence = project
+    scripts = source / 'scripts'
+    scripts.mkdir()
+    (scripts / 'checks.toml').write_text(
+        'schema_version=1\n[checks.worker]\nkind="junit"\n'
+        'argv=["uv","run","--project","worker","--locked","pytest",'
+        '"tests/test_owned.py","--junitxml={report_path}"]\n')
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Run checks.worker JUnit recipe from scripts/checks.toml and test_owned.py.']})
+    freeze_recipes(spec, source)
+    state = source.parent / 'run-owned'
+    state.mkdir(mode=0o700)
+    checkout = source.parent / 'owned-checkout'
+    spec.update(run_id='run-owned', state_dir=str(state), checkout=str(checkout),
+                policy={'host_sandbox': 'trusted-local'})
+    resources = RunResources(spec)
+    resources.register(checkout, 'checkout')
+    shutil.copytree(source, checkout)
+    resources.created(checkout)
+    recipe, dependencies, _ = planned_checks(spec, checkout, evidence)
+    broker = object.__new__(DeliveryBroker)
+    broker.spec = spec
+    environment = checkout / 'worker/.venv'
+    if foreign_environment:
+        environment.mkdir(mode=0o700)
+        with pytest.raises(ValueError, match='existing unregistered resource'):
+            broker._register_generated(checkout, dependencies['generated_directories'])
+        assert str(environment) not in read_private(resources.manifest)['roots']
+        return
+    roots = broker._register_generated(checkout, recipe.get('generated_directories', []))
+    # Logical filesystem effect of the approved uv recipe; no command is launched.
+    environment.mkdir(mode=0o700)
+    broker._record_generated(roots)
+    broker._register_generated(checkout, dependencies['generated_directories'])
+    entry = read_private(resources.manifest)['roots'][str(environment)]
+    assert entry['state'] == 'created'
+    assert entry['identity']['inode'] == environment.stat().st_ino
+
+
 @pytest.fixture
 def junit_project(project):
     spec, checkout, _, evidence = project

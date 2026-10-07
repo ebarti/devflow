@@ -204,6 +204,61 @@ def validate_handoff(reference: dict, root: Path):
     return verify_manifest(reference, reference['candidate_id'], root)
 
 
+def repair_payload_progress(store, request: dict, result: dict, workspace: Path) -> bool:
+    """An unchanged source repair must restore actual, attempt-bound evidence."""
+    iteration = request['iteration']
+    session = request.get('resume_session')
+    reference = result.get('role_artifacts')
+    if (iteration < 1 or not request.get('findings') or not session
+            or result.get('session_id') != session or result.get('cleanup') != 'confirmed'
+            or not isinstance(reference, dict)):
+        return False
+    root = Path(request['spec']['state_dir'])
+    try:
+        with store._connect() as db:
+            rows = db.execute(
+                """SELECT job_key,candidate_id,result_json FROM delivery_attempts
+                   WHERE run_id=? AND role='implement' AND iteration=? AND session_id=?
+                   AND state='finished' AND cleanup='confirmed'""",
+                (request['spec']['run_id'], iteration, session),
+            ).fetchall()
+            prior = db.execute(
+                """SELECT job_key,candidate_id,result_json FROM delivery_attempts
+                   WHERE run_id=? AND role='implement' AND iteration<? AND session_id=?
+                   AND state='finished' AND cleanup='confirmed'
+                   ORDER BY iteration DESC,started_at DESC LIMIT 1""",
+                (request['spec']['run_id'], iteration, session),
+            ).fetchone()
+        current = next((row for row in rows if json.loads(row['result_json'] or '{}').get(
+            'role_artifacts') == reference), None)
+        if current is None or prior is None:
+            return False
+
+        def bound(row, ref):
+            expected = root / 'role-artifacts/sealed' / row['job_key'] / 'artifacts.json'
+            if Path(ref['path']) != expected:
+                raise ValueError('repair evidence left its controller attempt')
+            manifest = validate_handoff(ref, root)
+            if manifest['input_candidate']['id'] != row['candidate_id']:
+                raise ValueError('repair evidence changed its input candidate')
+            return manifest
+
+        manifest = bound(current, reference)
+        previous = bound(prior, json.loads(prior['result_json'])['role_artifacts'])
+        from .candidate import candidate_for
+
+        if (manifest['input_candidate'] != request['candidate']
+                or manifest['source_candidate'] != candidate_for(workspace)
+                or previous['source_candidate']['content_sha256']
+                != manifest['source_candidate']['content_sha256']):
+            return False
+        old_hashes = {item['sha256'] for item in previous['artifacts'] if item['size']}
+        return any(item['size'] and item['sha256'] not in old_hashes
+                   for item in manifest['artifacts'])
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+
+
 def historical_context(store, spec):
     """Keep prior sealed recovery receipts available after current checks reset."""
     with store._connect() as db:

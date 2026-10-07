@@ -214,6 +214,13 @@ def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
     result = planned_junit_recipes(spec, checkout, evidence)
     result.extend(planned_junit_recipes(spec, checkout, evidence, static=True))
     projects = planned_projects(spec, checkout)
+    # Approved recipes can create the same environments before the named-test
+    # dependency step. Record their ownership before the first recipe launches.
+    generated = [(project / '.venv').relative_to(checkout).as_posix()
+                 for project in sorted(projects)]
+    for check in result:
+        if generated:
+            check['generated_directories'] = generated
     node_tests = planned_node_tests(spec, checkout, result)
     if not projects and not node_tests:
         return result
