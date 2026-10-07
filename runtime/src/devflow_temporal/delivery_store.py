@@ -3660,6 +3660,8 @@ class DeliveryStore:
                                     "limit": 50 * 1024 * 1024})
         details = self.detail(run_id)
         for result in details.get("checks", {}).get("local", {}).get("results", []):
+            if "log" not in result:
+                continue  # Preparation can fail before a process log exists.
             path = Path(result["log"])
             indexed.append(
                 {
