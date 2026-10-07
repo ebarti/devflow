@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import test_delivery_gate_retry as gate_tests
@@ -128,3 +130,39 @@ def test_resume_native_cleanup_only_observes_owned_closure(monkeypatch):
     spec = {'provider': 'codex'}
     assert resume.observed_native_cleanup(spec) == digest(observed)
     assert calls == [spec]
+
+
+@pytest.mark.parametrize(('complete', 'live_monitor', 'accepted'), [
+    (True, True, False), ('unknown', False, False), (1, False, False),
+    (True, False, True),
+])
+def test_observed_cleanup_requires_strict_completion_and_separate_monitor_exit(
+        monkeypatch, complete, live_monitor, accepted):
+    from devflow_temporal import delivery_native_process
+    from devflow_temporal import delivery_policy_recovery as policy
+
+    root = Path('/synthetic-not-created')
+    resources = SimpleNamespace(root=root, manifest=root / 'manifest.json')
+    journal = {'phase': 'finished', 'monitoring_complete': complete, 'owned': {},
+               'monitor': {'pid': 12345, 'identity': 'synthetic monitor'}, 'ports': []}
+    receipts = {
+        resources.manifest: {'processes': [str(root / 'journal.json')]},
+        root / 'finalization.json': {'state': 'confirmed',
+                                    'process_cleanup': 'observed-native-confirmed',
+                                    'resource_cleanup': 'confirmed', 'roots': []},
+        root / 'journal.json': journal,
+    }
+    monkeypatch.setattr(policy, 'RunResources', lambda _spec: resources)
+    monkeypatch.setattr(policy, 'read_private', lambda path: receipts[path])
+    monkeypatch.setattr(Path, 'read_bytes', lambda _path: b'synthetic bytes')
+    monkeypatch.setattr(policy, 'process_table', lambda: {
+        12345: {'identity': 'synthetic monitor', 'stat': 'S'}} if live_monitor else {})
+    def unexpected(*_args, **_kwargs):
+        pytest.fail('observation-only cleanup attempted process control')
+    monkeypatch.setattr(delivery_native_process, 'reconcile_process', unexpected)
+    monkeypatch.setattr(delivery_native_process, 'stop_observed', unexpected)
+    if accepted:
+        assert resume.observed_native_cleanup({'provider': 'codex'})
+    else:
+        with pytest.raises(ValueError, match='still live or unknown'):
+            resume.observed_native_cleanup({'provider': 'codex'})
