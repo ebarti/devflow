@@ -592,7 +592,8 @@ async def delivery_gates_readback(request: dict[str, Any]) -> dict[str, Any]:
             from .delivery_pending_publication import readback
         elif request["recovery"].get("kind") in {
                 "published_gate_retry", "prepublication_gate_retry",
-                "published_check_prelaunch_retry", "published_ci_retry"}:
+                "published_check_prelaunch_retry", "published_ci_retry",
+                "published_controller_retry"}:
             from .delivery_gate_retry import readback
         else:
             from .delivery_gates_admission import readback

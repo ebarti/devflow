@@ -20,6 +20,7 @@ KIND = 'published_gate_retry'
 PREPUBLICATION_KIND = 'prepublication_gate_retry'
 PRELAUNCH_KIND = 'published_check_prelaunch_retry'
 CI_KIND = 'published_ci_retry'
+CONTROLLER_KIND = 'published_controller_retry'
 
 
 def _consumed_payloads(spec, state, previous):
@@ -95,6 +96,13 @@ def snapshot(store, run_id, kind=KIND):
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     ci_only = kind == CI_KIND
+    controller_only = kind == CONTROLLER_KIND
+    if controller_only and previous is not None:
+        raise ValueError('controller retry requires its original finalized checkpoint')
+    if (controller_only and (row['iteration'] > spec['policy']['max_repairs']
+                             or (spec['provider'] != 'fake' and spec['policy'].get(
+                                 'execution_backend') != 'native-macos'))):
+        raise ValueError('controller retry cannot change its original native repair ceiling')
     prelaunch = bool(kind == PRELAUNCH_KIND and previous and previous.get('kind') == KIND
                     and spec.get('gate_retry_stage') == 'published'
                     and spec.get('gate_retry_generation') == 1)
@@ -118,7 +126,7 @@ def snapshot(store, run_id, kind=KIND):
         if ci_only and history.get('kind') == CI_KIND:
             raise ValueError('this run already received its bounded CI observation retry')
         history = history.get('original_recovery')
-    if ((renewed or published_after_recovery or prelaunch or report_retry)
+    if ((renewed or published_after_recovery or prelaunch or report_retry or controller_only)
             and spec['provider'] != 'fake'):
         from .delivery_native_preparation import native_identity
         if native_identity(spec)['runtime_payload_sha256'] in _consumed_payloads(
@@ -141,6 +149,12 @@ def snapshot(store, run_id, kind=KIND):
                            for r in precheck.get('results', []))) if unpublished else bool(failed)
     prelaunch_observation = None
     report_observation = None
+    controller_observation = None
+    if controller_only:
+        from .delivery_controller_retry import observe
+
+        controller_observation = observe(store, spec, state, attempts, broker)
+        failed_gate = True
     if report_retry:
         if state.get('checks') != json.loads(row['checks_json'] or '{}'):
             raise ValueError('report recovery lost its passed check projection')
@@ -189,12 +203,14 @@ def snapshot(store, run_id, kind=KIND):
                                               if ci_only
                                       else 'local check process cleanup is unknown' if prelaunch
                                       else 'prepublication repair limit exhausted'
-                                      if unpublished else 'repair limit exhausted'})
+                                      if unpublished else state.get('error') if controller_only
+                                      else 'repair limit exhausted'})
             or row['protocol_revision'] != state.get('revision')
             or row['iteration'] != state.get('iteration')
             or closed['request_digest'] != row['request_digest']
             or closed['recovery_digest'] != (digest(previous) if previous else None)
-            or not implementation or implementation.get('status') != 'pass' or not failed_gate
+            or not implementation or (implementation.get('status') != 'pass'
+                                      and not controller_only) or not failed_gate
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
             or any(e['state'] != 'complete' or not e['observed_json'] for e in effects)
             or (claim is not None and not prelaunch)):
@@ -242,8 +258,9 @@ def snapshot(store, run_id, kind=KIND):
             'cleanup': prelaunch_observation or _stopped_cleanup(spec), 'work_binding': binding,
             'previous': previous, 'prior_gate': prior_gate,
             **({'report_observation': report_observation} if report_observation else {}),
+            **({'controller_observation': controller_observation} if controller_only else {}),
             'stage': 'report' if report_retry else 'ci' if ci_only else 'published'
-                     if published_after_recovery or prelaunch else None,
+                     if published_after_recovery or prelaunch or controller_only else None,
             'generation': 2 if renewed or prelaunch else 1}
 
 
@@ -258,7 +275,7 @@ def admit(store, run_id, payload, *, preflight=False):
     if (not isinstance(payload, dict) or set(payload) not in (
             fields, fields | {'verification_test_paths'})
             or ('verification_test_paths' in payload and kind != KIND)
-            or kind not in {KIND, PREPUBLICATION_KIND, PRELAUNCH_KIND, CI_KIND}
+            or kind not in {KIND, PREPUBLICATION_KIND, PRELAUNCH_KIND, CI_KIND, CONTROLLER_KIND}
             or not isinstance(payload.get('command_id'), str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', payload['command_id'])
             or any(type(payload.get(k)) is not int or payload[k] < low for k, low in (
@@ -424,6 +441,13 @@ def readback(store, spec, recovery):
     if effective != spec or DeliveryBroker(store, spec).candidate() != recovery['candidate']:
         raise ValueError('gate retry source or execution authority changed')
     broker = DeliveryBroker(store, spec)
+    if recovery['kind'] == CONTROLLER_KIND:
+        from .delivery_controller_retry import observe
+
+        original = recovery['seal']['original_spec']
+        if observe(store, original, recovery['state'], recovery['seal']['attempts'],
+                   broker) != recovery['seal']['controller_observation']:
+            raise ValueError('controller retry preserved failure custody changed')
     pr = broker._existing_pr()
     unpublished = recovery['kind'] == PREPUBLICATION_KIND
     if unpublished:
