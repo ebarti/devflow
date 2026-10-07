@@ -50,8 +50,8 @@ jobs:
         working-directory: runtime
   temporal-runtime-macos:
     runs-on: macos-latest
-    # The observed native macOS job took 17m39s; reserve runner/cleanup headroom.
-    timeout-minutes: 30
+    # The composed suite reached 84% before the observed 30-minute job timeout.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -71,7 +71,7 @@ jobs:
         working-directory: runtime
       - run: uv run --frozen ruff check src tests
         working-directory: runtime
-      - run: uv run --frozen pytest -q -ra
+      - run: uv run --frozen pytest -v --tb=short -ra --durations=20
         working-directory: runtime
   temporal-dashboard:
     runs-on: ubuntu-latest
