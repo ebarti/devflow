@@ -6,6 +6,7 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -25,10 +26,21 @@ STATUSES = {
 }
 
 
+class GitHubTransientError(RuntimeError):
+    """A recognized transport failure, rather than a mapping or permission error."""
+
+
 def gh(*args, as_json=False):
     result = subprocess.run([os.environ.get("DEVFLOW_GH", "gh"), *args], text=True, capture_output=True, timeout=60)
     if result.returncode:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gh failed")
+        message = result.stderr.strip() or result.stdout.strip() or "gh failed"
+        transient = re.search(
+            r"HTTP (?:408|429|500|502|503|504)\b|dial tcp|TLS handshake timeout|"
+            r"i/o timeout|connection (?:reset|refused|timed out)|no such host|"
+            r"temporary failure in name resolution|API rate limit exceeded",
+            message, re.IGNORECASE,
+        )
+        raise (GitHubTransientError if transient else RuntimeError)(message)
     return json.loads(result.stdout) if as_json else result.stdout.strip()
 
 
@@ -241,6 +253,8 @@ def synchronize(db, args):
             queued = reconcile.queue(db, args.work_id, "sync", payload, args.owner, force=True)
     result = reconcile.apply_one(db, queued)
     if result["state"] != "acknowledged":
+        if result.get("error_type") in {"GitHubTransientError", "TimeoutExpired"}:
+            raise GitHubTransientError("GitHub reconciliation pending: " + state.encode(result))
         raise RuntimeError("GitHub reconciliation pending: " + state.encode(result))
     return dict(issue=issue_url, assignee=result["assignee"], status=args.status,
                 project=selected["url"], project_status=result["project_status"],
@@ -391,7 +405,8 @@ def main():
         return 0
     except (ValueError, OSError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
         if args.action == "audit":
-            print(state.encode({"error": str(exc), "work_id": args.work_id}), file=sys.stderr)
+            print(state.encode({"error": str(exc), "error_type": type(exc).__name__,
+                                "work_id": args.work_id}), file=sys.stderr)
             return 1
         try:
             with closing(state.connect(args.db)) as db, db:
@@ -404,7 +419,8 @@ def main():
                                  kind="github", status="failed", evidence_ref=work["issue"], summary=str(exc)))
         except (ValueError, OSError, sqlite3.Error):
             pass  # The original failure remains visible even if recording is unavailable.
-        print(state.encode({"error": str(exc), "work_id": args.work_id}), file=sys.stderr)
+        print(state.encode({"error": str(exc), "error_type": type(exc).__name__,
+                            "work_id": args.work_id}), file=sys.stderr)
         return 1
 
 

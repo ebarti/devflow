@@ -111,7 +111,8 @@ def retry(db, saved, exc):
     seconds = min(3600, 15 * (2 ** min(attempts - 1, 8)))
     at = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
     finish(db, saved, "pending", str(exc), "retry GitHub synchronization", at)
-    return {"work_id": saved["work_id"], "state": "pending", "error": str(exc), "next_attempt_at": at}
+    return {"work_id": saved["work_id"], "state": "pending", "error": str(exc),
+            "error_type": type(exc).__name__, "next_attempt_at": at}
 
 
 def descendants_terminal(db, root):

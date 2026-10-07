@@ -27,8 +27,24 @@ from devflow_temporal.delivery_activities import (
 )
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_resources import RunResources
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+
+@pytest.fixture(autouse=True)
+def legacy_tracker_admission(monkeypatch):
+    """These recovery cases represent specs admitted before automatic retries."""
+    original = DeliveryConfig.admit
+
+    def admit(self, request):
+        spec = original(self, request)
+        spec.pop('tracker_retry_version', None)
+        spec['policy'].pop('tracker_retry_seconds', None)
+        spec['policy_digest'] = digest(spec['policy'])
+        return spec
+
+    monkeypatch.setattr(DeliveryConfig, 'admit', admit)
 
 
 @workflow.defn(name="ControlledTrackerCheckpoint")

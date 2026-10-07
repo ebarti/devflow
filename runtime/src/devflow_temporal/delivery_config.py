@@ -145,6 +145,7 @@ class DeliveryConfig:
             "execution_mode": self.raw.get("execution_mode", "native-profile"),
             "max_attempts": self.raw.get("max_attempts", 3),
             "max_repairs": self.raw.get("max_repairs", 2),
+            "tracker_retry_seconds": self.raw.get("tracker_retry_seconds", 600),
         }
 
     def admit(self, supplied: dict[str, Any], *, _base_ref: str | None = None) -> dict[str, Any]:
@@ -277,6 +278,10 @@ class DeliveryConfig:
             raise ValueError("max_attempts must be an integer between 1 and 10")
         policy["max_attempts"] = maximum
         baseline_ids = repository.get("baseline_check_ids", [])
+        duration = self.raw.get("tracker_retry_seconds", 600)
+        if type(duration) is not int or not 60 <= duration <= 3600:
+            raise ValueError("tracker_retry_seconds must be an integer from 60 to 3600")
+        policy["tracker_retry_seconds"] = duration
         if (not isinstance(baseline_ids, list)
                 or any(not isinstance(item, str) for item in baseline_ids)
                 or len(set(baseline_ids)) != len(baseline_ids)):
@@ -490,6 +495,7 @@ class DeliveryConfig:
             "version": 1,
             "automatic_retry_version": 1,
             **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
+            "tracker_retry_version": 1,
             **({"baseline_checks_version": 1} if baseline_ids else {}),
             **(
                 {"preparation_version": 1}
@@ -610,6 +616,14 @@ def scope_amended_spec(
         effective["policy"]["max_attempts"] = original["policy"]["max_attempts"]
     else:
         effective["policy"].pop("max_attempts", None)
+    if "tracker_retry_version" in original:
+        effective["tracker_retry_version"] = original["tracker_retry_version"]
+    else:
+        effective.pop("tracker_retry_version", None)
+    if "tracker_retry_seconds" in original["policy"]:
+        effective["policy"]["tracker_retry_seconds"] = original["policy"]["tracker_retry_seconds"]
+    else:
+        effective["policy"].pop("tracker_retry_seconds", None)
     effective["policy_digest"] = digest(effective["policy"])
     effective["intake_required"] = original.get("intake_required", False)
     for key in (

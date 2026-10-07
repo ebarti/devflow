@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 
 from temporalio.client import WorkflowExecutionStatus
 
 from .contracts import canonical_json, digest
-from .delivery_broker import DeliveryBroker, _git
+from .delivery_broker import BrokerReadbackUnavailable, DeliveryBroker, _git
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_resources import RunResources, read_private
@@ -79,7 +80,12 @@ def published_readback(store, spec, candidate, pr):
         raise ValueError('terminal published candidate/PR is missing')
     broker = DeliveryBroker(store, spec)
     found = broker._existing_pr()
-    remote = _git(broker.source, 'ls-remote', 'origin', f"refs/heads/{spec['branch']}")
+    try:
+        remote = _git(broker.source, 'ls-remote', 'origin', f"refs/heads/{spec['branch']}")
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+        if spec.get('tracker_retry_version') != 1:
+            raise
+        raise BrokerReadbackUnavailable('terminal branch readback unavailable') from exc
     if (not found or not remote
             or candidate.get('head') != pr.get('head') or found['headRefOid'] != pr['head']
             or found['number'] != pr['number'] or found['url'] != pr['url']
