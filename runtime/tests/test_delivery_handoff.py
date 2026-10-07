@@ -105,7 +105,7 @@ async def test_stopped_mcp_handoff_starts_explicitly_before_required_reads(
             if mutation == "submit_run":
                 policy = current["policy"]["repositories"][0]
                 listed = await session.call_tool("list_runs")
-                assert json.loads(listed.content[0].text) == {"runs": []}
+                assert json.loads(listed.content[0].text) == {"runs": [], "next_cursor": None}
                 payload = {
                     "command_id": "submit-1", "run_id": "run-1", "work_id": "work-1",
                     "issue_url": "https://github.com/example/fixture/issues/1",
@@ -155,10 +155,7 @@ class RoutedClient:
     ("list_runs", {}, "read", "runs"),
     ("get_run", {"run_id": "run-1"}, "read", "status"),
     ("read_evidence", {"run_id": "run-1", "evidence_id": "one"}, "read", "evidence"),
-    ("recovery_preflight", {"run_id": "run-1"}, "read", "recovery_preflight"),
     ("gates_only_preflight", {"run_id": "run-1"}, "read", "gates_only_preflight"),
-    ("metadata_preflight", {"run_id": "run-1", "request_json": "{}"},
-     "read", "metadata_preflight"),
     ("repair_admission_preflight", {"run_id": "run-1", "request_json": "{}"},
      "read", "repair_admission_preflight"),
     ("start_service", {}, "write", "service"),
@@ -166,8 +163,7 @@ class RoutedClient:
     ("answer_decision", {"run_id": "run-1", "request_json": "{}"}, "write", "decision"),
     ("cancel_run", {"run_id": "run-1", "request_json": "{}"}, "write", "cancel"),
     *[(name, {"run_id": "run-1", "request_json": "{}"}, "write", name) for name in (
-        "recover_execution", "reconcile_tracker", "reconcile_published_metadata",
-        "admit_gates_only", "continue_repair",
+        "reconcile_tracker", "admit_gates_only", "continue_repair",
     )],
 ])
 async def test_mcp_tools_use_distinct_read_and_starting_factories(
@@ -182,16 +178,40 @@ async def test_mcp_tools_use_distinct_read_and_starting_factories(
     assert json.loads(result.content[0].text) == {"factory": factory, "method": method}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", [
+    "recovery_preflight", "recover_execution", "metadata_preflight",
+    "reconcile_published_metadata",
+])
+async def test_retired_mcp_tools_reject_without_start_or_stop(tmp_path, monkeypatch, tool):
+    calls = []
+    path = tmp_path / "absent" / "service.json"
+    for name in ("client", "read_only_client"):
+        monkeypatch.setattr(f"devflow_temporal.delivery_mcp.{name}",
+                            lambda *_args, _name=name: calls.append(_name))
+    for name in ("ensure_service_running", "service_start", "service_stop"):
+        monkeypatch.setattr(control, name,
+                            lambda *_args, _name=name, **_kwargs: calls.append(_name))
+    arguments = {"run_id": "run-1"}
+    if tool != "recovery_preflight":
+        arguments["request_json"] = "{}"
+    async with create_connected_server_and_client_session(build_server(path)) as session:
+        tools = {item.name for item in (await session.list_tools()).tools}
+        result = await session.call_tool(tool, arguments)
+    assert tool not in tools
+    assert result.isError and f"Unknown tool: {tool}" in result.content[0].text
+    assert calls == []
+    assert not path.parent.exists()
+
+
 @pytest.mark.parametrize("command,factory,method", [
     ("runs", "read", "runs"), ("run", "read", "status"), ("evidence", "read", "evidence"),
     *[(name, "read", name.replace("-", "_")) for name in (
-        "recovery-preflight", "gates-only-preflight", "metadata-preflight",
-        "repair-admission-preflight",
+        "gates-only-preflight", "repair-admission-preflight",
     )],
     *[(name, "write", name.replace("-", "_")) for name in (
         "submit", "decision", "cancel", "reconcile-tracker", "recover-publication",
-        "reconcile-published-metadata", "admit-gates-only", "continue-repair",
-        "recover-execution", "retry-prelaunch", "amend-scope",
+        "admit-gates-only", "continue-repair", "retry-prelaunch", "amend-scope",
     )],
 ])
 def test_cli_commands_use_distinct_read_and_starting_factories(

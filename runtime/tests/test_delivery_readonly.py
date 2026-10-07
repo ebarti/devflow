@@ -23,11 +23,63 @@ from devflow_temporal.delivery_mcp import build_server
 READ_TOOLS = [
     ('get_service', {}), ('list_runs', {}), ('get_run', {'run_id': 'absent'}),
     ('read_evidence', {'run_id': 'absent', 'evidence_id': 'missing'}),
-    ('recovery_preflight', {'run_id': 'absent'}),
     ('gates_only_preflight', {'run_id': 'absent'}),
-    ('metadata_preflight', {'run_id': 'absent', 'request_json': '{}'}),
     ('repair_admission_preflight', {'run_id': 'absent', 'request_json': '{}'}),
 ]
+
+RETIRED_COMMANDS = [
+    'recovery-preflight', 'recover-execution', 'metadata-preflight',
+    'reconcile-published-metadata',
+]
+
+
+@pytest.mark.parametrize('command', [*RETIRED_COMMANDS, 'unknown-command'])
+def test_unsupported_private_command_rejects_before_configuration_or_lifecycle(
+    tmp_path, monkeypatch, command, capsys,
+):
+    calls = []
+    path = tmp_path / 'absent' / 'service.json'
+    for name in (
+        '_config', '_read_manifest', 'api_client', 'read_only_client',
+        'ensure_service_running', 'service_start', 'service_stop',
+    ):
+        monkeypatch.setattr(control, name,
+                            lambda *_args, _name=name, **_kwargs: calls.append(_name))
+    monkeypatch.setattr(DeliveryConfig, 'load',
+                        classmethod(lambda *_args: calls.append('load_config')))
+    args = argparse.Namespace(command=command, config=str(path), request=None)
+    try:
+        control._run(args, argparse.ArgumentParser())
+    except SystemExit as failure:
+        assert failure.code == 2
+    else:
+        pytest.fail(f'unsupported command {command} did not reject; effects={calls}')
+    assert 'invalid choice' in capsys.readouterr().err
+    assert calls == []
+    assert not path.parent.exists()
+
+
+@pytest.mark.parametrize('command', [*RETIRED_COMMANDS, 'unknown-command'])
+def test_unsupported_public_command_rejects_before_configuration_or_lifecycle(
+    tmp_path, monkeypatch, command, capsys,
+):
+    calls = []
+    path = tmp_path / 'absent' / 'service.json'
+    for name in (
+        '_config', 'api_client', 'read_only_client',
+        'ensure_service_running', 'service_start', 'service_stop',
+    ):
+        monkeypatch.setattr(control, name,
+                            lambda *_args, _name=name, **_kwargs: calls.append(_name))
+    monkeypatch.setattr(DeliveryConfig, 'load',
+                        classmethod(lambda *_args: calls.append('load_config')))
+    monkeypatch.setattr('sys.argv', ['devflow-delivery', '--config', str(path), command])
+    with pytest.raises(SystemExit) as failure:
+        control.main()
+    assert failure.value.code == 2
+    assert 'invalid choice' in capsys.readouterr().err
+    assert calls == []
+    assert not path.parent.exists()
 
 
 @pytest.mark.asyncio
@@ -94,8 +146,7 @@ async def test_cold_read_mcp_does_not_start_api_or_dispatch(config, monkeypatch,
 
 
 @pytest.mark.parametrize('command', [
-    'runs', 'run', 'evidence', 'recovery-preflight', 'gates-only-preflight',
-    'metadata-preflight', 'repair-admission-preflight',
+    'runs', 'run', 'evidence', 'gates-only-preflight', 'repair-admission-preflight',
 ])
 def test_cold_cli_reads_report_unavailable_without_start(config, monkeypatch, command, capsys):
     calls = []

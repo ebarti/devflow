@@ -517,37 +517,37 @@ async def worker(
                 marker.unlink()
 
 
+_COMMANDS = (
+    "start",
+    "status",
+    "stop",
+    "token",
+    "worker",
+    "api",
+    "submit",
+    "runs",
+    "run",
+    "evidence",
+    "decision",
+    "cancel",
+    "reconcile-tracker",
+    "recover-publication",
+    "repair-admission-preflight",
+    "gates-only-preflight",
+    "admit-gates-only",
+    "continue-repair",
+    "retry-prelaunch",
+    "amend-scope",
+)
+
+
 def main() -> None:
     from .delivery_native_guard import reject_nested_controller
 
     reject_nested_controller()
     parser = argparse.ArgumentParser(prog="devflow-delivery")
     parser.add_argument("--config", required=True)
-    parser.add_argument(
-        "command",
-        choices=(
-            "start",
-            "status",
-            "stop",
-            "token",
-            "worker",
-            "api",
-            "submit",
-            "runs",
-            "run",
-            "evidence",
-            "decision",
-            "cancel",
-            "reconcile-tracker",
-            "recover-publication",
-            "repair-admission-preflight",
-            "gates-only-preflight",
-            "admit-gates-only",
-            "continue-repair",
-            "retry-prelaunch",
-            "amend-scope",
-        ),
-    )
+    parser.add_argument("command", choices=_COMMANDS)
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
     parser.add_argument("--id", help="run ID")
     parser.add_argument("--evidence-id", help="indexed evidence ID")
@@ -564,13 +564,14 @@ def main() -> None:
 
 
 def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.command not in _COMMANDS:
+        parser.error(f"invalid choice: {args.command!r}")
     deployment = _worker_deployment(
         getattr(args, "deployment_name", None), getattr(args, "deployment_build_id", None))
     if deployment is not None and args.command not in {"start", "worker"}:
         parser.error("worker deployment options apply only to start or worker")
     read_commands = {
-        "runs", "run", "evidence", "recovery-preflight", "gates-only-preflight",
-        "metadata-preflight", "repair-admission-preflight",
+        "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
     }
     if args.command in read_commands | {"status", "token"}:
         config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
