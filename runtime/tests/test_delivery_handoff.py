@@ -146,7 +146,7 @@ class RoutedClient:
         self.factory = factory
 
     def __getattr__(self, method):
-        return lambda *_args: {"factory": self.factory, "method": method}
+        return lambda *_args, **_kwargs: {"factory": self.factory, "method": method}
 
 
 @pytest.mark.asyncio
