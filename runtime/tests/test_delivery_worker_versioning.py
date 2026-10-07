@@ -209,7 +209,8 @@ def test_starting_different_version_preserves_ready_worker(tmp_path, monkeypatch
     monkeypatch.setattr(control, "_owned", lambda _process: True)
     monkeypatch.setattr(control, "_ready", lambda *_args: True)
     monkeypatch.setattr(control, "_stop", lambda *_args: pytest.fail("restarted ready worker"))
-    monkeypatch.setattr(control, "_start", lambda *_args, **_kwargs: pytest.fail("new worker launched"))
+    monkeypatch.setattr(
+        control, "_start", lambda *_args, **_kwargs: pytest.fail("new worker launched"))
     with pytest.raises(ValueError, match="running worker deployment differs"):
         control.ensure_service_running(config, deployment=deployment)
     assert existing["processes"]["worker"]["deployment"]["build_id"] == "old"
