@@ -77,8 +77,26 @@ def test_payload_only_native_generation_preserves_old_proof_and_replays_strictly
     store, before, payload, old, _package = payload_update
     if home_generation is None:
         before.pop('role_home_generation')
-    with pytest.raises(PreparationError):
-        native.verify_native_spec(before)
+    historical = deepcopy(before)
+    native.verify_native_spec(before)
+    assert before == historical
+    assert Path(before['preparation']['environment']['path']).read_bytes() == old
+    assert json.loads(old)['identity'] == historical['policy']['native_identity']
+    current = native.native_identity(before)
+    frozen = historical['policy']['native_identity']
+    assert current['runtime_payload_sha256'] != frozen['runtime_payload_sha256']
+    assert {key: value for key, value in current.items() if key != 'runtime_payload_sha256'} == {
+        key: value for key, value in frozen.items() if key != 'runtime_payload_sha256'
+    }
+    for mismatch in ('sandbox', 'fingerprint'):
+        changed = deepcopy(before)
+        if mismatch == 'sandbox':
+            changed['policy']['host_sandbox'] = 'native-profile'
+            changed['policy_digest'] = digest(changed['policy'])
+        else:
+            changed['preparation']['fingerprint'] = '0' * 64
+        with pytest.raises(PreparationError):
+            native.verify_native_spec(changed)
     after, reference = renewal.renew(before, payload, digest(payload))
     assert after.get('role_home_generation') == home_generation
     assert Path(before['preparation']['environment']['path']).read_bytes() == old

@@ -24,6 +24,27 @@ deadlines, owned process/port cleanup, synthetic fixture QA and the
 separate mode-bound proof and confirms the launcher and ancestry guard; it does
 not claim constrained sandbox denials.
 
+An owner-controlled update of the installed controller Python source may change
+the current runtime payload hash for a run already frozen as `trusted-local`.
+Every other native identity field must still match, including the interpreter,
+OS/architecture, bundled CLI, locked dependencies, sandbox overrides and tool
+roots. Verification authenticates the original private proof, evidence hashes,
+measurements, fingerprint, policy and run binding against its frozen identity.
+It preserves that specification and proof; the old observations remain historical
+measurements rather than measurements of the replacement source. `native-profile`
+retains its existing strict update checks.
+
+Before deployment, inspect queued and running executions through public status
+and indexed evidence. Finish executions whose recorded activities have one attempt
+and special legacy PID-bound recoveries under their matching previous runtime
+before upgrading. An update does not retrofit heartbeat or retry options into recorded
+histories. Retry-capable ordinary trusted executions can reattach to the same
+owned native invocation after worker replacement and start their remaining
+authorized roles and gates. Changed configuration, source candidate, scope,
+models, dependencies or interpreter require their existing authority checks;
+unknown effects or cleanup still require inspection. Never rewrite a frozen
+specification, proof or private state to force continuation.
+
 Publication keeps a conventional goal subject, or prefixes a plain goal with
 `chore:`, for both the commit and new PR title. The controller uses `git commit
 --signoff` with the existing configured Git identity; it requires the author and

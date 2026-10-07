@@ -335,14 +335,17 @@ def verify_native_spec(spec: dict) -> None:
         {k: v for k, v in identity.items() if k != "runtime_payload_sha256"}
         == {k: v for k, v in frozen.items() if k != "runtime_payload_sha256"}
     ):
-        from .delivery_transport_adoption import transport_adoption
+        if spec["policy"].get("host_sandbox") != "trusted-local":
+            from .delivery_transport_adoption import transport_adoption
 
-        try:
-            transport_adoption(spec, frozen["runtime_payload_sha256"])
-        except (OSError, ValueError, KeyError) as exc:
-            raise PreparationError(
-                "native transport update has no valid installation receipt"
-            ) from exc
+            try:
+                transport_adoption(spec, frozen["runtime_payload_sha256"])
+            except (OSError, ValueError, KeyError) as exc:
+                raise PreparationError(
+                    "native transport update has no valid installation receipt"
+                ) from exc
+        # Owner-controlled trusted source may change; its original measurements
+        # and per-run authority must still authenticate against the frozen identity.
         identity = frozen
     if (
         spec["policy"].get("native_identity") != identity
