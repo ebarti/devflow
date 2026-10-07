@@ -220,9 +220,15 @@ CHECK_PROGRAM = '''
 import os,sys,time,threading,urllib.request
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,HTTPServer
+from socketserver import TCPServer
 state=Path(sys.argv[1])
 print('fixture-child-entered',flush=True)
 servers=[]
+class FixtureHTTPServer(HTTPServer):
+    def server_bind(self):
+        # Fixed numeric loopback probes need binding/listening, not reverse DNS.
+        TCPServer.server_bind(self)
+        self.server_name,self.server_port=self.server_address[:2]
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b'ready')
@@ -230,7 +236,7 @@ class Handler(BaseHTTPRequestHandler):
 for key in ['QA_API_PORT','QA_WEB_PORT']:
     if key in os.environ:
         print('fixture-child-binding:'+key,flush=True)
-        server=HTTPServer(('127.0.0.1',int(os.environ[key])),Handler)
+        server=FixtureHTTPServer(('127.0.0.1',int(os.environ[key])),Handler)
         print('fixture-child-bound:'+key,flush=True)
         servers.append(server)
         threading.Thread(target=server.serve_forever,daemon=True).start()
@@ -650,6 +656,80 @@ def test_fixture_boundary_diagnostics_preserve_original_result_and_exception():
         namespace['trace_fixture_boundary']('owned-boundary', reject)()
     assert error.value is original
     assert output[-1]['event'] == 'error' and output[-1]['type'] == 'ValueError'
+
+
+@pytest.mark.parametrize('fail_at', [None, 'bind', 'listen'])
+def test_fixture_http_constructor_keeps_numeric_loopback_bind_without_dns(monkeypatch, fail_at):
+    from http.server import HTTPServer
+    from socketserver import TCPServer
+
+    sockets, lookups = [], []
+    original_error = OSError('opaque socket rejection')
+
+    class SocketDouble:
+        def __init__(self):
+            self.operations = []
+            sockets.append(self)
+
+        def setsockopt(self, *_args):
+            self.operations.append('setsockopt')
+
+        def bind(self, address):
+            self.address = address
+            self.operations.append(('bind', address))
+            if fail_at == 'bind':
+                raise original_error
+
+        def getsockname(self):
+            self.operations.append('getsockname')
+            return self.address
+
+        def listen(self, backlog):
+            self.operations.append(('listen', backlog))
+            if fail_at == 'listen':
+                raise original_error
+
+        def close(self):
+            self.operations.append('close')
+
+    def forbidden_lookup(name):
+        lookups.append(name)
+        raise AssertionError('reverse DNS is outside the numeric loopback fixture contract')
+
+    monkeypatch.setattr(socket, 'socket', lambda *_args: SocketDouble())
+    monkeypatch.setattr(socket, 'getfqdn', forbidden_lookup)
+    tree = ast.parse(CHECK_PROGRAM)
+    definition = [node for node in tree.body if isinstance(node, ast.ClassDef)
+                  and node.name == 'FixtureHTTPServer']
+    constructor = next(node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == 'server'
+                               for target in node.targets))
+    namespace = {'HTTPServer': HTTPServer, 'TCPServer': TCPServer, 'Handler': object()}
+    definition_code = compile(
+        ast.Module(body=definition, type_ignores=[]), '<fixture-server>', 'exec')
+    exec(definition_code, namespace)
+    constructor_code = compile(ast.Expression(constructor), '<fixture-constructor>', 'eval')
+    servers = []
+    for key, port in [('QA_API_PORT', 12345), ('QA_WEB_PORT', 23456)]:
+        namespace.update(key=key, os=SimpleNamespace(environ={key: str(port)}))
+        if fail_at:
+            with pytest.raises(OSError) as error:
+                eval(constructor_code, namespace)
+            assert error.value is original_error and lookups == []
+            assert sockets[-1].operations[-1] == 'close'
+            return
+        server = eval(constructor_code, namespace)
+        servers.append(server)
+        assert server.server_name == '127.0.0.1' and server.server_port == port
+        assert sockets[-1].operations == [
+            'setsockopt', ('bind', ('127.0.0.1', port)), 'getsockname',
+            ('listen', server.request_queue_size)]
+        assert type(server).server_activate is TCPServer.server_activate
+        assert type(server).serve_forever is HTTPServer.serve_forever
+    assert lookups == []
+    for server in servers:
+        server.server_close()
+    assert all(child.operations[-1] == 'close' for child in sockets)
 
 
 @pytest.mark.asyncio
