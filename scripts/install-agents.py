@@ -1,13 +1,23 @@
 #!/usr/bin/env python3.12
 """Preflight and install loadable regular agent definitions without replacing custom files."""
 import hashlib
+import importlib.util
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import sys
 import tempfile
+from pathlib import Path
+
+ROLLBACK = None
+
+
+def rollback_module():
+    spec = importlib.util.spec_from_file_location("agent_install_rollback", Path(__file__).with_name("install-rollback.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def fail(message):
@@ -134,13 +144,15 @@ def hook_pin(codex_home, source_root, force):
 
 
 def atomic_write(path, content, mode=0o644):
+    if ROLLBACK is None:
+        fail("Agent writes require the installer snapshot; run scripts/install.sh with the original locations")
     descriptor, name = tempfile.mkstemp(prefix=".devflow-agent-", dir=path.parent)
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(content)
         temporary.chmod(mode)
-        os.replace(temporary, path)
+        rollback_module().effect(ROLLBACK, path, temporary)
     finally:
         if exists(temporary):
             temporary.unlink()
@@ -207,9 +219,11 @@ def plan(source_root, skills, codex_home, force):
 
 
 def main():
-    if len(sys.argv) != 6 or sys.argv[1] not in {"preflight", "apply"}:
-        fail("usage: install-agents.py preflight|apply SOURCE_ROOT SKILLS CODEX_HOME FORCE")
-    mode, source_root, skills, codex_home, force = sys.argv[1:]
+    global ROLLBACK
+    if len(sys.argv) not in {6, 7} or sys.argv[1] not in {"preflight", "apply"}:
+        fail("usage: install-agents.py preflight|apply SOURCE_ROOT SKILLS CODEX_HOME FORCE [BACKUP]")
+    mode, source_root, skills, codex_home, force = sys.argv[1:6]
+    ROLLBACK = Path(sys.argv[6]) if len(sys.argv) == 7 else None
     check_skills_destination(skills)
     source_root = Path(source_root).expanduser().resolve()
     skills = Path(skills).resolve()
@@ -217,9 +231,11 @@ def main():
     sources, hashes, actions, obsolete, manifest_path = plan(source_root, skills, codex_home, force == "true")
     if mode == "preflight":
         return 0
+    if ROLLBACK is None:
+        fail("Agent application requires the installer snapshot; run scripts/install.sh with the original locations")
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     for target in obsolete:
-        target.unlink()
+        rollback_module().effect(ROLLBACK, target)
     for name, action in actions.items():
         if action == "copy":
             source = sources[name]
@@ -238,4 +254,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (ValueError, OSError) as exc:
         print(exc, file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
