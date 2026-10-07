@@ -178,9 +178,11 @@ class NativeProcess:
         self.timeout, self.ports, self.cancelled = timeout, ports, cancelled
         private_directory(folder)
         self.journal = folder / "native-process.json"
+        self.launch_absent = False
         if not self.journal.exists() and any(listeners(port) for port in ports):
             raise ValueError("native fixture port belongs to another process")
-        RunResources(spec).process(self.journal)
+        if self.journal.exists() or self.journal.is_symlink():
+            RunResources(spec).process(self.journal)
 
     def run(self) -> dict:
         # The monitor owns stdio and teardown independently of the activity
@@ -189,6 +191,10 @@ class NativeProcess:
         lock = os.open(
             self.folder / "native-monitor.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
         )
+        monitor = None
+        spawning = False
+        reattaching = False
+        self.launch_absent = False
         try:
             while True:
                 try:
@@ -197,7 +203,8 @@ class NativeProcess:
                 except BlockingIOError:
                     self._request_cancel()
                     time.sleep(0.03)
-            if self.journal.exists():
+            if self.journal.exists() or self.journal.is_symlink():
+                reattaching = True
                 return self._run()
             descriptor = os.open(
                 self.folder / "monitor.log", os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW,
@@ -208,6 +215,7 @@ class NativeProcess:
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                         or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
                     raise ValueError("native monitor log is not a private owned file")
+                spawning = True
                 monitor = subprocess.Popen(
                     [sys.executable, "-I", "-m", __name__],
                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=descriptor,
@@ -231,6 +239,18 @@ class NativeProcess:
             if not self.journal.exists():
                 raise RuntimeError("native monitor failed before recording its invocation")
             return self._run()
+        except Exception as exc:
+            # The monitor journals its intent before any provider child starts.
+            # A live or unjoined monitor, or an existing journal, never proves
+            # launch absence. The caller must still authenticate its DB owner.
+            if not reattaching and not os.path.lexists(self.journal) and (
+                (monitor is None and (not spawning or isinstance(exc, OSError)))
+                or (monitor is not None and monitor.poll() is not None)
+            ):
+                if monitor is not None:
+                    monitor.wait()
+                self.launch_absent = True
+            raise
         finally:
             # Do not LOCK_UN: the detached monitor shares this open file
             # description and must retain the lock if the worker disappears.
@@ -274,7 +294,9 @@ class NativeProcess:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
             intent = self._intent()
-            if self.journal.exists():
+            if self.journal.exists() or self.journal.is_symlink():
+                # Custody also covers journals appearing after construction.
+                RunResources(self.spec).process(self.journal)
                 old = read_private(self.journal)
                 if old["intent"] != intent:
                     raise ValueError("native attempt authority changed")
@@ -301,6 +323,7 @@ class NativeProcess:
             if monitor:
                 journal["monitor"] = {"pid": os.getpid(), **process_table()[os.getpid()]}
             write_private(self.journal, journal)
+            RunResources(self.spec).process(self.journal)
             write_private(
                 self.folder / "launch.json", {"argv": self.argv, "environment": self.environment}
             )

@@ -48,35 +48,35 @@ class DeliverySupervisor:
         self.capacity = capacity
         self.job_locks: dict[str, asyncio.Lock] = {}
 
+    def _enter_capacity(self, job_key: str, *, cancelled=None) -> str | None:
+        if cancelled is not None and cancelled():
+            raise ValueError("native role cancelled before capacity admission")
+        with self.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT state FROM delivery_attempts WHERE job_key=?", (job_key,)
+            ).fetchone()
+            if row is None or row["state"] != "queued":
+                raise NativeProcessUnknown("role attempt changed while waiting for capacity")
+            occupied = db.execute(
+                """SELECT COUNT(*) FROM delivery_attempts
+                   WHERE state IN ('starting','running','unknown')"""
+            ).fetchone()[0]
+            if occupied < self.capacity:
+                started = _now()
+                updated = db.execute(
+                    """UPDATE delivery_attempts SET state='starting',started_at=?
+                       WHERE job_key=? AND state='queued'""",
+                    (started, job_key),
+                ).rowcount
+                if updated != 1:
+                    raise NativeProcessUnknown("role capacity claim changed before launch")
+                return started
+        return None
+
     async def _acquire_capacity(self, job_key: str, *, cancelled=None) -> None:
         """Atomically claim one shared DB slot across config overlays and workers."""
-
-        def enter():
-            if cancelled is not None and cancelled():
-                raise ValueError("native role cancelled before capacity admission")
-            with self.store._connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                row = db.execute(
-                    "SELECT state FROM delivery_attempts WHERE job_key=?", (job_key,)
-                ).fetchone()
-                if row is None or row["state"] != "queued":
-                    raise NativeProcessUnknown("role attempt changed while waiting for capacity")
-                occupied = db.execute(
-                    """SELECT COUNT(*) FROM delivery_attempts
-                       WHERE state IN ('starting','running','unknown')"""
-                ).fetchone()[0]
-                if occupied < self.capacity:
-                    updated = db.execute(
-                        """UPDATE delivery_attempts SET state='starting',started_at=?
-                           WHERE job_key=? AND state='queued'""",
-                        (_now(), job_key),
-                    ).rowcount
-                    if updated != 1:
-                        raise NativeProcessUnknown("role capacity claim changed before launch")
-                    return True
-            return False
-
-        while not await asyncio.to_thread(enter):
+        while not await asyncio.to_thread(self._enter_capacity, job_key, cancelled=cancelled):
             # Ambiguous attempts retain their slots until reconciled.
             await asyncio.sleep(1)
 
@@ -382,12 +382,6 @@ class DeliverySupervisor:
         folder = Path(spec["state_dir"]) / "attempts" / job_key
         result_path = folder / "result.json"
         request_path = folder / "request.json"
-        native_request = {
-            **request,
-            "native_authorized": True,
-            "result_path": str(result_path),
-            "start_path": str(folder / "start.json"),
-        }
         stopped = threading.Event()
 
         def cancelled() -> bool:
@@ -399,88 +393,220 @@ class DeliverySupervisor:
                 ).fetchone()
             return row is not None and row["phase"] == "cancelling"
 
-        try:
-            await asyncio.to_thread(verify_prepared_spec, spec)
-            with self.store._connect() as db:
-                row = db.execute(
-                    "SELECT state FROM delivery_attempts WHERE job_key=?", (job_key,)
-                ).fetchone()
-            if row["state"] == "queued":
-                await self._acquire_capacity(job_key, cancelled=cancelled)
-            elif not (folder / "native-process.json").is_file():
-                return self._mark_unknown(job_key, "native prelaunch identity gap")
-            from .delivery_dashboard import launch_steering
+        entered_monitor = threading.Event()
 
-            native_request = launch_steering(self.store, native_request, job_key)
-            from .delivery_role_evidence import allocate
-
-            if not request_path.exists():
-                native_request = allocate(native_request, job_key)
-            else:
-                # A supervised reattachment keeps the original durable launch contract.
-                native_request = read_private(request_path)
-            _private_json(request_path, native_request)
-            _, environment = await asyncio.to_thread(prepare_native_role, native_request, folder)
-            process = NativeProcess(
-                spec,
-                folder,
-                argv=[
-                    sys.executable,
-                    "-I",
-                    "-m",
-                    "devflow_temporal.role_runner",
-                    str(request_path),
-                ],
-                cwd=Path(request["workspace"]),
-                environment=environment,
-                timeout=int(spec["policy"]["roles"][request["role"]].get("timeout_seconds", 7200)),
-                cancelled=cancelled,
-            )
-            def monitor():
-                # Finalize independently of the Temporal waiter. Its overall deadline
-                # can close the workflow without leaving a replacement activity.
-                try:
-                    outcome = process.run()
-                    return outcome, self._complete_native(
-                        request, native_request, process, job_key, outcome,
-                    )
-                except Exception as exc:
-                    return {"cleanup": "unknown"}, self._mark_unknown(
-                        job_key, f"native completion failed: {type(exc).__name__}",
-                    )
-
-            pending = asyncio.create_task(asyncio.to_thread(monitor))
+        def monitor():
+            # One executor owner joins admission and preparation before deciding
+            # whether cancellation preceded launch. Cancelling an asyncio waiter
+            # cannot abandon a DB claim or let preparation launch a later provider.
+            expected = None
+            fresh = False
+            process = None
             try:
-                outcome, result = await asyncio.shield(pending)
-            except asyncio.CancelledError:
-                from temporalio import activity
-
-                details = activity.cancellation_details() if activity.in_activity() else None
-                if details and not details.cancel_requested and (
-                    details.timed_out or details.not_found or details.worker_shutdown
-                ):
-                    # Temporal replaced this activity, not its durable provider turn.
-                    # The bounded monitor remains available to the next attempt;
-                    # its cancellation callback still observes a cancelled run.
-                    pending.add_done_callback(
-                        lambda task: task.exception() if not task.cancelled() else None
+                with self.store._connect() as db:
+                    expected = dict(db.execute(
+                        "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,),
+                    ).fetchone())
+                if expected["state"] == "finished":
+                    # A retry may have claimed before waiting on the job lock.
+                    self.retained_request(request)
+                    return {"cleanup": expected["cleanup"]}, json.loads(expected["result_json"])
+                fresh = expected["state"] == "queued" and not any(
+                    os.path.lexists(folder / name) for name in (
+                        "request.json", "native-process.json", "native-monitor.lock",
+                        "native-process.lock", "monitor.log", "launch.json", "ready.json",
+                        "start.json", "result.json", "cancel",
                     )
-                    raise
-                stopped.set()
-                outcome, result = await asyncio.shield(pending)
-                self._mark_unknown(
-                    job_key,
-                    "native activity cancelled during provider work",
-                    cleanup="confirmed" if outcome["cleanup"] != "unknown" else "unknown",
                 )
-                raise
+                if (expected["run_id"] != spec["run_id"]
+                        or expected["role"] != request["role"]
+                        or expected["iteration"] != request["iteration"]
+                        or expected["candidate_id"] != request["candidate"]["id"]
+                        or expected["result_path"] != str(result_path)):
+                    raise NativeProcessUnknown("native role reservation ownership changed")
+                if expected["state"] == "queued" and (not fresh or any(
+                    expected[name] is not None for name in (
+                        "pid", "process_identity", "session_id", "result_json",
+                        "started_at", "finished_at",
+                    )
+                ) or expected["cleanup"] != "none"):
+                    fresh = False
+                    raise NativeProcessUnknown("queued native role retains prior launch evidence")
+                verify_prepared_spec(spec)
+                if expected["state"] == "queued":
+                    while True:
+                        started = self._enter_capacity(job_key, cancelled=cancelled)
+                        if started:
+                            expected.update(state="starting", started_at=started)
+                            break
+                        stopped.wait(1)
+                elif not (folder / "native-process.json").is_file():
+                    return {"cleanup": "unknown"}, self._mark_unknown(
+                        job_key, "native prelaunch identity gap",
+                    )
+                if cancelled():
+                    raise ValueError("native role cancelled before monitor entry")
+                from .delivery_dashboard import launch_steering
+                from .delivery_role_evidence import allocate
+
+                native_request = launch_steering(self.store, {
+                    **request, "native_authorized": True, "result_path": str(result_path),
+                    "start_path": str(folder / "start.json"),
+                }, job_key)
+                if not request_path.exists():
+                    native_request = allocate(native_request, job_key)
+                else:
+                    # Reattachment keeps the original durable launch contract.
+                    native_request = read_private(request_path)
+                _private_json(request_path, native_request)
+                _, environment = prepare_native_role(native_request, folder)
+                if cancelled():
+                    raise ValueError("native role cancelled before monitor entry")
+                process = NativeProcess(
+                    spec, folder,
+                    argv=[sys.executable, "-I", "-m", "devflow_temporal.role_runner",
+                          str(request_path)],
+                    cwd=Path(request["workspace"]), environment=environment,
+                    timeout=int(spec["policy"]["roles"][request["role"]].get(
+                        "timeout_seconds", 7200)),
+                    cancelled=cancelled,
+                )
+                if cancelled():
+                    raise ValueError("native role cancelled before monitor entry")
+                entered_monitor.set()
+                outcome = process.run()
+                return outcome, self._complete_native(
+                    request, native_request, process, job_key, outcome,
+                )
+            except Exception as exc:
+                result = self._native_failure(
+                    request, job_key, expected, str(exc)[:300],
+                    launch_absent=fresh and (
+                        not entered_monitor.is_set() or getattr(process, "launch_absent", False)
+                    ),
+                )
+                return {"cleanup": result["cleanup"]}, result
+
+        pending = asyncio.create_task(asyncio.to_thread(monitor))
+        try:
+            _, result = await asyncio.shield(pending)
             return result
         except asyncio.CancelledError:
+            from temporalio import activity
+
+            details = activity.cancellation_details() if activity.in_activity() else None
+            if entered_monitor.is_set() and details and not details.cancel_requested and (
+                details.timed_out or details.not_found or details.worker_shutdown
+            ):
+                # An already entered durable monitor survives replacement of its
+                # Temporal waiter and still observes cancellation of its run.
+                pending.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None
+                )
+                raise
+            stopped.set()
+            while True:
+                try:
+                    outcome, result = await asyncio.shield(pending)
+                    break
+                except asyncio.CancelledError:
+                    # Repeated cancellation still cannot strand executor work.
+                    continue
+            if entered_monitor.is_set() and result.get("finish_reason") != "prelaunch":
+                self._mark_unknown(
+                    job_key, "native activity cancelled during provider work",
+                    cleanup="confirmed" if outcome["cleanup"] != "unknown" else "unknown",
+                )
             raise
-        except Exception as exc:
-            if not (folder / "native-process.json").exists():
-                return self._mark_prelaunch_blocked(job_key, str(exc)[:300])
-            return self._mark_unknown(job_key, f"native launch failed: {type(exc).__name__}")
+
+    def _native_failure(self, request, job_key, expected, reason, *, launch_absent=False):
+        """Finalize only a terminated prelaunch owner, under its monitor lock."""
+        import stat
+
+        folder = Path(request["spec"]["state_dir"]) / "attempts" / job_key
+        unknown = {
+            "status": "recovery_unknown", "summary": reason, "findings": [reason],
+            "session_id": None, "cleanup": "unknown", "usage": None,
+            "finish_reason": "recovery_unknown",
+        }
+        descriptors = []
+        try:
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,),
+                ).fetchone()
+                observer_unknown = (
+                    launch_absent and expected is not None and expected["state"] == "starting"
+                    and row is not None and row["state"] == "unknown"
+                    and row["cleanup"] == "unknown"
+                    and {k: v for k, v in dict(row).items()
+                         if k not in {"state", "cleanup", "finished_at"}}
+                    == {k: v for k, v in expected.items()
+                        if k not in {"state", "cleanup", "finished_at"}}
+                )
+                if row is None or (dict(row) != expected and not observer_unknown) or (
+                    row["run_id"] != request["spec"]["run_id"]
+                    or row["role"] != request["role"] or row["iteration"] != request["iteration"]
+                    or row["candidate_id"] != request["candidate"]["id"]
+                    or row["result_path"] != str(folder / "result.json")
+                ):
+                    return unknown
+                if row["state"] == "finished":
+                    return unknown
+                # An observer can mark an in-flight reservation unknown. Only
+                # its original fresh owner, after terminal prelaunch proof, can
+                # close that unchanged reservation; prior unknowns cannot pass.
+                confirmed = launch_absent and (
+                    row["state"] in {"queued", "starting"} or observer_unknown
+                ) and (
+                    row["pid"] is None and row["process_identity"] is None
+                    and row["session_id"] is None and row["result_json"] is None
+                    and ((row["cleanup"] == "none" and row["finished_at"] is None)
+                         or observer_unknown)
+                )
+                if confirmed:
+                    try:
+                        for name in ("native-monitor.lock", "native-process.lock"):
+                            path = folder / name
+                            if name == "native-process.lock" and not os.path.lexists(path):
+                                continue
+                            descriptor = os.open(
+                                path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600,
+                            )
+                            descriptors.append(descriptor)
+                            info = os.fstat(descriptor)
+                            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                                raise ValueError("native lock ownership changed")
+                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            named = path.lstat()
+                            if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+                                raise ValueError("native lock pathname changed")
+                        confirmed = not any(os.path.lexists(folder / name) for name in (
+                            "native-process.json", "launch.json", "ready.json",
+                            "start.json", "result.json", "cancel",
+                        ))
+                    except (OSError, ValueError):
+                        confirmed = False
+                result = {
+                    **unknown, "status": "blocked", "cleanup": "confirmed",
+                    "summary": "role launch failed before any provider process started",
+                    "finish_reason": "prelaunch",
+                } if confirmed else unknown
+                db.execute(
+                    """UPDATE delivery_attempts SET state=?,result_json=?,cleanup=?,finished_at=?
+                       WHERE job_key=?""",
+                    ("finished" if confirmed else "unknown",
+                     canonical_json(result) if confirmed else None,
+                     result["cleanup"], _now(), job_key),
+                )
+                return result
+        except (OSError, ValueError):
+            return unknown
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
     def _complete_native(self, request, native_request, process, job_key, outcome):
         from .delivery_resources import read_private, write_private
