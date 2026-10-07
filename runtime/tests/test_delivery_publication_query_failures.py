@@ -65,7 +65,7 @@ def test_real_owned_pr_query_remains_pending_in_repair_preflight(service, monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['candidate', 'permission'])
+@pytest.mark.parametrize('failure', ['candidate', 'committed_candidate', 'permission'])
 async def test_activity_confirms_pre_mutation_rejection_without_unknown_effect(
     service, monkeypatch, failure,
 ):
@@ -74,8 +74,12 @@ async def test_activity_confirms_pre_mutation_rejection_without_unknown_effect(
     broker = DeliveryBroker(store, store.spec('run-1'))
     broker.prepare()
     broker.state_dir.mkdir(parents=True, exist_ok=True)
-    if failure == 'candidate':
+    if failure in {'candidate', 'committed_candidate'}:
         (broker.checkout / 'outside.md').write_text('Outside the frozen edit scope\n')
+        if failure == 'committed_candidate':
+            delivery_broker._git(broker.checkout, 'add', 'outside.md')
+            delivery_broker._git(broker.checkout, 'commit', '--signoff',
+                                 '-m', 'docs: add an out-of-scope fixture')
     else:
         (broker.checkout / 'README.md').write_text('Owned edit\n')
     checked = broker.candidate()
@@ -98,13 +102,19 @@ async def test_activity_confirms_pre_mutation_rejection_without_unknown_effect(
         })
     assert error.value.type == 'PublicationRejected'
     assert error.value.non_retryable
+    assert broker.publication_may_have_effect is False
     assert not any('push' in argv or argv[:3] == ['gh', 'pr', 'create'] for argv in commands)
     with store._connect() as db:
         row = db.execute('SELECT state,observed_json FROM delivery_effects WHERE kind=?',
                          ('publish',)).fetchone()
-        assert row['state'] == 'pending'
-        if failure == 'candidate':
-            assert json.loads(row['observed_json'] or 'null') is None
+        if failure in {'candidate', 'committed_candidate'}:
+            assert 'outside allowed paths: outside.md' in str(error.value)
+            assert row is None
+        else:
+            assert row['state'] == 'pending'
+            observed = json.loads(row['observed_json'])
+            assert observed['head'] == delivery_broker._git(broker.checkout, 'rev-parse', 'HEAD')
+            assert observed['remote_confirmed'] is False
 
 
 @pytest.mark.asyncio
@@ -160,3 +170,28 @@ async def test_prior_lost_effect_cannot_be_reclassified_as_pre_mutation_rejectio
     assert broker.publication_may_have_effect is True
     assert not any('push' in argv or argv[:3] == ['gh', 'pr', 'create']
                    for argv in state['calls'][previous:])
+
+
+@pytest.mark.asyncio
+async def test_scope_rejection_preserves_prior_uncertain_publication(service, monkeypatch):
+    broker, checked, _published, state = published_broker(service, monkeypatch,
+                                                        lost_completion=True)
+    with broker.store._connect() as db:
+        original = dict(db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
+                                   ("publish:run-1:0",)).fetchone())
+    (broker.checkout / 'outside.md').write_text('New out-of-scope edit after a lost effect\n')
+    monkeypatch.setattr(delivery_activities, '_context', lambda _spec: (broker.store, broker))
+    previous = len(state['calls'])
+    with pytest.raises(ValueError, match='outside allowed paths: outside.md') as error:
+        await delivery_activities.delivery_publish({
+            'spec': broker.spec, 'iteration': 0, 'candidate': checked,
+        })
+    assert not isinstance(error.value, ApplicationError)
+    assert broker.publication_may_have_effect is True
+    assert not any('push' in argv or 'commit' in argv or argv[:3] == ['gh', 'pr', 'create']
+                   for argv in state['calls'][previous:])
+    with broker.store._connect() as db:
+        retained = dict(db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
+                                   ("publish:run-1:0",)).fetchone())
+    assert retained == original and retained['state'] == 'pending'
+    assert json.loads(retained['observed_json'])['remote_confirmed'] is True
