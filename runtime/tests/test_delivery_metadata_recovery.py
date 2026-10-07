@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
+from datetime import timedelta
 
 import pytest
 from test_delivery_store import _git, submit_historical_admission
@@ -11,6 +13,7 @@ from test_delivery_store import service as service
 from devflow_temporal import delivery_metadata_recovery as metadata
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 @pytest.fixture
@@ -164,19 +167,6 @@ def published(service, monkeypatch):
         "authority_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
     return store, broker, state, closed, command, title
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 def restore_admitted_metadata(store, broker, state, closed, command, title):
     """Fixture rows for an already-admitted predecessor; never an admission API or history."""
@@ -345,3 +335,136 @@ def test_metadata_gate_namespace_refuses_foreign_alias_or_changed_custody(publis
     if change in {'foreign', 'alias', 'raw-spec', 'seal'}:
         assert not expected.exists()
     assert original.state_dir == broker.state_dir
+
+
+@pytest.mark.parametrize("failed_stage", [None, "prepublish", "local"])
+def test_metadata_workflow_runs_deterministic_gates_without_any_provider_turn(
+    published, monkeypatch, failed_stage,
+):
+    store, broker, state, closed, command, title = published
+    recovery = restore_admitted_metadata(store, broker, state, closed, command, title)
+    flow = DeliveryWorkflow()
+    called, projections = [], []
+    before = broker.spec["policy"]["max_repairs"]
+
+    async def project(_spec, event, _message):
+        projections.append(event)
+
+    async def execute(name, request, **_kwargs):
+        called.append(name)
+        assert name != "delivery_role"
+        if name == "delivery_tracker_start":
+            return {"state": "consistent"}
+        stage = {"delivery_precheck": "prepublish", "delivery_checks": "local"}.get(name)
+        if stage and stage == failed_stage:
+            return {"state": "failed", "candidate_id": recovery["candidate"]["id"],
+                    "cleanup": "confirmed", "results": [
+                        {"id": "retained-check", "passed": False, "exit_code": 1},
+                    ]}
+        return {"state": "passed", "cleanup": "confirmed"}
+
+    monkeypatch.setattr(flow, "_project", project)
+    monkeypatch.setattr(flow, "_activity", execute)
+    result = asyncio.run(flow._resume_metadata(broker.spec, recovery))
+    assert result["roles"] == recovery["state"]["roles"]
+    assert result["outcome"] == "blocked"
+    assert result["iteration"] == recovery["state"]["iteration"] == 1
+    assert broker.spec["policy"]["max_repairs"] == before
+    expected = ["delivery_metadata_readback", "delivery_tracker_start", "delivery_precheck"]
+    if failed_stage != "prepublish":
+        expected.append("delivery_checks")
+    assert called == expected
+    assert projections == ["metadata_validation_started", "blocked"]
+    assert result["error"] == (
+        "repair limit exhausted" if failed_stage
+        else "metadata reconciled; independent source assessment remains incomplete"
+    )
+    assert result["findings"][:1] == state["findings"]
+    if failed_stage:
+        assert result["checks"][failed_stage]["state"] == "failed"
+        assert len(result["findings"]) == len(state["findings"]) + 1
+        assert failed_stage in result["findings"][-1]
+        assert recovery["candidate"]["id"] in result["findings"][-1]
+        assert "retained-check" in result["findings"][-1]
+    else:
+        assert result["findings"] == state["findings"]
+        assert result["checks"]["local"]["state"] == "passed"
+
+
+def test_prequeue_metadata_intent_is_visible_without_a_detail_phase(published):
+    store, broker, _state, _closed, _command, _title = published
+    root = broker.state_dir / "metadata-reconciliation"
+    root.mkdir(mode=0o700)
+    metadata._immutable(root / "intent.json", {"kind": "published_metadata_recovery"})
+    detail = store.detail("run-1")
+    assert detail["phase"] == "blocked"
+    assert detail["metadata_reconciliation"] is None
+    indexed = {item["id"] for item in store.evidence_index("run-1")}
+    assert "metadata-reconciliation-intent" in indexed
+    assert store.evidence("run-1", "metadata-reconciliation-intent")["sha256"] == (
+        hashlib.sha256((root / "intent.json").read_bytes()).hexdigest()
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_temporal_metadata_successor_uses_production_activities_and_zero_provider_roles(
+    published,
+):
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    from devflow_temporal.delivery_activities import (
+        delivery_checks,
+        delivery_metadata_readback,
+        delivery_precheck,
+        delivery_project,
+        delivery_tracker_start,
+    )
+
+    store, broker, state, closed, command, title = published
+    recovery = restore_admitted_metadata(store, broker, state, closed, command, title)
+    expected = {"old_head": recovery["old_head"], "new_head": recovery["new_head"],
+                "mapping_sha256": digest(recovery["mapping"]), "provider_turns": 0}
+    queued = store.detail("run-1")
+    assert queued["phase"] == "metadata_validation_queued"
+    assert queued["queued"]
+    assert queued["metadata_reconciliation"] == expected
+    with store._connect() as db:
+        before = db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0]
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="metadata-real",
+            workflows=[DeliveryWorkflow],
+            activities=[delivery_metadata_readback, delivery_tracker_start, delivery_precheck,
+                        delivery_checks, delivery_project],
+        ):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run, args=[broker.spec, recovery],
+                id="delivery-run-1-metadata-1", task_queue="metadata-real",
+                execution_timeout=timedelta(seconds=45),
+            )
+            result = await handle.result()
+            history = await handle.fetch_history()
+    scheduled = [
+        event.activity_task_scheduled_event_attributes.activity_type.name
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+    assert "delivery_role" not in scheduled
+    assert [name for name in scheduled if name != "delivery_project"] == [
+        "delivery_metadata_readback", "delivery_tracker_start",
+        "delivery_precheck", "delivery_checks",
+    ]
+    assert result["outcome"] == "blocked"
+    assert result["error"] == (
+        "metadata reconciled; independent source assessment remains incomplete"
+    )
+    assert result["checks"]["local"]["state"] == "passed"
+    assert result["roles"] == recovery["state"]["roles"]
+    assert result["findings"] == state["findings"]
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == before
+    final = store.detail("run-1")
+    assert final["phase"] == "blocked"
+    assert final["metadata_reconciliation"] == expected

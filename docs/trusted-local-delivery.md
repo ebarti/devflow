@@ -246,27 +246,17 @@ directory scan, manual copying race or shared cache cleanup is required.
 Installation, service restart and managed recovery require the separately
 assigned operational verification. This repair does not merge or deploy.
 
-Stopped published metadata has a separate bounded reconciliation. The public
-`metadata-preflight --id RUN --request REQUEST.json` command authenticates the
-closed workflow, exact clean local/remote/PR head, controller publication range,
-source scope, configured existing signer and resource cleanup. A gates-first
-publication binds the exact retained implementation through its durable policy
-recovery, controller-held input candidate and copied closed role envelope; it
-does not require an implementation at that publication iteration or infer one
-from proximity. The same request
-is used by `reconcile-published-metadata`. Its fields are `command_id`,
-`expected_revision`, `expected_candidate_id`, `expected_head`,
-`expected_pr_number`, `expected_signer`, `authority_path`, and
-`authority_sha256`. The authority receipt permits one command per admitted
-original run and at most two admitted run IDs. The controller retains every old
-commit object and preservation ref, each tree/author/author date, the original
-receipts and an immutable old-to-new mapping. It changes commit subjects and
-actual author sign-off, with an exact remote force-with-lease; a changed remote,
-foreign commit, source edit, merged PR or unknown identity is refused. Replay
-uses the same command and request after a known interrupted effect.
+Published metadata reconciliation is retired for new commands. The API, client,
+tools, CLI and store no longer expose `metadata-preflight` or
+`reconcile-published-metadata`; the commit rewrite, force-with-lease and PR-title
+writer are removed. Existing admitted metadata inputs and their evidence remain
+readable. An interrupted write must finish under the previous runtime before
+updating: replaying its old command on the new runtime cannot finish it. Follow
+the [metadata deployment drain instructions](temporal-runtime.md#retired-published-metadata-admissions),
+including pending commands, archived runs and nested recoveries.
 
-Metadata validation runs no implementation, review or QA provider turn. It runs
-fresh native gates and retains explicit source-identical applicability for a
+Already-admitted metadata validation runs no implementation, review or QA provider
+turn. It runs fresh native gates and retains explicit source-identical applicability for a
 prior genuine independent PASS. A missing QA assessment remains incomplete.
 A failed gate remains blocked with its fresh evidence. Neither an old CI result
 nor an old head assessment is presented as a new head rerun.

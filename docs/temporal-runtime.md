@@ -137,13 +137,20 @@ evidence and existing `published_metadata_recovery` workflow inputs stay readabl
 the workflow dispatch, `delivery_metadata_readback` activity, evidence applicability,
 source/candidate validation and shared resource/identity helpers remain unchanged.
 
-Operator steps before deployment: under the previous runtime, inspect the full
-retained run inventory and each run's detail/evidence for pending metadata commands,
-`metadata_reconciling` effects/intents and `metadata_validation_queued` or
-`metadata_validation` executions. Include archived records and metadata nested
-inside tracker, gates, technical, title or other recovery inputs; the outer phase
-alone is insufficient. Finish pending writes under that runtime and finish or cancel
-all nested queued/running executions before updating. Unknown effects require
+Operator steps before deployment: under the previous runtime, audit the retained
+`delivery_metadata_recoveries` rows for `state = 'pending'` and the corresponding
+saved commands. `metadata_reconciling` is a command response, not a run-detail
+phase. Also inspect the indexed `metadata-reconciliation-intent` evidence for each
+run and compare it with the saved recovery input and queued/validated metadata
+rows. An intent can predate a row or appear under a later nested recovery; its
+presence alone does not establish completion. Run detail alone cannot rule out
+an interrupted prequeue write.
+
+Include archived runs and metadata nested inside tracker, gates, technical, title
+or other recovery inputs. Finish every pending write under the previous runtime;
+finish or cancel all queued/running metadata executions, including nested ones,
+and confirm owned resource cleanup before updating. Unknown effects require
 readback on the previous runtime, never a fresh command or assumed completion.
-The retained readers replay admitted work; they cannot finish an interrupted writer.
-No rows or history are deleted and no schema migration is required.
+These are owner deployment checks; the retained readers cannot finish an
+interrupted writer. No rows or history are deleted and no schema migration is
+required.
