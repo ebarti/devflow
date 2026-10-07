@@ -7,6 +7,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -24,7 +25,8 @@ from temporalio.api.enums.v1 import TaskQueueType
 from temporalio.api.taskqueue.v1 import TaskQueue
 from temporalio.api.workflowservice.v1 import DescribeTaskQueueRequest
 from temporalio.client import Client
-from temporalio.worker import Worker
+from temporalio.common import VersioningBehavior
+from temporalio.worker import Worker, WorkerDeploymentConfig, WorkerDeploymentVersion
 
 from .delivery_activities import DELIVERY_ACTIVITIES
 from .delivery_api import create_app
@@ -245,11 +247,15 @@ def _ready(config: DeliveryConfig, manifest: dict, deadline: float) -> bool:
             "pid": processes["worker"]["pid"],
             "identity": processes["worker"]["identity"],
             "config_path": str(config.path),
+            **({"deployment": processes["worker"]["deployment"]}
+               if "deployment" in processes["worker"] else {}),
         }
     )
 
 
-def ensure_service_running(config: DeliveryConfig) -> dict:
+def ensure_service_running(
+    config: DeliveryConfig, *, deployment: WorkerDeploymentConfig | None = None,
+) -> dict:
     deadline = _deadline(config)
     try:
         _ports(config)
@@ -262,6 +268,10 @@ def ensure_service_running(config: DeliveryConfig) -> dict:
                     raise ValueError("state root has a running service for another configuration")
                 while True:
                     if _ready(config, existing, deadline):
+                        if (deployment is not None and existing["processes"]["worker"].get(
+                                "deployment") != _deployment_identity(deployment)):
+                            raise ValueError(
+                                "running worker deployment differs; drain it before changing")
                         return {"dashboard_url": config.dashboard_url, **existing}
                     processes = existing["processes"]
                     if set(processes) != {"temporal", "worker", "api"} or not all(
@@ -274,7 +284,8 @@ def ensure_service_running(config: DeliveryConfig) -> dict:
                 _stop(config, existing)
                 if any(_owned(process) for process in existing["processes"].values()):
                     raise ValueError("owned service termination is pending; inspect service status")
-            return _start(config, deadline)
+            return (_start(config, deadline, deployment=deployment) if deployment
+                    else _start(config, deadline))
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(
             f"local service startup failed: {exc}; logs: "
@@ -284,15 +295,20 @@ def ensure_service_running(config: DeliveryConfig) -> dict:
         ) from None
 
 
-def service_start(config: DeliveryConfig) -> dict:
-    return ensure_service_running(config)
+def service_start(
+    config: DeliveryConfig, *, deployment: WorkerDeploymentConfig | None = None,
+) -> dict:
+    return (ensure_service_running(config, deployment=deployment) if deployment
+            else ensure_service_running(config))
 
 
 def _dashboard_bundle() -> Path:
     return Path(__file__).resolve().parents[2] / "ui" / "dist" / "index.html"
 
 
-def _start(config: DeliveryConfig, deadline: float) -> dict:
+def _start(
+    config: DeliveryConfig, deadline: float, *, deployment: WorkerDeploymentConfig | None = None,
+) -> dict:
     bundle = _dashboard_bundle()
     if not bundle.is_file():
         raise ValueError("dashboard bundle is missing; build runtime/ui before service start")
@@ -337,8 +353,14 @@ def _start(config: DeliveryConfig, deadline: float) -> dict:
                 "--config",
                 str(config.path),
                 "worker",
+                *([] if deployment is None else [
+                    "--deployment-name", deployment.version.deployment_name,
+                    "--deployment-build-id", deployment.version.build_id,
+                ]),
             ],
         )
+        if deployment is not None:
+            processes["worker"]["deployment"] = _deployment_identity(deployment)
         _write_manifest(config, processes)
         processes["api"] = _launch(
             config,
@@ -364,7 +386,27 @@ def _start(config: DeliveryConfig, deadline: float) -> dict:
     return {"dashboard_url": config.dashboard_url, "processes": processes}
 
 
-async def worker(config: DeliveryConfig) -> None:
+def _deployment_identity(deployment: WorkerDeploymentConfig) -> dict:
+    return {"name": deployment.version.deployment_name, "build_id": deployment.version.build_id}
+
+
+def _worker_deployment(name: str | None, build_id: str | None) -> WorkerDeploymentConfig | None:
+    if name is None and build_id is None:
+        return None
+    if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name)
+            or not isinstance(build_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", build_id)):
+        raise ValueError(
+            "deployment name and build ID must be supplied together as bounded identifiers")
+    return WorkerDeploymentConfig(
+        WorkerDeploymentVersion(name, build_id), use_worker_versioning=True,
+        default_versioning_behavior=VersioningBehavior.PINNED,
+    )
+
+
+async def worker(
+    config: DeliveryConfig, *, deployment: WorkerDeploymentConfig | None = None,
+) -> None:
     identity = f"devflow-{os.getpid()}-{time.time_ns()}"
     client = await Client.connect(
         config.temporal_address,
@@ -377,6 +419,7 @@ async def worker(config: DeliveryConfig) -> None:
         workflows=[DeliveryWorkflow],
         activities=DELIVERY_ACTIVITIES,
         identity=identity,
+        **({"deployment_config": deployment} if deployment is not None else {}),
     ):
         # Registration of both pollers proves readiness without starting a workflow.
         deadline = _deadline(config)
@@ -402,6 +445,8 @@ async def worker(config: DeliveryConfig) -> None:
             "identity": _process_identity(os.getpid()),
             "config_path": str(config.path),
         }
+        if deployment is not None:
+            readiness["deployment"] = _deployment_identity(deployment)
         descriptor = os.open(marker, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(readiness, stream)
@@ -450,6 +495,8 @@ def main() -> None:
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
     parser.add_argument("--id", help="run ID")
     parser.add_argument("--evidence-id", help="indexed evidence ID")
+    parser.add_argument("--deployment-name", help="explicit Temporal worker deployment")
+    parser.add_argument("--deployment-build-id", help="immutable retained source artifact version")
     args = parser.parse_args()
     try:
         _run(args, parser)
@@ -458,9 +505,13 @@ def main() -> None:
 
 
 def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    deployment = _worker_deployment(
+        getattr(args, "deployment_name", None), getattr(args, "deployment_build_id", None))
+    if deployment is not None and args.command not in {"start", "worker"}:
+        parser.error("worker deployment options apply only to start or worker")
     config = _config(args.config)
     if args.command == "worker":
-        asyncio.run(worker(config))
+        asyncio.run(worker(config, deployment=deployment))
         return
     if args.command == "api":
         host, port, _, _ = _ports(config)
@@ -564,7 +615,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         print(json.dumps(result, sort_keys=True, indent=2))
         return
     if args.command == "start":
-        print(json.dumps(service_start(config), sort_keys=True))
+        print(json.dumps(service_start(config, deployment=deployment), sort_keys=True))
         return
     manifest = _read_manifest(config)
     if args.command == "status":

@@ -929,7 +929,7 @@ class DeliveryWorkflow:
             spec, start_iteration=self.state["iteration"],
             prior_implementer_session=implementation.get("session_id"), repair_findings=[],
             continuation=None, recovery=None, authorized_max_iteration=self.state["iteration"],
-            published_checkpoint=True, post_handoff_checkpoint=True,
+            published_checkpoint=True,
         )
 
     async def _resume_published_gates(self, spec, recovery):
@@ -963,7 +963,7 @@ class DeliveryWorkflow:
                 self.state["roles"]) if role.get("role") == "implement"), None),
             repair_findings=[], continuation=None, recovery=None,
             authorized_max_iteration=self.state["iteration"],
-            resume_prechecks=True, published_checkpoint=published, post_handoff_checkpoint=True,
+            resume_prechecks=True, published_checkpoint=published,
         )
 
     async def _resume_ci(self, spec, recovery):
@@ -1561,7 +1561,6 @@ class DeliveryWorkflow:
         allow_first_session: bool = False,
         resume_prechecks: bool = False,
         published_checkpoint: bool = False,
-        post_handoff_checkpoint: bool = False,
         title_constraint: dict[str, Any] | None = None,
         verify_only: bool = False,
     ) -> dict[str, Any]:
@@ -1783,14 +1782,7 @@ class DeliveryWorkflow:
                 )
             repair_findings = []
             qa_evidence = None
-            # Pre-handoff histories checked before QA; histories recorded after
-            # the handoff change already checked before review without an order
-            # marker. Preserve both while marking this order for new executions.
-            checks_before_review = (
-                workflow.patched("local-checks-before-review-v1")
-                or post_handoff_checkpoint
-                or workflow.patched("role-evidence-handoff-v1")
-            )
+            checks_before_review = workflow.patched("local-checks-before-review-v1")
             for role in (("verify",) if verify_only else ("review", "verify")):
                 if self.cancel_requested:
                     return await self._cancelled(spec)
