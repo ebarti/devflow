@@ -38,10 +38,8 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             recovery_preflight=lambda run_id: {"run_id": run_id, "precheck_sha256": "a" * 64},
             recover_execution=lambda run_id, request: {"run_id": run_id, **request},
             reconcile_tracker=lambda run_id, request: {"run_id": run_id, **request},
-            reconcile_published_metadata=lambda run_id, request: {"run_id": run_id, **request},
             gates_only_preflight=lambda run_id: {"run_id": run_id},
             admit_gates_only=lambda run_id, request: {"run_id": run_id, **request},
-            metadata_preflight=lambda run_id, request: {"run_id": run_id, **request},
             repair_admission_preflight=lambda run_id, request: {"run_id": run_id, **request},
             continue_repair=lambda run_id, request: {"run_id": run_id, **request},
         )
@@ -63,10 +61,8 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "recovery_preflight",
             "recover_execution",
             "reconcile_tracker",
-            "reconcile_published_metadata",
             "gates_only_preflight",
             "admit_gates_only",
-            "metadata_preflight",
             "repair_admission_preflight",
             "continue_repair",
         }
@@ -77,7 +73,6 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "read_evidence",
             "recovery_preflight",
             "gates_only_preflight",
-            "metadata_preflight",
             "repair_admission_preflight",
         ):
             assert tools[name].annotations.readOnlyHint is True
@@ -90,7 +85,6 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "cancel_run",
             "recover_execution",
             "reconcile_tracker",
-            "reconcile_published_metadata",
             "admit_gates_only",
             "continue_repair",
         ):
@@ -130,9 +124,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "expected_revision": 13,
         }
         for name in (
-            "reconcile_published_metadata",
             "admit_gates_only",
-            "metadata_preflight",
             "repair_admission_preflight",
             "continue_repair",
         ):
@@ -147,8 +139,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         result = await session.call_tool("gates_only_preflight", {"run_id": "same-run"})
         assert not result.isError and json.loads(result.content[0].text) == {"run_id": "same-run"}
         assert seen == [(factory, config) for factory in (
-            "read", "read", "write", "write", "write", "write",
-            "read", "read", "write", "read",
+            "read", "read", "write", "write", "write", "read", "write", "read",
         )]
 
 

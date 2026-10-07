@@ -180,3 +180,30 @@ without releasing the claim; unavailable observations exhaust into recoverable
 original activity result shapes.
 
 Run lists return up to 50 observations by default (maximum 100). `/api/runs`, CLI `runs` and MCP `list_runs` accept `limit`, `cursor` and `archived`; CLI uses `--limit`, `--cursor` and `--archived`. Follow a returned `next_cursor` explicitly to read older history, keeping the same archive filter. Ordering uses last-update time and run ID. These are live observations, so concurrent updates can move rows between pages; cursors do not freeze history. The dashboard polls only the recent page every five seconds. **Load older tasks** retrieves one older page on demand and retains its rows without polling that page; toggling the archive collection resets older observations. Direct run URLs remain available, and statistics still include complete stored history.
+
+### Retired published-metadata admissions
+
+Fresh `metadata-preflight` and `reconcile-published-metadata` commands are no
+longer exposed by the API, client, tools, CLI or store. Their commit-range rewrite,
+force-with-lease and PR-title writer are removed. Retained metadata rows, immutable
+evidence and existing `published_metadata_recovery` workflow inputs stay readable;
+the workflow dispatch, `delivery_metadata_readback` activity, evidence applicability,
+source/candidate validation and shared resource/identity helpers remain unchanged.
+
+Operator steps before deployment: under the previous runtime, audit the retained
+`delivery_metadata_recoveries` rows for `state = 'pending'` and the corresponding
+saved commands. `metadata_reconciling` is a command response, not a run-detail
+phase. Also inspect the indexed `metadata-reconciliation-intent` evidence for each
+run and compare it with the saved recovery input and queued/validated metadata
+rows. An intent can predate a row or appear under a later nested recovery; its
+presence alone does not establish completion. Run detail alone cannot rule out
+an interrupted prequeue write.
+
+Include archived runs and metadata nested inside tracker, gates, technical, title
+or other recovery inputs. Finish every pending write under the previous runtime;
+finish or cancel all queued/running metadata executions, including nested ones,
+and confirm owned resource cleanup before updating. Unknown effects require
+readback on the previous runtime, never a fresh command or assumed completion.
+These are owner deployment checks; the retained readers cannot finish an
+interrupted writer. No rows or history are deleted and no schema migration is
+required.
