@@ -497,6 +497,7 @@ class DeliveryStore:
                     (command_id, run_id, request_digest, canonical_json(response)),
                 )
                 return response
+            self._freeze_issue_budget(db, spec)
             work = self.state.row(db, "works", spec["work_id"])
             if work is None:
                 self.state.record(
@@ -606,6 +607,23 @@ class DeliveryStore:
                 (command_id, run_id, request_digest, canonical_json(response)),
             )
             return response
+
+    def _freeze_issue_budget(self, db: sqlite3.Connection, spec: dict[str, Any]) -> None:
+        """Use all admissions, not the dashboard's visible subset, under the claim transaction."""
+        issue = self.state.issue_resource(spec["issue_url"])
+        previous = [json.loads(row["request_json"]) for row in db.execute(
+            "SELECT issue_url,request_json FROM delivery_runs ORDER BY created_at,run_id"
+        ) if self.state.issue_resource(row["issue_url"]) == issue]
+        frozen = next((item["policy"]["max_attempts"] for item in previous
+                       if item.get("retry_budget_version") == 1), None)
+        maximum = frozen if frozen is not None else spec["policy"].get("max_attempts")
+        if maximum is None:
+            return
+        if len(previous) >= maximum:
+            raise ValueError("issue attempt budget is exhausted")
+        spec["retry_budget_version"] = 1
+        spec["policy"]["max_attempts"] = maximum
+        spec["policy_digest"] = digest(spec["policy"])
 
     def owns_execution(self, spec: dict[str, Any]) -> bool:
         """Shared database visibility does not grant another service's transport."""
@@ -1022,6 +1040,11 @@ class DeliveryStore:
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
+        if (self.submitted_spec(run_id).get("retry_budget_version") == 1
+                and isinstance(supplied, dict)
+                and type(supplied.get("additional_iterations")) is int
+                and supplied["additional_iterations"] > 0):
+            raise ValueError("a fixed repair budget cannot receive additional iterations")
         if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') == 'stopped_delivery_resume'):
             from .delivery_stopped_resume import admit

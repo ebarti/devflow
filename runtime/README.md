@@ -13,6 +13,21 @@ Unknown completion, lost transport, cancellation, authentication or budget error
 collaboration conflicts and assessment findings never authorize another turn.
 Existing frozen runs without this setting retain their one-attempt behavior.
 
+### Fixed retry budgets
+
+Set `max_attempts` (1–10, for example 3) in the service configuration to enable
+fixed budgets for new admissions. The first budgeted admission freezes the issue's
+attempt ceiling; all previous admissions, including archived and failed runs,
+consume it. Changing run IDs, work IDs, or later configuration cannot reset that
+ceiling. Replaying an accepted command does not consume another attempt.
+
+These runs also keep their original `max_repairs` ceiling. Public continuations
+cannot add implementation iterations, and native roles cannot use historical
+grant rows to exceed it. Existing configurations and histories without the frozen
+budget version retain their original behavior. Budgets are scoped to one
+authoritative tracking database; separate databases cannot enforce a shared limit.
+This supplies admission bounds for automatic retries; it does not add resubmission.
+
 ### Rerun gates after a runtime repair
 
 A finalized native run that published a PR and stopped on review or QA can receive
