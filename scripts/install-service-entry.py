@@ -44,17 +44,8 @@ def install(skills, home, force, backup=None):
     rollback.exchange_function()
     guard = load("install-delivery-launchers")
     agents.check_skills_destination(str(skills))
-    # Retire existing global registrations explicitly. Normal installation neither
-    # removes foreign host state nor recreates the old controller hooks.
-    if any(
-        os.path.lexists(home / n) for n in (".devflow-install.json", ".devflow-hook.py")
-    ):
-        raise ValueError("retire inspected old Devflow hook/guard registrations first")
-    for name in (ROOT / "skills").iterdir():
-        if (skills / name.name / "SKILL.md").exists():
-            raise ValueError(
-                "retire inspected direct-agent skills before service installation"
-            )
+    migration_helper = load("install-migration")
+    migration = migration_helper.plan(ROOT, skills, home, guard)
     _, _, actions, obsolete, _ = agents.plan(ROOT, skills, home, force)
     service = skills / "devflow-local-delivery"
     source = ROOT / "runtime/desktop/devflow-local-delivery"
@@ -78,7 +69,9 @@ def install(skills, home, force, backup=None):
         for p in (ROOT / "skills/devflow").iterdir()
         if p.name not in {"SKILL.md", "__pycache__"}
     ]
-    if os.path.lexists(compatibility):
+    if os.path.lexists(compatibility) and not (
+        migration and compatibility in migration["links"]
+    ):
         # Preserve the authentic old real paths used by already-running work.
         guard.directory(compatibility.resolve())
         if {p.name for p in compatibility.iterdir()} != {p.name for p in children}:
@@ -94,6 +87,7 @@ def install(skills, home, force, backup=None):
                     "retained helper/reference bytes differ from current source"
                 )
     MUTATING = True
+    migration_helper.apply(migration, ROOT, skills, agents, rollback, backup)
     if obsolete or any(action == "copy" for action in actions.values()):
         subprocess.run(
             [
@@ -119,7 +113,7 @@ def install(skills, home, force, backup=None):
     if not plugin.exists() and not os.path.lexists(service):
         service.symlink_to(source)
         rollback.created(backup, service)
-    print("Installed the delivery service entry and internal roles; hooks unchanged.")
+    print("Installed the delivery service entry and internal roles; previous owned registrations migrated when present.")
 
 
 if __name__ == "__main__":
