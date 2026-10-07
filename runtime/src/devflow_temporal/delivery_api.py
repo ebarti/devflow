@@ -185,7 +185,20 @@ class DeliveryService:
                 # Any interrupted dispatching record becomes visible unknown on
                 # the next exclusive pump, without repeating its external effect.
                 pass
+            try:
+                await self.reconcile_closed_native_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Failed maintenance never acknowledges starts or releases claims.
+                pass
             await asyncio.sleep(5)
+
+    async def reconcile_closed_native_once(self) -> None:
+        from .delivery_orphans import reconcile_closed_native
+
+        client = await self.healthy_client()
+        await reconcile_closed_native(self.store, client)
 
     async def dispatch_questions_once(self) -> None:
         from .delivery_question_sender import pump_blocking_questions
