@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import fcntl
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 import subprocess
 import sys
-from contextlib import nullcontext
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -17,12 +21,145 @@ from temporalio.exceptions import ApplicationError
 
 from .candidate import candidate_for
 from .contracts import digest
-from .delivery_broker import CheckPreparationFailure, DeliveryBroker
+from .delivery_broker import CheckCancelledBeforeLaunch, CheckPreparationFailure, DeliveryBroker
 from .delivery_config import DeliveryConfig
-from .delivery_preparation import _lock
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
+
+_CHECK_HEARTBEAT_INTERVAL = 5
+_UNCLEAN_CHECK_SLOTS: list[int] = []
+
+
+def _cancelled_check_result(request: dict[str, Any], broker: DeliveryBroker) -> dict[str, Any]:
+    # Rejecting this launch cannot establish cleanup for any earlier child.
+    confirmed = broker.native_cleanup_confirmed
+    result = {"state": "failed" if confirmed else "unknown",
+              "cleanup": "confirmed" if confirmed else "unknown",
+              "cancelled": True, "results": []}
+    if "candidate" in request:
+        result["candidate_id"] = request["candidate"]["id"]
+    else:
+        result["base_sha"] = request["spec"]["base_sha"]
+    return result
+
+
+def _try_check_lock(path: Path) -> int | None:
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise ValueError("check lock is not private and owned")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descriptor
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+async def _execute_check(
+    request: dict[str, Any], execute, *, ports: tuple[int, ...] = (),
+) -> dict[str, Any]:
+    """Bound native gates across workers and join their monitor on cancellation."""
+    cancelled = threading.Event()
+    admitted = threading.Event()
+    ports_admitted = threading.Event()
+
+    def run():
+        from .delivery_resources import private_directory
+
+        store, broker = _context(request["spec"])
+        broker.check_cancelled = cancelled.is_set
+        if request["spec"]["provider"] != "codex":
+            admitted.set()
+            return execute(broker)
+        root = store.config.state_root / "check-execution"
+        private_directory(root)
+        slots = store.config.raw.get("check_concurrency", 2)
+        descriptor = None
+        port_descriptors = []
+        try:
+            # Frozen port sets may overlap across runs. Acquire them in one
+            # consistent order, before consuming generic check capacity.
+            for port in sorted(set(ports)):
+                while not cancelled.is_set() and not broker._native_cancelled():
+                    handle = _try_check_lock(root / f"port-{port}.lock")
+                    if handle is not None:
+                        port_descriptors.append(handle)
+                        break
+                    cancelled.wait(0.1)
+                else:
+                    raise CheckCancelledBeforeLaunch(
+                        "native check cancelled while queued for ports"
+                    )
+            ports_admitted.set()
+            while not cancelled.is_set() and not broker._native_cancelled():
+                for slot in range(slots):
+                    handle = _try_check_lock(root / f"slot-{slot}.lock")
+                    if handle is None:
+                        continue
+                    descriptor = handle
+                    break
+                if descriptor is not None:
+                    if cancelled.is_set() or broker._native_cancelled():
+                        raise CheckCancelledBeforeLaunch("native check cancelled before admission")
+                    admitted.set()
+                    result = execute(broker)
+                    if not broker.native_cleanup_confirmed:
+                        result = {**result, "state": "unknown", "cleanup": "unknown"}
+                    return result
+                cancelled.wait(0.1)
+            raise CheckCancelledBeforeLaunch("native check cancelled while queued for a slot")
+        except CheckCancelledBeforeLaunch:
+            return _cancelled_check_result(request, broker)
+        finally:
+            if descriptor is not None:
+                port_descriptors.append(descriptor)
+            if broker.native_cleanup_confirmed:
+                for handle in port_descriptors:
+                    os.close(handle)
+            else:
+                # Unknown teardown cannot supply ports or capacity to another gate.
+                _UNCLEAN_CHECK_SLOTS.extend(port_descriptors)
+
+    execution = asyncio.get_running_loop().run_in_executor(
+        None, contextvars.copy_context().run, run,
+    )
+
+    async def wait_for_executor():
+        return await asyncio.shield(execution)
+
+    pending = asyncio.create_task(wait_for_executor())
+    try:
+        while not pending.done():
+            if activity.in_activity():
+                stage = ("executing-check" if admitted.is_set() else
+                         "waiting-browser-ports" if ports and not ports_admitted.is_set() else
+                         "waiting-check-slot")
+                activity.heartbeat({
+                    "run_id": request["spec"]["run_id"],
+                    "stage": stage,
+                })
+            await asyncio.wait({pending}, timeout=_CHECK_HEARTBEAT_INTERVAL)
+        return await asyncio.shield(pending)
+    except BaseException:
+        cancelled.set()
+        # The task can be cancelled during shutdown without stopping its
+        # executor. Join that original future before returning cancellation.
+        while not execution.done():
+            try:
+                await asyncio.shield(execution)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not execution.cancelled():
+            execution.exception()
+        raise
 
 
 async def _with_heartbeat(operation, request: dict[str, Any], stage: str) -> dict[str, Any]:
@@ -292,9 +429,12 @@ async def _run_role(request: dict[str, Any]) -> dict[str, Any]:
     if (role == "implement" and request["spec"].get("provider") == "codex"
             and request["spec"]["policy"].get("host_sandbox") == "trusted-local"
             and retained is None):
-        prerequisites = await asyncio.to_thread(
-            broker.run_implementation_preparation, iteration, candidate,
-        )
+        try:
+            prerequisites = await asyncio.to_thread(
+                broker.run_implementation_preparation, iteration, candidate,
+            )
+        except CheckCancelledBeforeLaunch:
+            prerequisites = _cancelled_check_result(request, broker)
         if prerequisites.get("state") != "passed":
             return {"status": "blocked", "role": role, "iteration": iteration,
                     "candidate": candidate, "cleanup": prerequisites.get("cleanup", "unknown"),
@@ -455,19 +595,17 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_checks")
 async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
-    def execute() -> dict[str, Any]:
-        store, broker = _context(request["spec"])
+    def execute(broker: DeliveryBroker) -> dict[str, Any]:
         try:
-            with (_lock(store.config.state_root / "check-execution")
-                  if request["spec"]["provider"] == "codex" else nullcontext()):
-                return broker.run_checks(request["iteration"], request["candidate"])
+            return broker.run_checks(request["iteration"], request["candidate"])
         except CheckPreparationFailure as exc:
             return {'state': 'failed', 'cleanup': 'confirmed',
                     'candidate_id': request['candidate']['id'],
                     'source_unchanged': broker.candidate()['id'] == request['candidate']['id'],
                     'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
-            if request["spec"]["provider"] != "codex":
+            if (request["spec"]["provider"] != "codex"
+                    or isinstance(exc, CheckCancelledBeforeLaunch)):
                 raise
             return {
                 "state": "unknown",
@@ -476,19 +614,17 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
                 "reason": type(exc).__name__,
             }
 
-    return await _with_heartbeat(asyncio.to_thread(execute), request, 'checks')
+    return await _with_heartbeat(_execute_check(request, execute), request, 'checks')
 
 
 @activity.defn(name="delivery_browser_qa")
 async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
-    def execute() -> dict[str, Any]:
-        store, broker = _context(request["spec"])
+    def execute(broker: DeliveryBroker) -> dict[str, Any]:
         try:
-            with (_lock(store.config.state_root / "check-execution")
-                  if request["spec"]["provider"] == "codex" else nullcontext()):
-                return broker.run_browser_qa(request["iteration"], request["candidate"])
+            return broker.run_browser_qa(request["iteration"], request["candidate"])
         except Exception as exc:
-            if request["spec"]["provider"] != "codex":
+            if (request["spec"]["provider"] != "codex"
+                    or isinstance(exc, CheckCancelledBeforeLaunch)):
                 raise
             return {
                 "state": "unknown",
@@ -500,24 +636,26 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
     # Browser/API fixtures may run for minutes. Keep the Temporal worker loop
     # available for cancellation updates and unrelated workflows while this
     # bounded child is supervised on its own thread.
-    return await _with_heartbeat(asyncio.to_thread(execute), request, 'browser_qa')
+    qa = request["spec"].get("policy", {}).get("browser_qa") or {}
+    return await _with_heartbeat(
+        _execute_check(request, execute, ports=tuple(qa.get("ports", {}).values())),
+        request, 'browser_qa',
+    )
 
 
 @activity.defn(name="delivery_precheck")
 async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
-    def execute() -> dict[str, Any]:
-        store, broker = _context(request["spec"])
+    def execute(broker: DeliveryBroker) -> dict[str, Any]:
         try:
-            with (_lock(store.config.state_root / "check-execution")
-                  if request["spec"]["provider"] == "codex" else nullcontext()):
-                return broker.run_prechecks(request["iteration"], request["candidate"])
+            return broker.run_prechecks(request["iteration"], request["candidate"])
         except CheckPreparationFailure as exc:
             return {'state': 'failed', 'cleanup': 'confirmed',
                     'candidate_id': request['candidate']['id'],
                     'source_unchanged': broker.candidate()['id'] == request['candidate']['id'],
                     'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
-            if request["spec"]["provider"] != "codex":
+            if (request["spec"]["provider"] != "codex"
+                    or isinstance(exc, CheckCancelledBeforeLaunch)):
                 raise
             return {
                 "state": "unknown",
@@ -526,24 +664,21 @@ async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
                 "reason": type(exc).__name__,
             }
 
-    return await _with_heartbeat(asyncio.to_thread(execute), request, 'precheck')
+    return await _with_heartbeat(_execute_check(request, execute), request, 'precheck')
 
 
 @activity.defn(name="delivery_baseline_checks")
 async def delivery_baseline_checks(request: dict[str, Any]) -> dict[str, Any]:
-    def execute() -> dict[str, Any]:
+    def execute(broker: DeliveryBroker) -> dict[str, Any]:
         from .delivery_baseline import run_baseline_checks
 
-        store, broker = _context(request["spec"])
-        with (_lock(store.config.state_root / "check-execution")
-              if request["spec"]["provider"] == "codex" else nullcontext()):
-            try:
-                return run_baseline_checks(broker)
-            except CheckPreparationFailure as exc:
-                return {"state": "failed", "results": exc.results, "diagnostic": str(exc),
-                        "base_sha": request["spec"]["base_sha"]}
+        try:
+            return run_baseline_checks(broker)
+        except CheckPreparationFailure as exc:
+            return {"state": "failed", "results": exc.results, "diagnostic": str(exc),
+                    "base_sha": request["spec"]["base_sha"]}
 
-    return await _with_heartbeat(asyncio.to_thread(execute), request, 'baseline_checks')
+    return await _with_heartbeat(_execute_check(request, execute), request, 'baseline_checks')
 
 
 @activity.defn(name="delivery_ci")

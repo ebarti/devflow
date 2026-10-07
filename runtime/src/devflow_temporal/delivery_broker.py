@@ -103,6 +103,10 @@ class CheckPreparationFailure(ValueError):
         }]
 
 
+class CheckCancelledBeforeLaunch(RuntimeError):
+    """Cancellation was observed before entering the next native process."""
+
+
 class DeliveryBroker:
     def __init__(self, store: DeliveryStore, spec: dict[str, Any]) -> None:
         from .delivery_preparation import require_native_execution
@@ -117,6 +121,8 @@ class DeliveryBroker:
 
         self.evidence_dir = _gate_evidence_root(spec)
         self.effect_namespace = ""
+        self.check_cancelled = lambda: False
+        self.native_cleanup_confirmed = True
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -554,7 +560,7 @@ class DeliveryBroker:
                 command = [
                     native_dependencies["store"] if item == "/store" else item for item in argv
                 ]
-                native_result = NativeProcess(
+                native_result = self._run_native_check(NativeProcess(
                     self.spec,
                     evidence_dir / check["id"] / "native",
                     argv=native_check_argv(self.spec, profile, cwd, command),
@@ -562,7 +568,7 @@ class DeliveryBroker:
                     environment=environment,
                     timeout=int(check.get("timeout_seconds", 600)),
                     cancelled=self._native_cancelled,
-                ).run()
+                ))
                 self._record_generated(generated)
                 if native_result["cleanup"] == "unknown":
                     return {
@@ -787,8 +793,6 @@ class DeliveryBroker:
         tools["native_builder"] = builder
         receipt = evidence / "native-addon-preparation.json"
         if receipt.exists():
-            from .delivery_native_process import reconcile_process
-
             old = read_private(receipt)
             if old["candidate_id"] != candidate["id"] or old["native_addon_authority"] != authority:
                 raise ValueError("native addon preparation receipt has stale source authority")
@@ -809,7 +813,8 @@ class DeliveryBroker:
             for row in old["results"]:
                 if (
                     _sha256(Path(row["log"])) != row["log_sha256"]
-                    or reconcile_process(Path(row["native_process"]["journal"]))["cleanup"]
+                    or self._reconcile_native_check(
+                        Path(row["native_process"]["journal"]))["cleanup"]
                     != "observed-native-confirmed"
                 ):
                     raise ValueError("native addon process/log readback changed across replay")
@@ -892,11 +897,29 @@ class DeliveryBroker:
         return result
 
     def _native_cancelled(self) -> bool:
+        if self.check_cancelled():
+            return True
         with self.store._connect() as db:
             row = db.execute(
                 "SELECT phase FROM delivery_runs WHERE run_id=?", (self.spec["run_id"],)
             ).fetchone()
         return row is not None and row["phase"] == "cancelling"
+
+    def _run_native_check(self, process) -> dict:
+        if self._native_cancelled():
+            raise CheckCancelledBeforeLaunch("native check cancelled before launch")
+        self.native_cleanup_confirmed = False
+        result = process.run()
+        self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
+        return result
+
+    def _reconcile_native_check(self, journal: Path) -> dict:
+        from .delivery_native_process import reconcile_process
+
+        self.native_cleanup_confirmed = False
+        result = reconcile_process(journal)
+        self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
+        return result
 
     def _register_generated(self, checkout: Path, names: list[str]) -> list[Path]:
         from .delivery_resources import RunResources
@@ -966,14 +989,14 @@ class DeliveryBroker:
         environment.update({
             "COREPACK_ENABLE_NETWORK": "0", "npm_config_registry": "https://" + REGISTRY + "/",
         })
-        process = NativeProcess(
+        process = self._run_native_check(NativeProcess(
             self.spec, folder / "process",
             argv=native_check_argv(self.spec, profile, staging, [
                 "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
                 "--ignore-pnpmfile", "--store-dir", str(dependencies),
             ]),
             cwd=staging, environment=environment, timeout=1800, cancelled=self._native_cancelled,
-        ).run()
+        ))
         unchanged = hashes == write_frozen_inputs(staging, inputs)
         passed = (
             process["exit_code"] == 0

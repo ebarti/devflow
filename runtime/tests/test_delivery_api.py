@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import subprocess
 import threading
 import time
@@ -129,6 +130,11 @@ async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkey
     release = threading.Event()
 
     class Broker:
+        native_cleanup_confirmed = True
+
+        def _native_cancelled(self):
+            return False
+
         def run_prechecks(self, _iteration, _candidate):
             started.set()
             assert release.wait(2)
@@ -138,7 +144,7 @@ async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkey
 
     monkeypatch.setattr(
         "devflow_temporal.delivery_activities._context", lambda _spec: (
-            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()
+            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()
         )
     )
     task = asyncio.create_task(activity_fn(
@@ -161,7 +167,13 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
     activity_fn, monkeypatch, tmp_path
 ):
     class Broker:
+        native_cleanup_confirmed = True
+
+        def _native_cancelled(self):
+            return False
+
         def run_prechecks(self, _iteration, _candidate):
+            self.native_cleanup_confirmed = False
             raise NativeProcessUnknown("Native process inspection became unavailable")
 
         run_checks = run_prechecks
@@ -169,12 +181,21 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
 
     monkeypatch.setattr(
         "devflow_temporal.delivery_activities._context", lambda _spec: (
-            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()
+            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()
         )
     )
-    result = await activity_fn(
-        {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {"id": "candidate"}}
-    )
+    from devflow_temporal.delivery_activities import _UNCLEAN_CHECK_SLOTS
+
+    retained = len(_UNCLEAN_CHECK_SLOTS)
+    try:
+        result = await activity_fn(
+            {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {"id": "candidate"}}
+        )
+        assert len(_UNCLEAN_CHECK_SLOTS) == retained + 1
+    finally:
+        for descriptor in _UNCLEAN_CHECK_SLOTS[retained:]:
+            os.close(descriptor)
+        del _UNCLEAN_CHECK_SLOTS[retained:]
     assert result == {
         "state": "unknown",
         "cleanup": "unknown",
@@ -191,6 +212,11 @@ async def test_check_preparation_failure_keeps_diagnostics_without_claiming_a_la
     from devflow_temporal.delivery_broker import CheckPreparationFailure
 
     class Broker:
+        native_cleanup_confirmed = True
+
+        def _native_cancelled(self):
+            return False
+
         def run_prechecks(self, _iteration, _candidate):
             raise CheckPreparationFailure('planned-dependencies', ValueError('owned root rejected'))
 
@@ -200,7 +226,7 @@ async def test_check_preparation_failure_keeps_diagnostics_without_claiming_a_la
             return {'id': 'candidate'}
 
     monkeypatch.setattr('devflow_temporal.delivery_activities._context', lambda _: (
-        SimpleNamespace(config=SimpleNamespace(state_root=tmp_path)), Broker()))
+        SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()))
     result = await activity_fn({'spec': {'provider': 'codex'}, 'iteration': 0,
                                'candidate': {'id': 'candidate'}})
     assert result['state'] == 'failed' and result['cleanup'] == 'confirmed'

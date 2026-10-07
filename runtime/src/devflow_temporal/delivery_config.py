@@ -88,6 +88,9 @@ class DeliveryConfig:
             raise ValueError("unsupported configured role provider")
         if value.get("execution_mode", "native-profile") not in {"native-profile", "trusted-local"}:
             raise ValueError("unsupported local execution mode")
+        slots = value.get("check_concurrency", 2)
+        if type(slots) is not int or not 1 <= slots <= 32:
+            raise ValueError("check_concurrency must be an integer between 1 and 32")
         return cls(path=path.resolve(), raw=value)
 
     @property
