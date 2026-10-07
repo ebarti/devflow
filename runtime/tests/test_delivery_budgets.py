@@ -215,7 +215,7 @@ async def test_previous_admission_history_keeps_its_original_workflow_path():
 
 @pytest.mark.parametrize('entry', ['precheck', 'recover'])
 @pytest.mark.parametrize('maximum', [None, 5])
-def test_policy_recovery_rejects_frozen_budget_before_any_effect(
+def test_retired_policy_recovery_rejects_calls_without_any_effect(
     service, monkeypatch, entry, maximum,
 ):
     store, request = service
@@ -236,9 +236,9 @@ def test_policy_recovery_rejects_frozen_budget_before_any_effect(
     def unexpected(*args, **kwargs):
         pytest.fail('policy budget rejection must precede inspection or preparation')
 
-    monkeypatch.setattr(delivery_policy_recovery, 'require_native_execution', unexpected)
+    monkeypatch.setattr(store, 'intake_execution_spec', unexpected)
     monkeypatch.setattr(delivery_policy_recovery, '_lock', unexpected)
-    with pytest.raises(ValueError, match='fixed repair budget'):
+    with pytest.raises(AttributeError, match='policy_recovery_precheck|recover_execution'):
         if entry == 'precheck':
             store.policy_recovery_precheck(request['run_id'])
         else:
