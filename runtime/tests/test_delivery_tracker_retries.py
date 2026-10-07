@@ -348,6 +348,16 @@ async def test_real_terminal_retry_survives_worker_replacement_without_operator(
             async with asyncio.timeout(15):
                 while calls.count('tracker') < 3:
                     await asyncio.sleep(0.05)
+                # The activity call precedes the durable automatic retry timer.
+                while True:
+                    history = await handle.fetch_history()
+                    if any(
+                        event.HasField('timer_started_event_attributes')
+                        and event.timer_started_event_attributes.start_to_fire_timeout.seconds == 30
+                        for event in history.events
+                    ):
+                        break
+                    await asyncio.sleep(0.05)
             assert (await handle.describe()).close_time is None
         async with Worker(environment.client, **options):
             result = await asyncio.wait_for(handle.result(), 40)
