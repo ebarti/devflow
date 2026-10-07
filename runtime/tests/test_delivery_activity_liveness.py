@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import shutil
@@ -245,7 +246,7 @@ else:
 '''
 
 
-WORKER_DRIVER = NATIVE_DRIVER.split('async def execute():')[0].replace(
+WORKER_DRIVER = 'import os\n' + NATIVE_DRIVER.split('async def execute():')[0].replace(
     "options['argv']=[sys.executable,'-I',str(provider),str(folder/'request.json')]",
     "if request.get('role'): "
     "options['argv']=[sys.executable,'-I',str(provider),str(folder/'request.json')]",
@@ -279,10 +280,157 @@ async def main():
     client=await Client.connect(sys.argv[3])
     async with Worker(client,task_queue='activity-worker-loss',
         workflows=[ActivityLivenessWorkflow],activities=[delivery_role,delivery_checks,
-            delivery_precheck,delivery_baseline_checks,delivery_browser_qa,delivery_intake,block_loop]):
+            delivery_precheck,delivery_baseline_checks,delivery_browser_qa,delivery_intake,
+            block_loop]) as worker:
+        while not worker.is_running:
+            await asyncio.sleep(0.05)
+        print(f'fixture-worker-ready:{os.getpid()}',flush=True)
         await asyncio.Event().wait()
 asyncio.run(main())
 '''
+
+
+async def _wait_for_fixture_worker_ready(worker, log_path):
+    # Cold subprocess imports/connection get their own bound, outside activity timeouts.
+    deadline = time.monotonic()+60
+    signal = f'fixture-worker-ready:{worker.pid}'
+    while True:
+        diagnostic = log_path.read_text()
+        exit_code = worker.poll()
+        assert exit_code is None, (
+            f'fixture worker initialization exited ({exit_code}):\n{diagnostic}')
+        if signal in diagnostic.splitlines():
+            return
+        assert time.monotonic()<deadline, f'fixture worker initialization timed out:\n{diagnostic}'
+        await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_fixture_worker_announces_readiness_after_sdk_validation():
+    # Execute only main's control flow with opaque doubles: no imports, server or child.
+    output, entered = [], []
+
+    class ClientDouble:
+        @staticmethod
+        async def connect(_address):
+            entered.append('connected')
+            return object()
+
+    class WorkerDouble:
+        def __init__(self, *_args, **_kwargs):
+            self.polls = 0
+
+        @property
+        def is_running(self):
+            self.polls += 1
+            if self.polls == 3:
+                entered.append('running')
+                return True
+            assert not output
+            return False
+
+        async def __aenter__(self):
+            assert entered == ['connected']
+            entered.append('worker')
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+    class EventDouble:
+        async def wait(self):
+            assert entered == ['connected', 'worker', 'running']
+            assert output == [('fixture-worker-ready:123', True)]
+
+    async def sleep(_seconds):
+        assert not output and entered == ['connected', 'worker']
+
+    tree = ast.parse(WORKER_DRIVER)
+    main = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                and node.name == 'main')
+    namespace = {'Client': ClientDouble, 'Worker': WorkerDouble,
+                 'sys': SimpleNamespace(argv=['driver', 'input', 'provider', 'address']),
+                 'os': SimpleNamespace(getpid=lambda: 123),
+                 'asyncio': SimpleNamespace(Event=EventDouble, sleep=sleep),
+                 'print': lambda text, *, flush: output.append((text, flush))}
+    namespace.update({name: object() for name in [
+        'ActivityLivenessWorkflow', 'delivery_role', 'delivery_checks', 'delivery_precheck',
+        'delivery_baseline_checks', 'delivery_browser_qa', 'delivery_intake', 'block_loop']})
+    exec(compile(ast.Module(body=[main], type_ignores=[]), '<fixture-main>', 'exec'), namespace)
+    await namespace['main']()
+
+
+def test_fixture_worker_readiness_precedes_workflow_submission():
+    source = ast.parse(Path(__file__).read_text())
+    fixture = next(node for node in source.body if isinstance(node, ast.AsyncFunctionDef)
+                   and node.name == 'test_real_temporal_worker_loss_reuses_original_native_command')
+    submission = min(node.lineno for node in ast.walk(fixture)
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                     and node.func.attr == 'start_workflow')
+    readiness = [node.lineno for node in ast.walk(fixture)
+                 if isinstance(node, ast.Await) and isinstance(node.value, ast.Call)
+                 and isinstance(node.value.func, ast.Name)
+                 and node.value.func.id == '_wait_for_fixture_worker_ready']
+    assert len(readiness) == 2 and min(readiness) < submission, (
+        'workflow/activity deadline starts before worker initialization is observed')
+
+
+@pytest.mark.asyncio
+async def test_fixture_worker_cold_start_is_separate_from_native_start(monkeypatch, tmp_path):
+    clock, sleeps = [0.0], []
+    log = tmp_path / 'worker.log'
+    log.write_text('fixture-worker-ready:999\n')  # A foreign PID cannot satisfy readiness.
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += 1
+        if clock[0] == 25:
+            log.write_text('fixture-worker-ready:123\n')
+
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(asyncio, 'sleep', sleep)
+    await _wait_for_fixture_worker_ready(SimpleNamespace(pid=123, poll=lambda: None), log)
+    assert clock[0] == 25 and len(sleeps) == 25
+    # Native startup retains its own 20s allowance, not the spent bootstrap clock.
+    fixture = next(node for node in ast.parse(Path(__file__).read_text()).body
+                   if isinstance(node, ast.AsyncFunctionDef)
+                   and node.name == 'test_real_temporal_worker_loss_reuses_original_native_command')
+    native_wait = next(node for node in ast.walk(fixture) if isinstance(node, ast.While)
+                       and isinstance(node.test, ast.UnaryOp)
+                       and "'started'" in ast.unparse(node.test))
+    deadline = next(node for node in ast.walk(fixture) if isinstance(node, ast.Assign)
+                    and node.lineno == native_wait.lineno-1)
+    assert ast.unparse(deadline.value) == 'time.monotonic() + 20'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('exit_code', [None, 7])
+async def test_fixture_worker_readiness_reports_bounded_startup_failure(
+    monkeypatch, tmp_path, exit_code,
+):
+    clock = [0.0]
+    log = tmp_path / 'worker.log'
+    log.write_text('initialization diagnostic\n')
+
+    async def sleep(_seconds):
+        clock[0] += 1
+
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(asyncio, 'sleep', sleep)
+    with pytest.raises(AssertionError, match=(
+        'initialization timed out' if exit_code is None else r'initialization exited \(7\)'
+    )) as error:
+        await _wait_for_fixture_worker_ready(SimpleNamespace(pid=123, poll=lambda: exit_code), log)
+    assert 'initialization diagnostic' in str(error.value)
+    assert clock[0] == (60 if exit_code is None else 0)
+
+
+@pytest.mark.asyncio
+async def test_fixture_worker_readiness_rejects_exited_worker_with_signal(tmp_path):
+    log = tmp_path / 'worker.log'
+    log.write_text('fixture-worker-ready:123\n')
+    with pytest.raises(AssertionError, match=r'initialization exited \(0\)'):
+        await _wait_for_fixture_worker_ready(SimpleNamespace(pid=123, poll=lambda: 0), log)
 
 
 @pytest.mark.asyncio
@@ -384,6 +532,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                     str(Path(__file__).parent)]
             logs.append((tmp_path / 'first-worker.log').open('wb'))
             workers.append(subprocess.Popen(argv, stdout=logs[0], stderr=subprocess.STDOUT))
+            await _wait_for_fixture_worker_ready(workers[0], tmp_path / 'first-worker.log')
             handle = await environment.client.start_workflow(
                 ActivityLivenessWorkflow.run, {'activity_name': name, 'request': request,
                     **({'hours': 40/3600} if interruption == 'deadline' else {})},
@@ -392,7 +541,9 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             deadline = time.monotonic()+20
             while not (state / 'started').exists():
                 assert workers[0].poll() is None, (tmp_path / 'first-worker.log').read_text()
-                assert time.monotonic()<deadline, (tmp_path / 'first-worker.log').read_text()
+                assert time.monotonic()<deadline, (
+                    'native command did not start within 20 seconds after worker readiness',
+                    (tmp_path / 'first-worker.log').read_text())
                 await asyncio.sleep(0.05)
             if interruption == 'worker_loss':
                 workers[0].kill()
@@ -464,6 +615,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                 return
             logs.append((tmp_path / 'replacement-worker.log').open('wb'))
             workers.append(subprocess.Popen(argv, stdout=logs[1], stderr=subprocess.STDOUT))
+            await _wait_for_fixture_worker_ready(workers[1], tmp_path / 'replacement-worker.log')
             if interruption in {'loop_stall', 'dirty_result'}:
                 await asyncio.wait_for(stall.result(), 30)
                 # Let rejected heartbeats cancel the live first attempt before releasing its child.
