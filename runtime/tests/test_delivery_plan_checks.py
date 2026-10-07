@@ -165,6 +165,16 @@ def test_named_node_tests_reject_missing_ambiguous_or_unsealed_owners(project, f
         planned_checks(spec, checkout, evidence)
 
 
+def freeze_recipes(spec, checkout, *, stage=True):
+    """Establish real admitted recipe metadata before testing its validation."""
+    _git(checkout, 'config', 'user.name', 'Fixture')
+    _git(checkout, 'config', 'user.email', 'fixture@example.invalid')
+    if stage:
+        _git(checkout, 'add', '.')
+    _git(checkout, 'commit', '--allow-empty', '-qm', 'Admitted recipes')
+    spec.update(source_path=str(checkout), base_sha=_git(checkout, 'rev-parse', 'HEAD'))
+
+
 @pytest.fixture
 def junit_project(project):
     spec, checkout, _, evidence = project
@@ -180,6 +190,7 @@ def junit_project(project):
     _git(checkout, 'add', '.')
     spec['accepted_plan'] = json.dumps({'verification': [
         'Run the configured scripts recipe from scripts/checks.toml with owned JUnit output.']})
+    freeze_recipes(spec, checkout)
     return spec, checkout, metadata, evidence
 
 
@@ -231,7 +242,7 @@ def test_node_recipe_option_value_does_not_prove_named_test_execution(junit_proj
         '"--test-reporter=junit",',
         '"--test-name-pattern","scripts/report.test.mjs","--test-reporter=junit",'
     ).replace('"scripts/report.test.mjs"]', '"scripts/other.mjs"]'))
-    _git(checkout, 'add', '.')
+    freeze_recipes(spec, checkout)
     spec['accepted_plan'] = json.dumps({'verification': [
         'Run the configured scripts recipe from scripts/checks.toml with owned JUnit output.']})
     recipe = planned_checks(spec, checkout, evidence)[0]
@@ -262,6 +273,7 @@ def test_recipe_rejects_unsealed_or_unbounded_execution(junit_project, bad):
                         'cwd': ('timeout_seconds=600', 'cwd="../escape"')}
         old, new = replacements[bad]
         metadata.write_text(metadata.read_text().replace(old, new))
+    freeze_recipes(spec, checkout, stage=bad != 'untracked')
     with pytest.raises(ValueError):
         planned_checks(spec, checkout, evidence)
 
@@ -271,7 +283,7 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
     metadata.write_text(metadata.read_text() + '\n[checks.diff]\nkind="static"\n'
                         'argv=["git","diff","--check","origin/main...HEAD"]\n'
                         '\n[checks.docs]\nkind="static"\nargv=["corepack","pnpm","docs:build"]\n')
-    _git(checkout, 'add', '.')
+    freeze_recipes(spec, checkout)
     spec['accepted_plan'] = json.dumps({'verification': [
         'Execute tracked scripts/checks.toml checks.diff and checks.docs.']})
     spec['policy'] = {'checks': [{'id': 'diff', 'argv': ['git', 'diff', '--check']}]}
@@ -302,6 +314,7 @@ def test_static_recipes_reject_unowned_or_unbounded_metadata(junit_project, bad)
                     'timeout': ('timeout_seconds=30', 'timeout_seconds=2701'),
                     'report': ('origin/main...HEAD', '{report_path}')}[bad]
         metadata.write_text(metadata.read_text().replace(old, new))
+    freeze_recipes(spec, checkout, stage=bad != 'untracked')
     with pytest.raises(ValueError):
         planned_checks(spec, checkout, evidence)
 
@@ -312,7 +325,7 @@ def test_metadata_defined_junit_shell_wrapper_remains_exact_with_static_recipes(
                         'argv=["sh","-c","node --test --test-reporter=junit > {report_path}"]\n'
                         '[checks.diff]\nkind="static"\n'
                         'argv=["git","diff","--check","origin/main...HEAD"]\n')
-    _git(checkout, 'add', '.')
+    freeze_recipes(spec, checkout)
     spec['accepted_plan'] = json.dumps({'verification': [
         'Execute scripts/checks.toml checks.scripts with JUnit and checks.diff.']})
     checks = planned_checks(spec, checkout, evidence)
@@ -333,7 +346,7 @@ def test_static_recipe_and_named_vitest_can_share_junit_verification_step(projec
     (checkout / 'scripts/checks.toml').write_text(
         'schema_version=1\n[checks.diff]\nkind="static"\n'
         'argv=["git","diff","--check","origin/main...HEAD"]\n')
-    _git(checkout, 'add', '.')
+    freeze_recipes(spec, checkout)
     spec['accepted_plan'] = json.dumps({'verification': [
         'Run scripts/checks.toml checks.diff and API audit.test.ts with retained JUnit output.']})
     checks = planned_checks(spec, checkout, evidence)

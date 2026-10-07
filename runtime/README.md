@@ -74,6 +74,11 @@ controller retains the real report, metadata and plan hashes, and counts actual
 test cases. Missing, malformed, empty, changed or failing reports cannot pass.
 Existing configured checks continue to run unchanged.
 
+Named JUnit and static recipes come from the admitted base commit in the source
+repository. Candidate edits to `scripts/checks.toml` cannot change those commands;
+a recipe update takes effect for runs admitted after it merges. Metadata hashes
+refer to the exact base blob, while the checks still execute against the candidate.
+
 A finalized published candidate whose passed local assessment omitted such a
 requested report may receive one report assessment through `published_gate_retry`
 after a measured runtime repair. Admission authenticates the old empty artifact
