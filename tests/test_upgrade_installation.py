@@ -499,6 +499,7 @@ class UpgradeInstallation(unittest.TestCase):
 
     def test_rollback_keeps_public_helper_available_at_each_mutation(self):
         self.historical(GUARDED)
+        before = self.snapshot()
         spec = importlib.util.spec_from_file_location(
             "upgrade_rollback", self.source / "scripts/install-rollback.py")
         rollback = importlib.util.module_from_spec(spec)
@@ -507,7 +508,6 @@ class UpgradeInstallation(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             rollback.capture(self.source, self.skills, self.home)
         backup = Path(output.getvalue().strip())
-        before = self.snapshot()
         service_spec = importlib.util.spec_from_file_location(
             "upgrade_service", self.source / "scripts/install-service-entry.py")
         service = importlib.util.module_from_spec(service_spec)
@@ -530,6 +530,7 @@ class UpgradeInstallation(unittest.TestCase):
                 mock.patch.object(rollback, "exchange", lambda *a, **kw: observe(exchange, *a, **kw)):
             rollback.restore(backup)
         self.assertTrue(observations)
+        self.assertFalse(backup.exists())
         self.assertEqual(self.snapshot(), before)
 
     def test_failure_after_migration_restores_owned_files_and_helpers(self):
