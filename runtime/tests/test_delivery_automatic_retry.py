@@ -514,3 +514,18 @@ def test_private_fresh_ref_cannot_change_configured_branch_or_sha_pin(service, r
     config = DeliveryConfig.load(store.config.path)
     with pytest.raises(ValueError, match='configured named branch'):
         config.admit({**request, 'base_ref': ref}, _base_ref='refs/remotes/origin/foreign')
+
+
+def test_fresh_attempt_preserves_frozen_publication_summary(service, monkeypatch):
+    store, request = service
+    request.update(goal="Investigate the fixture. Publish only the documented design.",
+                   publication_summary="docs: investigate fixture behavior")
+    store, request, _ = stopped(service, monkeypatch)
+    original = store.spec(request["run_id"])
+    results = retry.retry_once(store)
+    assert len(results) == 1
+    fresh = store.spec(results[0]["run_id"])
+    assert fresh["goal"] == original["goal"]
+    assert fresh["publication_summary"] == original["publication_summary"]
+    assert fresh["accepted_plan"] == original["accepted_plan"]
+    assert fresh["policy"] == original["policy"]

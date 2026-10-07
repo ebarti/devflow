@@ -360,7 +360,8 @@ def retry_once(store, *, stopped=lambda: False):
             identity = digest({'run_id': spec['run_id'],
                                'request_digest': row['request_digest']})[:24]
             supplied = {key: deepcopy(spec[key]) for key in (
-                'work_id', 'issue_url', 'repository_key', 'goal', 'base_ref', 'authorized_endpoint',
+                'work_id', 'issue_url', 'repository_key', 'goal', 'publication_summary',
+                'base_ref', 'authorized_endpoint',
                 'origin_thread_id', 'recovery_key') if key in spec}
             supplied.update(command_id='automatic-' + identity, run_id='run-' + identity,
                             supersedes_run_id=spec['run_id'], branch='fix/automatic-' + identity,
