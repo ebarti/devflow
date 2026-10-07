@@ -249,6 +249,36 @@ class ServiceEntryInstallation(unittest.TestCase):
             rollback.capture(ROOT, self.skills, self.home)
         return service, rollback, Path(output.getvalue().strip())
 
+    def test_migration_staging_collision_preserves_foreign_path(self):
+        spec = importlib.util.spec_from_file_location(
+            "stage_migration", ROOT / "scripts/install-migration.py"
+        )
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        self.skills.mkdir()
+        stage = self.skills / (".devflow-helper-pointer-" + str(os.getpid()))
+        for kind in ("file", "symlink"):
+            with self.subTest(kind=kind):
+                if kind == "file":
+                    stage.write_bytes(b"foreign staging bytes")
+                else:
+                    stage.symlink_to("foreign-target")
+                helper = self.skills / (".owned-helper-" + kind)
+                rollback = mock.Mock()
+                with self.assertRaises(FileExistsError):
+                    migration.apply(
+                        {"links": [self.skills / "devflow"], "helper": helper},
+                        ROOT, self.skills, mock.Mock(), rollback, "unused-backup",
+                    )
+                rollback.effect.assert_not_called()
+                self.assertTrue(os.path.lexists(stage), "foreign staging path was removed")
+                if kind == "file":
+                    self.assertEqual(stage.read_bytes(), b"foreign staging bytes")
+                else:
+                    self.assertEqual(os.readlink(stage), "foreign-target")
+                stage.unlink()
+                shutil.rmtree(helper)
+
     def test_helper_exchange_rolls_back_without_missing_helper_interval(self):
         _, compatibility = self.historical_helper()
         before = self.snapshot()

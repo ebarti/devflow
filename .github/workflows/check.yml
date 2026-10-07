@@ -14,40 +14,27 @@ concurrency:
 
 jobs:
   install:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
       - run: sh scripts/check-install.sh
   test:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # Authentic published installer fixtures require historical Git objects.
-      - run: python3.12 -B -m unittest discover -s tests -v
-  temporal-runtime:
-    runs-on: ubuntu-latest
-    # A passing 723.78s suite exceeded the former 12-minute job deadline.
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: temporalio/setup-temporal@1059a504f87e7fa2f385e3fa40d1aa7e62f1c6ca # v0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          version: '1.9.1'
-      - run: temporal --version
-      - run: python3.12 -m venv /tmp/devflow-uv
-      - run: /tmp/devflow-uv/bin/pip install uv==0.12.17
-      - run: echo '/tmp/devflow-uv/bin' >> "$GITHUB_PATH"
-      - run: /tmp/devflow-uv/bin/uv sync --locked --python python3.12
-        working-directory: runtime
-      - run: /tmp/devflow-uv/bin/uv run --frozen ruff check src tests
-        working-directory: runtime
-      - run: /tmp/devflow-uv/bin/uv run --frozen pytest -q
-        working-directory: runtime
+          python-version: '3.12'
+      - run: python3.12 -B -m unittest discover -s tests -v
   temporal-runtime-macos:
     runs-on: macos-latest
     # The composed suite reached 84% before the observed 30-minute job timeout.
@@ -74,7 +61,7 @@ jobs:
       - run: uv run --frozen pytest -v --tb=short -ra --durations=20
         working-directory: runtime
   temporal-dashboard:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

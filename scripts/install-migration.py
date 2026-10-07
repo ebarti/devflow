@@ -205,8 +205,8 @@ def apply(migration, source, skills, agents, rollback, backup):
                 (helper / child.name).symlink_to(child)
                 rollback.created(backup, helper / child.name)
         stage = skills / (".devflow-helper-pointer-" + str(os.getpid()))
+        stage.symlink_to(helper)
         try:
-            stage.symlink_to(helper)
             rollback.effect(backup, compatibility, stage)
         finally:
             stage.unlink(missing_ok=True)
