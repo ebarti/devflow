@@ -1,0 +1,9 @@
+# Technical successor admission retirement
+
+New repair-continuation requests with `continuation_kind: accepted_technical_successor` are unsupported, including preflight requests. Unknown or malformed kinds are also rejected before new commands, claims, outbox records, files or Git effects. Other supported continuation operations keep their existing routes.
+
+Only the admission writer and its target-specific integration builder are removed. Existing technical-successor records, effective execution specs, native predecessor bindings, integration commit readback, activity registrations and workflow bodies remain supported. Already-admitted queued outbox entries still dispatch their original workflow. Historical issue-specific validators remain necessary for those records; this change does not claim to remove every legacy recovery path.
+
+Before deploying, cease new technical-successor calls. Drain matching queued and running native executions, and resolve in-flight pre-workflow pending or orphan intents, under the previous release. Native execution retains its runtime-source binding; replay and outbox decoding do not prove that an old execution can resume under a changed runtime hash. Inspect uncertain effects and dispatches before acting; do not replay an old command through the retired admission. Preserve all recorded evidence. This repository change does not audit or modify a live installation.
+
+The technical-history fixtures were captured from untouched `c04f00eb43eb225728b63c82026ffe97a41cafc2` using a disposable local Temporal server with explicit activity stubs. They include completed checks/review recovery and recovery suspended at its review activity. Their original event bytes replay against the retained workflow; they are not evidence of native provider execution or GitHub delivery.
