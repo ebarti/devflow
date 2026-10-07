@@ -68,13 +68,61 @@ async def test_native_activity_options_bound_worker_loss_retries(monkeypatch, na
         return {'state': 'passed'}
 
     monkeypatch.setattr(delivery_workflow.workflow, 'execute_activity', execute)
-    monkeypatch.setattr(delivery_workflow.workflow, 'patched', lambda _name: True)
+    # Isolate the original liveness policy from the independent check-slot patch.
+    monkeypatch.setattr(delivery_workflow.workflow, 'patched',
+                        lambda flag: flag == 'delivery-activity-liveness-v1')
     await DeliveryWorkflow()._activity(name, {
         'spec': {'policy': {'execution_backend': 'native-macos'}},
     })
     assert observed.get('heartbeat_timeout') == timedelta(seconds=15)
     assert observed['retry_policy'].maximum_attempts == 3
     assert observed['schedule_to_close_timeout'] == timedelta(hours=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('liveness,slots', [(False, False), (True, False),
+                                          (False, True), (True, True)])
+@pytest.mark.parametrize('backend', ['native-macos', 'fake'])
+@pytest.mark.parametrize('name', ['delivery_intake', 'delivery_role', 'delivery_checks',
+                                 'delivery_precheck', 'delivery_browser_qa',
+                                 'delivery_baseline_checks'])
+async def test_independent_activity_patches_preserve_each_reviewed_policy(
+    monkeypatch, name, backend, liveness, slots,
+):
+    from devflow_temporal import delivery_workflow
+
+    observed = {}
+    flags = {'delivery-activity-liveness-v1': liveness, 'delivery-check-slots-v1': slots}
+    async def execute(_name, _request, **options):
+        observed.update(options)
+    monkeypatch.setattr(delivery_workflow.workflow, 'execute_activity', execute)
+    monkeypatch.setattr(delivery_workflow.workflow, 'patched', lambda flag: flags.get(flag, False))
+    await DeliveryWorkflow()._activity(name, {'spec': {'policy': {'execution_backend': backend}}})
+    native_liveness = backend == 'native-macos' and liveness
+    slotted = slots and name in {'delivery_checks', 'delivery_precheck',
+                                'delivery_browser_qa', 'delivery_baseline_checks'}
+    # PR77's independent check policy controls heartbeat/cancellation when active;
+    # PR73 still controls native retries and the unchanged overall activity deadline.
+    if slotted:
+        assert observed['heartbeat_timeout'] == timedelta(seconds=30)
+        assert observed['cancellation_type'] == (
+            delivery_workflow.workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED)
+    else:
+        assert 'cancellation_type' not in observed
+        if native_liveness:
+            assert observed['heartbeat_timeout'] == timedelta(seconds=15)
+        else:
+            assert 'heartbeat_timeout' not in observed
+    assert observed['start_to_close_timeout'] == timedelta(hours=2)
+    assert observed['retry_policy'].maximum_attempts == (3 if native_liveness else 1)
+    if native_liveness:
+        assert observed['schedule_to_close_timeout'] == timedelta(hours=2)
+        assert observed['retry_policy'].initial_interval == timedelta(seconds=1)
+        assert observed['retry_policy'].maximum_interval == timedelta(seconds=10)
+        assert observed['retry_policy'].non_retryable_error_types == [
+            'ValueError', 'TypeError', 'PermissionError', 'NativeProcessUnknown']
+    else:
+        assert 'schedule_to_close_timeout' not in observed
 
 
 @pytest.mark.asyncio
