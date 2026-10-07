@@ -169,3 +169,5 @@ python3.12 -m unittest discover -s tests
 It does not run live model-driven workflow trials or target projects' suites, review/QA checks or merges; target projects retain their own check policies.
 
 [Architecture](docs/architecture.md)
+
+Automatic retries keep the accepted plan and frozen per-issue attempt ceiling. Later cleanup and acknowledged Blocked/claim release can finish after that ceiling is exhausted, but cannot create another attempt. Cleanup maintenance preserves the exact original resource manifest and finalization bytes before updating their canonical latest observations; interrupted maintenance reuses and authenticates the immutable originals. Completed provider journals without the original result binding remain unresolved rather than inferred clean.

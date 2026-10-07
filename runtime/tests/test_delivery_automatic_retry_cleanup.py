@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 from test_delivery_automatic_retry import stopped
@@ -25,8 +28,17 @@ def later_cleanup(service, monkeypatch):
                    ('unknown', json.dumps(historical['result']['checks'])))
         store.state.claim_work(db, request['work_id'],
                                'external:devflow:' + request['run_id'], 'fixture')
+    from devflow_temporal.delivery_resources import write_private
+    resources = Path(store.spec(request['run_id'])['state_dir']) / 'resources'
+    write_private(resources / 'manifest.json', {'run_id': request['run_id'], 'original': True})
+    write_private(resources / 'finalization.json', {'state': 'unknown', 'outcome': 'blocked'})
+    original_hash = hashlib.sha256((resources / 'finalization.json').read_bytes()).hexdigest()
+    historical['result']['checks']['resource_cleanup']['receipt_sha256'] = original_hash
+    with store._connect() as db:
+        db.execute('UPDATE delivery_runs SET checks_json=?',
+                   (json.dumps(historical['result']['checks']),))
     calls = []
-    external = {'ready': False, 'hash': 'fixture-finalization', 'tracker': 'consistent'}
+    external = {'ready': False, 'hash': original_hash, 'tracker': 'consistent'}
     monkeypatch.setattr(DeliveryStore, '_completed_temporal_result',
                         lambda *_a, **_k: copy.deepcopy(historical))
 
@@ -36,17 +48,30 @@ def later_cleanup(service, monkeypatch):
             external['on_observe'](unknown_allowed)
         if not external['ready']:
             raise ValueError('original monitor is not observably finished')
-        return {'finalization_sha256': external['hash'],
+        return {'manifest_sha256': hashlib.sha256(
+                    (resources / 'manifest.json').read_bytes()).hexdigest(),
+                'finalization_sha256': external['hash'],
                 'journal_sha256': {'opaque': external.get('journal', 'original')}}
 
     class Resources:
         def __init__(self, spec, **_kwargs):
             assert spec['run_id'] == request['run_id']
 
+        @contextmanager
+        def locked(self):
+            yield {}
+
         def finalize(self, outcome, *, uncertain=False):
             calls.append(('finalize', outcome, uncertain))
             assert external['ready'] and not uncertain
-            external['hash'] = 'later-finalization'
+            write_private(resources / 'manifest.json', {'run_id': request['run_id'],
+                                                        'finalization': 'later'})
+            if external.pop('crash_finalizing', False):
+                raise RuntimeError('opaque crash after replacing manifest')
+            write_private(resources / 'finalization.json', {'state': 'confirmed',
+                                                            'outcome': 'blocked'})
+            external['hash'] = hashlib.sha256(
+                (resources / 'finalization.json').read_bytes()).hexdigest()
             return {'state': 'confirmed', 'resource_cleanup': 'confirmed',
                     'process_cleanup': 'observed-native-confirmed',
                     'receipt_sha256': external['hash']}
@@ -189,8 +214,9 @@ def test_later_closure_survives_base_failure_without_repeating_effects_or_events
     with store._connect() as db:
         events = list(db.execute("SELECT payload_json FROM delivery_events "
                                  "WHERE type='resource_cleanup_reconciled'"))
-    assert len(events) == 1
-    assert json.loads(events[0][0])['original_checks'] == historical['result']['checks']
+    completed = [json.loads(item[0]) for item in events if 'tracker' in json.loads(item[0])]
+    assert len(completed) == 1
+    assert completed[0]['original_checks'] == historical['result']['checks']
     count = calls.count(('finalize', 'blocked', False))
     store._automatic_retry_waits.clear()
     external['base_unknown'] = False
@@ -199,7 +225,7 @@ def test_later_closure_survives_base_failure_without_repeating_effects_or_events
     assert external['external_sets'] == 1
     with store._connect() as db:
         assert db.execute("SELECT COUNT(*) FROM delivery_events "
-                          "WHERE type='resource_cleanup_reconciled'").fetchone()[0] == 1
+                          "WHERE type='resource_cleanup_reconciled'").fetchone()[0] == 2
         assert db.execute('SELECT outcome FROM delivery_runs WHERE run_id=?',
                           (request['run_id'],)).fetchone()[0] == 'blocked'
 

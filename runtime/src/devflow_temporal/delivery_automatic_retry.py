@@ -1,6 +1,7 @@
 """Finite fresh attempts for closed, unpublished original transient failures."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -12,10 +13,13 @@ from pathlib import Path
 from .contracts import digest
 from .delivery_activities import _tracker_sync
 from .delivery_broker import DeliveryBroker, _git
+from .delivery_metadata_recovery import _immutable
 from .delivery_resources import (
     RunResources,
     observe_completed_resources,
     observe_finalized_resources,
+    private_directory,
+    read_private,
 )
 
 
@@ -67,6 +71,70 @@ def _current(store, row, spec, stopped):
             'SELECT * FROM delivery_attempts WHERE run_id=?', (spec['run_id'],))]
 
 
+def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped):
+    """Keep the original bytes before replacing canonical latest observations."""
+    root = Path(execution['state_dir']) / 'resources'
+    original = closed['result']['checks']
+    binding = digest(closed['result'])
+    with store._connect() as db:
+        records = [json.loads(item[0]) for item in db.execute(
+            "SELECT payload_json FROM delivery_events WHERE run_id=? "
+            "AND type='resource_cleanup_reconciled' ORDER BY rowid DESC", (spec['run_id'],))]
+    saved = next((item['predecessor_resources'] for item in records
+                  if item.get('original_result_digest') == binding
+                  and item.get('original_checks') == original
+                  and 'predecessor_resources' in item), None)
+    expected = {'manifest.json': before['manifest_sha256'],
+                'finalization.json': original['resource_cleanup']['receipt_sha256']}
+    if saved is None:
+        if before['finalization_sha256'] != expected['finalization.json']:
+            raise ValueError('original finalization changed before preservation')
+        with RunResources(execution, read_only=True).locked():
+            for name, sha in expected.items():
+                read_private(root / name)
+                if hashlib.sha256((root / name).read_bytes()).hexdigest() != sha:
+                    raise ValueError('original resource bytes changed before archive')
+            private_directory(root / 'predecessor-resources')
+            for name in expected:
+                _immutable(root / 'predecessor-resources' / name,
+                           read_private(root / name), raw=(root / name).read_bytes())
+            saved = expected
+    if set(saved) != set(expected):
+        raise ValueError('archived original inventory changed')
+    for name, sha in saved.items():
+        path = root / 'predecessor-resources' / name
+        read_private(path)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
+            raise ValueError('archived original resource bytes changed')
+    if saved.get('finalization.json') != expected['finalization.json']:
+        raise ValueError('archived finalization differs from the original closed result')
+    if any('predecessor_resources' in item and item.get('original_result_digest') == binding
+           and item.get('original_checks') == original for item in records):
+        return
+    with store._connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        current = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                             (spec['run_id'],)).fetchone()
+        if (dict(current) != row or stopped()
+                or unavailable(store, db, spec, own_claim_allowed=True)
+                or [dict(item) for item in db.execute(
+                    'SELECT * FROM delivery_attempts WHERE run_id=?',
+                    (spec['run_id'],))] != attempts):
+            raise ValueError('original run changed before preservation observation')
+        existing = [json.loads(item[0]) for item in db.execute(
+            "SELECT payload_json FROM delivery_events WHERE run_id=? "
+            "AND type='resource_cleanup_reconciled'", (spec['run_id'],))]
+        if any(item.get('original_result_digest') == binding
+               and item.get('original_checks') == original
+               and item.get('predecessor_resources') == saved for item in existing):
+            return
+        # This observes preservation, not completed cleanup or permission to retry.
+        store._event(db, spec['run_id'], row['revision'], 'resource_cleanup_reconciled',
+            'Original cleanup bytes retained before refreshing the latest observation',
+            {'original_checks': original, 'original_result_digest': binding,
+             'predecessor_resources': saved})
+
+
 def _close_cleanup(store, row, spec, closed, stopped):
     """Keep historical failure immutable; record separately authenticated later cleanup."""
     attempts = _current(store, row, spec, stopped)
@@ -75,6 +143,7 @@ def _close_cleanup(store, row, spec, closed, stopped):
     unpublished(store, spec)
     if _current(store, row, spec, stopped) != attempts:
         raise ValueError('original finished attempts changed before finalization')
+    _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped)
     receipt = RunResources(execution, read_only=True).finalize('blocked')
     observed = observe_finalized_resources(execution)
     if (not (receipt.get('state') == receipt.get('resource_cleanup') == 'confirmed')
@@ -142,6 +211,7 @@ def _reuse_cleanup(store, row, spec, closed, stopped):
             or fresh['journal_sha256'] != prior['native_observation']['journal_sha256']
             or observed['finalization_sha256'] != checks['resource_cleanup']['receipt_sha256']):
         raise ValueError('later cleanup changed after its acknowledged closure')
+    _preserve_cleanup(store, row, spec, execution, closed, fresh, attempts, stopped)
     _current(store, row, spec, stopped)
     with store._connect() as db:
         if unavailable(store, db, spec):
