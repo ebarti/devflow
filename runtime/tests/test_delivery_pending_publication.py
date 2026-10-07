@@ -18,8 +18,18 @@ from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 @pytest.fixture
-def pending(unpublished, monkeypatch):
-    store, broker, original, gate_request = unpublished
+def pending(service, monkeypatch):
+    store, _request = service
+    original_admit = type(store.config).admit
+
+    def historical_admit(config, request):
+        spec = original_admit(config, request)
+        spec.pop('publication_readback_version')
+        spec.pop('publication_readback_seconds')
+        return spec
+
+    monkeypatch.setattr(type(store.config), 'admit', historical_admit)
+    store, broker, original, gate_request = unpublished.__wrapped__(service, monkeypatch)
 
     def renew(spec, *_args):
         return {**deepcopy(spec), 'policy_digest': digest({'measured_runtime': 'renewed'})}
@@ -119,9 +129,8 @@ def test_pending_workflow_completes_effect_then_independent_gates_without_implem
         calls.append((name, body.get('role')))
         if name in {'delivery_tracker_start', 'delivery_tracker'}:
             return {'state': 'consistent'}
-        if name == 'delivery_reconcile_publish':
+        if name == 'delivery_publish':
             assert body['candidate'] == state['candidate']
-            assert body['expected_head'] == request['expected_head']
             return {'state': 'OPEN', 'number': 7, 'head': broker.candidate()['head'],
                     'candidate': broker.candidate()}
         if name == 'delivery_role':
@@ -141,8 +150,9 @@ def test_pending_workflow_completes_effect_then_independent_gates_without_implem
     assert ('delivery_role', 'implement') not in calls
     assert [role for name, role in calls if name == 'delivery_role'] == ['review', 'verify']
     assert 'delivery_precheck' not in [name for name, _ in calls]
-    assert ('delivery_publish', None) not in calls
-    assert calls.index(('delivery_reconcile_publish', None)) < \
+    assert 'publication_readback_version' not in spec
+    assert ('delivery_reconcile_publish', None) not in calls
+    assert calls.index(('delivery_publish', None)) < \
         calls.index(('delivery_role', 'review'))
     assert ('delivery_ci', None) in calls
 

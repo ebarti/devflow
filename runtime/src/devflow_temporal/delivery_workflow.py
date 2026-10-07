@@ -443,7 +443,12 @@ class DeliveryWorkflow:
             initial = await self._activity("delivery_publish", {
                 "spec": spec, "iteration": iteration, "candidate": candidate,
             })
-        except ActivityError:
+        except ActivityError as exc:
+            if (spec.get("publication_readback_version") == 1
+                    and isinstance(exc.cause, ApplicationError)
+                    and exc.cause.type == "PublicationRejected" and exc.cause.non_retryable):
+                self.state["cleanup"] = "none"
+                raise
             initial = None
         previous = self.state.get("pull_request") or {}
         return await self._published_result(

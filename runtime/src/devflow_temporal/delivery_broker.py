@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import hashlib
 import json
 import os
@@ -85,23 +84,6 @@ def publication_title(goal: str) -> str:
     return title
 
 
-def _transport_failure(exc: Exception) -> bool:
-    """Only known transport failures may defer publication authority readback."""
-    if isinstance(exc, (subprocess.TimeoutExpired, TimeoutError, ConnectionError)):
-        return True
-    if isinstance(exc, OSError):
-        return exc.errno in {errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNREFUSED,
-                             errno.ENETUNREACH, errno.EHOSTUNREACH}
-    if isinstance(exc, RuntimeError):
-        message = str(exc).lower()
-        return any(marker in message for marker in (
-            "connection reset", "connection refused", "connection timed out",
-            "could not resolve host", "temporary failure in name resolution",
-            "i/o timeout", "tls handshake timeout", "http 502", "http 503", "http 504",
-        ))
-    return False
-
-
 class BrokerReadbackUnavailable(RuntimeError):
     """A remote PR query failed before its authority could be inspected."""
 
@@ -131,6 +113,7 @@ class DeliveryBroker:
 
         self.evidence_dir = _gate_evidence_root(spec)
         self.effect_namespace = ""
+        self.publication_may_have_effect = True
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -1221,8 +1204,6 @@ class DeliveryBroker:
                 timeout=60,
             )
         except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-            if self.spec.get("publication_readback_version") == 1 and not _transport_failure(exc):
-                raise
             raise BrokerReadbackUnavailable("owned branch PR readback unavailable") from exc
         matches = json.loads(output)
         if len(matches) > 1:
@@ -1295,6 +1276,13 @@ class DeliveryBroker:
             )
 
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        # Only this invocation's confirmed pre-mutation failure can release uncertainty.
+        # Any retained original effect may belong to an earlier lost completion.
+        if self.spec.get("publication_readback_version") == 1:
+            with self.store._connect() as db:
+                prior = db.execute("SELECT 1 FROM delivery_effects WHERE effect_key=?",
+                                   (f"publish:{self.spec['run_id']}:{iteration}",)).fetchone()
+            self.publication_may_have_effect = prior is not None
         publication_branch = self._publication_base_ref()
         self._validate_publication_commits()
         key = f"publish:{self.spec['run_id']}:{iteration}"
@@ -1363,6 +1351,7 @@ class DeliveryBroker:
                 )
                 if ancestry.returncode != 0:
                     raise RuntimeError("remote feature branch diverged")
+            self.publication_may_have_effect = True
             _git(self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}")
         if self.spec.get("publication_readback_version") == 1:
             self._bind_pending_publication(
@@ -1381,6 +1370,7 @@ class DeliveryBroker:
                 encoding="utf-8",
             )
             os.chmod(body, 0o600)
+            self.publication_may_have_effect = True
             _run(
                 [
                     "gh",
@@ -1490,7 +1480,7 @@ class DeliveryBroker:
         try:
             remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
         except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-            if self.spec.get("publication_readback_version") == 1 and _transport_failure(exc):
+            if self.spec.get("publication_readback_version") == 1:
                 raise BrokerReadbackUnavailable("published branch readback unavailable") from exc
             raise
         if (self.spec.get("publication_readback_version") == 1 and saved["state"] == "pending"

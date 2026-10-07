@@ -95,8 +95,12 @@ Newly admitted runs freeze `publication_readback_version: 1` and the service's
 completion is lost, the workflow inspects that existing publication effect and its
 owned branch/PR; it never repeats commit, push, or PR creation. Known transport
 failures and delayed PR-head projection wait on durable backoff within this deadline.
-Cancellation wakes the wait. Permission, ownership, candidate or unexpected-head
-conflicts stop immediately. An exhausted deadline or cancelled unresolved publication
+Cancellation wakes the wait. Confirmed validation or permission failures before any
+remote mutation stop immediately with known cleanup. Failed read-only commands remain
+unavailable queries, regardless of their diagnostic text; only observed ownership,
+candidate or unexpected-head conflicts stop reconciliation. A failed mutation process
+cannot prove remote rejection from its exit status or stderr, so its original effect
+is still read back without repeating the mutation. An exhausted deadline or cancelled unresolved publication
 retains unknown cleanup, resources and the work claim for inspection. Scope amendments
 preserve the original version/deadline, including their absence on historical runs.
 Historical workflows retain their previous commands; this policy does not resubmit

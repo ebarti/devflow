@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from temporalio import activity
 from temporalio.client import WorkflowHistory
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from test_delivery_store import service as _service_fixture
@@ -38,7 +39,7 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
             'policy': {'max_repairs': 0, 'browser_qa': None}}
     if versioned:
         spec.update(publication_readback_version=1, publication_readback_seconds=30)
-    if failure in {'deadline', 'cancel', 'semantic'}:
+    if failure in {'deadline', 'cancel', 'semantic', 'pre_mutation'}:
         spec.update(resource_cleanup_version=1, terminal_tracker_version=1)
 
     @activity.defn(name='delivery_project')
@@ -70,6 +71,11 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
     @activity.defn(name='delivery_publish')
     async def publish(_payload):
         calls['publish'] += 1
+        if failure == 'pre_mutation':
+            raise ApplicationError('candidate rejected before remote mutation',
+                                   type='PublicationRejected', non_retryable=True)
+        if failure == 'failed_mutation':
+            raise RuntimeError('mutation command failed; its remote outcome is unconfirmed')
         if failure == 'lost_initial':
             # The original remote effect already exists; only its activity completion is lost.
             raise subprocess.TimeoutExpired(['gh', 'pr', 'create'], 90)
@@ -79,6 +85,8 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
     async def reconcile(payload):
         calls['reconcile'] += 1
         assert payload['candidate'] == checked
+        if failure == 'pre_mutation':
+            raise ValueError('original publication head has not been observed')
         if failure == 'semantic':
             raise ValueError('publication resolved to a different PR')
         if failure in {'deadline', 'cancel'}:
@@ -101,12 +109,16 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
 
     @activity.defn(name='delivery_finalize_resources')
     async def finalize_resources(payload):
+        if failure == 'pre_mutation':
+            assert payload['uncertain'] is False
+            return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+                    'resource_cleanup': 'confirmed'}
         assert payload['uncertain'] is True
         return {'state': 'unknown', 'process_cleanup': 'unknown', 'resource_cleanup': 'unknown'}
 
     @activity.defn(name='delivery_terminal_tracker')
     async def terminal_tracker(payload):
-        assert payload['release'] is False
+        assert payload['release'] is (failure == 'pre_mutation')
         return {'state': 'consistent'}
 
     activities = [project, prepare, tracker_start, role, precheck, publish,
@@ -132,7 +144,7 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['lost_initial', 'read_timeout'])
+@pytest.mark.parametrize('failure', ['lost_initial', 'read_timeout', 'failed_mutation'])
 async def test_publication_transport_failure_reconciles_original_inside_run(failure):
     result, calls, events = await run_publication_probe(failure=failure)
     assert result['outcome'] == 'delivered'
@@ -251,7 +263,7 @@ def test_slow_pr_readback_keeps_original_effect_and_mutations(service, monkeypat
             'external:devflow:run-1'
 
 
-def test_permission_error_is_terminal_not_transport_pending(service, monkeypatch):
+def test_failed_permission_query_does_not_prove_remote_authority(service, monkeypatch):
     broker, checked, _published, _state = published_broker(service, monkeypatch)
     real_run = delivery_broker._run
 
@@ -261,9 +273,8 @@ def test_permission_error_is_terminal_not_transport_pending(service, monkeypatch
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(delivery_broker, '_run', forbidden)
-    with pytest.raises(RuntimeError, match='HTTP 403') as error:
+    with pytest.raises(BrokerReadbackUnavailable):
         broker.reconcile_publish(0, checked)
-    assert not isinstance(error.value, BrokerReadbackUnavailable)
 
 
 @pytest.mark.parametrize('drift', ['head', 'pr', 'base', 'draft', 'multiple'])
@@ -439,3 +450,13 @@ def test_original_completion_can_arrive_during_readonly_reconciliation(service, 
 
     monkeypatch.setattr(delivery_broker, '_run', acknowledge_original)
     assert broker.reconcile_publish(0, checked) == published
+
+
+@pytest.mark.asyncio
+async def test_confirmed_pre_mutation_rejection_stops_without_readback_or_retaining_claim():
+    result, calls, events = await run_publication_probe(failure='pre_mutation')
+    assert result['outcome'] == 'blocked'
+    assert result['checks']['resource_cleanup']['state'] == 'confirmed'
+    assert calls['publish'] == 1
+    assert calls['reconcile'] == 0
+    assert 'publication_pending' not in events
