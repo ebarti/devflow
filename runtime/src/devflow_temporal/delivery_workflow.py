@@ -223,6 +223,15 @@ class DeliveryWorkflow:
                 "heartbeat_timeout": timedelta(seconds=30),
                 "retry_policy": RetryPolicy(maximum_attempts=3),
             }
+        elif (name == "delivery_project"
+              and request["spec"].get("projection_retry_version") == 1):
+            options = {
+                "schedule_to_close_timeout": timedelta(minutes=3),
+                "retry_policy": RetryPolicy(
+                    maximum_attempts=3, initial_interval=timedelta(seconds=2),
+                    maximum_interval=timedelta(seconds=10),
+                ),
+            }
         elif name in {
             "delivery_metadata_readback", "delivery_gates_readback", "delivery_technical_readback",
         }:
@@ -237,6 +246,8 @@ class DeliveryWorkflow:
         else:
             options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         timeout = timedelta(hours=hours)
+        if name == "delivery_project" and request["spec"].get("projection_retry_version") == 1:
+            timeout = timedelta(seconds=45)
         if patient_ci:
             timeout = timedelta(seconds=request["spec"]["policy"]["ci_wait_seconds"] + 120)
             options["schedule_to_close_timeout"] = timeout

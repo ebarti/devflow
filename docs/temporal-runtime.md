@@ -1,5 +1,14 @@
 # Local Temporal delivery runtime
 
+New admissions retry an exact keyed local phase projection up to three times over
+three minutes. A database lock or lost activity completion does not launch another
+role, publication or tracker effect: the existing transaction deduplicates the
+same event and key. Database work runs outside the shared worker event loop.
+Malformed state, missing runs, changed configuration and database corruption are
+terminal. Previously admitted inputs keep their recorded projection options;
+scope amendments preserve that choice. No database migration or operator retry
+is needed after an ordinary deployment.
+
 The runtime under `runtime/` is a single-host, local development service. It accepts a raw goal with an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. A read-only intake role investigates repository evidence, asks only blocking questions, and records a scoped plan before autonomous implementation. The managed path then owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. Its endpoint is a **published, unmerged PR**. It does not merge, release, deploy, or update personal production data.
 
 The older `devflow-temporal` CLI remains a disposable role-ordering demonstration. It does not publish a PR or reconcile an issue. Use the managed `devflow-delivery` service for an end-to-end delivery.
