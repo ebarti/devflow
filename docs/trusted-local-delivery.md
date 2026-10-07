@@ -403,20 +403,19 @@ PDFs, six source HTML files, six bbox HTML files, measurements and every page
 image. Calibration PDFs are additional evidence. The expected new page count
 comes from the actual rerun rather than a historical removed-file count.
 
-The existing `continue-repair` command accepts its original seven fields. A
-cause-specific title correction additionally requires `authority_path` and
-`authority_sha256`, and can be inspected with `repair-admission-preflight` using
-the same request. This narrow route requires the authenticated effective policy,
-completed metadata reconciliation and a fresh failed browser receipt whose
-frozen regex matches the exact title. It atomically reacquires a released claim
-with grant/outbox persistence, rolling back acquisition on admission failure.
-The admitted original session receives the bounded exact match, pattern and
-owned log/hash provenance. The controller permits one title literal change
-only; every surrounding byte, all five cases/assertions and other source files
-must remain identical. This grant admits exactly iteration5 under an existing
-max_repairs3 ceiling, with no iteration6 or automatic renewal. Metadata repair
-must precede this source correction. No generic old failed run gains this
-released-claim or effective-policy exception.
+The existing `continue-repair` command retains its ordinary seven-field contract.
+The former browser-test-name correction variant, identified by additional
+`authority_path` and `authority_sha256` fields, no longer admits new work through
+preflight or continuation. An exact previously persisted command can still return
+its saved response without effects. Previously admitted `title_constraint`
+payloads and their nested lineage remain readable; their strict literal-only
+source validation continues before and after the original provider turn.
+
+Before deploying this retirement, finish or cancel queued/running title-constrained
+repairs, including nested continuations, using the prior runtime. Also finish
+pre-workflow admission effects and resolve any uncertain command acknowledgement
+under that runtime. Generic continuation routes and the existing historical table
+reads are unchanged. This retirement concerns browser test names, not PR titles.
 
 Implementation admission measures the net file diff against the frozen base,
 including untracked files. A committed, clean feature proceeds to the same
