@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -27,15 +28,32 @@ def private_directory(path: Path) -> None:
 
 
 def read_private(path: Path) -> dict:
-    info = path.lstat()
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.getuid()
-        or info.st_mode & 0o777 != 0o600
-        or info.st_nlink != 1
-    ):
-        raise ValueError("resource evidence is not a private owned file")
-    return json.loads(path.read_bytes())
+    # Recheck the replacement once when publication unlinks the first inode.
+    # A second authenticated descriptor remains a valid snapshot if unlinked too;
+    # it need not be the latest pathname value under continuous publication.
+    for observation in range(2):
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError("resource evidence is not a private owned file") from exc
+            raise
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_mode & 0o777 != 0o600
+                or info.st_nlink not in (0, 1)
+            ):
+                raise ValueError("resource evidence is not a private owned file")
+            if info.st_nlink == 0 and observation == 0:
+                continue
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                return json.load(stream)
+        finally:
+            os.close(descriptor)
+    raise ValueError("resource evidence is not a private owned file")
 
 
 def write_private(path: Path, value: dict) -> None:

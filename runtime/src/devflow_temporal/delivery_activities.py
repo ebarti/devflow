@@ -25,6 +25,19 @@ from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
 
 
+async def _with_heartbeat(operation, request: dict[str, Any], stage: str) -> dict[str, Any]:
+    pending = asyncio.create_task(operation)
+    try:
+        while not pending.done():
+            if activity.in_activity():
+                activity.heartbeat({'run_id': request['spec']['run_id'], 'stage': stage})
+            await asyncio.wait({pending}, timeout=5)
+        return await pending
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
 def _context(
     spec: dict[str, Any], *, preparation_input: bool = False
 ) -> tuple[DeliveryStore, DeliveryBroker]:
@@ -136,14 +149,18 @@ async def delivery_prepare(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_intake")
 async def delivery_intake(request: dict[str, Any]) -> dict[str, Any]:
-    store, broker = _context(request["spec"])
+    return await _with_heartbeat(_run_intake(request), request, 'intake')
+
+
+async def _run_intake(request: dict[str, Any]) -> dict[str, Any]:
+    store, broker = await asyncio.to_thread(_context, request["spec"])
     candidate = request["candidate"]
-    if broker.candidate() != candidate:
+    if await asyncio.to_thread(broker.candidate) != candidate:
         raise ValueError("intake checkout changed before investigation")
     result = await get_supervisor(store).run(
         {**request, "role": "intake", "workspace": str(broker.checkout)}
     )
-    if broker.candidate() != candidate:
+    if await asyncio.to_thread(broker.candidate) != candidate:
         result["status"] = "blocked"
         result.setdefault("findings", []).append("intake changed the read-only checkout")
     return {
@@ -204,7 +221,10 @@ async def delivery_accept_plan(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_role")
 async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
-    store, broker = _context(request["spec"])
+    return await _with_heartbeat(_run_role(request), request, 'role')
+
+
+def _role_context(request, store, broker, supervisor):
     role = request["role"]
     iteration = request["iteration"]
     candidate = request["candidate"]
@@ -212,8 +232,8 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
         workspace = broker.checkout
         review_diff = None
     elif role in {"review", "verify"}:
-        workspace = broker.gate_checkout(role, iteration, candidate)
-        review_diff = broker.gate_diff(role, iteration, candidate)
+        workspace = broker._gate_path(role, iteration)
+        review_diff = None
     else:
         raise ValueError("unknown delivery role")
     constraint = request.get("title_constraint")
@@ -244,15 +264,31 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
                 or digest(saved.get("title_constraint")) != digest(constraint)
                 or request.get("resume_session") != saved["session_id"]):
             raise ValueError("title repair role does not match its sealed single turn")
-    supervisor = get_supervisor(store)
-    retained = supervisor.retained_request(
-        {**request, 'workspace': str(workspace), 'review_diff': review_diff}
-    ) if role == 'implement' else None
+    retained = supervisor.retained_request({
+        **request, 'workspace': str(workspace),
+        **({'review_diff': review_diff} if role == 'implement' else {}),
+    })
+    if role in {'review', 'verify'}:
+        if retained is not None:
+            review_diff = retained['review_diff']
+        else:
+            workspace = broker.gate_checkout(role, iteration, candidate)
+            review_diff = broker.gate_diff(role, iteration, candidate)
     if role == 'implement' and retained is None:
         if broker.candidate() != candidate:
             raise ValueError('implementer checkout changed before its role')
         if constraint:
             validate_source(request['spec'], constraint, completed=False)
+    return request, workspace, review_diff, retained
+
+
+async def _run_role(request: dict[str, Any]) -> dict[str, Any]:
+    store, broker = await asyncio.to_thread(_context, request['spec'])
+    supervisor = get_supervisor(store)
+    request, workspace, review_diff, retained = await asyncio.to_thread(
+        _role_context, request, store, broker, supervisor,
+    )
+    role, iteration, candidate = request['role'], request['iteration'], request['candidate']
     if (role == "implement" and request["spec"].get("provider") == "codex"
             and request["spec"]["policy"].get("host_sandbox") == "trusted-local"
             and retained is None):
@@ -274,7 +310,17 @@ async def delivery_role(request: dict[str, Any]) -> dict[str, Any]:
     result = await supervisor.run(
         {**request, "workspace": str(workspace), "review_diff": review_diff}
     )
+    return await asyncio.to_thread(
+        _role_result, request, broker, workspace, review_diff, result,
+    )
+
+
+def _role_result(request, broker, workspace, review_diff, result):
+    role, iteration, candidate = request['role'], request['iteration'], request['candidate']
+    constraint = request.get('title_constraint')
     if constraint:
+        from .delivery_title_repair import validate_source
+
         try:
             validate_source(request["spec"], constraint, completed=True)
         except (ValueError, OSError, UnicodeError) as exc:
@@ -422,7 +468,7 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
                 "reason": type(exc).__name__,
             }
 
-    return await asyncio.to_thread(execute)
+    return await _with_heartbeat(asyncio.to_thread(execute), request, 'checks')
 
 
 @activity.defn(name="delivery_browser_qa")
@@ -446,7 +492,7 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
     # Browser/API fixtures may run for minutes. Keep the Temporal worker loop
     # available for cancellation updates and unrelated workflows while this
     # bounded child is supervised on its own thread.
-    return await asyncio.to_thread(execute)
+    return await _with_heartbeat(asyncio.to_thread(execute), request, 'browser_qa')
 
 
 @activity.defn(name="delivery_precheck")
@@ -472,7 +518,7 @@ async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
                 "reason": type(exc).__name__,
             }
 
-    return await asyncio.to_thread(execute)
+    return await _with_heartbeat(asyncio.to_thread(execute), request, 'precheck')
 
 
 @activity.defn(name="delivery_baseline_checks")
@@ -489,7 +535,7 @@ async def delivery_baseline_checks(request: dict[str, Any]) -> dict[str, Any]:
                 return {"state": "failed", "results": exc.results, "diagnostic": str(exc),
                         "base_sha": request["spec"]["base_sha"]}
 
-    return await asyncio.to_thread(execute)
+    return await _with_heartbeat(asyncio.to_thread(execute), request, 'baseline_checks')
 
 
 @activity.defn(name="delivery_ci")
