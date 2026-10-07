@@ -17,8 +17,8 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.context import RequestContext
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import RequestParams
+from temporal_test_server import local_temporal
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from test_delivery_intake import intake_fixture as source_intake_fixture
 
@@ -378,7 +378,7 @@ async def test_public_blocking_question_callback_and_actual_user_answer_resume_t
 
     activities = [delivery_project, delivery_prepare, delivery_intake, delivery_accept_plan,
                   tracker, implement]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "blocking-temporal.sqlite3"),
     ) as environment:

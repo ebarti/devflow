@@ -9,8 +9,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from test_delivery_store import service as service
 
@@ -116,7 +116,7 @@ async def test_two_public_concurrent_runs_measure_baseline_before_roles_and_repl
         assert passes
         return {"state": "consistent"}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "baseline-temporal.sqlite3"),
     ) as environment:

@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from devflow_temporal.delivery_activities import (
@@ -879,7 +879,7 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
         return await delivery_project(payload)
 
     activities = [project_fixture, delivery_prepare, tracker_start_stub, role_stub]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "public-decision.sqlite3")
     ) as environment:
 
@@ -972,8 +972,9 @@ async def test_public_decision_and_cancel_use_temporal_revision_after_worker_res
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("browser_entry_delay", [0, 6])
 async def test_public_cancel_remains_responsive_during_blocking_browser_activity(
-    api_fixture, tmp_path, monkeypatch
+    api_fixture, tmp_path, monkeypatch, browser_entry_delay
 ):
     path, request = api_fixture
     config = json.loads(path.read_text())
@@ -985,6 +986,7 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
     release = threading.Event()
 
     def blocking_browser(_broker, _iteration, candidate):
+        time.sleep(browser_entry_delay)
         entered.set()
         assert release.wait(timeout=10)
         return {"state": "passed", "cleanup": "confirmed", "candidate_id": candidate["id"]}
@@ -1015,7 +1017,7 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
     async def checks_stub(_payload):
         return {"state": "passed"}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_database_filename=str(tmp_path / "browser-cancel.sqlite3")
     ) as environment:
 
@@ -1056,8 +1058,12 @@ async def test_public_cancel_remains_responsive_during_blocking_browser_activity
                     task_queue="public-browser-cancel",
                 )
                 store.mark_start(request["run_id"], accepted=True)
-                assert await asyncio.wait_for(asyncio.to_thread(entered.wait), 5)
                 try:
+                    async def browser_entered():
+                        while not entered.is_set():
+                            await asyncio.sleep(0.05)
+
+                    await asyncio.wait_for(browser_entered(), 15)
                     detail = (await browser.get("/api/runs/run-1")).json()["run"]
                     assert detail["phase"] == "browser_qa"
                     cancelled = await asyncio.wait_for(

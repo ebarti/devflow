@@ -14,8 +14,8 @@ import pytest
 import uvicorn
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from temporal_test_server import local_temporal
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 from test_delivery_intake import intake_fixture as source_intake_fixture
 
@@ -215,7 +215,7 @@ async def test_generated_stdio_command_raw_goal_question_auto_plan_and_evidence(
         command=command["command"], args=command["args"],
         env={"PYTHONPATH": str(shim), "PATH": os.environ["PATH"]},
     )
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "temporal.sqlite3"),
     ) as environment:

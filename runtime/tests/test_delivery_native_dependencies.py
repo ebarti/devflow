@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from temporalio.testing import WorkflowEnvironment
+from temporal_test_server import local_temporal
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import ControlledNativeTerminalFixture, controlled_terminal_tracker
@@ -238,7 +238,7 @@ async def test_fresh_native_registry_fetch_offline_install_check_and_resource_re
         assert replay == dependency  # durable receipt, not another network fetch
         outcome = "delivered"
     finally:
-        async with await WorkflowEnvironment.start_local(
+        async with local_temporal(
             dev_server_existing_path=shutil.which("temporal"),
         ) as environment:
             async with Worker(

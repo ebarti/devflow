@@ -9,10 +9,10 @@ from datetime import timedelta
 
 import httpx
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import activity, workflow
 from temporalio.client import WorkflowFailureError
 from temporalio.service import RPCError, RPCStatusCode
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
@@ -68,7 +68,7 @@ async def test_real_pending_terminal_remains_open_and_public_retry_delivers(
         return {'state': 'pending' if pending else 'consistent', 'pending': pending,
                 'desired': request['status'], 'readback_at': 'pending' if pending else 'fresh'}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which('temporal'),
     ) as environment:
         class Client:
@@ -217,7 +217,7 @@ async def test_authentic_closed_tail_queues_only_tracker_successor(
             await asyncio.sleep(2)
         return await delivery_terminal_preflight(payload)
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which('temporal'),
     ) as environment:
         async def client():
@@ -389,7 +389,7 @@ async def test_closed_cancelled_recovery_preserves_cleanup_source_contract(
         return {'state': 'pending' if pending else 'consistent', 'pending': pending,
                 'desired': payload['status'], 'readback_at': 'fresh'}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which('temporal'),
     ) as environment:
         async def client():
@@ -537,7 +537,7 @@ async def test_closed_recovery_binds_real_preparation_and_automatic_intake_evolu
                     f"external:devflow:{submitted['run_id']}")
         return {'state': 'consistent' if consistent else 'pending', 'pending': not consistent}
 
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which('temporal'),
     ) as environment:
         async def client():
