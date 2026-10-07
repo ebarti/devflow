@@ -7,6 +7,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -31,6 +32,8 @@ from .delivery_continuation import (
     session_state_digest,
 )
 from .delivery_preparation import execution_retired
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -606,9 +609,16 @@ class DeliveryStore:
 
     def owns_execution(self, spec: dict[str, Any]) -> bool:
         """Shared database visibility does not grant another service's transport."""
-        frozen = DeliveryConfig.load(Path(spec["config_path"]))
-        if digest(frozen.raw) != spec["config_digest"]:
-            raise ValueError("frozen service configuration changed")
+        try:
+            frozen = DeliveryConfig.load(Path(spec["config_path"]))
+            if digest(frozen.raw) != spec["config_digest"]:
+                raise ValueError("frozen service configuration changed")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning(
+                "Run %s skipped: frozen execution configuration unavailable (%s)",
+                spec.get("run_id", "unknown"), type(exc).__name__,
+            )
+            return False
 
         def binding(config: DeliveryConfig) -> tuple:
             return (

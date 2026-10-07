@@ -13,6 +13,7 @@ import httpx
 import pytest
 from temporal_test_server import local_temporal
 from temporalio import activity
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 
 from devflow_temporal.delivery_activities import (
@@ -271,6 +272,59 @@ def _foreign_queued_service(api_fixture, key, value):
     foreign = create_app(foreign_path).state.delivery
     foreign.store.submit(request)
     return owner, foreign, request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["edit", "delete", "spec"])
+async def test_invalid_foreign_row_does_not_block_owned_dispatch(
+    api_fixture, monkeypatch, caplog, mutation,
+):
+    owner, foreign, request = _foreign_queued_service(
+        api_fixture, "temporal_address", "127.0.0.1:17399",
+    )
+    own = {**request, "command_id": "own-submit", "run_id": "own-run",
+           "work_id": "own-work", "branch": "feat/own-run",
+           "issue_url": "https://github.com/example/fixture/issues/4"}
+    owner.store.submit(own)
+    before = foreign.store.detail(request["run_id"])
+    if mutation == "edit":
+        raw = json.loads(foreign.config.path.read_text())
+        raw["label"] = "changed after admission"
+        foreign.config.path.write_text(json.dumps(raw))
+    elif mutation == "delete":
+        foreign.config.path.unlink()
+    else:
+        original = owner.store.effective_spec
+
+        def invalid_spec(run_id):
+            if run_id == request["run_id"]:
+                raise ValueError("invalid foreign specification")
+            return original(run_id)
+
+        monkeypatch.setattr(owner.store, "effective_spec", invalid_spec)
+    started = []
+
+    async def missing():
+        raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+
+    class Temporal:
+        def get_workflow_handle(self, _workflow_id):
+            return SimpleNamespace(describe=missing)
+
+        async def start_workflow(self, _workflow, **kwargs):
+            started.append(kwargs["id"])
+
+    async def healthy():
+        owner.temporal_status = "connected"
+        return Temporal()
+
+    monkeypatch.setattr(owner, "healthy_client", healthy)
+    await owner.dispatch_once()
+    assert started == ["delivery-own-run"]
+    assert owner.temporal_status == "connected"
+    assert foreign.store.detail(request["run_id"]) == before
+    assert [row["run_id"] for row in owner.store.pending_starts()] == [request["run_id"]]
+    assert request["run_id"] in caplog.text
 
 
 @pytest.mark.asyncio
