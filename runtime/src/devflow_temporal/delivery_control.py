@@ -62,12 +62,42 @@ def _read_manifest(config: DeliveryConfig) -> dict | None:
     return value
 
 
-def _write_manifest(config: DeliveryConfig, processes: dict) -> None:
+def _recorded_deployment(manifest: dict) -> dict | None:
+    worker = manifest.get("processes", {}).get("worker", {}).get("deployment")
+    recorded = manifest.get("worker_deployment", worker)
+    if "worker_deployment" in manifest and recorded is None:
+        raise ValueError("recorded worker deployment is invalid")
+    if worker is not None and recorded != worker:
+        raise ValueError("worker deployment differs from its lifecycle selection")
+    return recorded
+
+
+def _validated_deployment(recorded: dict, *, same_payload: bool = True):
+    if (not isinstance(recorded, dict)
+            or not re.fullmatch(r"[a-f0-9]{64}", str(recorded.get("runtime_payload_sha256", "")))
+            or (same_payload and recorded["runtime_payload_sha256"]
+                != payload_digest(Path(__file__).resolve().parent))):
+        raise ValueError(
+            "recorded worker source payload differs or is unknown; "
+            "retain the original artifact and drain it before changing")
+    selected = _worker_deployment(recorded.get("name"), recorded.get("build_id"))
+    if selected is None:
+        raise ValueError("recorded worker deployment is invalid")
+    return selected
+
+
+def _write_manifest(
+    config: DeliveryConfig, processes: dict, *, deployment: dict | None = None,
+) -> None:
     path = _manifest(config)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps({"config_path": str(config.path), "processes": processes}, indent=2) + "\n"
-    )
+    if deployment is None:
+        deployment = (processes.get("worker", {}).get("deployment")
+                      or _recorded_deployment(_read_manifest(config) or {}))
+    value = {"config_path": str(config.path), "processes": processes}
+    if deployment is not None:
+        value["worker_deployment"] = deployment
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
 
@@ -180,6 +210,11 @@ def _launch(config: DeliveryConfig, name: str, argv: list[str]) -> dict:
 
 
 def _stop(config: DeliveryConfig, manifest: dict) -> dict:
+    recorded = _recorded_deployment(manifest)
+    if recorded is None:
+        recorded = _recorded_deployment(_read_manifest(config) or {})
+    if recorded is not None:
+        _validated_deployment(recorded)
     results = {}
     for name in ("api", "worker", "temporal"):
         process = manifest.get("processes", {}).get(name)
@@ -212,7 +247,10 @@ def _stop(config: DeliveryConfig, manifest: dict) -> dict:
                 time.sleep(0.05)
         results[name] = "stopped" if not _owned(process) else "termination_pending"
     if all(not _owned(process) for process in manifest.get("processes", {}).values()):
-        _manifest(config).unlink(missing_ok=True)
+        if recorded is None:
+            _manifest(config).unlink(missing_ok=True)
+        else:
+            _write_manifest(config, {}, deployment=recorded)
         (config.state_root / "worker-ready.json").unlink(missing_ok=True)
     return results
 
@@ -267,18 +305,23 @@ def ensure_service_running(
                     _owned(process) for process in existing["processes"].values()
                 ):
                     raise ValueError("state root has a running service for another configuration")
-                recorded = existing["processes"].get("worker", {}).get("deployment")
+                recorded = _recorded_deployment(existing)
                 if recorded is not None:
-                    if (not isinstance(recorded, dict) or recorded.get("runtime_payload_sha256")
-                            != payload_digest(Path(__file__).resolve().parent)):
-                        raise ValueError(
-                            "recorded worker source payload differs or is unknown; "
-                            "retain the original artifact and drain it before changing")
-                    selected = _worker_deployment(recorded.get("name"), recorded.get("build_id"))
-                    if selected is None or (deployment is not None and deployment != selected):
+                    different = isinstance(recorded, dict) and deployment is not None and (
+                        deployment.version.deployment_name != recorded.get("name")
+                        or deployment.version.build_id != recorded.get("build_id"))
+                    replace = different and not existing["processes"]
+                    selected = _validated_deployment(recorded, same_payload=not replace)
+                    if different and not replace:
                         raise ValueError(
                             "running worker deployment differs; drain it before changing")
-                    deployment = selected
+                    if not replace:
+                        deployment = selected
+                    else:
+                        # Explicit owner selection only after the prior lifecycle was stopped.
+                        existing = {**existing,
+                                    "worker_deployment": _deployment_identity(deployment)}
+                        _write_manifest(config, {}, deployment=existing["worker_deployment"])
                 while True:
                     if _ready(config, existing, deadline):
                         if (deployment is not None and existing["processes"]["worker"].get(
@@ -297,6 +340,9 @@ def ensure_service_running(
                 _stop(config, existing)
                 if any(_owned(process) for process in existing["processes"].values()):
                     raise ValueError("owned service termination is pending; inspect service status")
+            if deployment is not None:
+                # Selection outlives PIDs, including failure before the first worker launch.
+                _write_manifest(config, {}, deployment=_deployment_identity(deployment))
             return (_start(config, deadline, deployment=deployment) if deployment
                     else _start(config, deadline))
     except (OSError, RuntimeError, ValueError) as exc:

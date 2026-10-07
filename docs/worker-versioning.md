@@ -16,19 +16,19 @@ code and fixture activities; it does not prove native preparation compatibility.
 
 `start` and `worker` accept optional `--deployment-name` and
 `--deployment-build-id`. Both are required together. They configure the Python
-SDK's `WorkerDeploymentConfig` with `VersioningBehavior.PINNED`. Without the flags,
-worker registration is unchanged. These options do not change admission specs,
+SDK's `WorkerDeploymentConfig` with `VersioningBehavior.PINNED`. For a lifecycle
+without a stored selection, registration is unchanged when flags are absent.
+These options do not change admission specs,
 configuration files, ownership hashes, repair budgets, or historical preparations.
-The version appears in the process manifest and readiness record. Readiness still
-requires both registered pollers and the owned process identity. Starting another
-version while a worker is recorded fails without restarting it. A cold restart
-reuses the explicit selection only when the recorded `runtime_payload_sha256`
-matches the current package. Missing or changed source identity rejects startup
-before any process is signalled or launched. This prevents silently registering
-changed source under a pinned version or losing versioning after a crash.
-Unversioned historical manifests keep their original behavior; they are not
-upgraded by a restart. To change an artifact, the owner must first drain and stop
-its existing lifecycle, then explicitly select the new version.
+The selection is stored at the top level of the existing process manifest before
+any launch, separately from PIDs, and is also included in worker readiness. A
+stop retains that selection with an empty process inventory. Failed and partial
+starts preserve it; later implicit starts reuse it only when the recorded source
+digest matches the package. Unknown or changed identity rejects startup and stop
+before readiness, signalling or launching. Unversioned historical manifests keep
+their original behavior. An explicit different version can replace a selection
+only after the previous lifecycle has been drained and stopped to an empty
+inventory. Selecting the same version never refreshes its source digest.
 
 A version name denotes one immutable, replay-qualified source/dependency artifact.
 Never reuse it for different bytes. These flags register the worker; they do not
@@ -62,34 +62,30 @@ execution override.
    IDs. Record incompatibilities without rewriting history. The included source
    archive demonstrates the intervening order; use the full retained deployment
    artifact for native execution.
-3. Drain native activities before changing a worker. The current service owns
-   one worker/readiness lifecycle. Run compatible retained artifacts sequentially,
-   preserving the original namespace, queue, configurations and transport. Wait
-   for both pollers to register; a deployment override issued before registration
-   is rejected. Confirm the deployment via Temporal's public readback.
-4. For each execution whose complete history passed that artifact's replay, the
-   owner can set an explicit pinned override with the public Temporal options API:
-
-   ```sh
-   temporal --address "$ADDRESS" --namespace "$NAMESPACE" workflow update-options \
-     --workflow-id "$WORKFLOW_ID" --run-id "$RUN_ID" \
-     --versioning-override-behavior pinned \
-     --versioning-override-deployment-name "$DEPLOYMENT" \
-     --versioning-override-build-id "$REPLAY_QUALIFIED_VERSION"
-   ```
-
-   Read back the override and observe a new completed workflow task and actual
-   progress. An accepted routing update alone proves no resumption. Retain failure
-   history. Existing native source, interpreter, dependency and resource guards
-   still apply: a workflow replay pass cannot override a preparation mismatch.
-   Do not refresh frozen inputs, waive checks, or adopt a different transport to
-   make the migration pass.
-5. Drain each retained cohort before switching this single worker lifecycle to
-   another artifact. Only after historical executions are accounted for, register
-   the current worker with an explicit deployment version, verify its two pollers,
-   and set that version current through `temporal worker deployment
-   set-current-version`. Then reopen admissions. New executions pin to the selected
-   version; future deployments must retain workers for versions still in use.
+3. Drain all workflow and native activity work before changing artifacts. The
+   bundled lifecycle owns Temporal, the API and one worker together: `stop` stops
+   all three, and there is no worker-only stop or simultaneous version support.
+   Never run the retained adapter beside that worker; they share
+   `worker-ready.json`. A whole-stack stop cannot keep the bundled Temporal server
+   available to an adapter. The adapter is only usable with an independently
+   supervised Temporal server and exclusive worker/readiness ownership supplied
+   by the owner; this tooling does not provision that migration environment.
+4. In such an owner-managed migration environment, register only the
+   replay-qualified retained artifact. Verify both pollers and readiness ownership
+   before setting a replay-qualified execution's explicit pinned override through
+   Temporal's public workflow options API. Read back the override and observe a
+   completed workflow task and actual progress; an accepted routing update alone
+   proves no resumption. Frozen preparation/source/dependency guards still apply.
+   If the retained artifact cannot resume under them, keep the incompatibility
+   unresolved; do not refresh frozen inputs or waive checks.
+5. Finish every retained execution and native task before retiring its artifact.
+   After full drain, stop that entire owned lifecycle. Explicitly select the new
+   artifact/version with `start --deployment-name ... --deployment-build-id ...`,
+   verify its pollers/readiness, then set it current through Temporal's public
+   deployment API and reopen admissions. Pinned mode requires this full drain
+   again for subsequent upgrades with this single-worker tooling; it cannot keep
+   old and new versions serving concurrently. Preserve persistence and retained
+   artifacts until all executions are accounted for.
 
 A history spanning incompatible unmarked implementations may replay on neither
 artifact. None has been observed by these fixtures. If encountered, report the

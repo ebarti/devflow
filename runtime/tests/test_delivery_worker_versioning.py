@@ -278,3 +278,119 @@ def test_restart_rejects_unknown_or_changed_source_before_lifecycle_effects(
         control.ensure_service_running(config, deployment=(
             control._worker_deployment("delivery", "retained") if explicit else None))
     assert control._manifest(config).read_bytes() == before
+
+
+@pytest.mark.parametrize("stop_first", [False, True])
+def test_pinned_selection_survives_stop_and_repeated_start_failure(
+    tmp_path, monkeypatch, stop_first,
+):
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    config = DeliveryConfig(tmp_path / "config.json", {
+        "state_root": str(tmp_path), "service_start_timeout": 1,
+    })
+    selection = control._worker_deployment("delivery", "retained")
+    control._write_manifest(config, {"worker": {
+        "pid": 99_999_999, "identity": "dead-fixture",
+        "deployment": control._deployment_identity(selection),
+    }})
+    calls = []
+
+    def failing_start(_config, _deadline, *, deployment=None):
+        calls.append(deployment)
+        raise RuntimeError("Temporal did not become ready")
+
+    monkeypatch.setattr(control, "_ports", lambda _config: None)
+    monkeypatch.setattr(control, "_start", failing_start)
+    monkeypatch.setattr(control.os, "killpg", lambda *_args: pytest.fail("signalled a fixture PID"))
+    if stop_first:
+        control.service_stop(config)
+    for _ in range(2):
+        with pytest.raises(ValueError, match="did not become ready"):
+            control.ensure_service_running(config)
+    assert calls == [selection, selection]
+    recorded = control._read_manifest(config)
+    assert recorded["processes"] == {}
+    assert recorded["worker_deployment"] == control._deployment_identity(selection)
+
+
+@pytest.mark.parametrize("crash", [False, True])
+def test_pinned_selection_precedes_temporal_only_partial_start(tmp_path, monkeypatch, crash):
+    import sys
+
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    config = DeliveryConfig(tmp_path / "config.json", {
+        "state_root": str(tmp_path), "service_start_timeout": 1,
+        "temporal_bin": sys.executable,
+    })
+    selection = control._worker_deployment("delivery", "retained")
+    bundle = tmp_path / "bundle.html"
+    bundle.write_text("fixture")
+    monkeypatch.setattr(control, "_dashboard_bundle", lambda: bundle)
+    monkeypatch.setattr(control, "_ports", lambda _config: ("127.0.0.1", 1, 2, 3))
+    monkeypatch.setattr(control, "_free", lambda *_args: True)
+    monkeypatch.setattr(control, "DeliveryStore", lambda _config: None)
+    monkeypatch.setattr(control, "_launch", lambda *_args: {
+        "pid": 99_999_999, "identity": "dead-fixture",
+    })
+    monkeypatch.setattr(control, "_wait_port", lambda *_args, **_kwargs: (
+        _ for _ in ()).throw(
+            KeyboardInterrupt("controller died before worker launch") if crash
+            else RuntimeError("Temporal startup failed")))
+    original_stop = control._stop
+    # Abrupt controller death cannot run its cleanup handler. No fixture process exists.
+    if crash:
+        monkeypatch.setattr(control, "_stop", lambda *_args: {})
+    with pytest.raises(KeyboardInterrupt if crash else ValueError):
+        control.ensure_service_running(config, deployment=selection)
+    partial = control._read_manifest(config)
+    assert set(partial["processes"]) == ({"temporal"} if crash else set())
+    assert partial.get("worker_deployment") == control._deployment_identity(selection)
+    calls = []
+    monkeypatch.setattr(control, "_stop", original_stop)
+    monkeypatch.setattr(control, "_start", lambda *_args, **kwargs: calls.append(kwargs))
+    control.ensure_service_running(config)
+    assert calls == [{"deployment": selection}]
+
+
+@pytest.mark.parametrize("digest", [None, "invalid", "0" * 64])
+@pytest.mark.parametrize("operation", ["start", "stop"])
+def test_stopped_selection_rejects_unknown_source_before_any_effect(
+    tmp_path, monkeypatch, digest, operation,
+):
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    config = DeliveryConfig(tmp_path / "config.json", {
+        "state_root": str(tmp_path), "service_start_timeout": 1,
+    })
+    control._write_manifest(config, {}, deployment={
+        "name": "delivery", "build_id": "retained", "runtime_payload_sha256": digest,
+    })
+    before = control._manifest(config).read_bytes()
+    monkeypatch.setattr(control, "_ports", lambda _config: None)
+    monkeypatch.setattr(control, "_ready", lambda *_args: pytest.fail("readiness effect"))
+    monkeypatch.setattr(control, "_start", lambda *_args, **_kwargs: pytest.fail("launch effect"))
+    monkeypatch.setattr(control.os, "killpg", lambda *_args: pytest.fail("signal effect"))
+    with pytest.raises(ValueError, match="recorded worker source payload"):
+        (control.service_stop if operation == "stop" else control.ensure_service_running)(config)
+    assert control._manifest(config).read_bytes() == before
+
+
+def test_explicit_new_selection_requires_empty_stopped_inventory(tmp_path, monkeypatch):
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    config = DeliveryConfig(tmp_path / "config.json", {
+        "state_root": str(tmp_path), "service_start_timeout": 1,
+    })
+    old = {"name": "delivery", "build_id": "retained", "runtime_payload_sha256": "0" * 64}
+    control._write_manifest(config, {}, deployment=old)
+    new = control._worker_deployment("delivery", "new")
+    calls = []
+    monkeypatch.setattr(control, "_ports", lambda _config: None)
+    monkeypatch.setattr(control, "_start", lambda *_args, **kwargs: calls.append(kwargs))
+    with pytest.raises(ValueError, match="recorded worker source payload"):
+        control.ensure_service_running(config)
+    control.ensure_service_running(config, deployment=new)
+    assert calls == [{"deployment": new}]
+    assert control._read_manifest(config)["worker_deployment"] == control._deployment_identity(new)
