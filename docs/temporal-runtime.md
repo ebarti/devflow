@@ -178,3 +178,5 @@ including their timeouts. Successful conflicting PR/head observations still bloc
 without releasing the claim; unavailable observations exhaust into recoverable
 `waiting_tracker` at the frozen deadline. Existing unversioned inputs keep their
 original activity result shapes.
+
+Run lists return up to 50 observations by default (maximum 100). `/api/runs`, CLI `runs` and MCP `list_runs` accept `limit`, `cursor` and `archived`; CLI uses `--limit`, `--cursor` and `--archived`. Follow a returned `next_cursor` explicitly to read older history, keeping the same archive filter. Ordering uses last-update time and run ID. These are live observations, so concurrent updates can move rows between pages; cursors do not freeze history. The dashboard polls only the recent page every five seconds. **Load older tasks** retrieves one older page on demand and retains its rows without polling that page; toggling the archive collection resets older observations. Direct run URLs remain available, and statistics still include complete stored history.

@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from .delivery_config import DeliveryConfig
 
@@ -69,8 +69,16 @@ class DeliveryClient:
     def service(self) -> dict:
         return self._request("GET", "/api/service")
 
-    def runs(self) -> dict:
-        return self._request("GET", "/api/runs")
+    def runs(self, *, limit: int = 50, cursor: str | None = None, archived: bool = False) -> dict:
+        parameters: dict[str, str | int] = {}
+        if limit != 50:
+            parameters["limit"] = limit
+        if archived:
+            parameters["archived"] = "true"
+        if cursor is not None:
+            parameters["cursor"] = cursor
+        suffix = "?" + urlencode(parameters) if parameters else ""
+        return self._request("GET", "/api/runs" + suffix)
 
     def status(self, run_id: str) -> dict:
         return self._request("GET", "/api/runs/" + quote(run_id, safe=""))

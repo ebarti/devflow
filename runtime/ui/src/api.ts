@@ -89,7 +89,15 @@ async function command<T>(path: string, body: object): Promise<T> {
 
 export const api = {
   session,
-  listRuns: async (archived = false): Promise<RunSummary[]> => (await request<{ runs: RunSummary[] }>(archived ? '/api/runs?archived=true' : '/api/runs')).runs,
+  listRuns: async (archived = false): Promise<RunSummary[]> => (await api.listRunsPage(archived)).runs,
+  listRunsPage: async (archived = false, cursor?: string): Promise<{ runs: RunSummary[]; next_cursor: string | null }> => {
+    const params = new URLSearchParams()
+    if (archived) params.set('archived', 'true')
+    if (cursor) params.set('cursor', cursor)
+    const query = params.toString()
+    const page = await request<{ runs: RunSummary[]; next_cursor?: string | null }>(`/api/runs${query ? `?${query}` : ''}`)
+    return { ...page, next_cursor: page.next_cursor ?? null }
+  },
   getStatistics: (): Promise<Statistics> => request('/api/statistics'),
   archive: async (runId: string, body: { command_id: string; expected_revision: number; archived: boolean }): Promise<void> => {
     await command(`/api/runs/${encodeURIComponent(runId)}/archive`, body)

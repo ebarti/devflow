@@ -3183,13 +3183,42 @@ class DeliveryStore:
             )
 
     def list_runs(self, archived: bool = False) -> list[dict[str, Any]]:
+        return self.list_runs_page(archived)["runs"]
+
+    def list_runs_page(
+        self, archived: bool = False, *, limit: int = 50, cursor: str | None = None,
+    ) -> dict[str, Any]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("run page limit must be between 1 and 100")
+        boundary = ""
+        parameters: list[Any] = [int(archived)]
+        if cursor:
+            try:
+                if len(cursor) > 2048:
+                    raise ValueError()
+                value = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+                if (not isinstance(value, list) or len(value) != 3
+                        or type(value[0]) is not bool or value[0] != archived
+                        or not all(isinstance(part, str) and part for part in value[1:])):
+                    raise ValueError()
+            except (ValueError, TypeError, UnicodeError) as exc:
+                raise ValueError("invalid run page cursor for archive filter") from exc
+            boundary = " AND (r.updated_at,r.run_id) < (?,?)"
+            parameters.extend(value[1:])
         with self._connect() as db:
             rows = db.execute(
                 "SELECT r.* FROM delivery_runs r LEFT JOIN delivery_dashboard_state d "
-                "ON r.run_id=d.run_id WHERE COALESCE(d.archived,0)=? ORDER BY r.updated_at DESC",
-                (int(archived),),
+                "ON r.run_id=d.run_id WHERE COALESCE(d.archived,0)=?" + boundary +
+                " ORDER BY r.updated_at DESC,r.run_id DESC LIMIT ?",
+                (*parameters, limit + 1),
             ).fetchall()
-            return [self._compact(dict(row)) for row in rows]
+        next_cursor = None
+        if len(rows) > limit:
+            last = rows[limit - 1]
+            encoded = json.dumps([archived, last["updated_at"], last["run_id"]]).encode()
+            next_cursor = base64.urlsafe_b64encode(encoded).decode().rstrip("=")
+        return {"runs": [self._compact(dict(row)) for row in rows[:limit]],
+                "next_cursor": next_cursor}
 
     def _compact(self, row: dict[str, Any]) -> dict[str, Any]:
         spec = json.loads(row["request_json"])

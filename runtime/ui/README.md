@@ -21,10 +21,10 @@ Reads and SSE require no login. Before a command, the browser bootstraps or rene
 
 | Request | Response used by UI |
 | --- | --- |
-| `GET /api/runs` | `{runs:[{id, title?, goal?, repository?, issue?, phase?, execution_state?, updated_at?, revision?}]}` |
+| `GET /api/runs?archived=false&limit=50&cursor=...` | `{runs:[{id, title?, goal?, repository?, issue?, phase?, execution_state?, archived?, updated_at?, revision?}],next_cursor:string\|null}`; `archived` defaults to false, `limit` defaults to 50 (1–100), and the first request omits `cursor` |
 | `GET /api/runs/{id}` | `{run, events, evidence}`; `run` has `id`, nullable Temporal `revision`/`protocol_revision`, `projection_revision`, `iteration`, `sequence`, ordered `phase_gates`, `roles`, `capacity:{limit,active}`, boolean `queued`, top-level `cleanup`, `candidate`, `pull_request`, `checks`, `tracker`, role-keyed `usage`, and `decisions` with string `options` and optional blocking `blocker:{unknown,evidence_checked,why_no_safe_default}`, plus `question_notifications` with decision identity, sender `state` and optional acknowledgement/error `receipt` |
 | `GET /api/runs/{id}/events?after=N` | SSE `event: update`, numeric `id`, optional JSON `sequence`; snapshot refetched on new event and reconnect |
-| `GET /api/runs?archived=true` | The archived collection; normal lists exclude archived tasks |
+| `GET /api/runs?archived=true` | The same paged response for archived tasks; continue with its `next_cursor` and the same archive filter |
 | `GET /api/statistics` | All durable runs grouped by recorded release, revision, local source digest and provider; outcomes, repairs, duration and observed usage with coverage |
 | `GET /api/service` | Service health, version, Temporal, capacity, and `policy` containing allowlisted `repositories` and role settings |
 | `POST /api/runs` | Revisioned raw-goal command with `command_id`, `run_id`, `work_id`, `issue_url`, `repository_key`, `goal`, `base_ref`, `branch`, `authorized_endpoint: published_unmerged`, optional `plan_approval: automatic | required` (new requests default to automatic), legacy `accepted_plan` and `recovery_key`; returns `{run_id,dashboard_url,existing,phase}` |
@@ -37,7 +37,9 @@ The service owns repository paths, role models, checks, authorization scope, and
 
 ## Board, steering and statistics
 
-The default Runs page is a status board refreshed every five seconds. Cards follow authoritative workflow phases; selecting a card opens its evidence and controls. The archive toggle switches collections without deleting a run. Only run detail shows the recent-runs rail; Settings, Statistics and New run use the full content area.
+The default Runs page is a status board refreshed every five seconds with one recent page of 50 tasks. Runs are ordered by `updated_at` then run ID descending. **Load older tasks** requests one more page using the opaque `next_cursor`; `null` means no further page. Cursors belong to their archive filter. After paging starts, previously observed rows remain cached when they leave the recent page. Polling does not refetch older pages; detail reads and stream snapshots reconcile loaded rows, including archive/restore preferences. Switching collections clears the cache. If the entire recent page changes, a notice restarts explicit paging from the new boundary to recover potentially skipped rows while retaining loaded observations. Statistics continue to use complete durable history.
+
+Cards follow authoritative workflow phases; selecting a card opens its evidence and controls. Refreshing or archiving retains the selected detail URL. The archive toggle switches collections without deleting a run. Only run detail shows the recent-runs rail; Settings, Statistics and New run use the full content area.
 
 Steering appends up to 4000 characters per message, bounded to 16000 per run. It does not interrupt the active role or change permissions, required checks, accepted scope, models or the endpoint. Each role launch freezes the instructions it receives; retries reuse that snapshot. History distinguishes queued notes from notes included in a launch input, which is not proof the model followed them. Final QA closes steering to prevent instructions arriving after the final independent check. Existing plan decisions remain the control for approving or revising a pending plan.
 
