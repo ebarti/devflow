@@ -441,8 +441,6 @@ def main() -> None:
             "gates-only-preflight",
             "admit-gates-only",
             "continue-repair",
-            "recover-execution",
-            "recovery-preflight",
             "retry-prelaunch",
             "amend-scope",
         ),
@@ -484,8 +482,6 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "gates-only-preflight",
         "admit-gates-only",
         "continue-repair",
-        "recover-execution",
-        "recovery-preflight",
         "retry-prelaunch",
         "amend-scope",
     }:
@@ -501,7 +497,6 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "repair-admission-preflight",
             "admit-gates-only",
             "continue-repair",
-            "recover-execution",
             "retry-prelaunch",
             "amend-scope",
         } and not isinstance(request, dict):
@@ -521,8 +516,6 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "gates-only-preflight",
                 "admit-gates-only",
                 "continue-repair",
-                "recover-execution",
-                "recovery-preflight",
                 "retry-prelaunch",
                 "amend-scope",
             }
@@ -554,8 +547,6 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "gates-only-preflight": lambda: caller.gates_only_preflight(args.id),
                 "admit-gates-only": lambda: caller.admit_gates_only(args.id, request),
                 "continue-repair": lambda: caller.continue_repair(args.id, request),
-                "recover-execution": lambda: caller.recover_execution(args.id, request),
-                "recovery-preflight": lambda: caller.recovery_preflight(args.id),
                 "retry-prelaunch": lambda: caller.retry_prelaunch(args.id, request),
                 "amend-scope": lambda: caller.amend_scope(args.id, request),
             }[args.command]()

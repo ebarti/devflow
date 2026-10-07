@@ -366,7 +366,7 @@ async def test_pinned_sdk_automatically_discovers_selected_primary_skill_and_all
             assert servers[0]['toolsError'] is None
             assert set(servers[0]['tools']) == {
                 'get_service', 'submit_run', 'list_runs', 'get_run', 'read_evidence',
-                'answer_decision', 'cancel_run', 'recovery_preflight', 'recover_execution',
+                'answer_decision', 'cancel_run',
                 'reconcile_tracker',
                 'reconcile_published_metadata', 'gates_only_preflight', 'admit_gates_only',
                 'metadata_preflight', 'repair_admission_preflight', 'continue_repair',

@@ -35,8 +35,6 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         seen.append(path)
         return SimpleNamespace(
             service=lambda: policy,
-            recovery_preflight=lambda run_id: {"run_id": run_id, "precheck_sha256": "a" * 64},
-            recover_execution=lambda run_id, request: {"run_id": run_id, **request},
             reconcile_tracker=lambda run_id, request: {"run_id": run_id, **request},
             reconcile_published_metadata=lambda run_id, request: {"run_id": run_id, **request},
             gates_only_preflight=lambda run_id: {"run_id": run_id},
@@ -57,8 +55,6 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "read_evidence",
             "answer_decision",
             "cancel_run",
-            "recovery_preflight",
-            "recover_execution",
             "reconcile_tracker",
             "reconcile_published_metadata",
             "gates_only_preflight",
@@ -72,7 +68,6 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "list_runs",
             "get_run",
             "read_evidence",
-            "recovery_preflight",
             "gates_only_preflight",
             "metadata_preflight",
             "repair_admission_preflight",
@@ -84,7 +79,6 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "submit_run",
             "answer_decision",
             "cancel_run",
-            "recover_execution",
             "reconcile_tracker",
             "reconcile_published_metadata",
             "admit_gates_only",
@@ -98,19 +92,6 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         assert tools["get_service"].inputSchema.get("required", []) == []
         result = await session.call_tool("get_service")
         assert not result.isError and json.loads(result.content[0].text) == policy
-        preflight = await session.call_tool("recovery_preflight", {"run_id": "same-run"})
-        assert json.loads(preflight.content[0].text)["precheck_sha256"] == "a" * 64
-        recovered = await session.call_tool(
-            "recover_execution",
-            {
-                "run_id": "same-run",
-                "request_json": '{"command_id":"same-grant"}',
-            },
-        )
-        assert json.loads(recovered.content[0].text) == {
-            "run_id": "same-run",
-            "command_id": "same-grant",
-        }
         reconciled = await session.call_tool(
             "reconcile_tracker",
             {
@@ -140,4 +121,4 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             }
         result = await session.call_tool("gates_only_preflight", {"run_id": "same-run"})
         assert not result.isError and json.loads(result.content[0].text) == {"run_id": "same-run"}
-        assert seen == [config] * 10
+        assert seen == [config] * 8

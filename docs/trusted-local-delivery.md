@@ -128,96 +128,35 @@ acknowledges it. Authorized development continuations instead remove the active
 terminal checkpoint before their first live projection, while retaining the
 predecessor history; cancellation can then stop the newly authorized work.
 
-## Preserved-candidate execution recovery
+## Previously admitted execution-policy recoveries
 
-An operator can grant one explicit recovery for a stopped, unpublished native
-run whose constrained implementation or prepublication gates exhausted their
-budget. This supports multiple completed attempts with one original implementer
-session. It retains the same work ID, run ID, branch, source bytes and provider
-session. The original accepted plan, submitted configuration, closed Temporal
-tail, attempt results, process logs and cleanup evidence remain unchanged.
-Native attempt results are recorded before the role activity adds its controller
-candidate envelope. Recovery authenticates the retained source against both the
-frozen controller projection and that closed role envelope, including its input
-candidate and session identity. A missing raw-result candidate is supported;
-a present conflicting candidate or missing controller evidence is rejected.
-Current GitHub issue requirements are read, hashed and supplied as requirements
-data to the managed roles; they are not accepted results or new authority.
+New execution-policy recovery admission is retired. The CLI commands
+`recovery-preflight` and `recover-execution`, their HTTP routes, MCP tools and
+client/store grant methods are no longer available.
 
-The public preflight binds the original specification, authentic closed Temporal
-result/execution, every stopped attempt, current candidate, same-session state,
-confirmed process/resource cleanup, released claim, completed effects, absence
-of the branch/PR on the remote and original issue evidence. Any changed or
-unavailable readback rejects admission. It observes PID/start identities and
-ports; it never kills a process to manufacture stopped evidence. An unknown or
-pending external effect cannot be retried through this operation.
-Canonical work issue/repository and claim resource are bound to the frozen issue
-before preparation, inside the atomic claim grant, during resume preflight and
-before/after tracker-start effects and readback. Supported reassignment of a
-released work item conflicts; it cannot redirect recovery to another issue. This
-uses the existing owning helper contract without modifying installed helpers.
+Before deploying this release, cease new calls to these operations. Let every
+existing pre-workflow policy intent and its preparation or other effects finish
+under the previous release. Also let admitted queued and running legacy policy
+recoveries finish under the matching installed runtime before deployment. Inspect
+their public run status and indexed evidence, including unknown effects and
+pending dispatches; do not blindly retry commands, edit private records or infer
+that an empty queue proves every intent or execution is finished.
 
-Create a private, owned configuration under the existing service state root by
-copying the original JSON and changing only `execution_mode` to `trusted-local`.
-The original file stays untouched. Model, effort, capacity, source scope, checks,
-deadlines and all other raw configuration must match exactly. The new preparation
-proof binds the actual installed trusted runtime/SDK/CLI and has a separate
-identity; it cannot reuse the constrained proof. The same implementation
-session's conversation/database state is copied into a new isolated role-home
-generation; credentials and permission files are regenerated.
+Already admitted queued inputs remain supported by dispatch and workflow code.
+Their existing durable grant, original/effective configuration, candidate and
+session custody checks, bounded gates-first execution and activity registrations
+remain unchanged. Native launches still require the frozen installed-runtime
+identity; history replay and retained outbox support do not authorize an old
+native execution to continue under a changed runtime payload.
+Completed and suspended workflow histories retain their recorded ordering. Old
+rows, command receipts, preparation intents, cleanup archives and public recovery
+provenance remain readable; this retirement does not delete their tables or
+rewrite historical failures.
 
-After separately authorized installation and chosen-mode verification:
-
-```sh
-devflow-delivery --config /private/state/trusted-local.json recovery-preflight --id RUN_ID
-devflow-delivery --config /private/state/trusted-local.json recover-execution --id RUN_ID --request /private/state/recovery.json
-devflow-delivery --config /private/state/trusted-local.json run --id RUN_ID
-```
-
-`recovery.json` is a private JSON object with exactly these fields:
-
-```json
-{
-  "command_id": "stable-operator-command-id",
-  "expected_precheck_sha256": "SHA256_FROM_THE_FRESH_PUBLIC_PREFLIGHT",
-  "config_path": "/private/state/trusted-local.json",
-  "config_sha256": "SHA256_OF_EXACT_PRIVATE_CONFIG_BYTES",
-  "additional_iterations": 2
-}
-```
-
-`additional_iterations: 1` authorizes only the preserved candidate's gates;
-`2` also permits one same-session implementation repair after a newly observed
-gate failure. The controller runs original prepublication checks first, then
-normal publication, independent review, checks, browser QA when configured,
-independent verification, required CI and terminal reconciliation. It does not
-blindly call implementation or turn historical failures into a pass. The
-endpoint remains `published_unmerged`.
-
-A private command/preparation intent is durable before any new probe. Preparation
-uses at most two separately owned resource generations, finalized independently
-of the predecessor; neither a failed cache-miss probe nor unavailable subsequent
-remote readback can rewrite its cleanup manifest or recreate its transient root.
-A stable-ID retry observes interrupted probe ownership/cleanup before any new
-probe, preserves failed logs, and reuses the new proof when already established.
-Unknown probe cleanup blocks additional execution. The intent/failures are
-publicly indexed, and prepared history is frozen in the eventual grant.
-
-Admission atomically seals one durable grant, reacquires the released claim for
-the same managed owner, and queues a new Temporal execution for the same run.
-The original failure remains in the event timeline and recovery summary. A
-repeat of identical command bytes returns the recorded receipt; changed bytes
-under that ID or a second grant conflict. After an uncertain transport response,
-read the run/receipt with the same command ID. Outbox dispatch inspects the exact
-request/recovery memo before acknowledging an already started execution, without
-starting a duplicate. No private database mutation or model-capacity retry is
-part of this recovery.
-
-HTTP exposes `GET /api/runs/{id}/recovery-preflight` and same-origin,
-CSRF-protected `POST /api/runs/{id}/recover-execution`. The official MCP server
-exposes `recovery_preflight` and `recover_execution` over that same client. The
-dashboard status/evidence and existing plugin discovery, submission, status and
-decision tools continue to read the shared service.
+Use the existing run and indexed evidence reads to follow an admitted recovery.
+An original run's supported automatic retry policy is independent of these
+historical grants and does not replace every published, uncertain or manual
+recovery path.
 
 ## Durable synthetic check evidence
 
