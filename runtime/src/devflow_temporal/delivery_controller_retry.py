@@ -45,6 +45,7 @@ def observe(store, spec, state, attempts, broker):
     request = read_private(root / 'request.json')
     journal = read_private(root / 'native-process.json')
     metadata = journal.get('provider_session', {})
+    intent = journal.get('intent', {})
     candidate = broker.candidate()
     input_candidate = {k: v for k, v in candidate.items() if k != 'revision'}
     input_candidate['policy_digest'] = spec['policy_digest']
@@ -55,6 +56,9 @@ def observe(store, spec, state, attempts, broker):
             or request.get('candidate', {}).get('id') != attempt['candidate_id']
             or request.get('resume_session') != implementation['session_id']
             or DeliverySupervisor._job_key(request) != attempt['job_key']
+            or intent.get('run_id') != spec['run_id']
+            or intent.get('policy_digest') != spec['policy_digest']
+            or intent.get('cwd') != request['workspace']
             or metadata.get('result_digest') != digest(saved)
             or metadata.get('session_id') != implementation['session_id']
             or metadata.get('resumed_from') != implementation['session_id']

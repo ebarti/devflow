@@ -23,10 +23,11 @@ CI_KIND = 'published_ci_retry'
 CONTROLLER_KIND = 'published_controller_retry'
 
 
-def _consumed_payloads(spec, state, previous):
+def _consumed_payloads(spec, state, previous, *, include_implementation=False):
     """Follow actual gate launches; old journals retain their preparation identity."""
     records = [role for role in state.get('roles', [])
-               if role.get('role') in {'review', 'verify'}
+               if (role.get('role') in {'review', 'verify'}
+                   or (include_implementation and role.get('role') == 'implement'))
                and role.get('iteration') == state.get('iteration')]
     for stage in ('prepublish', 'local', 'browser_qa'):
         check = state.get('checks', {}).get(stage, {})
@@ -130,7 +131,7 @@ def snapshot(store, run_id, kind=KIND):
             and spec['provider'] != 'fake'):
         from .delivery_native_preparation import native_identity
         if native_identity(spec)['runtime_payload_sha256'] in _consumed_payloads(
-                spec, state, previous):
+                spec, state, previous, include_implementation=controller_only):
             raise ValueError('a later gate retry requires a repaired measured runtime')
     broker = DeliveryBroker(store, spec)
     candidate = broker.candidate()
@@ -445,6 +446,11 @@ def readback(store, spec, recovery):
         from .delivery_controller_retry import observe
 
         original = recovery['seal']['original_spec']
+        _, current_attempts, _, _ = _rows(store, spec['run_id'])
+        current = {attempt['job_key']: attempt for attempt in current_attempts}
+        if any(current.get(attempt['job_key']) != attempt
+               for attempt in recovery['seal']['attempts']):
+            raise ValueError('controller retry original attempt changed after admission')
         if observe(store, original, recovery['state'], recovery['seal']['attempts'],
                    broker) != recovery['seal']['controller_observation']:
             raise ValueError('controller retry preserved failure custody changed')

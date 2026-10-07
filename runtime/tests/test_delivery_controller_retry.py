@@ -43,7 +43,9 @@ def evidence_failure(published, monkeypatch):
            'candidate': candidate}
     saved = {**raw, 'cleanup': 'confirmed', 'role_artifacts': reference,
              'native_process': {'cleanup': 'confirmed', 'phase': 'finished'}}
-    journal = {'phase': 'finished', 'result': saved['native_process'], 'provider_session': {
+    journal = {'intent': {'run_id': spec['run_id'], 'policy_digest': spec['policy_digest'],
+                          'cwd': str(broker.checkout)},
+               'phase': 'finished', 'result': saved['native_process'], 'provider_session': {
         'role': 'implement', 'iteration': 2, 'session_id': 'original-session',
         'resumed_from': 'original-session', 'result_digest': digest(saved),
         'output_candidate': {k: candidate[k] for k in ('id', 'head', 'content_sha256')}}}
@@ -224,3 +226,56 @@ def test_continuation_preserves_failure_and_runs_fresh_independent_gates(
     assert result['outcome'] == ('delivered' if qa_status == 'pass' else 'blocked')
     if qa_status != 'pass':
         assert not any(name == 'delivery_ci' for name, _ in calls)
+
+
+def test_repaired_runtime_guard_uses_actual_failed_implementation_journal(
+    evidence_failure, monkeypatch,
+):
+    from devflow_temporal.delivery_gate_retry import snapshot
+
+    store, broker, state, _, _, folder = evidence_failure
+    native_spec = deepcopy(broker.spec)
+    native_spec['provider'] = 'codex'
+    native_spec['policy'].update(execution_backend='native-macos', host_sandbox='trusted-local',
+                                 native_identity={'runtime_payload_sha256': '1' * 64})
+    consumed = {'runtime_payload_sha256': '2' * 64}
+    process = {'journal': str(folder / 'consumed-process.json'), 'runtime_identity': consumed}
+    write_private(folder / 'consumed-process.json', {
+        'runtime_identity': consumed, 'result': process,
+        'intent': {'run_id': 'run-1', 'policy_digest': native_spec['policy_digest']},
+    })
+    state['roles'][-1]['native_process'] = process
+    monkeypatch.setattr(store, 'effective_spec', lambda _: native_spec)
+    monkeypatch.setattr('devflow_temporal.delivery_native_preparation.native_identity',
+                        lambda _: consumed)
+    with pytest.raises(ValueError, match='requires a repaired measured runtime'):
+        snapshot(store, 'run-1', KIND)
+
+
+@pytest.mark.parametrize('field', ['run_id', 'policy_digest', 'cwd'])
+def test_original_journal_intent_must_match_frozen_request(evidence_failure, field):
+    store, _, _, _, command, folder = evidence_failure
+    path = folder / 'native-process.json'
+    journal = json.loads(path.read_text())
+    journal['intent'][field] = 'unrelated'
+    write_private(path, journal)
+    with pytest.raises(ValueError, match='authentic same-session'):
+        store.repair_admission_preflight('run-1', command)
+
+
+def test_readback_rejects_changed_durable_original_assessment(evidence_failure):
+    from devflow_temporal.delivery_gate_retry import readback
+
+    store, _, _, _, command, folder = evidence_failure
+    store.continue_repair('run-1', command)
+    effective = store.effective_spec('run-1')
+    with store._connect() as db:
+        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_gate_admissions')
+                              .fetchone()[0])
+        saved = json.loads(db.execute('SELECT result_json FROM delivery_attempts WHERE job_key=?',
+                                      (folder.name,)).fetchone()[0])
+        saved['status'] = 'blocked'
+        db.execute('UPDATE delivery_attempts SET result_json=? WHERE job_key=?',
+                   (canonical_json(saved), folder.name))
+    with pytest.raises(ValueError, match='original attempt'):
+        readback(store, effective, recovery)
