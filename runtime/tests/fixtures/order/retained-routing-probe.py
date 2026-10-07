@@ -16,9 +16,11 @@ from temporalio.api.taskqueue.v1 import TaskQueue
 from temporalio.api.workflow.v1 import VersioningOverride, WorkflowExecutionOptions
 from temporalio.api.workflowservice.v1 import (
     DescribeTaskQueueRequest,
+    DescribeWorkerDeploymentVersionRequest,
     UpdateWorkflowExecutionOptionsRequest,
 )
 from temporalio.common import RawValue, VersioningBehavior
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
 from temporalio.worker import WorkerDeploymentVersion as DeploymentVersion
 
@@ -26,6 +28,56 @@ from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 candidate = {"id": "candidate-1", "head": "head-1"}
 consistent = False
+
+
+async def pin_registered_retained_version(client, handle, *, timeout=10):
+    """Poller presence precedes registration and matching membership propagation."""
+    version = WorkerDeploymentVersion(deployment_name="delivery-retained", build_id="original")
+    kinds = {TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW, TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY}
+    override = VersioningOverride(pinned=VersioningOverride.PinnedOverride(
+        behavior=VersioningOverride.PINNED_OVERRIDE_BEHAVIOR_PINNED, version=version))
+    request = UpdateWorkflowExecutionOptionsRequest(namespace="default",
+        workflow_execution=WorkflowExecution(
+            workflow_id=handle.id, run_id=handle.first_execution_run_id),
+        workflow_execution_options=WorkflowExecutionOptions(versioning_override=override),
+        update_mask=FieldMask(paths=["versioning_override"]))
+    membership_missing = ("Pinned version 'delivery-retained:original' is not present in "
+                          "task queue 'retained-routing' of type 'Workflow'")
+    async with asyncio.timeout(timeout):
+        while True:
+            ready = True
+            for kind in kinds:
+                queue = await client.workflow_service.describe_task_queue(
+                    DescribeTaskQueueRequest(namespace="default",
+                        task_queue=TaskQueue(name="retained-routing"), task_queue_type=kind))
+                ready &= any(p.identity == "retained-versioned" and
+                             p.deployment_options.deployment_name == version.deployment_name and
+                             p.deployment_options.build_id == version.build_id
+                             for p in queue.pollers)
+            try:
+                description = await client.workflow_service.describe_worker_deployment_version(
+                    DescribeWorkerDeploymentVersionRequest(namespace="default",
+                        deployment_version=version))
+            except RPCError as error:
+                if error.status != RPCStatusCode.NOT_FOUND:
+                    raise
+                ready = False
+            else:
+                ready &= description.worker_deployment_version_info.deployment_version == version
+                ready &= kinds <= {q.type for q in description.version_task_queues
+                                   if q.name == "retained-routing"}
+            if ready:
+                try:
+                    await client.workflow_service.update_workflow_execution_options(request)
+                except RPCError as error:
+                    # This exact precondition is checked before applying the override.
+                    # Network/timeout/other errors have unknown outcomes and are not retried.
+                    if (error.status != RPCStatusCode.FAILED_PRECONDITION or
+                            error.message != membership_missing):
+                        raise
+                else:
+                    return
+            await asyncio.sleep(0.1)
 
 
 @activity.defn(dynamic=True)
@@ -79,28 +131,7 @@ async def main(output):
         async with Worker(environment.client, task_queue="retained-routing",
                           workflows=[DeliveryWorkflow], activities=[fake_activity],
                           deployment_config=deployment, identity="retained-versioned"):
-            async with asyncio.timeout(10):
-                for queue_type in (TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW,
-                                   TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY):
-                    while True:
-                        queue = await environment.client.workflow_service.describe_task_queue(
-                            DescribeTaskQueueRequest(namespace="default",
-                                task_queue=TaskQueue(name="retained-routing"),
-                                task_queue_type=queue_type))
-                        if any(p.identity == "retained-versioned" for p in queue.pollers):
-                            break
-                        await asyncio.sleep(0.01)
-            override = VersioningOverride(pinned=VersioningOverride.PinnedOverride(
-                behavior=VersioningOverride.PINNED_OVERRIDE_BEHAVIOR_PINNED,
-                version=WorkerDeploymentVersion(deployment_name="delivery-retained",
-                                                build_id="original")))
-            await environment.client.workflow_service.update_workflow_execution_options(
-                UpdateWorkflowExecutionOptionsRequest(namespace="default",
-                    workflow_execution=WorkflowExecution(
-                        workflow_id=handle.id, run_id=handle.first_execution_run_id),
-                    workflow_execution_options=WorkflowExecutionOptions(
-                        versioning_override=override),
-                    update_mask=FieldMask(paths=["versioning_override"])))
+            await pin_registered_retained_version(environment.client, handle)
             consistent = True
             await handle.execute_update("reconcile_tracker", {
                 "expected_revision": checkpoint["revision"], "reason": "Fixture tracker ready"})
