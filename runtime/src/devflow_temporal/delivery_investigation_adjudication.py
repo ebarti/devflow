@@ -1,8 +1,4 @@
-"""One source-applicable investigation disposition, followed only by controller final gates.
-
-This preserves the failed native assessment. It authorizes no native execution under
-an old payload proof, and never enters an implementation or preparation route.
-"""
+"""Readback and historical validation for retired investigation adjudications."""
 
 from __future__ import annotations
 
@@ -16,9 +12,8 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_gates_admission import _assessment_receipt, _native_result_bytes
-from .delivery_metadata_recovery import _immutable
 from .delivery_policy_recovery import _rows, work_binding
-from .delivery_resources import _ancestors, private_directory, read_private
+from .delivery_resources import _ancestors, read_private
 from .delivery_technical_integration import reference
 
 KIND = "investigation_assessment_adjudication"
@@ -588,87 +583,5 @@ def admit(store, run_id, payload, *, preflight=False):
         recovery = json.loads(row[0])
         readback(store, recovery["spec"], recovery)
         return {**json.loads(prior["response_json"]), "existing": True, "preflight": preflight}
-    seal = _snapshot(store, run_id, payload)
-    root = Path(seal["spec"]["state_dir"]) / "investigation-adjudication"
-    intent = root / "intent.json"
-    _ancestors(intent, allow_missing=True)
-    if intent.exists() and canonical_json(read_private(intent)) != canonical_json(seal):
-        raise ValueError("adjudication orphan intent does not bind the same stopped request")
-    response = {
-        "run_id": run_id,
-        "workflow_id": f"delivery-{run_id}-adjudication-1",
-        "phase": "investigation_adjudication_queued",
-        "authorized_through_iteration": 4,
-        "additional_iterations": 0,
-        "existing": False,
-        "dashboard_url": f"{store.config.dashboard_url}/runs/{run_id}",
-    }
-    if preflight:
-        return {
-            **response,
-            "preflight": True,
-            "precheck_sha256": digest(seal),
-            "raw_status": "findings",
-            "remaining_activities": sorted(ACTIVITIES),
-        }
-    from .delivery_preparation import _lock
-
-    with _lock(root / "controller.lock"):
-        fresh = _snapshot(store, run_id, payload)
-        if canonical_json(fresh) != canonical_json(seal):
-            raise ValueError("whole adjudication request changed before sealing")
-        private_directory(root)
-        with store._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
-            if (
-                dict(current) != seal["original_row"]
-                or store.state.claim_for(db, seal["spec"]["work_id"]) is not None
-            ):
-                raise ValueError("adjudication stopped checkpoint or claim changed")
-            work_binding(store, seal["spec"], db)
-            # Transaction rollback releases this owning reacquisition if any immutable write fails.
-            store.state.claim_work(
-                db,
-                seal["spec"]["work_id"],
-                f"external:devflow:{run_id}",
-                store.config.dashboard_url,
-            )
-            _immutable(intent, seal)
-            private_directory(root / "predecessor-resources")
-            for name, key in (
-                ("manifest.json", "manifest_sha256"),
-                ("finalization.json", "finalization_sha256"),
-            ):
-                source = Path(seal["spec"]["state_dir"]) / "resources" / name
-                raw = _bytes(source, seal["resources"][key])
-                _immutable(root / "predecessor-resources" / name, json.loads(raw), raw=raw)
-            db.execute(
-                "UPDATE delivery_runs SET phase='investigation_adjudication_queued',"
-                "execution_state='queued',"
-                "outcome=NULL,error=NULL,revision=revision+1,workflow_id=?,recovery_json=?,"
-                "updated_at=? WHERE run_id=?",
-                (response["workflow_id"], canonical_json(seal), store.state.now(), run_id),
-            )
-            db.execute(
-                "UPDATE delivery_outbox SET state='pending',last_error=NULL,updated_at=? "
-                "WHERE run_id=?",
-                (store.state.now(), run_id),
-            )
-            db.execute(
-                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
-                (payload["command_id"], run_id, command_digest, canonical_json(response)),
-            )
-            store._event(
-                db,
-                run_id,
-                current["revision"] + 1,
-                response["phase"],
-                "Independent investigation disposition retained; controller final gates queued",
-                {
-                    "raw_status": "findings",
-                    "authority_sha256": payload["authority_sha256"],
-                    "iteration": 4,
-                },
-            )
-    return response
+    raise ValueError("QA findings require repair and a passing QA assessment; "
+                     "new adjudication admissions are retired")

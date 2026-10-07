@@ -274,7 +274,7 @@ def seal_for(stopped_tail, kind):
     return store, payload, seal
 
 
-@pytest.mark.parametrize("kind", [adjudication.KIND, closure.KIND])
+@pytest.mark.parametrize("kind", [closure.KIND])
 @pytest.mark.parametrize("failure", ["preflight", "locked-recheck", "lost-intent", "none"])
 def test_controller_admission_is_atomic_replayable_and_preserves_original_bytes(
     stopped_tail,
@@ -375,7 +375,8 @@ def test_real_controller_tail_preserves_raw_history_and_never_codes_or_publishes
     old = deepcopy(recovery["state"])
     flow, calls = DeliveryWorkflow(), []
     monkeypatch.setattr(workflow, "now", lambda: datetime.now(UTC))
-    monkeypatch.setattr(workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(workflow, "patched", lambda name:
+                        name != "qa-findings-require-passing-assessment-v1")
 
     async def execute(name, body, **_kwargs):
         calls.append((name, body))
@@ -420,7 +421,7 @@ def test_real_controller_tail_preserves_raw_history_and_never_codes_or_publishes
 
     monkeypatch.setattr(workflow, "execute_activity", execute)
     result = asyncio.run(
-        flow._resume_adjudication(recovery["spec"], recovery)
+        flow._replay_legacy_adjudication(recovery["spec"], recovery)
         if kind == adjudication.KIND
         else flow._resume_resource_closure(recovery["spec"], recovery)
     )
@@ -637,3 +638,47 @@ def test_pending_abandonment_preserves_history_checkpoint_and_is_replayable(
                     == 'queued')
             assert db.execute('SELECT COUNT(*) FROM delivery_repair_grants').fetchone()[0] == 0
             assert db.execute('SELECT COUNT(*) FROM delivery_attempts').fetchone()[0] == 0
+
+
+def test_new_adjudication_is_rejected_before_admission_effects(stopped_tail, monkeypatch):
+    store, payload, seal = seal_for(stopped_tail, adjudication.KIND)
+    with store._connect() as db:
+        store.state.release_work(db, 'work-1', 'external:devflow:run-1')
+        commands = list(db.execute('SELECT * FROM delivery_commands'))
+    # A fully checked old checkpoint cannot authorize declaring failed QA delivered.
+    monkeypatch.setattr(adjudication, '_snapshot', lambda *_args: deepcopy(seal))
+    monkeypatch.setattr(adjudication, '_authority', lambda *_args: ({}, {}, {}))
+    for operation in (store.repair_admission_preflight, store.continue_repair):
+        with pytest.raises(ValueError, match='QA findings'):
+            operation('run-1', payload)
+    with store._connect() as db:
+        assert list(db.execute('SELECT * FROM delivery_commands')) == commands
+        assert store.state.claim_for(db, 'work-1') is None
+    assert not (Path(seal['spec']['state_dir']) / 'investigation-adjudication').exists()
+
+
+def test_consumed_adjudication_command_remains_read_only(stopped_tail, monkeypatch):
+    from devflow_temporal.contracts import canonical_json, digest
+
+    store, payload, seal = seal_for(stopped_tail, adjudication.KIND)
+    response = {'run_id': 'run-1', 'workflow_id': 'historical-adjudication',
+                'additional_iterations': 0, 'existing': False}
+    command_digest = digest({'run_id': 'run-1', **payload})
+    with store._connect() as db:
+        db.execute('INSERT INTO delivery_commands VALUES (?,?,?,?)',
+                   (payload['command_id'], 'run-1', command_digest, canonical_json(response)))
+        db.execute('UPDATE delivery_runs SET recovery_json=? WHERE run_id=?',
+                   (canonical_json(seal), 'run-1'))
+        before = list(db.execute('SELECT * FROM delivery_commands'))
+        run = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?', ('run-1',)).fetchone())
+        claim = store.state.claim_for(db, 'work-1')
+    observed = []
+    monkeypatch.setattr(adjudication, 'readback', lambda *args: observed.append(args))
+    for operation in (store.repair_admission_preflight, store.continue_repair):
+        assert operation('run-1', payload)['existing'] is True
+    assert len(observed) == 2
+    with store._connect() as db:
+        assert list(db.execute('SELECT * FROM delivery_commands')) == before
+        assert dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                               ('run-1',)).fetchone()) == run
+        assert store.state.claim_for(db, 'work-1') == claim
