@@ -519,7 +519,14 @@ def _role_result(request, broker, workspace, review_diff, result):
 async def delivery_publish(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
         _, broker = _context(request["spec"])
-        return broker.publish(request["iteration"], request["candidate"])
+        try:
+            return broker.publish(request["iteration"], request["candidate"])
+        except Exception as exc:
+            if (request["spec"].get("publication_readback_version") == 1
+                    and broker.publication_may_have_effect is False):
+                raise ApplicationError(str(exc)[:600], type="PublicationRejected",
+                                       non_retryable=True) from exc
+            raise
 
     return await asyncio.to_thread(execute)
 

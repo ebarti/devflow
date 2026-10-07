@@ -123,6 +123,7 @@ class DeliveryBroker:
         self.effect_namespace = ""
         self.check_cancelled = lambda: False
         self.native_cleanup_confirmed = True
+        self.publication_may_have_effect = True
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -1301,7 +1302,42 @@ class DeliveryBroker:
             if author not in signers:
                 raise ValueError("owned commit lacks its author Signed-off-by trailer: " + commit)
 
+    def _bind_pending_publication(
+        self, key: str, head: str, number: int | None, *, remote_confirmed: bool = False,
+    ) -> None:
+        """Freeze observed identity in the existing effect before remote mutation."""
+        with self.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = db.execute(
+                "SELECT state,observed_json FROM delivery_effects WHERE effect_key=?", (key,),
+            ).fetchone()
+            if saved is None or saved["state"] not in {"pending", "complete"}:
+                raise ValueError("original publication effect is no longer recoverable")
+            previous = json.loads(saved["observed_json"] or "null")
+            if previous:
+                if (previous["head"] != head
+                        or number is not None and previous.get("number") not in {None, number}):
+                    raise ValueError("original publication identity changed")
+                number = previous.get("number") or number
+                remote_confirmed |= previous.get("remote_confirmed", False)
+            if saved["state"] == "complete":
+                # The original activity may acknowledge while this read is in flight.
+                # Preserve its completed result rather than replacing it with a partial observation.
+                return
+            db.execute(
+                "UPDATE delivery_effects SET observed_json=? WHERE effect_key=?",
+                (canonical_json({"head": head, "number": number,
+                                 "remote_confirmed": remote_confirmed}), key),
+            )
+
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        # Only this invocation's confirmed pre-mutation failure can release uncertainty.
+        # Any retained original effect may belong to an earlier lost completion.
+        if self.spec.get("publication_readback_version") == 1:
+            with self.store._connect() as db:
+                prior = db.execute("SELECT 1 FROM delivery_effects WHERE effect_key=?",
+                                   (f"publish:{self.spec['run_id']}:{iteration}",)).fetchone()
+            self.publication_may_have_effect = prior is not None
         self.validate_candidate_scope()
         publication_branch = self._publication_base_ref()
         self._validate_publication_commits()
@@ -1355,6 +1391,8 @@ class DeliveryBroker:
         head = _git(self.checkout, "rev-parse", "HEAD")
         if head == self.spec["base_sha"]:
             raise ValueError("no meaningful commit is available for publication")
+        if self.spec.get("publication_readback_version") == 1:
+            self._bind_pending_publication(key, head, existing["number"] if existing else None)
         remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
         if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
             raise RuntimeError("Git push destination changed from the admitted origin")
@@ -1375,7 +1413,12 @@ class DeliveryBroker:
                 )
                 if ancestry.returncode != 0:
                     raise RuntimeError("remote feature branch diverged")
+            self.publication_may_have_effect = True
             _git(self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}")
+        if self.spec.get("publication_readback_version") == 1:
+            self._bind_pending_publication(
+                key, head, existing["number"] if existing else None, remote_confirmed=True,
+            )
         if existing is None:
             title = publication_title(self.spec["goal"])
             body = self.state_dir / "pull-request.md"
@@ -1389,6 +1432,7 @@ class DeliveryBroker:
                 encoding="utf-8",
             )
             os.chmod(body, 0o600)
+            self.publication_may_have_effect = True
             _run(
                 [
                     "gh",
@@ -1459,6 +1503,24 @@ class DeliveryBroker:
             or saved["request_json"] != canonical_json(request)
         ):
             raise ValueError("publication effect does not match this candidate")
+        if saved["state"] == "complete" and self.spec.get("publication_readback_version") == 1:
+            done = json.loads(saved["observed_json"])
+            if expected_head is not None and expected_head != done["head"]:
+                raise ValueError("publication expected head differs from original effect")
+            if expected_pr_number is not None and expected_pr_number != done["number"]:
+                raise ValueError("publication expected PR differs from original effect")
+            expected_head, expected_pr_number = done["head"], done["number"]
+        elif self.spec.get("publication_readback_version") == 1:
+            original = json.loads(saved["observed_json"] or "null")
+            if not original or not original.get("head"):
+                raise ValueError("original publication head has not been observed")
+            if expected_head is not None and expected_head != original["head"]:
+                raise ValueError("publication expected head differs from original effect")
+            if (expected_pr_number is not None and original.get("number") is not None
+                    and expected_pr_number != original["number"]):
+                raise ValueError("publication expected PR differs from original effect")
+            expected_head = original["head"]
+            expected_pr_number = original.get("number") or expected_pr_number
         current = self.candidate()
         head = current["head"]
         if expected_head is not None and head != expected_head:
@@ -1477,10 +1539,32 @@ class DeliveryBroker:
             raise ValueError("published commit does not descend directly from checked candidate")
         if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
             raise ValueError("published Git destination changed")
-        remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        try:
+            remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+            if self.spec.get("publication_readback_version") == 1:
+                raise BrokerReadbackUnavailable("published branch readback unavailable") from exc
+            raise
+        if (self.spec.get("publication_readback_version") == 1 and saved["state"] == "pending"
+                and not original.get("remote_confirmed")
+                and (not remote or (remote.split()[0] != head
+                                    and remote.split()[0] == input_candidate["head"]))):
+            return {"state": "pending", "reason": "original_push_readback", "head": head}
         if not remote or remote.split()[0] != head:
             raise ValueError("remote feature branch differs from the published checkout")
+        if saved["state"] == "pending" and self.spec.get("publication_readback_version") == 1:
+            self._bind_pending_publication(key, head, expected_pr_number, remote_confirmed=True)
         found = self._existing_pr()
+        if found is not None:
+            if (self.spec.get("publication_readback_version") == 1
+                    and expected_pr_number is not None and found["number"] != expected_pr_number):
+                raise ValueError("publication resolved to a different PR")
+            if (self.spec.get("publication_readback_version") == 1
+                    and found["headRefOid"] not in {head, input_candidate["head"]}):
+                raise ValueError("owned PR head changed from the original publication")
+        if (found is not None and saved["state"] == "pending"
+                and self.spec.get("publication_readback_version") == 1):
+            self._bind_pending_publication(key, head, found["number"], remote_confirmed=True)
         if found is None or found["headRefOid"] != head:
             return {"state": "pending", "reason": "pr_head_readback", "head": head}
         if expected_pr_number is not None and found["number"] != expected_pr_number:

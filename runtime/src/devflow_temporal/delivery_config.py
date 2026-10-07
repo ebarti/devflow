@@ -486,8 +486,13 @@ class DeliveryConfig:
                     or not 30 <= qa["timeout_seconds"] <= 1800
                 ):
                     raise ValueError("browser QA requires positive count and bounded timeout")
+        publication_seconds = self.raw.get("publication_readback_seconds", 900)
+        if type(publication_seconds) is not int or not 30 <= publication_seconds <= 3600:
+            raise ValueError("publication_readback_seconds must be an integer from 30 to 3600")
         return {
             **supplied,
+            "publication_readback_version": 1,
+            "publication_readback_seconds": publication_seconds,
             "plan_approval": plan_approval,
             "blocking_questions_version": 1,
             "accepted_plan": accepted_plan or "",
@@ -625,6 +630,11 @@ def scope_amended_spec(
     else:
         effective["policy"].pop("tracker_retry_seconds", None)
     effective["policy_digest"] = digest(effective["policy"])
+    for key in ("publication_readback_version", "publication_readback_seconds"):
+        if key in original:
+            effective[key] = original[key]
+        else:
+            effective.pop(key, None)
     effective["intake_required"] = original.get("intake_required", False)
     for key in (
         "run_id", "work_id", "issue_url", "repository_key", "goal", "accepted_plan",
