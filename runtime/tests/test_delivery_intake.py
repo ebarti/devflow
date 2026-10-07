@@ -718,8 +718,9 @@ async def test_pre_policy_intake_history_replays_with_original_human_gate():
 
 
 @pytest.mark.parametrize("approval", ["automatic", "required", None])
+@pytest.mark.parametrize("provider_limit", [None, 1, 3])
 def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
-    intake_fixture, approval
+    intake_fixture, approval, provider_limit
 ):
     path, request = intake_fixture
     if approval is not None:
@@ -728,6 +729,14 @@ def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
     store = create_app(path).state.delivery.store
     store.submit(request)
     spec = store.spec("run-1")
+    if provider_limit is None:
+        spec["policy"].pop("provider_max_attempts")
+    else:
+        spec["policy"]["provider_max_attempts"] = provider_limit
+    spec["policy_digest"] = digest(spec["policy"])
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'",
+                   (json.dumps(spec),))
     if approval is None:
         # Historical durable input, not a new public submission.
         spec.pop("plan_approval")
@@ -750,6 +759,10 @@ def test_scope_amendment_preserves_policy_bound_plan_and_historical_identity(
                                    hashlib.sha256(amended_path.read_bytes()).hexdigest(),
                                    ["tests/fixture.py"])
     assert effective.get("plan_approval") == original.get("plan_approval")
+    assert effective["policy"].get("provider_max_attempts") == original["policy"].get(
+        "provider_max_attempts")
+    assert ("provider_max_attempts" in effective["policy"]) == (
+        "provider_max_attempts" in original["policy"])
     assert ("plan_approval" in effective) == ("plan_approval" in original)
     assert effective.get("origin_thread_id") == original.get("origin_thread_id")
     assert effective.get("blocking_questions_version") == original.get("blocking_questions_version")

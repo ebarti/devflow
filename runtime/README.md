@@ -2,6 +2,17 @@ See [worker deployment migration](../docs/worker-versioning.md) for ordering
 compatibility, optional pinned worker registration and required owner steps.
 
 
+### Native provider turn retries
+
+New admissions freeze `provider_max_attempts` from the service configuration
+(default 3; allowed range 1–3). A finalized typed provider rate limit, overload or
+connection failure retries in the same owned session with backoff, within the
+original role deadline. An explicitly rejected overload at turn start shares
+that limit. Original failed turns, tool effects and token usage remain retained.
+Unknown completion, lost transport, cancellation, authentication or budget errors,
+collaboration conflicts and assessment findings never authorize another turn.
+Existing frozen runs without this setting retain their one-attempt behavior.
+
 ### Rerun gates after a runtime repair
 
 A finalized native run that published a PR and stopped on review or QA can receive

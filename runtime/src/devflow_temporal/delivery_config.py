@@ -91,6 +91,9 @@ class DeliveryConfig:
         slots = value.get("check_concurrency", 2)
         if type(slots) is not int or not 1 <= slots <= 32:
             raise ValueError("check_concurrency must be an integer between 1 and 32")
+        attempts = value.get("provider_max_attempts", 3)
+        if type(attempts) is not int or not 1 <= attempts <= 3:
+            raise ValueError("provider_max_attempts must be between 1 and 3")
         return cls(path=path.resolve(), raw=value)
 
     @property
@@ -120,6 +123,7 @@ class DeliveryConfig:
     def public_policy(self) -> dict[str, Any]:
         return {
             "roles": self.raw["roles"],
+            "provider_max_attempts": self.raw.get("provider_max_attempts", 3),
             "repositories": [
                 {
                     "key": key,
@@ -231,6 +235,7 @@ class DeliveryConfig:
         checkout = self.state_root / "checkouts" / supplied["run_id"]
         policy = {
             "roles": self.raw["roles"],
+            "provider_max_attempts": self.raw.get("provider_max_attempts", 3),
             "checks": repository.get("checks", []),
             "prepublish_checks": repository.get("prepublish_checks", []),
             "browser_qa": repository.get("browser_qa"),
@@ -565,6 +570,11 @@ def scope_amended_spec(
         supplied.pop("accepted_plan", None)
         supplied["plan_approval"] = original.get("plan_approval", "required")
     effective = amended.admit(supplied)
+    if "provider_max_attempts" in original["policy"]:
+        effective["policy"]["provider_max_attempts"] = original["policy"]["provider_max_attempts"]
+    else:
+        effective["policy"].pop("provider_max_attempts", None)
+    effective["policy_digest"] = digest(effective["policy"])
     effective["accepted_plan"] = original["accepted_plan"]
     if "plan_approval" in original:
         effective["plan_approval"] = original["plan_approval"]
