@@ -68,11 +68,11 @@ async def test_worker_uses_explicit_pinned_deployment_without_changing_config(
 
 @pytest.mark.asyncio
 async def test_real_deployment_worker_registers_both_pollers_before_ready(tmp_path):
-    from temporalio.testing import WorkflowEnvironment
+    from temporal_test_server import local_temporal
 
     from devflow_temporal.delivery_config import DeliveryConfig
 
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         raw = {"temporal_address": environment.client.service_client.config.target_host,
                "queue": "versioned-readiness", "state_root": str(tmp_path)}
         config = DeliveryConfig(tmp_path / "config.json", raw)
@@ -98,6 +98,7 @@ async def test_real_deployment_worker_registers_both_pollers_before_ready(tmp_pa
 async def test_new_delivery_is_pinned_and_records_order_marker_before_checks():
     from datetime import timedelta
 
+    from temporal_test_server import local_temporal
     from temporalio import activity
     from temporalio.api.enums.v1 import TaskQueueType
     from temporalio.api.taskqueue.v1 import TaskQueue
@@ -106,7 +107,6 @@ async def test_new_delivery_is_pinned_and_records_order_marker_before_checks():
         SetWorkerDeploymentCurrentVersionRequest,
     )
     from temporalio.common import RawValue
-    from temporalio.testing import WorkflowEnvironment
     from temporalio.worker import Replayer, Worker
 
     from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -145,7 +145,7 @@ async def test_new_delivery_is_pinned_and_records_order_marker_before_checks():
                 "candidate": candidate, "publication": publication,
                 "seal": {"session_id": "fake:implement"}, "semantic": {}}
     deployment = control._worker_deployment("delivery-order", "marked-v1")
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         async with Worker(environment.client, task_queue="pinned-order", identity="order-worker",
                           workflows=[DeliveryWorkflow], activities=[fake_activity],
                           deployment_config=deployment):

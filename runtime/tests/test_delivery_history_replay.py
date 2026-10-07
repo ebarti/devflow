@@ -75,7 +75,8 @@ async def test_actual_unversioned_execution_moves_to_retained_artifact_without_h
     result = subprocess.run(
         [sys.executable, "-B", str(FIXTURES / "order/retained-routing-probe.py"),
          str(tmp_path / "observed")],
-        env={**os.environ, "PYTHONPATH": str(tmp_path / "runtime/src")},
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((
+            str(tmp_path / "runtime/src"), str(Path(__file__).parent.resolve())))},
         capture_output=True, text=True, check=False, timeout=40,
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -93,10 +94,10 @@ async def test_external_adapter_registers_original_artifact_without_changing_sou
     import asyncio
     import signal
 
+    from temporal_test_server import local_temporal
     from temporalio.api.enums.v1 import TaskQueueType
     from temporalio.api.taskqueue.v1 import TaskQueue
     from temporalio.api.workflowservice.v1 import DescribeTaskQueueRequest
-    from temporalio.testing import WorkflowEnvironment
 
     with tarfile.open(FIXTURES / "order/c04-source.tar.gz") as artifact:
         artifact.extractall(tmp_path, filter="data")
@@ -104,7 +105,7 @@ async def test_external_adapter_registers_original_artifact_without_changing_sou
     before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in source.rglob("*.py")}
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         config = tmp_path / "config.json"
         config.write_text(json.dumps({"version": 1, "provider": "fake",
             "state_root": str(state), "tracking_db": str(tmp_path / "tracking.sqlite3"),

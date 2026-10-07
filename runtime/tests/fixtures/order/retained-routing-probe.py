@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from google.protobuf.field_mask_pb2 import FieldMask
+from temporal_test_server import local_temporal
 from temporalio import activity
 from temporalio.api.common.v1 import WorkflowExecution
 from temporalio.api.deployment.v1 import WorkerDeploymentVersion
@@ -18,7 +19,6 @@ from temporalio.api.workflowservice.v1 import (
     UpdateWorkflowExecutionOptionsRequest,
 )
 from temporalio.common import RawValue, VersioningBehavior
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
 from temporalio.worker import WorkerDeploymentVersion as DeploymentVersion
 
@@ -58,7 +58,7 @@ async def main(output):
                 "command": {"additional_iterations": 0}, "state": state,
                 "candidate": candidate, "publication": publication,
                 "seal": {"session_id": "fake:implement"}, "semantic": {}}
-    async with await WorkflowEnvironment.start_local() as environment:
+    async with local_temporal() as environment:
         # Original, unversioned artifact really records its checks-first history.
         async with Worker(environment.client, task_queue="retained-routing",
                           workflows=[DeliveryWorkflow], activities=[fake_activity]):
