@@ -87,11 +87,12 @@ predates these manifests: that case requires its exact verified historical Git
 inventory, owned canonical source and skill symlinks, unchanged current source
 files and all of its exact generated telemetry hook registrations. Arbitrary
 unrecorded registrations are not migration candidates. The exact historical recipe
-must use one consistently serialized canonical absolute Python 3.12 prefix across
+must use one consistently serialized canonical absolute interpreter prefix across
 all generated events; its hook target, arguments, item fields and groups must
-match. The retired interpreter is never executed. Old manifests did not record
-its value, so this recognizes the generated recipe with a consistent historical
-interpreter; it cannot cryptographically prove that an unknown old interpreter
+match. Historical installers supported Python 3.12+ and canonicalized the selected
+executable without restricting its filename. The retired interpreter is never
+executed. Old manifests did not record its value or version, so this recognizes
+the generated recipe with a consistent historical interpreter; it cannot cryptographically prove that an unknown old interpreter
 value was never edited. Inconsistent prefixes, quoting, arguments, events and
 modified owned files still refuse before effects.
 
@@ -104,8 +105,9 @@ registration stops installation with its precise path and reason, even with
 registration and retry. Do not delete source helpers or user data to resolve a
 registration conflict.
 
-Private snapshots live in the owned Codex directory or its nearest owned existing
-parent, outside the OS temporary-directory policy. Backup/target filesystems and
+Private snapshots live in the owned Codex directory or its nearest owned protected
+ancestor, outside the OS temporary-directory policy. A group-writable Codex
+directory uses that ancestor without changing its permissions. Backup/target filesystems and
 real native exchange are checked before destination effects. Snapshot file bytes,
 mode and identity come from one opened-file observation;
 a write during that read refuses capture before installation effects.
@@ -114,8 +116,10 @@ and the authenticated previous checkout is restored, including updates begun
 by the historical exec-based updater. After an installer effect,
 rollback restores only matching recorded object identities; later changed or
 foreign objects remain, with an actionable path and retained private backup.
-Destination recovery failure still attempts authenticated source checkout recovery
-and retains the backup until the operator recovers it. Public refusals return
+Destination recovery failure still attempts authenticated source checkout recovery.
+Recovery continues independent paths after object errors; helper cleanup waits
+for pointer recovery. All conflicts and the backup remain until the operator
+recovers them. Successful installation removes its rollback snapshot. Public refusals return
 status 1; the installer never excludes other writers.
 Owned destination pointers use native atomic exchange on Linux/macOS before
 helper cleanup; unsupported hosts refuse without a replacement fallback.

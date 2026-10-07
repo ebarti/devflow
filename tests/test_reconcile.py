@@ -611,8 +611,11 @@ p.write_text(json.dumps(s))
         # Preserve the historical Git objects and ancestry used by migration.
         subprocess.run(["git", "clone", "--quiet", "--shared", str(ROOT), str(origin)], check=True)
         subprocess.run(["git", "-C", str(origin), "checkout", "--quiet", "--detach", baseline], check=True)
-        for key, value in (("user.name", "Test"), ("user.email", "test@example.invalid"),
-                           ("core.hooksPath", "/dev/null"), ("commit.gpgsign", "false")):
+        # Keep this disposable origin stable across commit and the local clone.
+        fixture_git = (("maintenance.auto", "false"), ("gc.auto", "0"),
+                       ("core.hooksPath", "/dev/null"), ("commit.gpgSign", "false"))
+        for key, value in (*fixture_git, ("user.name", "Test"),
+                           ("user.email", "test@example.invalid")):
             subprocess.run(["git", "-C", str(origin), "config", key, value], check=True)
         subprocess.run(["git", "-C", str(origin), "tag", "v1"], check=True)
         tracked = subprocess.check_output(["git", "-C", str(ROOT), "ls-files", "-z"]).decode().split("\0")
@@ -625,6 +628,9 @@ p.write_text(json.dumps(s))
         subprocess.run(["git", "-C", str(origin), "tag", "v2"], check=True)
         candidate = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "v2"], text=True).strip()
         subprocess.run(["git", "clone", "-q", str(origin), str(checkout)], check=True)
+        # Fetches must not leave a background packer running during fixture cleanup.
+        for key, value in fixture_git:
+            subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
         subprocess.run(["git", "-C", str(checkout), "checkout", "-q", "--detach", "v1"], check=True)
         home = fixture / "home"
         codex = home / ".codex"

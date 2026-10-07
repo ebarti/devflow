@@ -190,7 +190,7 @@ class UpgradeInstallation(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_upgraded()
 
-    def exercise_retired_interpreter_transition(self, revision):
+    def exercise_retired_interpreter_transition(self, revision, canonical_name=None):
         python = self.root / "python-old"
         subprocess.run([sys.executable, "-m", "venv", "--without-pip", "--copies", str(python)], check=True)
         # Relocatable CPython builds need their shared library and stdlib base.
@@ -198,7 +198,14 @@ class UpgradeInstallation(unittest.TestCase):
             destination = python / "lib" / library.name
             if not destination.exists():
                 destination.symlink_to(library)
-        self.env.update(DEVFLOW_PYTHON=str(python / "bin/python3.12"), PYTHONHOME=sys.base_prefix)
+        binary = python / "bin/python3.12"
+        if canonical_name:
+            canonical = python / "bin" / canonical_name
+            canonical.unlink(missing_ok=True)
+            shutil.copyfile(binary, canonical)
+            canonical.chmod(binary.stat().st_mode)
+            binary = canonical
+        self.env.update(DEVFLOW_PYTHON=str(binary), PYTHONHOME=sys.base_prefix)
         self.historical(revision)
         original = self.hooks.read_bytes()
         command = json.loads(original)["hooks"]["Stop"][-1]["hooks"][0]["command"]
@@ -217,6 +224,33 @@ class UpgradeInstallation(unittest.TestCase):
 
     def test_v022_recipe_accepts_consistent_retired_interpreter(self):
         self.exercise_retired_interpreter_transition(V022)
+
+    def exercise_supported_python313(self, revision):
+        python = shutil.which("python3.13")
+        if python is None:
+            self.skipTest("Python 3.13 is unavailable; canonical-name transition remains covered")
+        version = subprocess.check_output([python, "-c", "import sys; print(sys.version_info[:2])"], text=True).strip()
+        self.assertEqual(version, "(3, 13)")
+        self.env["DEVFLOW_PYTHON"] = python
+        self.historical(revision)
+        generated = json.loads(self.hooks.read_text())["hooks"]["Stop"][-1]["hooks"][0]["command"]
+        self.assertEqual(shlex.split(generated)[0], str(Path(python).resolve()))
+        self.env["DEVFLOW_PYTHON"] = sys.executable
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_upgraded()
+
+    def test_v022_recipe_accepts_actual_supported_python313(self):
+        self.exercise_supported_python313(V022)
+
+    def test_guarded_recipe_accepts_actual_supported_python313(self):
+        self.exercise_supported_python313(GUARDED)
+
+    def test_v022_recipe_accepts_retired_canonical_python3_name(self):
+        self.exercise_retired_interpreter_transition(V022, "python3")
+
+    def test_guarded_recipe_accepts_retired_canonical_python3_name(self):
+        self.exercise_retired_interpreter_transition(GUARDED, "python3")
 
     def test_changed_recipe_prefix_serialization_arguments_or_events_refuse(self):
         self.historical(GUARDED)

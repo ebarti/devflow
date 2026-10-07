@@ -166,7 +166,6 @@ def plan(source, skills, home, guard):
                             or item["timeout"] != 3
                             or len(command) != len(suffix) + 1
                             or not Path(command[0]).is_absolute()
-                            or Path(command[0]).name != "python3.12"
                             or str(Path(command[0])) != command[0]
                             or os.path.normpath(command[0]) != command[0]
                             or command_text != shlex.join(command)
