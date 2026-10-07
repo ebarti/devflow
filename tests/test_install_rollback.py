@@ -381,7 +381,11 @@ class InstallRollback(unittest.TestCase):
 
     def test_destination_restore_error_still_restores_owned_prior_checkout(self):
         import errno
-        prior = "c04f00eb43eb225728b63c82026ffe97a41cafc2"
+        prior = subprocess.check_output(["git", "-C", str(self.source), "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(["git", "-C", str(self.source), "-c", "core.hooksPath=/dev/null",
+                        "-c", "commit.gpgsign=false", "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "commit", "--allow-empty",
+                        "--quiet", "-m", "isolated installer candidate"], check=True)
         current = subprocess.check_output(["git", "-C", str(self.source), "rev-parse", "HEAD"], text=True).strip()
         for revision in (prior, current):
             subprocess.run(["git", "-C", str(self.source), "checkout", "--quiet", "--detach", revision], check=True)
