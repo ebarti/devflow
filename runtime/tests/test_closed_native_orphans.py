@@ -599,7 +599,7 @@ def test_closed_maintenance_keeps_legacy_confirmed_projection(api_fixture, attem
 
 
 @pytest.mark.asyncio
-async def test_closed_maintenance_keeps_policy_recovery_preflight(preserved):
+async def test_closed_maintenance_keeps_historical_policy_recovery(preserved):
     from datetime import UTC, datetime
     from types import SimpleNamespace
 
@@ -607,14 +607,44 @@ async def test_closed_maintenance_keeps_policy_recovery_preflight(preserved):
 
     from devflow_temporal.delivery_orphans import reconcile_closed_native
 
-    store, spec, _payload, _state = preserved
+    store, spec, _payload, state = preserved
     run_id = spec["run_id"]
-    precheck = store.policy_recovery_precheck(run_id)
+    # Prospective policy admission is retired; existing grants remain validated
+    # by the historical reader and publicly retain their original provenance.
+    effective = store.effective_spec(run_id)
+    submitted = store.submitted_spec(run_id)
+    policy = store.detail(run_id)["execution_policy_recovery"]
     events = store.events(run_id)
+    root = Path(spec["state_dir"])
+    frozen_files = {
+        path.relative_to(root): (path.read_bytes(), path.stat().st_mode)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
     with store._connect() as db:
         before = dict(
             db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
         )
+        historical_rows = {
+            table: [
+                dict(row)
+                for row in db.execute(
+                    f"SELECT * FROM {table} WHERE run_id=? ORDER BY rowid", (run_id,)
+                )
+            ]
+            for table in ("delivery_policy_recoveries", "delivery_attempts", "delivery_effects")
+        }
+    recovery = json.loads(before["recovery_json"])
+    assert recovery["kind"] == "execution_policy_recovery"
+    assert effective == recovery["effective_spec"]
+    assert effective["policy"]["host_sandbox"] == "trusted-local"
+    assert policy["precheck_sha256"] == recovery["seal"]["precheck_sha256"]
+    assert policy["session_id"] == recovery["session_id"]
+    assert policy["predecessor_workflow_id"] == recovery["predecessor_workflow_id"]
+    assert policy["predecessor_execution_run_id"] == recovery["predecessor_execution_run_id"]
+    assert policy["authorized_through_iteration"] == recovery["maximum_iteration"]
+    assert policy["preserved_checks"] == state["checks"]
+    assert policy["preserved_error"] == state["error"]
 
     class Handle:
         def __init__(self, workflow_id):
@@ -642,9 +672,25 @@ async def test_closed_maintenance_keeps_policy_recovery_preflight(preserved):
     await reconcile_closed_native(store, client)
     with store._connect() as db:
         after = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone())
+        assert historical_rows == {
+            table: [
+                dict(row)
+                for row in db.execute(
+                    f"SELECT * FROM {table} WHERE run_id=? ORDER BY rowid", (run_id,)
+                )
+            ]
+            for table in historical_rows
+        }
     assert after == before
     assert store.events(run_id) == events
-    assert store.policy_recovery_precheck(run_id) == precheck
+    assert store.effective_spec(run_id) == effective
+    assert store.submitted_spec(run_id) == submitted
+    assert store.detail(run_id)["execution_policy_recovery"] == policy
+    assert frozen_files == {
+        path.relative_to(root): (path.read_bytes(), path.stat().st_mode)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 @pytest.mark.parametrize("interruption", [None, "acknowledgement", "changed-execution"])
