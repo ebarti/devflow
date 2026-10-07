@@ -1043,6 +1043,9 @@ class DeliveryStore:
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
         """Spend one explicit, bounded grant on a closed failed gate of this run."""
+        if (isinstance(supplied, dict) and 'continuation_kind' in supplied
+                and not isinstance(supplied['continuation_kind'], str)):
+            raise ValueError("unsupported repair continuation kind")
         if (self.submitted_spec(run_id).get("retry_budget_version") == 1
                 and isinstance(supplied, dict)
                 and type(supplied.get("additional_iterations")) is int
@@ -1076,9 +1079,7 @@ class DeliveryStore:
 
             return admit(self, run_id, supplied, preflight=preflight)
         if isinstance(supplied, dict) and 'continuation_kind' in supplied:
-            from .delivery_technical_continuation import continue_technical
-
-            return continue_technical(self, run_id, supplied, preflight=preflight)
+            raise ValueError("unsupported repair continuation kind")
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))

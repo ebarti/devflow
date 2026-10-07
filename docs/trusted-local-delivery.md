@@ -373,56 +373,46 @@ Caller roots and symlink aliases refuse before allocation or
 read-scope expansion. Generated-child cleanup and gate finalization use the same
 owned namespace. Native process and lease roots remain in the original run.
 
-An already admitted original that stops at an authenticated controller boundary
-can use the existing `repair-admission-preflight` and `continue-repair` JSON
-surfaces with `continuation_kind: "accepted_technical_successor"` and
-`additional_iterations: 0`. The complete request includes `command_id`,
-`expected_revision` (the closed protocol revision), `expected_iteration`,
-`expected_candidate_id`, `expected_pr_number`, `expected_pr_head`,
-`expected_source_revision`, and the main-task `authority_path`/`authority_sha256`.
-The explicitly authorized integration also supplies
-`prospective_path`/`prospective_sha256`. Public preflight validates the whole
-authority, exact closed failure, consumed admission and immediate native
-generation, clean installed source/configuration, stopped actor/port/lease/root
-inventory and owning claim before an immutable intent or preparation effect.
-Missing, changed, aliased, foreign or stale inputs refuse first.
+### Technical-successor admission retirement
 
-This technical successor spends no feature grant or implementation iteration.
-It retains consumed admissions and generation journals, archives the original
-resource bytes (including UNKNOWN), and appends a fresh observation and supported
-cleanup closure. Its one child native generation has a separate journal and a
-two-attempt ceiling. Only the installed runtime payload may change in native
-identity. A failed borrowing of a released claim rolls back that owning claim;
-a previously retained original claim stays bound. Exact request replay checks
-actual partial effects and resumes their journals.
+`continuation_kind: "accepted_technical_successor"` is unsupported by the current
+`repair-admission-preflight` and `continue-repair` surfaces. This includes exact
+request replay: the retired writer cannot finish a pending or orphan pre-workflow
+intent. Historical technical-successor records, effective-spec and native
+predecessor readers, integration readback, workflow bodies and activities remain
+retained. That preservation does not authorize a new technical admission. See
+[technical-successor retirement](technical-continuation-retirement.md).
 
-An exclusive intent whose SQLite transaction did not commit is recovered by the
-same command only after fresh whole-request validation under its owning lock.
-The original seal and controller identity remain byte-for-byte historical;
-separate append-only observations bind each resume controller. Complete sealed
-failure rows have a dedicated 4 MiB read limit with exact hash, run identity,
-private ownership and no-follow custody; ordinary authority receipts retain
-their smaller limit. A resumed workflow drops the inherited active terminal
-checkpoint while preserving the frozen predecessor and its passed checks.
-A newly initiated terminal transition still freezes cancellation.
+Before deploying the changed runtime, cease new technical-successor requests and
+keep the previous release available to finish its existing work:
 
-The review launch boundary resumes review and QA of the unchanged published
-candidate at iteration 4. It preserves prior source-applicable checks and never
-repeats publication. The separately authorized integration computes the entire
-prospective tree read-only from the frozen base, owned head and exact current
-main. All six overlap outputs and every remaining entry must match; the sole
-conflict preserves the coaching insertion bytes and accepts the main inventory
-title/counts. The one signed merge preserves both parents and old history and
-checks the exact owned remote before pushing. Its explicit base, candidate,
-accepted-plan and preparation-input mapping is separate from native payload
-renewal. Nested worker preparation inputs are compared as typed TOML alongside
-all package manifests and locks. Fresh checks, browser QA, independent review
-and current CI run at existing iteration 4. The existing title-only iteration 5
-remains a separate admission after its fresh exact browser rejection; there is
-no iteration 6. None of these source contracts authorizes an installation or
-public continuation before independent review and current CI pass.
-After a separate title admission changes the current head, replay of an older
-technical command may refuse stale source identity rather than repeat effects.
+1. Inventory both unarchived and archived runs (`GET /api/runs` and
+   `GET /api/runs?archived=true`) and known original run IDs. Where accessible,
+   `GET /api/runs/{id}` exposes the retained technical-successor projection and
+   evidence index; the existing evidence read exposes indexed intent, closure,
+   integration, native-generation, predecessor-resource and resume-actor files.
+   Include nested recovery chains; a summary, missing projection or failed read
+   does not establish that no technical successor exists.
+2. The owner must also inspect the previous runtime's owned state read-only.
+   Check `delivery_technical_successors` for pending rows and the original run
+   roots for `technical-successor/intent.json`, closure/integration effects,
+   native-generation journals and predecessor-resource archives. Include orphan
+   intents without a committed row, archived runs, nested records and queued
+   outbox dispatches. Public run/evidence reads are not a complete orphan scan.
+   Use existing ownership/custody checks and preserve the original evidence;
+   do not rewrite database rows, seals or cleanup results to bypass recovery.
+3. Under the previous release, finish matching queued/running native executions
+   or cancel them through its supported controls, and resolve pending/orphan
+   pre-workflow intents through that release's supported procedure. An exact
+   command resume belongs to the previous writer, not the retired current route.
+   Confirm terminal execution and cleanup of actors, ports, leases and resources
+   before deployment. An accepted cancellation alone does not prove cleanup.
+   If any intent, dispatch or effect remains uncertain, retain the previous
+   release and defer deployment rather than retrying the retired admission.
+
+Native executions retain their runtime-source binding. Preserved outbox decoding
+and replay of the three captured minimal c04 fixtures do not prove execution
+across runtime hashes, every historical input, worker restart or lifecycle upgrade.
 
 Resource roots stay under their original
 registered ownership. For trusted pytest checks, the unchanged frozen argv runs
