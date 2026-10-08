@@ -18,7 +18,8 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
   const [commandId, setCommandId] = useState(() => crypto.randomUUID())
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const repositories = service?.repositories ?? []
+  const access = service?.repository_access
+  const repositories = (service?.repositories ?? []).filter(repo => !access || access.repositories.some(item => item.name.toLowerCase() === repo.github_repo?.toLowerCase() && item.allowed))
   const intakeEnabled = service?.policy?.intake_enabled === true
   const selected = useMemo(() => repositories.find(repo => repo.key === fields.repository_key), [repositories, fields.repository_key])
 

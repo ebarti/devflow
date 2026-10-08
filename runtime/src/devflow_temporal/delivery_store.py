@@ -383,6 +383,9 @@ class DeliveryStore:
             from .delivery_dashboard import initialize
 
             initialize(db)
+            from .delivery_settings import initialize as initialize_settings
+
+            initialize_settings(db)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -494,6 +497,10 @@ class DeliveryStore:
                     (command_id, run_id, request_digest, canonical_json(response)),
                 )
                 return response
+            from .delivery_settings import require_repository_access
+
+            if _automatic is None:
+                require_repository_access(self, db, spec["github_repo"])
             if _automatic is not None:
                 self._freeze_issue_budget(db, spec)
             work = self.state.row(db, "works", spec["work_id"])

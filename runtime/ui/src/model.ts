@@ -172,6 +172,7 @@ export interface RunDetail extends RunSummary {
 }
 
 export interface RepositoryInfo {
+  github_repo?: string | null
   key: string
   label?: string | null
   base_ref?: string | null
@@ -180,6 +181,7 @@ export interface RepositoryInfo {
 }
 
 export interface ServiceInfo {
+  repository_access?: RepositoryAccess | null
   runtime_identity?: RuntimeIdentity | null
   status?: string | null
   version?: string | null
@@ -187,6 +189,11 @@ export interface ServiceInfo {
   capacity?: { active?: number | null; queued?: number | null; limit?: number | null } | null
   repositories?: RepositoryInfo[] | null
   policy?: { roles?: Record<string, { model?: string | null; effort?: string | null }> | null; repositories?: RepositoryInfo[] | null; authorized_endpoint?: string | null; intake_enabled?: boolean | null } | null
+}
+
+export interface RepositoryAccess {
+  revision: number
+  repositories: { name: string; allowed: boolean }[]
 }
 
 export interface RuntimeIdentity {

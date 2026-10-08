@@ -323,7 +323,22 @@ def create_app(config_path: Path) -> FastAPI:
             "temporal": service.temporal_status,
             "capacity": {"limit": service.config.raw.get("capacity", 2), "active": active},
             "policy": service.config.public_policy(),
+            "repository_access": await asyncio.to_thread(
+                _read_repository_access, service.store),
         }
+
+    from .delivery_settings import read_repository_access as _read_repository_access
+
+    @app.post("/api/settings/repositories")
+    async def save_repositories(request: Request) -> dict[str, Any]:
+        _mutation(request)
+        from .delivery_settings import save_repository_access
+
+        try:
+            return await asyncio.to_thread(
+                save_repository_access, service.store, await request.json())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/runs")
     async def list_runs(

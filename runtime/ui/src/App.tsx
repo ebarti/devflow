@@ -255,7 +255,7 @@ export function App() {
     </aside> : null}
     <main className="main-panel" id="main-content">
       {location.page === 'statistics' ? <Statistics /> : null}
-      {location.page === 'settings' ? <Settings service={service} loading={serviceLoading} error={serviceError} onRefresh={() => void refreshService()} /> : null}
+      {location.page === 'settings' ? <Settings service={service} loading={serviceLoading} error={serviceError} onRefresh={() => void refreshService()} onRepositoryAccessSaved={access => setService(current => current ? { ...current, repository_access: access } : current)} /> : null}
       {location.page === 'new' ? serviceLoading && !service ? <p className="empty-section">Loading admission policy…</p> : <NewRun service={service} onCreated={id => { void refreshRuns(); navigate('runs', id) }} onBack={() => navigate('runs', allRuns[0]?.id || allRuns[0]?.run_id || null)} /> : null}
       {location.page === 'runs' ? <>
         {connection === 'disconnected' || detailError ? <div className="connection-banner connection-banner--bad" role="alert"><div><strong>Disconnected · showing last observed state</strong><span>{detailError || runsError || `Connection lost ${time(staleSince)}.`} {lastGoodAt ? `Last successful read ${time(lastGoodAt)}.` : ''}</span></div><button onClick={() => void refreshCurrent()}>Retry</button></div> : null}

@@ -209,9 +209,11 @@ th:nth-child(3), td:nth-child(3) { width: 24%; }
 .settings-list div { display: grid; grid-template-columns: 170px 1fr; font-size: 14px; }
 .settings-list dt { color: var(--muted); }
 .settings-list dd { margin: 0; }
-.settings-repos { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
-.settings-repos li { display: grid; grid-template-columns: minmax(130px,1fr) minmax(100px,1fr) minmax(200px,1fr); border-top: 1px solid var(--line); padding: 10px 0 0; gap: 15px; font-size: 14px; }
-.settings-repos span { color: var(--muted); overflow-wrap: anywhere; }
+.settings-repos { list-style: none; padding: 0; margin: 0 0 16px; display: grid; gap: 10px; }
+.settings-repos li { display: flex; border-top: 1px solid var(--line); padding: 10px 0 0; gap: 15px; font-size: 14px; }
+.settings-repos label { display: flex; align-items: center; gap: 12px; overflow-wrap: anywhere; }
+.settings-repos input { width: 18px; height: 18px; margin: 0; accent-color: var(--blue); }
+.settings-help { color: var(--muted); font-size: 14px; line-height: 1.5; margin: 6px 0 14px; }
 
 @media (max-width: 1100px) {
   .app-shell { grid-template-columns: 190px 285px minmax(0,1fr); }
