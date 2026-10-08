@@ -1011,12 +1011,21 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_merge")
 async def delivery_merge(request):
+    from threading import Event
+
     from .delivery_merge import merge_verified
 
     store, _ = _context(request["spec"])
-    return await _with_heartbeat(
-        asyncio.to_thread(merge_verified, store, request["spec"], request), request, "merge"
-    )
+    cancelled = Event()
+    try:
+        return await _with_heartbeat(
+            asyncio.to_thread(merge_verified, store, request["spec"], request, cancelled),
+            request, "merge"
+        )
+    finally:
+        # Cancelling asyncio.to_thread does not stop its underlying thread.
+        # Fence any later external effect, retaining an already-sent effect as unknown.
+        cancelled.set()
 
 
 @activity.defn(name="delivery_terminal_preflight")

@@ -41,3 +41,13 @@ The service sends one callback per blocking decision revision through the instal
 Native roles use controller-owned finite turns, capacity, deadlines and session/thread IDs, with PID/start identity recorded before launch. Built-in agent spawning is disabled; nested Devflow and recursive provider work are denied by launch and measured command-sandbox controls. Harmless CLI metadata may run. Process receipts cover observed descendants and owned ports; interrupted or ambiguous monitoring remains unknown.
 
 Terminal workflow finalization owns temporary-directory removal and records a hashed receipt separately from process cleanup. Inspect removed/already-absent, retained reasons and failed/unknown roots before claiming cleanup. Durable sessions/evidence and dirty or unpushed recovery source remain; never sweep global temp directories or remove historical/user work to mask a failed cleanup. Native local execution does not promise a Codex Desktop Computer Use connection.
+
+Fresh merged deliveries require an active GitHub ruleset enforcing their required
+checks with an up-to-date base and no bypass actors. The runtime only reads these
+rules and refuses a merge when enforcement is missing or ambiguous. It preserves
+the original frozen base; if the actual squash parent advanced within the verified
+head ancestry, it records that parent separately and verifies both ancestry ranges
+and the exact tested whole tree before closing the issue. A divergent base requires
+fresh integration evidence. Concurrent administrative changes to branch rules are
+outside that server-enforcement guarantee. Unknown merge effects retain the claim;
+read-only terminal reconciliation never schedules another merge.

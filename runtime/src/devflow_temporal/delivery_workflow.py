@@ -351,7 +351,8 @@ class DeliveryWorkflow:
                         error="resource cleanup is unknown",
                     )
                     event, message = "blocked", "Resource cleanup requires recovery"
-        if event == "delivered" and spec.get("merge_version") == 1:
+        if (event == "delivered" and spec.get("merge_version") == 1
+                and not self.terminal_reconciliation_only):
             try:
                 merged = await self._activity("delivery_merge", {
                     "spec": spec, "candidate": self.state.get("candidate"),
@@ -375,6 +376,9 @@ class DeliveryWorkflow:
                 receipt.get("process_cleanup") == "observed-native-confirmed"
                 and receipt.get("resource_cleanup") == "confirmed"
             )
+            if (spec.get("merge_version") == 1
+                    and self.state["checks"].get("merge", {}).get("state") == "unknown"):
+                release = False
             checkpoint = {
                 "event": event, "message": message, "phase": self.state["phase"],
                 "execution_state": self.state["execution_state"],

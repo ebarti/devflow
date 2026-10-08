@@ -32,8 +32,9 @@ def gates():
                       "resource_cleanup": "confirmed"})
     attempts = [{"role": role, "candidate_id": "published", "state": "finished",
                  "cleanup": "confirmed", "session_id": role,
-                 "result_json": json.dumps({"status": "pass", "candidate": {
-                     "id": "source", "content_sha256": "contents"}})}
+                 "controller_output_candidate": {"id": "source", "head": "source-head",
+                                                 "content_sha256": "contents"},
+                 "result_json": json.dumps({"status": "pass", "session_id": role})}
                 for role in ("implement", "review", "verify")]
     return spec, candidate, pr, checks, attempts, {"input_candidate_id": "source"}
 
@@ -125,8 +126,7 @@ def test_changed_authority_candidate_or_native_custody_prevents_merge(change):
     elif change == "missing_review":
         attempts.pop(1)
     elif change == "changed_implementation":
-        attempts[0]["result_json"] = json.dumps({"status": "pass", "candidate": {
-            "id": "source", "content_sha256": "other"}})
+        attempts[0]["controller_output_candidate"]["content_sha256"] = "other"
     elif change == "publication":
         publication["input_candidate_id"] = "other"
     else:
@@ -220,6 +220,9 @@ async def test_actual_workflow_orders_cleanup_merge_and_done(monkeypatch, mode):
     if "delivery_merge" in names:
         assert names.index("delivery_merge") < names.index("delivery_terminal_tracker")
     status = next(r["status"] for n, r in probe.calls if n == "delivery_terminal_tracker")
+    if mode == "unknown_merge":
+        terminal = next(r for n, r in probe.calls if n == "delivery_terminal_tracker")
+        assert terminal["release"] is False
     assert status == {"merged": "done", "unmerged": "in-review",
                       "bad_cleanup": "blocked", "unknown_merge": "blocked"}[mode]
     assert probe.state["outcome"] == ("delivered" if mode in {"merged", "unmerged"} else "blocked")
@@ -232,7 +235,8 @@ def test_squash_readback_rejects_different_merged_tree_or_base(tmp_path):
     found = {"merged": True, "state": "closed", "merged_at": "now", "merge_commit_sha": "m"}
     for tree, parent in [("other", "b"), ("t", "advanced")]:
         broker.api = lambda *_, tree=tree, parent=parent, **__: {
-            "sha": "m", "tree": {"sha": tree}, "parents": [{"sha": parent}]}
+            "sha": "m", "tree": {"sha": tree}, "parents": [{"sha": parent}],
+            "status": "diverged"}
         with pytest.raises(ValueError, match="verified tree or base"):
             broker.merged(pr, found, "t")
 
@@ -353,3 +357,274 @@ def test_remote_ci_mismatch_cannot_bless_a_merge(tmp_path, change):
         broker.log = "checkout other\nMerge h into b\n"
     with pytest.raises(ValueError):
         broker.live_ci(pr, found, "t")
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciliation_never_schedules_merge_or_changes_confirmed_outcome():
+    probe = Projection(gates()[3]["resource_cleanup"], {"state": "unknown"})
+    probe.terminal_reconciliation_only = True
+    await probe._project(gates()[0], "delivered", "readback only")
+    assert [n for n, _ in probe.calls] == ["delivery_project"]
+    assert probe.state["outcome"] == "delivered"
+
+
+def native_receipt(tmp_path):
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_resources import write_private
+    from devflow_temporal.supervisor import DeliverySupervisor
+
+    spec = gates()[0]
+    spec.update(state_dir=str(tmp_path / "fresh"), checkout=str(tmp_path / "source"))
+    request = {"spec": spec, "role": "implement", "iteration": 0,
+               "candidate": {"id": "input"}, "workspace": spec["checkout"]}
+    key = DeliverySupervisor._job_key(request)
+    root = tmp_path / "fresh" / "attempts" / key
+    path = root / "native-process.json"
+    assessment = {"status": "pass", "session_id": "implement", "findings": []}
+    outcome = {"state": "finished", "monitoring_complete": True,
+               "cleanup": "observed-native-confirmed", "journal": str(path)}
+    saved = {**assessment, "cleanup": "confirmed", "process_cleanup": "observed-native-confirmed",
+             "resource_cleanup": "pending_workflow_finalization", "native_process": outcome}
+    output = {"id": "source", "head": "source-head", "content_sha256": "contents"}
+    journal = {"phase": "finished", "owned": {"123": {"identity": "observed"}},
+               "intent": {"run_id": spec["run_id"], "policy_digest": spec["policy_digest"],
+                          "cwd": spec["checkout"]}, "result": outcome,
+               "provider_session": {"role": "implement", "iteration": 0,
+                                    "session_id": "implement", "output_candidate": output,
+                                    "result_digest": digest(saved)}}
+    for name, value in (("request.json", request), ("result.json", assessment),
+                        ("native-process.json", journal)):
+        write_private(root / name, value)
+    attempt = {**gates()[4][0], "job_key": key, "iteration": 0, "candidate_id": "input",
+               "result_path": str(root / "result.json"), "result_json": json.dumps(saved)}
+    attempt.pop("controller_output_candidate")
+    return spec, attempt, path, journal
+
+
+def test_actual_native_saved_receipt_uses_separate_supervisor_output_binding(tmp_path):
+    from devflow_temporal.delivery_merge import native_implementation_output
+
+    spec, attempt, _, _ = native_receipt(tmp_path)
+    assert "candidate" not in json.loads(attempt["result_json"])
+    output = native_implementation_output(spec, attempt)
+    values = gates()
+    values[4][0] = {**attempt, "controller_output_candidate": output}
+    require_merge_gates(*values)
+
+
+@pytest.mark.parametrize("change", ["receipt", "session", "output", "request", "run", "policy",
+                                   "iteration", "result", "role", "cleanup"])
+def test_changed_native_receipt_or_controller_binding_cannot_bless_implementation(tmp_path, change):
+    from devflow_temporal.delivery_merge import native_implementation_output
+    from devflow_temporal.delivery_resources import write_private
+
+    spec, attempt, path, journal = native_receipt(tmp_path)
+    if change == "receipt":
+        write_private(path.with_name("result.json"), {"status": "pass", "session_id": "other"})
+    elif change == "request":
+        write_private(path.with_name("request.json"), {"spec": spec, "role": "review"})
+    elif change in {"session", "output", "iteration", "role"}:
+        journal["provider_session"][{"session": "session_id", "output": "output_candidate"}.get(
+            change, change)] = "changed"
+    elif change in {"run", "policy"}:
+        journal["intent"][{"run": "run_id", "policy": "policy_digest"}[change]] = "changed"
+    elif change == "cleanup":
+        journal["phase"] = "unknown"
+    else:
+        journal["provider_session"]["result_digest"] = "changed"
+    write_private(path, journal)
+    with pytest.raises(ValueError):
+        native_implementation_output(spec, attempt)
+
+
+def strict_rules():
+    params = {"strict_required_status_checks_policy": True,
+              "required_status_checks": [{"context": "test", "integration_id": 15368}]}
+    rule = {"type": "required_status_checks", "parameters": params, "ruleset_id": 42,
+            "ruleset_source_type": "Repository", "ruleset_source": "owner/repo"}
+    detail = {"id": 42, "target": "branch", "enforcement": "active",
+              "source_type": "Repository", "source": "owner/repo", "bypass_actors": [],
+              "rules": [{"type": "required_status_checks", "parameters": params}]}
+    return rule, detail
+
+
+@pytest.mark.parametrize("change", ["loose", "missing_checks", "disabled", "bypass", "exempt",
+                                   "pull_request_bypass", "hidden_bypass", "changed_rules",
+                                   "foreign"])
+def test_merge_refuses_unenforced_or_bypassable_github_base_checks(tmp_path, change):
+    spec = gates()[0]
+    spec["state_dir"] = str(tmp_path)
+    broker = MergeBroker(None, spec)
+    rule, detail = strict_rules()
+    if change == "loose":
+        rule["parameters"]["strict_required_status_checks_policy"] = False
+    elif change == "missing_checks":
+        rule["parameters"]["required_status_checks"] = []
+    elif change == "disabled":
+        detail["enforcement"] = "evaluate"
+    elif change in {"bypass", "exempt", "pull_request_bypass"}:
+        detail["bypass_actors"] = [{"actor_type": "RepositoryRole", "actor_id": 5,
+                                    "bypass_mode": {"bypass": "always", "exempt": "exempt",
+                                                    "pull_request_bypass": "pull_request"}[change]}]
+    elif change == "hidden_bypass":
+        detail.pop("bypass_actors")
+    elif change == "foreign":
+        rule["ruleset_source"] = "foreign/repo"
+    else:
+        detail["rules"] = []
+    broker.api = lambda endpoint, **_: detail if "/rulesets/" in endpoint else [rule]
+    with pytest.raises(ValueError, match="active strict GitHub checks"):
+        broker.require_base_enforcement()
+
+
+def test_strict_main_only_ruleset_with_no_bypass_is_a_server_enforcement_receipt(tmp_path):
+    spec = gates()[0]
+    spec["state_dir"] = str(tmp_path)
+    broker = MergeBroker(None, spec)
+    rule, detail = strict_rules()
+    broker.api = lambda endpoint, **_: detail if "/rulesets/" in endpoint else [rule]
+    assert broker.require_base_enforcement() == {
+        "ruleset_id": 42, "required_ci": ["test"], "strict": True, "bypass_actors": []}
+
+
+def test_contained_base_advance_records_actual_parent_without_changing_frozen_base(tmp_path):
+    spec, _, pr, _, _, _ = gates()
+    spec["state_dir"] = str(tmp_path)
+    broker = MergeBroker(None, spec)
+    calls = []
+    def api(endpoint, **_):
+        calls.append(endpoint)
+        if "/git/commits/" in endpoint:
+            return {"sha": "m", "tree": {"sha": "t"}, "parents": [{"sha": "c"}]}
+        before = endpoint.split("/compare/", 1)[1].split("...", 1)[0]
+        return {"status": "ahead", "base_commit": {"sha": before},
+                "merge_base_commit": {"sha": before}}
+    broker.api = api
+    found = {"merged": True, "state": "closed", "merged_at": "now", "merge_commit_sha": "m"}
+    result = broker.merged(pr, found, "t")
+    assert result["base"] == spec["base_sha"] == "b"
+    assert result["actual_merge_base"] == "c"
+    assert calls[-2:] == ["repos/owner/repo/compare/b...c", "repos/owner/repo/compare/c...h"]
+
+
+@pytest.mark.parametrize("boundary", ["cancelled", "deadline"])
+def test_lost_activity_ownership_prevents_external_writes(tmp_path, monkeypatch, boundary):
+    from threading import Event
+
+    spec = gates()[0]
+    spec["state_dir"] = str(tmp_path)
+    cancelled = Event()
+    broker = MergeBroker(None, spec, cancelled)
+    if boundary == "cancelled":
+        cancelled.set()
+    else:
+        broker.deadline = 0
+    monkeypatch.setattr("devflow_temporal.delivery_merge.subprocess.run",
+                        lambda *_, **__: pytest.fail("expired ownership cannot send requests"))
+    with pytest.raises(RuntimeError, match="no longer owns"):
+        broker.api("repos/owner/repo/issues/7", method="PATCH", body={"state": "closed"})
+
+
+def concurrent_base_probe():
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    import devflow_temporal.delivery_merge as merge_module
+    from devflow_temporal.contracts import canonical_json
+
+    spec, candidate, pr, checks, attempts, publication = gates()
+    with tempfile.TemporaryDirectory(prefix="devflow-merge-pure-race-", dir="/private/tmp") as tmp:
+        spec["state_dir"] = tmp
+        store = Store(Path(tmp) / "fake.sqlite3")
+        saved = deepcopy(checks)
+        saved.pop("resource_cleanup")
+        with store._connect() as db:
+            db.execute("CREATE TABLE delivery_runs("
+                       "run_id,iteration,candidate_json,pr_json,checks_json)")
+            db.execute("CREATE TABLE delivery_attempts(run_id,role,candidate_id,state,cleanup,"
+                       "session_id,result_json,iteration)")
+            db.execute("INSERT INTO delivery_runs VALUES(?,?,?,?,?)", (
+                spec["run_id"], 0, canonical_json(candidate), canonical_json(pr),
+                canonical_json(saved)))
+            for attempt in attempts:
+                db.execute("INSERT INTO delivery_attempts VALUES(?,?,?,?,?,?,?,?)", (
+                    spec["run_id"], *(attempt[k] for k in (
+                        "role", "candidate_id", "state", "cleanup", "session_id", "result_json")),
+                    0))
+            db.execute("INSERT INTO delivery_effects VALUES(?,?,?,?,?,?,?)", (
+                "publish:fresh:0", "fresh", "publish", canonical_json(publication), "complete",
+                canonical_json(pr), "2026-10-08T00:00:00Z"))
+        hosted = Hosted(spec)
+        remote = {"base": "b", "merged": False, "put_calls": [], "calls": []}
+
+        def fake_api(self, endpoint, *, method="GET", body=None, raw=False):
+            remote["calls"].append({"endpoint": endpoint, "method": method})
+            if endpoint == "repos/owner/repo/pulls/1":
+                return {"number": 1, "html_url": pr["url"], "draft": False,
+                        "head": {"sha": "h", "ref": spec["branch"],
+                                 "repo": {"full_name": "owner/repo"}},
+                        "base": {"sha": remote["base"], "ref": "main",
+                                 "repo": {"full_name": "owner/repo"}},
+                        "merged": remote["merged"],
+                        "state": "closed" if remote["merged"] else "open",
+                        "merged_at": "2026-10-08T00:01:00Z" if remote["merged"] else None,
+                        "merge_commit_sha": "actual-merge" if remote["merged"] else "hosted"}
+            if endpoint == "repos/owner/repo/git/commits/h":
+                return {"sha": "h", "tree": {"sha": "t"}, "parents": [{"sha": "b"}]}
+            if endpoint == "repos/owner/repo/git/commits/actual-merge":
+                return {"sha": "actual-merge", "tree": {"sha": "untested-tree"},
+                        "parents": [{"sha": "advanced"}]}
+            if endpoint == "repos/owner/repo/pulls/1/merge" and method == "PUT":
+                remote["put_calls"].append({"body": deepcopy(body),
+                                            "base_at_write": remote["base"]})
+                remote["merged"] = True
+                return {"merged": True, "sha": "actual-merge"}
+            # The original candidate does not inspect these unprotected-repository
+            # observations. Their explicit absence of strict enforcement is the
+            # publication trigger and can be rejected by an owning repair.
+            if endpoint == "repos/owner/repo/branches/main/protection":
+                return {"required_status_checks": {"strict": False, "contexts": ["test"]},
+                        "enforce_admins": {"enabled": True}}
+            if endpoint.startswith("repos/owner/repo/rules/branches/main"):
+                return []
+            if endpoint.startswith("repos/owner/repo/rulesets"):
+                return []
+            if endpoint == "user":
+                return {"login": "owner", "id": 1}
+            if endpoint.endswith("/logs"):
+                # A second delivery advances main after every old-base check
+                # has succeeded, while the first delivery's head stays fixed.
+                remote["base"] = "advanced"
+            return deepcopy(hosted.api(endpoint, method=method, body=body, raw=raw))
+
+        error = None
+        with patch.object(merge_module.MergeBroker, "api", fake_api), \
+                patch.object(merge_module, "observe_finalized_resources",
+                             lambda _: {"state": "confirmed"}), \
+                patch("devflow_temporal.delivery_policy_recovery.work_binding", lambda *_: None), \
+                patch.object(merge_module, "native_implementation_output", lambda *_: {
+                    "id": "source", "head": "source-head", "content_sha256": "contents"}):
+            try:
+                merge_module.merge_verified(store, spec, {
+                    "candidate": candidate, "pull_request": pr, "checks": checks})
+            except (ValueError, RuntimeError) as exc:
+                error = str(exc)
+        with store._connect() as db:
+            effect = db.execute("SELECT state FROM delivery_effects "
+                                "WHERE effect_key='merge:fresh'").fetchone()
+        return {"probe": "actual-entry-concurrent-base-change",
+                "status": "RED" if remote["put_calls"] else "PASS",
+                "original_base": "b", "base_after_ci": remote["base"],
+                "put_calls": remote["put_calls"], "simulated_merge_applied": remote["merged"],
+                "merge_effect_state": effect["state"] if effect else None, "error": error,
+                "remote_calls": remote["calls"]}
+
+
+def test_actual_merge_entry_rejects_intervening_base_advance_without_server_enforcement():
+    proof = concurrent_base_probe()
+    assert proof["base_after_ci"] == "advanced"
+    assert proof["put_calls"] == []
+    assert proof["simulated_merge_applied"] is False
+    assert proof["merge_effect_state"] is None
+    assert "active strict GitHub checks" in proof["error"]

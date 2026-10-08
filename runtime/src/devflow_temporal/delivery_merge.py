@@ -5,7 +5,9 @@ import hashlib
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
+from urllib.parse import quote
 
 from .contracts import canonical_json, digest
 from .delivery_resources import observe_finalized_resources, read_private, write_private
@@ -61,9 +63,10 @@ def require_merge_gates(spec, candidate, pr, checks, attempts, publication):
         result = json.loads(last["result_json"])
         if result.get("status") != "pass" or not last.get("session_id"):
             raise ValueError(role + " did not pass with a native session")
+        output = last.get("controller_output_candidate", {})
         if role == "implement" and (
-            result.get("candidate", {}).get("id") != origin_id
-            or result["candidate"].get("content_sha256") != candidate.get("content_sha256")
+            output.get("id") != origin_id
+            or output.get("content_sha256") != candidate.get("content_sha256")
         ):
             raise ValueError("publication changed the implementer's accepted source content")
         selected[role] = last["session_id"]
@@ -71,13 +74,58 @@ def require_merge_gates(spec, candidate, pr, checks, attempts, publication):
         raise ValueError("merge requires independent implementation, review and QA sessions")
 
 
+def native_implementation_output(spec, attempt):
+    """Read the supervisor's separate output binding, never activity-only enrichment."""
+    from .delivery_gates_admission import _native_result_bytes
+    from .delivery_resources import _ancestors
+    from .supervisor import DeliverySupervisor
+
+    raw = json.loads(_native_result_bytes(spec, attempt))
+    saved = json.loads(attempt["result_json"])
+    enriched = {"cleanup", "process_cleanup", "resource_cleanup", "native_process",
+                "role_artifacts"}
+    if canonical_json(raw) != canonical_json({k: v for k, v in saved.items() if k not in enriched}):
+        raise ValueError("merge implementation assessment changed from its original receipt")
+    root = Path(spec["state_dir"]) / "attempts" / attempt["job_key"]
+    _ancestors(root / "request.json")
+    request = read_private(root / "request.json")
+    journal = read_private(root / "native-process.json")
+    metadata, intent = journal.get("provider_session", {}), journal.get("intent", {})
+    output = metadata.get("output_candidate")
+    if (request.get("spec") != spec or request.get("role") != "implement"
+            or request.get("iteration") != attempt["iteration"]
+            or request.get("candidate", {}).get("id") != attempt["candidate_id"]
+            or request.get("workspace") != spec["checkout"]
+            or DeliverySupervisor._job_key(request) != attempt["job_key"]
+            or journal.get("phase") != "finished" or not journal.get("owned")
+            or intent.get("run_id") != spec["run_id"]
+            or intent.get("policy_digest") != spec["policy_digest"]
+            or intent.get("cwd") != spec["checkout"]
+            or metadata.get("role") != "implement"
+            or metadata.get("iteration") != attempt["iteration"]
+            or metadata.get("session_id") != attempt["session_id"]
+            or saved.get("session_id") != attempt["session_id"]
+            or metadata.get("result_digest") != digest(saved)
+            or journal.get("result") != saved.get("native_process")
+            or saved.get("process_cleanup") != "observed-native-confirmed"
+            or saved.get("native_process", {}).get("monitoring_complete") is not True
+            or not isinstance(output, dict) or set(output) != {"id", "head", "content_sha256"}):
+        raise ValueError("merge implementation lost its controller-bound native output")
+    return output
+
+
 class MergeBroker:
-    def __init__(self, store, spec):
+    def __init__(self, store, spec, cancel_event=None):
         self.store, self.spec = store, spec
+        self.cancel_event = cancel_event
+        self.deadline = time.monotonic() + 9 * 60
         self.root = Path(spec["state_dir"]) / "merge"
         self.sequence = 0
 
     def api(self, endpoint, *, method="GET", body=None, raw=False):
+        if (self.cancel_event is not None and self.cancel_event.is_set()
+                or time.monotonic() >= self.deadline):
+            raise RuntimeError("merge activity no longer owns a live execution boundary")
         self.sequence += 1
         argv = ["gh", "api", "--method", method, endpoint]
         if body is not None:
@@ -132,11 +180,20 @@ class MergeBroker:
             raise ValueError("owned PR is not merged")
         commit = self.api(f"repos/{self.spec['github_repo']}/git/commits/"
                           + found["merge_commit_sha"])
-        if (commit["tree"]["sha"] != head_tree
-                or [p["sha"] for p in commit["parents"]] != [self.spec["base_sha"]]):
+        parents = [p["sha"] for p in commit["parents"]]
+        if commit["tree"]["sha"] != head_tree or len(parents) != 1:
             raise ValueError("actual squash merge differs from the verified tree or base")
+        actual_base = parents[0]
+        if actual_base != self.spec["base_sha"]:
+            for before, after in ((self.spec["base_sha"], actual_base), (actual_base, pr["head"])):
+                compare = self.api(f"repos/{self.spec['github_repo']}/compare/{before}...{after}")
+                if (compare.get("status") not in {"ahead", "identical"}
+                        or compare.get("base_commit", {}).get("sha") != before
+                        or compare.get("merge_base_commit", {}).get("sha") != before):
+                    raise ValueError("actual squash merge differs from the verified tree or base")
         return {"state": "confirmed", "number": pr["number"], "url": pr["url"],
                 "head": pr["head"], "base": self.spec["base_sha"], "tree": head_tree,
+                "actual_merge_base": actual_base,
                 "merged_commit": commit["sha"], "merged_at": found["merged_at"]}
 
     def live_ci(self, pr, found, head_tree):
@@ -189,6 +246,43 @@ class MergeBroker:
         return {"head": pr["head"], "base": self.spec["base_sha"],
                 "hosted_checkout": hosted["sha"], "hosted_tree": head_tree, "jobs": observed}
 
+    def require_base_enforcement(self):
+        """GitHub must reject base movement atomically at the merge operation."""
+        repo = self.spec["github_repo"]
+        branch = quote(self.spec["publication_base_ref"], safe="")
+        rules = []
+        # Observe every applicable active rule, including later pages.
+        for page in range(1, 101):
+            items = self.api(f"repos/{repo}/rules/branches/{branch}?per_page=100&page={page}")
+            if not isinstance(items, list):
+                raise ValueError("GitHub branch enforcement inventory is invalid")
+            rules.extend(items)
+            if len(items) < 100:
+                break
+        else:
+            raise ValueError("GitHub branch enforcement inventory is incomplete")
+        required = set(self.spec["policy"]["required_ci"])
+        for rule in rules:
+            params = rule.get("parameters", {})
+            contexts = {c["context"] for c in params.get("required_status_checks", [])}
+            if (rule.get("type") != "required_status_checks"
+                    or rule.get("ruleset_source_type") != "Repository"
+                    or rule.get("ruleset_source") != repo
+                    or params.get("strict_required_status_checks_policy") is not True
+                    or not required or not required <= contexts):
+                continue
+            found = self.api(f"repos/{repo}/rulesets/{rule['ruleset_id']}")
+            if (found.get("id") == rule["ruleset_id"] and found.get("target") == "branch"
+                    and found.get("enforcement") == "active"
+                    and found.get("source_type") == "Repository" and found.get("source") == repo
+                    and found.get("bypass_actors") == []
+                    and any(r.get("type") == "required_status_checks"
+                            and r.get("parameters") == params for r in found.get("rules", []))):
+                return {"ruleset_id": found["id"], "required_ci": sorted(required),
+                        "strict": True, "bypass_actors": []}
+        raise ValueError(
+            "merge requires active strict GitHub checks without bypass on its base branch")
+
     def close_issue(self, merged):
         repo = self.spec["github_repo"]
         prefix = f"https://github.com/{repo}/issues/"
@@ -217,7 +311,7 @@ class MergeBroker:
         return result
 
 
-def merge_verified(store, spec, request):
+def merge_verified(store, spec, request, cancel_event=None):
     from .delivery_policy_recovery import work_binding
 
     candidate, pr, checks = (request[key] for key in ("candidate", "pull_request", "checks"))
@@ -239,16 +333,22 @@ def merge_verified(store, spec, request):
             raise ValueError("merge request differs from the durable candidate and gates")
         if not publication or json.loads(publication["observed_json"] or "null") != pr:
             raise ValueError("merge has no completed original publication effect")
+    implementations = [a for a in attempts if a["role"] == "implement"]
+    if implementations:
+        implementations[-1]["controller_output_candidate"] = native_implementation_output(
+            spec, implementations[-1])
     require_merge_gates(spec, candidate, pr, checks, attempts,
                        json.loads(publication["request_json"]))
     resources = observe_finalized_resources(spec)
-    broker = MergeBroker(store, spec)
+    broker = MergeBroker(store, spec, cancel_event)
     head = broker.api(f"repos/{spec['github_repo']}/git/commits/{pr['head']}")
     head_tree = head["tree"]["sha"]
     found = broker.publication(pr)
     key = "merge:" + spec["run_id"]
     intent = {"candidate": candidate, "pr": pr, "base": spec["base_sha"], "tree": head_tree,
-              "policy_digest": spec["policy_digest"], "checks_sha256": digest(saved)}
+              "policy_digest": spec["policy_digest"], "checks_sha256": digest({
+                  k: saved.get(k) for k in (
+                      "prepublish", "local", "review", "qa", "ci", "browser_qa")})}
     if found["merged"]:
         with store._connect() as db:
             prior = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
@@ -258,6 +358,8 @@ def merge_verified(store, spec, request):
     else:
         ci = broker.live_ci(pr, found, head_tree)
         write_private(broker.root / "ci.json", ci)
+        enforcement = broker.require_base_enforcement()
+        write_private(broker.root / "base-enforcement.json", enforcement)
         if not broker.intent(key, "merge", intent):
             raise ValueError("original merge is unresolved; no mutation replay")
         broker.api(f"repos/{spec['github_repo']}/pulls/{pr['number']}/merge", method="PUT",

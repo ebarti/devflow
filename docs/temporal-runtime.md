@@ -9,7 +9,7 @@ terminal. Previously admitted inputs keep their recorded projection options;
 scope amendments preserve that choice. No database migration or operator retry
 is needed after an ordinary deployment.
 
-The runtime under `runtime/` is a single-host, local development service. It accepts a raw goal with an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. A read-only intake role investigates repository evidence, asks only blocking questions, and records a scoped plan before autonomous implementation. The managed path then owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. The default endpoint is a **published, unmerged PR**. A fresh native run can instead explicitly authorize `merged`. That endpoint keeps all original checks, independent roles and required CI, then confirms owned cleanup before requesting a head-pinned squash merge. It independently verifies the actual merged commit/tree and closes only the admitted issue before reconciling Done and releasing the claim. A moved base, uncertain effect or failed gate blocks completion; a lost response is reconciled through the original intent without blindly repeating the mutation. Existing unmerged histories retain their endpoint. Release, deployment and personal production data remain separate authority.
+The runtime under `runtime/` is a single-host, local development service. It accepts a raw goal with an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. A read-only intake role investigates repository evidence, asks only blocking questions, and records a scoped plan before autonomous implementation. The managed path then owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. The default endpoint is a **published, unmerged PR**. A fresh native run can instead explicitly authorize `merged`. That endpoint keeps all original checks, independent roles and required CI, then confirms owned cleanup before requesting a head-pinned squash merge. It independently verifies the actual merged commit/tree and closes only the admitted issue before reconciling Done and releasing the claim. A divergent base, uncertain effect or failed gate blocks completion; a lost response is reconciled through the original intent without blindly repeating the mutation. Existing unmerged histories retain their endpoint. Release, deployment and personal production data remain separate authority.
 
 The older `devflow-temporal` CLI remains a disposable role-ordering demonstration. It does not publish a PR or reconcile an issue. Use the managed `devflow-delivery` service for an end-to-end delivery.
 
@@ -209,3 +209,13 @@ readback on the previous runtime, never a fresh command or assumed completion.
 These are owner deployment checks; the retained readers cannot finish an
 interrupted writer. No rows or history are deleted and no schema migration is
 required.
+
+Fresh merged deliveries require an active GitHub ruleset enforcing their required
+checks with an up-to-date base and no bypass actors. The runtime only reads these
+rules and refuses a merge when enforcement is missing or ambiguous. It preserves
+the original frozen base; if the actual squash parent advanced within the verified
+head ancestry, it records that parent separately and verifies both ancestry ranges
+and the exact tested whole tree before closing the issue. A divergent base requires
+fresh integration evidence. Concurrent administrative changes to branch rules are
+outside that server-enforcement guarantee. Unknown merge effects retain the claim;
+read-only terminal reconciliation never schedules another merge.
