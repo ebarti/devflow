@@ -1,14 +1,16 @@
 """Pure contract and workflow scheduling probes; no native roles or servers."""
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 
 import pytest
 from test_delivery_intake import intake_fixture as intake_fixture
 
+from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_baseline_contract import repairable_baseline
-from devflow_temporal.delivery_config import DeliveryConfig
+from devflow_temporal.delivery_config import DeliveryConfig, scope_amended_spec
 from devflow_temporal.delivery_resources import _gate_path
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -70,8 +72,10 @@ def test_original_recipe_is_mandatory_at_both_final_boundaries(stage, change):
 @pytest.mark.parametrize("field,value", [
     ("cleanup", "unknown"), ("passed", 0), ("exit_code", -9), ("exit_code", True),
     ("exit_code", 0), ("test_count", None), ("test_count", 0), ("test_count", True),
-    ("failure_kind", "preparation"), ("launched", False), ("rejected_output", True),
+    ("failure_kind", "preparation"), ("evidence_failure", "unowned artifact"),
+    ("launched", False), ("rejected_output", True),
     ("rejection_causes", [{}]), ("log", ""), ("log_sha256", "unauthenticated"),
+    ("argv", [1]), ("argv", "pnpm scripts:test"),
 ])
 def test_uncertain_or_prerequisite_failure_blocks(field, value):
     spec, result = evidence()
@@ -125,6 +129,19 @@ def test_fail_fast_observation_preserves_unexecuted_final_recipes():
     # An observed command after an omitted earlier one is not a fail-fast prefix.
     for stage in ("baseline_checks", "prepublish_checks", "checks"):
         spec["policy"][stage].reverse()
+    assert not repairable_baseline(spec, result)
+
+
+@pytest.mark.parametrize("argv", [
+    ["corepack", "pnpm", "install", "--offline"],
+    ["uv", "--project", "worker", "sync", "--locked"],
+    ["uv", "run", "python", "-m", "playwright", "install", "chromium"],
+])
+def test_executed_prerequisite_cannot_be_a_feature_repair(argv):
+    spec, result = evidence()
+    for stage in ("baseline_checks", "prepublish_checks", "checks"):
+        spec["policy"][stage][0]["argv"] = argv
+    result["results"][0]["argv"] = argv
     assert not repairable_baseline(spec, result)
 
 def test_passed_prerequisites_must_also_have_observed_cleanup():
@@ -258,3 +275,38 @@ async def test_real_workflow_retains_legacy_unsafe_and_cancel_stops(scenario):
     assert state["outcome"] == ("cancelled" if scenario == "cancel" else "blocked")
     assert state["roles"] == []
     assert state["checks"]["baseline"] == baseline
+
+
+@pytest.mark.parametrize("version", [None, 1, 2])
+def test_scope_delta_never_upgrades_frozen_baseline_behavior(intake_fixture, version):
+    path, request = intake_fixture
+    raw = json.loads(path.read_text())
+    recipe = evidence()[0]["policy"]["baseline_checks"][0]
+    raw["repositories"]["fixture"].update(
+        baseline_check_ids=[recipe["id"]], prepublish_checks=[recipe], checks=[recipe],
+    )
+    path.write_text(json.dumps(raw))
+    config = DeliveryConfig.load(path)
+    config.state_root.mkdir(mode=0o700, parents=True)
+    original = config.admit(request)
+    original["accepted_plan"] = "Original accepted raw-goal plan"
+    original["request_digest"] = digest(request)
+    if version is None:
+        original.pop("baseline_checks_version")
+    else:
+        original["baseline_checks_version"] = version
+    updated = deepcopy(raw)
+    updated["repositories"]["fixture"]["allowed_paths"].append("tests/fixture.py")
+    amendment = config.state_root / "amendment.json"
+    amendment.write_text(json.dumps(updated))
+    amendment.chmod(0o600)
+    before = deepcopy(original)
+    effective = scope_amended_spec(
+        original, amendment, hashlib.sha256(amendment.read_bytes()).hexdigest(),
+        ["tests/fixture.py"],
+    )
+    assert effective.get("baseline_checks_version") == version
+    assert ("baseline_checks_version" in effective) == (version is not None)
+    assert effective["request_digest"] == original["request_digest"]
+    assert effective["accepted_plan"] == original["accepted_plan"]
+    assert original == before

@@ -13,6 +13,7 @@ from temporalio.exceptions import ActivityError, ApplicationError, ServerError
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from .contracts import digest
+from .delivery_baseline_contract import preparation_failure as _preparation_failure
 from .delivery_baseline_contract import repairable_baseline
 from .delivery_metadata_contract import evidence_applicability
 from .delivery_questions import valid_blocking_questions
@@ -38,28 +39,6 @@ def _failure_classification(cause: Exception | None, controller_cause: str | Non
         }:
             result["classification"] = "transient"
     return result
-
-
-def _preparation_failure(result: dict[str, Any]) -> str | None:
-    """Dependency installers are controller prerequisites, not feature repairs."""
-    for item in result.get("results", []):
-        if not isinstance(item, dict) or item.get("passed"):
-            continue
-        if item.get('failure_kind') == 'preparation' and item.get('launched') is False:
-            return str(item.get('id', 'check preparation'))[:128]
-        argv = item.get("argv", [])
-        if not isinstance(argv, list):
-            continue
-        preparation = any(
-            argv[i:i + len(command)] == list(command)
-            for command in (("pnpm", "install"), ("playwright", "install"))
-            for i in range(len(argv))
-        )
-        preparation |= (bool(argv) and argv[0].rsplit('/', 1)[-1] == 'uv'
-                        and 'sync' in argv and 'run' not in argv)
-        if preparation:
-            return str(item.get("id", "dependency installer"))[:128]
-    return None
 
 
 def _broker_findings(stage: str, result: dict[str, Any], *, iteration: int) -> list[str]:

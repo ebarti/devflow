@@ -635,7 +635,7 @@ def scope_amended_spec(
         effective.pop("plan_approval")
     if "blocking_questions_version" not in original:
         effective.pop("blocking_questions_version")
-    for marker in ("automatic_retry_version", "retry_budget_version"):
+    for marker in ("automatic_retry_version", "retry_budget_version", "baseline_checks_version"):
         if marker in original:
             effective[marker] = original[marker]
         else:

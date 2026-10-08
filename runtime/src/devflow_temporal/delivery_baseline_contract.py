@@ -5,6 +5,28 @@ import re
 from typing import Any
 
 
+def preparation_failure(result: dict[str, Any]) -> str | None:
+    """Dependency installers are controller prerequisites, not feature repairs."""
+    for item in result.get("results", []):
+        if not isinstance(item, dict) or item.get("passed"):
+            continue
+        if item.get('failure_kind') == 'preparation' and item.get('launched') is False:
+            return str(item.get('id', 'check preparation'))[:128]
+        argv = item.get("argv", [])
+        if not isinstance(argv, list):
+            continue
+        preparation = any(
+            argv[i:i + len(command)] == list(command)
+            for command in (("pnpm", "install"), ("playwright", "install"))
+            for i in range(len(argv))
+        )
+        preparation |= (bool(argv) and argv[0].rsplit('/', 1)[-1] == 'uv'
+                        and 'sync' in argv and 'run' not in argv)
+        if preparation:
+            return str(item.get("id", "dependency installer"))[:128]
+    return None
+
+
 def repairable_baseline(spec: dict[str, Any], result: dict[str, Any]) -> bool:
     """Allow only fully observed source regressions under fresh raw-goal authority."""
     candidate = result.get("baseline_candidate")
@@ -45,11 +67,18 @@ def repairable_baseline(spec: dict[str, Any], result: dict[str, Any]) -> bool:
     if (len(failures) != 1 or rows[-1] is not failures[0]
             or failures[0].get("id") not in required):
         return False
+    if any("argv" in row and (not isinstance(row["argv"], list)
+                               or any(not isinstance(arg, str) for arg in row["argv"]))
+           for row in rows):
+        return False
+    if preparation_failure(result) is not None:
+        return False
     for row in rows:
         native = row.get("native_process")
         if (type(row.get("passed")) is not bool or type(row.get("exit_code")) is not int
                 or (row["exit_code"] != 0 if row["passed"] else row["exit_code"] <= 0)
                 or row.get("cleanup") != "confirmed" or row.get("failure_kind") is not None
+                or row.get("evidence_failure") is not None
                 or row.get("launched") is False or row.get("rejected_output") is not False
                 or row.get("rejection_causes") != []
                 or not isinstance(row.get("log"), str) or not row["log"]
