@@ -47,7 +47,7 @@ export function Settings({ service, loading, error, onRefresh, onRepositoryAcces
         <div><dt>Status</dt><dd>{titleCase(service.status)}</dd></div>
         <div><dt>Version</dt><dd>{display(service.version)}</dd></div>
         <div><dt>Temporal</dt><dd>{typeof service.temporal === 'string' ? titleCase(service.temporal) : titleCase(service.temporal?.status)}</dd></div>
-        <div><dt>Parallel agents</dt><dd>{display(service.capacity?.active)} running · maximum {display(service.capacity?.limit)}<p className="settings-help">Maximum agents working at the same time. Additional agents wait for a slot.</p></dd></div>
+        <div><dt>Parallel agents</dt><dd>{display(service.capacity?.active)} slots in use · maximum {display(service.capacity?.limit)}<p className="settings-help">Maximum agents working at the same time. Additional agents wait for a slot.</p></dd></div>
       </dl></section>
       <section className="section settings-section"><h2>Allowed repositories</h2>{service.repository_access ? <RepositoryPermissions access={service.repository_access} onSaved={onRepositoryAccessSaved} /> : <p className="empty-section">Repository access settings are unavailable. Refresh after updating the local service.</p>}</section>
       <section className="section settings-section"><h2>Agent models</h2>{service.policy?.roles && Object.keys(service.policy.roles).length ? <div className="table-scroll"><table><thead><tr><th>Role</th><th>Model</th><th>Effort</th></tr></thead><tbody>{Object.entries(service.policy.roles).map(([role, config]) => <tr key={role}><td>{titleCase(role)}</td><td>{display(config.model)}</td><td>{display(config.effort)}</td></tr>)}</tbody></table></div> : <p className="empty-section">Agent models are unavailable.</p>}</section>

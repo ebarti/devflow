@@ -16,7 +16,7 @@ it('shows one configurable identity, clear parallel-agent wording, and saves per
   const onSaved = vi.fn()
   render(<Settings service={service} loading={false} error="" onRefresh={vi.fn()} onRepositoryAccessSaved={onSaved} />)
   expect(screen.getAllByRole('checkbox')).toHaveLength(1)
-  expect(screen.getByText('0 running · maximum 2')).toBeTruthy()
+  expect(screen.getByText('0 slots in use · maximum 2')).toBeTruthy()
   expect(screen.queryByText(/Unknown queued|fixture-repo|fixture-sha/)).toBeNull()
   const button = screen.getByRole('button', { name: 'Save repository access' })
   expect((button as HTMLButtonElement).disabled).toBe(true)
