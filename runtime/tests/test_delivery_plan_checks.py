@@ -35,7 +35,8 @@ def test_recipe_uses_only_named_owned_tests_locked_deps_and_retained_junit(proje
     checks = planned_checks(spec, checkout, evidence)
     assert len(checks) == 2
     deps, test = checks
-    assert deps['argv'][1:5] == ['sync', '--locked', '--no-install-project', '--extra']
+    assert deps['argv'][1:4] == ['sync', '--locked', '--extra']
+    assert '--no-install-project' not in deps['argv']
     assert deps['generated_directories'] == ['worker/.venv']
     assert test['argv'][:4] == [str(checkout / 'worker/.venv/bin/python'), '-m',
                               'pytest', 'tests/test_owned.py']

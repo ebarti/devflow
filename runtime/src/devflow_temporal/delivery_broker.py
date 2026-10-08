@@ -496,6 +496,14 @@ class DeliveryBroker:
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec)
+        if self.spec['provider'] == 'codex' and any('/store' in c['argv'] for c in checks):
+            from .delivery_native_dependencies import frozen_native_projects
+
+            try:
+                native_projects = sorted(set(native_projects or []) | set(
+                    frozen_native_projects(self.spec, checkout)))
+            except (ValueError, OSError, KeyError) as exc:
+                raise CheckPreparationFailure('native-addon-authority', exc) from exc
         if self.spec['provider'] == 'codex' and native_projects:
             from .delivery_native_dependencies import native_addon_authority
 
@@ -1040,7 +1048,8 @@ class DeliveryBroker:
         folder = self.evidence_dir / "implementation-preparation" / str(iteration)
         planned = planned_checks(self.spec, self.checkout, folder, preparation=True)
         dependencies = [c for c in planned if c['id'].startswith('planned-python-dependencies-')]
-        if any(c['id'].startswith('planned-vitest-') for c in planned):
+        if any('/store' in c['argv']
+               for c in self.spec['policy'].get('prepublish_checks', [])):
             dependencies = [c for c in self.spec['policy'].get('prepublish_checks', [])
                             if '/store' in c['argv']] + dependencies
         from .delivery_resources import RunResources

@@ -103,6 +103,8 @@ def prepare_sandbox(request: dict[str, Any], attempt_dir: Path) -> tuple[Path, d
             "HOME": str(role_home),
             "CODEX_HOME": str(codex_home),
             "TMPDIR": str(scratch),
+            "TMP": str(scratch),
+            "TEMP": str(scratch),
             "XDG_CACHE_HOME": str(role_home / ".cache"),
             "PYTHONDONTWRITEBYTECODE": "1",
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -188,6 +190,8 @@ def _native_env(
             "HOME": str(home),
             "CODEX_HOME": str(codex_home),
             "TMPDIR": str(scratch),
+            "TMP": str(scratch),
+            "TEMP": str(scratch),
             "XDG_CACHE_HOME": str(home / ".cache"),
             "PYTHONDONTWRITEBYTECODE": "1",
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -327,7 +331,7 @@ def prepare_native_role(
     from .delivery_resources import RunResources
 
     ephemeral_home = RunResources(spec).scratch("role", request["role"])
-    scratch = ephemeral_home / "tmp"
+    scratch = RunResources(spec).execution_scratch("role", request["role"])
     for path in (role_home, codex_home, ephemeral_home, scratch, attempt_dir):
         _private(path)
     source = Path(spec["policy"].get("codex_auth_path") or Path.home() / ".codex" / "auth.json")
@@ -480,7 +484,7 @@ def prepare_native_check(
     key = str(evidence_dir.relative_to(Path(spec["state_dir"]))) + "/" + check["id"]
     home = RunResources(spec).scratch("checks", key)
     codex_home = home / "codex"
-    scratch = home / "tmp"
+    scratch = RunResources(spec).execution_scratch("checks", key)
     for path in (home, codex_home, scratch):
         _private(path)
     domains = tuple(check.get("network_domains", ()))

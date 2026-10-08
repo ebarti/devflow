@@ -272,7 +272,7 @@ def planned_checks(spec: dict, checkout: Path, evidence: Path, *,
         key = digest(provenance)[:16]
         result.append({'id': 'planned-python-dependencies-' + key,
                        'cwd': relative, 'timeout_seconds': 600,
-                       'argv': [manager, 'sync', '--locked', '--no-install-project',
+                       'argv': [manager, 'sync', '--locked',
                                 '--extra', 'dev', '--python', str(Path(sys.executable).resolve())],
                        'generated_directories': [
                            (project / '.venv').relative_to(checkout).as_posix()],
