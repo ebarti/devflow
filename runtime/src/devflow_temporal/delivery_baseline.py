@@ -9,7 +9,7 @@ from .delivery_resources import RunResources, private_directory
 def run_baseline_checks(broker: DeliveryBroker) -> dict:
     spec = broker.spec
     checks = spec["policy"].get("baseline_checks", [])
-    if spec.get("baseline_checks_version") != 1 or not checks:
+    if spec.get("baseline_checks_version") not in (1, 2) or not checks:
         raise ValueError("baseline checks require an explicit immutable admission")
     path = broker._gate_path("baseline", 0)
     private_directory(path.parent)

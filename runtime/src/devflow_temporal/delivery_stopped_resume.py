@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from .contracts import canonical_json, digest
+from .delivery_baseline_contract import repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_config import DeliveryConfig
 from .delivery_gate_retry import prepare_runtime
@@ -145,17 +146,20 @@ def snapshot(store, run_id):
         raise ValueError('resume requires a closed finalized delivery with released ownership')
     if not isinstance(spec.get('accepted_plan'), str) or not spec['accepted_plan'].strip():
         raise ValueError('implementation resume requires an accepted plan')
-    if spec.get('baseline_checks_version') == 1:
+    if spec.get('baseline_checks_version') in (1, 2):
         baseline = state.get('checks', {}).get('baseline', {})
         required = {check['id'] for check in spec['policy']['baseline_checks']}
         results = baseline.get('results', [])
-        if (baseline.get('state') != 'passed' or baseline.get('base_sha') != spec['base_sha']
-                or baseline.get('baseline_candidate', {}).get('head') != spec['base_sha']
-                or baseline.get('feature_unchanged') is not True
-                or baseline.get('source_unchanged') is not True
-                or not required <= {r.get('id') for r in results if r.get('passed') is True}
-                or any(r.get('passed') is not True for r in results)):
-            raise ValueError('implementation resume requires the passed immutable baseline')
+        passed = (baseline.get('state') == 'passed' and baseline.get('base_sha') == spec['base_sha']
+                  and baseline.get('baseline_candidate', {}).get('head') == spec['base_sha']
+                  and baseline.get('feature_unchanged') is True
+                  and baseline.get('source_unchanged') is True
+                  and required <= {r.get('id') for r in results if r.get('passed') is True}
+                  and all(r.get('passed') is True for r in results))
+        if not passed and not repairable_baseline(spec, baseline):
+            raise ValueError('implementation resume requires the passed immutable baseline'
+                             if spec.get('baseline_checks_version') == 1 else
+                             'implementation resume requires an authenticated immutable baseline')
     broker = DeliveryBroker(store, spec)
     candidate, session = _candidate(broker, state, attempts)
     publication = state.get('pull_request')

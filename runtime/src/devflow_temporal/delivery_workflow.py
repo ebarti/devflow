@@ -13,6 +13,7 @@ from temporalio.exceptions import ActivityError, ApplicationError, ServerError
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from .contracts import digest
+from .delivery_baseline_contract import repairable_baseline
 from .delivery_metadata_contract import evidence_applicability
 from .delivery_questions import valid_blocking_questions
 
@@ -698,6 +699,8 @@ class DeliveryWorkflow:
             "round": 0, "questions": [], "answers": [], "plans": [],
             "accepted_plan": None, "change_requests": [],
         }
+        if self.state.get("baseline_findings"):
+            self.state["intake"]["baseline_findings"] = self.state["baseline_findings"]
         while True:
             if self.cancel_requested:
                 await self._cancelled(spec)
@@ -979,8 +982,9 @@ class DeliveryWorkflow:
         self.state["candidate"] = prepared["candidate"]
         self.state["candidate_revision"] += 1
         # Frozen legacy inputs omit this marker, preserving recorded histories.
-        # A shared baseline defect must not consume a feature repair turn.
-        if spec.get("baseline_checks_version") == 1:
+        # Legacy v1 stops before roles; fresh raw-goal v2 can diagnose fully
+        # observed regressions without approving the baseline or spending a turn.
+        if spec.get("baseline_checks_version") in (1, 2):
             self.state["phase"] = "baseline_checks"
             self.state["revision"] += 1
             await self._project(spec, "baseline_checks", "Checking the immutable project baseline")
@@ -997,13 +1001,21 @@ class DeliveryWorkflow:
             if baseline.get("state") != "passed":
                 failed = [str(item.get("id", "unknown")) for item in baseline.get("results", [])
                           if not item.get("passed")]
-                return await self._stop(
-                    spec, "project baseline failed before feature work: " + ", ".join(failed)
+                if not repairable_baseline(spec, baseline):
+                    return await self._stop(
+                        spec, "project baseline failed before feature work: " + ", ".join(failed)
+                    )
+                findings = _broker_findings("baseline", baseline, iteration=0)
+                self.state["baseline_findings"] = findings
+                self.state["findings"].extend(findings)
+                self.state["revision"] += 1
+                await self._project(spec, "baseline_diagnosed",
+                                    "Baseline regressions require repair and passing final checks")
+            else:
+                self.state["revision"] += 1
+                await self._project(
+                    spec, "baseline_passed", "Project baseline passed; starting feature work"
                 )
-            self.state["revision"] += 1
-            await self._project(
-                spec, "baseline_passed", "Project baseline passed; starting feature work"
-            )
         if spec.get("intake_required"):
             accepted_spec = await self._run_intake(spec)
             if accepted_spec is None:
@@ -1053,6 +1065,7 @@ class DeliveryWorkflow:
         continuation = prepared.get("continuation")
         prior_implementer_session = continuation["session_id"] if continuation else None
         repair_findings: list[str] = list(continuation.get("findings", [])) if continuation else []
+        repair_findings.extend(self.state.get("baseline_findings", []))
         return await self._run_iterations(
             spec,
             start_iteration=0,

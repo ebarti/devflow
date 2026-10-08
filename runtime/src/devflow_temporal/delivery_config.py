@@ -517,7 +517,8 @@ class DeliveryConfig:
             "automatic_retry_version": 1,
             **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
             "tracker_retry_version": 1,
-            **({"baseline_checks_version": 1} if baseline_ids else {}),
+            **({"baseline_checks_version": 2 if accepted_plan is None else 1}
+               if baseline_ids else {}),
             **(
                 {"preparation_version": 1}
                 if self.raw.get("provider", "codex") == "codex"
