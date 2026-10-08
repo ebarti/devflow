@@ -63,26 +63,29 @@ def test_invalid_issue_budget_is_rejected_before_admission(service, maximum):
 
 @pytest.mark.parametrize('outcome', ['blocked', 'delivered', 'cancelled'])
 @pytest.mark.parametrize('archived', [False, True])
-def test_every_previous_issue_attempt_counts_including_archives(service, outcome, archived):
+def test_owner_rerun_preserves_terminal_and_archived_history(service, outcome, archived):
     store, request = service
     store = configured(store, max_attempts=1)
     store.submit(request)
     finish(store, request, archived=archived, outcome=outcome)
-    rejected = next_request(request, 2, issue_url=request['issue_url'].replace('/3', '/003'))
-    with pytest.raises(ValueError, match='issue attempt budget'):
-        store.submit(rejected)
+    original = store.submitted_spec(request['run_id'])
+    rerun = next_request(request, 2, issue_url=request['issue_url'].replace('/3', '/003'))
+    assert store.submit(rerun)['existing'] is False
+    assert store.submitted_spec(request['run_id']) == original
     with store._connect() as db:
-        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
-        assert db.execute('SELECT COUNT(*) FROM delivery_outbox').fetchone()[0] == 1
-        assert store.state.row(db, 'works', rejected['work_id']) is None
-        assert store.state.claim_for(db, rejected['work_id']) is None
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 2
+        assert db.execute('SELECT COUNT(*) FROM delivery_outbox').fetchone()[0] == 2
+        assert store.state.claim_for(db, rerun['work_id']) is not None
+        assert db.execute('SELECT outcome FROM delivery_runs WHERE run_id=?',
+                          (request['run_id'],)).fetchone()[0] == outcome
 
 
 @pytest.mark.parametrize('later', [5, None])
-def test_configuration_cannot_reset_an_existing_issue_budget(service, later):
+def test_owner_rerun_uses_current_policy_without_changing_original(service, later):
     store, request = service
     store = configured(store, max_attempts=2)
     store.submit(request)
+    original = store.submitted_spec(request['run_id'])
     finish(store, request)
     raw = copy.deepcopy(store.config.raw)
     if later is None:
@@ -95,10 +98,29 @@ def test_configuration_cannot_reset_an_existing_issue_budget(service, later):
     store.submit(second)
     spec = store.submitted_spec(second['run_id'])
     assert spec['retry_budget_version'] == 1
-    assert spec['policy']['max_attempts'] == 2
+    assert spec['policy']['max_attempts'] == (3 if later is None else later)
     finish(store, second)
-    with pytest.raises(ValueError, match='issue attempt budget'):
-        store.submit(next_request(request, 3))
+    assert store.submit(next_request(request, 3))['existing'] is False
+    assert store.submitted_spec(request['run_id']) == original
+
+
+def test_fourth_explicit_submission_keeps_all_three_original_attempts(service):
+    store, request = service
+    store = configured(store, max_attempts=3)
+    originals = {}
+    for number in range(1, 4):
+        previous = next_request(request, number)
+        store.submit(previous)
+        originals[previous['run_id']] = store.submitted_spec(previous['run_id'])
+        finish(store, previous, archived=True)
+    fourth = next_request(request, 4)
+    assert store.submit(fourth)['existing'] is False
+    assert store.submit(fourth)['existing'] is False  # same durable command receipt
+    for run_id, spec in originals.items():
+        assert store.submitted_spec(run_id) == spec
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 4
+        assert db.execute('SELECT COUNT(*) FROM delivery_outbox').fetchone()[0] == 4
 
 
 def test_command_replays_and_different_issues_do_not_spend_another_attempt(service):
@@ -111,7 +133,7 @@ def test_command_replays_and_different_issues_do_not_spend_another_attempt(servi
     assert store.submit(other)['existing'] is False
 
 
-def test_enabling_budgets_counts_original_legacy_admissions(service, monkeypatch):
+def test_owner_rerun_preserves_legacy_admissions(service, monkeypatch):
     store, request = service
     # Retained pre-budget input, rather than a new admission under today's defaults.
     legacy = store.config.admit(request)
@@ -123,10 +145,29 @@ def test_enabling_budgets_counts_original_legacy_admissions(service, monkeypatch
         historical.setattr(DeliveryConfig, 'admit', lambda *_args: copy.deepcopy(legacy))
         store.submit(request)
     assert 'retry_budget_version' not in store.submitted_spec(request['run_id'])
+    original = store.submitted_spec(request['run_id'])
     finish(store, request, archived=True)
     store = configured(store, max_attempts=1)
+    assert store.submit(next_request(request, 2))['existing'] is False
+    assert store.submitted_spec(request['run_id']) == original
+
+
+@pytest.mark.parametrize('archived', [False, True])
+def test_internal_automatic_admission_cannot_bypass_exhausted_budget(service, archived):
+    store, request = service
+    store = configured(store, max_attempts=1)
+    store.submit(request)
+    finish(store, request, archived=archived)
+    successor = next_request(request, 2)
+    with store._connect() as db:
+        predecessor = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                                      (request['run_id'],)).fetchone())
     with pytest.raises(ValueError, match='issue attempt budget'):
-        store.submit(next_request(request, 2))
+        store.submit(successor, _automatic={'row': predecessor})
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
+        assert db.execute('SELECT COUNT(*) FROM delivery_outbox').fetchone()[0] == 1
+        assert store.state.row(db, 'works', successor['work_id']) is None
 
 
 def test_reloading_configuration_does_not_extend_an_admitted_repair_limit(service):
@@ -153,7 +194,7 @@ def test_admission_race_cannot_create_an_extra_run_or_claim(service):
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(submit, [2, 3]))
     assert sum(isinstance(result, dict) for result in results) == 1
-    assert sum(isinstance(result, str) and 'issue attempt budget' in result
+    assert sum(isinstance(result, str) and 'already claimed' in result
                for result in results) == 1
     with store._connect() as db:
         assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1

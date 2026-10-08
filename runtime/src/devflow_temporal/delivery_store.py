@@ -494,7 +494,8 @@ class DeliveryStore:
                     (command_id, run_id, request_digest, canonical_json(response)),
                 )
                 return response
-            self._freeze_issue_budget(db, spec)
+            if _automatic is not None:
+                self._freeze_issue_budget(db, spec)
             work = self.state.row(db, "works", spec["work_id"])
             if work is None:
                 self.state.record(
@@ -610,7 +611,7 @@ class DeliveryStore:
             return response
 
     def _freeze_issue_budget(self, db: sqlite3.Connection, spec: dict[str, Any]) -> None:
-        """Use all admissions, not the dashboard's visible subset, under the claim transaction."""
+        """Bound autonomous retries against all admissions under the claim transaction."""
         issue = self.state.issue_resource(spec["issue_url"])
         previous = [json.loads(row["request_json"]) for row in db.execute(
             "SELECT issue_url,request_json FROM delivery_runs ORDER BY created_at,run_id"
