@@ -18,7 +18,8 @@ function RepositoryPermissions({ access, onSaved }: { access: RepositoryAccess; 
         expected_revision: draft.revision,
         allowed_repositories: draft.repositories.filter(item => item.allowed).map(item => item.name),
       })
-      setDraft(updated); onSaved(updated); setSaved(true)
+      setDraft(current => current.revision > updated.revision ? current : updated)
+      onSaved(updated); setSaved(true)
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Repository access could not be saved.')
     } finally { setBusy(false) }
