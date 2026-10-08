@@ -159,8 +159,11 @@ def test_internal_automatic_admission_cannot_bypass_exhausted_budget(service, ar
     store.submit(request)
     finish(store, request, archived=archived)
     successor = next_request(request, 2)
+    with store._connect() as db:
+        predecessor = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                                      (request['run_id'],)).fetchone())
     with pytest.raises(ValueError, match='issue attempt budget'):
-        store.submit(successor, _automatic={})
+        store.submit(successor, _automatic={'row': predecessor})
     with store._connect() as db:
         assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
         assert db.execute('SELECT COUNT(*) FROM delivery_outbox').fetchone()[0] == 1
