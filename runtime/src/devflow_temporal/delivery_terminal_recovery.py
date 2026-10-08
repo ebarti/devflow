@@ -78,6 +78,10 @@ def receipt(store, run_id, payload):
 def published_readback(store, spec, candidate, pr):
     if not isinstance(candidate, dict) or not isinstance(pr, dict):
         raise ValueError('terminal published candidate/PR is missing')
+    if spec.get('merge_version') == 1 and spec.get('authorized_endpoint') == 'merged':
+        from .delivery_merge import merged_readback
+
+        return merged_readback(store, spec, candidate, pr)
     broker = DeliveryBroker(store, spec)
     found = broker._existing_pr()
     try:
@@ -172,8 +176,9 @@ def _grant(store, run_id, payload, closed):
             or tail.get('cleanup') != row['cleanup'] or tail.get('error') != row['error']
             or checkpoint.get('event') not in {'delivered', 'blocked', 'cancelled'}
             or checkpoint.get('outcome') != checkpoint.get('event')
-            or checkpoint.get('status') != ('in-review' if checkpoint['event'] == 'delivered'
-                                            else 'blocked')
+            or checkpoint.get('status') != (
+                ('done' if spec.get('merge_version') == 1 else 'in-review')
+                if checkpoint['event'] == 'delivered' else 'blocked')
             or not checkpoint.get('release')):
         raise ValueError('closed terminal projection, cleanup or frozen transition changed')
     while previous and previous.get('kind') == 'terminal_tracker_recovery':
