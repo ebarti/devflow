@@ -103,8 +103,6 @@ def prepare_sandbox(request: dict[str, Any], attempt_dir: Path) -> tuple[Path, d
             "HOME": str(role_home),
             "CODEX_HOME": str(codex_home),
             "TMPDIR": str(scratch),
-            "TMP": str(scratch),
-            "TEMP": str(scratch),
             "XDG_CACHE_HOME": str(role_home / ".cache"),
             "PYTHONDONTWRITEBYTECODE": "1",
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -167,7 +165,8 @@ def _remove_generated_project_directory(workspace: Path) -> None:
 
 
 def _native_env(
-    home: Path, codex_home: Path, scratch: Path, toolchain_roots: tuple[Path, ...] = ()
+    home: Path, codex_home: Path, scratch: Path, toolchain_roots: tuple[Path, ...] = (),
+    *, short_temp: bool = False,
 ) -> dict[str, str]:
     env = {
         key: value
@@ -190,8 +189,6 @@ def _native_env(
             "HOME": str(home),
             "CODEX_HOME": str(codex_home),
             "TMPDIR": str(scratch),
-            "TMP": str(scratch),
-            "TEMP": str(scratch),
             "XDG_CACHE_HOME": str(home / ".cache"),
             "PYTHONDONTWRITEBYTECODE": "1",
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -204,7 +201,27 @@ def _native_env(
             "GCM_INTERACTIVE": "never",
         }
     )
+    if short_temp:
+        env.update({"TMP": str(scratch), "TEMP": str(scratch)})
     return env
+
+
+def _native_environment_version(owner: Path, legacy_evidence: Path) -> int:
+    """Pin each profile recipe before launch; retained profiles keep their intent."""
+
+    marker = owner / "native-environment.json"
+    if marker.exists() or marker.is_symlink():
+        _private_file(marker)
+        value = json.loads(marker.read_bytes())
+        if value not in ({"version": 1}, {"version": 2}) or type(value["version"]) is not int:
+            raise ValueError("native environment recipe is not admitted")
+        return value["version"]
+    legacy = legacy_evidence.exists() or legacy_evidence.is_symlink()
+    if legacy:
+        _private_file(legacy_evidence)
+    version = 1 if legacy else 2
+    _write_once(marker, json.dumps({"version": version}).encode())
+    return version
 
 
 def _profile_lines(
@@ -331,9 +348,14 @@ def prepare_native_role(
     from .delivery_resources import RunResources
 
     ephemeral_home = RunResources(spec).scratch("role", request["role"])
-    scratch = RunResources(spec).execution_scratch("role", request["role"])
-    for path in (role_home, codex_home, ephemeral_home, scratch, attempt_dir):
+    for path in (role_home, codex_home, ephemeral_home, attempt_dir):
         _private(path)
+    environment_version = _native_environment_version(
+        attempt_dir, attempt_dir / "native-process.json",
+    )
+    scratch = (RunResources(spec).execution_scratch("role", request["role"])
+               if environment_version == 2 else ephemeral_home / "tmp")
+    _private(scratch)
     source = Path(spec["policy"].get("codex_auth_path") or Path.home() / ".codex" / "auth.json")
     _private_file(source)
     _write_once(codex_home / "auth.json", source.read_bytes())
@@ -372,7 +394,10 @@ def prepare_native_role(
     if trusted_local(spec):
         lines = _trusted_lines(workspace)
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
-    env = _native_env(ephemeral_home, codex_home, scratch, toolchain_roots)
+    env = _native_env(
+        ephemeral_home, codex_home, scratch, toolchain_roots,
+        short_temp=environment_version == 2,
+    )
     if cache:
         env["COREPACK_HOME"] = cache
     return profile_name, env
@@ -484,9 +509,12 @@ def prepare_native_check(
     key = str(evidence_dir.relative_to(Path(spec["state_dir"]))) + "/" + check["id"]
     home = RunResources(spec).scratch("checks", key)
     codex_home = home / "codex"
-    scratch = RunResources(spec).execution_scratch("checks", key)
-    for path in (home, codex_home, scratch):
+    for path in (home, codex_home):
         _private(path)
+    environment_version = _native_environment_version(codex_home, codex_home / "config.toml")
+    scratch = (RunResources(spec).execution_scratch("checks", key)
+               if environment_version == 2 else home / "tmp")
+    _private(scratch)
     domains = tuple(check.get("network_domains", ()))
     toolchain_roots = tuple(Path(root) for root in spec["policy"].get("toolchain_roots", []))
     cache = spec["policy"].get("package_manager_cache")
@@ -512,7 +540,10 @@ def prepare_native_check(
     if trusted_local(spec):
         lines = _trusted_lines(checkout)
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
-    env = _native_env(home, codex_home, scratch, toolchain_roots)
+    env = _native_env(
+        home, codex_home, scratch, toolchain_roots,
+        short_temp=environment_version == 2,
+    )
     env.update(
         {
             "CI": "1",

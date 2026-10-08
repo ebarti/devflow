@@ -572,3 +572,25 @@ def test_verification_prepares_python_before_existing_consumers(project, monkeyp
     assert observed[0]['id'].startswith('planned-python-dependencies-')
     assert observed[1]['id'] == 'api-rpc-test'
     assert observed[2]['id'].startswith('planned-pytest-')
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_retained_python_dependency_invocation_preserves_exact_recipe(project, legacy):
+    from devflow_temporal.delivery_resources import write_private
+
+    spec, checkout, _, evidence = project
+    spec['policy'] = {'host_sandbox': 'trusted-local'}
+    fresh = planned_checks(spec, checkout, evidence)[0]
+    command = list(fresh['argv'])
+    if legacy:
+        command.insert(3, '--no-install-project')
+    journal = evidence / fresh['id'] / 'native/native-process.json'
+    journal.parent.mkdir(parents=True)
+    write_private(journal, {'intent': {'argv': command}})
+    resumed = planned_checks(spec, checkout, evidence)[0]
+    assert resumed['id'] == fresh['id']
+    assert resumed['plan_provenance'] == fresh['plan_provenance']
+    assert resumed['argv'] == command
+    write_private(journal, {'intent': {'argv': [*command, '--unexpected']}})
+    with pytest.raises(ValueError, match='command is not admitted'):
+        planned_checks(spec, checkout, evidence)

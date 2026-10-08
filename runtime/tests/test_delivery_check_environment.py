@@ -55,7 +55,7 @@ def test_all_temp_environment_aliases_use_owned_root_and_do_not_inherit_credenti
     monkeypatch.setenv("TMPDIR", "/foreign/long/temp")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "synthetic-secret")
     scratch = Path("/private/tmp/dftmp-controlled/0123456789abcdef")
-    env = _native_env(Path("/durable/home"), Path("/durable/codex"), scratch)
+    env = _native_env(Path("/durable/home"), Path("/durable/codex"), scratch, short_temp=True)
     assert all(env[key] == str(scratch) for key in ["TMPDIR", "TMP", "TEMP"])
     assert "AWS_SECRET_ACCESS_KEY" not in env
 
@@ -215,3 +215,71 @@ def test_short_scratch_cleanup_preserves_durable_evidence_and_foreign_directorie
     assert recreated.is_dir()
     assert read_private(resources.manifest)["roots"][str(root)]["generation"] == 1
     resources.finalize("blocked")
+
+
+@pytest.mark.parametrize("role", [False, True], ids=["check", "role"])
+def test_retained_legacy_invocation_keeps_environment_but_new_attempt_gets_short_temp(
+    tmp_path, monkeypatch, role
+):
+    from devflow_temporal import delivery_sandbox as sandbox
+    from devflow_temporal.delivery_native_process import NativeProcess
+
+    state = tmp_path / "run-retained"
+    state.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    auth = tmp_path / "synthetic-auth.json"
+    auth.write_text("{}")
+    auth.chmod(0o600)
+    spec = {"run_id": state.name, "state_dir": str(state), "provider": "codex",
+            "policy_digest": "unchanged-policy",
+            "policy": {"host_sandbox": "trusted-local", "codex_auth_path": str(auth)}}
+    monkeypatch.setattr("devflow_temporal.delivery_preparation.require_native_execution",
+                        lambda *_: None)
+    monkeypatch.setattr(sandbox, "_protected_native_commands", lambda *_: ())
+    short = tmp_path / "short"
+    monkeypatch.setattr(RunResources, "_execution_scratch_root", lambda self: short)
+    evidence = state / "checks" / "0"
+    evidence.mkdir(parents=True)
+    attempt = state / "attempt"
+    request = {"spec": spec, "workspace": str(checkout), "role": "implement", "iteration": 0}
+    original_version = sandbox._native_environment_version
+    # Seed a pre-upgrade profile without the new durable marker.
+    monkeypatch.setattr(sandbox, "_native_environment_version", lambda *_: 1)
+    if role:
+        _, before = sandbox.prepare_native_role(request, attempt)
+        journal = attempt / "native-process.json"
+        journal.write_text(json.dumps({"intent": {"environment_sha256": "synthetic"}}))
+        journal.chmod(0o600)
+    else:
+        _, before = sandbox.prepare_native_check(spec, checkout, evidence, {"id": "api"})
+    monkeypatch.setattr(sandbox, "_native_environment_version", original_version)
+    if role:
+        _, after = sandbox.prepare_native_role(request, attempt)
+    else:
+        _, after = sandbox.prepare_native_check(spec, checkout, evidence, {"id": "api"})
+    assert after == before
+    assert "TMP" not in after and "TEMP" not in after
+    process = object.__new__(NativeProcess)
+    process.spec, process.argv, process.cwd = spec, ["unchanged-command"], checkout
+    process.timeout, process.ports, process.environment = 600, (), before
+    old_intent = process._intent()
+    process.environment = after
+    assert process._intent() == old_intent
+    if role:
+        _, fresh = sandbox.prepare_native_role({**request, "iteration": 1}, state / "next-attempt")
+    else:
+        _, fresh = sandbox.prepare_native_check(spec, checkout, evidence, {"id": "next-api"})
+    assert Path(fresh["TMPDIR"]).parent == short
+    assert fresh["TMP"] == fresh["TEMP"] == fresh["TMPDIR"]
+
+
+@pytest.mark.parametrize("bad", [True, 3, "2"])
+def test_environment_recipe_marker_rejects_unknown_or_noninteger_versions(tmp_path, bad):
+    from devflow_temporal.delivery_sandbox import _native_environment_version
+
+    marker = tmp_path / "native-environment.json"
+    marker.write_text(json.dumps({"version": bad}))
+    marker.chmod(0o600)
+    with pytest.raises(ValueError, match="recipe is not admitted"):
+        _native_environment_version(tmp_path, tmp_path / "native-process.json")
