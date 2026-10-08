@@ -177,7 +177,11 @@ def test_both_preparation_entries_pass_the_fresh_checkout_native_target(
         },
     }
     planned = [{"id": "planned-vitest-fixture", "cwd": "apps/api", "argv": ["vitest"]}]
-    monkeypatch.setattr("devflow_temporal.delivery_plan_checks.planned_checks", lambda *a: planned)
+    def phase_planner(*_args, preparation=False):
+        assert preparation is (entry == "implementation")
+        return planned
+
+    monkeypatch.setattr("devflow_temporal.delivery_plan_checks.planned_checks", phase_planner)
     broker = object.__new__(DeliveryBroker)
     broker.spec, broker.checkout, broker.state_dir, broker.evidence_dir = (
         spec,

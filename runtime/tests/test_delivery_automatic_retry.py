@@ -486,7 +486,7 @@ def test_retry_observes_real_cleanup_using_accepted_intake_plan(service, monkeyp
     broker._record_generated(generated)
     final = resources.finalize('blocked')
     assert final['state'] == 'confirmed'
-    with pytest.raises(ValueError, match='registered run boundary'):
+    with pytest.raises(ValueError, match='generated environment recorded plan changed'):
         observe(original)
     monkeypatch.setattr(retry, 'observe_finalized_resources', observe)
     closed['result']['checks']['resource_cleanup'] = final
