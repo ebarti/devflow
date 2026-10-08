@@ -44,7 +44,7 @@ def selected_tests(spec: dict, checkout: Path) -> list[Path]:
 
 
 def _future_test(spec: dict, checkout: Path, name: str) -> Path:
-    """Resolve a not-yet-created test only within the exact admitted file scope."""
+    """Resolve future or partial tests only for locked dependency preparation."""
     paths = [raw for raw in spec.get('policy', {}).get('allowed_paths', [])
              if isinstance(raw, str) and Path(raw).name == name]
     if len(paths) != 1:
@@ -53,8 +53,9 @@ def _future_test(spec: dict, checkout: Path, name: str) -> Path:
     relative = Path(raw)
     test = checkout / relative
     if (relative.is_absolute() or '..' in relative.parts or relative.as_posix() != raw
-            or test.is_symlink() or test.exists() or test.resolve() != test):
-        raise ValueError('future planned test is not a missing fixed authorized path')
+            or test.is_symlink() or (test.exists() and not test.is_file())
+            or test.resolve() != test):
+        raise ValueError('future planned test is not a fixed authorized file path')
     return test
 
 

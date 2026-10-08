@@ -1103,9 +1103,12 @@ class DeliveryBroker:
             from .delivery_plan_checks import planned_checks
 
             try:
-                checks.extend(planned_checks(
+                planned = planned_checks(
                     self.spec, checkout, self.evidence_dir / "checks" / str(iteration)
-                ))
+                )
+                dependencies = [c for c in planned
+                                if c['id'].startswith('planned-python-dependencies-')]
+                checks = dependencies + checks + [c for c in planned if c not in dependencies]
             except (ValueError, OSError) as exc:
                 raise CheckPreparationFailure('accepted-plan-recipes', exc) from exc
         return self._run_check_list(
