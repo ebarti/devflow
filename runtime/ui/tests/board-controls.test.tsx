@@ -62,7 +62,7 @@ describe('workflow board and controls', () => {
     expect(read).not.toHaveBeenCalled()
     await userEvent.setup().click(screen.getByRole('button', { name: 'Settings' }))
     expect(screen.queryByRole('complementary', { name: 'Recent runs' })).toBeNull()
-    expect(screen.getByRole('heading', { name: 'Role policy' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Agent models' })).toBeTruthy()
     expect(document.querySelector('.app-shell--wide')).toBeTruthy()
   })
 

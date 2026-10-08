@@ -38,7 +38,7 @@ def config(tmp_path, monkeypatch):
                 "helpers_dir": str(Path(__file__).resolve().parents[2] / "skills/devflow/scripts"),
                 "codex_bin": "/usr/bin/true",
                 "provider": "fake",
-                "repositories": {"fixture": {"base_ref": "main"}},
+                "repositories": {"fixture": {"base_ref": "main", "github_repo": "example/fixture"}},
                 "roles": {name: {} for name in ("implement", "review", "verify")},
             }
         )

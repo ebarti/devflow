@@ -133,6 +133,7 @@ class DeliveryConfig:
                 {
                     "key": key,
                     "label": value.get("label", key),
+                    "github_repo": value["github_repo"],
                     "base_ref": value["base_ref"],
                     "base_sha": value.get("expected_base_sha"),
                     "recovery_keys": sorted(value.get("recovery", {})),

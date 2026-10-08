@@ -1,4 +1,4 @@
-import type { NewRunRequest, RunDetail, RunSummary, ServiceInfo, Statistics, Usage } from './model'
+import type { NewRunRequest, RepositoryAccess, RunDetail, RunSummary, ServiceInfo, Statistics, Usage } from './model'
 
 /** The only HTTP path/contract adapter. No credentials are persisted or put in URLs. */
 export class ApiError extends Error {
@@ -126,6 +126,9 @@ export const api = {
       events: result.events ?? run.events,
       evidence: result.evidence ?? run.evidence,
     }
+  },
+  saveRepositoryAccess(body: { expected_revision: number; allowed_repositories: string[] }) {
+    return command<RepositoryAccess>('/api/settings/repositories', body)
   },
   getService: async (): Promise<ServiceInfo> => {
     const info = await request<ServiceInfo>('/api/service')
