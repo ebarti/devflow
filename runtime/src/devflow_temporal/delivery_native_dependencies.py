@@ -171,6 +171,25 @@ def write_frozen_inputs(staging: Path, inputs: dict[str, bytes]) -> dict[str, st
     return hashes
 
 
+def frozen_native_projects(spec: dict, checkout: Path) -> list[str]:
+    """Find native owners from the admitted lock, independent of test prose."""
+    _, inputs = frozen_pnpm_inputs(spec, checkout)
+    importers = yaml.safe_load(inputs["pnpm-lock.yaml"]).get("importers", {})
+    if not isinstance(importers, dict) or len(importers) > 256:
+        raise ValueError("native dependency importers are malformed or unbounded")
+    projects = []
+    for name, importer in importers.items():
+        if (not isinstance(name, str) or Path(name).is_absolute()
+                or ".." in Path(name).parts or not isinstance(importer, dict)):
+            raise ValueError("native dependency importer escaped the frozen workspace")
+        dependencies = importer.get("dependencies", {})
+        if not isinstance(dependencies, dict):
+            raise ValueError("native dependency importer is malformed")
+        if "better-sqlite3" in dependencies:
+            projects.append(name)
+    return sorted(projects)
+
+
 def native_addon_authority(spec: dict, checkout: Path, projects: list[str]) -> dict | None:
     """A single registry target explicitly allowed by unchanged frozen manifests."""
     manager, _ = frozen_pnpm_inputs(spec, checkout)

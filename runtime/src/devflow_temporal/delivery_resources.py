@@ -372,6 +372,8 @@ class RunResources:
     def _allowed(self, path: Path, kind: str, *, finalizing: bool = False) -> None:
         short = Path("/private/tmp") / ("dfqa-" + digest(str(self.state))[:20])
         valid = path == self.state / "transient" or path == short
+        if kind == "execution-scratch":
+            valid = path == self._execution_scratch_root()
         if kind == "checkout":
             valid = path == Path(self.spec["checkout"])
         elif kind == "gate":
@@ -484,6 +486,28 @@ class RunResources:
         result = path / kind / key
         _ancestors(path)
         private_directory(result)
+        return result
+
+    def _execution_scratch_root(self) -> Path:
+        return Path("/private/tmp") / ("dftmp-" + digest(str(self.state))[:20])
+
+    def execution_scratch(self, kind: str, key: str) -> Path:
+        """Keep child IPC paths short, with the same exclusive run custody."""
+        for value in (kind, key):
+            if not value or Path(value).is_absolute() or ".." in Path(value).parts:
+                raise ValueError("execution scratch key escaped its run")
+        path = self._execution_scratch_root()
+        self.register(path, "execution-scratch")
+        with self.locked() as manifest:
+            entry = manifest["roots"][str(path)]
+            if entry["identity"] is None:
+                path.mkdir(mode=0o700)
+                entry.update(identity=_identity(path), state="created")
+                write_private(self.manifest, manifest)
+            elif _identity(path) != entry["identity"]:
+                raise ValueError("execution scratch root changed")
+            result = path / digest([kind, key])[:16]
+            private_directory(result)
         return result
 
     def browser_scratch(self) -> Path:

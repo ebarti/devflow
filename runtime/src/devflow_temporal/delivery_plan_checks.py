@@ -270,10 +270,25 @@ def planned_checks(spec: dict, checkout: Path, evidence: Path, *,
                                    for name in ('pyproject.toml', 'uv.lock')},
                       'test_paths': [test.relative_to(project).as_posix() for test in tests]}
         key = digest(provenance)[:16]
-        result.append({'id': 'planned-python-dependencies-' + key,
+        dependency_id = 'planned-python-dependencies-' + key
+        journal = evidence / dependency_id / 'native' / 'native-process.json'
+        command = [manager, 'sync', '--locked', '--extra', 'dev',
+                   '--python', str(Path(sys.executable).resolve())]
+        legacy_command = [*command[:3], '--no-install-project', *command[3:]]
+        if journal.exists() or journal.is_symlink():
+            from .delivery_resources import read_private
+            from .delivery_sandbox import native_check_argv
+
+            # Select only a complete known recipe; never adopt arbitrary journal
+            # argv. NativeProcess still authenticates every original intent field.
+            recorded = read_private(journal)['intent']['argv']
+            if recorded == native_check_argv(spec, 'devflow-check', project, legacy_command):
+                command = legacy_command
+            elif recorded != native_check_argv(spec, 'devflow-check', project, command):
+                raise ValueError('retained Python preparation command is not admitted')
+        result.append({'id': dependency_id,
                        'cwd': relative, 'timeout_seconds': 600,
-                       'argv': [manager, 'sync', '--locked', '--no-install-project',
-                                '--extra', 'dev', '--python', str(Path(sys.executable).resolve())],
+                       'argv': command,
                        'generated_directories': [
                            (project / '.venv').relative_to(checkout).as_posix()],
                        'plan_provenance': provenance})

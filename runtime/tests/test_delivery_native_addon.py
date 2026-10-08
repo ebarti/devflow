@@ -240,9 +240,9 @@ def test_target_prerequisite_runs_after_successful_original_install_before_tests
     from devflow_temporal import delivery_native_process, delivery_preparation, delivery_sandbox
     from devflow_temporal.delivery_broker import DeliveryBroker
 
-    _, checkout, _, _, store, _ = addon
+    spec, checkout, _, _, store, _ = addon
     broker = object.__new__(DeliveryBroker)
-    broker.spec = {"provider": "codex", "policy": {}}
+    broker.spec = {**spec, "provider": "codex", "policy": {}}
     broker.state_dir = tmp_path / "run-fixture"
     broker._ensure_native_dependency_store = lambda _: {"store": str(store)}
     broker._register_generated = lambda *a: []
@@ -299,7 +299,7 @@ def test_target_prerequisite_runs_after_successful_original_install_before_tests
         {"id": "test", "argv": ["node", "test"]},
     ]
     result = broker._run_check_list(
-        checkout, checks, tmp_path / "evidence", candidate, native_projects=["apps/api"]
+        checkout, checks, tmp_path / "evidence", candidate, native_projects=[]
     )
     assert sequence == (
         ["install", "target-build-and-load", "test"] if install_exit == 0 else ["install"]

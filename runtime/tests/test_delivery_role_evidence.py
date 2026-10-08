@@ -251,7 +251,8 @@ def test_controller_prepares_real_locked_python_before_native_probe(service, tmp
     assert 'normally imported probe' in measured.stdout
     assert broker.candidate() == before
     assert len(result['results']) == 1
-    assert result['results'][0]['argv'][1:4] == ['sync', '--locked', '--no-install-project']
+    assert result['results'][0]['argv'][1:3] == ['sync', '--locked']
+    assert '--no-install-project' not in result['results'][0]['argv']
     if retained_environment:
         from devflow_temporal.delivery_role_evidence import allocate, read_context
         role = {'spec': spec, 'role': 'implement', 'iteration': 0,
