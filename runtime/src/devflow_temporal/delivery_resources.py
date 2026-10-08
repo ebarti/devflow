@@ -402,9 +402,11 @@ class RunResources:
                 if (path.name == '.venv' and path.is_relative_to(root)
                         and self.spec['policy'].get('host_sandbox') == 'trusted-local'):
                     retained = ownership.get(str(path), {})
-                    if (finalizing and retained.get('kind') == 'generated'
-                            and retained.get('accepted_plan_sha256')
-                            == digest(self.spec['accepted_plan'])):
+                    if finalizing:
+                        if (retained.get('kind') != 'generated'
+                                or retained.get('accepted_plan_sha256')
+                                != digest(self.spec['accepted_plan'])):
+                            raise ValueError('generated environment recorded plan changed')
                         # Partial implementation can change test discovery. Cleanup
                         # authenticates recorded custody, parent and resource identity.
                         names.add(path.relative_to(root).as_posix())

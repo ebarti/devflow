@@ -519,6 +519,22 @@ def test_cleanup_uses_recorded_custody_after_partial_test_changes(project):
     resources.created(venv)
     (checkout / relative).write_text('def test_future(): assert True\n')
     resources._allowed(venv, 'generated', finalizing=True)
+    with resources.locked() as manifest:
+        entry = manifest['roots'][str(venv)]
+        original_digest = entry['accepted_plan_sha256']
+        entry['accepted_plan_sha256'] = '0' * 64
+        from devflow_temporal.delivery_resources import write_private
+        write_private(resources.manifest, manifest)
+    with pytest.raises(ValueError, match='recorded plan changed'):
+        resources._allowed(venv, 'generated', finalizing=True)
+    with resources.locked() as manifest:
+        manifest['roots'][str(venv)]['accepted_plan_sha256'] = original_digest
+        write_private(resources.manifest, manifest)
+    original_plan = spec['accepted_plan']
+    spec['accepted_plan'] = json.dumps({'verification': ['Run test_owned.py']})
+    with pytest.raises(ValueError, match='recorded plan changed'):
+        resources._allowed(venv, 'generated', finalizing=True)
+    spec['accepted_plan'] = original_plan
     # Even broken candidate metadata must not erase preexisting cleanup custody.
     (root / 'uv.lock').unlink()
     resources._allowed(venv, 'generated', finalizing=True)
