@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_baseline_contract import repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
-from .delivery_config import DeliveryConfig
+from .delivery_config import DeliveryConfig, scope_amended_spec, scope_amendment_config
 from .delivery_gate_retry import prepare_runtime
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _remote, _rows, _stopped_cleanup, work_binding
@@ -19,6 +20,51 @@ from .delivery_resources import private_directory, read_private
 KIND = 'stopped_delivery_resume'
 FIELDS = {'continuation_kind', 'command_id', 'expected_revision', 'expected_iteration',
           'expected_candidate_id', 'expected_candidate_head', 'additional_iterations'}
+SCOPE_FIELDS = {'added_paths', 'amended_config_path', 'amended_config_sha256'}
+
+
+def scope_spec(store, seal, command):
+    """Add only explicitly named, unchanged tracked files to an authentic stopped role."""
+    spec = seal['predecessor_spec']
+    if not SCOPE_FIELDS <= command.keys():
+        return spec
+    latest = next((role for role in reversed(seal['state'].get('roles', []))
+                   if role.get('role') == 'implement'), None)
+    if (not latest or latest.get('status') != 'findings'
+            or latest.get('finish_reason') != 'done' or not seal['session_id']
+            or not latest.get('findings')
+            or seal['state'].get('error') != 'implementer did not establish a pass'):
+        raise ValueError('scope resume requires an authenticated implementation finding')
+    path = command['amended_config_path']
+    if not isinstance(path, str) or not isinstance(command['amended_config_sha256'], str):
+        raise ValueError('scope amendment configuration must be absolute')
+    effective = scope_amended_spec(spec, Path(path), command['amended_config_sha256'],
+                                   command['added_paths'])
+    broker = DeliveryBroker(store, spec)
+    changed = broker._changed_paths(spec['base_sha'])
+    for name in command['added_paths']:
+        parts = Path(name).parts
+        if (not parts or Path(name).is_absolute() or name != Path(name).as_posix()
+                or any(part in {'.', '..', '.git', '.codex'} for part in parts)):
+            raise ValueError('scope amendment must name tracked files')
+        try:
+            tracked = _git(broker.checkout, 'ls-files', '--error-unmatch', '--', name)
+        except RuntimeError as exc:
+            raise ValueError('scope amendment file is not tracked') from exc
+        target = broker.checkout / name
+        if (tracked != name or name in changed or target.is_symlink()
+                or not stat.S_ISREG(target.lstat().st_mode)):
+            raise ValueError('scope amendment file is already changed or unsafe')
+        parent = target.parent
+        while parent != broker.checkout:
+            if not stat.S_ISDIR(parent.lstat().st_mode) or parent.is_symlink():
+                raise ValueError('scope amendment file has an unsafe ancestor')
+            parent = parent.parent
+    amended = DeliveryBroker(store, effective).candidate()
+    if any(amended[key] != seal['candidate'][key] for key in (
+            'id', 'head', 'content_sha256', 'base_sha', 'environment_digest')):
+        raise ValueError('scope amendment changed stopped implementation bytes')
+    return effective
 
 
 def fixed_budget_allows(spec, iteration, iterations):
@@ -56,6 +102,14 @@ def custody(db, recovery):
             or recovery['maximum_iteration'] != (recovery['state']['iteration']
                                                  + recovery['command']['additional_iterations'])):
         raise ValueError('stopped resume lost its immutable command authority')
+    if SCOPE_FIELDS <= recovery['command'].keys():
+        scope = recovery['command']
+        amended = scope_amendment_config(
+            recovery['predecessor_spec'], Path(scope['amended_config_path']),
+            scope['amended_config_sha256'], scope['added_paths'])
+        repository = amended.raw['repositories'][spec['repository_key']]
+        if spec['policy']['allowed_paths'] != repository['allowed_paths']:
+            raise ValueError('stopped scope resume changed its sealed file authority')
     return spec
 
 
@@ -178,7 +232,7 @@ def snapshot(store, run_id):
 
 
 def admit(store, run_id, command, *, preflight=False):
-    if (not isinstance(command, dict) or set(command) != FIELDS
+    if (not isinstance(command, dict) or set(command) not in (FIELDS, FIELDS | SCOPE_FIELDS)
             or command.get('continuation_kind') != KIND
             or not isinstance(command.get('command_id'), str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', command['command_id'])
@@ -211,9 +265,12 @@ def admit(store, run_id, command, *, preflight=False):
             and not fixed_budget_allows(original, seal['state']['iteration'],
                                         command['additional_iterations'])):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
+    amended = scope_spec(store, seal, command)
     if preflight:
         return {'run_id': run_id, 'preflight': True, 'candidate': seal['candidate'],
-                'authorized_through_iteration': maximum, 'implementation_authority': True}
+                'authorized_through_iteration': maximum, 'implementation_authority': True,
+                **({'added_paths': command['added_paths']}
+                   if amended is not seal['predecessor_spec'] else {})}
     spec = seal['predecessor_spec']
     root = Path(spec['state_dir']) / 'stopped-resumes' / command_digest
     with _lock(Path(spec['state_dir']) / 'stopped-resumes' / 'controller.lock'):
@@ -229,9 +286,11 @@ def admit(store, run_id, command, *, preflight=False):
         if digest(snapshot(store, run_id)) != digest(seal):
             raise ValueError('stopped checkpoint changed before admission')
         private_directory(root)
-        execution = prepare_runtime(spec, root, command_digest, digest(seal))
+        execution = prepare_runtime(amended, root, command_digest, digest(seal))
         if digest(snapshot(store, run_id)) != digest(seal):
             raise ValueError('stopped checkpoint changed during runtime preparation')
+        if scope_spec(store, seal, command) != amended:
+            raise ValueError('stopped scope configuration changed during runtime preparation')
         execution['role_home_generation'] = spec.get('role_home_generation', '')
         if not execution['role_home_generation']:
             execution.pop('role_home_generation')
@@ -279,7 +338,11 @@ def admit(store, run_id, command, *, preflight=False):
                          {'iteration': seal['state']['iteration'],
                           'authorized_through_iteration': maximum,
                           'command_id': command['command_id'],
-                          'predecessor_execution_run_id': seal['closed']['execution_run_id']})
+                          'predecessor_execution_run_id': seal['closed']['execution_run_id'],
+                          **({'added_paths': command['added_paths'],
+                              'original_policy_digest': spec['policy_digest'],
+                              'effective_policy_digest': execution['policy_digest']}
+                             if SCOPE_FIELDS <= command.keys() else {})})
             db.execute('INSERT INTO delivery_commands VALUES (?,?,?,?)',
                        (command['command_id'], run_id, command_digest, canonical_json(response)))
         return response

@@ -3336,6 +3336,15 @@ class DeliveryStore:
             if scope_recovery and scope_recovery.get("kind") == "scope_amendment"
             else None
         )
+        if (recovery and recovery.get('kind') == 'stopped_delivery_resume'
+                and 'added_paths' in recovery['command']):
+            scope_amendment = {
+                'added_paths': recovery['command']['added_paths'],
+                'original_policy_digest': recovery['predecessor_spec']['policy_digest'],
+                'effective_policy_digest': recovery['execution_spec']['policy_digest'],
+                'authorized_through_iteration': recovery['maximum_iteration'],
+                'predecessor_execution_run_id': recovery['closed']['execution_run_id'],
+            }
         candidate = json.loads(row["candidate_json"]) if row["candidate_json"] else None
         roles = []
         for attempt in attempts:
