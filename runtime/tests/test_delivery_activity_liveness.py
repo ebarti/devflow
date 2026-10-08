@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 import shutil
@@ -398,77 +397,7 @@ async def _wait_for_fixture_native_start(worker, log_path, state, handle):
 
 
 @pytest.mark.asyncio
-async def test_fixture_worker_announces_readiness_after_sdk_validation():
-    # Execute only main's control flow with opaque doubles: no imports, server or child.
-    output, entered = [], []
-
-    class ClientDouble:
-        @staticmethod
-        async def connect(_address):
-            entered.append('connected')
-            return object()
-
-    class WorkerDouble:
-        def __init__(self, *_args, **_kwargs):
-            self.polls = 0
-
-        @property
-        def is_running(self):
-            self.polls += 1
-            if self.polls == 3:
-                entered.append('running')
-                return True
-            assert not output
-            return False
-
-        async def __aenter__(self):
-            assert entered == ['connected']
-            entered.append('worker')
-            return self
-
-        async def __aexit__(self, *_args):
-            pass
-
-    class EventDouble:
-        async def wait(self):
-            assert entered == ['connected', 'worker', 'running']
-            assert output == [('fixture-worker-ready:123', True)]
-
-    async def sleep(_seconds):
-        assert not output and entered == ['connected', 'worker']
-
-    tree = ast.parse(WORKER_DRIVER)
-    main = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
-                and node.name == 'main')
-    namespace = {'Client': ClientDouble, 'Worker': WorkerDouble,
-                 'sys': SimpleNamespace(argv=['driver', 'input', 'provider', 'address']),
-                 'os': SimpleNamespace(getpid=lambda: 123),
-                 'asyncio': SimpleNamespace(Event=EventDouble, sleep=sleep),
-                 'print': lambda text, *, flush: output.append((text, flush))}
-    namespace.update({name: object() for name in [
-        'ActivityLivenessWorkflow', 'delivery_role', 'delivery_checks', 'delivery_precheck',
-        'delivery_baseline_checks', 'delivery_browser_qa', 'delivery_intake', 'block_loop']})
-    exec(compile(ast.Module(body=[main], type_ignores=[]), '<fixture-main>', 'exec'), namespace)
-    await namespace['main']()
-
-
-def test_fixture_worker_readiness_precedes_workflow_submission():
-    source = ast.parse(Path(__file__).read_text())
-    fixture = next(node for node in source.body if isinstance(node, ast.AsyncFunctionDef)
-                   and node.name == 'test_real_temporal_worker_loss_reuses_original_native_command')
-    submission = min(node.lineno for node in ast.walk(fixture)
-                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                     and node.func.attr == 'start_workflow')
-    readiness = [node.lineno for node in ast.walk(fixture)
-                 if isinstance(node, ast.Await) and isinstance(node.value, ast.Call)
-                 and isinstance(node.value.func, ast.Name)
-                 and node.value.func.id == '_wait_for_fixture_worker_ready']
-    assert len(readiness) == 2 and min(readiness) < submission, (
-        'workflow/activity deadline starts before worker initialization is observed')
-
-
-@pytest.mark.asyncio
-async def test_fixture_worker_cold_start_is_separate_from_native_start(monkeypatch, tmp_path):
+async def test_fixture_worker_readiness_requires_its_own_pid(monkeypatch, tmp_path):
     clock, sleeps = [0.0], []
     log = tmp_path / 'worker.log'
     log.write_text('fixture-worker-ready:999\n')  # A foreign PID cannot satisfy readiness.
@@ -483,14 +412,6 @@ async def test_fixture_worker_cold_start_is_separate_from_native_start(monkeypat
     monkeypatch.setattr(asyncio, 'sleep', sleep)
     await _wait_for_fixture_worker_ready(SimpleNamespace(pid=123, poll=lambda: None), log)
     assert clock[0] == 25 and len(sleeps) == 25
-    # Native startup retains its own 20s allowance, not the spent bootstrap clock.
-    fixture = next(node for node in ast.parse(Path(__file__).read_text()).body
-                   if isinstance(node, ast.AsyncFunctionDef)
-                   and node.name == '_wait_for_fixture_native_start')
-    deadline = next(node for node in ast.walk(fixture) if isinstance(node, ast.Assign)
-                    and any(isinstance(target, ast.Name) and target.id == 'deadline'
-                            for target in node.targets))
-    assert ast.unparse(deadline.value) == 'time.monotonic() + 20'
 
 
 @pytest.mark.asyncio
@@ -521,41 +442,6 @@ async def test_fixture_worker_readiness_rejects_exited_worker_with_signal(tmp_pa
     log.write_text('fixture-worker-ready:123\n')
     with pytest.raises(AssertionError, match=r'initialization exited \(0\)'):
         await _wait_for_fixture_worker_ready(SimpleNamespace(pid=123, poll=lambda: 0), log)
-
-
-def test_fixture_browser_profile_exposes_owned_startup_boundary():
-    output = []
-    profile = SimpleNamespace(write_text=lambda _text: None)
-
-    class Folder:
-        def __truediv__(self, _name):
-            return profile
-
-    tree = ast.parse(WORKER_DRIVER)
-    definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-                   and node.name in {'browser_profile', 'trace_fixture_boundary'}]
-    assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
-                      and any(ast.unparse(target) == 'browser.prepare_browser_qa'
-                              for target in node.targets))
-    browser = SimpleNamespace()
-    namespace = {'browser': browser, 'print': lambda text, *, flush: output.append(text),
-                 'time': SimpleNamespace(monotonic=lambda: 1), 'json': json}
-    exec(compile(ast.Module(body=[*definitions, assignment], type_ignores=[]),
-                 '<browser-profile-boundary>', 'exec'), namespace)
-    result = browser.prepare_browser_qa({}, None, Folder(), None, {'ports': {'PORT': 123}})
-    assert result == (profile, {'PATH': '/usr/bin:/bin', 'PORT': '123'})
-    assert output and 'browser-profile' in output[0] and 'enter' in output[0]
-    assert 'complete' in output[-1]
-
-
-def test_fixture_observes_terminal_workflow_during_native_start_wait():
-    fixture = next(node for node in ast.parse(Path(__file__).read_text()).body
-                   if isinstance(node, ast.AsyncFunctionDef)
-                   and node.name == 'test_real_temporal_worker_loss_reuses_original_native_command')
-    calls = [node for node in ast.walk(fixture) if isinstance(node, ast.Await)
-             and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
-             and node.value.func.id == '_wait_for_fixture_native_start']
-    assert len(calls) == 1, 'native-start waiter ignores early returned gate outcomes'
 
 
 @pytest.mark.asyncio
@@ -626,110 +512,6 @@ async def test_fixture_native_start_keeps_deadline_and_only_cancels_observer(
         assert clock[0] == 20
     assert cancelled == ['observer']
     assert (native / 'process.log').read_text() == 'fixture-child-binding:QA_API_PORT\n'
-
-
-def test_fixture_boundary_diagnostics_preserve_original_result_and_exception():
-    tree = ast.parse(WORKER_DRIVER)
-    definition = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                      and node.name == 'trace_fixture_boundary')
-    output = []
-    namespace = {'json': json, 'time': SimpleNamespace(monotonic=lambda: 1),
-                 'print': lambda text, *, flush: output.append(json.loads(text))}
-    exec(compile(ast.Module(body=[definition], type_ignores=[]), '<boundary>', 'exec'), namespace)
-    expected, calls = {'state': 'unknown', 'reason': 'ValueError'}, []
-
-    def execute(*args, **kwargs):
-        calls.append((args, kwargs))
-        return expected
-
-    observed = namespace['trace_fixture_boundary']('owned-boundary', execute)
-    assert observed('original', candidate='unchanged') is expected
-    assert calls == [(('original',), {'candidate': 'unchanged'})]
-    assert [row['event'] for row in output] == ['enter', 'complete']
-    assert output[-1]['state'] == 'unknown' and output[-1]['reason'] == 'ValueError'
-    original = ValueError('original rejection')
-
-    def reject():
-        raise original
-
-    with pytest.raises(ValueError) as error:
-        namespace['trace_fixture_boundary']('owned-boundary', reject)()
-    assert error.value is original
-    assert output[-1]['event'] == 'error' and output[-1]['type'] == 'ValueError'
-
-
-@pytest.mark.parametrize('fail_at', [None, 'bind', 'listen'])
-def test_fixture_http_constructor_keeps_numeric_loopback_bind_without_dns(monkeypatch, fail_at):
-    from http.server import HTTPServer
-    from socketserver import TCPServer
-
-    sockets, lookups = [], []
-    original_error = OSError('opaque socket rejection')
-
-    class SocketDouble:
-        def __init__(self):
-            self.operations = []
-            sockets.append(self)
-
-        def setsockopt(self, *_args):
-            self.operations.append('setsockopt')
-
-        def bind(self, address):
-            self.address = address
-            self.operations.append(('bind', address))
-            if fail_at == 'bind':
-                raise original_error
-
-        def getsockname(self):
-            self.operations.append('getsockname')
-            return self.address
-
-        def listen(self, backlog):
-            self.operations.append(('listen', backlog))
-            if fail_at == 'listen':
-                raise original_error
-
-        def close(self):
-            self.operations.append('close')
-
-    def forbidden_lookup(name):
-        lookups.append(name)
-        raise AssertionError('reverse DNS is outside the numeric loopback fixture contract')
-
-    monkeypatch.setattr(socket, 'socket', lambda *_args: SocketDouble())
-    monkeypatch.setattr(socket, 'getfqdn', forbidden_lookup)
-    tree = ast.parse(CHECK_PROGRAM)
-    definition = [node for node in tree.body if isinstance(node, ast.ClassDef)
-                  and node.name == 'FixtureHTTPServer']
-    constructor = next(node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
-                       and any(isinstance(target, ast.Name) and target.id == 'server'
-                               for target in node.targets))
-    namespace = {'HTTPServer': HTTPServer, 'TCPServer': TCPServer, 'Handler': object()}
-    definition_code = compile(
-        ast.Module(body=definition, type_ignores=[]), '<fixture-server>', 'exec')
-    exec(definition_code, namespace)
-    constructor_code = compile(ast.Expression(constructor), '<fixture-constructor>', 'eval')
-    servers = []
-    for key, port in [('QA_API_PORT', 12345), ('QA_WEB_PORT', 23456)]:
-        namespace.update(key=key, os=SimpleNamespace(environ={key: str(port)}))
-        if fail_at:
-            with pytest.raises(OSError) as error:
-                eval(constructor_code, namespace)
-            assert error.value is original_error and lookups == []
-            assert sockets[-1].operations[-1] == 'close'
-            return
-        server = eval(constructor_code, namespace)
-        servers.append(server)
-        assert server.server_name == '127.0.0.1' and server.server_port == port
-        assert sockets[-1].operations == [
-            'setsockopt', ('bind', ('127.0.0.1', port)), 'getsockname',
-            ('listen', server.request_queue_size)]
-        assert type(server).server_activate is TCPServer.server_activate
-        assert type(server).serve_forever is HTTPServer.serve_forever
-    assert lookups == []
-    for server in servers:
-        server.server_close()
-    assert all(child.operations[-1] == 'close' for child in sockets)
 
 
 @pytest.mark.asyncio

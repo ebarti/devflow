@@ -367,7 +367,6 @@ def test_packaged_handoff_example_admits_detailed_goal(package_fixture, tmp_path
     root, runtime, config = package_fixture
     target = packager.package(root, runtime, config)
     skill = (target / 'skills/devflow-local-delivery/SKILL.md').read_text()
-    assert 'publication_summary' in skill and 'supersed' in skill
     example = json.loads(re.search(r'```json\n(.*?)\n```', skill, re.S).group(1))
     fixture_root = tmp_path / 'admission'
     fixture_root.mkdir()

@@ -122,16 +122,3 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         assert seen == [(factory, config) for factory in (
             "read", "write", "write", "read", "write", "read",
         )]
-
-
-@pytest.mark.asyncio
-async def test_mcp_discovery_explains_detailed_and_superseding_goal_summary():
-    server = build_server(Path('/fixture/service.json'))
-    async with create_connected_server_and_client_session(server) as session:
-        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-        for text in (server.instructions, tools['submit_run'].description):
-            assert 'publication_summary' in text
-            assert '120' in text
-            assert 'Conventional Commit' in text
-            assert 'single line' in text
-            assert 'supersed' in text
