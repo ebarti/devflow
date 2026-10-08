@@ -178,9 +178,10 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
     recipes = metadata.get('checks', {})
     if metadata.get('schema_version') != 1 or not isinstance(recipes, dict):
         raise ValueError('planned JUnit recipe schema is unsupported')
+    # Dots and hyphens belong to recipe names, despite being prose word boundaries.
     selected = sorted({key for step in steps for key in recipes if re.search(
-        r'\b(?:checks\.' + re.escape(key) + r'\b|' + re.escape(key) + r'\s+recipe\b)',
-        step, re.I)})
+        r'(?<![\w.-])(?:checks\.' + re.escape(key) + r'(?![\w-]|\.[\w-])|'
+        + re.escape(key) + r'\s+recipe\b)', step, re.I)})
     if not selected or len(selected) > 32:
         raise ValueError('planned JUnit verification must name bounded repository recipes')
     result = []
