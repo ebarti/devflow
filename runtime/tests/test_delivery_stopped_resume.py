@@ -188,6 +188,33 @@ def test_resume_rejects_failed_baseline_before_feature_work(stopped, monkeypatch
         store.continue_repair('run-1', command)
 
 
+
+@pytest.mark.parametrize('version', [1, 2])
+def test_resume_requires_same_authoritative_baseline_contract(stopped, monkeypatch, version):
+    from test_delivery_baseline_remediation import evidence
+
+    store, broker, state, _ = stopped
+    fresh, baseline = evidence()
+    baseline['base_sha'] = broker.spec['base_sha']
+    baseline['baseline_candidate']['head'] = broker.spec['base_sha']
+    spec = {**broker.spec, 'baseline_checks_version': version, 'intake_required': True,
+            'policy': {**broker.spec['policy'], **{
+                key: fresh['policy'][key]
+                for key in ('baseline_checks', 'prepublish_checks', 'checks')}}}
+    state['checks']['baseline'] = baseline
+    project(store, state)
+    monkeypatch.setattr(store, 'effective_spec', lambda _: spec)
+    if version == 1:
+        with pytest.raises(ValueError, match='passed immutable baseline'):
+            resume.snapshot(store, 'run-1')
+    else:
+        result = resume.snapshot(store, 'run-1')
+        assert result['state']['checks']['baseline'] == baseline
+        assert result['candidate'] == state['candidate']
+        spec['policy']['checks'] = []
+        with pytest.raises(ValueError, match='authenticated immutable baseline'):
+            resume.snapshot(store, 'run-1')
+
 def test_successive_explicit_resumes_append_authority_preserving_original_history(stopped,
                                                                                 monkeypatch):
     store, _, state, command = stopped

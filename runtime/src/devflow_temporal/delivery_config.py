@@ -517,7 +517,8 @@ class DeliveryConfig:
             "automatic_retry_version": 1,
             **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
             "tracker_retry_version": 1,
-            **({"baseline_checks_version": 1} if baseline_ids else {}),
+            **({"baseline_checks_version": 2 if accepted_plan is None else 1}
+               if baseline_ids else {}),
             **(
                 {"preparation_version": 1}
                 if self.raw.get("provider", "codex") == "codex"
@@ -634,7 +635,7 @@ def scope_amended_spec(
         effective.pop("plan_approval")
     if "blocking_questions_version" not in original:
         effective.pop("blocking_questions_version")
-    for marker in ("automatic_retry_version", "retry_budget_version"):
+    for marker in ("automatic_retry_version", "retry_budget_version", "baseline_checks_version"):
         if marker in original:
             effective[marker] = original[marker]
         else:
