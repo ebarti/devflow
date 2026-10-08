@@ -198,6 +198,10 @@ class DeliveryWorkflow:
                     ],
                 ),
             }
+        elif name == "delivery_merge":
+            options = {"retry_policy": RetryPolicy(maximum_attempts=3),
+                       "heartbeat_timeout": timedelta(seconds=30),
+                       "schedule_to_close_timeout": timedelta(minutes=15)}
         elif patient_ci:
             options = {
                 "heartbeat_timeout": timedelta(seconds=30),
@@ -226,6 +230,8 @@ class DeliveryWorkflow:
         else:
             options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         timeout = timedelta(hours=hours)
+        if name == "delivery_merge":
+            timeout = timedelta(minutes=10)
         if name == "delivery_project" and request["spec"].get("projection_retry_version") == 1:
             timeout = timedelta(seconds=45)
         if patient_ci:
@@ -345,6 +351,23 @@ class DeliveryWorkflow:
                         error="resource cleanup is unknown",
                     )
                     event, message = "blocked", "Resource cleanup requires recovery"
+        if (event == "delivered" and spec.get("merge_version") == 1
+                and not self.terminal_reconciliation_only):
+            try:
+                merged = await self._activity("delivery_merge", {
+                    "spec": spec, "candidate": self.state.get("candidate"),
+                    "pull_request": self.state.get("pull_request"),
+                    "checks": self.state["checks"],
+                })
+            except Exception as exc:
+                merged = {"state": "unknown", "reason": type(exc).__name__}
+            self.state["checks"]["merge"] = merged
+            if merged.get("state") != "confirmed":
+                self.state.update(phase="blocked", execution_state="blocked", outcome="blocked",
+                                  error="merge endpoint is unconfirmed")
+                event, message = "blocked", "Merge requires authenticated recovery"
+            else:
+                message = "Verified candidate merged and its issue closed"
         if (event in {"delivered", "blocked", "cancelled"}
                 and spec.get("terminal_tracker_version") == 1
                 and not self.terminal_reconciliation_only):
@@ -353,11 +376,15 @@ class DeliveryWorkflow:
                 receipt.get("process_cleanup") == "observed-native-confirmed"
                 and receipt.get("resource_cleanup") == "confirmed"
             )
+            if (spec.get("merge_version") == 1
+                    and self.state["checks"].get("merge", {}).get("state") == "unknown"):
+                release = False
             checkpoint = {
                 "event": event, "message": message, "phase": self.state["phase"],
                 "execution_state": self.state["execution_state"],
                 "outcome": self.state["outcome"], "error": self.state.get("error"),
-                "status": "in-review" if event == "delivered" else "blocked",
+                "status": ("done" if spec.get("merge_version") == 1 else "in-review")
+                if event == "delivered" else "blocked",
                 "release": release, "reason": self.state.get("error") or message,
                 "cycles": 0, "attempts": 0, "waiting": False,
                 "deadline": (workflow.now() + timedelta(seconds=(

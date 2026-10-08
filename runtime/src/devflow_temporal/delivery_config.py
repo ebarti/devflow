@@ -142,6 +142,9 @@ class DeliveryConfig:
                 for key, value in sorted(self.raw["repositories"].items())
             ],
             "authorized_endpoint": "published_unmerged",
+            "authorized_endpoints": ["published_unmerged"] + (
+                ["merged"] if self.raw.get("provider", "codex") == "codex" else []
+            ),
             "intake_enabled": "intake" in self.raw["roles"],
             "execution_backend": self.raw.get("execution_backend", "native-macos"),
             "execution_mode": self.raw.get("execution_mode", "native-profile"),
@@ -202,13 +205,20 @@ class DeliveryConfig:
             raise ValueError("invalid run ID")
         if not RUN_ID_RE.fullmatch(supplied["work_id"]):
             raise ValueError("invalid work ID")
-        if supplied["authorized_endpoint"] != "published_unmerged":
-            raise ValueError("only published_unmerged delivery is authorized")
+        if supplied["authorized_endpoint"] not in {"published_unmerged", "merged"}:
+            raise ValueError("unknown delivery endpoint")
         if not BRANCH_RE.fullmatch(supplied["branch"]) or ".." in supplied["branch"]:
             raise ValueError("branch is outside the allowed naming policy")
         repository = self.raw["repositories"].get(supplied["repository_key"])
         if repository is None:
             raise ValueError("repository key is not configured")
+        if supplied["authorized_endpoint"] == "merged" and (
+            self.raw.get("provider", "codex") != "codex"
+            or supplied.get("recovery_key") or supplied.get("supersedes_run_id")
+        ):
+            raise ValueError(
+                "merged delivery requires a fresh native run in the repository allowlist"
+            )
         if supplied["base_ref"] != repository["base_ref"]:
             raise ValueError("base ref does not match the configured repository")
         issue = urlsplit(supplied["issue_url"])
@@ -517,6 +527,7 @@ class DeliveryConfig:
             "automatic_retry_version": 1,
             **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
             "tracker_retry_version": 1,
+            **({"merge_version": 1} if supplied["authorized_endpoint"] == "merged" else {}),
             **({"baseline_checks_version": 2 if accepted_plan is None else 1}
                if baseline_ids else {}),
             **(
@@ -635,7 +646,8 @@ def scope_amended_spec(
         effective.pop("plan_approval")
     if "blocking_questions_version" not in original:
         effective.pop("blocking_questions_version")
-    for marker in ("automatic_retry_version", "retry_budget_version", "baseline_checks_version"):
+    for marker in ("automatic_retry_version", "retry_budget_version", "baseline_checks_version",
+                   "merge_version"):
         if marker in original:
             effective[marker] = original[marker]
         else:

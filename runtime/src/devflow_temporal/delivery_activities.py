@@ -773,7 +773,8 @@ def _terminal_receipt(store, spec, status, release, project, assignee, desired):
                 "readback_at": _now()}
     if (intent["owner"] != owner or payload.get("status") != status
             or bool(payload.get("release")) != release or sync.get("status") != status
-            or sync.get("issue_state") != "OPEN" or sync.get("project") != project
+            or sync.get("issue_state") != ("CLOSED" if status == "done" else "OPEN")
+            or sync.get("project") != project
             or payload.get("assignee") != assignee or payload.get("project") != project
             or (assignee != "@me"
                 and sync.get("assignee", "").casefold() != assignee.lstrip("@").casefold())
@@ -987,7 +988,7 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
     if request["spec"]["provider"] == "fake":
         return {"state": "consistent", "pending": False, "observed": {"fixture": True}}
     try:
-        if request["status"] == "in-review" and request.get("pull_request") is not None:
+        if request["status"] in {"in-review", "done"} and request.get("pull_request") is not None:
             from .delivery_terminal_recovery import published_readback
 
             store, _ = _context(request["spec"])
@@ -1008,6 +1009,25 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+@activity.defn(name="delivery_merge")
+async def delivery_merge(request):
+    from threading import Event
+
+    from .delivery_merge import merge_verified
+
+    store, _ = _context(request["spec"])
+    cancelled = Event()
+    try:
+        return await _with_heartbeat(
+            asyncio.to_thread(merge_verified, store, request["spec"], request, cancelled),
+            request, "merge"
+        )
+    finally:
+        # Cancelling asyncio.to_thread does not stop its underlying thread.
+        # Fence any later external effect, retaining an already-sent effect as unknown.
+        cancelled.set()
+
+
 @activity.defn(name="delivery_terminal_preflight")
 async def delivery_terminal_preflight(request):
     def execute():
@@ -1023,6 +1043,7 @@ async def delivery_terminal_preflight(request):
 DELIVERY_ACTIVITIES = [
     delivery_terminal_preflight,
     delivery_terminal_tracker,
+    delivery_merge,
     delivery_project,
     delivery_prepare,
     delivery_baseline_checks,

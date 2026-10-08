@@ -3548,6 +3548,13 @@ class DeliveryStore:
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
+        merge_root = root / "merge"
+        if merge_root.is_dir() and not merge_root.is_symlink():
+            for path in sorted(merge_root.glob("*.json")):
+                if path.is_file() and not path.is_symlink():
+                    indexed.append({"id": "merge-" + path.stem,
+                                    "label": "Merge: " + path.name,
+                                    "path": path, "limit": 20 * 1024 * 1024})
         for namespace, names in (
             ("metadata-reconciliation", ("intent.json", "original-ref.json", "rewritten-ref.json",
                                           "publication.json")),
