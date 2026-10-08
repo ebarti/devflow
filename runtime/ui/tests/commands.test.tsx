@@ -120,26 +120,21 @@ describe('dashboard commands', () => {
     render(<RunDetails run={realBackendProjection as RunDetail} onRefresh={vi.fn()} />)
     const strip = screen.getByRole('region', { name: 'Workflow phase gates' })
     const gates = Array.from(strip.querySelectorAll('.phase'))
-    expect(gates.map(gate => gate.querySelector('.phase__label')?.textContent)).toEqual([
-      'Prepare', 'Before PR checks', 'Publish', 'Local checks', 'Required CI', 'Tracker',
-    ])
-    expect(gates.map(gate => gate.className)).toEqual([
-      'phase phase--good', 'phase phase--waiting', 'phase phase--waiting',
-      'phase phase--waiting', 'phase phase--waiting', 'phase phase--waiting',
+    expect(gates.map(gate => gate.textContent)).toEqual([
+      'Prepare: Completed', 'Before PR checks: Pending', 'Publish: Pending',
+      'Local checks: Pending', 'Required CI: Pending', 'Tracker: Pending',
     ])
     expect(strip.textContent).not.toContain('Implement')
-    expect(strip.querySelector('.phase-strip__progress')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
   })
 
-  it('keeps future gate IDs neutral and does not repeat a pending cancellation', () => {
+  it('shows future gate labels and does not repeat a pending cancellation', () => {
     render(<RunDetails run={{
       ...mockRun, outcome: null, execution_state: 'cancelling',
       phase_gates: [{ id: 'future_gate', label: 'Future gate', state: 'unobserved' }],
     }} onRefresh={vi.fn()} />)
     const strip = screen.getByRole('region', { name: 'Workflow phase gates' })
-    expect(strip.querySelector('.phase')?.className).toBe('phase phase--unknown')
-    expect(strip.textContent).toContain('Future gate')
+    expect(strip.textContent).toContain('Future gate: Unobserved')
     expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
   })
 

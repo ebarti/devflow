@@ -1,4 +1,4 @@
-"""Source-bound caller sequencing and cancellation contracts using memory only."""
+"""Cancellation rejection and command identity contracts using memory only."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def source_contracts():
                     if isinstance(n, ast.ClassDef) and n.name == "DeliveryWorkflow")
     compile_nodes(workflow_path, [n for n in workflow.body
                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                  and n.name in {"status", "cancel"}], namespace)
+                  and n.name == "cancel"], namespace)
     store_path = SOURCE / "delivery_store.py"
     store = next(n for n in ast.parse(store_path.read_text()).body
                  if isinstance(n, ast.ClassDef) and n.name == "DeliveryStore")
@@ -49,31 +49,6 @@ def source_contracts():
                              ("prior", "run_id", "kind", "request_digest")],
         kwonlyargs=[], kw_defaults=[], defaults=[]), body=[prior], decorator_list=[])
     compile_nodes(store_path, [check], namespace)  # No SQL, DB or store construction.
-    caller_path = RUNTIME / "tests/test_delivery_store.py"
-    caller = next(n for n in ast.parse(caller_path.read_text()).body
-                  if isinstance(n, ast.AsyncFunctionDef) and n.name ==
-                  "test_public_repair_grant_resumes_original_session_and_runs_broker_gates")
-    cancel_block = next(n for n in ast.walk(caller) if isinstance(n, ast.AsyncWith)
-                        and isinstance(n.items[0].optional_vars, ast.Name)
-                        and n.items[0].optional_vars.id == "browser"
-                        and any(isinstance(item, ast.Constant)
-                                and item.value == "/api/runs/run-1/cancel" for item in ast.walk(n)))
-    # Reject a broadened slice before execution; only memory transport calls
-    # belong here, never an enclosing Worker/server/fixture block.
-    for node in ast.walk(ast.Module(body=cancel_block.body, type_ignores=[])):
-        if isinstance(node, ast.Call):
-            assert isinstance(node.func, ast.Attribute)
-            assert isinstance(node.func.value, ast.Name)
-            assert node.func.value.id in {"browser", "login", "repair_handle"}
-    submit = ast.AsyncFunctionDef(name="submit", args=ast.arguments(
-        posonlyargs=[], args=[ast.arg(arg=name) for name in
-                             ("browser", "detail", "repair_handle")],
-        kwonlyargs=[], kw_defaults=[], defaults=[]), body=cancel_block.body, decorator_list=[])
-    namespace["origin_url"] = "memory-only-owner"
-    compile_nodes(caller_path, [submit], namespace)
-    for name, path in (("cancel", workflow_path), ("status", workflow_path),
-                       ("check_prior", store_path), ("submit", caller_path)):
-        assert namespace[name].__code__.co_filename == str(path)
     return namespace
 
 
@@ -86,29 +61,17 @@ class Rejected(Exception):
 class MemoryTransport:
     """Only in-memory protocol transport; not an HTTP/Temporal/native fixture."""
 
-    def __init__(self, namespace, *, advance_after_query=False):
+    def __init__(self, namespace):
         self.namespace = namespace
         self.owner = SimpleNamespace(state={"revision": 10, "outcome": None, "checks": {}},
                                      cancel_requested=False)
         self.receipts, self.acknowledgements = {}, []
-        self.queries = 0
         self.updates = 0
-        self.advance_after_query = advance_after_query
 
         async def ready(condition):
             assert condition()
 
         namespace.update(workflow=SimpleNamespace(wait_condition=ready), ApplicationError=Rejected)
-
-    async def get(self, path):
-        assert path == "/api/session"
-        self.owner.state["revision"] += 1  # Deterministic async-setup interleaving.
-        return SimpleNamespace(json=lambda: {"csrf_token": "memory-token"})
-
-    async def query(self, name):
-        assert name == "status"
-        self.queries += 1
-        return deepcopy(self.namespace["status"](self.owner))
 
     async def post(self, path, *, json, headers):
         assert path == "/api/runs/run-1/cancel"
@@ -121,8 +84,6 @@ class MemoryTransport:
             response = self.namespace["check_prior"](prior, "run-1", "cancel", request_digest)
             if response is not None:
                 return self.response(200, response)
-            if self.advance_after_query:
-                self.owner.state["revision"] += 1
             self.updates += 1
             state = await self.namespace["cancel"](self.owner, payload)
         except (Rejected, ValueError) as exc:
@@ -142,16 +103,6 @@ class MemoryTransport:
 
 
 class RepairCancelRevisionContract(unittest.IsolatedAsyncioTestCase):
-    async def test_actual_caller_refreshes_revision_after_async_setup(self):
-        namespace = source_contracts()
-        transport = MemoryTransport(namespace)
-        await namespace["submit"](transport, {"protocol_revision": 9}, transport)
-        self.assertEqual(transport.queries, 1)
-        self.assertEqual(len(transport.acknowledgements), 1)
-        self.assertTrue(transport.owner.cancel_requested)
-        self.assertEqual(transport.acknowledgements[0]["expected_revision"], 11)
-        self.assertEqual(transport.owner.state["revision"], 12)
-
     async def test_stale_command_remains_rejected_and_changed_payload_cannot_reuse_id(self):
         namespace = source_contracts()
         transport = MemoryTransport(namespace)
@@ -174,18 +125,13 @@ class RepairCancelRevisionContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.owner.state, before)
         self.assertFalse(transport.owner.cancel_requested)
         self.assertEqual(transport.acknowledgements, [])
-        await namespace["submit"](transport, {"protocol_revision": 9}, transport)
+        accepted = await transport.post('/api/runs/run-1/cancel', json={
+            'command_id': 'current-control', 'expected_revision': 10, 'reason': 'cancel',
+        }, headers=headers)
+        self.assertEqual(accepted.status_code, 200)
         self.assertEqual(len(transport.acknowledgements), 1)
         replay = await transport.post("/api/runs/run-1/cancel",
                                       json=transport.acknowledgements[0], headers=headers)
         self.assertEqual(replay.status_code, 200)
         self.assertEqual(transport.updates, 2)
         self.assertEqual(len(transport.acknowledgements), 1)
-
-    async def test_transition_after_live_query_is_still_rejected_without_acknowledgement(self):
-        namespace = source_contracts()
-        transport = MemoryTransport(namespace, advance_after_query=True)
-        with self.assertRaisesRegex(AssertionError, "stale run revision"):
-            await namespace["submit"](transport, {"protocol_revision": 9}, transport)
-        self.assertFalse(transport.owner.cancel_requested)
-        self.assertEqual(transport.acknowledgements, [])

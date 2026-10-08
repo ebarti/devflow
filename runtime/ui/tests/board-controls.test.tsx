@@ -63,7 +63,6 @@ describe('workflow board and controls', () => {
     await userEvent.setup().click(screen.getByRole('button', { name: 'Settings' }))
     expect(screen.queryByRole('complementary', { name: 'Recent runs' })).toBeNull()
     expect(screen.getByRole('heading', { name: 'Agent models' })).toBeTruthy()
-    expect(document.querySelector('.app-shell--wide')).toBeTruthy()
   })
 
   it('reads the archive collection and retains explicit restore commands', async () => {

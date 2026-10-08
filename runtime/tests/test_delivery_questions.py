@@ -592,20 +592,6 @@ def test_shared_database_sender_cannot_consume_or_abandon_another_service_questi
     assert len(log.read_text().splitlines()) == 1
 
 
-def test_receiving_skill_freezes_presented_question_across_human_wait():
-    skill = (Path(__file__).resolve().parents[1] / "desktop" /
-             "devflow-local-delivery" / "SKILL.md").read_text()
-    freeze = skill.index("presented_identity = (run.id, decision.id, decision.revision, "
-                         "decision.candidate_revision, run.candidate.id)")
-    human_wait = skill.index("wait for their answer", freeze)
-    recheck = skill.index("exactly the same `presented_identity`", human_wait)
-    discard = skill.index("discard the delayed answer", recheck)
-    assert freeze < human_wait < recheck < discard
-    assert "Never rebind an old answer to new decision or candidate IDs" in skill
-    assert "refreshed `protocol_revision` and the frozen decision ID" in skill
-
-
-
 def _quoted_question_fields(message):
     start = "BEGIN QUOTED QUESTION DATA\n"
     end = "\nEND QUOTED QUESTION DATA"

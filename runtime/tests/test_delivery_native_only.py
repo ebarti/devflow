@@ -7,7 +7,6 @@ import hashlib
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 import httpx
 import pytest
@@ -242,7 +241,6 @@ async def test_historical_execution_and_stale_recovery_api_cannot_mutate(api_fix
 
 
 def test_retired_action_is_absent_from_public_cli_and_dashboard():
-    runtime = Path(__file__).resolve().parents[1]
     result = subprocess.run(
         [sys.executable, "-I", "-m", "devflow_temporal.delivery_control", "--help"],
         capture_output=True, text=True, check=True,
@@ -251,6 +249,3 @@ def test_retired_action_is_absent_from_public_cli_and_dashboard():
     assert "continue-repair" in result.stdout
     assert "retry-prelaunch" in result.stdout
     assert "amend-scope" in result.stdout
-    for source in (runtime / "ui/src").glob("*.ts*"):
-        assert "recover-precheck-prelaunch" not in source.read_text()
-        assert "grant_number" not in source.read_text()

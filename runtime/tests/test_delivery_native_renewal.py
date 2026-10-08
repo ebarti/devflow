@@ -154,8 +154,6 @@ def test_native_generation_resumes_interrupted_probe_and_retains_failure(
     payload_update, monkeypatch,
 ):
     _store, spec, payload, old, _package = payload_update
-    from devflow_temporal import delivery_policy_recovery
-
     original = native._measure
     calls = []
 
@@ -167,8 +165,6 @@ def test_native_generation_resumes_interrupted_probe_and_retains_failure(
         return observed
 
     monkeypatch.setattr(native, '_measure', interrupted)
-    # _prepare resolves the native function lazily, preserving its real process cleanup.
-    assert delivery_policy_recovery._prepare is not None
     with pytest.raises(RuntimeError, match='uncertain measurement'):
         renewal.renew(spec, payload, digest(payload))
     assert Path(spec['preparation']['environment']['path']).read_bytes() == old

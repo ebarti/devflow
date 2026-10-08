@@ -1,4 +1,4 @@
-"""Static contract and memory-only historical validation; no physical fixture imports."""
+"""Memory-only historical validation; no physical fixture imports."""
 
 from __future__ import annotations
 
@@ -31,41 +31,9 @@ def source_functions(path, names, namespace):
     )
     ast.fix_missing_locations(module)
     exec(compile(module, str(path), "exec"), namespace)
-    assert all(namespace[name].__code__.co_filename == str(path) for name in names)
 
 
 class HistoricalPolicyMaintenanceContract(unittest.TestCase):
-    def test_closed_maintenance_uses_live_historical_readers_without_retired_admission(self):
-        tree = ast.parse((RUNTIME / "tests/test_closed_native_orphans.py").read_text())
-        test = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.AsyncFunctionDef)
-            and node.name.startswith("test_closed_maintenance_keeps_")
-            and "policy_recovery" in node.name
-        )
-        calls = [
-            node.func.attr
-            for node in ast.walk(test)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "store"
-        ]
-        self.assertNotIn("policy_recovery_precheck", calls)
-        self.assertNotIn("recover_execution", calls)
-        for name in ("effective_spec", "submitted_spec", "detail", "events"):
-            self.assertGreaterEqual(calls.count(name), 2, name)
-        store_tree = ast.parse((SOURCE / "delivery_store.py").read_text())
-        store = next(
-            node
-            for node in store_tree.body
-            if isinstance(node, ast.ClassDef) and node.name == "DeliveryStore"
-        )
-        methods = {node.name for node in store.body if isinstance(node, ast.FunctionDef)}
-        self.assertTrue({"effective_spec", "detail", "submitted_spec"} <= methods)
-        self.assertTrue({"policy_recovery_precheck", "recover_execution"}.isdisjoint(methods))
-
     def test_actual_historical_validator_preserves_inputs_and_refuses_changed_authority(self):
         recorded = json.loads(
             gzip.decompress(

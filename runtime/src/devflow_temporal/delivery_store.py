@@ -3324,7 +3324,12 @@ class DeliveryStore:
             if recovery.get("kind") == "accepted_technical_successor":
                 technical_successor = recovery
             recovery = recovery["original_recovery"]
-        scope_recovery = self._scope_recovery(recovery)
+        scope_source = recovery
+        # A plain successor inherits the earlier scope receipt unchanged.
+        while (scope_source and scope_source.get('kind') == 'stopped_delivery_resume'
+               and 'added_paths' not in scope_source['command']):
+            scope_source = scope_source['original_recovery']
+        scope_recovery = self._scope_recovery(scope_source)
         scope_amendment = (
             {
                 "added_paths": scope_recovery["added_paths"],
@@ -3336,14 +3341,14 @@ class DeliveryStore:
             if scope_recovery and scope_recovery.get("kind") == "scope_amendment"
             else None
         )
-        if (recovery and recovery.get('kind') == 'stopped_delivery_resume'
-                and 'added_paths' in recovery['command']):
+        if (scope_source and scope_source.get('kind') == 'stopped_delivery_resume'
+                and 'added_paths' in scope_source['command']):
             scope_amendment = {
-                'added_paths': recovery['command']['added_paths'],
-                'original_policy_digest': recovery['predecessor_spec']['policy_digest'],
-                'effective_policy_digest': recovery['execution_spec']['policy_digest'],
-                'authorized_through_iteration': recovery['maximum_iteration'],
-                'predecessor_execution_run_id': recovery['closed']['execution_run_id'],
+                'added_paths': scope_source['command']['added_paths'],
+                'original_policy_digest': scope_source['predecessor_spec']['policy_digest'],
+                'effective_policy_digest': scope_source['execution_spec']['policy_digest'],
+                'authorized_through_iteration': scope_source['maximum_iteration'],
+                'predecessor_execution_run_id': scope_source['closed']['execution_run_id'],
             }
         candidate = json.loads(row["candidate_json"]) if row["candidate_json"] else None
         roles = []

@@ -10,7 +10,8 @@ from test_delivery_store import service as service
 from test_delivery_unused_budget_resume import fixed_stop
 
 from devflow_temporal import delivery_stopped_resume as resume
-from devflow_temporal.contracts import canonical_json
+from devflow_temporal.contracts import canonical_json, digest
+from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_store import DeliveryStore
 
@@ -153,6 +154,60 @@ def test_scope_config_drift_after_admission_is_rejected_at_readback(scope_stop):
     config['repositories']['fixture']['allowed_paths'].append('unapproved.ts')
     path.write_text(json.dumps(config))
     with pytest.raises(ValueError):
+        resume.readback(store, effective, recovery)
+
+
+def test_plain_successor_retains_inherited_scope_provenance_and_seal(scope_stop, monkeypatch):
+    from pathlib import Path
+
+    store, _, state, command = scope_stop
+    original = copy.deepcopy(store.submitted_spec('run-1'))
+    state['iteration'] = state['roles'][0]['iteration'] = 0
+    project(store, state)
+    with store._connect() as db:
+        db.execute('UPDATE delivery_attempts SET iteration=0')
+    command['expected_iteration'] = 0
+    first = store.continue_repair('run-1', command)
+    first_recovery = saved(store)
+    scope = store.detail('run-1')['scope_amendment']
+    effective = store.effective_spec('run-1')
+    candidate = DeliveryBroker(store, effective).candidate()
+
+    # The first resumed turn stops normally, releasing ownership with the same session.
+    later = copy.deepcopy(state)
+    later.update(iteration=1, revision=15, candidate=candidate)
+    latest = {**later['roles'][0], 'iteration': 1, 'candidate': candidate}
+    later['roles'].append(latest)
+    project(store, later)
+    receipt = {k: v for k, v in latest.items() if k not in {
+        'role', 'iteration', 'candidate', 'attempt_id', 'input_candidate_id', 'provider'}}
+    with store._connect() as db:
+        db.execute('INSERT INTO delivery_attempts '
+                   '(job_key,run_id,role,iteration,candidate_id,state,'
+                   'session_id,result_json,cleanup) '
+                   "VALUES('continued','run-1','implement',1,?,'finished',?,?,'confirmed')",
+                   (candidate['id'], latest['session_id'], canonical_json(receipt)))
+        store.state.release_work(db, effective['work_id'], 'external:devflow:run-1')
+    closed = {'workflow_id': first['workflow_id'], 'execution_run_id': 'closed-second',
+              'request_digest': effective['request_digest'],
+              'recovery_digest': digest(first_recovery), 'result': later}
+    monkeypatch.setattr(store, '_completed_temporal_result', lambda *_args, **_kwargs: closed)
+    successor = {k: v for k, v in command.items() if k not in resume.SCOPE_FIELDS}
+    successor.update(command_id='second-unused-original-turn', expected_revision=15,
+                     expected_iteration=1, expected_candidate_id=candidate['id'])
+    store.continue_repair('run-1', successor)
+
+    recovery, effective = saved(store), store.effective_spec('run-1')
+    assert resume.readback(store, effective, recovery) == {'state': 'confirmed'}
+    assert store.detail('run-1')['scope_amendment'] == scope
+    assert recovery['original_recovery'] == first_recovery
+    assert recovery['maximum_iteration'] == effective['policy']['max_repairs'] == 2
+    assert effective['policy']['allowed_paths'] == ['README.md', 'contract.test.ts']
+    assert store.submitted_spec('run-1') == original
+    # Displaying inherited authority must not replace or weaken its original seal.
+    path = Path(command['amended_config_path'])
+    path.write_text(path.read_text() + '\n')
+    with pytest.raises(ValueError, match='configuration is not private or changed'):
         resume.readback(store, effective, recovery)
 
 
