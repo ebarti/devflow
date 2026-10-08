@@ -401,14 +401,21 @@ class RunResources:
                 names = set(allowed_names)
                 if (path.name == '.venv' and path.is_relative_to(root)
                         and self.spec['policy'].get('host_sandbox') == 'trusted-local'):
-                    if root.exists():
+                    retained = ownership.get(str(path), {})
+                    if finalizing:
+                        if (retained.get('kind') != 'generated'
+                                or retained.get('accepted_plan_sha256')
+                                != digest(self.spec['accepted_plan'])):
+                            raise ValueError('generated environment recorded plan changed')
+                        # Partial implementation can change test discovery. Cleanup
+                        # authenticates recorded custody, parent and resource identity.
+                        names.add(path.relative_to(root).as_posix())
+                    elif root.exists():
                         from .delivery_plan_checks import planned_projects
 
                         names.update((project / '.venv').relative_to(root).as_posix()
-                                     for project in planned_projects(self.spec, root))
-                    elif finalizing and ownership.get(str(path), {}).get(
-                            'accepted_plan_sha256') == digest(self.spec['accepted_plan']):
-                        names.add(path.relative_to(root).as_posix())
+                                     for project in planned_projects(
+                                         self.spec, root, preparation=True))
                 if not any(path == root / name for name in names):
                     continue
                 self._allowed(root, entry["kind"], finalizing=finalizing)

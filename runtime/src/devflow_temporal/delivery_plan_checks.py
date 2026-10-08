@@ -43,7 +43,24 @@ def selected_tests(spec: dict, checkout: Path) -> list[Path]:
     return result
 
 
-def planned_projects(spec: dict, checkout: Path) -> dict[Path, list[Path]]:
+def _future_test(spec: dict, checkout: Path, name: str) -> Path:
+    """Resolve future or partial tests only for locked dependency preparation."""
+    paths = [raw for raw in spec.get('policy', {}).get('allowed_paths', [])
+             if isinstance(raw, str) and Path(raw).name == name]
+    if len(paths) != 1:
+        raise ValueError(f'future planned test must have one authorized owner: {name}')
+    raw = paths[0]
+    relative = Path(raw)
+    test = checkout / relative
+    if (relative.is_absolute() or '..' in relative.parts or relative.as_posix() != raw
+            or test.is_symlink() or (test.exists() and not test.is_file())
+            or test.resolve() != test):
+        raise ValueError('future planned test is not a fixed authorized file path')
+    return test
+
+
+def planned_projects(spec: dict, checkout: Path, *,
+                     preparation: bool = False) -> dict[Path, list[Path]]:
     try:
         plan = json.loads(spec['accepted_plan'])
     except (ValueError, TypeError):
@@ -55,13 +72,19 @@ def planned_projects(spec: dict, checkout: Path) -> dict[Path, list[Path]]:
     files = _git(checkout, 'ls-files', '--', '*.py').splitlines()
     projects: dict[Path, list[Path]] = {}
     chosen = [p for p in selected_tests(spec, checkout) if p.suffix == '.py']
+    future = set()
     for name in names:
         matches = [checkout / f for f in files if Path(f).name == name]
+        if not matches and preparation:
+            test = _future_test(spec, checkout, name)
+            chosen.append(test)
+            future.add(test)
+            continue
         if len(matches) != 1:
             raise ValueError(f'planned pytest file must have one tracked owner: {name}')
         chosen.append(matches[0])
     for test in sorted(set(chosen)):
-        if test.is_symlink() or test.resolve(strict=True) != test:
+        if test not in future and (test.is_symlink() or test.resolve(strict=True) != test):
             raise ValueError('planned pytest source is not a fixed owned file')
         project = next((p for p in test.parents if p.is_relative_to(checkout)
                         and (p / 'pyproject.toml').is_file() and (p / 'uv.lock').is_file()), None)
@@ -93,7 +116,8 @@ def _node_script_covered(test: Path, checkout: Path, recipe: dict) -> bool:
     return any((checkout / recipe['cwd'] / arg).resolve() == test for arg in operands)
 
 
-def planned_node_tests(spec: dict, checkout: Path, junit_recipes: list[dict]) -> list[Path]:
+def planned_node_tests(spec: dict, checkout: Path, junit_recipes: list[dict], *,
+                       preparation: bool = False) -> list[Path]:
     """Resolve named Node tests from the same sealed plan used for Python."""
     try:
         plan = json.loads(spec['accepted_plan'])
@@ -106,9 +130,15 @@ def planned_node_tests(spec: dict, checkout: Path, junit_recipes: list[dict]) ->
     if len(names) > 32:
         raise ValueError('planned Node tests require a bounded name list')
     chosen = [p for p in selected_tests(spec, checkout) if p.suffix != '.py']
+    future = set()
     files = _git(checkout, 'ls-files', '--', '*.test.*').splitlines()
     for name in names:
         matches = [checkout / f for f in files if Path(f).name == name]
+        if not matches and preparation:
+            test = _future_test(spec, checkout, name)
+            chosen.append(test)
+            future.add(test)
+            continue
         if len(matches) != 1:
             raise ValueError(f'planned Node test must have one tracked owner: {name}')
         test = matches[0]
@@ -123,7 +153,8 @@ def planned_node_tests(spec: dict, checkout: Path, junit_recipes: list[dict]) ->
     if len(result) > 32:
         raise ValueError('planned Node tests require a bounded selection')
     for test in result:
-        if test.is_symlink() or test.resolve(strict=True) != test or not test.is_file():
+        if test not in future and (test.is_symlink() or test.resolve(strict=True) != test
+                                   or not test.is_file()):
             raise ValueError('planned Node test is not a fixed owned file')
     return result
 
@@ -210,10 +241,11 @@ def _base_recipe_metadata(spec: dict) -> bytes:
     return result.stdout
 
 
-def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
+def planned_checks(spec: dict, checkout: Path, evidence: Path, *,
+                   preparation: bool = False) -> list[dict]:
     result = planned_junit_recipes(spec, checkout, evidence)
     result.extend(planned_junit_recipes(spec, checkout, evidence, static=True))
-    projects = planned_projects(spec, checkout)
+    projects = planned_projects(spec, checkout, preparation=preparation)
     # Approved recipes can create the same environments before the named-test
     # dependency step. Record their ownership before the first recipe launches.
     generated = [(project / '.venv').relative_to(checkout).as_posix()
@@ -221,7 +253,7 @@ def planned_checks(spec: dict, checkout: Path, evidence: Path) -> list[dict]:
     for check in result:
         if generated:
             check['generated_directories'] = generated
-    node_tests = planned_node_tests(spec, checkout, result)
+    node_tests = planned_node_tests(spec, checkout, result, preparation=preparation)
     if not projects and not node_tests:
         return result
     plan = json.loads(spec['accepted_plan'])
