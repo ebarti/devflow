@@ -405,7 +405,8 @@ class RunResources:
                         from .delivery_plan_checks import planned_projects
 
                         names.update((project / '.venv').relative_to(root).as_posix()
-                                     for project in planned_projects(self.spec, root))
+                                     for project in planned_projects(
+                                         self.spec, root, preparation=True))
                     elif finalizing and ownership.get(str(path), {}).get(
                             'accepted_plan_sha256') == digest(self.spec['accepted_plan']):
                         names.add(path.relative_to(root).as_posix())

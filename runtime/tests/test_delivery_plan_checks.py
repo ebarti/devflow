@@ -47,6 +47,97 @@ def test_recipe_uses_only_named_owned_tests_locked_deps_and_retained_junit(proje
     assert _git(checkout, 'diff', '--cached') == before
 
 
+@pytest.mark.parametrize('node', [False, True])
+def test_future_authorized_test_prepares_dependencies_but_verification_stays_strict(project, node):
+    spec, checkout, root, evidence = project
+    if node:
+        root = checkout / 'api'
+        (root / 'test').mkdir(parents=True)
+        (root / 'package.json').write_text(json.dumps({'devDependencies': {'vitest': '4.1.11'}}))
+        (checkout / 'package.json').write_text('{"packageManager":"pnpm@10.33.3"}')
+        (checkout / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
+        name, relative = 'future.test.ts', 'api/test/future.test.ts'
+        _git(checkout, 'add', '.')
+    else:
+        name, relative = 'test_future.py', 'worker/tests/test_future.py'
+    spec.update(accepted_plan=json.dumps({'verification': [f'Add and execute {name}']}),
+                policy={'allowed_paths': [relative]})
+    before = dict(spec)
+    checks = planned_checks(spec, checkout, evidence, preparation=True)
+    assert any(name in ' '.join(check['argv']) for check in checks)
+    assert spec == before and not (checkout / relative).exists()
+    with pytest.raises(ValueError, match='tracked owner'):
+        planned_checks(spec, checkout, evidence)
+    (checkout / relative).write_text('new feature regression')
+    with pytest.raises(ValueError):
+        planned_checks(spec, checkout, evidence)
+    _git(checkout, 'add', relative)
+    final = planned_checks(spec, checkout, evidence)
+    assert any(name in ' '.join(check['argv']) for check in final)
+
+
+@pytest.mark.parametrize('failure', ['unauthorized', 'ambiguous', 'escape', 'symlink', 'untracked',
+                                     'project-link', 'lock'])
+def test_future_test_preparation_rejects_unsealed_owners_and_metadata(project, failure):
+    spec, checkout, root, evidence = project
+    relative = 'worker/tests/test_future.py'
+    spec.update(accepted_plan=json.dumps({'verification': ['Create and run test_future.py']}),
+                policy={'allowed_paths': [relative]})
+    if failure == 'unauthorized':
+        spec['policy']['allowed_paths'] = []
+    elif failure == 'ambiguous':
+        spec['policy']['allowed_paths'].append('worker/other/test_future.py')
+    elif failure == 'escape':
+        spec['policy']['allowed_paths'] = ['../worker/tests/test_future.py']
+    elif failure == 'symlink':
+        (checkout / relative).symlink_to(root / 'missing')
+    elif failure == 'untracked':
+        (checkout / relative).write_text('untracked')
+    elif failure == 'project-link':
+        (root / 'tests').rename(root / 'original-tests')
+        (root / 'tests').symlink_to(root / 'original-tests', target_is_directory=True)
+    else:
+        _git(checkout, 'rm', '--cached', 'worker/uv.lock')
+    with pytest.raises((ValueError, FileNotFoundError)):
+        planned_checks(spec, checkout, evidence, preparation=True)
+
+
+def test_broker_prepares_only_dependencies_and_records_future_project_custody(project, monkeypatch):
+    from devflow_temporal.delivery_broker import DeliveryBroker
+    from devflow_temporal.delivery_resources import RunResources
+
+    spec, checkout, root, evidence = project
+    state = evidence.parent / 'run-fixture'
+    state.mkdir(mode=0o700)
+    spec.update(run_id='run-fixture', state_dir=str(state), checkout=str(checkout),
+                accepted_plan=json.dumps({'verification': ['Create and run test_future.py']}),
+                policy={'allowed_paths': ['worker/tests/test_future.py'],
+                        'host_sandbox': 'trusted-local'})
+    resources = RunResources(spec)
+    original = checkout.with_name('fixture-source')
+    checkout.rename(original)
+    resources.register(checkout, 'checkout')
+    original.rename(checkout)
+    resources.created(checkout)
+    broker = object.__new__(DeliveryBroker)
+    broker.spec, broker.checkout = spec, checkout
+    broker.evidence_dir = broker.state_dir = state
+    candidate = {'id': 'a' * 64}
+    monkeypatch.setattr(broker, 'candidate', lambda: candidate)
+    observed = []
+
+    def dependency_checks(_checkout, checks, _folder, _candidate, **_options):
+        observed.extend(checks)
+        resources.register(root / '.venv', 'generated')
+        return {'state': 'passed', 'results': [{'cleanup': 'confirmed'}]}
+
+    monkeypatch.setattr(broker, '_run_check_list', dependency_checks)
+    assert broker.run_implementation_preparation(0, candidate)['state'] == 'passed'
+    assert len(observed) == 1 and observed[0]['id'].startswith('planned-python-dependencies-')
+    assert 'test_future.py' not in ' '.join(observed[0]['argv'])
+    assert not (root / '.venv').exists() and not (root / 'tests/test_future.py').exists()
+
+
 @pytest.mark.parametrize('failure', ['missing', 'duplicate', 'symlink', 'lock'])
 def test_recipe_rejects_untracked_ambiguous_or_unlocked_sources(project, failure):
     spec, checkout, root, evidence = project

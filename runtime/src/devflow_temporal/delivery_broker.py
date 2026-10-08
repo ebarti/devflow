@@ -1038,7 +1038,7 @@ class DeliveryBroker:
         from .delivery_plan_checks import planned_checks
 
         folder = self.evidence_dir / "implementation-preparation" / str(iteration)
-        planned = planned_checks(self.spec, self.checkout, folder)
+        planned = planned_checks(self.spec, self.checkout, folder, preparation=True)
         dependencies = [c for c in planned if c['id'].startswith('planned-python-dependencies-')]
         if any(c['id'].startswith('planned-vitest-') for c in planned):
             dependencies = [c for c in self.spec['policy'].get('prepublish_checks', [])
