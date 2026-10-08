@@ -60,10 +60,14 @@ def _stopped_cleanup(spec):
     for raw_path in manifest['processes']:
         path = Path(raw_path)
         journal = read_private(path)
-        if (journal.get('phase') != 'finished' or not journal.get('monitoring_complete')
+        identities = list(journal.get('owned', {}).items())
+        monitor = journal.get('monitor')
+        if monitor:
+            identities.append((monitor['pid'], monitor))
+        if (journal.get('phase') != 'finished' or journal.get('monitoring_complete') is not True
                 or any(table.get(int(pid), {}).get('identity') == item['identity']
                        and not table[int(pid)]['stat'].startswith('Z')
-                       for pid, item in journal.get('owned', {}).items())
+                       for pid, item in identities)
                 or any(listeners(port) for port in journal.get('ports', []))):
             raise ValueError('recorded native process identity or port is still live or unknown')
         journals[raw_path] = hashlib.sha256(path.read_bytes()).hexdigest()

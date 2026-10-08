@@ -10,14 +10,28 @@ from .delivery_broker import DeliveryBroker, _git
 from .delivery_config import DeliveryConfig
 from .delivery_gate_retry import prepare_runtime
 from .delivery_metadata_recovery import _immutable, preserve_resources
-from .delivery_policy_recovery import _remote, _rows, work_binding
+from .delivery_policy_recovery import _remote, _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
-from .delivery_repair import confirmed_native_cleanup, published_identity
+from .delivery_repair import published_identity
 from .delivery_resources import private_directory, read_private
 
 KIND = 'stopped_delivery_resume'
 FIELDS = {'continuation_kind', 'command_id', 'expected_revision', 'expected_iteration',
           'expected_candidate_id', 'expected_candidate_head', 'additional_iterations'}
+
+
+def fixed_budget_allows(spec, iteration, iterations):
+    """A resume may spend unused original turns, never enlarge the frozen ceiling."""
+    maximum = spec.get('policy', {}).get('max_repairs')
+    return (type(iteration) is int and iteration >= 0
+            and type(iterations) is int and iterations in (1, 2)
+            and type(maximum) is int and maximum >= 0
+            and iteration + iterations <= maximum)
+
+
+def observed_native_cleanup(spec):
+    """Preflight and readback observe closure without controlling any process."""
+    return digest({'provider': 'fake'} if spec['provider'] == 'fake' else _stopped_cleanup(spec))
 
 
 def namespace(recovery):
@@ -26,6 +40,10 @@ def namespace(recovery):
 
 def custody(db, recovery):
     spec = recovery['execution_spec']
+    if (spec.get('retry_budget_version') == 1
+            and not fixed_budget_allows(spec, recovery['state']['iteration'],
+                                        recovery['command']['additional_iterations'])):
+        raise ValueError('a fixed repair budget cannot receive additional iterations')
     path = Path(spec['state_dir']) / namespace(recovery) / 'admission.json'
     command = db.execute('SELECT request_digest,response_json FROM delivery_commands '
                          'WHERE command_id=? AND run_id=?',
@@ -152,7 +170,7 @@ def snapshot(store, run_id):
     return {'predecessor_spec': spec, 'row': row, 'attempts': attempts, 'effects': effects,
             'closed': closed, 'state': state, 'candidate': candidate, 'session_id': session,
             'publication': publication, 'original_recovery': previous,
-            'cleanup_digest': confirmed_native_cleanup(spec), 'work_binding': binding}
+            'cleanup_digest': observed_native_cleanup(spec), 'work_binding': binding}
 
 
 def admit(store, run_id, command, *, preflight=False):
@@ -184,6 +202,11 @@ def admit(store, run_id, command, *, preflight=False):
             or command['expected_candidate_head'] != seal['candidate']['head']):
         raise ValueError('stopped resume checkpoint is stale')
     maximum = seal['state']['iteration'] + command['additional_iterations']
+    original = store.submitted_spec(run_id)
+    if (original.get('retry_budget_version') == 1
+            and not fixed_budget_allows(original, seal['state']['iteration'],
+                                        command['additional_iterations'])):
+        raise ValueError('a fixed repair budget cannot receive additional iterations')
     if preflight:
         return {'run_id': run_id, 'preflight': True, 'candidate': seal['candidate'],
                 'authorized_through_iteration': maximum, 'implementation_authority': True}
@@ -280,7 +303,7 @@ def readback(store, spec, recovery):
     if (not store.owns_execution(spec)
             or digest(DeliveryConfig.load(Path(spec['config_path'])).raw) != spec['config_digest']):
         raise ValueError('stopped service configuration or owner changed')
-    if confirmed_native_cleanup(predecessor) != recovery['cleanup_digest']:
+    if observed_native_cleanup(predecessor) != recovery['cleanup_digest']:
         raise ValueError('stopped predecessor process ownership changed')
     broker = DeliveryBroker(store, spec)
     if broker.candidate() != recovery['execution_candidate']:
