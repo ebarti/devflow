@@ -297,3 +297,53 @@ def test_listener_refuses_symlinked_endpoint_without_touching_target(tmp_path, m
           events.Notifications().listen([tmp_path / 'db'])):
         pytest.fail('listener accepted a symlink')
     assert target.read_text() == 'owned by someone else'
+
+
+def test_same_pr_new_validated_publication_refreshes_immediately_and_replays_once(service):
+    store, request = service
+    store.submit(request)
+    receipt = {'url': 'https://github.com/example/fixture/pull/7', 'state': 'OPEN',
+               'head': 'a' * 40, 'number': 7}
+    store.project(request['run_id'], phase='review', execution_state='running',
+                  event_type='published', message='first publication', pull_request=receipt)
+    stamp = datetime(2026, 10, 9, tzinfo=UTC)
+    remote = Remote()
+    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    sync.tick()
+    assert len(remote.reads) == 1
+    stamp += timedelta(seconds=60)
+    remote.head = 'c' * 40
+    updated = {**receipt, 'head': remote.head}
+    store.project(request['run_id'], phase='delivered', execution_state='terminal',
+                  event_type='delivered', message='same PR, new publication passed gates',
+                  outcome='published_unmerged', pull_request=updated)
+    view = sync.tick()[request['issue_url']]
+    assert view['status'] == 'Awaiting merge'
+    assert view['pull_requests'][0]['observation']['head'] == updated['head']
+    assert len(remote.reads) == 2
+    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, clock=lambda: stamp)
+    restarted.tick()
+    restarted.tick()
+    assert len(remote.reads) == 2
+    assert store.detail(request['run_id'])['pull_request'] == updated
+    # An external push is still found by the daily reconciliation, not by polling.
+    remote.head = 'd' * 40
+    stamp += timedelta(seconds=DAY - 1)
+    assert restarted.tick()[request['issue_url']]['status'] == 'Awaiting merge'
+    assert len(remote.reads) == 2
+    stamp += timedelta(seconds=1)
+    assert restarted.tick()[request['issue_url']]['status'] == 'Needs validation'
+    assert len(remote.reads) == 3
+
+
+def test_upgrade_establishes_publication_inputs_once(service):
+    store, _, _ = published(service)
+    remote = Remote()
+    sync = ProjectSynchronizer([store], remote)
+    sync.tick()
+    with store._connect() as db:
+        db.execute('DELETE FROM delivery_pr_observation_inputs')
+    restarted = ProjectSynchronizer([store], remote)
+    restarted.tick()
+    restarted.tick()
+    assert len(remote.reads) == 2

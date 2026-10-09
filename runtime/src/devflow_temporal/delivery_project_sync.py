@@ -272,25 +272,37 @@ class ProjectSynchronizer:
     def observe_prs(self) -> None:
         references: dict[str, list[tuple[DeliveryStore, str]]] = {}
         saved = {}
+        inputs: dict[str, set[tuple[str, str, str]]] = {}
+        consumed = {}
         for store in self.stores:
+            source = str(store.config.tracking_db.resolve())
             with store._connect() as db:
                 for row in db.execute("SELECT run_id,pr_json,issue_url FROM delivery_runs "
                                       "WHERE pr_json IS NOT NULL"):
-                    for url in publication_urls(json.loads(row["pr_json"])):
+                    receipt = json.loads(row["pr_json"])
+                    heads = {member["url"]: member.get("head") or "" for member in
+                             (receipt.get("pull_requests") or [receipt]) if member.get("url")}
+                    for url in publication_urls(receipt):
                         # A publication cannot grant access outside its admitted repository.
                         if urlsplit(url).netloc != urlsplit(row["issue_url"]).netloc or (
                             url.rsplit("/pull/", 1)[0] != row["issue_url"].rsplit("/issues/", 1)[0]
                         ):
                             raise ValueError("publication PR is outside the admitted repository")
                         references.setdefault(url, []).append((store, row["run_id"]))
+                        inputs.setdefault(url, set()).add((source, row["run_id"], heads[url]))
                 for row in db.execute("SELECT * FROM delivery_pr_observations"):
                     if row["url"] not in saved or row["next_check_at"] > saved[row["url"]][
                         "next_check_at"]:
                         saved[row["url"]] = dict(row)
+                for row in db.execute("SELECT * FROM delivery_pr_observation_inputs"):
+                    consumed[source, row["url"]] = row["publication_key"]
         for url, owners in references.items():
             stamp = self.clock()
             prior = saved.get(url)
-            due = not prior or prior["next_check_at"] <= stamp.isoformat()
+            publication_key = digest(sorted(inputs[url]))
+            changed = any(consumed.get((str(store.config.tracking_db.resolve()), url))
+                          != publication_key for store, _ in owners)
+            due = changed or not prior or prior["next_check_at"] <= stamp.isoformat()
             observed, error = None, None
             if due:
                 try:
@@ -317,6 +329,10 @@ class ProjectSynchronizer:
                         next_check_at=excluded.next_check_at,error=excluded.error""",
                         (url, canonical_json(observed) if observed else None,
                          checked_at, next_check, error))
+                    db.execute("INSERT INTO delivery_pr_observation_inputs VALUES (?,?) "
+                               "ON CONFLICT(url) DO UPDATE SET "
+                               "publication_key=excluded.publication_key",
+                               (url, publication_key))
                     transition(db, store.config, run_id)
 
     @staticmethod

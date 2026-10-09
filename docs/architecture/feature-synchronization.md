@@ -76,8 +76,11 @@ Daily reconciliation also recovers a writer crash between commit and notificatio
 A stopped service catches up immediately on restart.
 
 GitHub PR observation and Project drift checks default to 24 hours, independently
-configurable from 300 to 86400 seconds. Newly recorded PRs are observed when first
-discovered. Local status changes are mirrored immediately when the service is
+configurable from 300 to 86400 seconds. Newly recorded PRs and newly published heads
+on existing PRs trigger an immediate observation. The consumed publication identity
+is durable, so duplicate notifications and service restarts do not repeat that read.
+An upgrade from the older observer establishes these identities with one initial
+read of each recorded PR. Local status changes are mirrored immediately when the service is
 available, regardless of these intervals. Configuration changes rebase existing
 periodic deadlines once; pending Project retries keep their existing backoff.
 Project write failures back off from 15 seconds to one hour without involving the
