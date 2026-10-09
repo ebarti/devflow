@@ -27,6 +27,9 @@ ownership or consume delivery repair cycles.
 - Each runtime database keeps its original immutable run specifications and receipts.
 - Local state transitions and their feature events commit together. Publication receipts
   remain available independently of current PR observations.
+- After committing, Devflow sends a nonblocking local notification to the independent
+  sync service. It never waits for a service acknowledgement or a GitHub response.
+  Notification failure cannot fail the delivery; the durable event remains available.
 - The synchronizer is a separate process with an explicit list of runtime configurations.
   It takes exclusive locks for every source database and Project, preventing overlapping consumers.
 - For an issue with attempts in several sources, the most recently admitted run owns the
@@ -38,7 +41,7 @@ ownership or consume delivery repair cycles.
 - The worker consumes committed changes, coalescing obsolete projections, with durable
   retry state. An acknowledged mirror requires remote readback of the exact status and
   assignee. A failed mirror remains pending and does not change the feature's status.
-- Known PRs are checked about every five minutes, including historical receipts. Their
+- Known PRs and Project drift are checked every 24 hours, including historical receipts. Their
   observation schedule survives restarts. No agents or product repairs are dispatched.
 - PR state, head changes, Project drift, duplicate events, and worker restarts reconcile
   idempotently. Unknown remote observations retain the last known fact with an error and
@@ -60,13 +63,32 @@ features. Do not run separate consumers with disjoint owner lists for the same P
 The list is intentionally explicit; the worker never scans arbitrary local databases.
 
 ```json
-{"version":1,"owners":["/absolute/runtime/service.json"],"pr_interval_seconds":300}
+{"version":1,"owners":["/absolute/runtime/service.json"],"pr_interval_seconds":86400,"project_interval_seconds":86400}
 ```
 
 Use `devflow-project-sync --config /absolute/project-sync.json --once` for one
-reconciliation or omit `--once` for the durable loop. The loop checks only committed
-local state every two seconds. GitHub observation and drift checks default to five
-minutes. Project write failures back off from 15 seconds to one hour.
+reconciliation or omit `--once` for the durable service. The service binds an owned
+Unix datagram endpoint for every configured database before its initial catch-up,
+then waits for notifications or the next durable retry/check deadline. It does not
+poll local state on a two-second timer. Notifications carry no state or authority;
+the service always reads committed SQLite state, coalescing duplicate notifications.
+Daily reconciliation also recovers a writer crash between commit and notification.
+A stopped service catches up immediately on restart.
+
+GitHub PR observation and Project drift checks default to 24 hours, independently
+configurable from 300 to 86400 seconds. Newly recorded PRs and newly published heads
+on existing PRs trigger an immediate observation. The consumed publication identity
+is durable, so duplicate notifications and service restarts do not repeat that read.
+An upgrade from the older observer establishes these identities with one initial
+read of each recorded PR. Local status changes are mirrored immediately when the service is
+available, regardless of these intervals. Configuration changes rebase existing
+periodic deadlines once; pending Project retries keep their existing backoff.
+Project write failures back off from 15 seconds to one hour without involving the
+delivery controller or consuming repair cycles.
+
+PR head observation checks which commit was validated. Updating a local checkout
+does not validate an additional commit pushed after review. A changed published
+head therefore requires validation, even when a local checkout has been updated.
 
 On macOS, install from the reviewed runtime checkout using its virtualenv Python:
 `python scripts/project-sync-service.py install --config /absolute/project-sync.json`.

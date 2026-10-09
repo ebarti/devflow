@@ -109,7 +109,7 @@ def test_poll_schedule_and_failure_backoff_survive_restart(service):
     remote.failure = False
     assert restarted.tick()[request["issue_url"]]["mirror"]["state"] == "consistent"
     assert len(remote.reads) == 1
-    stamp += timedelta(seconds=284)
+    stamp += timedelta(seconds=86384)
     restarted.tick()
     assert len(remote.reads) == 1
     stamp += timedelta(seconds=1)
@@ -215,7 +215,7 @@ def test_unknown_pr_read_retains_last_fact_and_error(service):
     stamp = datetime(2026, 10, 9, tzinfo=UTC)
     sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
     first = sync.tick()[request["issue_url"]]
-    stamp += timedelta(seconds=300)
+    stamp += timedelta(days=1)
 
     def unavailable(_url):
         raise RuntimeError("PR read unavailable")
@@ -265,13 +265,13 @@ def test_multiple_databases_select_one_owner_and_mirror_same_view(service, tmp_p
         pytest.fail("overlapping source consumer acquired ownership")
 
 
-def test_project_drift_is_rechecked_at_five_minutes(service):
+def test_project_drift_is_rechecked_at_twenty_four_hours(service):
     store, _, _ = published(service)
     remote = Remote()
     stamp = datetime(2026, 10, 9, tzinfo=UTC)
     sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
     sync.tick()
-    stamp += timedelta(seconds=299)
+    stamp += timedelta(seconds=86399)
     sync.tick()
     assert len(remote.writes) == 1
     stamp += timedelta(seconds=1)
