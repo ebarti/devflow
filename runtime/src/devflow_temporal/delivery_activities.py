@@ -992,9 +992,7 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
     if request["spec"]["provider"] == "fake":
         return {"state": "consistent", "pending": False, "observed": {"fixture": True}}
     try:
-        if (request["spec"].get("project_sync_version") != 1
-                and request["status"] in {"in-review", "done"}
-                and request.get("pull_request") is not None):
+        if request["status"] in {"in-review", "done"} and request.get("pull_request") is not None:
             from .delivery_terminal_recovery import published_readback
 
             store, _ = _context(request["spec"])

@@ -37,13 +37,16 @@ function Facts({ run }: { run: RunDetail }) {
   const trackerTone = tracker?.conflict ? 'bad' : tracker?.state === 'consistent' ? 'neutral' : 'waiting'
   return <dl className="facts" aria-label="Run facts">
     <div><dt>Candidate</dt><dd className="mono" title={run.candidate?.head ?? undefined}>{display(run.candidate?.head, 'Not available')}</dd></div>
-    <div><dt>Pull request</dt><dd>{url ? <a href={url} target="_blank" rel="noopener noreferrer">{run.pull_request?.number ? `#${run.pull_request.number}` : 'Open pull request'} <ExternalIcon /></a> : display(run.pull_request?.number, 'Not published')}</dd></div>
+    <div><dt>{run.feature ? 'This run’s PR' : 'Pull request'}</dt><dd>{url ? <a href={url} target="_blank" rel="noopener noreferrer">{run.pull_request?.number ? `#${run.pull_request.number}` : 'Open pull request'} <ExternalIcon /></a> : display(run.pull_request?.number, 'Not published')}</dd></div>
     <div><dt>Authorized endpoint</dt><dd><span className="outline-pill">{titleCase(run.authorized_endpoint)}</span></dd></div>
     {run.feature ? <>
       <div><dt>Feature status</dt><dd>{run.feature.status}</dd></div>
       <div><dt>Project sync</dt><dd>{run.feature.mirror?.state === 'consistent' ? 'Synced' : 'Pending'}{run.feature.mirror?.last_error ? `: ${run.feature.mirror.last_error}` : ''}</dd></div>
       <div><dt>Run phase</dt><dd>{titleCase(run.phase)}</dd></div>
-      {run.feature.pull_requests.map(pr => <div key={pr.url}><dt>Current PR state</dt><dd>{pr.observation?.state ?? 'Not yet observed'} · checked {time(pr.checked_at)}{pr.error ? ` · ${pr.error}` : ''}</dd></div>)}
+      {run.feature.pull_requests.map(pr => {
+        const currentUrl = safeWebUrl(pr.url)
+        return <div key={pr.url}><dt>Current feature PR</dt><dd>{currentUrl ? <a href={currentUrl} target="_blank" rel="noopener noreferrer">#{currentUrl.split('/').pop()} <ExternalIcon /></a> : 'PR'} · {pr.observation?.state ?? 'Not yet observed'} · checked {time(pr.checked_at)}{pr.error ? ` · ${pr.error}` : ''}</dd></div>
+      })}
     </> : <div><dt>Tracker</dt><dd><span className={`soft-pill soft-pill--${trackerTone}`}>{trackerLabel}</span></dd></div>}
   </dl>
 }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json
@@ -144,14 +145,18 @@ def current(db: sqlite3.Connection, issue: str) -> dict | None:
     local = db.execute("SELECT * FROM delivery_features WHERE issue=?", (key,)).fetchone()
     saved = db.execute("SELECT payload_json FROM delivery_feature_views WHERE issue=?",
                        (key,)).fetchone()
-    local_value = ({**json.loads(local["payload_json"]), "version": local["version"]}
+    source = str(Path(db.execute("PRAGMA database_list").fetchone()[2]).resolve())
+    local_value = ({**json.loads(local["payload_json"]), "version": local["version"],
+                    "source": source}
                    if local else None)
     view = json.loads(saved[0]) if saved else None
     if not local_value:
         return mirror_freshness(view)
-    if view and (view["admitted_at"], view["run_id"]) >= (
-        local_value["admitted_at"], local_value["run_id"]
-    ) and (view["run_id"] != local_value["run_id"] or view["version"] >= local["version"]):
+    local_identity = (local_value["admitted_at"], local_value["run_id"], source)
+    selected_identity = (view["admitted_at"], view["run_id"], view["source"]) if view else None
+    if view and (selected_identity > local_identity or (
+        selected_identity == local_identity and view["version"] >= local["version"]
+    )):
         return mirror_freshness(view)
     return {**local_value, "mirror": {"state": "pending", "last_error": None}}
 

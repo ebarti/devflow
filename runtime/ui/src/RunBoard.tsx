@@ -4,9 +4,15 @@ import type { RunSummary } from './model'
 const lanes = ['Queued', 'Planning', 'Implementation', 'Review', 'QA & CI', 'Tracking', 'Awaiting merge', 'Merged', 'Delivered', 'Needs attention'] as const
 
 export function laneFor(run: RunSummary): typeof lanes[number] {
-  if (run.feature?.status === 'Merged') return 'Merged'
-  if (run.feature?.status === 'Awaiting merge') return 'Awaiting merge'
-  if (['Blocked', 'Cancelled', 'PR closed', 'Needs validation'].includes(run.feature?.status ?? '')) return 'Needs attention'
+  if (run.feature) {
+    const featureLanes: Record<string, typeof lanes[number]> = {
+      Queued: 'Queued', Planning: 'Planning', 'In progress': 'Implementation',
+      'In review': 'Review', Validating: 'QA & CI', 'Awaiting merge': 'Awaiting merge',
+      Merging: 'Tracking', Merged: 'Merged', Blocked: 'Needs attention',
+      Cancelled: 'Needs attention', 'PR closed': 'Needs attention', 'Needs validation': 'Needs attention',
+    }
+    return featureLanes[run.feature.status] ?? 'Needs attention'
+  }
   if (run.phase === 'delivered') return 'Delivered'
   if (['blocked', 'cancelled', 'cancelling', 'needs_decision', 'waiting_decision', 'waiting_question', 'waiting_plan', 'waiting_tracker'].includes(run.phase ?? '') || ['blocked', 'cancelled', 'waiting_decision', 'unknown', 'waiting_question', 'waiting_plan'].includes(run.execution_state ?? '')) return 'Needs attention'
   if (['investigating', 'intake', 'plan', 'awaiting_plan', 'awaiting_answers'].includes(run.phase ?? '')) return 'Planning'

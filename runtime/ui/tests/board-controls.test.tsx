@@ -56,6 +56,17 @@ describe('workflow board and controls', () => {
     expect(lane.textContent).toContain('Project: Sync pending')
   })
 
+  it.each([
+    ['Queued', 'Queued'], ['Planning', 'Planning'], ['In progress', 'Implementation'],
+    ['In review', 'Review'], ['Validating', 'QA & CI'], ['Merging', 'Tracking'],
+    ['Awaiting merge', 'Awaiting merge'], ['Merged', 'Merged'], ['Blocked', 'Needs attention'],
+    ['Cancelled', 'Needs attention'], ['PR closed', 'Needs attention'], ['Needs validation', 'Needs attention'],
+  ])('places the current %s feature ahead of an older delivered run', (status, lane) => {
+    expect(laneFor({ ...mockRun, phase: 'delivered', feature: {
+      issue: 'https://github.com/o/r/issues/1', run_id: 'newer-run', status, version: 1, pull_requests: [],
+    } })).toBe(lane)
+  })
+
   it('renders task statuses and opens the selected task', async () => {
     const select = vi.fn()
     render(<RunBoard runs={[mockRun]} archived={false} onSelect={select} onToggle={vi.fn()} onRefresh={vi.fn()} />)

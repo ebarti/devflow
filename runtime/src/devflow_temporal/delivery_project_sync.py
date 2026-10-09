@@ -74,6 +74,8 @@ class GitHub:
                 or not parts[3].isdigit()
                 or parsed.netloc.casefold() != urlsplit(feature["issue"]).netloc.casefold()):
             raise ValueError("Project binding must identify an existing Project on the issue host")
+        if assignee == "@me":
+            assignee = self.command("api", "user", "--hostname", parsed.netloc)["login"]
         owner_type = "user" if parts[0] == "users" else "organization"
         selected = self.graphql(parsed.netloc, """query($owner:String!,$number:Int!){
             OWNER(login:$owner){projectV2(number:$number){id closed field(name:"Status"){
@@ -104,8 +106,9 @@ class GitHub:
             fence()
             self.graphql(parsed.netloc, """mutation($id:ID!,$assignees:[ID!]!){
                 addAssigneesToAssignable(input:{assignableId:$id,assigneeIds:$assignees}){
-                assignable{id}}}""", id=issue["id"], assignees=[self.graphql(parsed.netloc,
-                "query($login:String!){user(login:$login){id}}", login=assignee)["user"]["id"]])
+                assignable{... on Issue{id}}}}""", id=issue["id"], assignees=[self.graphql(
+                parsed.netloc, "query($login:String!){user(login:$login){id}}",
+                login=assignee)["user"]["id"]])
         item_id = None
         cursor = None
         while True:
@@ -197,7 +200,7 @@ class ProjectSynchronizer:
             with store._connect() as db:
                 for row in db.execute("SELECT * FROM delivery_features"):
                     value = {**json.loads(row["payload_json"]), "version": row["version"],
-                             "source": str(store.config.tracking_db)}
+                             "source": str(store.config.tracking_db.resolve())}
                     prior = selected.get(value["issue"])
                     if not prior or (value["admitted_at"], value["run_id"], value["source"]) > (
                         prior[1]["admitted_at"], prior[1]["run_id"], prior[1]["source"]
@@ -260,74 +263,115 @@ class ProjectSynchronizer:
         return digest({key: feature[key] for key in
                        ("issue", "run_id", "source", "status", "binding", "legacy_tracking")})
 
+    @contextmanager
+    def handoff(self, issue: str):
+        """Serialize selected ownership with every participating legacy writer."""
+        def paths():
+            locks = set()
+            for store in self.stores:
+                with store._connect() as db:
+                    for row in db.execute("SELECT id FROM works WHERE lower(rtrim(issue,'/'))=?",
+                                          (issue,)):
+                        name = hashlib.sha256(row[0].encode()).hexdigest()[:24]
+                        locks.add(store.config.tracking_db.with_name(f".reconcile-{name}.lock"))
+            return locks
+
+        with ExitStack() as stack:
+            selected = paths()
+            for path in sorted(selected):
+                fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+                lock = stack.enter_context(os.fdopen(fd, "w"))
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if selected != paths():
+                raise Superseded("feature works changed during ownership handoff")
+            yield
+
+    def publish_view(self, feature: dict, outbox: dict, stamp: datetime) -> dict:
+        view = {**feature, "mirror": {
+            key: outbox[key]
+            for key in ("state", "last_error", "checked_at", "next_attempt_at")
+        }, "project_receipt": json.loads(outbox["receipt_json"] or "null")}
+        for destination in self.stores:
+            with destination._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("""INSERT INTO delivery_feature_views VALUES (?,?,?)
+                    ON CONFLICT(issue) DO UPDATE SET payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                    WHERE delivery_feature_views.payload_json!=excluded.payload_json""",
+                    (feature["issue"], canonical_json(view), stamp.isoformat()))
+        return view
+
     def tick(self) -> dict:
         self.observe_prs()
         results = {}
         for issue, (store, feature) in self.selected().items():
-            identity = self.identity(feature)
-            stamp = self.clock()
+            try:
+                with self.handoff(issue):
+                    view = self.project(store, feature)
+                    if view:
+                        results[issue] = view
+            except (BlockingIOError, Superseded):
+                # The existing owner finishes first; the next local tick retries.
+                continue
+        return results
+
+    def project(self, store: DeliveryStore, feature: dict) -> dict | None:
+        issue = feature["issue"]
+        identity = self.identity(feature)
+        stamp = self.clock()
+
+        def fence():
+            latest = self.selected().get(issue)
+            if not latest or self.identity(latest[1]) != identity:
+                raise Superseded("feature owner or status changed")
+
+        fence()
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute("SELECT * FROM delivery_project_outbox WHERE issue=?",
+                               (issue,)).fetchone()
+            if not prior or prior["identity"] != identity:
+                db.execute("""INSERT INTO delivery_project_outbox
+                    (issue,identity,payload_json,state,next_attempt_at)
+                    VALUES (?,?,?,'pending',?)
+                    ON CONFLICT(issue) DO UPDATE SET identity=excluded.identity,
+                    payload_json=excluded.payload_json,state='pending',attempts=0,
+                    next_attempt_at=excluded.next_attempt_at,last_error=NULL,receipt_json=NULL,
+                    checked_at=NULL""",
+                    (issue, identity, canonical_json(feature), stamp.isoformat()))
+            current = dict(db.execute("SELECT * FROM delivery_project_outbox WHERE issue=?",
+                                      (issue,)).fetchone())
+        # Establish selected ownership everywhere before making any remote
+        # effect. Legacy reconcile locks remain held through final readback.
+        self.publish_view(feature, current, stamp)
+        if current["next_attempt_at"] <= stamp.isoformat():
+            try:
+                fence()
+                if feature.get("legacy_tracking"):
+                    raise ValueError("historical workflow retains its frozen tracking contract "
+                                     "until it stops")
+                receipt = self.github.mirror(feature, fence)
+                fence()
+                state, error = "consistent", None
+                delay = self.interval
+            except Superseded:
+                return None
+            except Exception as exc:
+                receipt, state, error = None, "pending", str(exc)[:1000]
+                delay = min(3600, 15 * 2 ** min(current["attempts"], 8))
             with store._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                prior = db.execute("SELECT * FROM delivery_project_outbox WHERE issue=?",
-                                   (issue,)).fetchone()
-                if not prior or prior["identity"] != identity:
-                    db.execute("""INSERT INTO delivery_project_outbox
-                        (issue,identity,payload_json,state,next_attempt_at)
-                        VALUES (?,?,?,'pending',?)
-                        ON CONFLICT(issue) DO UPDATE SET identity=excluded.identity,
-                        payload_json=excluded.payload_json,state='pending',attempts=0,
-                        next_attempt_at=excluded.next_attempt_at,last_error=NULL,receipt_json=NULL,
-                        checked_at=NULL""",
-                        (issue, identity, canonical_json(feature), stamp.isoformat()))
+                db.execute("""UPDATE delivery_project_outbox SET state=?,attempts=?,
+                    next_attempt_at=?,last_error=?,receipt_json=?,checked_at=?
+                    WHERE issue=? AND identity=?""", (
+                    state, 0 if state == "consistent" else current["attempts"] + 1,
+                    (stamp + timedelta(seconds=delay)).isoformat(), error,
+                    canonical_json(receipt) if receipt else None, stamp.isoformat(),
+                    issue, identity))
                 current = dict(db.execute("SELECT * FROM delivery_project_outbox WHERE issue=?",
                                           (issue,)).fetchone())
-            if current["next_attempt_at"] <= stamp.isoformat():
-                def fence(issue=issue, identity=identity):
-                    latest = self.selected().get(issue)
-                    if not latest or self.identity(latest[1]) != identity:
-                        raise Superseded("feature owner or status changed")
-
-                try:
-                    fence()
-                    if feature.get("legacy_tracking"):
-                        raise ValueError("historical workflow retains its frozen tracking contract "
-                                         "until it stops")
-                    receipt = self.github.mirror(feature, fence)
-                    fence()
-                    state, error = "consistent", None
-                    delay = self.interval
-                except Superseded:
-                    continue
-                except Exception as exc:
-                    receipt, state, error = None, "pending", str(exc)[:1000]
-                    delay = min(3600, 15 * 2 ** min(current["attempts"], 8))
-                with store._connect() as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    db.execute("""UPDATE delivery_project_outbox SET state=?,attempts=?,
-                        next_attempt_at=?,last_error=?,receipt_json=?,checked_at=?
-                        WHERE issue=? AND identity=?""", (
-                        state, 0 if state == "consistent" else current["attempts"] + 1,
-                        (stamp + timedelta(seconds=delay)).isoformat(), error,
-                        canonical_json(receipt) if receipt else None, stamp.isoformat(),
-                        issue, identity))
-                    current = dict(db.execute("SELECT * FROM delivery_project_outbox WHERE issue=?",
-                                              (issue,)).fetchone())
-            view = {**feature, "mirror": {
-                key: current[key]
-                for key in ("state", "last_error", "checked_at", "next_attempt_at")
-            }, "project_receipt": json.loads(current["receipt_json"] or "null")}
-            # Retire the old helper's writes for these delivery works. Historical
-            # sync receipts remain untouched; they are no longer the live mirror.
-            for destination in self.stores:
-                with destination._connect() as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    db.execute("""INSERT INTO delivery_feature_views VALUES (?,?,?)
-                        ON CONFLICT(issue) DO UPDATE SET payload_json=excluded.payload_json,
-                        updated_at=excluded.updated_at
-                        WHERE delivery_feature_views.payload_json!=excluded.payload_json""",
-                        (issue, canonical_json(view), stamp.isoformat()))
-            results[issue] = view
-        return results
+        fence()
+        return self.publish_view(feature, current, stamp)
 
 
 def main() -> None:

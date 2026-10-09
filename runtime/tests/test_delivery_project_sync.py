@@ -270,7 +270,11 @@ def test_project_drift_is_rechecked_at_five_minutes(service):
     assert len(remote.writes) == 2
 
 
-def test_github_preserves_option_ids_paginates_and_reads_back_exact_status():
+@pytest.mark.parametrize("assignee", ["owner", "@me"])
+@pytest.mark.parametrize("already_assigned", [True, False])
+def test_github_preserves_option_ids_paginates_and_reads_back_exact_status(
+    assignee, already_assigned,
+):
     from devflow_temporal.delivery_project_sync import GitHub
 
     class FakeGraph(GitHub):
@@ -280,14 +284,28 @@ def test_github_preserves_option_ids_paginates_and_reads_back_exact_status():
             self.status = {"optionId": "existing", "name": "Existing"}
             self.cursors = []
             self.changes = []
+            self.assigned = already_assigned
+            self.assignment_writes = 0
 
         def command(self, *args, **_kwargs):
+            if args[:2] == ("api", "user"):
+                assert args == ("api", "user", "--hostname", "github.com")
+                return {"login": "owner"}
             assert args[:2] == ("issue", "view")
             return {"id": "issue", "url": "https://github.com/example/fixture/issues/3",
-                    "state": "OPEN", "assignees": [{"login": "owner"}]}
+                    "state": "OPEN", "assignees": [{"login": "owner"}] if self.assigned else []}
 
         def graphql(self, host, query, **variables):
             assert host == "github.com"
+            if "user(login:$login)" in query:
+                assert variables["login"] == "owner"
+                return {"user": {"id": "owner-id"}}
+            if "addAssigneesToAssignable" in query:
+                assert "assignable{... on Issue{id}}" in query
+                assert variables == {"id": "issue", "assignees": ["owner-id"]}
+                self.assigned = True
+                self.assignment_writes += 1
+                return {"addAssigneesToAssignable": {"assignable": {"id": "issue"}}}
             if "projectV2(number:" in query:
                 return {"user": {"projectV2": {"id": "project", "closed": False,
                         "field": {"id": "field", "options": self.options}}}}
@@ -314,16 +332,21 @@ def test_github_preserves_option_ids_paginates_and_reads_back_exact_status():
     remote = FakeGraph()
     feature = {"issue": "https://github.com/example/fixture/issues/3", "status": "Merged",
                "binding": {"project": "https://github.com/users/example/projects/1",
-                           "assignee": "owner"}}
+                           "assignee": assignee}}
     result = remote.mirror(feature, lambda: None)
     assert result["status"] == "Merged"
     assert remote.cursors == [None, "next"]
     assert len(remote.changes) == 1
     remote.mirror(feature, lambda: None)
     assert len(remote.changes) == 1  # Lost acknowledgement is safe to replay.
+    assert remote.assignment_writes == (0 if already_assigned else 1)
+    assert result["assignee"] == "owner"
 
 
-def test_audit_compares_canonical_status_and_live_pr_not_historical_mapping(service, monkeypatch):
+@pytest.mark.parametrize("assignee", ["owner", "@me"])
+def test_audit_compares_canonical_status_and_live_pr_not_historical_mapping(
+    service, monkeypatch, assignee,
+):
     import importlib.util
     import sys
 
@@ -335,7 +358,7 @@ def test_audit_compares_canonical_status_and_live_pr_not_historical_mapping(serv
     remote.mirror = lambda *_: receipt
     with store._connect() as db:
         saved = json.loads(db.execute("SELECT payload_json FROM delivery_features").fetchone()[0])
-        saved["binding"] = {"project": receipt["project"], "assignee": "owner"}
+        saved["binding"] = {"project": receipt["project"], "assignee": assignee}
         db.execute("UPDATE delivery_features SET payload_json=?", (json.dumps(saved),))
     # Keep the binding frozen across the PR-observation transition.
     with store._connect() as db:
@@ -353,7 +376,8 @@ def test_audit_compares_canonical_status_and_live_pr_not_historical_mapping(serv
     monkeypatch.setattr(helper, "project_item", lambda *_: {
         "project": {"id": "p"}, "fieldValueByName": {"optionId": "o", "name": "Awaiting merge"},
     })
-    monkeypatch.setattr(helper, "gh", lambda *_a, **_kw: {
+    monkeypatch.setattr(helper, "gh", lambda *args, **_kw: {"login": "owner"}
+                        if args[:2] == ("api", "user") else {
         "url": "https://github.com/example/fixture/pull/7", "state": "MERGED",
         "headRefOid": "a" * 40,
     })
@@ -415,3 +439,133 @@ def test_service_install_stages_owned_plist_without_starting_a_process(tmp_path,
     assert plist["KeepAlive"] and plist["RunAtLoad"]
     assert "--config-sha256" in plist["ProgramArguments"]
     assert not (tmp_path / "project-sync-activation.json").exists()
+
+
+def load_tracking_helpers(store, monkeypatch):
+    import importlib.util
+    import sys
+
+    monkeypatch.setitem(sys.modules, "state", store.state)
+    modules = {}
+    for name in ("github", "reconcile"):
+        loader = importlib.util.spec_from_file_location(
+            name, store.config.helpers_dir / f"{name}.py",
+        )
+        module = importlib.util.module_from_spec(loader)
+        monkeypatch.setitem(sys.modules, name, module)
+        loader.loader.exec_module(module)
+        modules[name] = module
+    return modules["github"], modules["reconcile"]
+
+
+def second_owner(store, tmp_path, *, copied=False):
+    import sqlite3
+
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    target = tmp_path / "z-current.sqlite3"
+    if copied:
+        with store._connect() as source, sqlite3.connect(target) as destination:
+            source.backup(destination)
+    raw = {**store.config.raw, "tracking_db": str(target),
+           "state_root": str(tmp_path / "second-state")}
+    config = tmp_path / "second.json"
+    config.write_text(json.dumps(raw))
+    return DeliveryStore(DeliveryConfig.load(config))
+
+
+def test_copied_admissions_compare_versions_only_within_selected_source(
+    service, tmp_path, monkeypatch,
+):
+    older, request = service
+    older.submit(request)
+    selected = second_owner(older, tmp_path, copied=True)
+    older.project(request["run_id"], phase="blocked", execution_state="blocked",
+                  event_type="blocked", message="Old source stopped", outcome="blocked")
+    github, _ = load_tracking_helpers(older, monkeypatch)
+    result = ProjectSynchronizer([older, selected], Remote()).tick()[request["issue_url"]]
+    assert result["source"] == str(selected.config.tracking_db.resolve())
+    assert result["status"] == "Queued" and result["version"] == 1
+    for store in (older, selected):
+        with store._connect() as db:
+            assert current(db, request["issue_url"])["status"] == "Queued"
+            assert github.feature_state(db, request["issue_url"])["status"] == "Queued"
+
+
+def test_handoff_fences_actual_legacy_apply_before_remote_effect(service, tmp_path, monkeypatch):
+    import fcntl
+    import hashlib
+
+    old, request = service
+    old.submit(request)
+    with old._connect() as db:
+        spec = json.loads(db.execute("SELECT request_json FROM delivery_runs").fetchone()[0])
+        spec.pop("project_sync_version")
+        db.execute("UPDATE delivery_runs SET request_json=?", (json.dumps(spec),))
+        transition(db, old.config, request["run_id"])
+    new = second_owner(old, tmp_path)
+    new.submit({**request, "run_id": "run-2", "work_id": "work-2", "command_id": "command-2"})
+    github, reconcile = load_tracking_helpers(old, monkeypatch)
+    monkeypatch.setattr(github, "gh", lambda *_a, **_k: pytest.fail("legacy remote effect"))
+    with old._connect() as db:
+        old.state.update(db, "work", {"id": request["work_id"], "details": {
+            "github": {"project": "https://github.com/users/example/projects/1"},
+        }}, None)
+        saved = reconcile.queue(db, request["work_id"], "sync", {
+            "issue": request["issue_url"], "status": "in-review", "release": False,
+            "project": "https://github.com/users/example/projects/1",
+            "project_status": "In review", "assignee": "owner",
+        }, owner="external:devflow:run-1")
+        assert reconcile.current(db, saved)
+    lock_name = hashlib.sha256(request["work_id"].encode()).hexdigest()[:24]
+    lock_path = old.config.tracking_db.with_name(f".reconcile-{lock_name}.lock")
+    remote = Remote()
+    mirror = remote.mirror
+
+    def overlap(feature, fence):
+        with lock_path.open("a") as handle, pytest.raises(BlockingIOError):
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with old._connect() as db:
+            assert github.feature_state(db, request["issue_url"])["run_id"] == "run-2"
+            assert reconcile.apply_one(db, saved)["state"] == "superseded"
+        return mirror(feature, fence)
+
+    remote.mirror = overlap
+    sync = ProjectSynchronizer([old, new], remote)
+    # A legacy write already in flight owns the lock; the projector must wait.
+    with lock_path.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert sync.tick() == {}
+        assert not remote.writes
+    assert sync.tick()[request["issue_url"]]["mirror"]["state"] == "consistent"
+    assert remote.writes == ["Queued"]
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+@pytest.mark.parametrize("drift", [False, True])
+def test_terminal_tracking_retains_publication_custody_readback(monkeypatch, fresh, drift):
+    import asyncio
+
+    from devflow_temporal import delivery_terminal_recovery
+
+    seen = []
+    spec = {"provider": "codex", **({"project_sync_version": 1} if fresh else {})}
+    monkeypatch.setattr(delivery_activities, "_context", lambda *_: (None, None))
+
+    def guard(*_):
+        seen.append("guard")
+        if drift:
+            raise ValueError("publication identity drift")
+
+    def acknowledge(*_, **_kwargs):
+        seen.append("local")
+        return {"state": "recorded" if fresh else "consistent"}
+
+    monkeypatch.setattr(delivery_terminal_recovery, "published_readback", guard)
+    monkeypatch.setattr(delivery_activities, "_tracker_sync", acknowledge)
+    result = asyncio.run(delivery_activities.delivery_terminal_tracker({
+        "spec": spec, "status": "in-review", "release": True,
+        "candidate": {"head": "a" * 40}, "pull_request": {"url": "https://github.com/o/r/pull/1"},
+    }))
+    assert seen == (["guard"] if drift else ["guard", "local"])
+    assert result["state"] == ("pending" if drift else "recorded" if fresh else "consistent")

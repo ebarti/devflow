@@ -248,6 +248,8 @@ def apply_sync(db, saved):
 
 
 def apply_one(db, saved):
+    if not current(db, saved):
+        return {"work_id": saved["work_id"], "state": "superseded"}
     lock_name = hashlib.sha256(saved["work_id"].encode()).hexdigest()[:24]
     filename = db.execute("PRAGMA database_list").fetchone()[2]
     lock = Path(filename).with_name(".reconcile-" + lock_name + ".lock")

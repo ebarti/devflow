@@ -32,6 +32,9 @@ ownership or consume delivery repair cycles.
 - For an issue with attempts in several sources, the most recently admitted run owns the
   feature. Updating an older run does not steal ownership. The worker publishes the same
   selected feature view to every participating source.
+  The source path breaks ties between copied admissions; version counters are compared
+  only within the same source. Handoff holds the legacy per-work reconciliation locks
+  and publishes pending ownership everywhere before any remote effect.
 - The worker consumes committed changes, coalescing obsolete projections, with durable
   retry state. An acknowledged mirror requires remote readback of the exact status and
   assignee. A failed mirror remains pending and does not change the feature's status.
@@ -41,6 +44,7 @@ ownership or consume delivery repair cycles.
   idempotently. Unknown remote observations retain the last known fact with an error and
   timestamp; they never imply successful synchronization.
 - New deliveries acknowledge local tracking transitions without waiting for GitHub.
+  Terminal publication still requires its PR custody readback before local acknowledgement.
   Historical run data is not rewritten to adopt new execution policies.
 - Project Status option names match the local feature status literally. Creating missing
   options preserves the existing option IDs and values; there are no status aliases.
@@ -78,3 +82,6 @@ retains its original activity contract while active. The projector yields Projec
 ownership to that workflow until it stops, then resumes the canonical mirror. Fresh
 admissions always use asynchronous tracking. This exception preserves replay and
 recovery without modifying frozen specifications or historical acknowledgements.
+Older immutable helper installations without the feature ownership guard must remain
+activation-fenced or be upgraded before enabling this service; the new ownership view
+cannot fence code that does not read it.

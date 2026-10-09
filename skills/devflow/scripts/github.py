@@ -275,10 +275,13 @@ def feature_state(db, issue):
     key = issue.rstrip("/").casefold()
     local = db.execute("SELECT payload_json,version FROM delivery_features WHERE issue=?", (key,)).fetchone()
     saved = db.execute("SELECT payload_json FROM delivery_feature_views WHERE issue=?", (key,)).fetchone()
-    feature = {**json.loads(local[0]), "version": local[1]} if local else None
+    source = str(Path(db.execute("PRAGMA database_list").fetchone()[2]).resolve())
+    feature = {**json.loads(local[0]), "version": local[1], "source": source} if local else None
     view = json.loads(saved[0]) if saved else None
-    if view and (not feature or (view["admitted_at"], view["run_id"]) > (feature["admitted_at"], feature["run_id"])
-                 or (view["run_id"] == feature["run_id"] and view["version"] >= feature["version"])):
+    local_identity = (feature["admitted_at"], feature["run_id"], source) if feature else None
+    selected_identity = (view["admitted_at"], view["run_id"], view["source"]) if view else None
+    if view and (not feature or selected_identity > local_identity
+                 or (selected_identity == local_identity and view["version"] >= feature["version"])):
         return None if view.get("legacy_tracking") else view
     return None if feature and feature.get("legacy_tracking") else feature
 
@@ -289,6 +292,9 @@ def audit_feature(db, work, feature):
                   reconciliation_required=[], unknown=[])
     issue = view(work["issue"])
     assignee = feature["binding"].get("assignee")
+    if assignee == "@me":
+        assignee = gh("api", "user", "--hostname", urlsplit(feature["issue"]).netloc,
+                      as_json=True)["login"]
     if not assignee:
         result["unknown"].append("assignee_unconfigured")
     elif assignee.casefold() not in {item["login"].casefold() for item in issue["assignees"]}:
