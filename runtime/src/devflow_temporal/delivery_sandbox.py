@@ -164,9 +164,24 @@ def _remove_generated_project_directory(workspace: Path) -> None:
         raise ValueError("project Codex directory changed before role launch")
 
 
+def _native_path(toolchain_roots: tuple[Path, ...], *, packaged_go: bool = False) -> str:
+    return ":".join(
+        [
+            *(str(root / "bin") for root in toolchain_roots),
+            *(["/usr/local/go/bin"] if packaged_go else []),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+    )
+
+
 def _native_env(
     home: Path, codex_home: Path, scratch: Path, toolchain_roots: tuple[Path, ...] = (),
-    *, short_temp: bool = False,
+    *, short_temp: bool = False, packaged_go: bool = False,
 ) -> dict[str, str]:
     env = {
         key: value
@@ -175,17 +190,7 @@ def _native_env(
     }
     env.update(
         {
-            "PATH": ":".join(
-                [
-                    *(str(root / "bin") for root in toolchain_roots),
-                    "/opt/homebrew/bin",
-                    "/usr/local/bin",
-                    "/usr/bin",
-                    "/bin",
-                    "/usr/sbin",
-                    "/sbin",
-                ]
-            ),
+            "PATH": _native_path(toolchain_roots, packaged_go=packaged_go),
             "HOME": str(home),
             "CODEX_HOME": str(codex_home),
             "TMPDIR": str(scratch),
@@ -213,13 +218,15 @@ def _native_environment_version(owner: Path, legacy_evidence: Path) -> int:
     if marker.exists() or marker.is_symlink():
         _private_file(marker)
         value = json.loads(marker.read_bytes())
-        if value not in ({"version": 1}, {"version": 2}) or type(value["version"]) is not int:
+        if (value not in ({"version": 1}, {"version": 2}, {"version": 3})
+                or type(value["version"]) is not int):
             raise ValueError("native environment recipe is not admitted")
         return value["version"]
     legacy = legacy_evidence.exists() or legacy_evidence.is_symlink()
     if legacy:
         _private_file(legacy_evidence)
-    version = 1 if legacy else 2
+    # v1: durable temp; v2: short owned temp; v3: packaged Go is discoverable.
+    version = 1 if legacy else 3
     _write_once(marker, json.dumps({"version": version}).encode())
     return version
 
@@ -354,7 +361,7 @@ def prepare_native_role(
         attempt_dir, attempt_dir / "native-process.json",
     )
     scratch = (RunResources(spec).execution_scratch("role", request["role"])
-               if environment_version == 2 else ephemeral_home / "tmp")
+               if environment_version >= 2 else ephemeral_home / "tmp")
     _private(scratch)
     source = Path(spec["policy"].get("codex_auth_path") or Path.home() / ".codex" / "auth.json")
     _private_file(source)
@@ -396,7 +403,7 @@ def prepare_native_role(
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
     env = _native_env(
         ephemeral_home, codex_home, scratch, toolchain_roots,
-        short_temp=environment_version == 2,
+        short_temp=environment_version >= 2, packaged_go=environment_version >= 3,
     )
     if cache:
         env["COREPACK_HOME"] = cache
@@ -513,7 +520,7 @@ def prepare_native_check(
         _private(path)
     environment_version = _native_environment_version(codex_home, codex_home / "config.toml")
     scratch = (RunResources(spec).execution_scratch("checks", key)
-               if environment_version == 2 else home / "tmp")
+               if environment_version >= 2 else home / "tmp")
     _private(scratch)
     domains = tuple(check.get("network_domains", ()))
     toolchain_roots = tuple(Path(root) for root in spec["policy"].get("toolchain_roots", []))
@@ -542,7 +549,7 @@ def prepare_native_check(
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
     env = _native_env(
         home, codex_home, scratch, toolchain_roots,
-        short_temp=environment_version == 2,
+        short_temp=environment_version >= 2, packaged_go=environment_version >= 3,
     )
     env.update(
         {

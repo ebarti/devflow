@@ -331,8 +331,9 @@ def test_target_only_build_still_requires_frozen_allowlist(addon, monkeypatch):
     "drift", [None, "source", "binary", "tools", "environment", "log", "process",
               "process-exception"]
 )
+@pytest.mark.parametrize("environment_version", [1, 2, 3])
 def test_native_receipt_replay_readback_refuses_drift_without_launch(
-    addon, tmp_path, monkeypatch, drift
+    addon, tmp_path, monkeypatch, drift, environment_version
 ):
     from devflow_temporal import delivery_native_process, delivery_resources
     from devflow_temporal.delivery_broker import DeliveryBroker
@@ -377,6 +378,8 @@ def test_native_receipt_replay_readback_refuses_drift_without_launch(
     candidate = {"id": "candidate"}
     evidence = state / "checks"
     evidence.mkdir()
+    marker = evidence / "native-environment.json"
+    delivery_resources.write_private(marker, {"version": environment_version})
     (package / "build/Release").mkdir(parents=True)
     binary = package / "build/Release/better_sqlite3.node"
     binary.write_bytes(b"controlled binary fixture")
@@ -411,6 +414,11 @@ def test_native_receipt_replay_readback_refuses_drift_without_launch(
         checkout, ["apps/api"], evidence, candidate, {"store": str(store)}
     )
     original_receipt = (evidence / "native-addon-preparation.json").read_bytes()
+    assert ("/usr/local/go/bin" in first["node_toolchain"]["environment"]["PATH"].split(":")) == (
+        environment_version >= 3
+    )
+    if environment_version == 1:
+        marker.unlink()  # Historical addon receipts predate the environment marker.
     if drift == "source":
         candidate["id"] = "other-candidate"
     elif drift == "binary":

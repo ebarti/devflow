@@ -750,6 +750,7 @@ class DeliveryBroker:
             validate_native_addon,
         )
         from .delivery_resources import RunResources, read_private, write_private
+        from .delivery_sandbox import _native_environment_version, _native_path
 
         authority = native_addon_authority(self.spec, checkout, projects)
         if authority is None:
@@ -767,6 +768,8 @@ class DeliveryBroker:
         if not roots:
             raise ValueError("native addon requires the frozen Node22 toolchain root")
         toolchain = roots[0]
+        receipt = evidence / "native-addon-preparation.json"
+        environment_version = _native_environment_version(evidence, receipt)
         node, corepack = toolchain / "bin/node", toolchain / "bin/corepack"
         if (
             node.resolve(strict=True) != node
@@ -789,17 +792,7 @@ class DeliveryBroker:
             },
             "package_manager": authority["package_manager"],
             "environment": {
-                "PATH": ":".join(
-                    [
-                        *(str(p / "bin") for p in roots),
-                        "/opt/homebrew/bin",
-                        "/usr/local/bin",
-                        "/usr/bin",
-                        "/bin",
-                        "/usr/sbin",
-                        "/sbin",
-                    ]
-                ),
+                "PATH": _native_path(tuple(roots), packaged_go=environment_version >= 3),
                 "COREPACK_HOME": self.spec["policy"]["package_manager_cache"],
                 "npm_config_nodedir": str(toolchain),
                 "npm_config_build_from_source": "true",
@@ -808,7 +801,6 @@ class DeliveryBroker:
         }
         builder = frozen_native_builder(self.spec, authority["package_manager"])
         tools["native_builder"] = builder
-        receipt = evidence / "native-addon-preparation.json"
         if receipt.exists():
             old = read_private(receipt)
             if old["candidate_id"] != candidate["id"] or old["native_addon_authority"] != authority:
