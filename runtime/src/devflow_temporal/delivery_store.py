@@ -386,6 +386,12 @@ class DeliveryStore:
             from .delivery_settings import initialize as initialize_settings
 
             initialize_settings(db)
+            from .delivery_features import initialize as initialize_features
+            from .delivery_features import transition
+
+            initialize_features(db)
+            for row in db.execute("SELECT run_id FROM delivery_runs ORDER BY created_at,run_id"):
+                transition(db, self.config, row[0])
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -397,8 +403,8 @@ class DeliveryStore:
         finally:
             db.close()
 
-    @staticmethod
     def _event(
+        self,
         db: sqlite3.Connection,
         run_id: str,
         revision: int,
@@ -412,6 +418,9 @@ class DeliveryStore:
                VALUES (?, ?, ?, ?, ?, ?)""",
             (run_id, _now(), event_type, message, revision, canonical_json(payload or {})),
         )
+        from .delivery_features import transition
+
+        transition(db, self.config, run_id)
         return int(cursor.lastrowid)
 
     def submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None) -> dict[str, Any]:
@@ -3220,6 +3229,16 @@ class DeliveryStore:
         return {"runs": [self._compact(dict(row)) for row in rows[:limit]],
                 "next_cursor": next_cursor}
 
+    def feature(self, run_id: str) -> dict | None:
+        from .delivery_features import current
+
+        with self._connect() as db:
+            row = db.execute("SELECT issue_url FROM delivery_runs WHERE run_id=?",
+                             (run_id,)).fetchone()
+            if row is None:
+                raise ValueError("run ID not found")
+            return current(db, row[0])
+
     def _compact(self, row: dict[str, Any]) -> dict[str, Any]:
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
@@ -3247,6 +3266,9 @@ class DeliveryStore:
             from .delivery_dashboard import presentation
 
             dashboard_state = presentation(db, row["run_id"])
+            from .delivery_features import current as current_feature
+
+            feature = current_feature(db, row["issue_url"])
             active = db.execute(
                 "SELECT COUNT(*) FROM delivery_attempts WHERE run_id=? "
                 "AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
@@ -3266,6 +3288,7 @@ class DeliveryStore:
             "issue": row["issue_url"],
             "issue_url": row["issue_url"],
             "repository": row["repository_key"],
+            "feature": feature,
             "phase": row["phase"],
             "execution_state": row["execution_state"],
             "execution_retired": execution_retired(spec) or execution_retired(effective),

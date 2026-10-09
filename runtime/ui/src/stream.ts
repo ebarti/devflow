@@ -58,6 +58,7 @@ export function subscribeRun(
 
   callbacks.onConnection('connecting')
   source.addEventListener('update', update)
+  source.addEventListener('feature', () => { void refresh() })
   source.addEventListener('reset', () => { void refresh() })
   source.onopen = () => { open = true; void refresh() }
   source.onerror = () => { open = false; callbacks.onConnection('disconnected') }

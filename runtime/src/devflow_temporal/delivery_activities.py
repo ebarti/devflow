@@ -812,6 +812,10 @@ def _tracker_error_retryable(exc) -> bool:
 def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
                   terminal: bool = False, reason: str | None = None) -> dict[str, Any]:
     store, _ = _context(spec)
+    if spec.get("project_sync_version") == 1:
+        from .delivery_features import record_tracking
+
+        return record_tracking(store, spec, status, release)
     guarded = spec.get("terminal_tracker_version") == 1
     if guarded and not terminal:
         from .delivery_policy_recovery import work_binding

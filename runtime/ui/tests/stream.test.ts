@@ -46,6 +46,17 @@ describe('run event stream', () => {
     expect(source.closed).toBe(true)
   })
 
+  it('refreshes feature changes without advancing the historical run cursor', async () => {
+    const source = new MockSource()
+    const load = vi.fn().mockResolvedValue(mockRun)
+    const stop = subscribeRun(mockRun.id, mockRun, { onSnapshot: vi.fn(), onConnection: vi.fn() }, { load, source: () => source })
+    source.listeners.get('feature')?.(new Event('feature')); await settle()
+    expect(load).toHaveBeenCalledTimes(1)
+    source.update(5); await settle()
+    expect(load).toHaveBeenCalledTimes(2)
+    stop()
+  })
+
   it('keeps the previous snapshot and marks the stream disconnected after a failed refresh', async () => {
     const source = new MockSource()
     const onSnapshot = vi.fn()

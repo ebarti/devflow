@@ -493,7 +493,14 @@ def create_app(config_path: Path) -> FastAPI:
 
         async def stream():
             nonlocal cursor
+            feature = None
             while not await request.is_disconnected():
+                current_feature = json.dumps(service.store.feature(run_id), sort_keys=True)
+                if current_feature != feature:
+                    feature = current_feature
+                    # A separate event domain: do not rewrite historical run
+                    # sequence numbers when only the current feature changes.
+                    yield 'event: feature\ndata: {}\n\n'
                 updates = service.store.events(run_id, cursor)
                 if updates:
                     for event in updates:

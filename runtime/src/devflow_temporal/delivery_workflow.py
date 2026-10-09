@@ -122,6 +122,13 @@ def _bounded_causes(result: dict[str, Any]) -> list[dict]:
     return bounded
 
 
+def _tracking_ready(spec: dict, tracker: dict) -> bool:
+    return tracker.get("state") == "consistent" or (
+        spec.get("project_sync_version") == 1 and tracker.get("state") == "recorded"
+        and tracker.get("scope") == "local"
+    )
+
+
 @workflow.defn(name="DevflowDeliveryWorkflow")
 class DeliveryWorkflow:
     def __init__(self) -> None:
@@ -444,7 +451,7 @@ class DeliveryWorkflow:
                                              **({"retryable": isinstance(exc, ActivityError)
                                                  and isinstance(exc.cause, ActivityTimeoutError)}
                                                 if spec.get("tracker_retry_version") == 1 else {})}
-                if self.state["tracker"].get("state") == "consistent":
+                if _tracking_ready(spec, self.state["tracker"]):
                     checkpoint["state"] = "confirmed"
                     self.state.update({key: checkpoint[key] for key in (
                         "phase", "execution_state", "outcome", "error",
@@ -1040,7 +1047,7 @@ class DeliveryWorkflow:
         self.state["tracker"] = started_tracker
         if spec.get("tracker_retry_version") == 1 and self.cancel_requested:
             return await self._cancelled(spec)
-        if started_tracker.get("state") != "consistent":
+        if not _tracking_ready(spec, started_tracker):
             return await self._stop(
                 spec, "initial tracker readback remains pending",
                 controller_cause=("tracker_readback" if started_tracker.get("retryable") is True
@@ -1158,7 +1165,7 @@ class DeliveryWorkflow:
                 "spec": spec, "repair_continuation": True,
             })
             self.state["tracker"] = tracker
-            if tracker.get("state") != "consistent":
+            if not _tracking_ready(spec, tracker):
                 return await self._stop(spec, "pending publication tracker readback pending")
             if self.cancel_requested:
                 return await self._stop(spec, "cancelled")
@@ -1213,7 +1220,7 @@ class DeliveryWorkflow:
                 "spec": spec, "repair_continuation": True,
             })
             self.state["tracker"] = tracker
-            if tracker.get("state") != "consistent":
+            if not _tracking_ready(spec, tracker):
                 return await self._stop(spec, "gate retry tracker readback remains pending")
         except Exception as exc:
             return await self._stop(spec, "gate retry preflight failed: " + type(exc).__name__)
@@ -1244,7 +1251,7 @@ class DeliveryWorkflow:
             tracker = await self._activity('delivery_tracker_start', {
                 'spec': spec, 'repair_continuation': True})
             self.state['tracker'] = tracker
-            if tracker.get('state') != 'consistent':
+            if not _tracking_ready(spec, tracker):
                 return await self._stop(spec, 'CI continuation tracker readback remains pending')
             self.state['revision'] += 1
             await self._project(spec, 'ci_retry_started',
@@ -1260,7 +1267,7 @@ class DeliveryWorkflow:
                 tracker = await self._activity('delivery_tracker', {
                     'spec': spec, 'pr': self.state['pull_request']})
                 self.state['tracker'] = tracker
-                if tracker.get('state') != 'consistent':
+                if not _tracking_ready(spec, tracker):
                     return await self._stop(spec, 'tracker readback remains pending or conflicting')
         except Exception as exc:
             return await self._stop(spec, 'CI continuation failed: ' + type(exc).__name__)
@@ -1293,7 +1300,7 @@ class DeliveryWorkflow:
                 "spec": spec, "repair_continuation": True,
             })
             self.state["tracker"] = tracker
-            if tracker.get("state") != "consistent":
+            if not _tracking_ready(spec, tracker):
                 return await self._stop(spec, "metadata tracker readback is pending or conflicting")
             for name, stage in (("delivery_precheck", "prepublish"),
                                 ("delivery_checks", "local"),
@@ -1424,7 +1431,7 @@ class DeliveryWorkflow:
                 'spec': spec, 'repair_continuation': True,
             })
             self.state['tracker'] = tracker
-            if tracker.get('state') != 'consistent':
+            if not _tracking_ready(spec, tracker):
                 return await self._stop(spec, 'technical tracker is pending or conflicting')
         except Exception as exc:
             return await self._stop(spec, 'technical custody failed: ' + type(exc).__name__)
@@ -1449,7 +1456,7 @@ class DeliveryWorkflow:
             tracker = await self._activity("delivery_tracker_start", {"spec": spec,
                                                                      "repair_continuation": True})
             self.state["tracker"] = tracker
-            if tracker.get("state") != "consistent":
+            if not _tracking_ready(spec, tracker):
                 return await self._stop(
                     spec, "gates-only tracker readback is pending or conflicting"
                 )
@@ -1498,7 +1505,7 @@ class DeliveryWorkflow:
             self.state["tracker"] = tracker
             if self.cancel_requested:
                 return await self._cancelled(spec)
-            if tracker.get("state") == "consistent":
+            if _tracking_ready(spec, tracker):
                 break
             if tracker.get("state") != "pending" or tracker.get("conflict"):
                 return await self._stop(spec, "repair tracker readback conflicts with authority")
@@ -1646,7 +1653,7 @@ class DeliveryWorkflow:
             self.state["tracker"] = tracker
             if self.cancel_requested:
                 return await self._cancelled(spec)
-            if tracker.get("state") == "consistent":
+            if _tracking_ready(spec, tracker):
                 break
             if tracker.get("state") != "pending" or tracker.get("conflict"):
                 return await self._stop(spec, "repair tracker readback conflicts with authority")
@@ -1702,7 +1709,7 @@ class DeliveryWorkflow:
         self.state["tracker"] = tracker
         if self.cancel_requested:
             return await self._cancelled(spec)
-        if tracker.get("state") != "consistent":
+        if not _tracking_ready(spec, tracker):
             return await self._stop(
                 spec, "policy recovery tracker readback is pending or conflicting"
             )
@@ -1793,7 +1800,7 @@ class DeliveryWorkflow:
                     spec, f"scope amendment tracker authority failed: {type(exc).__name__}"
                 )
             self.state["tracker"] = tracker
-            if tracker.get("state") == "consistent":
+            if _tracking_ready(spec, tracker):
                 break
             if tracker.get("state") != "pending" or tracker.get("conflict"):
                 return await self._stop(
@@ -2239,7 +2246,7 @@ class DeliveryWorkflow:
                 self.state["tracker"] = tracker
                 if self.cancel_requested:
                     return await self._cancelled(spec)
-                if tracker.get("state") != "consistent":
+                if not _tracking_ready(spec, tracker):
                     return await self._stop(spec, "tracker readback remains pending or conflicting")
             if self.cancel_requested:
                 return await self._cancelled(spec)
