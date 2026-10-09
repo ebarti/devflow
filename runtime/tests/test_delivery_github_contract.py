@@ -193,3 +193,39 @@ def test_update_cannot_rewrite_the_accepted_plan(tmp_path):
     updated["plan"]["scope"] = "Different feature"
     with pytest.raises(OwnershipConflict, match="business plan"):
         gh.update(ISSUE, record, updated, registry, token)
+
+
+@pytest.mark.parametrize("boundary", ["binding", "record"])
+def test_lost_binding_or_record_receipt_reconciles_known_comment(tmp_path, monkeypatch, boundary):
+    registry = ExecutionRegistry(tmp_path / "private" / "registry.sqlite3")
+    token = registry.claim({"issue": ISSUE}, "run-one", str(tmp_path / "store"))
+    gh = MemoryGitHub()
+    finish = registry.finish_effect
+    interrupted = False
+
+    def finish_effect(token, key, result, **kwargs):
+        nonlocal interrupted
+        prefix = "github-plan-bind:" if boundary == "binding" else "github-record:"
+        if key.startswith(prefix) and not interrupted:
+            interrupted = True
+            raise TimeoutError("response lost before local completion")
+        return finish(token, key, result, **kwargs)
+
+    monkeypatch.setattr(registry, "finish_effect", finish_effect)
+    if boundary == "binding":
+        with pytest.raises(TimeoutError):
+            gh.initialize(ISSUE, plan(), registry, token)
+    else:
+        record = gh.initialize(ISSUE, plan(), registry, token)
+        updated = deepcopy(record["manifest"])
+        updated["revision"] += 1
+        updated["workstream_issues"]["api"] = {
+            "id": "I_2", "number": 2, "url": "https://github.com/owner/repo/issues/2",
+        }
+        with pytest.raises(TimeoutError):
+            gh.update(ISSUE, record, updated, registry, token)
+    gh.calls.clear()
+    saved = gh.initialize(ISSUE, plan(), registry, token)
+    assert saved["comment_id"] == 11
+    assert gh.calls == [("GET", "repos/owner/repo/issues/comments/11")]
+    registry.stop(token, "settled", {})

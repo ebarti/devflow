@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 
 import pytest
@@ -45,13 +46,13 @@ def test_publication_response_loss_retains_feature_custody_until_binding_is_conf
     monkeypatch.setattr(
         publications,
         "record_publication",
-        lambda *_: (_ for _ in ()).throw(TimeoutError("binding response lost")),
+        lambda *_args, **_kw: (_ for _ in ()).throw(TimeoutError("binding response lost")),
     )
     with pytest.raises(TimeoutError):
         publications.publish(store, broker, req)
     with pytest.raises(OwnershipConflict, match="awaiting readback"):
         shared.stop(token, "still-cannot-release", {})
-    monkeypatch.setattr(publications, "record_publication", lambda *_: receipt)
+    monkeypatch.setattr(publications, "record_publication", lambda *_args, **_kw: receipt)
     assert publications.publish(store, broker, req) == receipt
     shared.stop(token, "settled", {})
 
@@ -107,3 +108,40 @@ def test_stack_append_uses_exact_bound_stack_and_preserves_plan(service, monkeyp
     assert all("?" not in path for _, path in calls)
     assert publications.record_publication(store, spec, receipt, gh) == receipt
     assert stack == [20, 21, 22]
+
+
+def test_integration_updates_lower_pr_in_place_with_a_new_pass(service, monkeypatch):
+    store, spec, record, _, _, gh = setup_feature(service, monkeypatch)
+    members = record["manifest"]["publication"]["members"]
+    original = deepcopy(members)
+    shared, token = registry(spec), spec["feature_delivery"]["owner"]
+    shared.checkpoint(token, "integration-pass:1", {
+        "number": 1, "target": "f" * 40, "members": original,
+    })
+    spec["feature_worker"] = {
+        "chunk_id": "model", "integration_pass": 1, "previous_publication": original[0],
+    }
+    spec["branch"], spec["publication_base_ref"] = original[0]["branch"], "main"
+    monkeypatch.setattr(publications, "require_execution", lambda *_: None)
+
+    def update(_issue, old, updated, *_):
+        record["manifest"] = deepcopy(updated)
+        return deepcopy(record)
+
+    gh.update = update
+    receipt = {"number": 20, "url": original[0]["url"], "head": "a" * 40}
+    assert publications.record_publication(store, spec, receipt, gh) == receipt
+    assert record["manifest"]["publication"]["stack_id"] == 42
+    assert record["manifest"]["publication"]["members"][0]["head"] == "a" * 40
+    assert record["manifest"]["publication"]["members"][1:] == original[1:]
+    assert all(method == "GET" for method, _, _ in gh.calls)
+    assert publications.record_publication(store, spec, receipt, gh) == receipt
+    # The same integration worker can repair its freshly published lower layer
+    # after QA, while all older pass evidence and higher PR identities remain.
+    with store._connect() as db:
+        db.execute("INSERT INTO delivery_effects(effect_key,run_id,kind,request_json,state,"
+                   "observed_json,updated_at) VALUES (? ,?,'publish','{}','complete',?,'now')",
+                   ("previous-integration-publish", spec["run_id"], json.dumps(receipt)))
+    repaired = {**receipt, "head": "b" * 40}
+    assert publications.record_publication(store, spec, repaired, gh) == repaired
+    assert record["manifest"]["publication"]["members"][0]["head"] == "b" * 40

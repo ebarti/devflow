@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -22,6 +24,8 @@ from .delivery_feature_execution import (
     worker_key,
     worker_spec,
 )
+from .delivery_feature_pass import checkpoint_key
+from .delivery_feature_pass import checkpoints as current_checkpoints
 from .delivery_feature_publication import current_record, live_members
 from .delivery_github_contract import GitHubDelivery, ordered_chunks
 
@@ -51,7 +55,7 @@ def open_feature(spec):
     record = gh.workstreams(issue, record, shared, token)
     shared.checkpoint(token, "workstream-issues", record["manifest"]["workstream_issues"])
     live_members(spec, record, gh)
-    checkpoints = shared.checkpoints(issue["id"])
+    checkpoints = current_checkpoints(spec)
     for member in record["manifest"]["publication"]["members"]:
         proof = checkpoints.get("verified:" + member["chunk_id"])
         if proof and (proof["head"] != member["head"] or proof["number"] != member["number"]):
@@ -71,7 +75,7 @@ def reserve(spec, chunk_id, kind):
     chunk = next((item for item in ordered_chunks(plan) if item["id"] == chunk_id), None)
     if chunk is None or kind not in {"build", "chunk"}:
         raise ValueError("unknown feature worker assignment")
-    checkpoints = shared.checkpoints(token["issue_id"])
+    checkpoints = current_checkpoints(spec)
     if any("verified:" + key not in checkpoints for key in chunk["depends_on"]):
         raise OwnershipConflict("worker's prerequisites have not passed their integrated gates")
     assignment_key = f"assignment:{chunk_id}:{kind}"
@@ -93,13 +97,21 @@ def reserve(spec, chunk_id, kind):
         shared.reserve_worker(token, worker_key(child["run_id"], token), chunk["workstream_id"])
         return {"spec": child, "completed": False, "workflow_id": row["workflow_id"]}
     members = record["manifest"]["publication"]["members"]
+    integration = checkpoints["integration-pass"]
+    index = next(i for i, item in enumerate(ordered_chunks(plan)) if item["id"] == chunk_id)
     if kind == "chunk":
-        if any(member["chunk_id"] == chunk_id for member in members):
+        if not integration and any(member["chunk_id"] == chunk_id for member in members):
             raise OwnershipConflict("published chunk lost its execution assignment")
-        if ordered_chunks(plan)[len(members)]["id"] != chunk_id:
+        if not integration and ordered_chunks(plan)[len(members)]["id"] != chunk_id:
             raise OwnershipConflict("chunk integration is not next in the recorded stack")
+        if integration and any("verified:" + item["id"] not in checkpoints
+                               for item in ordered_chunks(plan)[:index]):
+            raise OwnershipConflict("integration pass must reverify every preceding stack layer")
     head = members[-1]["head"] if members else spec["base_sha"]
     branch = members[-1]["branch"] if members else spec["publication_base_ref"]
+    if kind == "chunk" and integration:
+        head = members[index - 1]["head"] if index else integration["target"]
+        branch = members[index - 1]["branch"] if index else spec["publication_base_ref"]
     seed = checkpoints.get("build:" + chunk_id) if kind == "chunk" else None
     if kind == "chunk" and seed is None:
         raise OwnershipConflict("chunk lacks its preserved implementation checkpoint")
@@ -120,7 +132,7 @@ def reserve(spec, chunk_id, kind):
     register_worker(store, spec, child)
     shared.checkpoint(
         token,
-        assignment_key,
+        checkpoint_key(child, assignment_key),
         {
             "run_id": child["run_id"],
             "store_path": str(store.config.tracking_db),
@@ -129,6 +141,33 @@ def reserve(spec, chunk_id, kind):
         },
     )
     return {"spec": child, "completed": False, "workflow_id": "delivery-" + child["run_id"]}
+
+
+def begin_integration(spec, target):
+    store, _, shared, token = _feature_context(spec)
+    with shared.mutation(token):
+        record = current_record(spec)
+        live = live_members(spec, record)
+        if not live or any(raw["merged"] or raw["state"] != "open" for raw in live):
+            raise OwnershipConflict("integration requires the existing open stack")
+        if live[0]["base"]["sha"] != target:
+            raise OwnershipConflict("target moved again before integration admission")
+        prior = current_checkpoints(spec)["integration-pass"]
+        if prior and prior["target"] == target:
+            return prior
+        with shared.connect() as db:
+            shared._settled(db, token["issue_id"])
+        value = {"number": prior["number"] + 1 if prior else 1, "target": target,
+                 "members": record["manifest"]["publication"]["members"]}
+        shared.repair(token, "integration-pass:" + str(value["number"]),
+                      "Reintegrating feature on updated target")
+        shared.checkpoint(token, "integration-pass:" + str(value["number"]), value)
+        return value
+
+
+@activity.defn(name="delivery_feature_begin_integration")
+async def delivery_feature_begin_integration(request):
+    return await asyncio.to_thread(begin_integration, request["spec"], request["target"])
 
 
 def resume_worker(store, parent, child, row):
@@ -204,9 +243,22 @@ def seal_build(spec, candidate):
     ).stdout
     path = Path(spec["state_dir"]) / "feature-implementation.patch"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with path.open("xb") as stream:
-        stream.write(patch)
-    os.chmod(path, 0o600)
+    if path.exists() or path.is_symlink():
+        # Atomic creation below makes only complete files observable on replay.
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                or path.read_bytes() != patch):
+            raise OwnershipConflict("preserved implementation patch differs from this candidate")
+    else:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+            staged = Path(stream.name)
+            stream.write(patch)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(staged, 0o600)
+        os.link(staged, path)
+        staged.unlink()
     result = {
         "path": str(path),
         "sha256": hashlib.sha256(patch).hexdigest(),
@@ -271,6 +323,46 @@ def apply_seed(broker):
     )
 
 
+def integrate_previous(broker):
+    """Retain the exact old PR head as a parent; publishing never force-pushes."""
+    from .delivery_resources import read_private, write_private
+
+    previous = broker.spec["feature_worker"]["previous_publication"]
+    receipt = broker.state_dir / "feature-reintegration.json"
+    expected = {"previous": previous, "base": broker.spec["base_sha"]}
+    if receipt.exists():
+        if read_private(receipt)["input"] != expected:
+            raise OwnershipConflict("integration checkout is bound to another stack head")
+        return
+    _git(broker.source, "fetch", "--no-tags", "origin", previous["branch"])
+    if _git(broker.source, "rev-parse", "FETCH_HEAD") != previous["head"]:
+        raise OwnershipConflict("recorded PR head moved before integration")
+    if _git(broker.checkout, "rev-parse", "HEAD") != broker.spec["base_sha"]:
+        raise OwnershipConflict("new integration checkout moved before import")
+    pending = subprocess.run(
+        ["git", "-C", str(broker.checkout), "rev-parse", "--verify", "MERGE_HEAD"],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    if pending.returncode == 0:
+        if pending.stdout.strip() != previous["head"]:
+            raise OwnershipConflict("checkout has a different unfinished merge")
+        diagnostic = "Recovered original integration after its receipt was lost"
+    else:
+        if _git(broker.checkout, "status", "--porcelain"):
+            raise OwnershipConflict("new integration checkout has unattributed changes")
+        result = subprocess.run(
+            ["git", "-C", str(broker.checkout), "-c", "core.hooksPath=/dev/null",
+             "merge", "--no-commit", "--no-ff", previous["head"]],
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        diagnostic = result.stderr[-2000:]
+        if result.returncode and not _git(
+                broker.checkout, "diff", "--name-only", "--diff-filter=U"):
+            raise OwnershipConflict("original PR could not be imported: " + diagnostic)
+    broker.validate_candidate_scope()
+    write_private(receipt, {"input": expected, "diagnostic": diagnostic})
+
+
 def finish_worker(spec, child_id):
     store, _, shared, token = _feature_context(spec)
     child = store.effective_spec(child_id)
@@ -319,7 +411,7 @@ def finish_worker(spec, child_id):
             raise OwnershipConflict("verified worker no longer owns the published head")
         shared.checkpoint(
             token,
-            "verified:" + child["feature_worker"]["chunk_id"],
+            checkpoint_key(child, "verified:" + child["feature_worker"]["chunk_id"]),
             {
                 "run_id": child_id,
                 "head": pr["head"],
@@ -490,6 +582,16 @@ async def delivery_feature_merge(request):
         cancelled.set()
 
 
+@activity.defn(name="delivery_feature_settle_effects")
+async def delivery_feature_settle_effects(request):
+    from .delivery_activities import _with_heartbeat
+    from .delivery_feature_readback import settle
+
+    store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
+    return await _with_heartbeat(asyncio.to_thread(settle, store, request["spec"]),
+                                 request, "feature_readback")
+
+
 FEATURE_ACTIVITIES = [
     delivery_feature_open,
     delivery_feature_reserve,
@@ -499,4 +601,6 @@ FEATURE_ACTIVITIES = [
     delivery_feature_worker_result,
     delivery_feature_settle_workers,
     delivery_feature_merge,
+    delivery_feature_begin_integration,
+    delivery_feature_settle_effects,
 ]

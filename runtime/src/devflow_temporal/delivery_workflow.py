@@ -213,6 +213,16 @@ class DeliveryWorkflow:
             options = {"retry_policy": RetryPolicy(maximum_attempts=3),
                        "heartbeat_timeout": timedelta(seconds=30),
                        "schedule_to_close_timeout": timedelta(hours=3)}
+        elif name == "delivery_feature_settle_effects":
+            options = {"retry_policy": RetryPolicy(maximum_attempts=3),
+                       "heartbeat_timeout": timedelta(seconds=30),
+                       "schedule_to_close_timeout": timedelta(hours=2)}
+        elif name.startswith("delivery_feature_"):
+            options = {"retry_policy": RetryPolicy(
+                maximum_attempts=3, initial_interval=timedelta(seconds=1),
+                maximum_interval=timedelta(seconds=10),
+                non_retryable_error_types=["ValueError", "TypeError", "OwnershipConflict"],
+            )}
         elif patient_ci:
             options = {
                 "heartbeat_timeout": timedelta(seconds=30),

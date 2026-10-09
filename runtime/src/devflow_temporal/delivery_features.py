@@ -161,7 +161,9 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
            if owner else {}),
     }
     if owner:
-        checkpoints = registry(spec).checkpoints(owner["issue_id"])
+        from .delivery_feature_pass import checkpoints as current_checkpoints
+
+        checkpoints = current_checkpoints(spec)
         raw_plan = row.get("accepted_plan_text") or spec.get("accepted_plan")
         plan = json.loads(raw_plan) if raw_plan else {}
         workstreams = []

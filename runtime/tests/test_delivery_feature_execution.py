@@ -38,7 +38,8 @@ def feature_service(service, monkeypatch):
     old.config.path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(old.config.path))
     value = plan()
-    for stream in value["workstreams"]:
+    for number, stream in enumerate(value["workstreams"], 10):
+        stream["issue_number"] = number
         for chunk in stream["chunks"]:
             chunk["allowed_paths"] = ["README.md"]
     issue = {
@@ -68,6 +69,13 @@ def test_admission_claims_remote_identity_and_never_creates_business_features(se
             db.execute("SELECT input_json FROM execution_snapshots").fetchone()[0]
         )
     assert snapshot["issue"]["body"] == "Human scope"
+
+
+def test_legacy_default_budget_does_not_change_before_feature_migration(service):
+    store, request = service
+    store.submit(request)
+    assert store.effective_spec(request["run_id"])["policy"]["max_repairs"] == 2
+    assert store.config.public_policy()["max_repairs"] == 2
 
 
 def test_invalid_plan_does_not_leave_an_orphan_execution_claim(service, monkeypatch):
@@ -262,7 +270,9 @@ class Controller:
             return {"record": deepcopy(self.record), "checkpoints": {}, "budget": {"used": 0}}
         if name == "delivery_feature_merge":
             assert request["publication"]["scope_complete"]
-            return {"state": "confirmed"}
+            return {"state": "confirmed", "pull_requests": [
+                {"number": item["number"]} for item in request["publication"]["pull_requests"]
+            ]}
         return {"state": "confirmed"}
 
     async def _stop(self, spec, message, **kwargs):
@@ -290,7 +300,7 @@ async def test_independent_builds_overlap_but_integration_follows_the_shared_sta
         else:
             integrated.append(chunk_id)
             publication = controller.record["manifest"]["publication"]
-            publication["members"].append({"chunk_id": chunk_id})
+            publication["members"].append({"chunk_id": chunk_id, "number": len(integrated)})
             if len(publication["members"]) > 1:
                 publication["stack_id"] = 42
             controller.record["manifest"]["revision"] += 1

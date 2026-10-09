@@ -165,6 +165,7 @@ class DeliveryBroker:
 
     def prepare(self) -> dict[str, Any]:
         key = f"prepare:{self.spec['run_id']}"
+        local_branch_name = self.spec.get("local_branch", self.spec["branch"])
         request = {
             "base_sha": self.spec["base_sha"],
             "branch": self.spec["branch"],
@@ -186,7 +187,7 @@ class DeliveryBroker:
         if self.checkout.exists():
             if _git(self.checkout, "rev-parse", "--show-toplevel") != str(self.checkout):
                 raise RuntimeError("owned checkout path was replaced")
-            if _git(self.checkout, "branch", "--show-current") != self.spec["branch"]:
+            if _git(self.checkout, "branch", "--show-current") != local_branch_name:
                 raise RuntimeError("owned checkout branch changed")
         else:
             local_branch = subprocess.run(
@@ -197,7 +198,7 @@ class DeliveryBroker:
                     "show-ref",
                     "--verify",
                     "--quiet",
-                    f"refs/heads/{self.spec['branch']}",
+                    f"refs/heads/{local_branch_name}",
                 ],
                 check=False,
             )
@@ -208,7 +209,7 @@ class DeliveryBroker:
                 "worktree",
                 "add",
                 "-b",
-                self.spec["branch"],
+                local_branch_name,
                 str(self.checkout),
                 self.spec["base_sha"],
             )
@@ -216,7 +217,11 @@ class DeliveryBroker:
             resources.created(self.checkout)
         recovery = self.spec["policy"].get("recovery")
         provenance = self._recover(recovery) if recovery else None
-        if self.spec.get("feature_worker", {}).get("seed"):
+        if self.spec.get("feature_worker", {}).get("previous_publication"):
+            from .delivery_feature_activities import integrate_previous
+
+            integrate_previous(self)
+        elif self.spec.get("feature_worker", {}).get("seed"):
             from .delivery_feature_activities import apply_seed
 
             apply_seed(self)

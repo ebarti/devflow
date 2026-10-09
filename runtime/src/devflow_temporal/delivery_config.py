@@ -100,7 +100,7 @@ class DeliveryConfig:
             raise ValueError("ci_wait_seconds must be between 60 and 43200")
         if value.get("feature_delivery_version") not in (None, 1):
             raise ValueError("unsupported feature delivery protocol")
-        repairs = value.get("max_repairs", 10)
+        repairs = value.get("max_repairs", 10 if value.get("feature_delivery_version") == 1 else 2)
         if type(repairs) is not int or not 0 <= repairs <= 100:
             raise ValueError("max_repairs must be between 0 and 100")
         if value.get("feature_delivery_version") == 1 and repairs == 0:
@@ -156,7 +156,8 @@ class DeliveryConfig:
             "execution_backend": self.raw.get("execution_backend", "native-macos"),
             "execution_mode": self.raw.get("execution_mode", "native-profile"),
             "max_attempts": self.raw.get("max_attempts", 3),
-            "max_repairs": self.raw.get("max_repairs", 10),
+            "max_repairs": self.raw.get(
+                "max_repairs", 10 if self.raw.get("feature_delivery_version") == 1 else 2),
             "feature_delivery_version": self.raw.get("feature_delivery_version"),
             "tracker_retry_seconds": self.raw.get("tracker_retry_seconds", 600),
         }
@@ -298,7 +299,8 @@ class DeliveryConfig:
             "config_overrides": self.raw.get("config_overrides", ["features.plugins=false"]),
             "toolchain_roots": self.raw.get("toolchain_roots", []),
             "package_manager_cache": self.raw.get("package_manager_cache"),
-            "max_repairs": self.raw.get("max_repairs", 10),
+            "max_repairs": self.raw.get(
+                "max_repairs", 10 if self.raw.get("feature_delivery_version") == 1 else 2),
             "capacity": int(self.raw.get("capacity", 2)),
             "fake_findings": self.raw.get("fake_findings", {})
             if self.raw.get("provider") == "fake"

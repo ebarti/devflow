@@ -205,7 +205,9 @@ def validate_manifest(value: dict, issue: dict) -> dict:
     bindings = value["workstream_issues"]
     if not isinstance(bindings, dict) or bindings.keys() - streams:
         raise ValueError("workstream issue binding is invalid")
-    for binding in bindings.values():
+    owners = {stream["id"]: stream["issue_number"] for stream in plan["workstreams"]}
+    bound_ids, bound_numbers = set(), set()
+    for stream_id, binding in bindings.items():
         if (
             not isinstance(binding, dict)
             or set(binding) != {"id", "number", "url"}
@@ -218,6 +220,13 @@ def validate_manifest(value: dict, issue: dict) -> dict:
         _, number = issue_identity(binding["url"], issue["repository"])
         if number != binding["number"]:
             raise ValueError("workstream issue number differs from its URL")
+        if owners[stream_id] is not None and number != owners[stream_id]:
+            raise OwnershipConflict("workstream binding differs from the accepted issue")
+        if (binding["id"] == issue["id"] or binding["id"] in bound_ids
+                or number == issue["number"] or number in bound_numbers):
+            raise OwnershipConflict("workstreams require distinct child issue identities")
+        bound_ids.add(binding["id"])
+        bound_numbers.add(number)
     publication = value["publication"]
     if not isinstance(publication, dict) or set(publication) != {"stack_id", "members"}:
         raise ValueError("publication requires an explicit stack and member list")
@@ -417,6 +426,13 @@ class GitHubDelivery:
                     raise OwnershipConflict(
                         "feature already has a different accepted delivery plan"
                     )
+                self.reconcile_record(issue, existing, registry, token)
+                binding_key = "github-plan-bind:" + LABEL_PREFIX + str(existing["comment_id"])
+                pending = registry.effect(issue["id"], binding_key)
+                if pending and pending["state"] == "pending":
+                    registry.finish_effect(token, binding_key, {
+                        "issue": issue["id"], "name": LABEL_PREFIX + str(existing["comment_id"]),
+                    })
                 return existing
             receipt = registry.intent(token, key, "github_plan", {"body": body})
             if receipt["state"] == "complete":
@@ -528,6 +544,20 @@ class GitHubDelivery:
             registry.finish_effect(token, key, {"digest": digest(saved)})
             return {**record, "manifest": saved}
 
+    def reconcile_record(self, issue, record, registry, token):
+        """A recorded PATCH may have succeeded before its local receipt was saved."""
+        with registry.connect() as db:
+            pending = [dict(row) for row in db.execute(
+                "SELECT effect_key,request_json FROM execution_effects WHERE issue_id=? "
+                "AND kind='github_record' AND state='pending'", (issue["id"],),
+            )]
+        observed = digest(record["manifest"])
+        for receipt in pending:
+            request = json.loads(receipt["request_json"])
+            if request["comment_id"] != record["comment_id"] or request["after"] != observed:
+                raise UnresolvedEffect("recorded GitHub update does not match current readback")
+            registry.finish_effect(token, receipt["effect_key"], {"digest": observed})
+
     def workstreams(self, issue, record, registry, token):
         """Create or adopt exactly the plan's sub-issues, then bind their IDs."""
         for stream in record["manifest"]["plan"]["workstreams"]:
@@ -535,6 +565,8 @@ class GitHubDelivery:
             key = "workstream:" + stream["id"]
             with registry.mutation(token):
                 if existing:
+                    if stream["issue_number"] and stream["issue_number"] != existing["number"]:
+                        raise OwnershipConflict("recorded workstream differs from accepted issue")
                     child = self.issue(
                         issue["repository"], existing["number"], issue["repository_id"]
                     )
@@ -583,7 +615,7 @@ class GitHubDelivery:
                     token,
                     key + ":parent",
                     "github_subissue",
-                    {"parent": issue["id"], "child": child["id"]},
+                    {"parent": issue["id"], "child": child["id"], "child_number": child["number"]},
                 )
                 if parent is None:
                     if not link["fresh"]:

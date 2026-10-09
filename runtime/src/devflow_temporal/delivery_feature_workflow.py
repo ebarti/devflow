@@ -118,8 +118,7 @@ async def _worker(controller, spec, chunk_id, kind, active):
     return finished
 
 
-async def coordinate(controller, spec):
-    active, builds = {}, {}
+async def _coordinate_pass(controller, spec, active, builds):
     completed = set()
     try:
         opened = await controller._activity("delivery_feature_open", {"spec": spec})
@@ -214,11 +213,19 @@ async def coordinate(controller, spec):
                     controller.state["checks"]["feature_merge"] = merged
                     if merged["state"] == "confirmed":
                         break
+                    if merged["state"] == "needs_integration":
+                        await controller._activity("delivery_feature_begin_integration", {
+                            "spec": spec, "target": merged["target"],
+                        })
+                        return {"reintegrate": True}
                     if controller.cancel_requested:
                         raise RuntimeError(
                             "merge was submitted; its remote result still requires readback"
                         )
                     await workflow.sleep(timedelta(seconds=30))
+                receipts = {item["number"]: item for item in merged["pull_requests"]}
+                for member in controller.state["pull_request"]["pull_requests"]:
+                    member.update(receipts[member["number"]], state="MERGED")
                 controller.state.update(
                     phase="merged",
                     execution_state="terminal",
@@ -238,6 +245,17 @@ async def coordinate(controller, spec):
             await controller._stop(
                 spec, f"feature delivery stopped: {type(exc).__name__}: {str(exc)[:300]}", cause=exc
             )
+    return controller.state
+
+
+async def coordinate(controller, spec):
+    active, builds = {}, {}
+    try:
+        while True:
+            result = await _coordinate_pass(controller, spec, active, builds)
+            if not result.get("reintegrate"):
+                return result
+            builds.clear()
     finally:
         # No takeover while a build, check, or publication still has authority.
         # Cancel through the worker's supported update and observe its closure.
@@ -247,14 +265,40 @@ async def coordinate(controller, spec):
         if builds:
             await asyncio.gather(*builds.values(), return_exceptions=True)
         if controller.state.get("outcome"):
+            terminal = {key: controller.state.get(key) for key in
+                        ("phase", "execution_state", "outcome", "error", "cleanup")}
+            waiting = False
+            while True:
+                try:
+                    readback = await controller._activity(
+                        "delivery_feature_settle_effects", {"spec": spec}
+                    )
+                except Exception as exc:
+                    readback = {"state": "pending", "reason": type(exc).__name__}
+                controller.state["checks"]["feature_readback"] = readback
+                if readback["state"] == "confirmed":
+                    break
+                controller.state.update(phase="waiting_feature_readback", execution_state="waiting",
+                                        outcome=None)
+                controller.state["revision"] += 1
+                await controller._project(
+                    spec, "feature_readback_pending", "Reconciling the original GitHub operation"
+                )
+                waiting = True
+                await workflow.sleep(timedelta(seconds=30))
+            controller.state.update(terminal)
+            if waiting:
+                controller.state["revision"] += 1
+                await controller._project(spec, terminal["outcome"],
+                                          "Original operations settled; feature can be continued")
             await controller._activity(
                 "delivery_feature_stop",
                 {
                     "spec": spec,
                     "checkpoint": {
                         "state": controller.state,
-                        "completed_chunks": sorted(completed),
+                        "completed_chunks": controller.state["checks"].get(
+                            "feature_progress", {}).get("completed", []),
                     },
                 },
             )
-    return controller.state

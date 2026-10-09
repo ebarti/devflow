@@ -133,9 +133,11 @@ def worker_key(run_id, token):
 
 def worker_spec(parent, chunk, issue, *, kind, base_sha, base_branch, seed=None):
     """Derive a narrower worker authority before native preparation, never after it."""
-    suffix = digest(
-        {"owner": parent["feature_delivery"]["owner"], "chunk": chunk["id"], "kind": kind}
-    )[:20]
+    from .delivery_feature_pass import checkpoints
+
+    integration = checkpoints(parent)["integration-pass"] if kind == "chunk" else None
+    suffix = digest({"owner": parent["feature_delivery"]["owner"], "chunk": chunk["id"],
+                     "kind": kind, "integration_pass": integration})[:20]
     run_id = "worker-" + suffix
     spec = deepcopy(parent)
     for key in (
@@ -204,9 +206,17 @@ def worker_spec(parent, chunk, issue, *, kind, base_sha, base_branch, seed=None)
             "workstream_id": chunk["workstream_id"],
             "kind": kind,
             "seed": seed,
+            "integration_pass": integration["number"] if integration else 0,
         },
         policy_digest=digest(policy),
     )
+    if integration:
+        previous = next((member for member in integration["members"]
+                         if member["chunk_id"] == chunk["id"]), None)
+        if previous:
+            spec["branch"] = previous["branch"]
+            spec["local_branch"] = "feat/df-integration-" + suffix
+            spec["feature_worker"].update(previous_publication=previous, seed=None)
     # Chunk gates qualify their integrated base; the coordinator already checked
     # the feature baseline. Workers must not interpret a stack layer as trunk.
     spec.pop("baseline_checks_version", None)
@@ -343,7 +353,9 @@ def detail(store, spec):
     shared = registry(spec)
     token = spec["feature_delivery"]["owner"]
     current = shared.current(token["issue_id"])
-    checkpoints = shared.checkpoints(token["issue_id"])
+    from .delivery_feature_pass import checkpoints as current_checkpoints
+
+    checkpoints = current_checkpoints(spec)
     record = checkpoints.get("github-record")
     workers = []
     assignments = [value for key, value in checkpoints.items() if key.startswith("assignment:")]

@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import UTC, datetime, timedelta
 
-from .contracts import digest
+from .contracts import canonical_json, digest
 from .delivery_execution_registry import OwnershipConflict, UnresolvedEffect
 from .delivery_feature_execution import registry
+from .delivery_feature_pass import checkpoints as current_checkpoints
 from .delivery_feature_publication import current_record, live_members
 from .delivery_feature_workflow import publication
 from .delivery_github_contract import GitHubDelivery, ordered_chunks
@@ -16,14 +18,14 @@ from .delivery_merge import MergeBroker, native_implementation_output, require_m
 from .delivery_resources import observe_finalized_resources
 
 
-def authorize(store, spec, requested, command):
+def authorize(store, spec, requested, command, *, settlement=False):
     with store._connect() as db:
         row = db.execute(
             "SELECT pr_json,phase FROM delivery_runs WHERE run_id=?", (spec["run_id"],)
         ).fetchone()
         if (
             row is None
-            or row["phase"] != "merging"
+            or (row["phase"] != "merging" and not settlement)
             or not requested.get("scope_complete")
             or json.loads(row["pr_json"] or "null") != requested
         ):
@@ -54,8 +56,7 @@ def authorize(store, spec, requested, command):
 
 
 def evidence(store, parent, record, live, gh):
-    shared = registry(parent)
-    checkpoints = shared.checkpoints(parent["feature_delivery"]["owner"]["issue_id"])
+    checkpoints = current_checkpoints(parent)
     members = record["manifest"]["publication"]["members"]
     if len(members) != len(ordered_chunks(record["manifest"]["plan"])):
         raise OwnershipConflict("unpublished feature scope remains")
@@ -119,16 +120,33 @@ def evidence(store, parent, record, live, gh):
     return trees
 
 
-def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancelled=None):
+def hierarchy(spec, record, gh):
+    issue = spec["feature_delivery"]["snapshot"]["issue"]
+    for child in [issue, *record["manifest"]["workstream_issues"].values()]:
+        raw = gh.api(f"repos/{spec['github_repo']}/issues/{child['number']}")
+        if (raw["node_id"] != child["id"] or raw.get("pull_request")
+                or raw["number"] != child["number"] or raw["html_url"] != child["url"]):
+            raise OwnershipConflict("feature issue identity changed")
+        if child["id"] != issue["id"]:
+            parent = gh.api(f"repos/{spec['github_repo']}/issues/{child['number']}/parent")
+            if parent["node_id"] != issue["id"]:
+                raise OwnershipConflict("workstream hierarchy changed before merge or closure")
+
+
+def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancelled=None,
+          settlement=False):
     gh = gh or GitHubDelivery()
     shared = registry(spec)
     token = spec["feature_delivery"]["owner"]
-    authority = authorize(store, spec, requested, command)
+    authority = authorize(store, spec, requested, command, settlement=settlement)
     record = current_record(spec, gh)
     if publication(record, complete=True) != requested:
         raise OwnershipConflict("feature plan or stack changed after merge authorization")
     key = "feature-merge:" + digest(authority)
+    if settlement and shared.effect(token["issue_id"], key) is None:
+        raise OwnershipConflict("settlement cannot originate a new merge")
     with shared.mutation(token):
+        hierarchy(spec, record, gh)
         live = live_members(spec, record, gh)
         if any(item["state"] == "closed" and not item["merged"] for item in live):
             raise OwnershipConflict("a feature PR was closed without merging")
@@ -141,6 +159,12 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
         else:
             if any(item["merged"] for item in live) and not all(item["merged"] for item in live):
                 raise OwnershipConflict("partial remote merge requires reconciliation")
+            first = record["manifest"]["publication"]["members"][0]
+            proof = current_checkpoints(spec).get("verified:" + first["chunk_id"])
+            if proof and not live[0]["merged"]:
+                verified = store.effective_spec(proof["run_id"])
+                if live[0]["base"]["sha"] != verified["base_sha"]:
+                    return {"state": "needs_integration", "target": live[0]["base"]["sha"]}
             trees = evidence(store, spec, record, live, gh)
             if cancelled and cancelled.is_set():
                 raise OwnershipConflict("merge cancelled before submission")
@@ -213,10 +237,35 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
                 }
             )
         shared.finish_effect(token, key, {"pull_requests": merged})
+        # The merge command already obtained authoritative PR readbacks. Commit
+        # them with a projection event now; a known merge must not wait for the
+        # independent consumer's daily external-drift check.
+        from .delivery_features import transition
+
+        stamp = datetime.now(UTC)
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            schedule = db.execute(
+                "SELECT value FROM delivery_sync_settings WHERE key='pr_interval_seconds'"
+            ).fetchone()
+            due = stamp + timedelta(seconds=schedule[0] if schedule else 86400)
+            for member, raw in zip(members, live, strict=True):
+                observed = {
+                    "url": member["url"], "state": "MERGED", "head": raw["head"]["sha"],
+                    "base": raw["base"].get("sha"), "merged_at": raw["merged_at"],
+                }
+                db.execute(
+                    "INSERT INTO delivery_pr_observations VALUES (?,?,?,?,NULL) "
+                    "ON CONFLICT(url) DO UPDATE SET observation_json=excluded.observation_json,"
+                    "checked_at=excluded.checked_at,next_check_at=excluded.next_check_at,error=NULL",
+                    (member["url"], canonical_json(observed), stamp.isoformat(), due.isoformat()),
+                )
+            transition(db, store.config, spec["run_id"])
     # GitHub issues represent the business outcome. Close the feature and its
     # workstreams only after every accepted chunk is actually merged.
     issue = spec["feature_delivery"]["snapshot"]["issue"]
     closures = [*record["manifest"]["workstream_issues"].values(), issue]
+    hierarchy(spec, current_record(spec, gh), gh)
     for child in closures:
         endpoint = f"repos/{spec['github_repo']}/issues/{child['number']}"
         with shared.mutation(token):

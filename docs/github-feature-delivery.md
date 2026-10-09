@@ -34,6 +34,11 @@ unfinished workers resume their original checkout, PR and implementation session
 A continuation must use the runtime that owns those worker artifacts. This is a
 local execution system, not a cross-host artifact migration service.
 
+An interrupted GitHub write keeps its original effect identity. The coordinator
+performs readback while ownership is draining, and only releases the feature when
+that outcome is known. A remote outage can leave it waiting for readback; it does
+not authorize another creation or consume a product repair cycle.
+
 ## Controls and states
 
 Enable new admissions with `feature_delivery_version: 1` after custody migration.
@@ -68,6 +73,17 @@ read back without blind replay. A changed head or target requiring new integrati
 cannot reuse previous proof. Only confirmed merges whose trees match the verified
 chunks and are incorporated into the target close the issues. An incomplete
 feature with merged PRs is **Partially merged**, never **Merged**.
+
+If the target advances, the coordinator creates a new integration pass and
+rechecks every layer in dependency order. Unique local branches preserve earlier
+worker artifacts. Each new candidate incorporates its existing PR head and the
+updated preceding layer, then advances the same remote branch without a force
+push. The stack ID and PR numbers remain unchanged. Earlier verification remains
+immutable and only the new pass qualifies for merging. This consumes one repair
+cycle for the integration pass, plus any product repairs its gates require. A
+changed publication receives a fresh merge decision unless the admitted endpoint
+already authorizes merging. Issue identities and parent links are checked again
+before merge and closure. Confirmed PR observations update locally immediately.
 
 Feature and workstream status changes are projected through the existing
 transactional outbox and independent Project synchronizer. A Project outage leaves

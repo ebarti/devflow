@@ -306,6 +306,9 @@ def statistics_for(store):
             if r["iteration"] == 0
             and not r["recovery_json"]
             and not json.loads(r["request_json"]).get("supersedes_run_id")
+            and json.loads(r["request_json"]).get("feature_delivery", {}).get(
+                "owner", {}).get("generation", 1) == 1
+            and not json.loads(r["checks_json"] or "{}").get("repair_budget", {}).get("used", 0)
             and all(a["iteration"] == 0 for a in attempts.get(r["run_id"], []))
         ]
         durations = []

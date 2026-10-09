@@ -14,12 +14,16 @@ from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_execution_registry import OwnershipConflict
 from devflow_temporal.delivery_feature_execution import registry
 from devflow_temporal.delivery_feature_workflow import publication
-from devflow_temporal.delivery_github_contract import encode_manifest, ordered_chunks
+from devflow_temporal.delivery_github_contract import (
+    GitHubDelivery,
+    encode_manifest,
+    ordered_chunks,
+)
 
 service = legacy_service
 
 
-class Remote:
+class Remote(GitHubDelivery):
     def __init__(self, record):
         self.record, self.calls, self.merged, self.closed = record, [], set(), set()
         self.tampered = False
@@ -61,12 +65,16 @@ class Remote:
                 "status": "ahead",
                 "merge_base_commit": {"sha": path.rsplit("/", 1)[-1].split("...")[0]},
             }
+        if path.endswith("/parent"):
+            return {"node_id": "I_feature"}
         if "/issues/" in path:
             number = int(path.rsplit("/", 1)[-1])
             if method == "PATCH":
                 self.closed.add(number)
             return {
                 "node_id": "I_feature" if number == 3 else "I_" + str(number),
+                "number": number,
+                "html_url": f"https://github.com/example/fixture/issues/{number}",
                 "state": "closed" if number in self.closed else "open",
                 "state_reason": "completed" if number in self.closed else None,
             }
@@ -119,6 +127,7 @@ def setup_feature(service, monkeypatch):
     token = spec["feature_delivery"]["owner"]
     shared.checkpoint(token, "github-record", {"comment_id": 11, "comment_node_id": "IC_11"})
     shared.checkpoint(token, "accepted-plan", {"digest": digest(value)})
+    shared.checkpoint(token, "workstream-issues", record["manifest"]["workstream_issues"])
     requested = publication(record, complete=True)
     command = {
         "command_id": "merge-command",
@@ -156,6 +165,13 @@ def test_one_stack_merge_closes_issues_only_after_tree_and_trunk_readback(servic
     assert result["state"] == "confirmed"
     assert commands == [["gh", "stack", "merge", "42", "--yes", "--squash"]]
     assert gh.closed == {3, 10, 11}
+    with store._connect() as db:
+        observations = [json.loads(row[0]) for row in db.execute(
+            "SELECT observation_json FROM delivery_pr_observations")]
+        projected = json.loads(db.execute(
+            "SELECT payload_json FROM delivery_features").fetchone()[0])
+    assert len(observations) == 3 and all(item["state"] == "MERGED" for item in observations)
+    assert projected["status"] == "Merged"
     assert merger.merge(store, spec, requested, command, gh=gh, execute=execute) == result
     assert len(commands) == 1
 

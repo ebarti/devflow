@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 
 from .contracts import digest
 from .delivery_execution_registry import OwnershipConflict, UnresolvedEffect
 from .delivery_feature_execution import registry, require_execution
+from .delivery_feature_pass import checkpoints as current_checkpoints
 from .delivery_github_contract import GitHubDelivery, decode_manifest, ordered_chunks
 
 
@@ -33,14 +35,21 @@ def current_record(spec, gh=None):
     accepted = registry(spec).checkpoints(issue["id"]).get("accepted-plan")
     if accepted and accepted["digest"] != digest(manifest["plan"]):
         raise OwnershipConflict("GitHub plan changed after execution acceptance")
-    return {
+    bindings = registry(spec).checkpoints(issue["id"]).get("workstream-issues")
+    if bindings is not None and bindings != manifest["workstream_issues"]:
+        raise OwnershipConflict("GitHub workstream bindings changed after execution acceptance")
+    record = {
         "comment_id": raw["id"],
         "comment_node_id": raw["node_id"],
         "manifest": manifest,
     }
+    shared = registry(spec)
+    token = shared.token(shared.current(issue["id"]))
+    gh.reconcile_record(issue, record, shared, token)
+    return record
 
 
-def publish(store, broker, request, *, reconcile=False):
+def publish(store, broker, request, *, reconcile=False, settlement=False):
     """Keep feature custody until both the PR and its canonical binding settle."""
     spec = request["spec"]
     shared = registry(spec)
@@ -53,6 +62,8 @@ def publish(store, broker, request, *, reconcile=False):
         }
     )
     with shared.mutation(token):
+        if settlement and shared.effect(token["issue_id"], key) is None:
+            raise OwnershipConflict("settlement cannot originate a new publication")
         intent = shared.intent(
             token,
             key,
@@ -86,7 +97,7 @@ def publish(store, broker, request, *, reconcile=False):
     # stays pending throughout, including a crash between PR creation and binding.
     if result.get("state") == "pending" or not result.get("number"):
         return result
-    result = record_publication(store, spec, result)
+    result = record_publication(store, spec, result, settlement=settlement)
     shared.finish_effect(token, key, result)
     return result
 
@@ -131,11 +142,12 @@ def owned_pr_number(spec):
     return found[0]["number"] if found else None
 
 
-def record_publication(store, spec, receipt, gh=None):
+def record_publication(store, spec, receipt, gh=None, *, settlement=False):
     if not receipt.get("number"):
         return receipt
     gh = gh or GitHubDelivery()
-    require_execution(store, spec)
+    if not settlement:
+        require_execution(store, spec)
     shared = registry(spec)
     token = shared.token(shared.current(spec["feature_delivery"]["owner"]["issue_id"]))
     issue = spec["feature_delivery"]["snapshot"]["issue"]
@@ -157,13 +169,32 @@ def record_publication(store, spec, receipt, gh=None):
         live_members(spec, record, gh)
         return receipt
     if previous:
+        reintegrating = spec.get("feature_worker", {}).get("previous_publication")
+        pass_state = current_checkpoints(spec)
+        index = members.index(previous)
+        preceding = ordered_chunks(manifest["plan"])[:index]
+        own_previous = previous == reintegrating
+        if reintegrating and not own_previous:
+            with store._connect() as db:
+                receipts = [json.loads(row[0]) for row in db.execute(
+                    "SELECT observed_json FROM delivery_effects WHERE run_id=? "
+                    "AND kind='publish' AND state='complete' AND observed_json IS NOT NULL",
+                    (spec["run_id"],),
+                )]
+            own_previous = any(all(saved.get(key) == previous[key]
+                                   for key in ("number", "url", "head")) for saved in receipts)
+        if reintegrating and (
+            not own_previous or any("verified:" + item["id"] not in pass_state
+                                    for item in preceding)
+        ):
+            raise OwnershipConflict("integration differs from the original stack head or order")
         if (
-            previous != members[-1]
+            (not reintegrating and previous != members[-1])
             or previous["number"] != member["number"]
             or previous["branch"] != member["branch"]
         ):
             raise OwnershipConflict("repair would replace a PR or rewrite a lower stack layer")
-        members[-1] = member
+        members[index] = member
     else:
         expected = ordered_chunks(manifest["plan"])
         if len(members) >= len(expected) or expected[len(members)]["id"] != chunk_id:
