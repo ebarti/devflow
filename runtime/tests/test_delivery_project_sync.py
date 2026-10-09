@@ -117,21 +117,30 @@ def test_poll_schedule_and_failure_backoff_survive_restart(service):
     assert len(remote.reads) == 2
 
 
-def test_local_tracking_releases_claim_without_any_remote_call(service, monkeypatch):
+@pytest.mark.parametrize("status", ["blocked", "in-review"])
+@pytest.mark.parametrize("mapped", [False, True])
+def test_local_tracking_releases_claim_without_any_remote_call(
+    service, monkeypatch, status, mapped,
+):
     store, request = service
+    if mapped:
+        store.config.raw["repositories"]["fixture"]["project_statuses"] = {
+            status: "Needs validation",
+        }
     store.submit(request)
     spec = store.spec(request["run_id"])
     monkeypatch.setattr(delivery_activities, "_context", lambda *_: (store, None))
     monkeypatch.setattr(delivery_activities.subprocess, "run",
                         lambda *_args, **_kwargs: pytest.fail("unexpected remote call"))
-    receipt = delivery_activities._tracker_sync(spec, "in-review", release=True)
+    receipt = delivery_activities._tracker_sync(spec, status, release=True, terminal=True)
     assert receipt["state"] == "recorded"
     assert receipt["scope"] == "local"
     assert _tracking_ready(spec, receipt)
     assert not _tracking_ready({}, receipt)
     with store._connect() as db:
         assert store.state.claim_for(db, request["work_id"]) is None
-    assert record_tracking(store, spec, "in-review", True)["claim_released"]
+        assert db.execute("SELECT count(*) FROM reconcile_intents").fetchone()[0] == 0
+    assert record_tracking(store, spec, status, True)["claim_released"]
 
 
 def test_legacy_active_workflow_keeps_project_ownership_until_terminal(service):

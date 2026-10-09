@@ -234,8 +234,9 @@ async def test_transient_final_readback_finishes_original_transition(monkeypatch
 
 @pytest.mark.parametrize('status', ['blocked', 'in-review'])
 @pytest.mark.parametrize('mapped', [False, True])
-def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, monkeypatch,
-                                                              status, mapped):
+def test_legacy_terminal_tracker_uses_actual_helper_ack_before_release(
+    intake_fixture, monkeypatch, status, mapped,
+):
     import contextlib
     import importlib.util
     import io
@@ -253,6 +254,17 @@ def test_terminal_tracker_uses_actual_helper_ack_before_release(intake_fixture, 
                       assignee='example')
     if mapped:
         repository['project_statuses'] = {status: 'Needs validation'}
+    # This contract predates asynchronous Project tracking. Freeze the historical
+    # admission before submitting it, retaining the actual helper and audit checks.
+    admit = DeliveryConfig.admit
+
+    def legacy_admit(self, supplied, **kwargs):
+        spec = admit(self, supplied, **kwargs)
+        spec.pop('project_sync_version')
+        spec.pop('project_binding')
+        return spec
+
+    monkeypatch.setattr(DeliveryConfig, 'admit', legacy_admit)
     store = DeliveryStore(config)
     store.submit(request)
     spec = store.spec(request['run_id'])
