@@ -164,9 +164,24 @@ def _remove_generated_project_directory(workspace: Path) -> None:
         raise ValueError("project Codex directory changed before role launch")
 
 
+def _native_path(toolchain_roots: tuple[Path, ...], *, packaged_go: bool = False) -> str:
+    return ":".join(
+        [
+            *(str(root / "bin") for root in toolchain_roots),
+            *(["/usr/local/go/bin"] if packaged_go else []),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+    )
+
+
 def _native_env(
     home: Path, codex_home: Path, scratch: Path, toolchain_roots: tuple[Path, ...] = (),
-    *, short_temp: bool = False,
+    *, short_temp: bool = False, packaged_go: bool = False,
 ) -> dict[str, str]:
     env = {
         key: value
@@ -175,17 +190,7 @@ def _native_env(
     }
     env.update(
         {
-            "PATH": ":".join(
-                [
-                    *(str(root / "bin") for root in toolchain_roots),
-                    "/opt/homebrew/bin",
-                    "/usr/local/bin",
-                    "/usr/bin",
-                    "/bin",
-                    "/usr/sbin",
-                    "/sbin",
-                ]
-            ),
+            "PATH": _native_path(toolchain_roots, packaged_go=packaged_go),
             "HOME": str(home),
             "CODEX_HOME": str(codex_home),
             "TMPDIR": str(scratch),
@@ -206,21 +211,49 @@ def _native_env(
     return env
 
 
-def _native_environment_version(owner: Path, legacy_evidence: Path) -> int:
+def _native_environment_version(
+    owner: Path, legacy_evidence: Path, *, default_version: int = 3,
+) -> int:
     """Pin each profile recipe before launch; retained profiles keep their intent."""
 
+    if type(default_version) is not int or default_version not in (1, 2, 3):
+        raise ValueError("native environment recipe is not admitted")
     marker = owner / "native-environment.json"
     if marker.exists() or marker.is_symlink():
         _private_file(marker)
         value = json.loads(marker.read_bytes())
-        if value not in ({"version": 1}, {"version": 2}) or type(value["version"]) is not int:
+        if (value not in ({"version": 1}, {"version": 2}, {"version": 3})
+                or type(value["version"]) is not int):
             raise ValueError("native environment recipe is not admitted")
         return value["version"]
     legacy = legacy_evidence.exists() or legacy_evidence.is_symlink()
     if legacy:
         _private_file(legacy_evidence)
-    version = 1 if legacy else 2
+    # v1: durable temp; v2: short owned temp; v3: packaged Go is discoverable.
+    version = 1 if legacy else default_version
     _write_once(marker, json.dumps({"version": version}).encode())
+    return version
+
+
+def _native_check_key(spec: dict[str, Any], evidence: Path, check_id: str) -> str:
+    return str(evidence.relative_to(Path(spec["state_dir"]))) + "/" + check_id
+
+
+def _native_addon_environment_version(spec: dict[str, Any], evidence: Path) -> int:
+    """Keep interrupted child profiles authoritative before publishing a handoff."""
+    retained = []
+    for check_id in ("native-addon-node-identity", "native-addon-build", "native-addon-load"):
+        owner = (Path(spec["state_dir"]) / "transient/checks"
+                 / _native_check_key(spec, evidence, check_id) / "codex")
+        marker, profile = owner / "native-environment.json", owner / "config.toml"
+        if any(path.exists() or path.is_symlink() for path in (marker, profile)):
+            retained.append(_native_environment_version(owner, profile))
+    version = _native_environment_version(
+        evidence, evidence / "native-addon-preparation.json",
+        default_version=min(retained, default=3),
+    )
+    if any((child >= 3) != (version >= 3) for child in retained):
+        raise ValueError("native addon retained PATH recipes disagree")
     return version
 
 
@@ -354,7 +387,7 @@ def prepare_native_role(
         attempt_dir, attempt_dir / "native-process.json",
     )
     scratch = (RunResources(spec).execution_scratch("role", request["role"])
-               if environment_version == 2 else ephemeral_home / "tmp")
+               if environment_version >= 2 else ephemeral_home / "tmp")
     _private(scratch)
     source = Path(spec["policy"].get("codex_auth_path") or Path.home() / ".codex" / "auth.json")
     _private_file(source)
@@ -396,7 +429,7 @@ def prepare_native_role(
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
     env = _native_env(
         ephemeral_home, codex_home, scratch, toolchain_roots,
-        short_temp=environment_version == 2,
+        short_temp=environment_version >= 2, packaged_go=environment_version >= 3,
     )
     if cache:
         env["COREPACK_HOME"] = cache
@@ -506,14 +539,20 @@ def prepare_native_check(
 
     from .delivery_resources import RunResources
 
-    key = str(evidence_dir.relative_to(Path(spec["state_dir"]))) + "/" + check["id"]
+    key = _native_check_key(spec, evidence_dir, check["id"])
     home = RunResources(spec).scratch("checks", key)
     codex_home = home / "codex"
     for path in (home, codex_home):
         _private(path)
-    environment_version = _native_environment_version(codex_home, codex_home / "config.toml")
+    addon_version = check.get("native_addon_environment_version")
+    environment_version = _native_environment_version(
+        codex_home, codex_home / "config.toml",
+        **({"default_version": addon_version} if addon_version is not None else {}),
+    )
+    if addon_version is not None and (addon_version >= 3) != (environment_version >= 3):
+        raise ValueError("native addon retained PATH recipes disagree")
     scratch = (RunResources(spec).execution_scratch("checks", key)
-               if environment_version == 2 else home / "tmp")
+               if environment_version >= 2 else home / "tmp")
     _private(scratch)
     domains = tuple(check.get("network_domains", ()))
     toolchain_roots = tuple(Path(root) for root in spec["policy"].get("toolchain_roots", []))
@@ -542,7 +581,7 @@ def prepare_native_check(
     _write_once(codex_home / "config.toml", ("\n".join(lines) + "\n").encode())
     env = _native_env(
         home, codex_home, scratch, toolchain_roots,
-        short_temp=environment_version == 2,
+        short_temp=environment_version >= 2, packaged_go=environment_version >= 3,
     )
     env.update(
         {

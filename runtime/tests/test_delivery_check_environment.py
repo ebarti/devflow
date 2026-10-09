@@ -1,6 +1,7 @@
 """Synthetic execution-prerequisite regressions; never launch native processes."""
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,23 @@ def test_all_temp_environment_aliases_use_owned_root_and_do_not_inherit_credenti
     env = _native_env(Path("/durable/home"), Path("/durable/codex"), scratch, short_temp=True)
     assert all(env[key] == str(scratch) for key in ["TMPDIR", "TMP", "TEMP"])
     assert "AWS_SECRET_ACCESS_KEY" not in env
+
+
+def test_native_path_finds_packaged_go_and_keeps_explicit_tools_first(monkeypatch):
+    monkeypatch.setenv("PATH", "/foreign/bin")
+    tools = Path("/frozen/tools")
+    available = {"/usr/local/go/bin/go", "/foreign/bin/go",
+                 "/frozen/tools/bin/node", "/frozen/tools/bin/corepack"}
+    # Resolve a synthetic executable inventory without running a compiler or child.
+    monkeypatch.setattr(shutil, "_access_check", lambda path, mode: path in available)
+    env = _native_env(Path("/home"), Path("/codex"), Path("/scratch"), (tools,),
+                      packaged_go=True)
+    assert shutil.which("go", path=env["PATH"]) == "/usr/local/go/bin/go"
+    assert shutil.which("node", path=env["PATH"]) == "/frozen/tools/bin/node"
+    assert shutil.which("corepack", path=env["PATH"]) == "/frozen/tools/bin/corepack"
+    available.add("/frozen/tools/bin/go")
+    assert shutil.which("go", path=env["PATH"]) == "/frozen/tools/bin/go"
+    assert "/foreign/bin" not in env["PATH"].split(":")
 
 
 def test_native_projects_are_from_frozen_lock_not_plan_test_names(addon):
@@ -184,6 +202,7 @@ def test_role_and_check_profiles_get_short_temp_without_moving_durable_home(
     assert all(env[k] == env["TMPDIR"] for k in ["TMP", "TEMP"])
     assert Path(env["HOME"]).is_relative_to(state)
     assert Path(env["CODEX_HOME"]).is_relative_to(state)
+    assert "/usr/local/go/bin" in env["PATH"].split(":")
     assert (
         read_private(RunResources(spec).manifest)["roots"][str(short)]["kind"]
         == "execution-scratch"
@@ -218,8 +237,9 @@ def test_short_scratch_cleanup_preserves_durable_evidence_and_foreign_directorie
 
 
 @pytest.mark.parametrize("role", [False, True], ids=["check", "role"])
+@pytest.mark.parametrize("legacy_version", [1, 2])
 def test_retained_legacy_invocation_keeps_environment_but_new_attempt_gets_short_temp(
-    tmp_path, monkeypatch, role
+    tmp_path, monkeypatch, role, legacy_version
 ):
     from devflow_temporal import delivery_sandbox as sandbox
     from devflow_temporal.delivery_native_process import NativeProcess
@@ -244,8 +264,15 @@ def test_retained_legacy_invocation_keeps_environment_but_new_attempt_gets_short
     attempt = state / "attempt"
     request = {"spec": spec, "workspace": str(checkout), "role": "implement", "iteration": 0}
     original_version = sandbox._native_environment_version
-    # Seed a pre-upgrade profile without the new durable marker.
-    monkeypatch.setattr(sandbox, "_native_environment_version", lambda *_: 1)
+    # Seed either the unmarked original recipe or the retained short-temp recipe.
+    def retained_version(owner, legacy_evidence):
+        if legacy_version == 2:
+            marker = owner / "native-environment.json"
+            marker.write_text(json.dumps({"version": 2}))
+            marker.chmod(0o600)
+        return legacy_version
+
+    monkeypatch.setattr(sandbox, "_native_environment_version", retained_version)
     if role:
         _, before = sandbox.prepare_native_role(request, attempt)
         journal = attempt / "native-process.json"
@@ -259,7 +286,9 @@ def test_retained_legacy_invocation_keeps_environment_but_new_attempt_gets_short
     else:
         _, after = sandbox.prepare_native_check(spec, checkout, evidence, {"id": "api"})
     assert after == before
-    assert "TMP" not in after and "TEMP" not in after
+    assert ("TMP" in after) == (legacy_version == 2)
+    assert ("TEMP" in after) == (legacy_version == 2)
+    assert "/usr/local/go/bin" not in after["PATH"].split(":")
     process = object.__new__(NativeProcess)
     process.spec, process.argv, process.cwd = spec, ["unchanged-command"], checkout
     process.timeout, process.ports, process.environment = 600, (), before
@@ -272,9 +301,10 @@ def test_retained_legacy_invocation_keeps_environment_but_new_attempt_gets_short
         _, fresh = sandbox.prepare_native_check(spec, checkout, evidence, {"id": "next-api"})
     assert Path(fresh["TMPDIR"]).parent == short
     assert fresh["TMP"] == fresh["TEMP"] == fresh["TMPDIR"]
+    assert "/usr/local/go/bin" in fresh["PATH"].split(":")
 
 
-@pytest.mark.parametrize("bad", [True, 3, "2"])
+@pytest.mark.parametrize("bad", [True, 4, "3"])
 def test_environment_recipe_marker_rejects_unknown_or_noninteger_versions(tmp_path, bad):
     from devflow_temporal.delivery_sandbox import _native_environment_version
 
