@@ -527,6 +527,9 @@ class DeliveryConfig:
             "automatic_retry_version": 1,
             **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
             "tracker_retry_version": 1,
+            "project_sync_version": 1,
+            "project_binding": {"project": repository.get("project_url"),
+                                "assignee": repository.get("assignee")},
             **({"merge_version": 1} if supplied["authorized_endpoint"] == "merged" else {}),
             **({"baseline_checks_version": 2 if accepted_plan is None else 1}
                if baseline_ids else {}),
@@ -660,6 +663,11 @@ def scope_amended_spec(
         effective["policy"]["max_attempts"] = original["policy"]["max_attempts"]
     else:
         effective["policy"].pop("max_attempts", None)
+    for name in ("project_sync_version", "project_binding"):
+        if name in original:
+            effective[name] = deepcopy(original[name])
+        else:
+            effective.pop(name, None)
     if "tracker_retry_version" in original:
         effective["tracker_retry_version"] = original["tracker_retry_version"]
     else:

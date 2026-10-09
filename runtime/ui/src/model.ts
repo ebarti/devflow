@@ -14,7 +14,18 @@ export interface Usage {
   source?: 'role_attempts'
 }
 
+export interface FeatureState {
+  issue: string
+  run_id: string
+  status: string
+  version: number
+  mirror?: { state: string; last_error?: string | null; checked_at?: string | null }
+  pull_requests: { url: string; checked_at?: string | null; error?: string | null;
+    observation?: { state: string; head: string; base: string; merged_at?: string | null } | null }[]
+}
+
 export interface RunSummary {
+  feature?: FeatureState | null
   archived?: boolean
   runtime_identity?: RuntimeIdentity | null
   id: string

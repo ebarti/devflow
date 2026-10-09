@@ -45,6 +45,17 @@ describe('workflow board and controls', () => {
     expect(laneFor({ ...mockRun, phase })).toBe(lane)
   })
 
+  it('shows current merged feature state while retaining the historical run phase', () => {
+    const run = { ...mockRun, phase: 'blocked', feature: { issue: 'https://github.com/o/r/issues/1',
+      run_id: 'newer-run', status: 'Merged', version: 4, pull_requests: [],
+      mirror: { state: 'pending', last_error: 'GitHub unavailable' } } }
+    expect(laneFor(run)).toBe('Merged')
+    render(<RunBoard runs={[run]} archived={false} onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
+    const lane = screen.getByRole('region', { name: 'Merged column' })
+    expect(lane.textContent).toContain('Run: Blocked')
+    expect(lane.textContent).toContain('Project: Sync pending')
+  })
+
   it('renders task statuses and opens the selected task', async () => {
     const select = vi.fn()
     render(<RunBoard runs={[mockRun]} archived={false} onSelect={select} onToggle={vi.fn()} onRefresh={vi.fn()} />)

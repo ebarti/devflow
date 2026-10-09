@@ -1,0 +1,417 @@
+"""Pure SQLite/Git/stub checks; no Temporal or native process fixtures."""
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from test_delivery_store import service as delivery_service
+
+from devflow_temporal import delivery_activities
+from devflow_temporal.delivery_features import current, record_tracking, transition
+from devflow_temporal.delivery_project_sync import ProjectSynchronizer, Superseded
+from devflow_temporal.delivery_store import DeliveryStore
+from devflow_temporal.delivery_workflow import _tracking_ready
+
+service = delivery_service
+
+
+class Remote:
+    def __init__(self):
+        self.state = "OPEN"
+        self.head = "a" * 40
+        self.reads = []
+        self.writes = []
+        self.failure = False
+
+    def pull_request(self, url):
+        self.reads.append(url)
+        return {"url": url, "state": self.state, "head": self.head,
+                "base": "b" * 40, "merged_at": None}
+
+    def mirror(self, feature, fence):
+        fence()
+        self.writes.append(feature["status"])
+        if self.failure:
+            raise RuntimeError("GitHub unavailable")
+        return {"status": feature["status"], "assignee": "owner"}
+
+
+def published(service):
+    store, request = service
+    store.submit(request)
+    receipt = {"url": "https://github.com/example/fixture/pull/7", "state": "OPEN",
+               "head": "a" * 40, "number": 7}
+    store.project(request["run_id"], phase="delivered", execution_state="terminal",
+                  event_type="delivered", message="published", outcome="published_unmerged",
+                  pull_request=receipt)
+    return store, request, receipt
+
+
+def test_event_and_feature_roll_back_with_run_transaction(service):
+    store, request = service
+    store.submit(request)
+    with store._connect() as db:
+        before = db.execute("SELECT payload_json FROM delivery_features").fetchone()[0]
+        count = db.execute("SELECT count(*) FROM delivery_feature_events").fetchone()[0]
+    with pytest.raises(RuntimeError), store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("UPDATE delivery_runs SET phase='blocked'")
+        store._event(db, request["run_id"], 2, "blocked", "fail", {})
+        raise RuntimeError("crash before commit")
+    with store._connect() as db:
+        assert db.execute("SELECT payload_json FROM delivery_features").fetchone()[0] == before
+        assert db.execute("SELECT count(*) FROM delivery_feature_events").fetchone()[0] == count
+
+
+def test_merge_observation_preserves_receipts_and_run_outcome(service):
+    store, request, receipt = published(service)
+    remote = Remote()
+    remote.state = "MERGED"
+    sync = ProjectSynchronizer([store], remote)
+    result = sync.tick()[request["issue_url"]]
+    assert result["status"] == "Merged"
+    assert result["mirror"]["state"] == "consistent"
+    detail = store.detail(request["run_id"])
+    assert detail["pull_request"] == receipt
+    assert detail["outcome"] == "published_unmerged"
+    assert detail["phase"] == "delivered"
+    assert detail["feature"]["status"] == "Merged"
+
+
+@pytest.mark.parametrize(("state", "head", "expected"), [
+    ("OPEN", "a" * 40, "Awaiting merge"),
+    ("CLOSED", "a" * 40, "PR closed"),
+    ("OPEN", "c" * 40, "Needs validation"),
+])
+def test_current_pr_lifecycle(service, state, head, expected):
+    store, request, _ = published(service)
+    remote = Remote()
+    remote.state, remote.head = state, head
+    assert ProjectSynchronizer([store], remote).tick()[request["issue_url"]]["status"] == expected
+
+
+def test_poll_schedule_and_failure_backoff_survive_restart(service):
+    store, request, _ = published(service)
+    remote = Remote()
+    remote.failure = True
+    stamp = datetime(2026, 10, 9, tzinfo=UTC)
+    clock = lambda: stamp  # noqa: E731
+    sync = ProjectSynchronizer([store], remote, clock=clock)
+    first = sync.tick()[request["issue_url"]]
+    assert first["status"] == "Awaiting merge"
+    assert first["mirror"]["state"] == "pending"
+    assert "GitHub unavailable" in first["mirror"]["last_error"]
+    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, clock=clock)
+    restarted.tick()
+    assert len(remote.reads) == len(remote.writes) == 1
+    stamp += timedelta(seconds=15)
+    remote.failure = False
+    assert restarted.tick()[request["issue_url"]]["mirror"]["state"] == "consistent"
+    assert len(remote.reads) == 1
+    stamp += timedelta(seconds=284)
+    restarted.tick()
+    assert len(remote.reads) == 1
+    stamp += timedelta(seconds=1)
+    restarted.tick()
+    assert len(remote.reads) == 2
+
+
+def test_local_tracking_releases_claim_without_any_remote_call(service, monkeypatch):
+    store, request = service
+    store.submit(request)
+    spec = store.spec(request["run_id"])
+    monkeypatch.setattr(delivery_activities, "_context", lambda *_: (store, None))
+    monkeypatch.setattr(delivery_activities.subprocess, "run",
+                        lambda *_args, **_kwargs: pytest.fail("unexpected remote call"))
+    receipt = delivery_activities._tracker_sync(spec, "in-review", release=True)
+    assert receipt["state"] == "recorded"
+    assert receipt["scope"] == "local"
+    assert _tracking_ready(spec, receipt)
+    assert not _tracking_ready({}, receipt)
+    with store._connect() as db:
+        assert store.state.claim_for(db, request["work_id"]) is None
+    assert record_tracking(store, spec, "in-review", True)["claim_released"]
+
+
+def test_legacy_active_workflow_keeps_project_ownership_until_terminal(service):
+    store, request = service
+    store.submit(request)
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        spec = json.loads(db.execute("SELECT request_json FROM delivery_runs").fetchone()[0])
+        spec.pop("project_sync_version")
+        db.execute("UPDATE delivery_runs SET request_json=?", (json.dumps(spec),))
+        transition(db, store.config, request["run_id"])
+    remote = Remote()
+    sync = ProjectSynchronizer([store], remote)
+    assert sync.tick()[request["issue_url"]]["mirror"]["state"] == "pending"
+    assert not remote.writes
+    store.project(request["run_id"], phase="blocked", execution_state="blocked",
+                  event_type="blocked", message="Stopped", outcome="blocked")
+    assert sync.tick()[request["issue_url"]]["mirror"]["state"] == "consistent"
+    assert remote.writes == ["Blocked"]
+
+
+def test_older_run_changes_cannot_steal_feature(service):
+    store, request, _ = published(service)
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        store.state.release_work(db, request["work_id"], "external:devflow:run-1")
+    second = {**request, "run_id": "run-2", "work_id": "work-2", "command_id": "command-2"}
+    store.submit(second)
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("UPDATE delivery_runs SET phase='blocked',revision=revision+1 "
+                   "WHERE run_id='run-1'")
+        transition(db, store.config, "run-1")
+        assert current(db, request["issue_url"])["run_id"] == "run-2"
+
+
+def test_stale_mirror_is_not_acknowledged(service):
+    store, request, _ = published(service)
+    remote = Remote()
+
+    def changed(feature, fence):
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE delivery_runs SET phase='blocked',outcome='blocked'")
+            transition(db, store.config, request["run_id"])
+        with pytest.raises(Superseded):
+            fence()
+        return {"status": feature["status"]}
+
+    remote.mirror = changed
+    assert ProjectSynchronizer([store], remote).tick() == {}
+    with store._connect() as db:
+        assert db.execute("SELECT state FROM delivery_project_outbox").fetchone()[0] == "pending"
+
+
+def test_duplicate_poll_does_not_add_events_or_remote_reads(service):
+    store, _, _ = published(service)
+    remote = Remote()
+    sync = ProjectSynchronizer([store], remote)
+    sync.tick()
+    with store._connect() as db:
+        before = db.execute("SELECT count(*) FROM delivery_feature_events").fetchone()[0]
+    sync.tick()
+    with store._connect() as db:
+        assert db.execute("SELECT count(*) FROM delivery_feature_events").fetchone()[0] == before
+    assert len(remote.reads) == len(remote.writes) == 1
+
+
+def test_unknown_pr_read_retains_last_fact_and_error(service):
+    store, request, _ = published(service)
+    remote = Remote()
+    stamp = datetime(2026, 10, 9, tzinfo=UTC)
+    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    first = sync.tick()[request["issue_url"]]
+    stamp += timedelta(seconds=300)
+
+    def unavailable(_url):
+        raise RuntimeError("PR read unavailable")
+
+    remote.pull_request = unavailable
+    after = sync.tick()[request["issue_url"]]
+    assert after["status"] == first["status"]
+    assert after["pull_requests"][0]["observation"] == first["pull_requests"][0]["observation"]
+    assert after["pull_requests"][0]["error"] == "PR read unavailable"
+
+
+def test_stack_requires_every_member_to_merge(service):
+    store, request, receipt = published(service)
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        receipt = {"pull_requests": [receipt, {**receipt, "url": receipt["url"][:-1] + "8"}]}
+        db.execute("UPDATE delivery_runs SET pr_json=?", (json.dumps(receipt),))
+        transition(db, store.config, request["run_id"])
+    remote = Remote()
+    read = remote.pull_request
+    remote.pull_request = lambda url: {
+        **read(url), "state": "MERGED" if url.endswith("7") else "OPEN",
+    }
+    assert ProjectSynchronizer([store], remote).tick()[request["issue_url"]]["status"] != "Merged"
+
+
+def test_multiple_databases_select_one_owner_and_mirror_same_view(service, tmp_path):
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    older, request, _ = published(service)
+    raw = {**older.config.raw, "tracking_db": str(tmp_path / "second.sqlite3"),
+           "state_root": str(tmp_path / "second-state")}
+    config_path = tmp_path / "second.json"
+    config_path.write_text(json.dumps(raw))
+    newer = DeliveryStore(DeliveryConfig.load(config_path))
+    newer.submit({**request, "run_id": "run-2", "work_id": "work-2", "command_id": "command-2"})
+    remote = Remote()
+    remote.state = "MERGED"  # The older PR cannot complete the newer feature attempt.
+    sync = ProjectSynchronizer([older, newer], remote)
+    result = sync.tick()[request["issue_url"]]
+    assert result["status"] == "Queued" and result["run_id"] == "run-2"
+    for store in (older, newer):
+        with store._connect() as db:
+            assert current(db, request["issue_url"])["run_id"] == "run-2"
+    assert remote.writes == ["Queued"]
+    with sync.ownership(), pytest.raises(BlockingIOError), sync.ownership():
+        pytest.fail("overlapping source consumer acquired ownership")
+
+
+def test_project_drift_is_rechecked_at_five_minutes(service):
+    store, _, _ = published(service)
+    remote = Remote()
+    stamp = datetime(2026, 10, 9, tzinfo=UTC)
+    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    sync.tick()
+    stamp += timedelta(seconds=299)
+    sync.tick()
+    assert len(remote.writes) == 1
+    stamp += timedelta(seconds=1)
+    sync.tick()
+    assert len(remote.writes) == 2
+
+
+def test_github_preserves_option_ids_paginates_and_reads_back_exact_status():
+    from devflow_temporal.delivery_project_sync import GitHub
+
+    class FakeGraph(GitHub):
+        def __init__(self):
+            self.options = [{"id": "existing", "name": "Existing", "color": "BLUE",
+                             "description": "keep"}]
+            self.status = {"optionId": "existing", "name": "Existing"}
+            self.cursors = []
+            self.changes = []
+
+        def command(self, *args, **_kwargs):
+            assert args[:2] == ("issue", "view")
+            return {"id": "issue", "url": "https://github.com/example/fixture/issues/3",
+                    "state": "OPEN", "assignees": [{"login": "owner"}]}
+
+        def graphql(self, host, query, **variables):
+            assert host == "github.com"
+            if "projectV2(number:" in query:
+                return {"user": {"projectV2": {"id": "project", "closed": False,
+                        "field": {"id": "field", "options": self.options}}}}
+            if "updateProjectV2Field(" in query:
+                supplied = variables["input"]["singleSelectOptions"]
+                assert supplied[0] == self.options[0]  # Stable identity and existing values.
+                self.options = [supplied[0], {**supplied[1], "id": "merged"}]
+                return {"updateProjectV2Field": {"projectV2Field": {"options": self.options}}}
+            if "projectItems(first:" in query:
+                self.cursors.append(variables["cursor"])
+                first = variables["cursor"] is None
+                return {"node": {"projectItems": {
+                    "nodes": [] if first else [{"id": "item", "project": {"id": "project"}}],
+                    "pageInfo": {"hasNextPage": first, "endCursor": "next"},
+                }}}
+            if "updateProjectV2ItemFieldValue(" in query:
+                self.changes.append(variables)
+                self.status = {"name": "Merged", "optionId": "merged"}
+                return {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "item"}}}
+            if "fieldValueByName" in query:
+                return {"node": {"project": {"id": "project"}, "fieldValueByName": self.status}}
+            pytest.fail(query)
+
+    remote = FakeGraph()
+    feature = {"issue": "https://github.com/example/fixture/issues/3", "status": "Merged",
+               "binding": {"project": "https://github.com/users/example/projects/1",
+                           "assignee": "owner"}}
+    result = remote.mirror(feature, lambda: None)
+    assert result["status"] == "Merged"
+    assert remote.cursors == [None, "next"]
+    assert len(remote.changes) == 1
+    remote.mirror(feature, lambda: None)
+    assert len(remote.changes) == 1  # Lost acknowledgement is safe to replay.
+
+
+def test_audit_compares_canonical_status_and_live_pr_not_historical_mapping(service, monkeypatch):
+    import importlib.util
+    import sys
+
+    store, request, _ = published(service)
+    remote = Remote()
+    receipt = {"project": "https://github.com/users/example/projects/1", "project_id": "p",
+               "item_id": "i", "field_id": "f", "option_id": "o", "status": "Awaiting merge",
+               "assignee": "owner"}
+    remote.mirror = lambda *_: receipt
+    with store._connect() as db:
+        saved = json.loads(db.execute("SELECT payload_json FROM delivery_features").fetchone()[0])
+        saved["binding"] = {"project": receipt["project"], "assignee": "owner"}
+        db.execute("UPDATE delivery_features SET payload_json=?", (json.dumps(saved),))
+    # Keep the binding frozen across the PR-observation transition.
+    with store._connect() as db:
+        spec = json.loads(db.execute("SELECT request_json FROM delivery_runs").fetchone()[0])
+        spec["project_binding"] = saved["binding"]
+        db.execute("UPDATE delivery_runs SET request_json=?", (json.dumps(spec),))
+    ProjectSynchronizer([store], remote).tick()
+    monkeypatch.setitem(sys.modules, "state", store.state)
+    loader = importlib.util.spec_from_file_location("feature_github",
+                                                   store.config.helpers_dir / "github.py")
+    helper = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(helper)
+    monkeypatch.setattr(helper, "view", lambda _: {"state": "OPEN",
+                                                    "assignees": [{"login": "owner"}]})
+    monkeypatch.setattr(helper, "project_item", lambda *_: {
+        "project": {"id": "p"}, "fieldValueByName": {"optionId": "o", "name": "Awaiting merge"},
+    })
+    monkeypatch.setattr(helper, "gh", lambda *_a, **_kw: {
+        "url": "https://github.com/example/fixture/pull/7", "state": "MERGED",
+        "headRefOid": "a" * 40,
+    })
+    with store._connect() as db:
+        result = helper.audit(db, request["work_id"])
+    assert result["local_status"] == "Awaiting merge"
+    assert result["state"] == "reconciliation_required"
+    assert result["reconciliation_required"] == ["pr_state_mismatch"]
+
+
+def test_legacy_reconciler_cannot_apply_delivery_projection(service, monkeypatch):
+    import importlib.util
+    import sys
+
+    store, request, _ = published(service)
+    monkeypatch.syspath_prepend(str(store.config.helpers_dir))
+    monkeypatch.setitem(sys.modules, "state", store.state)
+    loaders = {}
+    for name in ("github", "reconcile"):
+        loader = importlib.util.spec_from_file_location(
+            name, store.config.helpers_dir / f"{name}.py",
+        )
+        module = importlib.util.module_from_spec(loader)
+        monkeypatch.setitem(sys.modules, name, module)
+        loader.loader.exec_module(module)
+        loaders[name] = module
+    with store._connect() as db:
+        assert not loaders["reconcile"].current(db, {"work_id": request["work_id"]})
+
+
+def test_stale_worker_cannot_leave_a_forever_consistent_badge():
+    from devflow_temporal.delivery_features import mirror_freshness
+
+    feature = {"mirror": {"state": "consistent", "next_attempt_at": "2000-01-01T00:00:00+00:00"}}
+    assert mirror_freshness(feature)["mirror"]["state"] == "stale"
+
+
+def test_service_install_stages_owned_plist_without_starting_a_process(tmp_path, monkeypatch):
+    import importlib.util
+    import plistlib
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    script = Path(__file__).resolve().parents[2] / "scripts/project-sync-service.py"
+    loader = importlib.util.spec_from_file_location("project_sync_service", script)
+    service_module = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(service_module)
+    owner = tmp_path / "owner.json"
+    owner.write_text('{}')
+    config = tmp_path / "sync.json"
+    config.write_text(json.dumps({"version": 1, "owners": [str(owner)]}))
+    monkeypatch.setattr(service_module.shutil, "which", lambda _: "/usr/bin/gh")
+    monkeypatch.setattr(service_module.subprocess, "check_output", lambda *_a, **_kw: "a" * 40)
+    monkeypatch.setattr(service_module, "launch", lambda *_a, **_kw: pytest.fail("process control"))
+    target = tmp_path / "agents" / (service_module.LABEL + ".plist")
+    result = service_module.install(SimpleNamespace(config=config, no_start=True), target)
+    assert not result["active"]
+    plist = plistlib.loads(target.read_bytes())
+    assert plist["KeepAlive"] and plist["RunAtLoad"]
+    assert "--config-sha256" in plist["ProgramArguments"]
+    assert not (tmp_path / "project-sync-activation.json").exists()

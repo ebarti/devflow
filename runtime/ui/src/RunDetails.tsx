@@ -39,7 +39,12 @@ function Facts({ run }: { run: RunDetail }) {
     <div><dt>Candidate</dt><dd className="mono" title={run.candidate?.head ?? undefined}>{display(run.candidate?.head, 'Not available')}</dd></div>
     <div><dt>Pull request</dt><dd>{url ? <a href={url} target="_blank" rel="noopener noreferrer">{run.pull_request?.number ? `#${run.pull_request.number}` : 'Open pull request'} <ExternalIcon /></a> : display(run.pull_request?.number, 'Not published')}</dd></div>
     <div><dt>Authorized endpoint</dt><dd><span className="outline-pill">{titleCase(run.authorized_endpoint)}</span></dd></div>
-    <div><dt>Tracker</dt><dd><span className={`soft-pill soft-pill--${trackerTone}`}>{trackerLabel}</span></dd></div>
+    {run.feature ? <>
+      <div><dt>Feature status</dt><dd>{run.feature.status}</dd></div>
+      <div><dt>Project sync</dt><dd>{run.feature.mirror?.state === 'consistent' ? 'Synced' : 'Pending'}{run.feature.mirror?.last_error ? `: ${run.feature.mirror.last_error}` : ''}</dd></div>
+      <div><dt>Run phase</dt><dd>{titleCase(run.phase)}</dd></div>
+      {run.feature.pull_requests.map(pr => <div key={pr.url}><dt>Current PR state</dt><dd>{pr.observation?.state ?? 'Not yet observed'} · checked {time(pr.checked_at)}{pr.error ? ` · ${pr.error}` : ''}</dd></div>)}
+    </> : <div><dt>Tracker</dt><dd><span className={`soft-pill soft-pill--${trackerTone}`}>{trackerLabel}</span></dd></div>}
   </dl>
 }
 
@@ -133,7 +138,7 @@ function Operations({ run }: { run: RunDetail }) {
       <div><dt>Cleanup</dt><dd>{titleCase(run.cleanup)}</dd></div>
       <div><dt>Tracker desired</dt><dd>{display(run.tracker?.desired)}</dd></div>
       <div><dt>Tracker observed</dt><dd>{display(run.tracker?.observed)}</dd></div>
-      <div><dt>Tracker sync</dt><dd>{titleCase(run.tracker?.state)}</dd></div>
+      <div><dt>{run.feature ? "Historical tracker receipt" : "Tracker sync"}</dt><dd>{titleCase(run.tracker?.state)}</dd></div>
       <div><dt>Tracker readback</dt><dd>{time(run.tracker?.readback_at)}</dd></div>
       <div><dt>Candidate revision</dt><dd>{display(run.candidate?.revision)}</dd></div>
       <div><dt>Base SHA</dt><dd className="mono">{display(run.candidate?.base)}</dd></div>

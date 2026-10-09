@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 devflow-temporal = "devflow_temporal.cli:main"
 devflow-delivery = "devflow_temporal.delivery_control:main"
+devflow-project-sync = "devflow_temporal.delivery_project_sync:main"
 devflow-delivery-mcp = "devflow_temporal.delivery_mcp:main"
 
 [dependency-groups]

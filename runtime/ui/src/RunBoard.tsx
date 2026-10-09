@@ -1,9 +1,12 @@
 import { display, titleCase, time } from './format'
 import type { RunSummary } from './model'
 
-const lanes = ['Queued', 'Planning', 'Implementation', 'Review', 'QA & CI', 'Tracking', 'Delivered', 'Needs attention'] as const
+const lanes = ['Queued', 'Planning', 'Implementation', 'Review', 'QA & CI', 'Tracking', 'Awaiting merge', 'Merged', 'Delivered', 'Needs attention'] as const
 
 export function laneFor(run: RunSummary): typeof lanes[number] {
+  if (run.feature?.status === 'Merged') return 'Merged'
+  if (run.feature?.status === 'Awaiting merge') return 'Awaiting merge'
+  if (['Blocked', 'Cancelled', 'PR closed', 'Needs validation'].includes(run.feature?.status ?? '')) return 'Needs attention'
   if (run.phase === 'delivered') return 'Delivered'
   if (['blocked', 'cancelled', 'cancelling', 'needs_decision', 'waiting_decision', 'waiting_question', 'waiting_plan', 'waiting_tracker'].includes(run.phase ?? '') || ['blocked', 'cancelled', 'waiting_decision', 'unknown', 'waiting_question', 'waiting_plan'].includes(run.execution_state ?? '')) return 'Needs attention'
   if (['investigating', 'intake', 'plan', 'awaiting_plan', 'awaiting_answers'].includes(run.phase ?? '')) return 'Planning'
@@ -22,10 +25,10 @@ export function RunBoard({ runs, archived, onSelect, onToggle, onRefresh }: {
   const groups = new Map(lanes.map(lane => [lane, [] as RunSummary[]]))
   for (const run of runs) groups.get(laneFor(run))!.push(run)
   return <section aria-label="Task status board">
-    <div className="board-toolbar"><div><h2>{archived ? 'Archived tasks' : 'Task board'}</h2><p className="subtle">{runs.length} tasks · live workflow statuses · refreshed every 5 seconds</p></div><div className="button-row"><button className="outline-button" onClick={onToggle}>{archived ? 'Show current tasks' : 'Show archived tasks'}</button><button className="text-button" onClick={onRefresh}>Refresh board</button></div></div>
+    <div className="board-toolbar"><div><h2>{archived ? 'Archived tasks' : 'Task board'}</h2><p className="subtle">{runs.length} tasks · current feature statuses · refreshed every 5 seconds</p></div><div className="button-row"><button className="outline-button" onClick={onToggle}>{archived ? 'Show current tasks' : 'Show archived tasks'}</button><button className="text-button" onClick={onRefresh}>Refresh board</button></div></div>
     {!runs.length ? <p className="empty-section">{archived ? 'No archived tasks.' : 'No current tasks. Start a new run to see it progress here.'}</p> : null}
     <div className="kanban-board">{lanes.map(lane => <section className="kanban-lane" key={lane} aria-label={`${lane} column`}><h3>{lane}<span>{groups.get(lane)!.length}</span></h3><div className="kanban-cards">{groups.get(lane)!.map(run => <button className="task-card" key={run.id} onClick={() => onSelect(run.id || run.run_id || '')}>
-      <span className="task-card__repo">{display(run.repository || run.repository_key)}</span><strong>{display(run.title || run.goal, 'Untitled task')}</strong><span className="task-card__status">{titleCase(run.phase || 'unknown')}</span><small>Last update {time(run.updated_at)}</small>
+      <span className="task-card__repo">{display(run.repository || run.repository_key)}</span><strong>{display(run.title || run.goal, 'Untitled task')}</strong><span className="task-card__status">{run.feature?.status ?? titleCase(run.phase || 'unknown')}</span>{run.feature ? <small>Run: {titleCase(run.phase)} · Project: {run.feature.mirror?.state === 'consistent' ? 'Synced' : 'Sync pending'}</small> : null}<small>Last update {time(run.updated_at)}</small>
     </button>)}</div></section>)}</div>
   </section>
 }

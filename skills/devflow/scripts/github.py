@@ -180,6 +180,8 @@ def synchronize(db, args):
     with db:
         db.execute("BEGIN IMMEDIATE")
         work = state.row(db, "works", args.work_id)
+        if work and work["issue"] and feature_state(db, work["issue"]):
+            raise ValueError("delivery feature Project updates belong to the independent synchronizer")
         if args.action == "set" or state.claim_for(db, args.work_id):
             state.require_owner(db, args.work_id, args.owner)
         saved = details(work).get("github", {})
@@ -265,11 +267,63 @@ def tracking_assignee(db, work_id):
     return details(state.row(db, "works", work_id))["github"]["sync"]["assignee"]
 
 
+def feature_state(db, issue):
+    """Current delivery feature, when this database has adopted the independent projector."""
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not {"delivery_features", "delivery_feature_views"} <= tables:
+        return None
+    key = issue.rstrip("/").casefold()
+    local = db.execute("SELECT payload_json,version FROM delivery_features WHERE issue=?", (key,)).fetchone()
+    saved = db.execute("SELECT payload_json FROM delivery_feature_views WHERE issue=?", (key,)).fetchone()
+    feature = {**json.loads(local[0]), "version": local[1]} if local else None
+    view = json.loads(saved[0]) if saved else None
+    if view and (not feature or (view["admitted_at"], view["run_id"]) > (feature["admitted_at"], feature["run_id"])
+                 or (view["run_id"] == feature["run_id"] and view["version"] >= feature["version"])):
+        return None if view.get("legacy_tracking") else view
+    return None if feature and feature.get("legacy_tracking") else feature
+
+
+def audit_feature(db, work, feature):
+    result = dict(work_id=work["id"], issue=work["issue"], local_status=feature["status"],
+                  local_work_status=work["status"], feature=feature,
+                  reconciliation_required=[], unknown=[])
+    issue = view(work["issue"])
+    assignee = feature["binding"].get("assignee")
+    if not assignee:
+        result["unknown"].append("assignee_unconfigured")
+    elif assignee.casefold() not in {item["login"].casefold() for item in issue["assignees"]}:
+        result["reconciliation_required"].append("assignee_mismatch")
+    receipt = feature.get("project_receipt")
+    if not receipt:
+        result["unknown"].append("project_sync_pending")
+    else:
+        observed = project_item(urlsplit(receipt["project"]).netloc, receipt["item_id"])
+        field = (observed or {}).get("fieldValueByName") or {}
+        result["project_observed"] = observed
+        if (not observed or observed["project"]["id"] != receipt["project_id"]
+                or field.get("name") != feature["status"]
+                or field.get("optionId") != receipt["option_id"]):
+            result["reconciliation_required"].append("project_status_mismatch")
+    for pr in feature["pull_requests"]:
+        observed = gh("pr", "view", pr["url"], "--json", "url,state,headRefOid", as_json=True)
+        saved = pr.get("observation")
+        if not saved:
+            result["unknown"].append("pr_state_unobserved")
+        elif observed["state"] != saved["state"] or observed["headRefOid"] != saved["head"]:
+            result["reconciliation_required"].append("pr_state_mismatch")
+    result["state"] = ("reconciliation_required" if result["reconciliation_required"] else
+                       "unknown" if result["unknown"] else "consistent")
+    return result
+
+
 def audit(db, work_id):
     """Read local and remote observations without claiming, syncing, or changing a work."""
     work = state.row(db, "works", work_id)
     if not work:
         raise ValueError("unknown work: " + work_id)
+    feature = feature_state(db, work["issue"]) if work["issue"] else None
+    if feature:
+        return audit_feature(db, work, feature)
     tracking = details(work).get("github", {})
     claim = state.claim_for(db, work_id)
     claim_summary = ({key: claim[key] for key in ("resource", "owner", "claimed_at", "updated_at")}

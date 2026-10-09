@@ -78,6 +78,9 @@ def queue(db, work_id, kind, payload, owner=None, next_action=None, force=False)
 
 
 def current(db, saved):
+    work = state.row(db, "works", saved["work_id"])
+    if work and work["issue"] and github.feature_state(db, work["issue"]):
+        return False
     latest = intent(db, saved["work_id"])
     if not latest or latest["revision"] != saved["revision"] or latest["state"] != "pending":
         return False
@@ -333,7 +336,7 @@ def discover(db, limit):
     for item in db.execute("SELECT * FROM works WHERE issue IS NOT NULL ORDER BY id"):
         work = dict(item)
         tracking = github.details(work).get("github", {})
-        if managed(tracking):
+        if managed(tracking) and not github.feature_state(db, work["issue"]):
             rows.append(work)
     cursor = db.execute("SELECT last_work_id FROM reconcile_cursor WHERE id=1").fetchone()[0]
     start = next((index for index, work in enumerate(rows) if work["id"] > (cursor or "")), 0)
