@@ -38,6 +38,8 @@ def initialize(db: sqlite3.Connection) -> None:
         state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
         next_attempt_at TEXT NOT NULL, last_error TEXT, receipt_json TEXT,
         checked_at TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_sync_settings (
+        key TEXT PRIMARY KEY, value INTEGER NOT NULL)""")
 
 
 def issue_key(url: str) -> str:

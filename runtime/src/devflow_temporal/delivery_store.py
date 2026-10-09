@@ -397,11 +397,26 @@ class DeliveryStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         db = self.state.connect(self.config.tracking_db)
         db.execute("PRAGMA foreign_keys=ON")
+        feature_event = False
+
+        def observe_write(action, table, _column, _database, _trigger):
+            nonlocal feature_event
+            if action == sqlite3.SQLITE_INSERT and table == "delivery_feature_events":
+                feature_event = True
+            return sqlite3.SQLITE_OK
+
+        # This hook observes statements; it does not send anything inside the
+        # transaction. A rollback must not expose an uncommitted feature change.
+        db.set_authorizer(observe_write)
         try:
             with db:
                 yield db
         finally:
             db.close()
+        if feature_event:
+            from .delivery_project_events import notify
+
+            notify(self.config.tracking_db)
 
     def _event(
         self,

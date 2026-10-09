@@ -1,4 +1,4 @@
-"""Independent durable Project projector and five-minute PR observer.
+"""Event-driven Project projector with daily PR and drift reconciliation.
 
 Run with --config pointing to {"version":1,"owners":["/absolute/service.json",...]}.
 This process has no workflow client, agent dispatch, merge, or product-repair authority.
@@ -24,9 +24,11 @@ from urllib.parse import urlsplit
 from .contracts import canonical_json, digest
 from .delivery_config import DeliveryConfig
 from .delivery_features import issue_key, publication_urls, transition
+from .delivery_project_events import Notifications
 from .delivery_store import DeliveryStore, _private_directory
 
 logger = logging.getLogger(__name__)
+DAY = 24 * 60 * 60
 
 
 class Superseded(RuntimeError):
@@ -161,17 +163,76 @@ class GitHub:
 
 
 class ProjectSynchronizer:
-    def __init__(self, stores: list[DeliveryStore], github=None, *, interval: int = 300,
-                 clock=None):
+    def __init__(self, stores: list[DeliveryStore], github=None, *, interval: int = DAY,
+                 project_interval: int = DAY, clock=None):
         if not stores or len({str(store.config.tracking_db) for store in stores}) != len(stores):
             raise ValueError("synchronizer needs distinct, explicitly configured runtime owners")
-        if not 300 <= interval <= 3600:
-            raise ValueError("PR observation interval must be between 300 and 3600 seconds")
+        for value in (interval, project_interval):
+            if type(value) is not int or not 300 <= value <= DAY:
+                raise ValueError("reconciliation intervals must be between 300 and 86400 seconds")
         self.stores = stores
         self.github = github or GitHub()
         self.interval = interval
+        self.project_interval = project_interval
+        self._schedule_configured = False
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lock_root = Path(tempfile.gettempdir()) / f"devflow-project-sync-{os.getuid()}"
+
+    def configure_schedule(self) -> None:
+        """Rebase saved operational deadlines once when configuration changes."""
+        if self._schedule_configured:
+            return
+        for store in self.stores:
+            with store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                for key, interval, table, column, condition in (
+                    ("pr_interval_seconds", self.interval, "delivery_pr_observations",
+                     "next_check_at", "1=1"),
+                    ("project_interval_seconds", self.project_interval, "delivery_project_outbox",
+                     "next_attempt_at", "state='consistent'"),
+                ):
+                    saved = db.execute("SELECT value FROM delivery_sync_settings WHERE key=?",
+                                       (key,)).fetchone()
+                    if not saved or saved[0] != interval:
+                        error = "error" if table == "delivery_pr_observations" else "NULL"
+                        rows = db.execute(f"SELECT rowid,{column},checked_at,{error} "
+                                          f"FROM {table} WHERE {condition}").fetchall()
+                        for row in rows:
+                            if saved:
+                                due = datetime.fromisoformat(row[1]) + timedelta(
+                                    seconds=interval - saved[0])
+                            else:
+                                # Legacy configurations stored no interval. A successful
+                                # check is an exact anchor; unknown failed attempts start
+                                # a fresh interval without assuming the old cadence.
+                                anchor = (datetime.fromisoformat(row[2]) if row[2] and not row[3]
+                                          else self.clock())
+                                due = anchor + timedelta(seconds=interval)
+                            db.execute(f"UPDATE {table} SET {column}=? WHERE rowid=?",
+                                       (due.isoformat(), row[0]))
+                    db.execute("INSERT INTO delivery_sync_settings VALUES (?,?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                               (key, interval))
+        self._schedule_configured = True
+
+    def next_delay(self) -> float:
+        """Sleep until a retry/daily deadline; a committed event wakes us earlier."""
+        stamp = self.clock()
+        deadlines = [stamp + timedelta(seconds=DAY)]  # Lost-notification safety sweep.
+        for store in self.stores:
+            with store._connect() as db:
+                for row in db.execute("SELECT next_check_at FROM delivery_pr_observations"):
+                    deadlines.append(datetime.fromisoformat(row[0]))
+        for issue, (store, feature) in self.selected().items():
+            with store._connect() as db:
+                row = db.execute("SELECT identity,next_attempt_at FROM delivery_project_outbox "
+                                 "WHERE issue=?", (issue,)).fetchone()
+            if not row or row["identity"] != self.identity(feature):
+                deadlines.append(stamp)  # Ownership handoff/supersession needs a retry.
+            else:
+                deadlines.append(datetime.fromisoformat(row["next_attempt_at"]))
+        # A held legacy handoff lock or a failed tick must not cause a busy loop.
+        return max(15, (min(deadlines) - stamp).total_seconds())
 
     @contextmanager
     def ownership(self):
@@ -302,6 +363,7 @@ class ProjectSynchronizer:
         return view
 
     def tick(self) -> dict:
+        self.configure_schedule()
         self.observe_prs()
         results = {}
         for issue, (store, feature) in self.selected().items():
@@ -353,7 +415,7 @@ class ProjectSynchronizer:
                 receipt = self.github.mirror(feature, fence)
                 fence()
                 state, error = "consistent", None
-                delay = self.interval
+                delay = self.project_interval
             except Superseded:
                 return None
             except Exception as exc:
@@ -372,6 +434,24 @@ class ProjectSynchronizer:
                                           (issue,)).fetchone())
         fence()
         return self.publish_view(feature, current, stamp)
+
+
+def serve(synchronizer: ProjectSynchronizer, notifications: Notifications, *, once=False) -> None:
+    while True:
+        try:
+            result = synchronizer.tick()
+            if once:
+                print(canonical_json(result))
+                return
+            delay = synchronizer.next_delay()
+        except Exception:
+            logger.exception("Project synchronization failed; durable state retained")
+            if once:
+                raise
+            delay = 15
+        notified = notifications.wait(delay)
+        logger.info("Project sync wakeup: %s",
+                    "feature event" if notified else "scheduled retry/check")
 
 
 def main() -> None:
@@ -404,20 +484,18 @@ def main() -> None:
     if config.get("version") != 1 or not isinstance(config.get("owners"), list):
         raise ValueError("invalid Project synchronizer configuration")
     stores = [DeliveryStore(DeliveryConfig.load(Path(path))) for path in config["owners"]]
-    synchronizer = ProjectSynchronizer(stores, interval=config.get("pr_interval_seconds", 300))
+    synchronizer = ProjectSynchronizer(
+        stores, interval=config.get("pr_interval_seconds", DAY),
+        project_interval=config.get("project_interval_seconds", DAY))
     logging.basicConfig(level=logging.INFO)
     with synchronizer.ownership():
-        while True:
-            try:
-                result = synchronizer.tick()
-                if args.once:
-                    print(canonical_json(result))
-                    return
-            except Exception:
-                logger.exception("Project synchronization tick failed; durable state retained")
-                if args.once:
-                    raise
-            time.sleep(2)
+        logger.info("Project sync active: event notifications; PR interval=%s; drift interval=%s",
+                    synchronizer.interval, synchronizer.project_interval)
+        if args.once:
+            serve(synchronizer, Notifications(), once=True)
+        else:
+            with Notifications().listen([store.config.tracking_db for store in stores]) as events:
+                serve(synchronizer, events)
 
 
 if __name__ == "__main__":
