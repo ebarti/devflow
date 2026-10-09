@@ -750,7 +750,7 @@ class DeliveryBroker:
             validate_native_addon,
         )
         from .delivery_resources import RunResources, read_private, write_private
-        from .delivery_sandbox import _native_environment_version, _native_path
+        from .delivery_sandbox import _native_addon_environment_version, _native_path
 
         authority = native_addon_authority(self.spec, checkout, projects)
         if authority is None:
@@ -769,7 +769,7 @@ class DeliveryBroker:
             raise ValueError("native addon requires the frozen Node22 toolchain root")
         toolchain = roots[0]
         receipt = evidence / "native-addon-preparation.json"
-        environment_version = _native_environment_version(evidence, receipt)
+        environment_version = _native_addon_environment_version(self.spec, evidence)
         node, corepack = toolchain / "bin/node", toolchain / "bin/corepack"
         if (
             node.resolve(strict=True) != node
@@ -875,6 +875,8 @@ class DeliveryBroker:
                 "timeout_seconds": 30,
             },
         ]
+        for check in checks:
+            check["native_addon_environment_version"] = environment_version
         result = self._run_check_list(checkout, checks, evidence, candidate)
         # Even failure retains original process logs and its exact source authority.
         result["native_addon_authority"] = authority

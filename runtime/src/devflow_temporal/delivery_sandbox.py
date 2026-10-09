@@ -211,9 +211,13 @@ def _native_env(
     return env
 
 
-def _native_environment_version(owner: Path, legacy_evidence: Path) -> int:
+def _native_environment_version(
+    owner: Path, legacy_evidence: Path, *, default_version: int = 3,
+) -> int:
     """Pin each profile recipe before launch; retained profiles keep their intent."""
 
+    if type(default_version) is not int or default_version not in (1, 2, 3):
+        raise ValueError("native environment recipe is not admitted")
     marker = owner / "native-environment.json"
     if marker.exists() or marker.is_symlink():
         _private_file(marker)
@@ -226,8 +230,30 @@ def _native_environment_version(owner: Path, legacy_evidence: Path) -> int:
     if legacy:
         _private_file(legacy_evidence)
     # v1: durable temp; v2: short owned temp; v3: packaged Go is discoverable.
-    version = 1 if legacy else 3
+    version = 1 if legacy else default_version
     _write_once(marker, json.dumps({"version": version}).encode())
+    return version
+
+
+def _native_check_key(spec: dict[str, Any], evidence: Path, check_id: str) -> str:
+    return str(evidence.relative_to(Path(spec["state_dir"]))) + "/" + check_id
+
+
+def _native_addon_environment_version(spec: dict[str, Any], evidence: Path) -> int:
+    """Keep interrupted child profiles authoritative before publishing a handoff."""
+    retained = []
+    for check_id in ("native-addon-node-identity", "native-addon-build", "native-addon-load"):
+        owner = (Path(spec["state_dir"]) / "transient/checks"
+                 / _native_check_key(spec, evidence, check_id) / "codex")
+        marker, profile = owner / "native-environment.json", owner / "config.toml"
+        if any(path.exists() or path.is_symlink() for path in (marker, profile)):
+            retained.append(_native_environment_version(owner, profile))
+    version = _native_environment_version(
+        evidence, evidence / "native-addon-preparation.json",
+        default_version=min(retained, default=3),
+    )
+    if any((child >= 3) != (version >= 3) for child in retained):
+        raise ValueError("native addon retained PATH recipes disagree")
     return version
 
 
@@ -513,12 +539,18 @@ def prepare_native_check(
 
     from .delivery_resources import RunResources
 
-    key = str(evidence_dir.relative_to(Path(spec["state_dir"]))) + "/" + check["id"]
+    key = _native_check_key(spec, evidence_dir, check["id"])
     home = RunResources(spec).scratch("checks", key)
     codex_home = home / "codex"
     for path in (home, codex_home):
         _private(path)
-    environment_version = _native_environment_version(codex_home, codex_home / "config.toml")
+    addon_version = check.get("native_addon_environment_version")
+    environment_version = _native_environment_version(
+        codex_home, codex_home / "config.toml",
+        **({"default_version": addon_version} if addon_version is not None else {}),
+    )
+    if addon_version is not None and (addon_version >= 3) != (environment_version >= 3):
+        raise ValueError("native addon retained PATH recipes disagree")
     scratch = (RunResources(spec).execution_scratch("checks", key)
                if environment_version >= 2 else home / "tmp")
     _private(scratch)

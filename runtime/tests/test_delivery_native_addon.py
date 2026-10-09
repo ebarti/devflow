@@ -450,6 +450,104 @@ def test_native_receipt_replay_readback_refuses_drift_without_launch(
         assert broker.native_cleanup_confirmed is True
 
 
+@pytest.mark.parametrize("retained_versions", [(), (2, 2, 2), (2,), (1,), (2, 3)])
+def test_partial_addon_handoff_matches_every_actual_child_path(
+    addon, tmp_path, monkeypatch, retained_versions
+):
+    from devflow_temporal import (
+        delivery_broker,
+        delivery_native_dependencies,
+        delivery_native_process,
+        delivery_preparation,
+        delivery_resources,
+        delivery_sandbox,
+    )
+
+    spec, checkout, _, package, store, _ = addon
+    state = tmp_path / "run-fixture"
+    tools = tmp_path / "toolchain"
+    (tools / "bin").mkdir(parents=True)
+    for name in ("node", "corepack"):
+        (tools / "bin" / name).write_text("frozen " + name)
+    spec.update(run_id=state.name, state_dir=str(state), provider="codex",
+                policy={"toolchain_roots": [str(tools)], "host_sandbox": "trusted-local",
+                        "package_manager_cache": str(tmp_path / "cache")})
+    resources = delivery_resources.RunResources(spec)
+    with resources.locked() as manifest:
+        manifest["roots"][str(checkout / "node_modules")] = {
+            "kind": "generated", "identity": {"fixture": True}}
+        delivery_resources.write_private(resources.manifest, manifest)
+    register = delivery_resources.RunResources.register
+
+    def owned_register(self, path, *args, **kwargs):
+        if path != checkout / "node_modules":
+            return register(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(delivery_resources.RunResources, "register", owned_register)
+    monkeypatch.setattr(delivery_resources.RunResources, "_execution_scratch_root",
+                        lambda self: tmp_path / "short")
+    monkeypatch.setattr(delivery_preparation, "require_native_execution", lambda *_: None)
+    monkeypatch.setattr(delivery_preparation, "verify_prepared_spec", lambda *_: None)
+    monkeypatch.setattr(delivery_sandbox, "_protected_native_commands", lambda *_: ())
+    monkeypatch.setattr(delivery_native_dependencies, "frozen_native_builder",
+                        lambda *_: {"absolute_path": "/frozen/node-gyp.js", "sha256": "fixture"})
+    candidate = {"id": "candidate"}
+    monkeypatch.setattr(delivery_broker, "candidate_for", lambda *_: candidate)
+    evidence = state / "checks"
+    evidence.mkdir(mode=0o700)
+    ids = ("native-addon-node-identity", "native-addon-build", "native-addon-load")
+    retained = {}
+    for check_id, version in zip(ids, retained_versions, strict=False):
+        home = resources.scratch("checks", "checks/" + check_id) / "codex"
+        home.mkdir(mode=0o700)
+        marker = home / "native-environment.json"
+        delivery_resources.write_private(marker, {"version": version})
+        delivery_sandbox.prepare_native_check(spec, checkout, evidence, {"id": check_id})
+        if version == 1:
+            marker.unlink()  # Historical original profiles have no version marker.
+        retained.update({p: p.read_bytes() for p in home.iterdir() if p.is_file()})
+    assert not (evidence / "native-addon-preparation.json").exists()
+    (package / "build/Release").mkdir(parents=True)
+    binary = package / "build/Release/better_sqlite3.node"
+    binary.write_bytes(b"controlled binary fixture")
+    captured = {}
+
+    class Process:
+        def __init__(self, spec, folder, **values):
+            self.folder = folder
+            captured[folder.parent.name] = values["environment"]["PATH"]
+
+    monkeypatch.setattr(delivery_native_process, "NativeProcess", Process)
+
+    def run(process):
+        process.folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        log = process.folder / "process.log"
+        log.write_text(json.dumps({"version": "v22.21.1", "modules_ABI": "127",
+                                   "native_binding_sha256": hashlib.sha256(
+                                       binary.read_bytes()).hexdigest()}))
+        return {"exit_code": 0, "cleanup": "observed-native-confirmed", "log": str(log),
+                "journal": str(process.folder / "journal.json")}
+
+    broker = object.__new__(delivery_broker.DeliveryBroker)
+    broker.spec, broker.state_dir = spec, state
+    broker._run_native_check = run
+    broker._register_generated = lambda *_: []
+    broker._record_generated = lambda *_: None
+    broker._native_cancelled = lambda: False
+    if retained_versions == (2, 3):
+        with pytest.raises(ValueError, match="retained PATH recipes disagree"):
+            broker._prepare_native_addon(checkout, ["apps/api"], evidence, candidate,
+                                         {"store": str(store)})
+        assert not captured and not (evidence / "native-addon-preparation.json").exists()
+    else:
+        result = broker._prepare_native_addon(checkout, ["apps/api"], evidence, candidate,
+                                              {"store": str(store)})
+        declared = result["node_toolchain"]["environment"]["PATH"]
+        assert set(captured) == set(ids) and set(captured.values()) == {declared}
+        assert ("/usr/local/go/bin" in declared.split(":")) == (not retained_versions)
+    assert all(path.read_bytes() == content for path, content in retained.items())
+
+
 def test_candidate_setup_refuses_before_original_install_or_registry_fetch(
     addon, monkeypatch, tmp_path
 ):
