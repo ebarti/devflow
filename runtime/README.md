@@ -15,19 +15,23 @@ Existing frozen runs without this setting retain their one-attempt behavior.
 
 ### Fixed retry budgets
 
-New admissions use a fixed `max_attempts` ceiling of 3. Set `max_attempts`
-(1–10) in the service configuration to choose a different ceiling. The first budgeted admission freezes the issue's
-attempt ceiling; all previous admissions, including archived and failed runs,
-consume it. Changing run IDs, work IDs, or later configuration cannot reset that
-ceiling. Replaying an accepted command does not consume another attempt.
+`max_attempts` bounds controller-created automatic retries. It defaults to 3 and
+accepts integers from 1 to 10. The first budgeted admission freezes the issue's
+automatic attempt ceiling; all earlier admissions, including archived and failed
+runs, count against it. Changing run IDs, work IDs, or later configuration cannot
+reset that automatic ceiling.
 
-These runs also keep their original `max_repairs` ceiling. Public continuations
-cannot add implementation iterations, and native roles cannot use historical
-grant rows to exceed it. Policy recovery also cannot grant positive iterations.
+An explicit owner submission can start a new run under the current admission
+policy after the earlier claim is released. Historical attempt counts do not
+reject that request. The new admission preserves earlier runs and their frozen
+policies; replaying an accepted command returns its original receipt.
+
+Each budgeted run keeps its original `max_repairs` ceiling. A stopped resume may
+spend unused original iterations, but public continuations and historical grant
+rows cannot extend that ceiling. Policy recovery cannot grant positive iterations.
 Already-admitted histories without the frozen budget version retain their original
-behavior; new admissions from existing configurations use the new default.
-Budgets are scoped to one authoritative tracking database; separate databases cannot enforce a shared limit.
-These admission bounds also apply to automatic fresh attempts after safely closed transient failures.
+behavior. Automatic attempt accounting is scoped to one authoritative tracking
+database; separate databases cannot enforce a shared limit.
 
 ### Failure classification
 
@@ -48,12 +52,12 @@ attempt ceiling. Existing workflows and historical continuation paths keep their
 original payloads. Operator steps: deploy through the usual service update when
 ready. No database schema migration is needed, but review issue attempt counts
 before deploying: archived, failed and superseded prior admissions all count.
-Choose `max_attempts` (1–10) before the first post-deploy admission if additional
-headroom is needed. Issues with three prior admissions exhaust the default; ten
-prior admissions exhaust every supported setting. Once frozen, the ceiling cannot
-be raised by changing configuration. New runs cannot receive positive-iteration
-continuations, including stopped resumes, repair grants, title repair or policy
-recovery. Existing admitted histories keep their original frozen behavior.
+Choose `max_attempts` (1–10) before the first budgeted admission if automatic
+retry headroom is needed. Three prior admissions exhaust the default automatic
+ceiling; ten exhaust every supported setting. Once frozen, changing configuration
+cannot raise it. This automatic retry limit does not reject a new explicit owner
+submission. A stopped resume still requires unused original repair iterations;
+it cannot grant extra turns or change an earlier run's frozen policy.
 
 ### QA findings require a passing assessment
 
