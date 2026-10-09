@@ -440,7 +440,7 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
     (name, configured)
     for name in ('python-lint', 'python.lint', 'python..lint', 'python+lint', 'python,lint')
     for configured in (False, True)
-] + [('**python', True)])
+] + [('**python', True), ('checks.python', True)])
 @pytest.mark.parametrize('reference', ['checks.{name}', '{name} recipe',
                                       '**checks.{name}**',
                                       '[checks.{name}](scripts/checks.toml).'])

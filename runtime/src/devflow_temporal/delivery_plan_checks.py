@@ -180,13 +180,13 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
         raise ValueError('planned JUnit recipe schema is unsupported')
     # Match whole references, longest names first. Internal punctuation cannot
     # authorize a prefix/suffix recipe; trailing prose punctuation ends a token.
+    # Complete natural names take precedence over qualified interpretations.
     names = '|'.join(re.escape(key) for key in sorted(recipes, key=len, reverse=True))
     closing = r'''[`'".,;:!?*)\]}]'''
     link = r'(?:\([^\n)]*\)|\[[^\n\]]*\])'
     reference = re.compile(
-        r'''(?<!\S)[`'"*(\[{]*?(?:checks\.(''' + names
-        + r')(?=$|\s|' + closing + r'+(?:' + link + closing + r'*)?(?:\s|$))|(' + names
-        + r''')\s+recipe\b)''', re.I)
+        r'''(?<!\S)[`'"*(\[{]*?(?:(''' + names + r''')\s+recipe\b|checks\.(''' + names
+        + r')(?=$|\s|' + closing + r'+(?:' + link + closing + r'*)?(?:\s|$)))', re.I)
     mentioned = {match[1] or match[2] for step in steps for match in reference.finditer(step)}
     selected = sorted(key for key in recipes if any(
         re.fullmatch(re.escape(key), name, re.I) for name in mentioned))
