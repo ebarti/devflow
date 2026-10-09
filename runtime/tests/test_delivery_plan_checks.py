@@ -436,17 +436,20 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
     assert json.dumps(spec, sort_keys=True) == before
 
 
-@pytest.mark.parametrize('name', ['python-lint', 'python.lint'])
+@pytest.mark.parametrize('name', ['python-lint', 'python.lint', 'python..lint',
+                                 'python+lint', 'python,lint'])
 @pytest.mark.parametrize('reference', ['checks.{name}', '{name} recipe'])
+@pytest.mark.parametrize('configured', [False, True])
 def test_plan_recipe_name_does_not_authorize_prefix_or_suffix_recipes(
-    junit_project, name, reference,
+    junit_project, name, reference, configured,
 ):
     spec, checkout, metadata, evidence = junit_project
     metadata.write_text(metadata.read_text() + '\n[checks.python]\nkind="junit"\n'
                         'argv=["python","-m","pytest","--junitxml={report_path}"]\n'
-                        '\n[checks.lint]\nkind="static"\nargv=["unrelated-lint"]\n'
-                        f'\n[checks."{name}"]\nkind="static"\n'
-                        'argv=["ruff","check","."]\n')
+                        '\n[checks.lint]\nkind="static"\nargv=["unrelated-lint"]\n')
+    if configured:
+        metadata.write_text(metadata.read_text() + f'\n[checks."{name}"]\nkind="static"\n'
+                            'argv=["ruff","check","."]\n')
     freeze_recipes(spec, checkout)
     spec['accepted_plan'] = json.dumps({'verification': [
         'Run scripts/checks.toml ' + reference.format(name=name)
@@ -454,12 +457,12 @@ def test_plan_recipe_name_does_not_authorize_prefix_or_suffix_recipes(
 
     checks = planned_checks(spec, checkout, evidence)
 
-    assert {check['plan_provenance']['recipe'] for check in checks} == {
-        'checks.scripts', 'checks.' + name,
-    }
-    assert next(check for check in checks if check['kind'] == 'static')['argv'] == [
-        'ruff', 'check', '.',
-    ]
+    expected = {'checks.scripts', 'checks.' + name} if configured else {'checks.scripts'}
+    assert {check['plan_provenance']['recipe'] for check in checks} == expected
+    if configured:
+        assert next(check for check in checks if check['kind'] == 'static')['argv'] == [
+            'ruff', 'check', '.',
+        ]
 
 
 @pytest.mark.parametrize('bad', ['untracked', 'symlink', 'cwd', 'timeout', 'report'])
