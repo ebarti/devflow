@@ -436,12 +436,14 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
     assert json.dumps(spec, sort_keys=True) == before
 
 
-@pytest.mark.parametrize('name', ['python-lint', 'python.lint', 'python..lint',
-                                 'python+lint', 'python,lint'])
+@pytest.mark.parametrize(('name', 'configured'), [
+    (name, configured)
+    for name in ('python-lint', 'python.lint', 'python..lint', 'python+lint', 'python,lint')
+    for configured in (False, True)
+] + [('**python', True)])
 @pytest.mark.parametrize('reference', ['checks.{name}', '{name} recipe',
                                       '**checks.{name}**',
                                       '[checks.{name}](scripts/checks.toml).'])
-@pytest.mark.parametrize('configured', [False, True])
 def test_plan_recipe_name_does_not_authorize_prefix_or_suffix_recipes(
     junit_project, name, reference, configured,
 ):

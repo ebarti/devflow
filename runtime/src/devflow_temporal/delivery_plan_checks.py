@@ -184,7 +184,7 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
     closing = r'''[`'".,;:!?*)\]}]'''
     link = r'(?:\([^\n)]*\)|\[[^\n\]]*\])'
     reference = re.compile(
-        r'''(?<!\S)[`'"*(\[{]*(?:checks\.(''' + names
+        r'''(?<!\S)[`'"*(\[{]*?(?:checks\.(''' + names
         + r')(?=$|\s|' + closing + r'+(?:' + link + closing + r'*)?(?:\s|$))|(' + names
         + r''')\s+recipe\b)''', re.I)
     mentioned = {match[1] or match[2] for step in steps for match in reference.finditer(step)}
