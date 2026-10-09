@@ -178,9 +178,18 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
     recipes = metadata.get('checks', {})
     if metadata.get('schema_version') != 1 or not isinstance(recipes, dict):
         raise ValueError('planned JUnit recipe schema is unsupported')
-    selected = sorted({key for step in steps for key in recipes if re.search(
-        r'\b(?:checks\.' + re.escape(key) + r'\b|' + re.escape(key) + r'\s+recipe\b)',
-        step, re.I)})
+    # Match whole references, longest names first. Internal punctuation cannot
+    # authorize a prefix/suffix recipe; trailing prose punctuation ends a token.
+    # Complete natural names take precedence over qualified interpretations.
+    names = '|'.join(re.escape(key) for key in sorted(recipes, key=len, reverse=True))
+    closing = r'''[`'".,;:!?*)\]}]'''
+    link = r'(?:\([^\n)]*\)|\[[^\n\]]*\])'
+    reference = re.compile(
+        r'''(?<!\S)[`'"*(\[{]*?(?:(''' + names + r''')\s+recipe\b|checks\.(''' + names
+        + r')(?=$|\s|' + closing + r'+(?:' + link + closing + r'*)?(?:\s|$)))', re.I)
+    mentioned = {match[1] or match[2] for step in steps for match in reference.finditer(step)}
+    selected = sorted(key for key in recipes if any(
+        re.fullmatch(re.escape(key), name, re.I) for name in mentioned))
     if not selected or len(selected) > 32:
         raise ValueError('planned JUnit verification must name bounded repository recipes')
     result = []

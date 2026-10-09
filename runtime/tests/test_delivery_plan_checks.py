@@ -436,6 +436,39 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
     assert json.dumps(spec, sort_keys=True) == before
 
 
+@pytest.mark.parametrize(('name', 'configured'), [
+    (name, configured)
+    for name in ('python-lint', 'python.lint', 'python..lint', 'python+lint', 'python,lint')
+    for configured in (False, True)
+] + [('**python', True), ('checks.python', True)])
+@pytest.mark.parametrize('reference', ['checks.{name}', '{name} recipe',
+                                      '**checks.{name}**',
+                                      '[checks.{name}](scripts/checks.toml).'])
+def test_plan_recipe_name_does_not_authorize_prefix_or_suffix_recipes(
+    junit_project, name, reference, configured,
+):
+    spec, checkout, metadata, evidence = junit_project
+    metadata.write_text(metadata.read_text() + '\n[checks.python]\nkind="junit"\n'
+                        'argv=["python","-m","pytest","--junitxml={report_path}"]\n'
+                        '\n[checks.lint]\nkind="static"\nargv=["unrelated-lint"]\n')
+    if configured:
+        metadata.write_text(metadata.read_text() + f'\n[checks."{name}"]\nkind="static"\n'
+                            'argv=["ruff","check","."]\n')
+    freeze_recipes(spec, checkout)
+    spec['accepted_plan'] = json.dumps({'verification': [
+        'Run scripts/checks.toml ' + reference.format(name=name)
+        + ' and checks.scripts with retained JUnit output.']})
+
+    checks = planned_checks(spec, checkout, evidence)
+
+    expected = {'checks.scripts', 'checks.' + name} if configured else {'checks.scripts'}
+    assert {check['plan_provenance']['recipe'] for check in checks} == expected
+    if configured:
+        assert next(check for check in checks if check['kind'] == 'static')['argv'] == [
+            'ruff', 'check', '.',
+        ]
+
+
 @pytest.mark.parametrize('bad', ['untracked', 'symlink', 'cwd', 'timeout', 'report'])
 def test_static_recipes_reject_unowned_or_unbounded_metadata(junit_project, bad):
     spec, checkout, metadata, evidence = junit_project
