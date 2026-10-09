@@ -438,7 +438,9 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
 
 @pytest.mark.parametrize('name', ['python-lint', 'python.lint', 'python..lint',
                                  'python+lint', 'python,lint'])
-@pytest.mark.parametrize('reference', ['checks.{name}', '{name} recipe'])
+@pytest.mark.parametrize('reference', ['checks.{name}', '{name} recipe',
+                                      '**checks.{name}**',
+                                      '[checks.{name}](scripts/checks.toml).'])
 @pytest.mark.parametrize('configured', [False, True])
 def test_plan_recipe_name_does_not_authorize_prefix_or_suffix_recipes(
     junit_project, name, reference, configured,

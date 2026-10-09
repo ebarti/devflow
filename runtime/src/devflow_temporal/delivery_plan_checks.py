@@ -181,9 +181,11 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
     # Match whole references, longest names first. Internal punctuation cannot
     # authorize a prefix/suffix recipe; trailing prose punctuation ends a token.
     names = '|'.join(re.escape(key) for key in sorted(recipes, key=len, reverse=True))
+    closing = r'''[`'".,;:!?*)\]}]'''
+    link = r'(?:\([^\n)]*\)|\[[^\n\]]*\])'
     reference = re.compile(
-        r'''(?<!\S)[`'"(\[{]*(?:checks\.(''' + names
-        + r''')(?=$|\s|[`'".,;:!?)\]}]+(?:\s|$))|(''' + names
+        r'''(?<!\S)[`'"*(\[{]*(?:checks\.(''' + names
+        + r')(?=$|\s|' + closing + r'+(?:' + link + closing + r'*)?(?:\s|$))|(' + names
         + r''')\s+recipe\b)''', re.I)
     mentioned = {match[1] or match[2] for step in steps for match in reference.finditer(step)}
     selected = sorted(key for key in recipes if any(
