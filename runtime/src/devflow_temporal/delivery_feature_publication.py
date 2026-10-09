@@ -151,6 +151,8 @@ def verify_retained_publication(broker):
     record = current_record(spec)
     if (previous not in record["manifest"]["publication"]["members"]
             or previous["branch"] != spec["branch"]
+            or _git(broker.checkout, "branch", "--show-current")
+            != spec.get("local_branch", spec["branch"])
             or _git(broker.source, "remote", "get-url", "origin") != spec["origin_url"]
             or _git(broker.checkout, "remote", "get-url", "--push", "origin")
             != spec["origin_url"]):

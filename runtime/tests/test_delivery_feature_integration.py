@@ -1,6 +1,7 @@
 """Compose Git imports with implementation admission, publication, and recovery."""
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from test_delivery_store import service as legacy_service
 
 from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_feature_publication as publications
-from devflow_temporal.delivery_activities import _role_result
+from devflow_temporal.delivery_activities import _role_result, delivery_repair_preflight
 from devflow_temporal.delivery_broker import DeliveryBroker, _git
 from devflow_temporal.delivery_feature_execution import (
     register_worker,
@@ -193,3 +194,6 @@ def test_stopped_integration_resumes_only_its_frozen_local_and_remote_custody(
                 "SELECT recovery_json FROM delivery_runs WHERE run_id=?",
                 (child["run_id"],)).fetchone()[0])
         assert readback(store, resumed["spec"], recovery)["state"] == "confirmed"
+        _git(broker.checkout, "branch", "-m", "feat/changed-after-admission")
+        with pytest.raises(ValueError, match="retained integration publication identity changed"):
+            asyncio.run(delivery_repair_preflight({"spec": resumed["spec"], "recovery": recovery}))
