@@ -79,7 +79,12 @@ def test_seal_build_replays_exact_patch_after_checkpoint_acknowledgement_loss(se
     assert Path(saved["path"]).read_bytes() == patch
 
 
-async def test_lost_plan_write_settles_before_public_successor_is_admitted(service, monkeypatch):
+@pytest.mark.parametrize("cancel_during_readback", [False, True])
+async def test_lost_plan_write_settles_before_public_successor_is_admitted(
+    service, monkeypatch, cancel_during_readback,
+):
+    from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
     store, request, snapshot = feature_service(service, monkeypatch)
     store.submit(request)
     spec = store.effective_spec(request["run_id"])
@@ -107,6 +112,11 @@ async def test_lost_plan_write_settles_before_public_successor_is_admitted(servi
     monkeypatch.setattr(activities, "GitHubDelivery", lambda: gh)
 
     class RecoveryController(Controller):
+        def __init__(self, value):
+            super().__init__(value)
+            self.original_execution = False
+            self.state.update(roles=[], iteration=0, execution_state="running", cleanup="confirmed")
+
         async def _activity(self, name, payload):
             if name == "delivery_feature_open":
                 return activities.open_feature(spec)
@@ -121,22 +131,37 @@ async def test_lost_plan_write_settles_before_public_successor_is_admitted(servi
 
         async def _project(self, spec, event, message):
             events.append(event)
-            with store._connect() as db:
-                db.execute("UPDATE delivery_runs SET phase=?,outcome=?,revision=? WHERE run_id=?",
-                           (self.state["phase"], self.state.get("outcome"),
-                            self.state["revision"], spec["run_id"]))
+            store.project(spec["run_id"], phase=self.state["phase"],
+                          execution_state=self.state["execution_state"],
+                          outcome=self.state.get("outcome"), event_type=event, message=message,
+                          checks=self.state["checks"], protocol_revision=self.state["revision"],
+                          iteration=self.state["iteration"], cleanup=self.state.get("cleanup"),
+                          error=self.state.get("error"))
 
         async def _stop(self, spec, message, **kwargs):
-            await super()._stop(spec, message, **kwargs)
-            self.state["revision"] += 1
-            await self._project(spec, "blocked", message)
+            return await DeliveryWorkflow._stop(self, spec, message, **kwargs)
 
     async def local_sleep(_):
-        return None
+        with store._connect() as db:
+            row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                                  (spec["run_id"],)).fetchone())
+            events = db.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE run_id=? "
+                "AND type='feature_readback_pending'", (spec["run_id"],)).fetchone()[0]
+            feature = json.loads(db.execute(
+                "SELECT payload_json FROM delivery_features WHERE issue=?",
+                (spec["issue_url"],)).fetchone()[0])
+        assert row["phase"] == "waiting_feature_readback" and row["outcome"] is None
+        assert row["execution_state"] == "waiting" and events == 1
+        assert json.loads(row["checks_json"])["feature_readback"]["state"] == "pending"
+        assert feature["status"] == "Waiting for GitHub"
+        assert registry(spec).current("I_feature")["state"] == "draining"
+        controller.cancel_requested = cancel_during_readback
 
     monkeypatch.setattr(protocol.workflow, "sleep", local_sleep)
     controller = RecoveryController(json.loads(request["accepted_plan"]))
     result = await protocol.coordinate(controller, spec)
+    assert result["outcome"] == ("cancelled" if cancel_during_readback else "blocked")
     assert len(comments) == 1 and "feature_readback_pending" in events
     assert registry(spec).current("I_feature")["state"] == "stopped"
     assert registry(spec).budget("I_feature")["used"] == 0
@@ -145,6 +170,23 @@ async def test_lost_plan_write_settles_before_public_successor_is_admitted(servi
         "command_id": "continue-original-plan", "expected_revision": result["revision"],
     })
     assert store.effective_spec(successor["run_id"])["feature_delivery"]["owner"]["generation"] == 2
+
+
+def test_feature_readback_projection_cannot_reopen_a_terminal_owner(service, monkeypatch):
+    store, request, _ = feature_service(service, monkeypatch)
+    store.submit(request)
+    spec = store.effective_spec(request["run_id"])
+    store.project(spec["run_id"], phase="blocked", execution_state="blocked", outcome="blocked",
+                  event_type="blocked", message="Original terminal state", protocol_revision=2)
+    pending = dict(phase="waiting_feature_readback", execution_state="waiting", outcome=None,
+                   event_type="feature_readback_pending", message="Late waiting event",
+                   checks={"feature_readback": {"state": "pending"}}, protocol_revision=3)
+    assert store.project(spec["run_id"], **pending)["outcome"] == "blocked"
+    registry(spec).stop(spec["feature_delivery"]["owner"], "stopped", {})
+    assert store.project(spec["run_id"], **pending)["outcome"] == "blocked"
+    assert store.project(spec["run_id"], phase="cancelling", execution_state="running",
+                         outcome=None, event_type="cancel_requested", message="Late cancel request",
+                         protocol_revision=4)["phase"] == "blocked"
 
 
 def test_integration_pass_retains_evidence_and_imports_without_force(service, monkeypatch):

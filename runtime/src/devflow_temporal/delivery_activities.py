@@ -525,7 +525,8 @@ def _role_result(request, broker, workspace, review_diff, result):
                     "implementer candidate has no feature diff"
                 )
             elif after["id"] == candidate["id"] and not (
-                request.get("continuation") and iteration == 0
+                iteration == 0 and (request.get("continuation")
+                                    or broker.is_imported_feature_candidate(candidate))
             ):
                 from .delivery_role_evidence import repair_payload_progress
 

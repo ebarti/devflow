@@ -387,6 +387,21 @@ class DeliveryBroker:
             _git(self.checkout, 'reset', '--soft', expected)
         return self.candidate()
 
+    def is_imported_feature_candidate(self, candidate: dict[str, Any]) -> bool:
+        """A completed chunk import may need validation without additional edits."""
+        worker = self.spec.get("feature_worker", {})
+        if (worker.get("kind") != "chunk"
+                or not (worker.get("seed") or worker.get("previous_publication"))):
+            return False
+        with self.store._connect() as db:
+            row = db.execute(
+                "SELECT observed_json FROM delivery_effects "
+                "WHERE effect_key=? AND run_id=? AND kind='prepare' AND state='complete'",
+                ("prepare:" + self.spec["run_id"], self.spec["run_id"]),
+            ).fetchone()
+        return bool(row and row[0] and json.loads(row[0]).get("candidate") == candidate
+                    and not _git(self.checkout, "ls-files", "-u"))
+
     def gate_checkout(self, role: str, iteration: int, candidate: dict[str, Any]) -> Path:
         if role not in {"review", "verify"}:
             raise ValueError("only independent gates use gate checkouts")

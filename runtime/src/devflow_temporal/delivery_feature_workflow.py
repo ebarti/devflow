@@ -286,6 +286,8 @@ async def coordinate(controller, spec):
                 )
                 waiting = True
                 await workflow.sleep(timedelta(seconds=30))
+            if controller.cancel_requested and terminal["outcome"] != "delivered":
+                terminal.update(phase="cancelled", execution_state="terminal", outcome="cancelled")
             controller.state.update(terminal)
             if waiting:
                 controller.state["revision"] += 1

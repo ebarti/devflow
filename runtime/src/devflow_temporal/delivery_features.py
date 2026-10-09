@@ -78,6 +78,8 @@ def _status(row: dict, observations: list[dict]) -> str:
     if any(item and item["state"] == "CLOSED" for item in known):
         return "PR closed"
     phase = row["phase"]
+    if phase == "waiting_feature_readback":
+        return "Waiting for GitHub"
     if row["outcome"] == "cancelled" or phase == "cancelled":
         return "Cancelled"
     if row["outcome"] == "blocked" or phase == "blocked":

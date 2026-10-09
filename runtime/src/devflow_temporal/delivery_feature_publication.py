@@ -142,6 +142,27 @@ def owned_pr_number(spec):
     return found[0]["number"] if found else None
 
 
+def verify_retained_publication(broker):
+    """An unpushed integration attempt retains its original, explicitly bound PR."""
+    from .delivery_broker import _git
+
+    spec = broker.spec
+    previous = spec["feature_worker"]["previous_publication"]
+    record = current_record(spec)
+    if (previous not in record["manifest"]["publication"]["members"]
+            or previous["branch"] != spec["branch"]
+            or _git(broker.source, "remote", "get-url", "origin") != spec["origin_url"]
+            or _git(broker.checkout, "remote", "get-url", "--push", "origin")
+            != spec["origin_url"]):
+        raise OwnershipConflict("retained integration publication identity changed")
+    raw = next(item for item in live_members(spec, record) if item["number"] == previous["number"])
+    remote = _git(broker.source, "ls-remote", "origin", "refs/heads/" + previous["branch"])
+    if raw["merged"] or raw["state"] != "open" or remote.split() != [
+        previous["head"], "refs/heads/" + previous["branch"],
+    ]:
+        raise OwnershipConflict("retained integration PR is closed or its branch moved")
+
+
 def record_publication(store, spec, receipt, gh=None, *, settlement=False):
     if not receipt.get("number"):
         return receipt

@@ -162,7 +162,8 @@ def _candidate(broker, state, attempts):
     if changed - set(broker.spec['policy']['allowed_paths']):
         raise ValueError('stopped source escaped its frozen scope')
     _git(broker.checkout, 'merge-base', '--is-ancestor', broker.spec['base_sha'], candidate['head'])
-    if (_git(broker.checkout, 'branch', '--show-current') != broker.spec['branch']
+    if (_git(broker.checkout, 'branch', '--show-current')
+            != broker.spec.get('local_branch', broker.spec['branch'])
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin')
             != broker.spec['origin_url']):
         raise ValueError('stopped checkout branch or origin changed')
@@ -225,13 +226,22 @@ def snapshot(store, run_id):
     else:
         if any(e['kind'] == 'publish' for e in effects):
             raise ValueError('unpublished resume has an unresolved publication')
-        _remote(broker)
+        _unpublished_remote(broker)
     with store._connect() as db:
         binding = work_binding(store, spec, db)
     return {'predecessor_spec': spec, 'row': row, 'attempts': attempts, 'effects': effects,
             'closed': closed, 'state': state, 'candidate': candidate, 'session_id': session,
             'publication': publication, 'original_recovery': previous,
             'cleanup_digest': observed_native_cleanup(spec), 'work_binding': binding}
+
+
+def _unpublished_remote(broker):
+    if broker.spec.get('feature_worker', {}).get('previous_publication'):
+        from .delivery_feature_publication import verify_retained_publication
+
+        verify_retained_publication(broker)
+    else:
+        _remote(broker)
 
 
 def admit(store, run_id, command, *, preflight=False):
@@ -382,5 +392,5 @@ def readback(store, spec, recovery):
     if recovery['publication']:
         published_identity(broker, recovery['execution_candidate'], recovery['publication'])
     else:
-        _remote(broker)
+        _unpublished_remote(broker)
     return {'state': 'confirmed'}

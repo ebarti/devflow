@@ -38,6 +38,8 @@ An interrupted GitHub write keeps its original effect identity. The coordinator
 performs readback while ownership is draining, and only releases the feature when
 that outcome is known. A remote outage can leave it waiting for readback; it does
 not authorize another creation or consume a product repair cycle.
+The durable local status and Project projection show **Waiting for GitHub** during
+that wait. A cancellation still settles the original operation before handoff.
 
 ## Controls and states
 
@@ -84,6 +86,10 @@ cycle for the integration pass, plus any product repairs its gates require. A
 changed publication receives a fresh merge decision unless the admitted endpoint
 already authorizes merging. Issue identities and parent links are checked again
 before merge and closure. Confirmed PR observations update locally immediately.
+An imported complete chunk may pass implementation without further edits when it
+matches its authenticated preparation receipt; every normal verification gate
+still runs. Stopped integration workers retain both their private local branch
+and the exact original PR binding when they resume.
 
 Feature and workstream status changes are projected through the existing
 transactional outbox and independent Project synchronizer. A Project outage leaves

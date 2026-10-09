@@ -2887,7 +2887,23 @@ class DeliveryStore:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
-            if row["outcome"] is not None and outcome != row["outcome"]:
+            feature_readback_wait = False
+            if (event_type == "feature_readback_pending" and phase == "waiting_feature_readback"
+                    and execution_state == "waiting" and outcome is None
+                    and (checks or {}).get("feature_readback", {}).get("state") == "pending"
+                    and protocol_revision is not None
+                    and protocol_revision > (row["protocol_revision"] or 0)):
+                from .delivery_feature_execution import registry
+
+                spec = json.loads(row["request_json"])
+                owner = spec.get("feature_delivery", {}).get("owner")
+                if owner and not spec.get("feature_worker"):
+                    shared = registry(spec)
+                    current = shared.current(owner["issue_id"])
+                    feature_readback_wait = bool(current and shared.token(current) == owner
+                                                 and current["state"] == "draining")
+            if (row["outcome"] is not None and outcome != row["outcome"]
+                    and not feature_readback_wait):
                 # A late cancel-request projection cannot overwrite the final
                 # workflow result after its update was accepted.
                 return dict(row)
@@ -2927,7 +2943,8 @@ class DeliveryStore:
                 "decision_json": canonical_json(decision),
                 "intake_json": canonical_json(intake)
                 if intake is not None else row["intake_json"],
-                "outcome": outcome if outcome is not None else row["outcome"],
+                "outcome": None if feature_readback_wait else (
+                    outcome if outcome is not None else row["outcome"]),
                 "cleanup": cleanup if cleanup is not None else row["cleanup"],
                 "error": error if error is not None or event_type == "delivered"
                 or (checks or {}).get("terminal_tracker_checkpoint", {}).get("state") == "confirmed"
