@@ -263,7 +263,9 @@ def _number(value):
 def statistics_for(store):
     """All durable runs, including archives and failures; no UI-list truncation."""
     with store._connect() as db:
-        runs = [dict(row) for row in db.execute("SELECT * FROM delivery_runs")]
+        all_runs = [dict(row) for row in db.execute("SELECT * FROM delivery_runs")]
+        runs = [row for row in all_runs
+                if not json.loads(row["request_json"]).get("feature_worker")]
         identities = {
             row[0]: json.loads(row[1])
             for row in db.execute(
@@ -274,6 +276,11 @@ def statistics_for(store):
         attempts = {}
         for row in db.execute("SELECT run_id,role,iteration,result_json FROM delivery_attempts"):
             attempts.setdefault(row[0], []).append(dict(row))
+        for worker in all_runs:
+            spec = json.loads(worker["request_json"])
+            if spec.get("feature_worker"):
+                parent = spec["feature_worker"]["parent_run_id"]
+                attempts.setdefault(parent, []).extend(attempts.get(worker["run_id"], []))
     groups = {}
     for run in runs:
         identity = identities.get(run["run_id"]) or {}

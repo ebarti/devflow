@@ -1,6 +1,13 @@
 See [worker deployment migration](../docs/worker-versioning.md) for ordering
 compatibility, optional pinned worker registration and required owner steps.
 
+For new GitHub-owned feature admissions, see
+[feature delivery and custody migration](../docs/github-feature-delivery.md).
+The sections below describing per-run automatic retries and legacy public repair
+grants apply to their original frozen versions. Feature mode uses one shared
+execution claim, ten cumulative product repair cycles by default, and explicit
+continuations of the same GitHub plan and stack.
+
 
 ### Native provider turn retries
 

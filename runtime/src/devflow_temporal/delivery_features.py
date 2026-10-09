@@ -13,6 +13,7 @@ from .contracts import canonical_json
 STATUSES = (
     "Queued", "Planning", "In progress", "In review", "Validating", "Awaiting merge",
     "Merging", "Merged", "Blocked", "Cancelled", "PR closed", "Needs validation",
+    "Partially merged",
 )
 
 
@@ -48,6 +49,13 @@ def issue_key(url: str) -> str:
     return url.rstrip("/").casefold()
 
 
+def ownership_order(value: dict) -> tuple:
+    """Explicit execution generations supersede legacy timestamp selection."""
+    owner = value.get("execution_owner")
+    return (bool(owner), owner["generation"] if owner else 0,
+            value["admitted_at"], value["run_id"], value["source"])
+
+
 def publication_urls(receipt: dict | None) -> list[str]:
     """Only explicit publication custody grants PR observation scope."""
     if not receipt:
@@ -60,8 +68,13 @@ def publication_urls(receipt: dict | None) -> list[str]:
 
 def _status(row: dict, observations: list[dict]) -> str:
     known = [item.get("observation") for item in observations]
-    if known and all(item and item["state"] == "MERGED" for item in known):
+    receipt = json.loads(row["pr_json"] or "{}")
+    spec = json.loads(row["request_json"])
+    complete = not spec.get("feature_delivery") or receipt.get("scope_complete") is True
+    if complete and known and all(item and item["state"] == "MERGED" for item in known):
         return "Merged"
+    if spec.get("feature_delivery") and any(item and item["state"] == "MERGED" for item in known):
+        return "Partially merged"
     if any(item and item["state"] == "CLOSED" for item in known):
         return "PR closed"
     phase = row["phase"]
@@ -69,13 +82,12 @@ def _status(row: dict, observations: list[dict]) -> str:
         return "Cancelled"
     if row["outcome"] == "blocked" or phase == "blocked":
         return "Blocked"
-    if phase == "delivered":
-        receipt = json.loads(row["pr_json"] or "{}")
+    if phase in {"delivered", "awaiting_merge", "merged"}:
         heads = {item["url"]: item.get("head") for item in
                  (receipt.get("pull_requests") or [receipt]) if item.get("url")}
         if any(item and item.get("head") != heads.get(item["url"]) for item in known):
             return "Needs validation"
-        return "Awaiting merge"
+        return "Merged" if phase == "merged" else "Awaiting merge"
     if phase in {"accepted", "queued", "preparing", "temporal_pending"}:
         return "Queued"
     if any(part in phase for part in ("intake", "plan", "decision", "question")):
@@ -95,14 +107,29 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
     if row is None:
         return
     row = dict(row)
+    spec = json.loads(row["request_json"])
+    if spec.get("feature_worker"):
+        from .delivery_feature_execution import registry
+
+        actual = registry(spec).current(spec["feature_delivery"]["owner"]["issue_id"])
+        if actual and actual["store_path"] == str(config.tracking_db):
+            transition(db, config, actual["run_id"])
+        return
     key = issue_key(row["issue_url"])
+    owner = spec.get("feature_delivery", {}).get("owner")
+    if owner:
+        from .delivery_feature_execution import registry
+
+        actual = registry(spec).current(owner["issue_id"])
+        if actual is None or registry(spec).token(actual) != owner:
+            return
     newest = db.execute(
         "SELECT run_id FROM delivery_runs WHERE lower(rtrim(issue_url,'/'))=? "
+        "AND json_extract(request_json,'$.feature_worker') IS NULL "
         "ORDER BY created_at DESC,run_id DESC LIMIT 1", (key,),
     ).fetchone()
-    if newest[0] != run_id:
+    if not owner and newest[0] != run_id:
         return
-    spec = json.loads(row["request_json"])
     work = db.execute("SELECT details FROM works WHERE id=?", (row["work_id"],)).fetchone()
     tracking = json.loads(work[0] or "{}").get("github", {}) if work else {}
     repository = config.raw["repositories"].get(row["repository_key"], {})
@@ -129,7 +156,48 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
         "legacy_tracking": spec.get("project_sync_version") != 1
         and row["execution_state"] not in {"terminal", "blocked", "cancelled"},
         "pull_requests": observations,
+        **({"execution_owner": owner, "repair_budget": registry(spec).budget(owner["issue_id"]),
+            "github_record": registry(spec).checkpoints(owner["issue_id"]).get("github-record")}
+           if owner else {}),
     }
+    if owner:
+        checkpoints = registry(spec).checkpoints(owner["issue_id"])
+        raw_plan = row.get("accepted_plan_text") or spec.get("accepted_plan")
+        plan = json.loads(raw_plan) if raw_plan else {}
+        workstreams = []
+        for stream in plan.get("workstreams", []):
+            binding = checkpoints.get("workstream-issues", {}).get(stream["id"])
+            if not binding:
+                continue
+            workers = []
+            finished = 0
+            for chunk in stream["chunks"]:
+                proof = checkpoints.get("verified:" + chunk["id"])
+                finished += bool(proof)
+                assignment = (checkpoints.get("assignment:" + chunk["id"] + ":chunk")
+                              or checkpoints.get("assignment:" + chunk["id"] + ":build"))
+                if assignment:
+                    worker = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                                        (assignment["run_id"],)).fetchone()
+                    if worker:
+                        workers.append(dict(worker))
+            status = "Queued"
+            if payload["status"] == "Merged":
+                status = "Merged"
+            elif finished == len(stream["chunks"]):
+                status = "Awaiting merge"
+            elif any(worker["outcome"] == "blocked" for worker in workers):
+                status = "Blocked"
+            elif payload["status"] in {"Cancelled", "Blocked", "PR closed", "Needs validation"}:
+                status = payload["status"]
+            elif workers:
+                status = "In progress"
+            urls = {url for worker in workers
+                    for url in publication_urls(json.loads(worker["pr_json"] or "null"))}
+            workstreams.append({"issue": issue_key(binding["url"]), "status": status,
+                                "pull_requests": [item for item in observations
+                                                  if item["url"] in urls]})
+        payload["workstreams"] = workstreams
     encoded = canonical_json(payload)
     prior = db.execute("SELECT * FROM delivery_features WHERE issue=?", (key,)).fetchone()
     if prior and prior["payload_json"] == encoded:
@@ -156,8 +224,8 @@ def current(db: sqlite3.Connection, issue: str) -> dict | None:
     view = json.loads(saved[0]) if saved else None
     if not local_value:
         return mirror_freshness(view)
-    local_identity = (local_value["admitted_at"], local_value["run_id"], source)
-    selected_identity = (view["admitted_at"], view["run_id"], view["source"]) if view else None
+    local_identity = ownership_order(local_value)
+    selected_identity = ownership_order(view) if view else None
     if view and (selected_identity > local_identity or (
         selected_identity == local_identity and view["version"] >= local["version"]
     )):

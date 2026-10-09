@@ -98,6 +98,13 @@ class DeliveryConfig:
         ci_wait = value.get("ci_wait_seconds", 10800)
         if type(ci_wait) is not int or not 60 <= ci_wait <= 43200:
             raise ValueError("ci_wait_seconds must be between 60 and 43200")
+        if value.get("feature_delivery_version") not in (None, 1):
+            raise ValueError("unsupported feature delivery protocol")
+        repairs = value.get("max_repairs", 10)
+        if type(repairs) is not int or not 0 <= repairs <= 100:
+            raise ValueError("max_repairs must be between 0 and 100")
+        if value.get("feature_delivery_version") == 1 and repairs == 0:
+            raise ValueError("feature delivery requires a positive finite repair allowance")
         return cls(path=path.resolve(), raw=value)
 
     @property
@@ -149,7 +156,8 @@ class DeliveryConfig:
             "execution_backend": self.raw.get("execution_backend", "native-macos"),
             "execution_mode": self.raw.get("execution_mode", "native-profile"),
             "max_attempts": self.raw.get("max_attempts", 3),
-            "max_repairs": self.raw.get("max_repairs", 2),
+            "max_repairs": self.raw.get("max_repairs", 10),
+            "feature_delivery_version": self.raw.get("feature_delivery_version"),
             "tracker_retry_seconds": self.raw.get("tracker_retry_seconds", 600),
         }
 
@@ -170,10 +178,12 @@ class DeliveryConfig:
         }
         optional = {
             "accepted_plan", "recovery_key", "supersedes_run_id",
-            "plan_approval", "origin_thread_id", "publication_summary"
+            "plan_approval", "origin_thread_id", "publication_summary", "feature_predecessor"
         }
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
+        if "feature_predecessor" in supplied and self.raw.get("feature_delivery_version") != 1:
+            raise ValueError("feature continuation requires the feature delivery protocol")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
             raise ValueError("required submit fields must be non-empty strings")
         if "publication_summary" in supplied and supplied["publication_summary"] is None:
@@ -288,7 +298,7 @@ class DeliveryConfig:
             "config_overrides": self.raw.get("config_overrides", ["features.plugins=false"]),
             "toolchain_roots": self.raw.get("toolchain_roots", []),
             "package_manager_cache": self.raw.get("package_manager_cache"),
-            "max_repairs": int(self.raw.get("max_repairs", 2)),
+            "max_repairs": self.raw.get("max_repairs", 10),
             "capacity": int(self.raw.get("capacity", 2)),
             "fake_findings": self.raw.get("fake_findings", {})
             if self.raw.get("provider") == "fake"
@@ -360,8 +370,8 @@ class DeliveryConfig:
                 timeout = selected.get("timeout_seconds", 7200)
                 if type(timeout) is not int or not 1 <= timeout <= 7200:
                     raise ValueError("native role deadline must be between 1 and 7200 seconds")
-        if policy["max_repairs"] < 0 or policy["max_repairs"] > 3:
-            raise ValueError("max_repairs must be between 0 and 3")
+        if type(policy["max_repairs"]) is not int or not 0 <= policy["max_repairs"] <= 100:
+            raise ValueError("max_repairs must be between 0 and 100")
         prompt = policy["initial_decision_prompt"]
         if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
             raise ValueError("initial decision prompt must be a non-empty string")

@@ -70,8 +70,9 @@ def scope_spec(store, seal, command):
 def fixed_budget_allows(spec, iteration, iterations):
     """A resume may spend unused original turns, never enlarge the frozen ceiling."""
     maximum = spec.get('policy', {}).get('max_repairs')
+    allowed = range(1, 101) if spec.get('feature_worker') else (1, 2)
     return (type(iteration) is int and iteration >= 0
-            and type(iterations) is int and iterations in (1, 2)
+            and type(iterations) is int and iterations in allowed
             and type(maximum) is int and maximum >= 0
             and iteration + iterations <= maximum)
 
@@ -182,11 +183,13 @@ def snapshot(store, run_id):
     closed = store._completed_temporal_result(run_id, workflow_id=predecessor_id)
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
-    if (row['phase'] != 'blocked' or row['outcome'] != 'blocked'
-            or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
-            or state.get('run_id') != run_id or state.get('phase') != 'blocked'
-            or state.get('outcome') != 'blocked' or state.get('cleanup') != 'confirmed'
-            or state.get('execution_state') != 'blocked'
+    stopped = ({'blocked', 'cancelled'} if spec.get('feature_worker') else {'blocked'})
+    expected_execution = 'terminal' if row['outcome'] == 'cancelled' else 'blocked'
+    if (row['phase'] not in stopped or row['outcome'] != row['phase']
+            or row['execution_state'] != expected_execution or row['cleanup'] != 'confirmed'
+            or state.get('run_id') != run_id or state.get('phase') != row['phase']
+            or state.get('outcome') != row['outcome'] or state.get('cleanup') != 'confirmed'
+            or state.get('execution_state') != expected_execution
             or closed.get('workflow_id') != predecessor_id
             or state.get('candidate') != json.loads(row['candidate_json'] or 'null')
             or state.get('checks') != json.loads(row['checks_json'] or '{}')
@@ -232,6 +235,8 @@ def snapshot(store, run_id):
 
 
 def admit(store, run_id, command, *, preflight=False):
+    original = store.submitted_spec(run_id)
+    allowed = range(1, 101) if original.get('feature_worker') else (1, 2)
     if (not isinstance(command, dict) or set(command) not in (FIELDS, FIELDS | SCOPE_FIELDS)
             or command.get('continuation_kind') != KIND
             or not isinstance(command.get('command_id'), str)
@@ -239,7 +244,7 @@ def admit(store, run_id, command, *, preflight=False):
             or any(type(command.get(k)) is not int or command[k] < low for k, low in (
                 ('expected_revision', 1), ('expected_iteration', 0)))
             or type(command.get('additional_iterations')) is not int
-            or command['additional_iterations'] not in (1, 2)
+            or command['additional_iterations'] not in allowed
             or any(not isinstance(command.get(k), str)
                    or not re.fullmatch(r'[0-9a-f]{' + str(size) + '}', command[k])
                    for k, size in [('expected_candidate_id', 64),
@@ -260,7 +265,6 @@ def admit(store, run_id, command, *, preflight=False):
             or command['expected_candidate_head'] != seal['candidate']['head']):
         raise ValueError('stopped resume checkpoint is stale')
     maximum = seal['state']['iteration'] + command['additional_iterations']
-    original = store.submitted_spec(run_id)
     if (original.get('retry_budget_version') == 1
             and not fixed_budget_allows(original, seal['state']['iteration'],
                                         command['additional_iterations'])):

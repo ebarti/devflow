@@ -79,7 +79,7 @@ export interface CheckState {
 export interface Decision {
   id: string
   revision: number
-  kind?: 'question' | 'plan' | null
+  kind?: 'question' | 'plan' | 'merge' | null
   question_id?: string | null
   plan_revision?: number | null
   plan_digest?: string | null
@@ -96,6 +96,7 @@ export interface IntakePlan {
   steps: string[]
   verification: string[]
   acceptance: string[]
+  workstreams?: Array<{ id: string; title: string; issue_number: number | null; chunks: Array<{ id: string; title: string; acceptance: string[]; depends_on: string[] }> }>
 }
 
 export interface IntakeState {
@@ -163,6 +164,9 @@ export interface RunDetail extends RunSummary {
     number?: number | null
     url?: string | null
     state?: string | null
+    stack_id?: number | null
+    scope_complete?: boolean
+    pull_requests?: Array<{ number: number; url: string; chunk_id: string }>
   } | null
   checks?: { review?: CheckState | null; qa?: CheckState | null; local?: CheckState | null; ci?: CheckState | null;
     terminal_tracker_checkpoint?: { waiting?: boolean; closed?: boolean; state?: string; deadline?: string; cycles?: number; attempts?: number } | null } | null
@@ -179,6 +183,15 @@ export interface RunDetail extends RunSummary {
   question_notifications?: Array<{ decision_id: string; decision_revision: number; state: string; receipt?: { reason?: string } | null }> | null
   intake?: IntakeState | null
   events?: ActivityEvent[] | null
+  feature_delivery?: {
+    issue_id: string
+    owner: { issue_id: string; run_id: string; store_path: string; generation: number } | null
+    github_plan_url: string | null
+    ownership_state: string
+    can_continue: boolean
+    repair_budget: { used: number; maximum: number; learning_required: boolean }
+    workers: Array<{ run_id: string; chunk_id: string; kind: 'build' | 'chunk'; phase: string; outcome: string | null; cleanup: string; pull_request?: { url: string; number: number } | null }>
+  } | null
   evidence?: Evidence[] | null
 }
 

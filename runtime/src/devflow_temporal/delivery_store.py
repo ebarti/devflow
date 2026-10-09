@@ -601,6 +601,12 @@ class DeliveryStore:
                     (self.state.now(), old_owner),
                 )
             self.state.claim_work(db, spec["work_id"], f"external:devflow:{run_id}", dashboard_url)
+            if self.config.raw.get("feature_delivery_version") == 1:
+                from .delivery_feature_execution import admit
+
+                if superseded or _automatic is not None:
+                    raise ValueError("feature continuations use their explicit execution owner")
+                admit(self, db, spec)
             timestamp = _now()
             initial_phase = "preparing" if spec.get("preparation_version") == 1 else "accepted"
             db.execute(
@@ -3233,6 +3239,7 @@ class DeliveryStore:
             rows = db.execute(
                 "SELECT r.* FROM delivery_runs r LEFT JOIN delivery_dashboard_state d "
                 "ON r.run_id=d.run_id WHERE COALESCE(d.archived,0)=?" + boundary +
+                " AND json_extract(r.request_json,'$.feature_worker') IS NULL" +
                 " ORDER BY r.updated_at DESC,r.run_id DESC LIMIT ?",
                 (*parameters, limit + 1),
             ).fetchall()
@@ -3592,9 +3599,15 @@ class DeliveryStore:
             else [],
             "intake": json.loads(row["intake_json"]) if row["intake_json"] else None,
             "question_notifications": self.question_notifications(run_id),
+            "feature_delivery": self.feature_delivery_detail(spec),
             "events": events,
             "error": row["error"],
         }
+
+    def feature_delivery_detail(self, spec):
+        from .delivery_feature_execution import detail
+
+        return detail(self, spec)
 
     def _evidence_items(self, run_id: str) -> list[dict[str, Any]]:
         spec = self.spec(run_id)

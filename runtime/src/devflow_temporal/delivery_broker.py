@@ -216,6 +216,10 @@ class DeliveryBroker:
             resources.created(self.checkout)
         recovery = self.spec["policy"].get("recovery")
         provenance = self._recover(recovery) if recovery else None
+        if self.spec.get("feature_worker", {}).get("seed"):
+            from .delivery_feature_activities import apply_seed
+
+            apply_seed(self)
         candidate = self.candidate()
         continuation = self.spec.get("continuation")
         if continuation:
@@ -1255,6 +1259,19 @@ class DeliveryBroker:
         return raw.removeprefix("origin/")
 
     def _read_owned_pr(self) -> dict[str, Any] | None:
+        if self.spec.get("feature_worker", {}).get("kind") == "chunk":
+            from .delivery_feature_publication import owned_pr_number
+
+            number = owned_pr_number(self.spec)
+            if number is not None:
+                found = json.loads(_run([
+                    "gh", "pr", "view", str(number), "--repo", self.spec["github_repo"], "--json",
+                    "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title",
+                ], timeout=60))
+                if (found["number"] != number or found["headRefName"] != self.spec["branch"]
+                        or found["isDraft"] or found["state"] != "OPEN"):
+                    raise ValueError("recorded chunk PR is no longer the owned open publication")
+                return found
         try:
             output = _run(
                 [

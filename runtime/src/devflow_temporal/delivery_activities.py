@@ -181,7 +181,7 @@ async def _with_heartbeat(operation, request: dict[str, Any], stage: str) -> dic
 
 
 def _context(
-    spec: dict[str, Any], *, preparation_input: bool = False
+    spec: dict[str, Any], *, preparation_input: bool = False, allow_stopped_feature: bool = False
 ) -> tuple[DeliveryStore, DeliveryBroker]:
     config = DeliveryConfig.load(Path(spec["config_path"]))
     if digest(config.raw) != spec["config_digest"]:
@@ -194,6 +194,10 @@ def _context(
     ):
         raise ValueError("Temporal input no longer matches the durable submitted run")
     broker = DeliveryBroker(store, spec)
+    if spec.get("feature_delivery"):
+        from .delivery_feature_execution import require_execution
+
+        require_execution(store, spec, allow_stopped=allow_stopped_feature)
     if broker.evidence_dir != broker.state_dir:
         namespace = str(broker.evidence_dir.relative_to(broker.state_dir).parent)
         from .delivery_resources import private_directory
@@ -448,6 +452,16 @@ def _role_context(request, store, broker, supervisor):
 
 async def _run_role(request: dict[str, Any]) -> dict[str, Any]:
     store, broker = await asyncio.to_thread(_context, request['spec'])
+    if (request["spec"].get("feature_worker") and request["role"] == "implement"
+            and request["iteration"] > 0):
+        from .delivery_feature_execution import registry
+
+        shared = registry(request["spec"])
+        issue_id = request["spec"]["feature_delivery"]["owner"]["issue_id"]
+        token = shared.token(shared.current(issue_id))
+        await asyncio.to_thread(shared.repair, token,
+                                f"{request['spec']['run_id']}:{request['iteration']}",
+                                "Product repair at worker iteration " + str(request["iteration"]))
     supervisor = get_supervisor(store)
     request, workspace, review_diff, retained = await asyncio.to_thread(
         _role_context, request, store, broker, supervisor,
@@ -547,8 +561,12 @@ def _role_result(request, broker, workspace, review_diff, result):
 @activity.defn(name="delivery_publish")
 async def delivery_publish(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        _, broker = _context(request["spec"])
+        store, broker = _context(request["spec"])
         try:
+            if request["spec"].get("feature_worker"):
+                from .delivery_feature_publication import publish
+
+                return publish(store, broker, request)
             return broker.publish(request["iteration"], request["candidate"])
         except Exception as exc:
             if (request["spec"].get("publication_readback_version") == 1
@@ -563,13 +581,18 @@ async def delivery_publish(request: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="delivery_reconcile_publish")
 async def delivery_reconcile_publish(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        _, broker = _context(request["spec"])
-        return broker.reconcile_publish(
+        store, broker = _context(request["spec"])
+        if request["spec"].get("feature_worker"):
+            from .delivery_feature_publication import publish
+
+            return publish(store, broker, request, reconcile=True)
+        result = broker.reconcile_publish(
             request["iteration"],
             request["candidate"],
             expected_head=request.get("expected_head"),
             expected_pr_number=request.get("expected_pr_number"),
         )
+        return result
 
     return await asyncio.to_thread(execute)
 
@@ -992,7 +1015,10 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
     if request["spec"]["provider"] == "fake":
         return {"state": "consistent", "pending": False, "observed": {"fixture": True}}
     try:
-        if request["status"] in {"in-review", "done"} and request.get("pull_request") is not None:
+        feature_parent = request["spec"].get("feature_delivery") and not request["spec"].get(
+            "feature_worker")
+        if (request["status"] in {"in-review", "done"} and request.get("pull_request") is not None
+                and not feature_parent):
             from .delivery_terminal_recovery import published_readback
 
             store, _ = _context(request["spec"])
@@ -1070,3 +1096,12 @@ DELIVERY_ACTIVITIES = [
     delivery_tracker_start,
     delivery_tracker,
 ]
+
+
+def _feature_activities():
+    from .delivery_feature_activities import FEATURE_ACTIVITIES
+
+    return FEATURE_ACTIVITIES
+
+
+DELIVERY_ACTIVITIES.extend(_feature_activities())

@@ -150,7 +150,8 @@ class DeliveryService:
                         "run_timeout": timedelta(minutes=14)
                         if recovery and recovery.get("kind") == "terminal_tracker_recovery"
                         else timedelta(hours=72)}
-                       if spec.get("terminal_tracker_version") == 1 else {}),
+                       if spec.get("terminal_tracker_version") == 1
+                       and not spec.get("feature_delivery") else {}),
                     memo={
                         "request_digest": item["request_digest"],
                         **({"recovery_digest": digest(recovery)} if recovery else {}),
@@ -383,6 +384,17 @@ def create_app(config_path: Path) -> FastAPI:
         _mutation(request)
         try:
             return await asyncio.to_thread(service.store.submit, await request.json())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/continue-feature")
+    async def continue_feature(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        from .delivery_feature_execution import continue_feature as continue_execution
+
+        try:
+            return await asyncio.to_thread(
+                continue_execution, service.store, run_id, await request.json())
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 

@@ -2,11 +2,20 @@ import { useState } from 'react'
 import { api, ApiError, safeWebUrl } from './api'
 import { CheckIcon, ExternalIcon } from './icons'
 import { display, time, timelineTime, titleCase, tokens, tone } from './format'
-import type { ActivityEvent, CheckState, Decision, PhaseGate, RoleState, RunDetail } from './model'
+import type { ActivityEvent, CheckState, Decision, IntakePlan, PhaseGate, RoleState, RunDetail } from './model'
 import { RunControls } from './RunControls'
+import { FeatureDelivery } from './FeatureDelivery'
 
 function State({ value }: { value: string | null | undefined }) {
   return <span className={`state state--${tone(value)}`}><span className="state__mark" aria-hidden="true">{tone(value) === 'good' ? <CheckIcon /> : null}</span>{titleCase(value)}</span>
+}
+
+function Workstreams({ plan }: { plan: IntakePlan }) {
+  if (!plan.workstreams?.length) return null
+  return <div><h3>Workstreams and complete chunks</h3>{plan.workstreams.map(stream => <div key={stream.id}>
+    <h4>{stream.title}{stream.issue_number ? ` · Issue #${stream.issue_number}` : ' · New sub-issue'}</h4>
+    <ol>{stream.chunks.map(chunk => <li key={chunk.id}><strong>{chunk.title}</strong><p>{chunk.acceptance.join('; ')}</p><small>{chunk.depends_on.length ? `Requires: ${chunk.depends_on.join(', ')}` : 'Can start independently'}</small></li>)}</ol>
+  </div>)}</div>
 }
 
 function PhaseStrip({ gates }: { gates: PhaseGate[] | null | undefined }) {
@@ -36,8 +45,8 @@ function Facts({ run }: { run: RunDetail }) {
   const trackerLabel = tracker?.conflict ? 'Conflict' : tracker?.state === 'unconfigured' ? 'Unconfigured' : tracker?.pending || tracker?.state === 'pending' ? 'Readback pending' : tracker?.state === 'consistent' ? 'Readback confirmed' : 'Unresolved'
   const trackerTone = tracker?.conflict ? 'bad' : tracker?.state === 'consistent' ? 'neutral' : 'waiting'
   return <dl className="facts" aria-label="Run facts">
-    <div><dt>Candidate</dt><dd className="mono" title={run.candidate?.head ?? undefined}>{display(run.candidate?.head, 'Not available')}</dd></div>
-    <div><dt>{run.feature ? 'This run’s PR' : 'Pull request'}</dt><dd>{url ? <a href={url} target="_blank" rel="noopener noreferrer">{run.pull_request?.number ? `#${run.pull_request.number}` : 'Open pull request'} <ExternalIcon /></a> : display(run.pull_request?.number, 'Not published')}</dd></div>
+    {run.feature_delivery ? <div><dt>Feature stack</dt><dd>{run.pull_request?.stack_id ? `Stack #${run.pull_request.stack_id} · ` : ''}{run.pull_request?.pull_requests?.length ?? 0} published PRs</dd></div> : <><div><dt>Candidate</dt><dd className="mono" title={run.candidate?.head ?? undefined}>{display(run.candidate?.head, 'Not available')}</dd></div>
+    <div><dt>{run.feature ? 'This run’s PR' : 'Pull request'}</dt><dd>{url ? <a href={url} target="_blank" rel="noopener noreferrer">{run.pull_request?.number ? `#${run.pull_request.number}` : 'Open pull request'} <ExternalIcon /></a> : display(run.pull_request?.number, 'Not published')}</dd></div></>}
     <div><dt>Authorized endpoint</dt><dd><span className="outline-pill">{titleCase(run.authorized_endpoint)}</span></dd></div>
     {run.feature ? <>
       <div><dt>Feature status</dt><dd>{run.feature.status}</dd></div>
@@ -206,11 +215,13 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
   }
 
   return <section className="decision-card" aria-labelledby={`decision-${decision.id}`}>
-    <div className="decision-card__heading"><h2 id={`decision-${decision.id}`}>{decision.kind === 'question' ? 'Clarification needed' : decision.kind === 'plan' ? 'Review Devflow plan' : 'Decision needed'}</h2><span>Revision {decision.revision}</span></div>
+    <div className="decision-card__heading"><h2 id={`decision-${decision.id}`}>{decision.kind === 'question' ? 'Clarification needed' : decision.kind === 'plan' ? 'Review Devflow plan' : decision.kind === 'merge' ? 'Merge feature' : 'Decision needed'}</h2><span>Revision {decision.revision}</span></div>
     <p>{decision.prompt}</p>
+    {decision.kind === 'merge' ? <p>This authorizes merging {run.pull_request?.stack_id ? `stack #${run.pull_request.stack_id}` : 'the feature PR'} with {(run.pull_request?.pull_requests ?? []).map(pr => `#${pr.number}`).join(', ')} and closing the feature and its workstream issues after GitHub confirms the merge.</p> : null}
     {decision.blocker ? <div className="intake-plan"><h3>Why input is needed</h3><p>{decision.blocker.unknown}</p><p>{decision.blocker.why_no_safe_default}</p><h3>Evidence checked</h3><ul>{decision.blocker.evidence_checked.map((item, index) => <li key={index}>{item}</li>)}</ul></div> : null}
     {notification ? <p className="subtle">Question callback: {titleCase(notification.state)}. {notification.state === 'queued' ? 'The native queue acknowledged the message; display and an answer are not confirmed.' : notification.state === 'unavailable' ? 'No originating thread is bound. Answer here.' : notification.state === 'unknown' ? 'The queue effect is uncertain and will not be retried automatically.' : notification.receipt?.reason ?? ''}</p> : null}
     {plan ? <div className="intake-plan"><h3>Scope</h3><p>{plan.scope}</p><h3>Steps</h3><ol>{plan.steps.map((item, index) => <li key={index}>{item}</li>)}</ol><h3>Verification</h3><ul>{plan.verification.map((item, index) => <li key={index}>{item}</li>)}</ul><h3>Acceptance</h3><ul>{plan.acceptance.map((item, index) => <li key={index}>{item}</li>)}</ul></div> : null}
+    {plan ? <Workstreams plan={plan} /> : null}
     {decision.candidate_revision != null ? <p className="subtle">Candidate revision {decision.candidate_revision}</p> : null}
     {run.execution_retired ? <p className="subtle">Saved decision · read-only</p> : <><fieldset disabled={busy || stale}>
       <legend className="sr-only">Choose a response</legend>
@@ -226,7 +237,7 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
     </fieldset>
     {decision.kind === 'question' || (decision.kind === 'plan' && choice === 'change') ? <label className="field-wide">{decision.kind === 'question' ? 'Your answer (or choose a suggestion)' : 'What should change in the plan?'}<textarea value={freeText} onChange={event => { setFreeText(event.target.value); if (decision.kind === 'question') setChoice(''); setCommandId(crypto.randomUUID()) }} rows={3} maxLength={4000} disabled={busy || stale} /></label> : null}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
-    <button className="primary-button" type="button" disabled={!valid || busy || stale || run.protocol_revision == null || decision.candidate_revision == null} onClick={() => void answer()}>{busy ? 'Submitting…' : decision.kind === 'plan' && choice === 'proceed' ? 'Accept this plan' : decision.kind === 'question' ? 'Submit answer' : decision.kind === 'plan' ? 'Submit plan response' : 'Submit decision'}</button>
+    <button className="primary-button" type="button" disabled={!valid || busy || stale || run.protocol_revision == null || decision.candidate_revision == null} onClick={() => void answer()}>{busy ? 'Submitting…' : decision.kind === 'plan' && choice === 'proceed' ? 'Accept this plan' : decision.kind === 'question' ? 'Submit answer' : decision.kind === 'plan' ? 'Submit plan response' : decision.kind === 'merge' ? 'Merge this feature' : 'Submit decision'}</button>
     </>}
   </section>
 }
@@ -244,6 +255,7 @@ function IntakeHistory({ run }: { run: RunDetail }) {
       <ol>{plan.content.steps.map((item, index) => <li key={index}>{item}</li>)}</ol>
       <p><strong>Verification:</strong> {plan.content.verification.join('; ')}</p>
       <p><strong>Acceptance:</strong> {plan.content.acceptance.join('; ')}</p>
+      <Workstreams plan={plan.content} />
       {plan.change_request ? <p><strong>Requested change:</strong> {plan.change_request}</p> : null}
     </div>)}
   </section>
@@ -319,16 +331,16 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     {run.execution_retired ? <p className="inline-alert">Historical run · read-only. Its execution backend is retired.</p> : null}
     {run.error ? <p className="inline-alert" role="alert">{run.error}</p> : null}
     <BlockingFindings run={run} />
-    <PhaseStrip gates={run.phase_gates} />
+    {!run.feature_delivery ? <PhaseStrip gates={run.phase_gates} /> : null}
     {decisions.map(decision => <DecisionCard key={`${decision.id}:${decision.revision}`} run={run} decision={decision} onRefresh={onRefresh} />)}
     <IntakeHistory run={run} />
-    <RunControls run={run} onRefresh={onRefresh} />
+    <FeatureDelivery key={`feature-${run.id}`} run={run} onRefresh={onRefresh} />
+    {!run.feature_delivery ? <RunControls run={run} onRefresh={onRefresh} /> : null}
     <Facts run={run} />
     <RoleTable roles={run.roles} />
     <Activity events={run.events} />
     <p className="stream-note">Updates stream from the local service. Waiting uses no model calls. Last observation: {time(run.observed_at || run.updated_at)}.</p>
-    <EvidenceAndQuality run={run} />
-    <GateDetails gates={run.phase_gates} />
+    {!run.feature_delivery ? <><EvidenceAndQuality run={run} /><GateDetails gates={run.phase_gates} /></> : null}
     <Operations run={run} />
     <UsageSection run={run} />
     <TrackerRecovery key={run.id} run={run} onRefresh={onRefresh} />
