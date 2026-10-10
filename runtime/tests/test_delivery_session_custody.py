@@ -210,6 +210,13 @@ def test_missing_rollout_cannot_hide_provider_work_or_an_unrelated_failure(missi
         with pytest.raises(ValueError, match="authenticated failure"):
             custody.implementation_custody(spec, state, attempts, previous)
     write_private(path, original)
+    for attempt in attempts:
+        receipt = Path(attempt["result_path"])
+        original_receipt = json.loads(receipt.read_text())
+        write_private(receipt, {})
+        with pytest.raises(ValueError, match="owning attempt|authenticated failure"):
+            custody.implementation_custody(spec, state, attempts, previous)
+        write_private(receipt, original_receipt)
     changed = copy.deepcopy(attempts)
     result = json.loads(changed[-1]["result_json"])
     result["findings"] = ["unrelated provider failure"]

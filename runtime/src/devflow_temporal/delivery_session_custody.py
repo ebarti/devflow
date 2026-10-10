@@ -37,6 +37,21 @@ def implementation_generation(spec, previous=None):
     return generation
 
 
+def _same_assessment(raw, result):
+    enriched = {
+        "cleanup",
+        "process_cleanup",
+        "resource_cleanup",
+        "native_process",
+        "role_artifacts",
+        "traceback",
+    }
+    return isinstance(raw, dict) and (
+        {key: value for key, value in raw.items() if key != "traceback"}
+        == {key: value for key, value in result.items() if key not in enriched}
+    )
+
+
 def _missing_rollout(spec, state, attempt, session, generation):
     from .delivery_gates_admission import _native_result_bytes
     from .delivery_sandbox import _native_role_home
@@ -75,7 +90,7 @@ def _missing_rollout(spec, state, attempt, session, generation):
         or DeliverySupervisor._job_key(request) != attempt["job_key"]
         or attempt["result_path"] != request["result_path"]
         or attempt["candidate_id"] != state["candidate"]["id"]
-        or any(raw.get(key) != result.get(key) for key in raw if key != "traceback")
+        or not _same_assessment(raw, result)
         or result.get("status") != "blocked"
         or result.get("finish_reason") != "exception"
         or result.get("summary") != "role process failed: InvalidRequestError"
@@ -167,7 +182,7 @@ def _session_origin(spec, state, attempts, session, home):
         or _native_role_home(request) != home
         or launch["environment"].get("CODEX_HOME") != str(home / "codex")
         or journal["intent"].get("environment_sha256") != digest(launch["environment"])
-        or any(raw.get(key) != result.get(key) for key in raw if key != "traceback")
+        or not _same_assessment(raw, result)
         or result.get("session_id") != session
         or result.get("cleanup") != "confirmed"
         or metadata.get("session_id") != session
