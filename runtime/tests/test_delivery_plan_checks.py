@@ -445,7 +445,8 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
     for reference in ('{name} recipe', '**checks.{name}**',
                       '[checks.{name}](scripts/checks.toml).')
     for configured in (False, True)
-] + [('**python', True, '**checks.{name}**'), ('checks.python', True, '{name} recipe')])
+] + [('**python', True, '**checks.{name}**'), ('**python', True, '{name} recipe'),
+   ('checks.python', True, '{name} recipe')])
 def test_plan_recipe_name_does_not_authorize_prefix_or_suffix_recipes(
     junit_project, name, reference, configured,
 ):
