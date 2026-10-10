@@ -3322,6 +3322,26 @@ class DeliveryStore:
                 raise ValueError("run ID not found")
             return current(db, row[0])
 
+    @staticmethod
+    def _historical_execution_readback(
+        row: dict[str, Any], spec: dict[str, Any], *, unfinished: int,
+    ) -> dict[str, str] | None:
+        """Display saved terminal legacy facts after their checkout is removed."""
+        if (spec.get("feature_delivery") or unfinished
+                or row["outcome"] not in {"delivered", "blocked", "cancelled"}
+                or row["execution_state"] not in {
+                    "terminal", "blocked", "cancelled", "waiting_tracker",
+                }):
+            return None
+        try:
+            # A replaced checkout, including a dangling symlink, still requires
+            # strict readback. Only an absent checkout permits historical display.
+            Path(spec["checkout"]).lstat()
+        except FileNotFoundError:
+            return {"state": "unavailable", "reason": "historical_checkout_absent",
+                    "checkout": spec["checkout"]}
+        return None
+
     def _compact(self, row: dict[str, Any]) -> dict[str, Any]:
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
@@ -3341,8 +3361,6 @@ class DeliveryStore:
         )
         if not isinstance(effective, dict):
             effective = spec
-        if technical:
-            effective = self.effective_spec(row["run_id"])
         from .delivery_resources import projected_cleanup
 
         with self._connect() as db:
@@ -3352,10 +3370,15 @@ class DeliveryStore:
             from .delivery_features import current as current_feature
 
             feature = current_feature(db, row["issue_url"])
-            active = db.execute(
-                "SELECT COUNT(*) FROM delivery_attempts WHERE run_id=? "
-                "AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
-            ).fetchone()[0]
+            active, unfinished = db.execute(
+                "SELECT COUNT(*),COALESCE(SUM(state!='finished'),0) FROM delivery_attempts "
+                "WHERE run_id=? AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
+            ).fetchone()
+        execution_readback = self._historical_execution_readback(row, spec, unfinished=unfinished)
+        if execution_readback:
+            effective = self.spec(row["run_id"])
+        elif technical:
+            effective = self.effective_spec(row["run_id"])
         cleanup = projected_cleanup(
             effective, json.loads(row["checks_json"] or "{}"), row["cleanup"],
             terminal=(not active and row["execution_state"] in {
@@ -3386,6 +3409,7 @@ class DeliveryStore:
             "outcome": row["outcome"],
             "cleanup": cleanup,
             "cleanup_recorded": row["cleanup"],
+            **({"execution_readback": execution_readback} if execution_readback else {}),
         }
 
     def detail(self, run_id: str) -> dict[str, Any]:
@@ -3407,8 +3431,10 @@ class DeliveryStore:
 
         with self._connect() as db:
             steering = steering_history(db, run_id)
-            can_steer = not compact["execution_retired"] and steering_open(db, row)
-        spec = self.effective_spec(run_id)
+            can_steer = (not compact.get("execution_readback")
+                         and not compact["execution_retired"] and steering_open(db, row))
+        historical = bool(compact.get("execution_readback"))
+        spec = self.spec(run_id) if historical else self.effective_spec(run_id)
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         adjudication = (recovery if recovery and recovery.get("kind")
                         == "investigation_assessment_adjudication" else None)
@@ -3606,8 +3632,9 @@ class DeliveryStore:
             "candidate": {
                 **candidate,
                 "revision": row["candidate_revision"],
-                "base_sha": spec["base_sha"],
-                "policy_digest": candidate.get("policy_digest", spec["policy_digest"]),
+                "base_sha": candidate.get("base_sha") if historical else spec["base_sha"],
+                "policy_digest": (candidate.get("policy_digest") if historical
+                                  else candidate.get("policy_digest", spec["policy_digest"])),
             }
             if candidate
             else None,
@@ -3651,7 +3678,7 @@ class DeliveryStore:
                 "preserved_error": recovery["state"]["error"],
                 "preparation_history": recovery.get("preparation_history", []),
             } if recovery and recovery.get("kind") == "execution_policy_recovery" else None,
-            "preparation": spec.get("preparation"),
+            "preparation": None if historical else spec.get("preparation"),
             "checks": checks,
             "tracker": tracker,
             "steering": steering,
