@@ -171,24 +171,38 @@ async def delivery_feature_begin_integration(request):
 
 
 def resume_worker(store, parent, child, row):
+    from . import delivery_gate_retry as gates
     from .delivery_stopped_resume import admit, snapshot
 
     shared = registry(parent)
     token = parent["feature_delivery"]["owner"]
     # The existing supported recovery reads Temporal closure and native cleanup,
     # preserves the original candidate/PR/session and never creates a new branch.
-    sealed = snapshot(store, child["run_id"])
+    preparation_failed = gates.prepublication_preparation_failed(
+        {"error": row["error"], "checks": json.loads(row["checks_json"] or "{}")})
+    if preparation_failed:
+        # The selector is only a hint. Gate admission authenticates the complete
+        # closed result, candidate, failed check, cleanup, and bounded retry history.
+        sealed = gates.snapshot(store, child["run_id"], gates.PREPUBLICATION_KIND)
+        state = sealed["closed"]["result"]
+        remaining = 0
+        kind = gates.PREPUBLICATION_KIND
+        admit = gates.admit
+    else:
+        sealed = snapshot(store, child["run_id"])
+        state = sealed["state"]
+        budget = shared.budget(token["issue_id"])
+        remaining = min(budget["maximum"] - budget["used"],
+                        child["policy"]["max_repairs"] - state["iteration"])
+        if remaining <= 0:
+            raise OwnershipConflict("feature product repair limit exhausted")
+        kind = "stopped_delivery_resume"
     candidate = sealed["candidate"]
-    budget = shared.budget(token["issue_id"])
-    remaining = min(budget["maximum"] - budget["used"],
-                    child["policy"]["max_repairs"] - sealed["state"]["iteration"])
-    if remaining <= 0:
-        raise OwnershipConflict("feature product repair limit exhausted")
     command = {
-        "continuation_kind": "stopped_delivery_resume",
+        "continuation_kind": kind,
         "command_id": "feature-resume-" + digest({"owner": token, "run": child["run_id"]})[:24],
-        "expected_revision": sealed["state"]["revision"],
-        "expected_iteration": sealed["state"]["iteration"],
+        "expected_revision": state["revision"],
+        "expected_iteration": state["iteration"],
         "expected_candidate_id": candidate["id"],
         "expected_candidate_head": candidate["head"],
         "additional_iterations": remaining,

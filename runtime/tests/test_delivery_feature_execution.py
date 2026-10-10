@@ -156,38 +156,6 @@ def test_workers_are_hidden_from_feature_run_list_and_have_narrow_fresh_authorit
         require_execution(store, child)
 
 
-@pytest.mark.parametrize("kind", ["build", "chunk"])
-def test_workers_keep_preparation_recipes_without_admitting_a_stack_baseline(
-    service, monkeypatch, kind,
-):
-    from types import SimpleNamespace
-
-    from devflow_temporal.delivery_baseline import run_baseline_checks
-    from devflow_temporal.delivery_configured_resources import implementation_prerequisites
-
-    store, request, _ = feature_service(service, monkeypatch)
-    store.submit(request)
-    parent = store.effective_spec(request["run_id"])
-    prerequisite = {"id": "python-worker", "kind": "check",
-                    "argv": ["uv", "sync", "--locked"],
-                    "generated_directories": ["worker/.venv"]}
-    parent["baseline_checks_version"] = 2
-    parent["policy"].update(host_sandbox="trusted-local",
-                           baseline_checks=[prerequisite], prepublish_checks=[prerequisite])
-    before = deepcopy(parent)
-    child = worker_spec(
-        parent, ordered_chunks(json.loads(request["accepted_plan"]))[0],
-        {"url": "https://github.com/example/fixture/issues/10"}, kind=kind,
-        base_sha=parent["base_sha"], base_branch="main",
-    )
-    assert implementation_prerequisites(child) == [prerequisite]
-    assert "baseline_checks_version" not in child
-    assert child["policy_digest"] == digest(child["policy"])
-    assert parent == before
-    with pytest.raises(ValueError, match="explicit immutable admission"):
-        run_baseline_checks(SimpleNamespace(spec=child))
-
-
 def test_partial_stack_merge_cannot_mark_unfinished_feature_merged():
     row = {
         "request_json": json.dumps({"feature_delivery": {"version": 1}}),

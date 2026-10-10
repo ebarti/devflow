@@ -108,6 +108,19 @@ dependencies when the accepted plan names only API or browser tests. A baseline
 checkout's environment is not shared with implementation checkouts. Recipe order
 and the later candidate checks are preserved; unrelated baseline tests and
 candidate-only checks are not run early.
+Feature workers keep their original sealed inputs, which omit the coordinator's
+baseline gate. They identify these prerequisites from their original configuration
+only after verifying its frozen digest and repository key, then require complete
+recipe equality with their frozen prepublication catalogue. A missing or changed
+configuration stops preparation before a role can run.
+
+A stopped feature worker whose passed implementation was followed by an
+authenticated prepublication preparation failure continues through the existing
+zero-repair gate retry. It retains its candidate, implementation session and
+product-repair count, and repeats publication checks before independent review
+and verification. Exact closed history, cleanup, configuration and source checks,
+and the existing finite gate-retry allowance still apply. An unregistered local
+environment is never silently adopted or removed to make recovery pass.
 
 New terminal runs synchronize tracker status and read back assignment, Project
 and claim through the existing tracker helper. Blocked/cancelled outcomes select

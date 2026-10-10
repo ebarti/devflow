@@ -219,9 +219,8 @@ def worker_spec(parent, chunk, issue, *, kind, base_sha, base_branch, seed=None)
             spec["feature_worker"].update(previous_publication=previous, seed=None)
     # Chunk gates qualify their integrated base; the coordinator already checked
     # the feature baseline. Workers must not interpret a stack layer as trunk.
-    # Keep the frozen recipes for dependency preparation in their own checkout;
-    # only the admission marker permits executing the full baseline gate.
     spec.pop("baseline_checks_version", None)
+    policy.pop("baseline_checks", None)
     spec["policy_digest"] = digest(policy)
     return spec
 

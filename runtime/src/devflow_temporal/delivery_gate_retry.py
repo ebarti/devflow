@@ -23,6 +23,26 @@ CI_KIND = 'published_ci_retry'
 CONTROLLER_KIND = 'published_controller_retry'
 
 
+def prepublication_preparation_failed(state):
+    """Recognize the controller's exact preparation stop, never a product finding."""
+    from .delivery_baseline_contract import preparation_failure
+
+    precheck = state.get('checks', {}).get('prepublish', {})
+    prerequisite = preparation_failure(precheck)
+    return (precheck.get('state') == 'failed' and prerequisite is not None
+            and state.get('error') == f'environment preparation failed: {prerequisite}; '
+            'candidate retained without requesting code repair')
+
+
+def _unpublished_remote_matches(broker, pr, remote):
+    if broker.spec.get('feature_worker', {}).get('previous_publication'):
+        from .delivery_feature_publication import verify_retained_publication
+
+        verify_retained_publication(broker)
+        return True
+    return pr is None and not remote
+
+
 def _consumed_payloads(spec, state, previous, *, include_implementation=False):
     """Follow actual gate launches; old journals retain their preparation identity."""
     records = [role for role in state.get('roles', [])
@@ -187,6 +207,8 @@ def snapshot(store, run_id, kind=KIND):
         failed_gate = True
     if (spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local'):
         raise ValueError('gate retry requires the existing trusted native execution policy')
+    unpublished_error = (state.get('error') if prepublication_preparation_failed(state)
+                         else 'prepublication repair limit exhausted')
     if ((kind == PRELAUNCH_KIND and not prelaunch)
             or (previous is not None and not (
                 renewed or published_after_recovery or prelaunch
@@ -203,7 +225,7 @@ def snapshot(store, run_id, kind=KIND):
                                         else {'required CI did not confirm this PR head'
                                               if ci_only
                                       else 'local check process cleanup is unknown' if prelaunch
-                                      else 'prepublication repair limit exhausted'
+                                      else unpublished_error
                                       if unpublished else state.get('error') if controller_only
                                       else 'repair limit exhausted'})
             or row['protocol_revision'] != state.get('revision')
@@ -220,8 +242,9 @@ def snapshot(store, run_id, kind=KIND):
     publication = json.loads(row['pr_json'] or 'null')
     remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])
     publication_matches = (
-        publication is None and state.get('pull_request') is None and pr is None
-        and not remote and candidate['head'] == spec['base_sha']
+        publication is None and state.get('pull_request') is None
+        and _unpublished_remote_matches(broker, pr, remote)
+        and candidate['head'] == spec['base_sha']
         and all(implementation.get('candidate', {}).get(k) == candidate.get(k)
                 for k in ('id', 'head', 'base_sha', 'content_sha256', 'environment_digest'))
     ) if unpublished else (
@@ -233,7 +256,8 @@ def snapshot(store, run_id, kind=KIND):
     )
     if (any(candidate.get(k) != frozen.get(k) for k in candidate)
             or frozen != state.get('candidate') or not publication_matches
-            or _git(broker.checkout, 'branch', '--show-current') != spec['branch']
+            or _git(broker.checkout, 'branch', '--show-current')
+            != (spec.get('local_branch', spec['branch']) if unpublished else spec['branch'])
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') != spec['origin_url']
             or _git(broker.source, 'remote', 'get-url', 'origin') != spec['origin_url']
             or not broker._changed_paths() <= set(spec['policy']['allowed_paths'])):
@@ -457,9 +481,10 @@ def readback(store, spec, recovery):
     pr = broker._existing_pr()
     unpublished = recovery['kind'] == PREPUBLICATION_KIND
     if unpublished:
-        if (pr is not None or recovery['publication'] is not None
+        remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])
+        if (not _unpublished_remote_matches(broker, pr, remote)
+                or recovery['publication'] is not None
                 or recovery['candidate']['head'] != spec['base_sha']
-                or _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])
                 or not broker._changed_paths() <= set(spec['policy']['allowed_paths'])):
             raise ValueError('gate retry unpublished candidate acquired publication or lost scope')
     elif (not pr or pr['number'] != recovery['publication']['number'] or pr['state'] != 'OPEN'
