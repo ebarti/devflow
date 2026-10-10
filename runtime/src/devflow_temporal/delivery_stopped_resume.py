@@ -77,6 +77,26 @@ def fixed_budget_allows(spec, iteration, iterations):
             and iteration + iterations <= maximum)
 
 
+def pending_repair(seal):
+    """Recover unexecuted work from the sealed admission that requested it."""
+    previous = seal.get('original_recovery') or {}
+    if (not seal.get('session_custody', {}).get('missing_rollout')
+            or previous.get('kind') != KIND
+            or seal['predecessor_spec'].get('feature_worker', {}).get('kind') == 'build'):
+        return None
+    state = previous['state']
+    iteration = state['iteration'] + 1
+    if (previous['execution_spec'] != seal['predecessor_spec']
+            or iteration != seal['state']['iteration'] or iteration <= 0):
+        raise ValueError('unstarted repair differs from its sealed predecessor admission')
+    findings = [state['error'], *[
+        finding for role in state.get('roles', [])
+        if role.get('iteration') == state['iteration']
+        for finding in role.get('findings', [])]]
+    return {'iteration': iteration,
+            'findings': [finding for finding in findings if finding is not None]}
+
+
 def observed_native_cleanup(spec):
     """Preflight and readback observe closure without controlling any process."""
     return digest({'provider': 'fake'} if spec['provider'] == 'fake' else _stopped_cleanup(spec))
@@ -103,6 +123,9 @@ def custody(db, recovery):
             or recovery['maximum_iteration'] != (recovery['state']['iteration']
                                                  + recovery['command']['additional_iterations'])):
         raise ValueError('stopped resume lost its immutable command authority')
+    if ('pending_repair' in recovery
+            and pending_repair(recovery) != recovery['pending_repair']):
+        raise ValueError('stopped resume changed its unstarted repair authority')
     if SCOPE_FIELDS <= recovery['command'].keys():
         scope = recovery['command']
         amended = scope_amendment_config(
@@ -274,6 +297,7 @@ def admit(store, run_id, command, *, preflight=False):
             raise ValueError('command ID already belongs to different inputs')
         return json.loads(prior[1])
     seal = snapshot(store, run_id)
+    pending = pending_repair(seal)
     if (command['expected_revision'] != seal['state']['revision']
             or command['expected_iteration'] != seal['state']['iteration']
             or command['expected_candidate_id'] != seal['candidate']['id']
@@ -321,7 +345,8 @@ def admit(store, run_id, command, *, preflight=False):
         recovery = {**retained, 'kind': KIND, 'command': command, 'command_digest': command_digest,
                     'execution_spec': execution, 'execution_candidate': candidate,
                     'maximum_iteration': maximum,
-                    'predecessor_result_digest': digest(seal['state'])}
+                    'predecessor_result_digest': digest(seal['state']),
+                    **({'pending_repair': pending} if pending else {})}
         workflow_id = 'delivery-' + run_id + '-resume-' + command_digest[:20]
         response = {'run_id': run_id, 'workflow_id': workflow_id,
                     'dashboard_url': store.config.dashboard_url + '/runs/' + run_id,

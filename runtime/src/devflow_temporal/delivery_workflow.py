@@ -1562,13 +1562,17 @@ class DeliveryWorkflow:
                                    start_iteration=recovery['state']['iteration'] + 1,
                                    session=recovery['session_id'],
                                    maximum_iteration=recovery['maximum_iteration'])
+        # This admission flag is absent from older histories. A proven unstarted
+        # repair reuses its existing iteration and shared budget debit.
+        pending = recovery.get('pending_repair')
         return await self._run_iterations(
-            spec, start_iteration=recovery['state']['iteration'] + 1,
+            spec, start_iteration=(pending['iteration'] if pending
+                                   else recovery['state']['iteration'] + 1),
             prior_implementer_session=recovery['session_id'],
-            repair_findings=[recovery['state']['error'], *[
+            repair_findings=(pending['findings'] if pending else [recovery['state']['error'], *[
                 finding for role in recovery['state'].get('roles', [])
                 if role.get('iteration') == recovery['state']['iteration']
-                for finding in role.get('findings', [])]],
+                for finding in role.get('findings', [])]]),
             operator_brief=None, continuation=None, recovery=None,
             authorized_max_iteration=recovery['maximum_iteration'],
             allow_first_session=recovery['session_id'] is None,

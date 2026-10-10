@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from pathlib import Path
@@ -258,3 +259,69 @@ def test_legacy_gate_chain_retains_the_real_policy_session_home(tmp_path):
         )
         == ""
     )
+
+
+def test_unstarted_repair_retains_its_feedback_and_iteration(missing_session, monkeypatch):
+    from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+    store, state, command, spec, attempts, _, _ = missing_session
+    finding = "Retain candidate-bound browser pagination results and page images"
+    assessment = {"role": "verify", "iteration": 0, "status": "findings",
+                  "cleanup": "confirmed", "findings": [finding]}
+    state["roles"].insert(1, assessment)
+    predecessor = copy.deepcopy(state)
+    predecessor["iteration"] = 0
+    predecessor["roles"].pop()
+    prior_command = {**command, "command_id": "prior-resume", "expected_iteration": 0}
+    prior_digest = digest({"run_id": "run-1", **prior_command})
+    previous = {"kind": resume.KIND, "execution_spec": spec, "state": predecessor,
+                "command": prior_command, "command_digest": prior_digest,
+                "maximum_iteration": prior_command["additional_iterations"],
+                "predecessor_result_digest": digest(predecessor)}
+    prior_root = Path(spec["state_dir"]) / "stopped-resumes" / prior_digest
+    private_directory(prior_root)
+    write_private(prior_root / "admission.json", previous)
+    closed = store._completed_temporal_result("run-1")
+    closed["recovery_digest"] = digest(previous)
+    with store._connect() as db:
+        db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                   ("prior-resume", "run-1", prior_digest,
+                    canonical_json({"admission_sha256": digest(previous)})))
+        db.execute("UPDATE delivery_runs SET recovery_json=? WHERE run_id='run-1'",
+                   (canonical_json(previous),))
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda *a, **k: closed)
+    request_path = Path(attempts[-1]["result_path"]).parent / "request.json"
+    request = json.loads(request_path.read_text())
+    request["findings"] = [predecessor["error"], finding]
+    write_private(request_path, request)
+    before = copy.deepcopy(state)
+    store.continue_repair("run-1", command)
+    recovery = saved(store)
+    assert recovery["state"] == before
+    assert resume.readback(store, recovery["execution_spec"], recovery) == {"state": "confirmed"}
+    flow = DeliveryWorkflow()
+    calls = []
+
+    async def confirmed(*_):
+        return True
+
+    async def activity(*_):
+        return {"state": "consistent"}
+
+    async def project(*_):
+        return None
+
+    async def iterations(actual_spec, **kwargs):
+        calls.append(kwargs)
+        return {"outcome": "normal-gates"}
+
+    monkeypatch.setattr(flow, "_confirm_repair_preflight", confirmed)
+    monkeypatch.setattr(flow, "_activity", activity)
+    monkeypatch.setattr(flow, "_project", project)
+    monkeypatch.setattr(flow, "_run_iterations", iterations)
+    result = asyncio.run(flow._resume_stopped(recovery["execution_spec"], recovery))
+    assert result["outcome"] == "normal-gates"
+    assert calls[0]["repair_findings"] == [predecessor["error"], finding]
+    assert calls[0]["start_iteration"] == 1
+    assert calls[0]["authorized_max_iteration"] == 3
+    assert calls[0]["prior_implementer_session"] == "original-implementation"
