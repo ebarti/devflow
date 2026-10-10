@@ -100,7 +100,7 @@ def test_original_admission_authenticates_default_workflow_identity(stopped, mon
 
 
 @pytest.mark.parametrize('drift', ['source', 'scope', 'claim', 'cleanup', 'attempt',
-                                    'remote', 'origin', 'plan', 'candidate', 'finite'])
+                                    'remote', 'origin', 'plan', 'candidate', 'finite', 'zero'])
 def test_public_resume_rejects_unowned_or_unsealed_stop(stopped, drift):
     store, broker, state, command = stopped
     if drift == 'source':
@@ -126,7 +126,7 @@ def test_public_resume_rejects_unowned_or_unsealed_stop(stopped, drift):
     elif drift == 'candidate':
         command['expected_candidate_id'] = 'a' * 64
     else:
-        command['additional_iterations'] = 20
+        command['additional_iterations'] = 0 if drift == 'zero' else 20
     try:
         with pytest.raises(ValueError):
             store.continue_repair('run-1', command)
