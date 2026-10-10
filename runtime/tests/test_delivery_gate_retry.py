@@ -734,3 +734,16 @@ def test_historical_gate_processes_keep_their_frozen_runtime_comparison(tmp_path
             'policy': {'native_identity': {'runtime_payload_sha256': '1' * 64}}}
     assert _consumed_payloads(spec, {'roles': [], 'checks': {
         'prepublish': {'results': [{'native_process': process}]}}}, None) == {'1' * 64}
+
+
+def test_gate_retry_preserves_the_implementation_session_home(unpublished):
+    from devflow_temporal.delivery_sandbox import _native_role_home
+
+    store, _, _, request = unpublished
+    original = store.effective_spec('run-1')
+    prior = _native_role_home({'spec': original, 'role': 'implement', 'iteration': 0})
+    old_review = _native_role_home({'spec': original, 'role': 'review', 'iteration': 1})
+    store.continue_repair('run-1', request)
+    retried = store.effective_spec('run-1')
+    assert _native_role_home({'spec': retried, 'role': 'implement', 'iteration': 1}) == prior
+    assert _native_role_home({'spec': retried, 'role': 'review', 'iteration': 1}) != old_review

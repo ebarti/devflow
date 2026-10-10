@@ -438,9 +438,11 @@ def prepare_native_role(
 
 def _native_role_home(request: dict[str, Any]) -> Path:
     spec = request['spec']
+    generation = spec.get('role_home_generation', '')
+    if request['role'] == 'implement':
+        generation = spec.get('implementation_role_home_generation', generation)
     home = Path(spec['state_dir']) / 'role-homes' / (
-        request['role'] + ('-' + spec['role_home_generation']
-                           if spec.get('role_home_generation') else '')
+        request['role'] + ('-' + generation if generation else '')
     )
     if request['role'] != 'implement':
         home /= str(request['iteration'])

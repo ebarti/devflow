@@ -119,7 +119,7 @@ def effective_spec(store, recovery):
         return custody(db, recovery)
 
 
-def _candidate(broker, state, attempts):
+def _candidate(broker, state, attempts, *, missing_rollout=None):
     candidate = broker.candidate()
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
@@ -145,7 +145,7 @@ def _candidate(broker, state, attempts):
         if len(matches) != 1 and not no_provider:
             raise ValueError('blocked implementation lacks its exact supervisor receipt')
         if latest.get('session_id') is None and not no_provider and (
-                latest.get('finish_reason') != 'prelaunch'):
+                latest.get('finish_reason') != 'prelaunch' and not missing_rollout):
             raise ValueError('blocked implementation has no authenticated launch outcome')
     elif candidate != state.get('candidate'):
         raise ValueError('stopped candidate changed after its sealed checkpoint')
@@ -219,7 +219,11 @@ def snapshot(store, run_id):
                              if spec.get('baseline_checks_version') == 1 else
                              'implementation resume requires an authenticated immutable baseline')
     broker = DeliveryBroker(store, spec)
-    candidate, session = _candidate(broker, state, attempts)
+    from .delivery_session_custody import implementation_custody
+
+    session_custody = implementation_custody(spec, state, attempts, previous)
+    candidate, session = _candidate(
+        broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'))
     publication = state.get('pull_request')
     if publication:
         published_identity(broker, candidate, publication)
@@ -232,7 +236,8 @@ def snapshot(store, run_id):
     return {'predecessor_spec': spec, 'row': row, 'attempts': attempts, 'effects': effects,
             'closed': closed, 'state': state, 'candidate': candidate, 'session_id': session,
             'publication': publication, 'original_recovery': previous,
-            'cleanup_digest': observed_native_cleanup(spec), 'work_binding': binding}
+            'cleanup_digest': observed_native_cleanup(spec), 'work_binding': binding,
+            **({'session_custody': session_custody} if session_custody else {})}
 
 
 def _unpublished_remote(broker):
@@ -308,6 +313,8 @@ def admit(store, run_id, command, *, preflight=False):
         execution['role_home_generation'] = spec.get('role_home_generation', '')
         if not execution['role_home_generation']:
             execution.pop('role_home_generation')
+        if seal.get('session_custody'):
+            execution['implementation_role_home_generation'] = seal['session_custody']['generation']
         candidate = {**seal['candidate'], 'policy_digest': execution['policy_digest']}
         retained = {k: v for k, v in seal.items() if k not in {'row', 'closed'}}
         retained['closed'] = {k: v for k, v in seal['closed'].items() if k != 'result'}
@@ -381,6 +388,14 @@ def readback(store, spec, recovery):
         if attempts != recovery['attempts'] or effects != recovery['effects']:
             raise ValueError('stopped receipt inventory changed before resume')
     predecessor = recovery['predecessor_spec']
+    if recovery.get('session_custody'):
+        from .delivery_session_custody import implementation_custody
+
+        if (implementation_custody(predecessor, recovery['state'], recovery['attempts'],
+                                   recovery['original_recovery']) != recovery['session_custody']
+                or spec.get('implementation_role_home_generation')
+                    != recovery['session_custody']['generation']):
+            raise ValueError('stopped implementation session custody changed before resume')
     if (not store.owns_execution(spec)
             or digest(DeliveryConfig.load(Path(spec['config_path'])).raw) != spec['config_digest']):
         raise ValueError('stopped service configuration or owner changed')

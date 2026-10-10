@@ -380,6 +380,10 @@ def admit(store, run_id, payload, *, preflight=False):
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
         if 'verification_test_paths' in payload:
             execution['verification_test_paths'] = payload['verification_test_paths']
+        from .delivery_session_custody import implementation_generation
+
+        execution['implementation_role_home_generation'] = implementation_generation(
+            spec, seal['previous'])
         execution['role_home_generation'] = (f'report-retry-{generation}'
                                               if seal['stage'] == 'report'
                                               else f'gate-retry-{generation}')
