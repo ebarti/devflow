@@ -18,6 +18,10 @@ def checkpoints(spec):
         values.update({key[len(prefix):]: value for key, value in list(values.items())
                        if key.startswith(prefix)})
     values["integration-pass"] = current
+    if spec.get("feature_plan_revision"):
+        from .delivery_feature_revisions import revision_checkpoints
+
+        values = revision_checkpoints(spec, values)
     return values
 
 
@@ -28,5 +32,9 @@ def checkpoint_key(spec, key):
         current = active["number"] if active else 0
     if current and (key.startswith("verified:") or (
             key.startswith("assignment:") and key.endswith(":chunk"))):
-        return f"pass:{current}:{key}"
+        key = f"pass:{current}:{key}"
+    if spec.get("feature_plan_revision"):
+        from .delivery_feature_revisions import revision_checkpoint_key
+
+        key = revision_checkpoint_key(spec, key)
     return key

@@ -80,7 +80,9 @@ def fixed_budget_allows(spec, iteration, iterations, *, pending=False):
 
 def pending_repair(seal):
     """Recover unexecuted work from the sealed admission that requested it."""
-    previous = seal.get('original_recovery') or {}
+    from .delivery_feature_revision_recovery import retained_recovery
+
+    previous = retained_recovery(seal.get('original_recovery')) or {}
     if (not seal.get('session_custody', {}).get('missing_rollout')
             or previous.get('kind') != KIND
             or seal['predecessor_spec'].get('feature_worker', {}).get('kind') == 'build'):
@@ -108,11 +110,15 @@ def namespace(recovery):
 
 
 def custody(db, recovery):
-    spec = recovery['execution_spec']
+    from .delivery_feature_revision_recovery import retained_recovery
+
+    details = retained_recovery(recovery)
+    spec = details['execution_spec']
     if (spec.get('retry_budget_version') == 1
             and not fixed_budget_allows(spec, recovery['state']['iteration'],
                                         recovery['command']['additional_iterations'],
-                                        pending=bool(recovery.get('pending_repair')))):
+                                        pending=bool(recovery.get('pending_repair')
+                                                     or details.get('resume_stage') == 'checks'))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
     path = Path(spec['state_dir']) / namespace(recovery) / 'admission.json'
     command = db.execute('SELECT request_digest,response_json FROM delivery_commands '
@@ -121,15 +127,24 @@ def custody(db, recovery):
     if (not command or command[0] != recovery['command_digest']
             or json.loads(command[1]).get('admission_sha256') != digest(recovery)
             or canonical_json(read_private(path)) != canonical_json(recovery)
-            or recovery['predecessor_result_digest'] != digest(recovery['state'])
+            or recovery['predecessor_result_digest'] != digest(details['state'])
             or recovery['maximum_iteration'] != (recovery['state']['iteration']
                                                  + recovery['command']['additional_iterations'])):
         raise ValueError('stopped resume lost its immutable command authority')
     if (('pending_repair' in recovery
-             and pending_repair(recovery) != recovery['pending_repair'])
+             and pending_repair(details) != recovery['pending_repair'])
             or (recovery['command']['additional_iterations'] == 0
-                and not recovery.get('pending_repair'))):
+                and not (recovery.get('pending_repair')
+                         or details.get('resume_stage') == 'checks'))):
         raise ValueError('stopped resume changed its unstarted repair authority')
+    if details.get('resume_stage') == 'checks':
+        from .delivery_feature_revision_recovery import gate_evidence
+
+        if (not details.get('feature_plan_revision')
+                or gate_evidence(details) != details.get('gate_evidence')
+                or details.get('resume_iteration') != (details['state']['iteration']
+                    + int(details['command']['additional_iterations'] > 0))):
+            raise ValueError('revision gate resume lost its exact passed implementation evidence')
     if SCOPE_FIELDS <= recovery['command'].keys():
         scope = recovery['command']
         amended = scope_amendment_config(
@@ -143,7 +158,12 @@ def custody(db, recovery):
 
 def effective_spec(store, recovery):
     with store._connect() as db:
-        return custody(db, recovery)
+        spec = custody(db, recovery)
+    if recovery.get('feature_plan_revision'):
+        from .delivery_feature_revision_recovery import retained_recovery, validate_custody
+
+        validate_custody(store, retained_recovery(recovery))
+    return spec
 
 
 def _candidate(broker, state, attempts, *, missing_rollout=None):
@@ -186,7 +206,9 @@ def _candidate(broker, state, attempts, *, missing_rollout=None):
     if not sessions and any(a['role'] == 'implement' and a['session_id'] for a in attempts):
         raise ValueError('unrecorded implementation session exists')
     changed = broker._changed_paths(broker.spec['base_sha'])
-    if changed - set(broker.spec['policy']['allowed_paths']):
+    from .delivery_source_scope import outside_scope
+
+    if outside_scope(broker.spec['policy'], changed, checkout=broker.checkout):
         raise ValueError('stopped source escaped its frozen scope')
     _git(broker.checkout, 'merge-base', '--is-ancestor', broker.spec['base_sha'], candidate['head'])
     if (_git(broker.checkout, 'branch', '--show-current')
@@ -197,7 +219,7 @@ def _candidate(broker, state, attempts, *, missing_rollout=None):
     return candidate, next(iter(sessions), None)
 
 
-def snapshot(store, run_id):
+def snapshot(store, run_id, *, _revision=None):
     spec = store.effective_spec(run_id)
     if spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local':
         raise ValueError('stopped resume preserves an already trusted execution policy')
@@ -212,7 +234,12 @@ def snapshot(store, run_id):
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     stopped = ({'blocked', 'cancelled'} if spec.get('feature_worker') else {'blocked'})
-    expected_execution = 'terminal' if row['outcome'] == 'cancelled' else 'blocked'
+    if _revision is not None:
+        from .delivery_feature_revision_recovery import validate_revision_recovery
+
+        validate_revision_recovery(store, spec, _revision)
+        stopped.add('delivered')
+    expected_execution = 'terminal' if row['outcome'] in {'cancelled', 'delivered'} else 'blocked'
     if (row['phase'] not in stopped or row['outcome'] != row['phase']
             or row['execution_state'] != expected_execution or row['cleanup'] != 'confirmed'
             or state.get('run_id') != run_id or state.get('phase') != row['phase']
@@ -246,9 +273,10 @@ def snapshot(store, run_id):
                              if spec.get('baseline_checks_version') == 1 else
                              'implementation resume requires an authenticated immutable baseline')
     broker = DeliveryBroker(store, spec)
+    from .delivery_feature_revision_recovery import retained_recovery
     from .delivery_session_custody import implementation_custody
 
-    session_custody = implementation_custody(spec, state, attempts, previous)
+    session_custody = implementation_custody(spec, state, attempts, retained_recovery(previous))
     candidate, session = _candidate(
         broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'))
     publication = state.get('pull_request')
@@ -276,7 +304,7 @@ def _unpublished_remote(broker):
         _remote(broker)
 
 
-def admit(store, run_id, command, *, preflight=False):
+def admit(store, run_id, command, *, preflight=False, _revision=None):
     original = store.submitted_spec(run_id)
     allowed = range(0, 101) if original.get('feature_worker') else (0, 1, 2)
     if (not isinstance(command, dict) or set(command) not in (FIELDS, FIELDS | SCOPE_FIELDS)
@@ -300,22 +328,33 @@ def admit(store, run_id, command, *, preflight=False):
         if prior[0] != command_digest:
             raise ValueError('command ID already belongs to different inputs')
         return json.loads(prior[1])
-    seal = snapshot(store, run_id)
-    pending = pending_repair(seal)
+    seal = snapshot(store, run_id, _revision=_revision)
+    gate_only = None
+    if _revision is not None:
+        from .delivery_feature_revision_recovery import gate_only_recovery
+
+        gate_only = gate_only_recovery(store, seal, _revision)
+    pending = None if gate_only else pending_repair(seal)
     if (command['expected_revision'] != seal['state']['revision']
             or command['expected_iteration'] != seal['state']['iteration']
             or command['expected_candidate_id'] != seal['candidate']['id']
             or command['expected_candidate_head'] != seal['candidate']['head']):
         raise ValueError('stopped resume checkpoint is stale')
-    if command['additional_iterations'] == 0 and not pending:
+    if command['additional_iterations'] == 0 and not (pending or gate_only):
         raise ValueError('zero additional iterations require an authenticated pending repair')
     maximum = seal['state']['iteration'] + command['additional_iterations']
     if (original.get('retry_budget_version') == 1
             and not fixed_budget_allows(original, seal['state']['iteration'],
                                         command['additional_iterations'],
-                                        pending=bool(pending))):
+                                        pending=bool(pending or gate_only))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
     amended = scope_spec(store, seal, command)
+    if _revision is not None:
+        from .delivery_feature_revision_recovery import validate_revision_recovery
+
+        if SCOPE_FIELDS <= command.keys():
+            raise ValueError('revision recovery cannot add an unrelated scope amendment')
+        amended = validate_revision_recovery(store, seal['predecessor_spec'], _revision)
     if preflight:
         return {'run_id': run_id, 'preflight': True, 'candidate': seal['candidate'],
                 'authorized_through_iteration': maximum, 'implementation_authority': True,
@@ -333,13 +372,16 @@ def admit(store, run_id, command, *, preflight=False):
                 raise ValueError('command ID already belongs to different inputs')
             return json.loads(prior[1])
         # Recheck all stopped readbacks after lock acquisition, before any native work.
-        if digest(snapshot(store, run_id)) != digest(seal):
+        if digest(snapshot(store, run_id, _revision=_revision)) != digest(seal):
             raise ValueError('stopped checkpoint changed before admission')
         private_directory(root)
         execution = prepare_runtime(amended, root, command_digest, digest(seal))
-        if digest(snapshot(store, run_id)) != digest(seal):
+        if digest(snapshot(store, run_id, _revision=_revision)) != digest(seal):
             raise ValueError('stopped checkpoint changed during runtime preparation')
-        if scope_spec(store, seal, command) != amended:
+        if _revision is not None:
+            if validate_revision_recovery(store, seal['predecessor_spec'], _revision) != amended:
+                raise ValueError('adopted worker derivation changed during runtime preparation')
+        elif scope_spec(store, seal, command) != amended:
             raise ValueError('stopped scope configuration changed during runtime preparation')
         execution['role_home_generation'] = spec.get('role_home_generation', '')
         if not execution['role_home_generation']:
@@ -353,7 +395,15 @@ def admit(store, run_id, command, *, preflight=False):
                     'execution_spec': execution, 'execution_candidate': candidate,
                     'maximum_iteration': maximum,
                     'predecessor_result_digest': digest(seal['state']),
-                    **({'pending_repair': pending} if pending else {})}
+                    **({'feature_plan_revision': _revision} if _revision is not None else {}),
+                    **({'pending_repair': pending} if pending else {}),
+                    **({'resume_stage': 'checks', 'gate_evidence': gate_only,
+                        'resume_iteration': seal['state']['iteration']
+                        + int(command['additional_iterations'] > 0)} if gate_only else {})}
+        if _revision is not None:
+            from .delivery_feature_revision_recovery import compact_recovery
+
+            recovery = compact_recovery(recovery, root)
         workflow_id = 'delivery-' + run_id + '-resume-' + command_digest[:20]
         response = {'run_id': run_id, 'workflow_id': workflow_id,
                     'dashboard_url': store.config.dashboard_url + '/runs/' + run_id,
@@ -402,6 +452,9 @@ def admit(store, run_id, command, *, preflight=False):
 
 
 def readback(store, spec, recovery):
+    from .delivery_feature_revision_recovery import retained_recovery
+
+    details = retained_recovery(recovery)
     with store._connect() as db:
         if custody(db, recovery) != spec:
             raise ValueError('stopped resume execution policy changed')
@@ -417,27 +470,28 @@ def readback(store, spec, recovery):
             'SELECT * FROM delivery_attempts WHERE run_id=? ORDER BY job_key', (spec['run_id'],))]
         effects = [dict(item) for item in db.execute(
             'SELECT * FROM delivery_effects WHERE run_id=? ORDER BY effect_key', (spec['run_id'],))]
-        if attempts != recovery['attempts'] or effects != recovery['effects']:
+        if attempts != details['attempts'] or effects != details['effects']:
             raise ValueError('stopped receipt inventory changed before resume')
-    predecessor = recovery['predecessor_spec']
+    predecessor = details['predecessor_spec']
     if recovery.get('session_custody'):
         from .delivery_session_custody import implementation_custody
 
-        if (implementation_custody(predecessor, recovery['state'], recovery['attempts'],
-                                   recovery['original_recovery']) != recovery['session_custody']
+        observed = implementation_custody(predecessor, details['state'], details['attempts'],
+                                           retained_recovery(details['original_recovery']))
+        if (observed != recovery['session_custody']
                 or spec.get('implementation_role_home_generation')
                     != recovery['session_custody']['generation']):
             raise ValueError('stopped implementation session custody changed before resume')
     if (not store.owns_execution(spec)
             or digest(DeliveryConfig.load(Path(spec['config_path'])).raw) != spec['config_digest']):
         raise ValueError('stopped service configuration or owner changed')
-    if observed_native_cleanup(predecessor) != recovery['cleanup_digest']:
+    if observed_native_cleanup(predecessor) != details['cleanup_digest']:
         raise ValueError('stopped predecessor process ownership changed')
     broker = DeliveryBroker(store, spec)
     if broker.candidate() != recovery['execution_candidate']:
         raise ValueError('stopped source changed before resume')
-    if recovery['publication']:
-        published_identity(broker, recovery['execution_candidate'], recovery['publication'])
+    if details['publication']:
+        published_identity(broker, recovery['execution_candidate'], details['publication'])
     else:
         _unpublished_remote(broker)
     return {'state': 'confirmed'}

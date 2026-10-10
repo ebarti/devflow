@@ -22,6 +22,7 @@ from .delivery_config import publication_base_ref
 from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
 from .delivery_output import observed_test_count, rejection_causes, visible_output
 from .delivery_publication import conventional, publication_summary
+from .delivery_source_scope import outside_scope, require_authorized
 from .delivery_store import DeliveryStore, _now
 
 
@@ -262,9 +263,8 @@ class DeliveryBroker:
         old = Path(recovery["source_path"])
         if not old.is_dir() or _git(old, "rev-parse", "--show-toplevel") != str(old):
             raise ValueError("configured recovery source is unavailable")
-        owned = set(self.spec["policy"].get("allowed_paths", []))
         selected = set(recovery["paths"])
-        if not selected or not selected <= owned:
+        if not selected or outside_scope(self.spec["policy"], selected):
             raise ValueError("recovery paths exceed the admitted source scope")
         expected_base = recovery.get("base_sha")
         if (
@@ -368,7 +368,7 @@ class DeliveryBroker:
 
     def validate_candidate_scope(self) -> set[str]:
         changed = self._changed_paths(self.spec['base_sha'], include_index=True)
-        escaped = changed - set(self.spec['policy'].get('allowed_paths', []))
+        escaped = outside_scope(self.spec['policy'], changed, checkout=self.checkout)
         if escaped:
             raise ValueError(
                 'candidate changed outside allowed paths: ' + ', '.join(sorted(escaped))
@@ -520,6 +520,25 @@ class DeliveryBroker:
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec)
+        from .delivery_feature_gates import (
+            GateAdmissionError,
+            bind_selector_report,
+            resolve_required_selectors,
+            retain_admission_failure,
+            retained_junit,
+            selector_evidence,
+        )
+
+        selected_sources = {}
+        for recipe in checks:
+            try:
+                selected_sources[recipe["id"]] = resolve_required_selectors(
+                    recipe, checkout, spec=self.spec)
+            except GateAdmissionError as exc:
+                return retain_admission_failure(
+                    self.spec, recipe, evidence_dir / recipe["id"], candidate, exc)
+        checks = [bind_selector_report(recipe, evidence_dir / recipe["id"])
+                  for recipe in checks]
         if self.spec['provider'] == 'codex' and any('/store' in c['argv'] for c in checks):
             from .delivery_native_dependencies import frozen_native_projects
 
@@ -676,6 +695,16 @@ class DeliveryBroker:
                         raise ValueError('required JUnit report records failed test cases')
                 except (ValueError, OSError) as exc:
                     evidence_failure = str(exc)
+            selector_receipts = None
+            if selected_sources.get(check["id"]):
+                try:
+                    if not check_evidence:
+                        raise ValueError("required per-selector JUnit report was not retained")
+                    selector_receipts = selector_evidence(
+                        check, checkout, selected_sources[check["id"]],
+                        junit=retained_junit(check_evidence, candidate["id"], self.state_dir))
+                except (ValueError, OSError) as exc:
+                    evidence_failure = str(exc)
             rejected_causes = rejection_causes(
                 parsed_output, [check["reject_regex"]] if check.get("reject_regex") else [],
                 test_results=check.get("kind") == "test",
@@ -695,6 +724,7 @@ class DeliveryBroker:
                     "exit_code": exit_code,
                     "test_count": count,
                     **({"junit": junit} if junit is not None else {}),
+                    **({"selectors": selector_receipts} if selector_receipts is not None else {}),
                     "rejected_output": rejected_output,
                     "rejection_causes": rejected_causes,
                     "passed": passed,
@@ -1414,11 +1444,7 @@ class DeliveryBroker:
         if before["id"] != input_candidate["id"] and self._changed_paths(include_index=True):
             raise RuntimeError("candidate changed during publication recovery")
         changed = self._changed_paths(include_index=True)
-        allowed = set(self.spec["policy"].get("allowed_paths", []))
-        if changed - allowed:
-            raise ValueError(
-                "candidate changed outside allowed paths: " + ", ".join(sorted(changed - allowed))
-            )
+        require_authorized(self.spec["policy"], changed, checkout=self.checkout)
         existing = self._existing_pr()
         if changed:
             author = _git(self.checkout, "var", "GIT_AUTHOR_IDENT").rsplit(" ", 2)[0]

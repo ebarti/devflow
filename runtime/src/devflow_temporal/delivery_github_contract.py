@@ -17,11 +17,24 @@ from urllib.parse import quote, urlsplit
 
 from .contracts import canonical_json, digest
 from .delivery_execution_registry import OwnershipConflict, UnresolvedEffect
+from .delivery_plan_model import (
+    _text,
+    compact_plan,
+    index_chunks,
+    ordered_chunks,
+    plan_version,
+    validate_plan,
+    validate_plan_index,
+)
 
 MARKER = "<!-- devflow-delivery:v1 -->"
+MARKER_V2 = "<!-- devflow-delivery:v2 -->"
 LABEL_PREFIX = "devflow-plan-"
 IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# Bound v2 GitHub identities so intake can be admitted before remote allocation.
+GITHUB_ID_MAX = 10**32 - 1
+GITHUB_NODE_MAX = 128
 
 
 class GitHubContractError(RuntimeError):
@@ -52,181 +65,59 @@ def issue_identity(url: str, repository: str) -> tuple[str, int]:
     return "/".join(parts[:2]), int(parts[3])
 
 
-def _text(value, label, maximum=8192):
-    if not isinstance(value, str) or not value.strip() or len(value) > maximum or "\x00" in value:
-        raise ValueError(label + " must be nonempty bounded text")
+def wire_manifest(manifest: dict) -> dict:
+    """The expanded in-memory plan must never be serialized on a v2 parent."""
+    value = deepcopy(manifest)
+    if value.get("version") == 2:
+        plan = value["plan"]
+        if (not isinstance(plan, dict) or not isinstance(plan.get("workstreams"), list)
+                or any(not isinstance(stream, dict) or not isinstance(stream.get("chunks"), list)
+                       for stream in plan["workstreams"])):
+            raise ValueError("v2 parent index requires structured workstreams")
+        chunks = [chunk for stream in plan["workstreams"] for chunk in stream["chunks"]]
+        if any(not isinstance(chunk, dict) for chunk in chunks):
+            raise ValueError("v2 parent index requires structured chunks")
+        if chunks and "scope" in chunks[0]:
+            if digest(validate_plan(value["plan"])) != value["plan_digest"]:
+                raise OwnershipConflict("assembled plan differs from the recorded plan digest")
+            value["plan"] = compact_plan(value["plan"])
+        else:
+            validate_plan_index(value["plan"])
     return value
 
 
-def _strings(value, label, maximum=64):
-    if not isinstance(value, list) or not 1 <= len(value) <= maximum:
-        raise ValueError(label + " must be a bounded nonempty list")
-    return [_text(item, label) for item in value]
-
-
-def validate_plan(value: dict, *, allowed_paths: list[str] | None = None) -> dict:
-    """Validate business decomposition without accepting new execution authority."""
-    if not isinstance(value, dict) or set(value) != {"scope", "acceptance", "workstreams"}:
-        raise ValueError("delivery plan requires scope, acceptance and workstreams")
-    _text(value["scope"], "feature scope")
-    _strings(value["acceptance"], "feature acceptance")
-    streams = value["workstreams"]
-    if not isinstance(streams, list) or not 1 <= len(streams) <= 16:
-        raise ValueError("delivery plan requires between one and sixteen workstreams")
-    stream_ids, chunks = set(), {}
-    issue_numbers = set()
-    required_stream = {"id", "title", "issue_number", "acceptance", "chunks"}
-    required_chunk = {
-        "id",
-        "title",
-        "scope",
-        "steps",
-        "verification",
-        "acceptance",
-        "allowed_paths",
-        "depends_on",
-    }
-    for stream in streams:
-        if not isinstance(stream, dict) or set(stream) != required_stream:
-            raise ValueError("workstream fields do not match the delivery contract")
-        ident = stream["id"]
-        if not isinstance(ident, str) or not IDENTIFIER.fullmatch(ident) or ident in stream_ids:
-            raise ValueError("workstream ID is invalid or duplicated")
-        stream_ids.add(ident)
-        _text(stream["title"], "workstream title", 200)
-        _strings(stream["acceptance"], "workstream acceptance")
-        number = stream["issue_number"]
-        if number is not None and (type(number) is not int or number < 1):
-            raise ValueError("workstream issue number must be positive or null")
-        if number is not None:
-            if number in issue_numbers:
-                raise ValueError("a sub-issue can own only one workstream")
-            issue_numbers.add(number)
-        if not isinstance(stream["chunks"], list) or not 1 <= len(stream["chunks"]) <= 32:
-            raise ValueError("workstream requires a bounded nonempty chunk list")
-        previous = None
-        for chunk in stream["chunks"]:
-            if not isinstance(chunk, dict) or set(chunk) != required_chunk:
-                raise ValueError("chunk fields do not match the delivery contract")
-            key = chunk["id"]
-            if not isinstance(key, str) or not IDENTIFIER.fullmatch(key) or key in chunks:
-                raise ValueError("chunk ID is invalid or duplicated")
-            for field in ("title", "scope"):
-                _text(chunk[field], "chunk " + field, 200 if field == "title" else 8192)
-            for field in ("steps", "verification", "acceptance", "allowed_paths"):
-                _strings(chunk[field], "chunk " + field)
-            paths = chunk["allowed_paths"]
-            if len(set(paths)) != len(paths):
-                raise ValueError("chunk paths must be unique")
-            for path in paths:
-                if (
-                    path.startswith("/")
-                    or "\\" in path
-                    or ".." in path.split("/")
-                    or any(part in {".git", ".codex", ".agents"} for part in path.split("/"))
-                    or path in {"", "."}
-                ):
-                    raise ValueError("chunk path is outside an owned source scope")
-            if allowed_paths is not None and set(paths) - set(allowed_paths):
-                raise ValueError("delivery plan exceeds the configured source scope")
-            dependencies = chunk["depends_on"]
-            if (
-                not isinstance(dependencies, list)
-                or len(dependencies) > 32
-                or any(not isinstance(item, str) for item in dependencies)
-                or len(set(dependencies)) != len(dependencies)
-                or key in dependencies
-            ):
-                raise ValueError("chunk dependencies are invalid")
-            if previous and previous not in dependencies:
-                raise ValueError("chunks in a workstream must declare their sequential dependency")
-            chunks[key] = chunk
-            previous = key
-    if len(chunks) > 32:
-        raise ValueError("feature exceeds the thirty-two chunk bound")
-    for chunk in chunks.values():
-        if set(chunk["depends_on"]) - chunks.keys():
-            raise ValueError("chunk depends on an unknown feature chunk")
-    ready = set()
-    while len(ready) < len(chunks):
-        next_items = {
-            key
-            for key, chunk in chunks.items()
-            if key not in ready and set(chunk["depends_on"]) <= ready
-        }
-        if not next_items:
-            raise ValueError("chunk dependency graph contains a cycle")
-        ready |= next_items
-    return deepcopy(value)
-
-
-def ordered_chunks(plan: dict) -> list[dict]:
-    """A stable topological order; independent work can build concurrently."""
-    validate_plan(plan)
-    pending = [
-        {**chunk, "workstream_id": stream["id"], "issue_number": stream["issue_number"]}
-        for stream in plan["workstreams"]
-        for chunk in stream["chunks"]
-    ]
-    done, result = set(), []
-    while pending:
-        selected = next(chunk for chunk in pending if set(chunk["depends_on"]) <= done)
-        result.append(selected)
-        done.add(selected["id"])
-        pending.remove(selected)
-    return result
-
-
-def validate_manifest(value: dict, issue: dict) -> dict:
-    if (
-        not isinstance(value, dict)
-        or set(value)
-        != {
-            "version",
-            "issue_id",
-            "repository_id",
-            "revision",
-            "creation_key",
-            "plan",
-            "workstream_issues",
-            "publication",
-        }
-        or type(value["version"]) is not int
-        or value["version"] != 1
-        or value["issue_id"] != issue["id"]
-        or value["repository_id"] != issue["repository_id"]
-        or type(value["revision"]) is not int
-        or value["revision"] < 1
-    ):
-        raise ValueError("GitHub delivery record has a different identity or schema")
-    _text(value["creation_key"], "creation key", 128)
-    plan = validate_plan(value["plan"])
-    streams = {stream["id"] for stream in plan["workstreams"]}
-    bindings = value["workstream_issues"]
-    if not isinstance(bindings, dict) or bindings.keys() - streams:
-        raise ValueError("workstream issue binding is invalid")
+def _validate_bindings(value, issue, plan, *, complete=False):
     owners = {stream["id"]: stream["issue_number"] for stream in plan["workstreams"]}
+    bindings = value["workstream_issues"]
+    if (not isinstance(bindings, dict) or bindings.keys() - owners.keys()
+            or (complete and bindings.keys() != owners.keys())):
+        raise ValueError("workstream issue binding is invalid")
     bound_ids, bound_numbers = set(), set()
     for stream_id, binding in bindings.items():
-        if (
-            not isinstance(binding, dict)
-            or set(binding) != {"id", "number", "url"}
-            or not isinstance(binding["id"], str)
-            or not binding["id"]
-            or type(binding["number"]) is not int
-            or binding["number"] < 1
-        ):
+        if (not isinstance(binding, dict) or set(binding) != {"id", "number", "url"}
+                or not isinstance(binding["id"], str) or not binding["id"]
+                or type(binding["number"]) is not int or binding["number"] < 1):
             raise ValueError("workstream binding requires an exact GitHub issue")
         _, number = issue_identity(binding["url"], issue["repository"])
+        if complete and (number > GITHUB_ID_MAX or len(binding["id"]) > GITHUB_NODE_MAX
+                         or binding["url"].casefold() != (
+                             f"https://github.com/{issue['repository']}/issues/{number}".casefold())):
+            raise ValueError("v2 workstream binding exceeds its bounded GitHub identity")
         if number != binding["number"]:
             raise ValueError("workstream issue number differs from its URL")
         if owners[stream_id] is not None and number != owners[stream_id]:
             raise OwnershipConflict("workstream binding differs from the accepted issue")
+        if complete and owners[stream_id] != number:
+            raise OwnershipConflict("v2 workstream issue must be resolved in the published plan")
         if (binding["id"] == issue["id"] or binding["id"] in bound_ids
                 or number == issue["number"] or number in bound_numbers):
             raise OwnershipConflict("workstreams require distinct child issue identities")
         bound_ids.add(binding["id"])
         bound_numbers.add(number)
+    return bindings
+
+
+def _validate_publication(value, issue, chunks, bindings):
     publication = value["publication"]
     if not isinstance(publication, dict) or set(publication) != {"stack_id", "members"}:
         raise ValueError("publication requires an explicit stack and member list")
@@ -234,35 +125,34 @@ def validate_manifest(value: dict, issue: dict) -> dict:
     if stack_id is not None and (type(stack_id) is not int or stack_id < 1):
         raise ValueError("remote stack identity is invalid")
     members = publication["members"]
-    ordered = [chunk["id"] for chunk in ordered_chunks(plan)]
-    if not isinstance(members, list) or len(members) > len(ordered):
+    if not isinstance(members, list) or len(members) > len(chunks):
         raise ValueError("publication exceeds the accepted feature plan")
+    fields = {"chunk_id", "number", "url", "branch", "head", "base_branch"}
+    if value["version"] == 2:
+        fields |= {"workstream_id", "issue_id", "issue_number", "issue_url"}
     numbers, branches = set(), set()
     for index, member in enumerate(members):
-        if (
-            not isinstance(member, dict)
-            or set(member) != {"chunk_id", "number", "url", "branch", "head", "base_branch"}
-            or member["chunk_id"] != ordered[index]
-            or type(member["number"]) is not int
-            or member["number"] < 1
-            or not isinstance(member["branch"], str)
-            or not isinstance(member["url"], str)
-            or not isinstance(member["head"], str)
-            or member["number"] in numbers
-            or member["branch"] in branches
-            or member["url"].casefold()
-            != (f"https://github.com/{issue['repository']}/pull/{member['number']}".casefold())
-            or not SHA.fullmatch(member["head"])
-        ):
+        if (not isinstance(member, dict) or set(member) != fields
+                or member["chunk_id"] != chunks[index]["id"]
+                or type(member["number"]) is not int or member["number"] < 1
+                or not isinstance(member["branch"], str) or not isinstance(member["url"], str)
+                or not isinstance(member["head"], str) or member["number"] in numbers
+                or member["branch"] in branches
+                or member["url"].casefold()
+                != f"https://github.com/{issue['repository']}/pull/{member['number']}".casefold()
+                or not SHA.fullmatch(member["head"])):
             raise ValueError("publication is not the unique ordered feature PR prefix")
+        if value["version"] == 2:
+            stream_id = chunks[index]["workstream_id"]
+            child = bindings[stream_id]
+            if (member["workstream_id"] != stream_id or member["issue_id"] != child["id"]
+                    or member["issue_number"] != child["number"]
+                    or member["issue_url"] != child["url"]):
+                raise OwnershipConflict("publication child ownership differs from its chunk")
         for branch in (member["branch"], member["base_branch"]):
-            if (
-                not isinstance(branch, str)
-                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", branch)
-                or ".." in branch
-                or branch.endswith("/")
-                or branch.endswith(".lock")
-            ):
+            if (not isinstance(branch, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", branch)
+                    or ".." in branch or branch.endswith("/") or branch.endswith(".lock")):
                 raise ValueError("publication branch is invalid")
         if index and member["base_branch"] != members[index - 1]["branch"]:
             raise ValueError("publication PRs do not form the recorded stack")
@@ -270,21 +160,79 @@ def validate_manifest(value: dict, issue: dict) -> dict:
         branches.add(member["branch"])
     if bool(stack_id) != (len(members) > 1):
         raise ValueError("multiple publications require their explicit GitHub stack identity")
+
+
+def validate_manifest(value: dict, issue: dict) -> dict:
+    base_fields = {"version", "issue_id", "repository_id", "revision", "creation_key", "plan",
+                   "workstream_issues", "publication"}
+    if (not isinstance(value, dict) or type(value.get("version")) is not int
+            or value["version"] not in {1, 2}
+            or set(value) != (base_fields if value["version"] == 1 else
+                              base_fields | {"plan_revision", "plan_digest", "workstream_plans"})
+            or value["issue_id"] != issue["id"] or value["repository_id"] != issue["repository_id"]
+            or type(value["revision"]) is not int or value["revision"] < 1):
+        raise ValueError("GitHub delivery record has a different identity or schema")
+    _text(value["creation_key"], "creation key", 128)
+    if value["version"] == 1:
+        plan = validate_plan(value["plan"])
+        if plan_version(plan) != 1:
+            raise ValueError("v1 record must retain its legacy plan")
+        chunks = ordered_chunks(plan)
+    else:
+        if (type(value["plan_revision"]) is not int or value["plan_revision"] < 1
+                or not isinstance(value["plan_digest"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", value["plan_digest"])):
+            raise ValueError("v2 record requires an exact plan revision and digest")
+        plan = wire_manifest(value)["plan"]
+        chunks = index_chunks(plan)
+    bindings = _validate_bindings(value, issue, plan, complete=value["version"] == 2)
+    if value["version"] == 2:
+        refs = value["workstream_plans"]
+        if not isinstance(refs, dict) or refs.keys() != bindings.keys():
+            raise ValueError("v2 parent requires every exact child-plan comment")
+        comment_ids = set()
+        for stream_id, ref in refs.items():
+            if (not isinstance(ref, dict)
+                    or set(ref) != {"comment_id", "comment_node_id", "digest", "url"}
+                    or type(ref["comment_id"]) is not int
+                    or not 1 <= ref["comment_id"] <= GITHUB_ID_MAX
+                    or ref["comment_id"] in comment_ids
+                    or not isinstance(ref["comment_node_id"], str) or not ref["comment_node_id"]
+                    or len(ref["comment_node_id"]) > GITHUB_NODE_MAX
+                    or not isinstance(ref["digest"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", ref["digest"])
+                    or ref["url"] != bindings[stream_id]["url"]
+                    + f"#issuecomment-{ref['comment_id']}"):
+                raise ValueError("child-plan reference requires immutable "
+                                 "comment identity and digest")
+            comment_ids.add(ref["comment_id"])
+    _validate_publication(value, issue, chunks, bindings)
     return deepcopy(value)
 
 
 def encode_manifest(manifest: dict) -> str:
-    plan = manifest["plan"]
+    value = wire_manifest(manifest)
+    plan = value["plan"]
     lines = ["## Delivery plan", "", plan["scope"], "", "Acceptance criteria:"]
     lines.extend("- " + item for item in plan["acceptance"])
+    if value["version"] == 2:
+        lines.extend(["", f"Plan revision: {value['plan_revision']}", "", "Workstream plans:"])
+        for stream in plan["workstreams"]:
+            ref = value["workstream_plans"][stream["id"]]
+            lines.append(f"- [{stream['title']}]({ref['url']}) (#{stream['issue_number']})")
+        chunks = index_chunks(plan)
+    else:
+        chunks = ordered_chunks(plan)
     lines.extend(["", "Delivery chunks:"])
-    for chunk in ordered_chunks(plan):
-        lines.append(f"- **{chunk['title']}** ({chunk['id']})")
-    members = manifest["publication"]["members"]
+    for chunk in chunks:
+        dependencies = ", ".join(chunk["depends_on"]) or "none"
+        lines.append(f"- **{chunk['title']}** ({chunk['id']}); prerequisites: {dependencies}")
+    members = value["publication"]["members"]
     if members:
         lines.extend(["", "Published changes:"])
         lines.extend(f"- {member['url']}" for member in members)
-    lines.extend(["", MARKER, "```json", canonical_json(manifest), "```", ""])
+    marker = MARKER if value["version"] == 1 else MARKER_V2
+    lines.extend(["", marker, "```json", canonical_json(value), "```", ""])
     body = "\n".join(lines)
     if len(body.encode()) > 60000:
         raise ValueError("delivery plan exceeds the GitHub comment limit")
@@ -292,12 +240,19 @@ def encode_manifest(manifest: dict) -> str:
 
 
 def decode_manifest(body: str, issue: dict) -> dict:
-    if not isinstance(body, str) or body.count(MARKER) != 1 or len(body.encode()) > 60000:
+    if not isinstance(body, str) or len(body.encode()) > 60000:
         raise ValueError("GitHub delivery comment lacks its unique record")
-    encoded = body.split(MARKER, 1)[1].strip()
+    markers = [marker for marker in (MARKER, MARKER_V2) if marker in body]
+    if len(markers) != 1 or body.count(markers[0]) != 1:
+        raise ValueError("GitHub delivery comment lacks its unique record")
+    marker = markers[0]
+    encoded = body.split(marker, 1)[1].strip()
     if not encoded.startswith("```json\n") or not encoded.endswith("\n```"):
         raise ValueError("GitHub delivery record is malformed")
-    return validate_manifest(json.loads(encoded[8:-4]), issue)
+    value = json.loads(encoded[8:-4])
+    if not isinstance(value, dict) or value.get("version") != (1 if marker == MARKER else 2):
+        raise ValueError("GitHub delivery marker and schema disagree")
+    return validate_manifest(value, issue)
 
 
 class GitHubDelivery:
@@ -397,15 +352,24 @@ class GitHubDelivery:
             or not record.get("node_id")
         ):
             raise OwnershipConflict("delivery comment belongs to a different issue")
-        return {
+        saved = {
             "comment_id": comment_id,
             "comment_node_id": record["node_id"],
             "manifest": decode_manifest(record["body"], issue),
         }
+        if saved["manifest"]["version"] == 2:
+            from .delivery_github_plans import hydrate_record
+
+            return hydrate_record(self, issue, saved)
+        return saved
 
     def initialize(self, issue: dict, plan: dict, registry, token: dict) -> dict:
         """Publish the plan without modifying the human-owned issue description."""
         validate_plan(plan)
+        if plan_version(plan) == 2:
+            from .delivery_github_plans import initialize_v2
+
+            return initialize_v2(self, issue, plan, registry, token)
         key = "github-plan:" + digest({"issue": issue["id"], "plan": plan})
         manifest = {
             "version": 1,
@@ -514,8 +478,14 @@ class GitHubDelivery:
             manifest["revision"] != old["revision"] + 1
             or manifest["plan"] != old["plan"]
             or manifest["creation_key"] != old["creation_key"]
+            or manifest["version"] != old["version"]
+            or any(manifest.get(key) != old.get(key)
+                   for key in ("plan_revision", "plan_digest", "workstream_plans"))
+            or (old["version"] == 2
+                and manifest["workstream_issues"] != old["workstream_issues"])
         ):
             raise OwnershipConflict("publication update changed its accepted business plan")
+        old_wire, new_wire = wire_manifest(old), wire_manifest(manifest)
         endpoint = f"repos/{issue['repository']}/issues/comments/{record['comment_id']}"
         body = encode_manifest(manifest)
         key = f"github-record:{record['comment_id']}:{manifest['revision']}"
@@ -525,23 +495,32 @@ class GitHubDelivery:
                 key,
                 "github_record",
                 {
-                    "before": digest(old),
-                    "after": digest(manifest),
+                    "before": digest(old_wire),
+                    "after": digest(new_wire),
                     "comment_id": record["comment_id"],
                 },
             )
             current = self.api(endpoint)
             saved = decode_manifest(current["body"], issue)
-            if saved != manifest:
-                if saved != old:
+            from .delivery_github_plans import authenticate_comment, verify_parent_binding
+
+            if old["version"] == 2:
+                verify_parent_binding(self, issue, record)
+            authenticate_comment(current, issue, record)
+            if saved != new_wire:
+                if saved != old_wire:
                     raise OwnershipConflict("GitHub delivery record changed before integration")
                 if not receipt["fresh"]:
                     raise UnresolvedEffect("original delivery record update is unresolved")
                 self.api(endpoint, method="PATCH", body={"body": body})
-                saved = decode_manifest(self.api(endpoint)["body"], issue)
-            if saved != manifest:
+                current = self.api(endpoint)
+                authenticate_comment(current, issue, record)
+                saved = decode_manifest(current["body"], issue)
+            if saved != new_wire:
                 raise OwnershipConflict("GitHub delivery record readback differs from integration")
             registry.finish_effect(token, key, {"digest": digest(saved)})
+            if saved["version"] == 2:
+                return self.load_record(issue, record)
             return {**record, "manifest": saved}
 
     def reconcile_record(self, issue, record, registry, token):
@@ -551,86 +530,93 @@ class GitHubDelivery:
                 "SELECT effect_key,request_json FROM execution_effects WHERE issue_id=? "
                 "AND kind='github_record' AND state='pending'", (issue["id"],),
             )]
-        observed = digest(record["manifest"])
+        observed = digest(wire_manifest(record["manifest"]))
         for receipt in pending:
             request = json.loads(receipt["request_json"])
             if request["comment_id"] != record["comment_id"] or request["after"] != observed:
                 raise UnresolvedEffect("recorded GitHub update does not match current readback")
             registry.finish_effect(token, receipt["effect_key"], {"digest": observed})
 
+    def _resolve_workstream(self, issue, stream, existing, registry, token):
+        """Resolve one exact child under the caller's registry mutation lock."""
+        key = "workstream:" + stream["id"]
+        if existing:
+            if stream["issue_number"] and stream["issue_number"] != existing["number"]:
+                raise OwnershipConflict("recorded workstream differs from accepted issue")
+            child = self.issue(
+                issue["repository"], existing["number"], issue["repository_id"]
+            )
+            if child["id"] != existing["id"]:
+                raise OwnershipConflict("recorded sub-issue identity changed")
+        elif stream["issue_number"]:
+            child = self.issue(
+                issue["repository"], stream["issue_number"], issue["repository_id"]
+            )
+        else:
+            body = (
+                stream["title"]
+                + "\n\nAcceptance:\n"
+                + "\n".join("- " + item for item in stream["acceptance"])
+                + f"\n\n<!-- devflow-workstream:{issue['id']}:{stream['id']} -->\n"
+            )
+            receipt = registry.intent(
+                token, key, "github_workstream", {"title": stream["title"], "body": body}
+            )
+            if receipt["state"] == "complete":
+                number = receipt["result"]["number"]
+            elif receipt["fresh"]:
+                raw = self.api(
+                    f"repos/{issue['repository']}/issues",
+                    method="POST",
+                    body={"title": stream["title"], "body": body},
+                )
+                number = raw["number"]
+            else:
+                # Exact creation-operation recovery, never generic PR discovery.
+                matches = [
+                    item
+                    for item in self.pages(f"repos/{issue['repository']}/issues?state=all")
+                    if item.get("body") == body and not item.get("pull_request")
+                ]
+                if len(matches) != 1:
+                    raise UnresolvedEffect("original workstream creation is unresolved")
+                number = matches[0]["number"]
+            child = self.issue(issue["repository"], number, issue["repository_id"])
+            registry.finish_effect(token, key, {"number": number, "id": child["id"]})
+        if child["id"] == issue["id"]:
+            raise OwnershipConflict("feature cannot be its own workstream")
+        parent_path = f"repos/{issue['repository']}/issues/{child['number']}/parent"
+        parent = self.optional(parent_path)
+        link = registry.intent(
+            token,
+            key + ":parent",
+            "github_subissue",
+            {"parent": issue["id"], "child": child["id"], "child_number": child["number"]},
+        )
+        if parent is None:
+            if not link["fresh"]:
+                raise UnresolvedEffect("original sub-issue linkage is unresolved")
+            self.api(
+                f"repos/{issue['repository']}/issues/{issue['number']}/sub_issues",
+                method="POST",
+                body={"sub_issue_id": child["database_id"]},
+            )
+            parent = self.api(parent_path)
+        if parent["node_id"] != issue["id"]:
+            raise OwnershipConflict("workstream belongs to another feature")
+        registry.finish_effect(
+            token, key + ":parent", {"child": child["id"], "parent": issue["id"]}
+        )
+        return child
+
     def workstreams(self, issue, record, registry, token):
         """Create or adopt exactly the plan's sub-issues, then bind their IDs."""
+        if record["manifest"]["version"] == 2:
+            return self.load_record(issue, record)
         for stream in record["manifest"]["plan"]["workstreams"]:
             existing = record["manifest"]["workstream_issues"].get(stream["id"])
-            key = "workstream:" + stream["id"]
             with registry.mutation(token):
-                if existing:
-                    if stream["issue_number"] and stream["issue_number"] != existing["number"]:
-                        raise OwnershipConflict("recorded workstream differs from accepted issue")
-                    child = self.issue(
-                        issue["repository"], existing["number"], issue["repository_id"]
-                    )
-                    if child["id"] != existing["id"]:
-                        raise OwnershipConflict("recorded sub-issue identity changed")
-                elif stream["issue_number"]:
-                    child = self.issue(
-                        issue["repository"], stream["issue_number"], issue["repository_id"]
-                    )
-                else:
-                    body = (
-                        stream["title"]
-                        + "\n\nAcceptance:\n"
-                        + "\n".join("- " + item for item in stream["acceptance"])
-                        + f"\n\n<!-- devflow-workstream:{issue['id']}:{stream['id']} -->\n"
-                    )
-                    receipt = registry.intent(
-                        token, key, "github_workstream", {"title": stream["title"], "body": body}
-                    )
-                    if receipt["state"] == "complete":
-                        number = receipt["result"]["number"]
-                    elif receipt["fresh"]:
-                        raw = self.api(
-                            f"repos/{issue['repository']}/issues",
-                            method="POST",
-                            body={"title": stream["title"], "body": body},
-                        )
-                        number = raw["number"]
-                    else:
-                        # Exact creation-operation recovery, never generic PR discovery.
-                        matches = [
-                            item
-                            for item in self.pages(f"repos/{issue['repository']}/issues?state=all")
-                            if item.get("body") == body and not item.get("pull_request")
-                        ]
-                        if len(matches) != 1:
-                            raise UnresolvedEffect("original workstream creation is unresolved")
-                        number = matches[0]["number"]
-                    child = self.issue(issue["repository"], number, issue["repository_id"])
-                    registry.finish_effect(token, key, {"number": number, "id": child["id"]})
-                if child["id"] == issue["id"]:
-                    raise OwnershipConflict("feature cannot be its own workstream")
-                parent_path = f"repos/{issue['repository']}/issues/{child['number']}/parent"
-                parent = self.optional(parent_path)
-                link = registry.intent(
-                    token,
-                    key + ":parent",
-                    "github_subissue",
-                    {"parent": issue["id"], "child": child["id"], "child_number": child["number"]},
-                )
-                if parent is None:
-                    if not link["fresh"]:
-                        raise UnresolvedEffect("original sub-issue linkage is unresolved")
-                    self.api(
-                        f"repos/{issue['repository']}/issues/{issue['number']}/sub_issues",
-                        method="POST",
-                        body={"sub_issue_id": child["database_id"]},
-                    )
-                    parent = self.api(parent_path)
-                if parent["node_id"] != issue["id"]:
-                    raise OwnershipConflict("workstream belongs to another feature")
-                registry.finish_effect(
-                    token, key + ":parent", {"child": child["id"], "parent": issue["id"]}
-                )
+                child = self._resolve_workstream(issue, stream, existing, registry, token)
             binding = {field: child[field] for field in ("id", "number", "url")}
             if not existing:
                 manifest = deepcopy(record["manifest"])
@@ -638,3 +624,25 @@ class GitHubDelivery:
                 manifest["workstream_issues"][stream["id"]] = binding
                 record = self.update(issue, record, manifest, registry, token)
         return record
+
+    def load_record(self, issue, reference):
+        from .delivery_github_plans import load_record
+
+        return load_record(self, issue, reference)
+
+    def stage_plan_revision(self, issue, record, plan, registry, token, *, operation_id):
+        from .delivery_github_plans import stage_plan_revision
+
+        return stage_plan_revision(self, issue, record, plan, registry, token,
+                                   operation_id=operation_id)
+
+    def publish_plan_revision(self, issue, record, plan, registry, token, *, operation_id):
+        from .delivery_github_plans import publish_plan_revision
+
+        return publish_plan_revision(self, issue, record, plan, registry, token,
+                                     operation_id=operation_id)
+
+    def settle_plan_effect(self, issue, entry, registry, token):
+        from .delivery_github_plans import settle_plan_effect
+
+        return settle_plan_effect(self, issue, entry, registry, token)

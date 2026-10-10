@@ -145,3 +145,110 @@ def test_integration_updates_lower_pr_in_place_with_a_new_pass(service, monkeypa
     repaired = {**receipt, "head": "b" * 40}
     assert publications.record_publication(store, spec, repaired, gh) == repaired
     assert record["manifest"]["publication"]["members"][0]["head"] == "b" * 40
+
+
+def record_spec(issue, record, shared, token, *, worker=False):
+    spec = {
+        "run_id": "original-worker" if worker else "original-run",
+        "github_repo": issue["repository"], "issue_url": issue["url"],
+        "accepted_plan": json.dumps(record["manifest"]["plan"]),
+        "policy": {"allowed_paths": ["model.py", "endpoint.py", "client.py"]},
+        "feature_delivery": {"registry": str(shared.path), "owner": token,
+                             "snapshot": {"issue": issue, "delivery": record}},
+    }
+    if worker:
+        spec["feature_worker"] = {"chunk_id": "model", "workstream_id": "api"}
+    return spec
+
+
+def test_old_worker_is_fenced_before_broker_effect_after_exact_plan_adoption(tmp_path):
+    from test_delivery_github_plan_records import converted, legacy_publication, setup
+
+    remote, issue, shared, token = setup(tmp_path)
+    original = legacy_publication(remote, issue, shared, token)
+    worker = record_spec(issue, original, shared, token, worker=True)
+    revised = remote.publish_plan_revision(issue, original, converted(original), shared, token,
+                                           operation_id="adopted-correction")
+    # Remote publication is not local adoption; the old execution cannot accept it.
+    with pytest.raises(OwnershipConflict, match="changed after execution acceptance"):
+        publications.current_record(worker, remote)
+    identity = {"plan_revision": revised["manifest"]["plan_revision"],
+                "plan_digest": revised["manifest"]["plan_digest"],
+                "comment_id": revised["comment_id"], "comment_node_id": revised["comment_node_id"],
+                "workstream_issues": revised["manifest"]["workstream_issues"]}
+    shared.checkpoint(token, "plan-revision:adopted:2",
+                      {"identity": identity, "plan": revised["manifest"]["plan"]})
+    remote.calls.clear()
+    with pytest.raises(OwnershipConflict, match="superseded plan revision"):
+        publications.current_record(worker, remote)
+    assert remote.calls == []
+
+    class Broker:
+        def publish(self, *_):
+            raise AssertionError("a stale worker must not originate a publication effect")
+
+    with pytest.raises(OwnershipConflict, match="superseded plan revision"):
+        publications.publish(None, Broker(), {"spec": worker, "iteration": 4,
+                                              "candidate": {"id": "same-original-candidate"}})
+    resumed = deepcopy(worker)
+    resumed["feature_plan_revision"] = {
+        key: identity[key] for key in ("plan_revision", "plan_digest")}
+    assert publications.current_record(resumed, remote) == revised
+
+
+def test_v2_chunk_publication_records_actual_child_and_rejects_a_different_worker(
+    tmp_path, monkeypatch,
+):
+    from test_delivery_github_plan_records import setup
+    from test_delivery_plan_model import v2_plan
+
+    remote, issue, shared, token = setup(tmp_path)
+    record = remote.initialize(issue, v2_plan(), shared, token)
+    spec = record_spec(issue, record, shared, token, worker=True)
+    spec.update(issue_url="https://github.com/owner/repo/issues/2", branch="feat/model",
+                publication_base_ref="main")
+    receipt = {"number": 1076, "url": "https://github.com/owner/repo/pull/1076", "head": "a" * 40}
+    original_api = remote.api
+
+    def api(endpoint, *, method="GET", body=None):
+        if endpoint.endswith("/pulls/1076"):
+            return {"number": 1076, "html_url": receipt["url"], "draft": False, "merged": False,
+                    "head": {"sha": receipt["head"], "ref": "feat/model",
+                             "repo": {"full_name": "owner/repo"}},
+                    "base": {"ref": "main", "repo": {"full_name": "owner/repo"}}}
+        return original_api(endpoint, method=method, body=body)
+
+    remote.api = api
+    monkeypatch.setattr(publications, "require_execution", lambda *_: None)
+    invalid = deepcopy(spec)
+    invalid["feature_worker"]["workstream_id"] = "ui"
+    remote.calls.clear()
+    with pytest.raises(OwnershipConflict, match="actual child issue"):
+        publications.record_publication(None, invalid, receipt, remote)
+    assert not any(method != "GET" for method, _ in remote.calls)
+    assert publications.record_publication(None, spec, receipt, remote) == receipt
+    member = remote.load_record(issue, record)["manifest"]["publication"]["members"][0]
+    assert {key: member[key] for key in ("chunk_id", "workstream_id", "issue_id",
+                                        "issue_number", "issue_url")} == {
+        "chunk_id": "model", "workstream_id": "api", "issue_id": "I_2", "issue_number": 2,
+        "issue_url": "https://github.com/owner/repo/issues/2"}
+
+
+def test_current_remote_publication_head_survives_revision_after_admission_snapshot_advanced(
+    tmp_path,
+):
+    from test_delivery_github_plan_records import converted, legacy_publication, setup
+
+    remote, issue, shared, token = setup(tmp_path)
+    snapshot_record = legacy_publication(remote, issue, shared, token)
+    spec = record_spec(issue, snapshot_record, shared, token)
+    advanced = deepcopy(snapshot_record["manifest"])
+    advanced["revision"] += 1
+    advanced["publication"]["members"][0]["head"] = "b" * 40
+    remote.update(issue, snapshot_record, advanced, shared, token)
+    current = publications.current_record(spec, remote)
+    assert current["manifest"]["publication"]["members"][0]["head"] == "b" * 40
+    revised = remote.publish_plan_revision(issue, current, converted(current), shared, token,
+                                           operation_id="retain-current-head")
+    assert revised["manifest"]["publication"]["members"][0]["head"] == "b" * 40
+    assert snapshot_record["manifest"]["publication"]["members"][0]["head"] == "a" * 40

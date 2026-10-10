@@ -44,23 +44,45 @@ def _feature_context(spec):
 
 
 def open_feature(spec):
+    if spec.get("feature_plan_version") == 2 and not spec.get("feature_plan_revision"):
+        from .delivery_config import DeliveryConfig
+        from .delivery_feature_revisions import authenticate_initial_plan_input
+        from .delivery_store import DeliveryStore
+
+        config = DeliveryConfig.load(Path(spec["config_path"]))
+        if digest(config.raw) != spec["config_digest"]:
+            raise ValueError("service configuration changed before initial plan adoption")
+        spec = authenticate_initial_plan_input(DeliveryStore(config), spec)
     store, _, shared, token = _feature_context(spec)
     gh = GitHubDelivery()
     issue = spec["feature_delivery"]["snapshot"]["issue"]
-    shared.checkpoint(token, "accepted-plan", {"digest": digest(plan_for(spec))})
-    record = gh.initialize(issue, plan_for(spec), shared, token)
+    plan = plan_for(spec)
+    if plan.get("version", 1) == 1:
+        shared.checkpoint(token, "accepted-plan", {"digest": digest(plan)})
+    record = gh.initialize(issue, plan, shared, token)
     shared.checkpoint(
         token, "github-record", {key: record[key] for key in ("comment_id", "comment_node_id")}
     )
     record = gh.workstreams(issue, record, shared, token)
     shared.checkpoint(token, "workstream-issues", record["manifest"]["workstream_issues"])
+    if plan.get("version") == 2:
+        from .delivery_feature_revisions import record_initial_plan_adoption
+
+        if not spec.get("feature_plan_revision"):
+            record_initial_plan_adoption(spec, record, shared)
+        spec = store.effective_spec(spec["run_id"])
+        if "accepted-plan" not in shared.checkpoints(issue["id"]):
+            shared.checkpoint(token, "accepted-plan", {
+                "digest": digest(record["manifest"]["plan"]),
+            })
     live_members(spec, record, gh)
     checkpoints = current_checkpoints(spec)
     for member in record["manifest"]["publication"]["members"]:
         proof = checkpoints.get("verified:" + member["chunk_id"])
         if proof and (proof["head"] != member["head"] or proof["number"] != member["number"]):
             raise OwnershipConflict("verified chunk no longer matches its recorded publication")
-    return {"record": record, "checkpoints": checkpoints, "budget": shared.budget(issue["id"])}
+    return {"record": record, "checkpoints": checkpoints, "budget": shared.budget(issue["id"]),
+            **({"spec": spec} if plan.get("version") == 2 else {})}
 
 
 @activity.defn(name="delivery_feature_open")
@@ -90,6 +112,14 @@ def reserve(spec, chunk_id, kind):
                     "SELECT * FROM delivery_runs WHERE run_id=?", (child["run_id"],)
                 ).fetchone()
             )
+        if spec.get("feature_plan_revision"):
+            from .delivery_feature_revisions import (
+                resume_revision_worker,
+                worker_revision_required,
+            )
+
+            if worker_revision_required(spec, child):
+                return resume_revision_worker(store, spec, child, row)
         if row["outcome"] == "delivered":
             return {"spec": child, "completed": True, "workflow_id": row["workflow_id"]}
         if row["outcome"] in {"blocked", "cancelled"}:
@@ -241,7 +271,7 @@ def seal_build(spec, candidate):
     shared = registry(spec)
     token = shared.token(shared.current(spec["feature_delivery"]["owner"]["issue_id"]))
     chunk_id = spec["feature_worker"]["chunk_id"]
-    prior = shared.checkpoints(token["issue_id"]).get("build:" + chunk_id)
+    prior = current_checkpoints(spec).get("build:" + chunk_id)
     if prior:
         if hashlib.sha256(Path(prior["path"]).read_bytes()).hexdigest() != prior["sha256"]:
             raise OwnershipConflict("preserved worker checkpoint changed")
@@ -267,7 +297,10 @@ def seal_build(spec, candidate):
         capture_output=True,
         timeout=30,
     ).stdout
-    path = Path(spec["state_dir"]) / "feature-implementation.patch"
+    revision = spec.get("feature_plan_revision", {}).get("plan_revision")
+    filename = (f"feature-implementation-revision-{revision}.patch" if revision
+                else "feature-implementation.patch")
+    path = Path(spec["state_dir"]) / filename
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if path.exists() or path.is_symlink():
         # Atomic creation below makes only complete files observable on replay.
@@ -293,7 +326,7 @@ def seal_build(spec, candidate):
         "worker_run_id": spec["run_id"],
         "paths": changed,
     }
-    shared.checkpoint(token, "build:" + chunk_id, result)
+    shared.checkpoint(token, checkpoint_key(spec, "build:" + chunk_id), result)
     return result
 
 
@@ -308,10 +341,8 @@ def apply_seed(broker):
         return
     from .delivery_resources import read_private, write_private
 
-    shared = registry(broker.spec)
-    issue_id = broker.spec["feature_delivery"]["owner"]["issue_id"]
     if (
-        shared.checkpoints(issue_id).get("build:" + broker.spec["feature_worker"]["chunk_id"])
+        current_checkpoints(broker.spec).get("build:" + broker.spec["feature_worker"]["chunk_id"])
         != seed
     ):
         raise OwnershipConflict("integration input is not the sealed worker checkpoint")
@@ -446,7 +477,9 @@ def finish_worker(spec, child_id):
                 "store_path": str(store.config.tracking_db),
             },
         )
-    return {**receipt, "record": current_record(spec), "budget": shared.budget(token["issue_id"])}
+    return {**receipt, "record": current_record(spec), "budget": shared.budget(token["issue_id"]),
+            **({"planning_defect": checks["planning_defect"]}
+               if checks.get("planning_defect") else {})}
 
 
 @activity.defn(name="delivery_feature_finish_worker")
@@ -671,6 +704,105 @@ async def delivery_feature_settle_effects(request):
                                  request, "feature_readback")
 
 
+@activity.defn(name="delivery_feature_revision_request")
+async def delivery_feature_revision_request(request):
+    from .delivery_feature_revisions import revision_request
+
+    await asyncio.to_thread(_feature_context, request["spec"])
+    return await asyncio.to_thread(revision_request, request["spec"])
+
+
+@activity.defn(name="delivery_feature_revision_begin")
+async def delivery_feature_revision_begin(request):
+    from .delivery_feature_revisions import begin_revision
+
+    store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
+    return await asyncio.to_thread(begin_revision, store, request["spec"],
+                                   request.get("diagnostic"), request.get("command_id"))
+
+
+async def _revision_role_request(request, role):
+    from .delivery_feature_revisions import authenticate_revision_role
+
+    store, broker = await asyncio.to_thread(_context, request["spec"])
+    if await asyncio.to_thread(broker.candidate) != request["candidate"]:
+        raise OwnershipConflict("revision role candidate changed before admission")
+    payload = {
+        "spec": request["spec"], "role": role, "iteration": 0,
+        "candidate": request["candidate"], "resume_session": None,
+        "revision_context": request["context"], "findings": [],
+    }
+    trusted = await asyncio.to_thread(authenticate_revision_role, store, payload)
+    # Evidence excerpts are authenticated derived context. Native roles cannot
+    # open a child controller directory or substitute arbitrary evidence paths.
+    payload["revision_context"] = {
+        **trusted,
+        **({"proposed_plan": request["context"]["proposed_plan"]}
+           if role == "review" else {}),
+    }
+    return store, payload
+
+
+@activity.defn(name="delivery_feature_revision_propose")
+async def delivery_feature_revision_propose(request):
+    from .delivery_activities import _run_intake, _with_heartbeat
+    from .delivery_feature_revisions import record_proposal
+
+    store, payload = await _revision_role_request(request, "intake")
+    result = await _with_heartbeat(_run_intake(payload), payload, "feature_revision_intake")
+    if result.get("status") != "plan" or result.get("cleanup") != "confirmed":
+        return {**result, "status": "blocked"}
+    receipt = await asyncio.to_thread(
+        record_proposal, store, request["spec"], request["context"]["revision_id"],
+        result["plan"], diagnostic=result.get("diagnostic"),
+    )
+    return {**result, "proposal_receipt": receipt}
+
+
+@activity.defn(name="delivery_feature_revision_review")
+async def delivery_feature_revision_review(request):
+    from .delivery_activities import _run_role, _with_heartbeat
+
+    _, payload = await _revision_role_request(request, "review")
+    result = await _with_heartbeat(_run_role(payload), payload, "feature_revision_review")
+    proposal_session = request["proposal_session_id"]
+    if (result.get("cleanup") != "confirmed"
+            or result.get("candidate") != request["candidate"]
+            or request["spec"]["provider"] == "codex" and (
+                not proposal_session or not result.get("session_id")
+                or result["session_id"] == proposal_session)):
+        result = {**result, "status": "blocked", "findings": [
+            "revision review lacks independent session, exact candidate or confirmed cleanup"],
+        }
+    return {**result, "proposal_session_id": proposal_session,
+            "candidate_id": request["candidate"]["id"]}
+
+
+@activity.defn(name="delivery_feature_revision_adopt")
+async def delivery_feature_revision_adopt(request):
+    from .delivery_config import DeliveryConfig
+    from .delivery_feature_revisions import adopt_revision
+    from .delivery_store import DeliveryStore
+
+    config = await asyncio.to_thread(DeliveryConfig.load, Path(request["spec"]["config_path"]))
+    if digest(config.raw) != request["spec"]["config_digest"]:
+        raise OwnershipConflict("revision adoption configuration changed")
+    store = DeliveryStore(config)
+    return await asyncio.to_thread(
+        adopt_revision, store, request["spec"], request["context"]["revision_id"],
+        request["proposed_plan"], request["review"],
+    )
+
+
+@activity.defn(name="delivery_feature_revision_reject")
+async def delivery_feature_revision_reject(request):
+    from .delivery_feature_revisions import reject_revision
+
+    store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
+    return await asyncio.to_thread(reject_revision, store, request["spec"],
+                                   request["context"]["revision_id"], request["reason"])
+
+
 FEATURE_ACTIVITIES = [
     delivery_feature_open,
     delivery_feature_reserve,
@@ -683,4 +815,10 @@ FEATURE_ACTIVITIES = [
     delivery_feature_merge,
     delivery_feature_begin_integration,
     delivery_feature_settle_effects,
+    delivery_feature_revision_request,
+    delivery_feature_revision_begin,
+    delivery_feature_revision_propose,
+    delivery_feature_revision_review,
+    delivery_feature_revision_adopt,
+    delivery_feature_revision_reject,
 ]

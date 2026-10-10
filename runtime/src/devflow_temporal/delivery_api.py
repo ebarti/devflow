@@ -387,6 +387,17 @@ def create_app(config_path: Path) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.post("/api/runs/{run_id}/revise-feature-plan")
+    async def revise_feature_plan(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        from .delivery_feature_revisions import revise_feature_plan as revise_execution
+
+        try:
+            return await asyncio.to_thread(
+                revise_execution, service.store, run_id, await request.json())
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.post("/api/runs/{run_id}/continue-feature")
     async def continue_feature(request: Request, run_id: str) -> dict[str, Any]:
         _mutation(request)

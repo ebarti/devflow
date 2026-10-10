@@ -146,9 +146,13 @@ merge, release and deployment require separate authority.
 The [GitHub feature delivery model](docs/github-feature-delivery.md) uses the
 parent issue as the feature, sub-issues as workstreams, and one stack for complete
 incremental chunks. Feature mode coordinates parallel implementation, preserves
-ownership and repair accounting across continuations, and supports an explicit
-merge instruction after verification. Project updates are handled by the
-independent event consumer.
+ownership and repair accounting across continuations, and supports reviewed plan
+corrections within the original authority. Version 2 records keep detailed plans
+on the child issues and a compact revision index on the parent. The public
+`revise_feature_plan` operation requests native investigation and review of a
+planning defect; it preserves the existing stack and cumulative repair budget.
+An explicit merge instruction follows verification. Project updates are handled
+by the independent event consumer.
 
 Use the dashboard or the plugin's status/evidence operations to inspect a run.
 Blocking decisions carry the exact run and candidate identity. A fresh host

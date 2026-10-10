@@ -21,7 +21,10 @@ def build_server(config_path: Path) -> FastMCP:
             "The local service owns roles, planning and authorized GitHub delivery through an "
             "unmerged PR or one feature-owned stack. In feature mode GitHub owns the parent "
             "issue, sub-issues and accepted plan; continue_feature resumes stopped ownership "
-            "without a replacement stack. Use merge_feature only on an explicit merge instruction. "
+            "without a replacement stack. revise_feature_plan requests a recorded correction "
+            "of a demonstrated planning defect within the same feature authority "
+            "and repair budget. "
+            "Use merge_feature only on an explicit merge instruction. "
             "Use status/evidence on request; dashboard SSE supplies progress. "
             "Preserve the original goal. Detailed or multi-sentence goals require a separate "
             "publication_summary describing the actual change: a single line, at most 120 "
@@ -100,6 +103,19 @@ def build_server(config_path: Path) -> FastMCP:
         cycles and published PRs remain attached to the same GitHub feature.
         """
         return client(config_path).continue_feature(run_id, json.loads(request_json))
+
+    @server.tool(annotations=write)
+    def revise_feature_plan(run_id: str, request_json: str) -> dict:
+        """Request native investigation and review of a stopped feature's planning defect.
+
+        Supply command_id, expected_revision from feature_plan.expected_revision
+        (the projection revision), and a bounded reason. Optional evidence is a
+        list of existing owned artifact {path, sha256} references. The runtime
+        crafts the proposal, preserves scope/acceptance/authority and stack,
+        and shares the cumulative repair budget. No plan or policy overrides
+        are accepted. Keep the full request stable after an uncertain response.
+        """
+        return client(config_path).revise_feature_plan(run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
     def merge_feature(run_id: str, request_json: str) -> dict:

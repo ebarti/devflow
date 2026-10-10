@@ -19,6 +19,7 @@ from .delivery_native_guard import NATIVE_OVERRIDES
 from .delivery_origin import thread_uuid
 from .delivery_publication import publication_summary
 from .delivery_sandbox import validate_network_domain
+from .delivery_source_scope import validate_authority
 from .runtime_dependencies import locked_dependency_identity
 
 BRANCH_RE = re.compile(r"^(?:feat|fix|docs|chore)/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
@@ -159,6 +160,9 @@ class DeliveryConfig:
             "max_repairs": self.raw.get(
                 "max_repairs", 10 if self.raw.get("feature_delivery_version") == 1 else 2),
             "feature_delivery_version": self.raw.get("feature_delivery_version"),
+            **({"feature_plan_versions": [1, 2], "feature_plan_revision_version": 1,
+                "revise_feature_plan": True}
+               if self.raw.get("feature_delivery_version") == 1 else {}),
             "tracker_retry_seconds": self.raw.get("tracker_retry_seconds", 600),
         }
 
@@ -309,6 +313,9 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
+        if repository.get("source_scope") is not None:
+            policy["source_scope"] = deepcopy(repository["source_scope"])
+        source_authority = validate_authority(policy)
         maximum = self.raw.get("max_attempts", 3)
         if type(maximum) is not int or not 1 <= maximum <= 10:
             raise ValueError("max_attempts must be an integer between 1 and 10")
@@ -384,23 +391,11 @@ class DeliveryConfig:
             if policy["config_overrides"] != expected_overrides:
                 raise ValueError("real role configuration overrides must disable plugins")
             if (
-                not policy["allowed_paths"]
+                not (source_authority["allowed_files"] or source_authority["allowed_roots"])
                 or not policy["prepublish_checks"]
                 or not policy["checks"]
             ):
                 raise ValueError("real delivery requires source scope and both check stages")
-            for raw_path in policy["allowed_paths"]:
-                if not isinstance(raw_path, str):
-                    raise ValueError("allowed feature path must be a relative file")
-                path = Path(raw_path)
-                if (
-                    path.is_absolute()
-                    or not path.parts
-                    or any(part in {".", "..", ".git", ".codex"} for part in path.parts)
-                    or path.name in {".gitattributes", ".gitmodules"}
-                    or raw_path != path.as_posix()
-                ):
-                    raise ValueError("allowed feature path controls Git or Codex configuration")
             if (
                 not isinstance(policy["toolchain_roots"], list)
                 or len(policy["toolchain_roots"]) > 3

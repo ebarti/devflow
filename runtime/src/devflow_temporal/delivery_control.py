@@ -537,6 +537,7 @@ _COMMANDS = (
     "admit-gates-only",
     "continue-repair",
     "continue-feature",
+    "revise-feature-plan",
     "retry-prelaunch",
     "amend-scope",
 )
@@ -602,6 +603,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "admit-gates-only",
         "continue-repair",
         "continue-feature",
+        "revise-feature-plan",
         "retry-prelaunch",
         "amend-scope",
     }:
@@ -616,6 +618,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "admit-gates-only",
             "continue-repair",
             "continue-feature",
+            "revise-feature-plan",
             "retry-prelaunch",
             "amend-scope",
         } and not isinstance(request, dict):
@@ -634,6 +637,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "admit-gates-only",
                 "continue-repair",
                 "continue-feature",
+                "revise-feature-plan",
                 "retry-prelaunch",
                 "amend-scope",
             }
@@ -666,6 +670,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "admit-gates-only": lambda: caller.admit_gates_only(args.id, request),
                 "continue-repair": lambda: caller.continue_repair(args.id, request),
                 "continue-feature": lambda: caller.continue_feature(args.id, request),
+                "revise-feature-plan": lambda: caller.revise_feature_plan(args.id, request),
                 "retry-prelaunch": lambda: caller.retry_prelaunch(args.id, request),
                 "amend-scope": lambda: caller.amend_scope(args.id, request),
             }[args.command]()

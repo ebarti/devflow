@@ -111,6 +111,11 @@ class DeliverySupervisor:
             identity["gate_retry_stage"] = spec.get("gate_retry_stage")
         if generation:
             identity["attempt_generation"] = generation
+        from .delivery_native_guard import revision_role_identity
+
+        revision = revision_role_identity(request)
+        if revision is not None:
+            identity["plan_revision"] = revision
         return hashlib.sha256(canonical_json(identity).encode()).hexdigest()
 
     def retained_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
@@ -181,6 +186,9 @@ class DeliverySupervisor:
 
     def _claim(self, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         spec = request["spec"]
+        from .delivery_native_guard import validate_revision_role
+
+        validate_revision_role(request, self.store)
         if spec["policy"].get("execution_backend") == "native-macos":
             from .delivery_native_guard import validate_native_turn
 
@@ -461,6 +469,9 @@ class DeliverySupervisor:
                     )
                 if cancelled():
                     raise ValueError("native role cancelled before monitor entry")
+                from .delivery_native_guard import validate_revision_role
+
+                validate_revision_role(request, self.store)
                 from .delivery_dashboard import launch_steering
                 from .delivery_role_evidence import allocate
 

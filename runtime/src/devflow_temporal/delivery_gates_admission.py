@@ -16,6 +16,26 @@ from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
 from .delivery_resources import private_directory
+from .delivery_source_scope import outside_scope, validate_authority
+
+
+def _source_authority_matches(policy, scope, semantic):
+    """Authenticate the authority form used by the stopped execution."""
+    validate_authority(policy)
+    if policy.get("source_scope") is not None:
+        return (
+            scope.get("source_scope") == policy["source_scope"]
+            and semantic.get("source_scope_unchanged") == policy["source_scope"]
+            and not scope.get("allowed_paths")
+            and not semantic.get("scope_unchanged")
+        )
+    return (
+        isinstance(scope.get("allowed_paths"), list)
+        and sorted(scope["allowed_paths"]) == sorted(policy["allowed_paths"])
+        and set(semantic.get("scope_unchanged", [])) == set(policy["allowed_paths"])
+        and scope.get("source_scope") is None
+        and semantic.get("source_scope_unchanged") is None
+    )
 
 
 def _native_result_bytes(spec, attempt):
@@ -143,12 +163,10 @@ def authority_readback(spec, seal, payload):
         or scope["max_commands"] != 1
         or canonical_json(scope.get("current_after_candidate")) != canonical_json(seal["candidate"])
         or scope.get("frozen_input_candidate_id") != seal["input_candidate_id"]
-        or not isinstance(scope.get("allowed_paths"), list)
-        or sorted(scope["allowed_paths"]) != sorted(spec["policy"]["allowed_paths"])
+        or not _source_authority_matches(spec["policy"], scope, semantic)
         or scope.get("authority_sha256") != payload["semantic_sha256"]
         or semantic.get("decision_owner") != "main task"
         or semantic.get("new_user_approval_required") is not False
-        or set(semantic.get("scope_unchanged", [])) != set(spec["policy"]["allowed_paths"])
     ):
         raise ValueError("gates-only investigation authority changed")
     custody = authority.get("custody_proof", {})
@@ -216,7 +234,7 @@ def preflight(store, run_id):
         or candidate["head"] != spec["base_sha"]
         or frozen.get("id") != implementation["input_candidate_id"]
         or not broker._changed_paths()
-        or not broker._changed_paths() <= set(spec["policy"]["allowed_paths"])
+        or outside_scope(spec["policy"], broker._changed_paths(), checkout=broker.checkout)
         or any(
             role.get("session_id") != implementation["session_id"]
             for role in state["roles"]

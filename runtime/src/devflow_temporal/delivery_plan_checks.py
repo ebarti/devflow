@@ -45,11 +45,15 @@ def selected_tests(spec: dict, checkout: Path) -> list[Path]:
 
 def _future_test(spec: dict, checkout: Path, name: str) -> Path:
     """Resolve future or partial tests only for locked dependency preparation."""
-    paths = [raw for raw in spec.get('policy', {}).get('allowed_paths', [])
-             if isinstance(raw, str) and Path(raw).name == name]
+    from .delivery_source_scope import require_authorized
+
+    hints = (spec.get("expected_paths", []) if spec.get("gate_selections_version") == 2
+             else spec.get('policy', {}).get('allowed_paths', []))
+    paths = [raw for raw in hints if isinstance(raw, str) and Path(raw).name == name]
     if len(paths) != 1:
         raise ValueError(f'future planned test must have one authorized owner: {name}')
     raw = paths[0]
+    require_authorized(spec.get("policy", {}), [raw])
     relative = Path(raw)
     test = checkout / relative
     if (relative.is_absolute() or '..' in relative.parts or relative.as_posix() != raw
@@ -69,10 +73,33 @@ def planned_projects(spec: dict, checkout: Path, *,
         return {}
     names = sorted({name for step in plan['verification'] if isinstance(step, str)
                     for name in re.findall(r'\btest_[A-Za-z0-9_]+\.py\b', step)})
+    if spec.get("gate_selections_version") == 2:
+        names = []  # Versioned selections replace prose inference, not authority.
     files = _git(checkout, 'ls-files', '--', '*.py').splitlines()
     projects: dict[Path, list[Path]] = {}
     chosen = [p for p in selected_tests(spec, checkout) if p.suffix == '.py']
     future = set()
+    if spec.get("gate_selections_version") == 2:
+        from .delivery_feature_gates import resolve_required_selectors, selector_path
+        from .delivery_source_scope import require_authorized
+
+        paths = sorted({raw for gate in spec.get("feature_gate_selections", [])
+                        if gate["stage"] == "checks" for raw in gate["selectors"]
+                        if Path(raw).suffix == ".py"})
+        for raw in paths:
+            selector_path(raw)
+            test = checkout / raw
+            if not test.exists() and preparation:
+                if raw not in spec.get("expected_paths", []):
+                    raise ValueError("future selected Python test has no current chunk owner")
+                require_authorized(spec["policy"], [raw])
+                if test.resolve() != test:
+                    raise ValueError("future selected Python test escaped its source")
+                future.add(test)
+            else:
+                resolve_required_selectors({"required_selectors": [raw],
+                                            "selector_evidence_version": 1}, checkout, spec=spec)
+            chosen.append(test)
     for name in names:
         matches = [checkout / f for f in files if Path(f).name == name]
         if not matches and preparation:
@@ -127,6 +154,8 @@ def planned_node_tests(spec: dict, checkout: Path, junit_recipes: list[dict], *,
         return []
     names = sorted({name for step in plan['verification'] if isinstance(step, str)
                     for name in re.findall(r'\b[A-Za-z0-9_.-]+\.test\.[cm]?[jt]sx?\b', step)})
+    if spec.get("gate_selections_version") == 2:
+        names = []  # Concrete selected recipes carry their own per-file evidence.
     if len(names) > 32:
         raise ValueError('planned Node tests require a bounded name list')
     chosen = [p for p in selected_tests(spec, checkout) if p.suffix != '.py']
@@ -171,7 +200,11 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
     steps = [step for step in plan['verification'] if isinstance(step, str)
              and 'scripts/checks.toml' in step
              and (static or re.search(r'\bjunit\b', step, re.I))]
-    if not steps:
+    if not steps and spec.get("gate_selections_version") != 2:
+        return []
+    if spec.get("gate_selections_version") == 2 and not any(
+            gate["stage"] == "checks" and gate["recipe_id"].startswith("checks.")
+            for gate in spec.get("feature_gate_selections", [])):
         return []
     content = _base_recipe_metadata(spec)
     metadata = tomllib.loads(content.decode('utf-8'))
@@ -188,8 +221,13 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
         r'''(?<!\S)[`'"*(\[{]*?(?:(''' + names + r''')\s+recipe\b|checks\.(''' + names
         + r')(?=$|\s|' + closing + r'+(?:' + link + closing + r'*)?(?:\s|$)))', re.I)
     mentioned = {match[1] or match[2] for step in steps for match in reference.finditer(step)}
-    selected = sorted(key for key in recipes if any(
-        re.fullmatch(re.escape(key), name, re.I) for name in mentioned))
+    gates = spec.get("feature_gate_selections", [])
+    if spec.get("gate_selections_version") == 2:
+        selected = sorted(gate["recipe_id"].removeprefix("checks.") for gate in gates
+                          if gate["stage"] == "checks" and gate["recipe_id"].startswith("checks."))
+    else:
+        selected = sorted(key for key in recipes if any(
+            re.fullmatch(re.escape(key), name, re.I) for name in mentioned))
     if not selected or len(selected) > 32:
         raise ValueError('planned JUnit verification must name bounded repository recipes')
     result = []
@@ -220,10 +258,18 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
                       'recipe_sha256': digest(recipe)}
         check_id = ('planned-static-' if static else 'planned-junit-') + digest(provenance)[:16]
         report = evidence / check_id / 'pytest-artifacts/junit.xml'
-        result.append({'id': check_id, 'kind': 'static' if static else 'test', 'cwd': relative,
-                       'argv': [arg.replace('{report_path}', str(report)) for arg in argv],
-                       'timeout_seconds': timeout, 'min_tests': minimum,
-                       'junit_required': not static, 'plan_provenance': provenance})
+        check = {'id': check_id, 'kind': 'static' if static else 'test', 'cwd': relative,
+                 'argv': [arg.replace('{report_path}', str(report)) for arg in argv],
+                 'timeout_seconds': timeout, 'min_tests': minimum,
+                 'junit_required': not static, 'plan_provenance': provenance}
+        if spec.get("gate_selections_version") == 2:
+            from .delivery_feature_gates import selected_recipe
+
+            gate = next(gate for gate in gates if gate["stage"] == "checks"
+                        and gate["recipe_id"] == "checks." + key)
+            check["tracked_recipe"] = True
+            check = selected_recipe(check, gate, spec)
+        result.append(check)
     return result
 
 
@@ -301,6 +347,10 @@ def planned_checks(spec: dict, checkout: Path, evidence: Path, *,
                        'generated_directories': [
                            (project / '.venv').relative_to(checkout).as_posix()],
                        'plan_provenance': provenance})
+        if spec.get("gate_selections_version") == 2 and all(
+                any(test.relative_to(checkout).as_posix() in check.get("required_selectors", [])
+                    for check in result if check.get("junit_required")) for test in tests):
+            continue  # Selected admitted recipes already prove these exact sources.
         check_id = 'planned-pytest-' + key
         report = evidence / check_id / 'pytest-artifacts' / 'junit.xml'
         result.append({'id': check_id, 'kind': 'test', 'cwd': relative,
@@ -310,7 +360,11 @@ def planned_checks(spec: dict, checkout: Path, evidence: Path, *,
                                 *(['-o', 'pythonpath=src'] if (project / 'src').is_dir() else []),
                                 '--junitxml=' + str(report)],
                        'test_count_regex': r'(\d+) passed', 'min_tests': 1,
-                       'plan_provenance': provenance})
+                       'plan_provenance': provenance,
+                       **({'required_selectors': [test.relative_to(checkout).as_posix()
+                                                  for test in tests],
+                           'selector_evidence_version': 1, 'selector_project': relative}
+                          if spec.get("gate_selections_version") == 2 else {})})
     node_projects: dict[Path, list[Path]] = {}
     for test in node_tests:
         project = next((p for p in test.parents if p.is_relative_to(checkout)
@@ -346,5 +400,10 @@ def planned_checks(spec: dict, checkout: Path, evidence: Path, *,
                                 *provenance['test_paths'], '--reporter=default',
                                 '--reporter=junit', '--outputFile=' + str(
                                     evidence / check_id / 'pytest-artifacts/junit.xml')],
-                       'test_count_regex': r'Tests\s+(\d+) passed', 'min_tests': 1})
+                       'test_count_regex': r'Tests\s+(\d+) passed', 'min_tests': 1,
+                       **({'required_selectors': [test.relative_to(checkout).as_posix()
+                                                  for test in tests],
+                           'selector_evidence_version': 1,
+                           'selector_project': provenance['project']}
+                          if spec.get("gate_selections_version") == 2 else {})})
     return result

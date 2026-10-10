@@ -85,6 +85,7 @@ async def test_lost_plan_write_settles_before_public_successor_is_admitted(
 ):
     from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
+    monkeypatch.setattr(protocol.workflow, "patched", lambda _marker: False)
     store, request, snapshot = feature_service(service, monkeypatch)
     store.submit(request)
     spec = store.effective_spec(request["run_id"])
@@ -239,6 +240,7 @@ def test_integration_pass_retains_evidence_and_imports_without_force(service, mo
 async def test_successor_reintegrates_completed_stack_after_target_moves(service, monkeypatch):
     from types import SimpleNamespace
 
+    monkeypatch.setattr(protocol.workflow, "patched", lambda _marker: False)
     store, original, record, _, _, gh = setup_feature(service, monkeypatch)
     shared, old_token = registry(original), original["feature_delivery"]["owner"]
     members = record["manifest"]["publication"]["members"]

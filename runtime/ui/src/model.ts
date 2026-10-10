@@ -124,7 +124,29 @@ export interface Evidence {
   state?: string | null
 }
 
+export interface FeaturePlanState {
+  plan_identity: {
+    plan_revision: number
+    plan_digest: string | null
+    comment_id: number | null
+    comment_node_id: string | null
+    workstream_issues: Record<string, { id: string; number: number; url: string }>
+  }
+  phase: string | null
+  reason: string | null
+  evidence: Array<{ path: string; sha256: string }>
+  affected_chunks: string[]
+  repair_budget: { used: number; maximum: number; learning_required: boolean }
+  can_revise: boolean
+  reason_ineligible: string | null
+  expected_revision: number | null
+  child_plan_links: Record<string, { comment_id: number; comment_node_id: string; digest: string; url: string }>
+  authority: { version: number; allowed_roots: string[]; allowed_files: string[]; protected_paths: string[] }
+  expected_paths: Record<string, string[]>
+}
+
 export interface RunDetail extends RunSummary {
+  feature_plan?: FeaturePlanState | null
   can_steer?: boolean
   steering?: Array<{ id: number; message: string; created_at: string; included_in: Array<{ role: string; job_key: string }> }>
   investigation_adjudication?: {
@@ -190,7 +212,7 @@ export interface RunDetail extends RunSummary {
     ownership_state: string
     can_continue: boolean
     repair_budget: { used: number; maximum: number; learning_required: boolean }
-    workers: Array<{ run_id: string; chunk_id: string; kind: 'build' | 'chunk'; phase: string; outcome: string | null; cleanup: string; pull_request?: { url: string; number: number } | null }>
+    workers: Array<{ run_id: string; chunk_id: string; workstream_id?: string; issue_url?: string; kind: 'build' | 'chunk'; phase: string; outcome: string | null; cleanup: string; pull_request?: { url: string; number: number } | null }>
   } | null
   evidence?: Evidence[] | null
 }

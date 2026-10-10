@@ -34,6 +34,8 @@ class FeatureActivities:
             @activity.defn(name=name)
             async def execute(payload):
                 self.calls.append((name, deepcopy(payload)))
+                if name == "delivery_feature_revision_request":
+                    return None
                 if name == "delivery_prepare":
                     return {"candidate": {"id": "parent", "head": "parent-head"}}
                 if name == "delivery_feature_open":
@@ -76,6 +78,7 @@ class FeatureActivities:
             return execute
 
         return [stub(name) for name in (
+            "delivery_feature_revision_request",
             "delivery_prepare", "delivery_project", "delivery_feature_open",
             "delivery_feature_reserve", "delivery_feature_finish_worker",
             "delivery_feature_merge", "delivery_feature_settle_workers", "delivery_feature_stop",

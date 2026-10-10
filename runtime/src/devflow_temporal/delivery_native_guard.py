@@ -14,6 +14,44 @@ NATIVE_OVERRIDES = [
 ]
 
 
+def revision_role_identity(request: dict) -> dict | None:
+    """Keep correction roles distinct from product roles on the same candidate."""
+    if "revision_context" not in request:
+        return None
+    from .contracts import digest
+
+    context = request["revision_context"]
+    if (
+        not isinstance(context, dict)
+        or not isinstance(context.get("revision_id"), str)
+        or not 1 <= len(context["revision_id"]) <= 128
+        or request.get("role") not in {"intake", "review"}
+        or type(request.get("iteration")) is not int
+        or request["iteration"] != 0
+        or request.get("resume_session") is not None
+    ):
+        raise ValueError("plan revision roles require a separate read-only attempt")
+    proposal = context.get("proposed_plan")
+    if (request["role"] == "review") != isinstance(proposal, dict):
+        raise ValueError("revision review requires its exact proposed plan")
+    return {
+        "revision_id": context["revision_id"],
+        "proposed_plan_sha256": digest(proposal) if proposal is not None else None,
+    }
+
+
+def validate_revision_role(request: dict, store) -> None:
+    """A context object is never sufficient authority to launch a planner."""
+    identity = revision_role_identity(request)
+    if identity is None:
+        return
+    from .delivery_feature_revisions import authenticate_revision_role
+
+    receipt = authenticate_revision_role(store, request)
+    if any(receipt.get(key) != value for key, value in identity.items()):
+        raise ValueError("plan revision role does not match its durable admission")
+
+
 def protected_commands(binary: str) -> tuple[Path, ...]:
     runtime = Path(__file__).resolve().parents[2]
     paths = {

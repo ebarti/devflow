@@ -9,6 +9,12 @@ from typing import Any
 
 from .candidate import candidate_for
 from .contracts import digest
+from .delivery_feature_gates import (
+    GateAdmissionError,
+    resolve_required_selectors,
+    retain_admission_failure,
+    selector_evidence,
+)
 from .delivery_output import observed_test_count, rejection_causes, visible_output
 from .delivery_sandbox import prepare_browser_qa, trusted_local
 
@@ -77,6 +83,15 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "ports": qa["ports"],
         "argv": qa["argv"],
     }
+    selector_sources = []
+    if qa.get("required_selectors"):
+        checkout = broker.gate_checkout("verify", iteration, candidate).resolve(strict=True)
+        try:
+            selector_sources = resolve_required_selectors(qa, checkout, spec=spec)
+        except GateAdmissionError as exc:
+            return retain_admission_failure(spec, qa, broker.evidence_dir / "browser-qa" /
+                                            str(iteration), candidate, exc)
+        request["selector_sources"] = selector_sources
     done = broker._effect(key, "browser_qa", request)
     if done:
         if _hash(Path(done["receipt"])) != done["receipt_sha256"]:
@@ -160,6 +175,13 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         if _hash(destination) != item["sha256"]:
             raise ValueError("native browser artifact changed while preserving evidence")
         artifacts.append({**item, "source": str(original), "path": str(destination)})
+    selector_receipts = None
+    selector_failure = None
+    if selector_sources:
+        try:
+            selector_receipts = selector_evidence(qa, checkout, selector_sources, playwright=output)
+        except (ValueError, OSError) as exc:
+            selector_failure = str(exc)
     unchanged = candidate_for(checkout)["id"] == candidate["id"]
     passed = (
         process["exit_code"] == 0
@@ -169,6 +191,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         and set(process["observed_listeners"]) == {str(port) for port in ports}
         and count >= qa["min_tests"]
         and not rejected
+        and selector_failure is None
         and unchanged
     )
     result = {
@@ -179,6 +202,8 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "execution_mode": spec["policy"].get("host_sandbox", "native-profile"),
         "exit_code": process["exit_code"],
         "test_count": count,
+        **({"selectors": selector_receipts} if selector_receipts is not None else {}),
+        **({"evidence_failure": selector_failure} if selector_failure else {}),
         "rejected_output": rejected,
         "rejection_causes": causes,
         "log": str(log),
