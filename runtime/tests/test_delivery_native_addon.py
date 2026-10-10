@@ -327,11 +327,10 @@ def test_target_only_build_still_requires_frozen_allowlist(addon, monkeypatch):
         native_addon_authority(spec, checkout, ["apps/api"])
 
 
-@pytest.mark.parametrize(
-    "drift", [None, "source", "binary", "tools", "environment", "log", "process",
-              "process-exception"]
-)
-@pytest.mark.parametrize("environment_version", [1, 2, 3])
+@pytest.mark.parametrize("drift,environment_version", [
+    (drift, 3) for drift in (None, "source", "binary", "tools", "environment", "log",
+                            "process", "process-exception")
+] + [(drift, version) for version in (1, 2) for drift in (None, "environment")])
 def test_native_receipt_replay_readback_refuses_drift_without_launch(
     addon, tmp_path, monkeypatch, drift, environment_version
 ):

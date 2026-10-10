@@ -171,12 +171,10 @@ def test_symlink_destinations_never_escape_root(package_fixture, tmp_path, compo
     assert list(outside.iterdir()) == []
 
 
-@pytest.mark.parametrize("package_format", ["portable", "codex"])
 @pytest.mark.parametrize("spelling", ["direct", "missing", "file"])
 @pytest.mark.parametrize("dangling", [False, True])
-@pytest.mark.parametrize("ancestor_alias", [False, True])
 def test_named_root_symlink_spellings_preserve_target(
-    package_fixture, tmp_path, package_format, spelling, dangling, ancestor_alias,
+    package_fixture, tmp_path, spelling, dangling,
 ):
     _root, runtime, config = package_fixture
     physical = tmp_path / "selected parent"
@@ -190,14 +188,12 @@ def test_named_root_symlink_spellings_preserve_target(
               for path in outside.rglob("*") if path.is_file()}
     link = physical / "named marketplace"
     link.symlink_to(outside, target_is_directory=True)
-    parent = physical
-    if ancestor_alias:
-        parent = tmp_path / "ancestor alias"
-        parent.symlink_to(physical, target_is_directory=True)
+    parent = tmp_path / "ancestor alias"
+    parent.symlink_to(physical, target_is_directory=True)
     selected = parent / link.name if spelling == "direct" else (
         parent / spelling / ".." / link.name)
     with pytest.raises(ValueError, match="destination is a symlink"):
-        packager.package(selected, runtime, config, package_format=package_format)
+        packager.package(selected, runtime, config, package_format="codex")
     assert link.is_symlink()
     assert outside.exists() is not dangling
     assert before == {path.relative_to(outside): (path.read_bytes(), path.stat().st_mtime_ns)

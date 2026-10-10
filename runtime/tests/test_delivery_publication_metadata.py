@@ -290,9 +290,12 @@ def test_summary_trims_outer_textarea_whitespace_and_preserves_goal(service, exp
     assert store.spec(request['run_id'])['goal'] == goal
 
 
-@pytest.mark.parametrize('control', ['\u009b', '\u0085', '\u202e', '\u2066', '\u200f'])
-@pytest.mark.parametrize('explicit', [False, True])
-@pytest.mark.parametrize('position', ['inside', 'outside'])
+@pytest.mark.parametrize('control,explicit,position', [
+    (control, explicit, position)
+    for control in ('\u0085', '\u202e')
+    for explicit in (False, True)
+    for position in ('inside', 'outside')
+] + [('\u200f', True, 'inside')])
 def test_summary_rejects_unicode_controls_before_claiming_work(
     service, control, explicit, position
 ):

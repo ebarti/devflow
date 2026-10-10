@@ -13,7 +13,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_delivery_browser_cleanup_assertions import assert_interrupted_browser_cleanup
 from test_delivery_check_slots import wait_until
 from test_delivery_resources import spec
 from test_delivery_store import _git
@@ -28,6 +27,38 @@ from devflow_temporal.delivery_resources import RunResources, read_private
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin", reason="actual macOS native port ownership inspector required",
 )
+
+
+def assert_interrupted_browser_cleanup(
+    result, native_cleanup_confirmed, original, terminal, table, ports, *, failure,
+):
+    if failure == "exception":
+        assert result["state"] == result["cleanup"] == "unknown"
+        assert native_cleanup_confirmed is False
+        return
+    assert failure == "interrupted"
+    assert result["cleanup"] == "confirmed"
+    assert native_cleanup_confirmed is True
+    assert terminal["intent"] == original["intent"]
+    assert terminal["ports"] == original["ports"] == original["intent"]["ports"]
+    assert terminal["monitor"] == original["monitor"]
+    assert terminal["phase"] == "finished" and terminal["monitoring_complete"] is True
+    native = result["native_process"]
+    assert native == terminal["result"]
+    assert native["cleanup"] == "observed-native-confirmed"
+    assert native["monitoring_complete"] is True and native["stdio_drained"] is True
+    owned = terminal["owned"]
+    assert owned and original["owned"].keys() <= owned.keys()
+    for pid, actor in original["owned"].items():
+        assert owned[pid]["identity"] == actor["identity"]
+    monitor = original["monitor"]
+    assert owned[str(monitor["pid"])]["identity"] == monitor["identity"]
+    assert native["observed_owned_pids"] == sorted(map(int, owned))
+    for pid, actor in owned.items():
+        observed = table.get(int(pid), {})
+        assert (observed.get("identity") != actor["identity"]
+                or observed["stat"].startswith("Z"))
+    assert set(ports) == set(original["ports"]) and not any(ports.values())
 
 
 @pytest.fixture

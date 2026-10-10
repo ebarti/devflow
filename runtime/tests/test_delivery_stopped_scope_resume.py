@@ -20,7 +20,8 @@ from devflow_temporal.delivery_store import DeliveryStore
 def scope_stop(service, monkeypatch):
     owner, request = service
     source = owner.config.path.parent / 'source'
-    (source / 'contract.test.ts').write_text('expect(endpoints).toHaveLength(145)\n')
+    (source / 'contract.test.ts').write_text(
+        "expect(parseRequest({name: 'fixture'}).success).toBe(true)\n")
     _git(source, 'add', 'contract.test.ts')
     _git(source, 'commit', '-qm', 'Existing contract test')
     config = copy.deepcopy(owner.config.raw)
@@ -32,7 +33,7 @@ def scope_stop(service, monkeypatch):
     candidate = broker.candidate()
     receipt = {'status': 'findings', 'session_id': 'original-implementation',
                'finish_reason': 'done', 'cleanup': 'confirmed',
-               'findings': ['contract.test.ts expects 145 endpoints but the new contract has 149']}
+               'findings': ['contract.test.ts must validate the new required request field']}
     state['roles'] = [{**receipt, 'role': 'implement', 'iteration': 1, 'candidate': candidate}]
     state['error'] = 'implementer did not establish a pass'
     project(store, state)
