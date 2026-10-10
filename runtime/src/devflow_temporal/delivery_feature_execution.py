@@ -371,6 +371,34 @@ def continue_feature(store, run_id, request):
     return store.submit(supplied)
 
 
+def _draining_handoff_ready(store, shared, token):
+    """Project eligibility; the command still authenticates closure and custody."""
+    with shared.connect() as db:
+        if db.execute("SELECT 1 FROM execution_effects WHERE issue_id=? AND state='pending'",
+                      (token['issue_id'],)).fetchone():
+            return False
+        workers = list(db.execute(
+            "SELECT worker_key,generation FROM execution_workers "
+            "WHERE issue_id=? AND state!='finished'", (token['issue_id'],)))
+    if any(worker['generation'] != token['generation'] for worker in workers):
+        return False
+    ids = [token['run_id'], *(w['worker_key'].split(':generation:')[0] for w in workers)]
+    with store._connect() as db:
+        for run_id in ids:
+            row = db.execute('SELECT outcome,cleanup FROM delivery_runs WHERE run_id=?',
+                             (run_id,)).fetchone()
+            if (not row or row['outcome'] not in {'delivered', 'blocked', 'cancelled'}
+                    or row['cleanup'] != 'confirmed'
+                    or db.execute("SELECT 1 FROM delivery_attempts WHERE run_id=? "
+                                  "AND (state!='finished' OR cleanup!='confirmed')",
+                                  (run_id,)).fetchone()
+                    or db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? "
+                                  "AND (state!='complete' OR observed_json IS NULL)",
+                                  (run_id,)).fetchone()):
+                return False
+    return True
+
+
 def detail(store, spec):
     if not spec.get("feature_delivery") or spec.get("feature_worker"):
         return None
@@ -405,7 +433,9 @@ def detail(store, spec):
         "owner": shared.token(current) if current else None,
         "ownership_state": current["state"] if current else "missing",
         "can_continue": bool(
-            current and shared.token(current) == token and current["state"] == "stopped"
+            current and shared.token(current) == token
+            and (current["state"] == "stopped" or (current["state"] == "draining"
+                 and _draining_handoff_ready(store, shared, token)))
         ),
         "github_plan_url": spec["issue_url"] + "#issuecomment-" + str(record["comment_id"])
         if record

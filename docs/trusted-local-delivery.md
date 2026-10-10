@@ -141,6 +141,9 @@ When that worker later closes, the feature continuation command can settle its
 draining coordinator through the normal worker and owner closure checks before
 admitting the next generation. Live workers, uncertain cleanup and unresolved
 remote effects continue to prevent handoff.
+The dashboard offers **Continue this feature** once the parent and current
+workers project closed, confirmed results with no pending effects or attempts;
+the command still authenticates Temporal closure and native resources afresh.
 
 New terminal runs synchronize tracker status and read back assignment, Project
 and claim through the existing tracker helper. Blocked/cancelled outcomes select

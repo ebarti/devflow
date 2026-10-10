@@ -11,6 +11,7 @@ from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal.delivery_execution_registry import OwnershipConflict
 from devflow_temporal.delivery_feature_execution import (
     continue_feature,
+    detail,
     register_worker,
     registry,
     worker_key,
@@ -54,6 +55,8 @@ def recovered_worker(service, monkeypatch):
 def test_public_continuation_settles_recovered_worker_without_changing_budget(recovered_worker):
     store, parent, child, shared, token, command, observed = recovered_worker
     budget = shared.budget(token['issue_id'])
+    projection = detail(store, parent)
+    assert projection['ownership_state'] == 'draining' and projection['can_continue']
     result = continue_feature(store, parent['run_id'], command)
     successor = store.effective_spec(result['run_id'])
     assert successor['feature_delivery']['owner']['generation'] == token['generation'] + 1
@@ -65,6 +68,42 @@ def test_public_continuation_settles_recovered_worker_without_changing_budget(re
     assert previous['state'] == 'finished'
     assert continue_feature(store, parent['run_id'], command) == result
     assert store.submitted_spec(child['run_id']) == child
+    assert not detail(store, parent)['can_continue']
+
+
+@pytest.mark.parametrize('pending', ['parent', 'child', 'cleanup', 'attempt', 'effect',
+                                   'remote-effect', 'generation', 'missing'])
+def test_dashboard_does_not_offer_handoff_with_unsettled_projections(recovered_worker, pending):
+    store, parent, child, shared, token, _, _ = recovered_worker
+    if pending in {'remote-effect', 'generation', 'missing'}:
+        with shared.connect() as db:
+            if pending == 'remote-effect':
+                db.execute('INSERT INTO execution_effects VALUES (?,?,?,?,?,?,?,?,?)',
+                           (token['issue_id'], 'pending', token['generation'], 'publication',
+                            'frozen', '{}', 'pending', None, 'original'))
+            elif pending == 'generation':
+                db.execute('UPDATE execution_workers SET generation=generation+1 '
+                           'WHERE worker_key=?', (worker_key(child['run_id'], token),))
+            else:
+                db.execute('UPDATE execution_workers SET worker_key=? WHERE worker_key=?',
+                           (worker_key('missing-child', token), worker_key(child['run_id'], token)))
+    else:
+        with store._connect() as db:
+            if pending in {'parent', 'child'}:
+                run_id = parent['run_id'] if pending == 'parent' else child['run_id']
+                db.execute('UPDATE delivery_runs SET outcome=NULL WHERE run_id=?', (run_id,))
+            elif pending == 'cleanup':
+                db.execute("UPDATE delivery_runs SET cleanup='unknown' WHERE run_id=?",
+                           (child['run_id'],))
+            elif pending == 'attempt':
+                db.execute("INSERT INTO delivery_attempts(job_key,run_id,role,iteration,"
+                           "candidate_id,state,cleanup) VALUES (? ,?,'verify',0,'fixed',"
+                           "'running','unknown')", ('unfinished', child['run_id']))
+            elif pending == 'effect':
+                db.execute('INSERT INTO delivery_effects VALUES (?,?,?,?,?,?,?)',
+                           ('pending', child['run_id'], 'browser_qa', '{}', 'pending',
+                            None, 'original'))
+    assert detail(store, parent)['can_continue'] is False
 
 
 @pytest.mark.parametrize('failure', ['parent-live', 'child-live', 'attempt', 'outcome', 'effect',
