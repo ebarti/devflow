@@ -701,6 +701,17 @@ class DeliveryStore:
             )
             handle = client.get_workflow_handle(workflow_id or "delivery-" + run_id)
             description = await handle.describe()
+            if description.status == WorkflowExecutionStatus.FAILED and description.close_time:
+                spec = self.effective_spec(run_id)
+                if spec.get("feature_delivery") and not spec.get("feature_worker"):
+                    from .delivery_feature_closure import FailedFeatureCoordinator
+
+                    raise FailedFeatureCoordinator({
+                        "workflow_id": description.id, "execution_run_id": description.run_id,
+                        "closed_at": description.close_time.isoformat(),
+                        "request_digest": await description.memo_value("request_digest", "unknown"),
+                        "recovery_digest": await description.memo_value("recovery_digest", None),
+                    })
             if (
                 description.status != WorkflowExecutionStatus.COMPLETED
                 or not description.close_time
@@ -724,6 +735,10 @@ class DeliveryStore:
                     lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))
                 ).result(timeout=35)
         except Exception as exc:
+            from .delivery_feature_closure import FailedFeatureCoordinator
+
+            if isinstance(exc, FailedFeatureCoordinator):
+                raise
             raise ValueError("continuation predecessor Temporal closure is unproven") from exc
 
     def recover_publication(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:

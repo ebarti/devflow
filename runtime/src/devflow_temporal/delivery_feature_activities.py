@@ -564,7 +564,19 @@ async def delivery_feature_settle_workers(request):
                         # revision. Re-read on the next bounded settlement pass.
                         continue
             else:
-                await asyncio.to_thread(finish_worker, request["spec"], child_id)
+                try:
+                    await asyncio.to_thread(finish_worker, request["spec"], child_id)
+                except (ValueError, OwnershipConflict) as exc:
+                    from temporalio.exceptions import ApplicationError
+
+                    owner = shared.current(token["issue_id"])
+                    if owner and shared.token(owner) == token and owner["state"] == "draining":
+                        raise ApplicationError(
+                            "Worker settlement remains pending: " + str(exc)[:300],
+                            {"owner": token, "worker": child_id},
+                            type="FeatureWorkerSettlementPending", non_retryable=True,
+                        ) from exc
+                    raise
         activity.heartbeat({"stage": "settling_feature_workers", "remaining": len(rows)})
         await asyncio.sleep(5)
     raise OwnershipConflict("worker closure remains unresolved; feature ownership is retained")
