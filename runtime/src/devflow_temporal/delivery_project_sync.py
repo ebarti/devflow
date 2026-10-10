@@ -467,6 +467,17 @@ class ProjectSynchronizer:
             latest = self.selected().get(issue)
             if not latest or self.identity(latest[1]) != identity:
                 raise Superseded("feature owner or revision changed")
+            if feature.get("legacy_publication_binding"):
+                from .delivery_legacy_publication import publication
+
+                # An older publisher can change without advancing the selected
+                # retry's cached version. Fence the live references as well.
+                with store._connect() as db:
+                    target = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                                        (feature["run_id"],)).fetchone()
+                    if (not target or publication(db, target)[1]
+                            != feature["legacy_publication_binding"]):
+                        raise Superseded("legacy publication reference changed")
 
         fence()
         with store._connect() as db:

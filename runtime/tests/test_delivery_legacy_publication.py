@@ -100,6 +100,45 @@ def test_changed_or_resumed_reference_invalidates_bridge_on_next_tick(service, c
     assert result["pull_requests"] == []
 
 
+@pytest.mark.parametrize("change", ["receipt", "publisher_resumed", "retry_resumed"])
+def test_reference_changed_during_mirror_cannot_acknowledge_stale_binding(service, change):
+    store, request, receipt, retry = unpublished_retry(service)
+    remote = Remote()
+    remote.state = "MERGED"
+    sync = ProjectSynchronizer([store], remote)
+    bind(sync, request["run_id"])
+    mirror = remote.mirror
+
+    def changed_during_mirror(feature, fence):
+        if change == "receipt":
+            # A supported writer updates the older publisher without changing
+            # the selected retry's cached feature/version.
+            store.project(request["run_id"], phase="delivered", execution_state="terminal",
+                          event_type="published", message="Updated retained publication receipt",
+                          outcome="published_unmerged",
+                          pull_request={**receipt, "head": "c" * 40})
+        else:
+            # Historical writers predate the bridge and can resume either side.
+            target = request if change == "publisher_resumed" else retry
+            with store._connect() as db:
+                db.execute("UPDATE delivery_runs SET phase='queued',execution_state='running',"
+                           "outcome=NULL WHERE run_id=?", (target["run_id"],))
+        return mirror(feature, fence)
+
+    remote.mirror = changed_during_mirror
+    assert sync.tick() == {}
+    with store._connect() as db:
+        pending = dict(db.execute("SELECT * FROM delivery_project_outbox").fetchone())
+    assert pending["state"] == "pending"
+    assert pending["receipt_json"] is None and pending["checked_at"] is None
+    assert store.detail(retry["run_id"])["feature"]["mirror"]["state"] == "pending"
+    remote.mirror = mirror
+    result = sync.tick()[request["issue_url"]]
+    assert result["status"] == ("Queued" if change == "retry_resumed" else "Blocked")
+    assert "legacy_publication_binding" not in result
+    assert result["mirror"]["state"] == "consistent"
+
+
 def test_later_attempt_does_not_inherit_explicit_tracking_bridge(service):
     store, request, _, retry = unpublished_retry(service)
     remote = Remote()
