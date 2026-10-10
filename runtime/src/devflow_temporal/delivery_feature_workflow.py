@@ -6,6 +6,7 @@ import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.exceptions import ActivityError, ApplicationError
 
 from .contracts import digest
 
@@ -259,9 +260,25 @@ async def coordinate(controller, spec):
     finally:
         # No takeover while a build, check, or publication still has authority.
         # Cancel through the worker's supported update and observe its closure.
-        await controller._activity(
-            "delivery_feature_settle_workers", {"spec": spec, "workers": dict(active)}
-        )
+        try:
+            await controller._activity(
+                "delivery_feature_settle_workers", {"spec": spec, "workers": dict(active)}
+            )
+        except ActivityError as exc:
+            cause = exc.cause
+            if (controller.state.get("outcome") not in {"blocked", "cancelled"}
+                    or not isinstance(cause, ApplicationError)
+                    or cause.type != "FeatureWorkerSettlementPending"
+                    or not cause.details or cause.details[0].get("owner")
+                    != spec["feature_delivery"]["owner"]
+                    or not workflow.patched("feature-stopped-settlement-checkpoint-v1")):
+                raise
+            # Stop local monitors; child cleanup and draining ownership are retained.
+            for task in builds.values():
+                task.cancel()
+            if builds:
+                await asyncio.gather(*builds.values(), return_exceptions=True)
+            return controller.state
         if builds:
             await asyncio.gather(*builds.values(), return_exceptions=True)
         if controller.state.get("outcome"):

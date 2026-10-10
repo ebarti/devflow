@@ -284,6 +284,7 @@ def register_worker(store, parent, spec):
 
 def continue_feature(store, run_id, request):
     from .delivery_config import COMMAND_RE
+    from .delivery_feature_closure import closed_coordinator
 
     if (
         not isinstance(request, dict)
@@ -326,7 +327,7 @@ def continue_feature(store, run_id, request):
         # the same settlement boundary before allowing the next generation.
         from .delivery_feature_activities import finish_worker, stop_feature
 
-        closed = store._completed_temporal_result(run_id)
+        closed = closed_coordinator(store, run_id)
         execution = store.effective_spec(run_id)
         with shared.connect() as db:
             workers = [dict(worker) for worker in db.execute(
@@ -342,11 +343,14 @@ def continue_feature(store, run_id, request):
                                             workflow_id=store.active_workflow_id(child_id))
             finish_worker(execution, child_id)
         stop_feature(execution, {'state': closed['result'],
-                                 'reconciled_workers': [w['worker_key'] for w in workers]})
+                                 'reconciled_workers': [w['worker_key'] for w in workers],
+                                 **({'failed_coordinator_closure': {
+                                     key: value for key, value in closed.items() if key != 'result'
+                                 }} if closed.get('workflow_status') == 'FAILED' else {})})
         current = shared.current(token['issue_id'])
     if current is None or shared.token(current) != token or current["state"] != "stopped":
         raise OwnershipConflict("feature workers or effects have not reached a safe handoff")
-    store._completed_temporal_result(run_id)
+    closed_coordinator(store, run_id)
     fields = {
         "work_id",
         "issue_url",
