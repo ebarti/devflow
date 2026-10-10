@@ -124,9 +124,12 @@ def snapshot(store, run_id, kind=KIND):
                              or (spec['provider'] != 'fake' and spec['policy'].get(
                                  'execution_backend') != 'native-macos'))):
         raise ValueError('controller retry cannot change its original native repair ceiling')
-    prelaunch = bool(kind == PRELAUNCH_KIND and previous and previous.get('kind') == KIND
-                    and spec.get('gate_retry_stage') == 'published'
-                    and spec.get('gate_retry_generation') == 1)
+    browser_prelaunch = bool(kind == PRELAUNCH_KIND
+                             and state.get('error') == 'browser QA child cleanup is unknown')
+    prelaunch = browser_prelaunch or bool(
+        kind == PRELAUNCH_KIND and previous and previous.get('kind') == KIND
+        and spec.get('gate_retry_stage') == 'published'
+        and spec.get('gate_retry_generation') == 1)
     report_retry = bool(kind == KIND and previous
                         and previous.get('kind') in {KIND, PRELAUNCH_KIND, CI_KIND}
                         and spec.get('gate_retry_stage') in {None, 'published', 'ci'})
@@ -140,6 +143,8 @@ def snapshot(store, run_id, kind=KIND):
             'finalized_checkpoint'):
         published_after_recovery = False
     while history:
+        if browser_prelaunch and history.get('kind') == PRELAUNCH_KIND:
+            raise ValueError('this run already received its bounded prelaunch retry')
         if report_retry and history.get('execution_spec', {}).get('gate_retry_stage') == 'report':
             raise ValueError('this run already received its bounded report assessment retry')
         if history.get('kind') == KIND:
@@ -169,6 +174,7 @@ def snapshot(store, run_id, kind=KIND):
                    and any(r.get('passed') is False and r.get('cleanup') == 'confirmed'
                            for r in precheck.get('results', []))) if unpublished else bool(failed)
     prelaunch_observation = None
+    browser_observation = None
     report_observation = None
     controller_observation = None
     if controller_only:
@@ -181,7 +187,15 @@ def snapshot(store, run_id, kind=KIND):
             raise ValueError('report recovery lost its passed check projection')
         report_observation = missing_planned_report(spec, state, broker)
         failed_gate = True
-    if prelaunch:
+    if browser_prelaunch:
+        from .delivery_browser_prelaunch import observe
+
+        if state.get('checks') != json.loads(row['checks_json'] or '{}'):
+            raise ValueError('browser prelaunch lost its original check projection')
+        browser_observation = observe(spec, state, effects)
+        prelaunch_observation = browser_observation['resources']
+        failed_gate = True
+    elif prelaunch:
         from .delivery_check_prelaunch import observe
 
         prelaunch_observation = observe(spec, state, previous)
@@ -224,7 +238,9 @@ def snapshot(store, run_id, kind=KIND):
                                         if report_retry
                                         else {'required CI did not confirm this PR head'
                                               if ci_only
-                                      else 'local check process cleanup is unknown' if prelaunch
+                                      else 'browser QA child cleanup is unknown'
+                                      if browser_prelaunch else
+                                      'local check process cleanup is unknown' if prelaunch
                                       else unpublished_error
                                       if unpublished else state.get('error') if controller_only
                                       else 'repair limit exhausted'})
@@ -235,7 +251,8 @@ def snapshot(store, run_id, kind=KIND):
             or not implementation or (implementation.get('status') != 'pass'
                                       and not controller_only) or not failed_gate
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
-            or any(e['state'] != 'complete' or not e['observed_json'] for e in effects)
+            or any((e['state'] != 'complete' or not e['observed_json'])
+                   and e != (browser_observation or {}).get('pending_effect') for e in effects)
             or (claim is not None and not prelaunch)):
         raise ValueError('gate retry requires a closed, finalized failed gate and released claim')
     frozen = json.loads(row['candidate_json'])
@@ -284,9 +301,13 @@ def snapshot(store, run_id, kind=KIND):
             'previous': previous, 'prior_gate': prior_gate,
             **({'report_observation': report_observation} if report_observation else {}),
             **({'controller_observation': controller_observation} if controller_only else {}),
+            **({'browser_prelaunch_observation': browser_observation}
+               if browser_observation else {}),
             'stage': 'report' if report_retry else 'ci' if ci_only else 'published'
                      if published_after_recovery or prelaunch or controller_only else None,
-            'generation': 2 if renewed or prelaunch else 1}
+            'generation': (2 if renewed or (prelaunch and not browser_prelaunch)
+                           or (browser_prelaunch and spec.get('gate_retry_stage') == 'published')
+                           else 1)}
 
 
 def admit(store, run_id, payload, *, preflight=False):
@@ -403,6 +424,20 @@ def admit(store, run_id, payload, *, preflight=False):
                 raise ValueError('gate retry admission lost its stopped projection')
             if work_binding(store, spec, db) != seal['work_binding']:
                 raise ValueError('gate retry admission lost issue ownership')
+            if observation := seal.get('browser_prelaunch_observation'):
+                from .delivery_browser_prelaunch import resolved_effect
+
+                pending = observation['pending_effect']
+                current_effect = db.execute('SELECT * FROM delivery_effects WHERE effect_key=?',
+                                            (pending['effect_key'],)).fetchone()
+                if not current_effect or dict(current_effect) != pending:
+                    raise ValueError('browser prelaunch effect changed before resolution')
+                # Finish the authenticated no-launch intent as a failure, never
+                # an assessment pass. Its original bytes remain in the admission.
+                db.execute("UPDATE delivery_effects SET state='complete',observed_json=?,"
+                           'updated_at=? WHERE effect_key=?',
+                           (canonical_json(resolved_effect(observation, seal['candidate'])),
+                            store.state.now(), pending['effect_key']))
             store.state.claim_work(db, spec['work_id'], f'external:devflow:{run_id}',
                                    store.config.dashboard_url)
             if seal['prior_gate'] is None:
@@ -466,6 +501,22 @@ def readback(store, spec, recovery):
     if effective != spec or DeliveryBroker(store, spec).candidate() != recovery['candidate']:
         raise ValueError('gate retry source or execution authority changed')
     broker = DeliveryBroker(store, spec)
+    if observation := recovery['seal'].get('browser_prelaunch_observation'):
+        from .delivery_browser_prelaunch import observe, resolved_effect
+
+        with store._connect() as db:
+            effect = db.execute('SELECT * FROM delivery_effects WHERE effect_key=?',
+                               (observation['pending_effect']['effect_key'],)).fetchone()
+        pending = observation['pending_effect']
+        if (not effect or any(effect[key] != pending[key] for key in pending
+                              if key not in {'state', 'observed_json', 'updated_at'})
+                or effect['state'] != 'complete' or json.loads(effect['observed_json'])
+                != resolved_effect(observation, recovery['seal']['candidate'])):
+            raise ValueError('browser prelaunch resolution changed after admission')
+        if observe(recovery['seal']['original_spec'], recovery['state'],
+                   recovery['seal']['effects'], resource_spec=spec,
+                   evidence_root=Path(observation['evidence_root'])) != observation:
+            raise ValueError('browser prelaunch preserved evidence changed after admission')
     if recovery['kind'] == CONTROLLER_KIND:
         from .delivery_controller_retry import observe
 
