@@ -1061,15 +1061,13 @@ class DeliveryBroker:
         """Prepare only accepted locked dependencies before a role executes probes."""
         if self.candidate() != candidate:
             raise ValueError("implementation preparation candidate is stale")
+        from .delivery_configured_resources import implementation_prerequisites
         from .delivery_plan_checks import planned_checks
 
         folder = self.evidence_dir / "implementation-preparation" / str(iteration)
         planned = planned_checks(self.spec, self.checkout, folder, preparation=True)
         dependencies = [c for c in planned if c['id'].startswith('planned-python-dependencies-')]
-        if any('/store' in c['argv']
-               for c in self.spec['policy'].get('prepublish_checks', [])):
-            dependencies = [c for c in self.spec['policy'].get('prepublish_checks', [])
-                            if '/store' in c['argv']] + dependencies
+        dependencies = implementation_prerequisites(self.spec) + dependencies
         from .delivery_resources import RunResources
 
         resources = RunResources(self.spec)
