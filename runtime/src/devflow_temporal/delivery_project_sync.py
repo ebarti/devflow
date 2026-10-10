@@ -390,8 +390,11 @@ class ProjectSynchronizer:
 
     @staticmethod
     def identity(feature: dict) -> str:
+        # A receipt acknowledges a committed event, including same-status
+        # finalization and explicit PR readback after remote Project drift.
         return digest({key: feature[key] for key in
-                       ("issue", "run_id", "source", "status", "binding", "legacy_tracking")})
+                       ("issue", "run_id", "source", "version", "status", "binding",
+                        "legacy_tracking")})
 
     @contextmanager
     def handoff(self, issue: str):
@@ -454,7 +457,7 @@ class ProjectSynchronizer:
         def fence():
             latest = self.selected().get(issue)
             if not latest or self.identity(latest[1]) != identity:
-                raise Superseded("feature owner or status changed")
+                raise Superseded("feature owner or revision changed")
 
         fence()
         with store._connect() as db:

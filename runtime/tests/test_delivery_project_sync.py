@@ -610,6 +610,83 @@ def test_explicit_refresh_is_durable_and_preserves_execution_and_daily_schedule(
         assert datetime.fromisoformat(due) == stamp + timedelta(days=1)
 
 
+def test_unchanged_pr_refresh_reconciles_project_drift_before_daily_deadline(service):
+    store, request, receipt = published(service)
+    remote = Remote()
+    remote.state = "MERGED"
+    stamp = datetime(2026, 10, 10, tzinfo=UTC)
+    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    project = {"status": "Merged"}
+    mirror = remote.mirror
+
+    def apply(feature, fence):
+        result = mirror(feature, fence)
+        project["status"] = result["status"]
+        return result
+
+    remote.mirror = apply
+    first = sync.tick()[request["issue_url"]]
+    project["status"] = "Done"  # An issue-close automation changes the Project afterward.
+    stamp += timedelta(minutes=1)
+    sync.request_pr_refresh([receipt["url"]])
+    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, clock=lambda: stamp)
+    after = restarted.tick()[request["issue_url"]]
+    assert after["status"] == first["status"] == project["status"] == "Merged"
+    assert after["version"] > first["version"]
+    assert after["mirror"]["checked_at"] == stamp.isoformat()
+    assert after["mirror"]["next_attempt_at"] == (stamp + timedelta(days=1)).isoformat()
+    restarted.tick()
+    assert len(remote.reads) == len(remote.writes) == 2
+
+
+def test_same_status_event_requires_new_readback_with_durable_failure_retry(service):
+    store, request, _ = published(service)
+    remote = Remote()
+    remote.state = "MERGED"
+    stamp = datetime(2026, 10, 10, tzinfo=UTC)
+    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    first = sync.tick()[request["issue_url"]]
+    # The final execution event follows PR observation and issue closure.
+    store.project(request["run_id"], phase="merged", execution_state="terminal",
+                  event_type="merged", message="Issue closure confirmed", outcome="merged")
+    remote.failure = True
+    assert sync.next_delay() == 15
+    pending = sync.tick()[request["issue_url"]]
+    assert pending["status"] == first["status"] == "Merged"
+    assert pending["mirror"]["state"] == "pending"
+    assert pending["project_receipt"] is None
+    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, clock=lambda: stamp)
+    restarted.tick()
+    assert len(remote.writes) == 2
+    stamp += timedelta(seconds=15)
+    remote.failure = False
+    after = restarted.tick()[request["issue_url"]]
+    assert after["mirror"]["state"] == "consistent"
+    assert after["version"] > first["version"]
+    assert len(remote.reads) == 1 and len(remote.writes) == 3
+
+
+def test_same_status_revision_during_mirror_cannot_acknowledge_old_event(service):
+    store, request, _ = published(service)
+    remote = Remote()
+    remote.state = "MERGED"
+    mirror = remote.mirror
+
+    def superseded(feature, fence):
+        result = mirror(feature, fence)
+        store.project(request["run_id"], phase="merged", execution_state="terminal",
+                      event_type="merged", message="Issue closure confirmed", outcome="merged")
+        return result
+
+    remote.mirror = superseded
+    sync = ProjectSynchronizer([store], remote)
+    assert sync.tick() == {}
+    remote.mirror = mirror
+    result = sync.tick()[request["issue_url"]]
+    assert result["mirror"]["state"] == "consistent"
+    assert remote.writes == ["Merged", "Merged"]
+
+
 def test_refresh_rejects_unbound_urls_before_queueing_any_request(service):
     store, _, receipt = published(service)
     remote = Remote()

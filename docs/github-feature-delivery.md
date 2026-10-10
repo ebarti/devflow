@@ -110,6 +110,10 @@ already bound to the configured deliveries. It durably queues a readback and
 wakes the independent service; `queued` is not confirmation of remote state or
 Project synchronization. If the service is unavailable, its next startup consumes
 the request. Read the run's feature status and mirror receipt to confirm completion.
+Each new feature revision requires a fresh Project readback, even when the desired
+status is unchanged. For example, refresh after closing a merged issue to reconcile
+a Project automation that changed its status to `Done`. Repeated consumer ticks
+without a new revision retain the existing receipt and daily drift deadline.
 It does not reopen execution, merge a PR, or change the product repair allowance.
 
 ## Upgrade and historical custody
