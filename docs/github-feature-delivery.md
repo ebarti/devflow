@@ -116,6 +116,25 @@ a Project automation that changed its status to `Done`. Repeated consumer ticks
 without a new revision retain the existing receipt and daily drift deadline.
 It does not reopen execution, merge a PR, or change the product repair allowance.
 
+Historical runs can include an unpublished retry that failed before feature work,
+while an earlier run owns the issue's actual PR. Bind tracking to that exact known
+publisher explicitly:
+
+```sh
+devflow-project-sync --config /absolute/path/to/synchronizer.json \
+  --bind-legacy-run run-known-publication
+```
+
+This bridge requires an unambiguous stopped legacy publisher and a stopped,
+unpublished selected attempt for the same issue in the same configured store.
+All executions for that issue must be stopped legacy runs. It records a reference
+to the exact publication receipt and triggers asynchronous readback. The feature
+view names both the selected attempt and `legacy_publication_binding.run_id`;
+original run inputs, outcomes, PR receipts and repair counts remain unchanged.
+It neither searches GitHub for another PR nor grants continuation or native-stack
+adoption authority. A resumed execution, changed publication receipt, or later
+attempt invalidates use of the bridge. Native feature custody takes precedence.
+
 ## Upgrade and historical custody
 
 Stop admission and establish that all participating runtime workflows are idle.

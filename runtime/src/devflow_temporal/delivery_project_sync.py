@@ -313,6 +313,8 @@ class ProjectSynchronizer:
         return selected
 
     def observe_prs(self) -> None:
+        from .delivery_legacy_publication import publication
+
         references: dict[str, list[tuple[DeliveryStore, str]]] = {}
         saved = {}
         inputs: dict[str, set[tuple[str, str, str]]] = {}
@@ -321,9 +323,16 @@ class ProjectSynchronizer:
         for store in self.stores:
             source = str(store.config.tracking_db.resolve())
             with store._connect() as db:
-                for row in db.execute("SELECT run_id,pr_json,issue_url FROM delivery_runs "
-                                      "WHERE pr_json IS NOT NULL"):
-                    receipt = json.loads(row["pr_json"])
+                db.execute("BEGIN IMMEDIATE")
+                # Old runtime writers do not know the tracking bridge. Revalidate
+                # its references before consuming observations or acknowledging it.
+                for row in db.execute("SELECT projection_run_id "
+                                      "FROM delivery_legacy_publication_bindings").fetchall():
+                    transition(db, store.config, row[0])
+                for row in db.execute("SELECT * FROM delivery_runs"):
+                    receipt, _binding = publication(db, row)
+                    if not receipt:
+                        continue
                     heads = {member["url"]: member.get("head") or "" for member in
                              (receipt.get("pull_requests") or [receipt]) if member.get("url")}
                     for url in publication_urls(receipt):
@@ -533,14 +542,16 @@ def main() -> None:
     mode.add_argument("--once", action="store_true")
     mode.add_argument("--refresh-pr", action="append", metavar="URL",
                       help="queue a readback of an already-bound PR; repeat for several PRs")
+    mode.add_argument("--bind-legacy-run", metavar="RUN_ID",
+                      help="bind tracking to one explicit stopped legacy publication run")
     parser.add_argument("--activation-file", type=Path)
     parser.add_argument("--activation-token")
     parser.add_argument("--expected-revision")
     parser.add_argument("--config-sha256")
     args = parser.parse_args()
     if args.activation_file:
-        if args.refresh_pr:
-            raise ValueError("managed consumer activation cannot request PR refreshes")
+        if args.refresh_pr or args.bind_legacy_run:
+            raise ValueError("managed consumer activation cannot issue tracking commands")
         if not all((args.activation_token, args.expected_revision, args.config_sha256)):
             raise ValueError("managed synchronization requires complete activation identity")
         while True:
@@ -567,6 +578,11 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     if args.refresh_pr:
         print(canonical_json(synchronizer.request_pr_refresh(args.refresh_pr)))
+        return
+    if args.bind_legacy_run:
+        from .delivery_legacy_publication import bind
+
+        print(canonical_json(bind(synchronizer, args.bind_legacy_run)))
         return
     with synchronizer.ownership():
         logger.info("Project sync active: event notifications; PR interval=%s; drift interval=%s",
