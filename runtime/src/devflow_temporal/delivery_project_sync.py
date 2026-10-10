@@ -256,17 +256,29 @@ class ProjectSynchronizer:
             yield
 
     def selected(self) -> dict:
+        from .delivery_feature_execution import registry
+        from .delivery_features import ownership_order
+
         selected = {}
         for store in self.stores:
             with store._connect() as db:
                 for row in db.execute("SELECT * FROM delivery_features"):
                     value = {**json.loads(row["payload_json"]), "version": row["version"],
                              "source": str(store.config.tracking_db.resolve())}
-                    prior = selected.get(value["issue"])
-                    if not prior or (value["admitted_at"], value["run_id"], value["source"]) > (
-                        prior[1]["admitted_at"], prior[1]["run_id"], prior[1]["source"]
-                    ):
-                        selected[value["issue"]] = (store, value)
+                    owner = value.get("execution_owner")
+                    if owner:
+                        shared = registry(store.spec(value["run_id"]))
+                        current = shared.current(owner["issue_id"])
+                        if current is None or shared.token(current) != owner:
+                            continue
+                    projections = [value, *[
+                        {**value, **stream, "feature_issue": value["issue"], "workstreams": []}
+                        for stream in value.get("workstreams", [])
+                    ]]
+                    for projection in projections:
+                        prior = selected.get(projection["issue"])
+                        if not prior or ownership_order(projection) > ownership_order(prior[1]):
+                            selected[projection["issue"]] = (store, projection)
         return selected
 
     def observe_prs(self) -> None:

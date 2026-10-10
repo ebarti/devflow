@@ -61,6 +61,25 @@ def test_public_resume_is_finite_idempotent_and_retains_terminal_failure(stopped
         store.continue_repair('run-1', {**command, 'additional_iterations': 1})
 
 
+@pytest.mark.parametrize('feature_worker', [False, True])
+def test_cancelled_worker_requires_the_feature_continuation_contract(stopped, monkeypatch,
+                                                                   feature_worker):
+    store, _, state, _ = stopped
+    original = store.effective_spec('run-1')
+    if feature_worker:
+        original['feature_worker'] = {'kind': 'build', 'chunk_id': 'model'}
+    monkeypatch.setattr(store, 'effective_spec', lambda _: original)
+    state.update(phase='cancelled', outcome='cancelled', execution_state='terminal')
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET phase='cancelled',outcome='cancelled',"
+                   "execution_state='terminal' WHERE run_id='run-1'")
+    if feature_worker:
+        assert resume.snapshot(store, 'run-1')['state']['outcome'] == 'cancelled'
+    else:
+        with pytest.raises(ValueError, match='closed finalized delivery'):
+            resume.snapshot(store, 'run-1')
+
+
 @pytest.mark.parametrize('foreign', [False, True])
 def test_original_admission_authenticates_default_workflow_identity(stopped, monkeypatch, foreign):
     store, _, _, command = stopped

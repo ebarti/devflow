@@ -8,7 +8,7 @@ export function laneFor(run: RunSummary): typeof lanes[number] {
     const featureLanes: Record<string, typeof lanes[number]> = {
       Queued: 'Queued', Planning: 'Planning', 'In progress': 'Implementation',
       'In review': 'Review', Validating: 'QA & CI', 'Awaiting merge': 'Awaiting merge',
-      Merging: 'Tracking', Merged: 'Merged', Blocked: 'Needs attention',
+      Merging: 'Tracking', 'Waiting for GitHub': 'Tracking', Merged: 'Merged', Blocked: 'Needs attention',
       Cancelled: 'Needs attention', 'PR closed': 'Needs attention', 'Needs validation': 'Needs attention',
     }
     return featureLanes[run.feature.status] ?? 'Needs attention'

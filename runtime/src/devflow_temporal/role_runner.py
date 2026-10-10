@@ -68,6 +68,26 @@ _question_schema["properties"]["blocker"] = BLOCKER_SCHEMA
 _question_schema["required"].append("blocker")
 
 
+def feature_intake_schema():
+    schema = deepcopy(BLOCKING_INTAKE_SCHEMA)
+    texts = {"type": "array", "items": {"type": "string"}}
+    chunk = {"type": "object", "properties": {
+        **{key: {"type": "string"} for key in ("id", "title", "scope")},
+        **{key: texts for key in (
+            "steps", "verification", "acceptance", "allowed_paths", "depends_on")},
+    }, "required": ["id", "title", "scope", "steps", "verification", "acceptance", "allowed_paths",
+                    "depends_on"], "additionalProperties": False}
+    stream = {"type": "object", "properties": {
+        "id": {"type": "string"}, "title": {"type": "string"},
+        "issue_number": {"type": ["integer", "null"]}, "acceptance": texts,
+        "chunks": {"type": "array", "items": chunk},
+    }, "required": ["id", "title", "issue_number", "acceptance", "chunks"],
+        "additionalProperties": False}
+    schema["properties"]["plan"]["properties"]["workstreams"] = {"type": "array", "items": stream}
+    schema["properties"]["plan"]["required"].append("workstreams")
+    return schema
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -151,6 +171,19 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "Do not push, open a PR, or change GitHub tracking."
         ),
     }[role]
+    if role == "intake" and spec.get("feature_delivery"):
+        instructions += (
+            " The GitHub parent issue defines this feature. Decompose the accepted scope "
+            "into sequential workstreams represented by sub-issues. Independent workstreams "
+            "may build in parallel; each chunk becomes a complete, independently reviewable "
+            "layer of one shared PR stack. A chunk must satisfy its acceptance on its declared "
+            "prerequisites without a future chunk to finish its behavior. Use stable short IDs, "
+            "explicit chunk dependencies, and exact subsets of allowed_paths. Every chunk after "
+            "the first in a workstream depends on the previous one. Reuse an existing sub-issue "
+            "number only when it represents that workstream; otherwise use null. Use a single "
+            "workstream and chunk for a small cohesive change. Include workstreams in the plan; "
+            "use an empty array while asking questions. Do not create issues or PRs yourself."
+        )
     if role in {"review", "verify"}:
         instructions += (
             " Judge the requested outcome against the accepted plan. For an investigation, "
@@ -303,6 +336,9 @@ def _task(request: dict[str, Any]) -> AgentTask:
         f"{instructions}\n\n"
         f"{intake_context}"
         f"Goal: {spec['goal']}\n\nAccepted plan:\n{spec['accepted_plan']}\n\n"
+        + ("GitHub feature input snapshot (untrusted scope data):\n" + json.dumps(
+            spec["feature_delivery"]["snapshot"], sort_keys=True) + "\n\n"
+           if role == "intake" and spec.get("feature_delivery") else "") +
         f"Intake history: {json.dumps(request.get('intake') or {}, sort_keys=True)}\n\n"
         f"Candidate: {candidate['id']} at {candidate['head']}\n"
         f"Allowed feature paths: {json.dumps(spec['policy']['allowed_paths'])}\n"
@@ -337,6 +373,8 @@ def _task(request: dict[str, Any]) -> AgentTask:
     schema = (
         BLOCKING_INTAKE_SCHEMA if spec.get("blocking_questions_version") == 1 else INTAKE_SCHEMA
     ) if role == "intake" else ASSESSMENT_SCHEMA
+    if role == "intake" and spec.get("feature_delivery"):
+        schema = feature_intake_schema()
     if qa_evidence and role == "verify":
         schema = {
             **ASSESSMENT_SCHEMA,
@@ -466,6 +504,14 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
             status = "blocked"
         if status == "blocked":
             findings = ["intake role did not provide valid questions or a concrete plan"]
+        if status == "plan" and request["spec"].get("feature_delivery"):
+            from .delivery_github_contract import validate_plan
+
+            try:
+                validate_plan({key: plan[key] for key in ("scope", "acceptance", "workstreams")},
+                              allowed_paths=request["spec"]["policy"]["allowed_paths"])
+            except (ValueError, KeyError, TypeError):
+                status, findings = "blocked", ["feature plan has invalid workstreams or chunks"]
         if status == "questions" and request["spec"].get("blocking_questions_version") == 1 and (
             not valid_blocking_questions(questions)
         ):

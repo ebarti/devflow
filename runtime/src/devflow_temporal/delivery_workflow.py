@@ -205,10 +205,24 @@ class DeliveryWorkflow:
                     ],
                 ),
             }
-        elif name == "delivery_merge":
+        elif name in {"delivery_merge", "delivery_feature_merge"}:
             options = {"retry_policy": RetryPolicy(maximum_attempts=3),
                        "heartbeat_timeout": timedelta(seconds=30),
                        "schedule_to_close_timeout": timedelta(minutes=15)}
+        elif name == "delivery_feature_settle_workers":
+            options = {"retry_policy": RetryPolicy(maximum_attempts=3),
+                       "heartbeat_timeout": timedelta(seconds=30),
+                       "schedule_to_close_timeout": timedelta(hours=3)}
+        elif name == "delivery_feature_settle_effects":
+            options = {"retry_policy": RetryPolicy(maximum_attempts=3),
+                       "heartbeat_timeout": timedelta(seconds=30),
+                       "schedule_to_close_timeout": timedelta(hours=2)}
+        elif name.startswith("delivery_feature_"):
+            options = {"retry_policy": RetryPolicy(
+                maximum_attempts=3, initial_interval=timedelta(seconds=1),
+                maximum_interval=timedelta(seconds=10),
+                non_retryable_error_types=["ValueError", "TypeError", "OwnershipConflict"],
+            )}
         elif patient_ci:
             options = {
                 "heartbeat_timeout": timedelta(seconds=30),
@@ -390,7 +404,8 @@ class DeliveryWorkflow:
                 "event": event, "message": message, "phase": self.state["phase"],
                 "execution_state": self.state["execution_state"],
                 "outcome": self.state["outcome"], "error": self.state.get("error"),
-                "status": ("done" if spec.get("merge_version") == 1 else "in-review")
+                "status": ("done" if spec.get("merge_version") == 1
+                           or self.state["phase"] == "merged" else "in-review")
                 if event == "delivered" else "blocked",
                 "release": release, "reason": self.state.get("error") or message,
                 "cycles": 0, "attempts": 0, "waiting": False,
@@ -425,6 +440,11 @@ class DeliveryWorkflow:
                 "key": f"{event}:{self.state['iteration']}:{self.state['revision']}",
             },
         )
+        if (event in {"delivered", "blocked", "cancelled"}
+                and spec.get("feature_delivery") and not spec.get("feature_worker")
+                and not getattr(self, "feature_coordinating", False)):
+            await self._activity("delivery_feature_stop", {
+                "spec": spec, "checkpoint": {"state": self.state, "completed_chunks": []}})
 
     async def _finish_terminal_tracker(self, spec: dict[str, Any], checkpoint: dict) -> bool:
         """Keep the original execution open; each reconciliation cycle is finite."""
@@ -1034,6 +1054,15 @@ class DeliveryWorkflow:
             if accepted_spec is None:
                 return self.state
             spec = accepted_spec
+        if spec.get("feature_delivery") and not spec.get("feature_worker"):
+            from .delivery_feature_workflow import coordinate
+
+            self.feature_coordinating = True
+            return await coordinate(self, spec)
+        if spec.get("feature_worker", {}).get("kind") == "build":
+            from .delivery_feature_workflow import run_build
+
+            return await run_build(self, spec)
         self.state["phase"] = "tracker_start"
         self.state["revision"] += 1
         await self._project(spec, "tracker_start", "Claimed issue entering In progress")
@@ -1526,6 +1555,13 @@ class DeliveryWorkflow:
         self.state['revision'] += 1
         await self._project(spec, 'stopped_resume_started',
                             'Resuming original delivery with earlier failures retained')
+        if spec.get("feature_worker", {}).get("kind") == "build":
+            from .delivery_feature_workflow import run_build
+
+            return await run_build(self, spec,
+                                   start_iteration=recovery['state']['iteration'] + 1,
+                                   session=recovery['session_id'],
+                                   maximum_iteration=recovery['maximum_iteration'])
         return await self._run_iterations(
             spec, start_iteration=recovery['state']['iteration'] + 1,
             prior_implementer_session=recovery['session_id'],
@@ -2340,6 +2376,8 @@ class DeliveryWorkflow:
         else:
             if answer not in pending["options"] or response is not None:
                 raise ApplicationError("answer is outside the decision options", non_retryable=True)
+            if pending.get("kind") == "merge":
+                self.feature_merge_authorization = dict(request)
             self.decision_answer = answer
         self.state["decision"] = None
         self.state["revision"] += 1

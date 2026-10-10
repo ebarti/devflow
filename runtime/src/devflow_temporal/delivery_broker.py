@@ -165,6 +165,7 @@ class DeliveryBroker:
 
     def prepare(self) -> dict[str, Any]:
         key = f"prepare:{self.spec['run_id']}"
+        local_branch_name = self.spec.get("local_branch", self.spec["branch"])
         request = {
             "base_sha": self.spec["base_sha"],
             "branch": self.spec["branch"],
@@ -186,7 +187,7 @@ class DeliveryBroker:
         if self.checkout.exists():
             if _git(self.checkout, "rev-parse", "--show-toplevel") != str(self.checkout):
                 raise RuntimeError("owned checkout path was replaced")
-            if _git(self.checkout, "branch", "--show-current") != self.spec["branch"]:
+            if _git(self.checkout, "branch", "--show-current") != local_branch_name:
                 raise RuntimeError("owned checkout branch changed")
         else:
             local_branch = subprocess.run(
@@ -197,7 +198,7 @@ class DeliveryBroker:
                     "show-ref",
                     "--verify",
                     "--quiet",
-                    f"refs/heads/{self.spec['branch']}",
+                    f"refs/heads/{local_branch_name}",
                 ],
                 check=False,
             )
@@ -208,7 +209,7 @@ class DeliveryBroker:
                 "worktree",
                 "add",
                 "-b",
-                self.spec["branch"],
+                local_branch_name,
                 str(self.checkout),
                 self.spec["base_sha"],
             )
@@ -216,6 +217,14 @@ class DeliveryBroker:
             resources.created(self.checkout)
         recovery = self.spec["policy"].get("recovery")
         provenance = self._recover(recovery) if recovery else None
+        if self.spec.get("feature_worker", {}).get("previous_publication"):
+            from .delivery_feature_activities import integrate_previous
+
+            integrate_previous(self)
+        elif self.spec.get("feature_worker", {}).get("seed"):
+            from .delivery_feature_activities import apply_seed
+
+            apply_seed(self)
         candidate = self.candidate()
         continuation = self.spec.get("continuation")
         if continuation:
@@ -377,6 +386,21 @@ class DeliveryBroker:
         if _git(self.checkout, 'rev-parse', 'HEAD') != expected:
             _git(self.checkout, 'reset', '--soft', expected)
         return self.candidate()
+
+    def is_imported_feature_candidate(self, candidate: dict[str, Any]) -> bool:
+        """A completed chunk import may need validation without additional edits."""
+        worker = self.spec.get("feature_worker", {})
+        if (worker.get("kind") != "chunk"
+                or not (worker.get("seed") or worker.get("previous_publication"))):
+            return False
+        with self.store._connect() as db:
+            row = db.execute(
+                "SELECT observed_json FROM delivery_effects "
+                "WHERE effect_key=? AND run_id=? AND kind='prepare' AND state='complete'",
+                ("prepare:" + self.spec["run_id"], self.spec["run_id"]),
+            ).fetchone()
+        return bool(row and row[0] and json.loads(row[0]).get("candidate") == candidate
+                    and not _git(self.checkout, "ls-files", "-u"))
 
     def gate_checkout(self, role: str, iteration: int, candidate: dict[str, Any]) -> Path:
         if role not in {"review", "verify"}:
@@ -1255,6 +1279,19 @@ class DeliveryBroker:
         return raw.removeprefix("origin/")
 
     def _read_owned_pr(self) -> dict[str, Any] | None:
+        if self.spec.get("feature_worker", {}).get("kind") == "chunk":
+            from .delivery_feature_publication import owned_pr_number
+
+            number = owned_pr_number(self.spec)
+            if number is not None:
+                found = json.loads(_run([
+                    "gh", "pr", "view", str(number), "--repo", self.spec["github_repo"], "--json",
+                    "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title",
+                ], timeout=60))
+                if (found["number"] != number or found["headRefName"] != self.spec["branch"]
+                        or found["isDraft"] or found["state"] != "OPEN"):
+                    raise ValueError("recorded chunk PR is no longer the owned open publication")
+                return found
         try:
             output = _run(
                 [

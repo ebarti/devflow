@@ -92,6 +92,10 @@ class DeliveryClient:
     def decision(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/decision", payload)
 
+    def continue_feature(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/continue-feature", payload)
+
     def cancel(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/cancel", payload)
 

@@ -19,7 +19,10 @@ def build_server(config_path: Path) -> FastMCP:
         instructions=(
             "Discover configured repository keys and base refs with get_service before submission. "
             "The local service owns roles, planning and authorized GitHub delivery through an "
-            "unmerged PR. Use status/evidence on request; dashboard SSE supplies progress. "
+            "unmerged PR or one feature-owned stack. In feature mode GitHub owns the parent "
+            "issue, sub-issues and accepted plan; continue_feature resumes stopped ownership "
+            "without a replacement stack. Use merge_feature only on an explicit merge instruction. "
+            "Use status/evidence on request; dashboard SSE supplies progress. "
             "Preserve the original goal. Detailed or multi-sentence goals require a separate "
             "publication_summary describing the actual change: a single line, at most 120 "
             "characters including its Conventional Commit type, without extra sentences or "
@@ -85,8 +88,31 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool(annotations=write)
     def answer_decision(run_id: str, request_json: str) -> dict:
-        """Answer a question or accept/change a plan with command ID and revisions."""
+        """Answer a question, review a plan, or authorize the recorded feature merge."""
         return client(config_path).decision(run_id, json.loads(request_json))
+
+    @server.tool(annotations=write)
+    def continue_feature(run_id: str, request_json: str) -> dict:
+        """Continue a stopped feature's exact plan and stack under a successor run.
+
+        Supply command_id and expected_revision from the current projection.
+        Ownership must be stopped with workers/effects settled. Earlier repair
+        cycles and published PRs remain attached to the same GitHub feature.
+        """
+        return client(config_path).continue_feature(run_id, json.loads(request_json))
+
+    @server.tool(annotations=write)
+    def merge_feature(run_id: str, request_json: str) -> dict:
+        """Merge on explicit user instruction using the pending merge decision's revisions.
+
+        Read get_run and copy decision_id, decision_revision, candidate_revision,
+        and protocol revision as expected_revision. Add command_id and answer='merge'.
+        The service rechecks the recorded stack, native gates and GitHub checks.
+        """
+        request = json.loads(request_json)
+        if request.get("answer") != "merge":
+            raise ValueError("merge_feature requires the explicit merge decision")
+        return client(config_path).decision(run_id, request)
 
     @server.tool(annotations=ToolAnnotations(
         readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True

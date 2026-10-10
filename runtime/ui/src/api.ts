@@ -136,6 +136,8 @@ export const api = {
   },
   newRun: async (body: NewRunRequest): Promise<{ run_id: string; dashboard_url: string; existing: boolean; phase: string }> =>
     command('/api/runs', body),
+  continueFeature: async (runId: string, body: { command_id: string; expected_revision: number }): Promise<{ run_id: string; phase: string }> =>
+    command(`/api/runs/${encodeURIComponent(runId)}/continue-feature`, body),
   answer: async (runId: string, body: { command_id: string; expected_revision: number; decision_id: string; decision_revision: number; candidate_revision: number; answer: string; response?: string }): Promise<void> => {
     await command(`/api/runs/${encodeURIComponent(runId)}/decision`, body)
   },

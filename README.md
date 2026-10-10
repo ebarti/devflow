@@ -143,6 +143,13 @@ review and verification. Missing issue or delivery authority requires a blocking
 decision. A submission authorizes publication through an unmerged PR;
 merge, release and deployment require separate authority.
 
+The [GitHub feature delivery model](docs/github-feature-delivery.md) uses the
+parent issue as the feature, sub-issues as workstreams, and one stack for complete
+incremental chunks. Feature mode coordinates parallel implementation, preserves
+ownership and repair accounting across continuations, and supports an explicit
+merge instruction after verification. Project updates are handled by the
+independent event consumer.
+
 Use the dashboard or the plugin's status/evidence operations to inspect a run.
 Blocking decisions carry the exact run and candidate identity. A fresh host
 task may be needed after registration for plugin discovery. The normal

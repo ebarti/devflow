@@ -601,6 +601,12 @@ class DeliveryStore:
                     (self.state.now(), old_owner),
                 )
             self.state.claim_work(db, spec["work_id"], f"external:devflow:{run_id}", dashboard_url)
+            if self.config.raw.get("feature_delivery_version") == 1:
+                from .delivery_feature_execution import admit
+
+                if superseded or _automatic is not None:
+                    raise ValueError("feature continuations use their explicit execution owner")
+                admit(self, db, spec)
             timestamp = _now()
             initial_phase = "preparing" if spec.get("preparation_version") == 1 else "accepted"
             db.execute(
@@ -2881,7 +2887,23 @@ class DeliveryStore:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
-            if row["outcome"] is not None and outcome != row["outcome"]:
+            feature_readback_wait = False
+            if (event_type == "feature_readback_pending" and phase == "waiting_feature_readback"
+                    and execution_state == "waiting" and outcome is None
+                    and (checks or {}).get("feature_readback", {}).get("state") == "pending"
+                    and protocol_revision is not None
+                    and protocol_revision > (row["protocol_revision"] or 0)):
+                from .delivery_feature_execution import registry
+
+                spec = json.loads(row["request_json"])
+                owner = spec.get("feature_delivery", {}).get("owner")
+                if owner and not spec.get("feature_worker"):
+                    shared = registry(spec)
+                    current = shared.current(owner["issue_id"])
+                    feature_readback_wait = bool(current and shared.token(current) == owner
+                                                 and current["state"] == "draining")
+            if (row["outcome"] is not None and outcome != row["outcome"]
+                    and not feature_readback_wait):
                 # A late cancel-request projection cannot overwrite the final
                 # workflow result after its update was accepted.
                 return dict(row)
@@ -2921,7 +2943,8 @@ class DeliveryStore:
                 "decision_json": canonical_json(decision),
                 "intake_json": canonical_json(intake)
                 if intake is not None else row["intake_json"],
-                "outcome": outcome if outcome is not None else row["outcome"],
+                "outcome": None if feature_readback_wait else (
+                    outcome if outcome is not None else row["outcome"]),
                 "cleanup": cleanup if cleanup is not None else row["cleanup"],
                 "error": error if error is not None or event_type == "delivered"
                 or (checks or {}).get("terminal_tracker_checkpoint", {}).get("state") == "confirmed"
@@ -3233,6 +3256,7 @@ class DeliveryStore:
             rows = db.execute(
                 "SELECT r.* FROM delivery_runs r LEFT JOIN delivery_dashboard_state d "
                 "ON r.run_id=d.run_id WHERE COALESCE(d.archived,0)=?" + boundary +
+                " AND json_extract(r.request_json,'$.feature_worker') IS NULL" +
                 " ORDER BY r.updated_at DESC,r.run_id DESC LIMIT ?",
                 (*parameters, limit + 1),
             ).fetchall()
@@ -3592,9 +3616,15 @@ class DeliveryStore:
             else [],
             "intake": json.loads(row["intake_json"]) if row["intake_json"] else None,
             "question_notifications": self.question_notifications(run_id),
+            "feature_delivery": self.feature_delivery_detail(spec),
             "events": events,
             "error": row["error"],
         }
+
+    def feature_delivery_detail(self, spec):
+        from .delivery_feature_execution import detail
+
+        return detail(self, spec)
 
     def _evidence_items(self, run_id: str) -> list[dict[str, Any]]:
         spec = self.spec(run_id)
