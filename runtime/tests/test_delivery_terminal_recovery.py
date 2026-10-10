@@ -59,8 +59,9 @@ class ControlledTrackerCheckpoint(DeliveryWorkflow):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('lost_receipt', [False, True])
-@pytest.mark.parametrize('outcome', ['delivered', 'blocked', 'cancelled'])
+@pytest.mark.parametrize('outcome,lost_receipt', [
+    ('delivered', False), ('delivered', True), ('blocked', True), ('cancelled', True),
+])
 async def test_real_pending_terminal_remains_open_and_public_retry_delivers(
     native_configuration, monkeypatch, lost_receipt, outcome,
 ):

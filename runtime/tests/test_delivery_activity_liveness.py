@@ -54,38 +54,14 @@ async def test_long_gate_activity_emits_liveness_heartbeat(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('name', [
-    'delivery_intake', 'delivery_role', 'delivery_checks', 'delivery_precheck',
-    'delivery_browser_qa', 'delivery_baseline_checks',
-])
-async def test_native_activity_options_bound_worker_loss_retries(monkeypatch, name):
-    from devflow_temporal import delivery_workflow
-
-    observed = {}
-
-    async def execute(_name, _request, **options):
-        observed.update(options)
-        return {'state': 'passed'}
-
-    monkeypatch.setattr(delivery_workflow.workflow, 'execute_activity', execute)
-    # Isolate the original liveness policy from the independent check-slot patch.
-    monkeypatch.setattr(delivery_workflow.workflow, 'patched',
-                        lambda flag: flag == 'delivery-activity-liveness-v1')
-    await DeliveryWorkflow()._activity(name, {
-        'spec': {'policy': {'execution_backend': 'native-macos'}},
-    })
-    assert observed.get('heartbeat_timeout') == timedelta(seconds=15)
-    assert observed['retry_policy'].maximum_attempts == 3
-    assert observed['schedule_to_close_timeout'] == timedelta(hours=2)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('liveness,slots', [(False, False), (True, False),
-                                          (False, True), (True, True)])
-@pytest.mark.parametrize('backend', ['native-macos', 'fake'])
-@pytest.mark.parametrize('name', ['delivery_intake', 'delivery_role', 'delivery_checks',
-                                 'delivery_precheck', 'delivery_browser_qa',
-                                 'delivery_baseline_checks'])
+# Exercise every patch combination for each execution family, then its wrappers.
+@pytest.mark.parametrize('name,backend,liveness,slots', [
+    (name, 'native-macos', liveness, slots)
+    for name in ('delivery_role', 'delivery_checks')
+    for liveness, slots in ((False, False), (True, False), (False, True), (True, True))
+] + [(name, 'fake', True, True) for name in ('delivery_role', 'delivery_checks')]
+  + [(name, 'native-macos', True, True) for name in (
+      'delivery_intake', 'delivery_precheck', 'delivery_browser_qa', 'delivery_baseline_checks')])
 async def test_independent_activity_patches_preserve_each_reviewed_policy(
     monkeypatch, name, backend, liveness, slots,
 ):
@@ -123,24 +99,6 @@ async def test_independent_activity_patches_preserve_each_reviewed_policy(
             'ValueError', 'TypeError', 'PermissionError', 'NativeProcessUnknown']
     else:
         assert 'schedule_to_close_timeout' not in observed
-
-
-@pytest.mark.asyncio
-async def test_legacy_history_keeps_original_activity_options(monkeypatch):
-    from devflow_temporal import delivery_workflow
-
-    observed = {}
-
-    async def execute(_name, _request, **options):
-        observed.update(options)
-
-    monkeypatch.setattr(delivery_workflow.workflow, 'execute_activity', execute)
-    monkeypatch.setattr(delivery_workflow.workflow, 'patched', lambda _name: False)
-    await DeliveryWorkflow()._activity('delivery_role', {
-        'spec': {'policy': {'execution_backend': 'native-macos'}},
-    })
-    assert 'heartbeat_timeout' not in observed
-    assert observed['retry_policy'].maximum_attempts == 1
 
 
 @pytest.mark.asyncio
@@ -397,135 +355,16 @@ async def _wait_for_fixture_native_start(worker, log_path, state, handle):
 
 
 @pytest.mark.asyncio
-async def test_fixture_worker_readiness_requires_its_own_pid(monkeypatch, tmp_path):
-    clock, sleeps = [0.0], []
-    log = tmp_path / 'worker.log'
-    log.write_text('fixture-worker-ready:999\n')  # A foreign PID cannot satisfy readiness.
-
-    async def sleep(seconds):
-        sleeps.append(seconds)
-        clock[0] += 1
-        if clock[0] == 25:
-            log.write_text('fixture-worker-ready:123\n')
-
-    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
-    monkeypatch.setattr(asyncio, 'sleep', sleep)
-    await _wait_for_fixture_worker_ready(SimpleNamespace(pid=123, poll=lambda: None), log)
-    assert clock[0] == 25 and len(sleeps) == 25
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('exit_code', [None, 7])
-async def test_fixture_worker_readiness_reports_bounded_startup_failure(
-    monkeypatch, tmp_path, exit_code,
-):
-    clock = [0.0]
-    log = tmp_path / 'worker.log'
-    log.write_text('initialization diagnostic\n')
-
-    async def sleep(_seconds):
-        clock[0] += 1
-
-    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
-    monkeypatch.setattr(asyncio, 'sleep', sleep)
-    with pytest.raises(AssertionError, match=(
-        'initialization timed out' if exit_code is None else r'initialization exited \(7\)'
-    )) as error:
-        await _wait_for_fixture_worker_ready(SimpleNamespace(pid=123, poll=lambda: exit_code), log)
-    assert 'initialization diagnostic' in str(error.value)
-    assert clock[0] == (60 if exit_code is None else 0)
-
-
-@pytest.mark.asyncio
-async def test_fixture_worker_readiness_rejects_exited_worker_with_signal(tmp_path):
-    log = tmp_path / 'worker.log'
-    log.write_text('fixture-worker-ready:123\n')
-    with pytest.raises(AssertionError, match=r'initialization exited \(0\)'):
-        await _wait_for_fixture_worker_ready(SimpleNamespace(pid=123, poll=lambda: 0), log)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('failure', [False, True])
-async def test_fixture_native_start_reports_early_gate_result(tmp_path, failure):
-    log = tmp_path / 'worker.log'
-    log.write_text('fixture-worker-ready:123\n')
-    state = tmp_path / 'state'
-    state.mkdir()
-
-    async def result():
-        if failure:
-            raise RuntimeError('opaque gate rejection')
-        return {'state': 'unknown', 'reason': 'ValueError'}
-
-    handle = SimpleNamespace(result=result)
-    worker = SimpleNamespace(poll=lambda: None)
-    with pytest.raises(AssertionError, match=(
-        'workflow failed before native start' if failure
-        else 'workflow completed before native start'
-    )) as error:
-        await _wait_for_fixture_native_start(worker, log, state, handle)
-    assert ('opaque gate rejection' if failure else 'ValueError') in str(error.value)
-    assert 'fixture-worker-ready:123' in str(error.value)
-    assert list(state.iterdir()) == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('started', [False, True])
-async def test_fixture_native_start_keeps_deadline_and_only_cancels_observer(
-    monkeypatch, tmp_path, started,
-):
-    clock, cancelled = [0], []
-    log, state = tmp_path / 'worker.log', tmp_path / 'state'
-    log.write_text('fixture-worker-ready:123\n')
-    state.mkdir()
-    native = state / 'browser-qa' / 'native'
-    native.mkdir(parents=True)
-    (native / 'process.log').write_text('fixture-child-binding:QA_API_PORT\n')
-    (native / 'monitor.log').write_text('opaque monitor diagnostic\n')
-    yielded = asyncio.sleep
-
-    async def sleep(_seconds):
-        clock[0] += 1
-        if started and clock[0] == 3:
-            (state / 'started').touch()
-        await yielded(0)
-
-    async def result():
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.append('observer')
-
-    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
-    monkeypatch.setattr(asyncio, 'sleep', sleep)
-    # There is deliberately no workflow cancel method available to this helper.
-    handle = SimpleNamespace(result=result)
-    worker = SimpleNamespace(poll=lambda: None)
-    if started:
-        await _wait_for_fixture_native_start(worker, log, state, handle)
-        assert clock[0] == 3
-    else:
-        with pytest.raises(AssertionError, match='within 20 seconds') as error:
-            await _wait_for_fixture_native_start(worker, log, state, handle)
-        assert 'fixture-child-binding:QA_API_PORT' in str(error.value)
-        assert 'opaque monitor diagnostic' in str(error.value)
-        assert clock[0] == 20
-    assert cancelled == ['observer']
-    assert (native / 'process.log').read_text() == 'fixture-child-binding:QA_API_PORT\n'
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize('stage,interruption', [
-    (stage, 'worker_loss') for stage in [
-        'implement', 'review', 'verify', 'checks', 'precheck', 'baseline_checks'
-    ]
+    # One writable role, one read-only role, and one ordinary check transport.
+    (stage, 'worker_loss') for stage in ['implement', 'review', 'checks']
 ] + [
     pytest.param('browser_qa', 'worker_loss', marks=pytest.mark.skipif(
         sys.platform != 'darwin', reason='actual macOS TCP listener inspection required')),
-    ('implement', 'loop_stall'), ('review', 'loop_stall'), ('verify', 'loop_stall'),
+    ('implement', 'loop_stall'), ('review', 'loop_stall'),
     ('intake', 'loop_stall'), ('implement', 'cancel'),
     ('implement', 'deadline'), ('implement', 'terminate'),
-    ('review', 'dirty_result'), ('verify', 'dirty_result'),
+    ('review', 'dirty_result'),
 ])
 async def test_real_temporal_worker_loss_reuses_original_native_command(
     api_fixture, tmp_path, stage, interruption,

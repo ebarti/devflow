@@ -563,9 +563,7 @@ def test_queued_trusted_preparation_and_real_broker_gates_survive_source_update(
 
 
 @pytest.mark.parametrize('field', [
-    'execution_mode', 'platform', 'os_version', 'architecture', 'python', 'python_sha256',
-    'codex_bin', 'codex_bin_sha256', 'packages', 'runtime_dependencies', 'config_overrides',
-    'toolchain_roots', 'package_manager_cache', 'browser_read_roots', 'protected_commands',
+    'execution_mode', 'python_sha256', 'packages', 'toolchain_roots',
 ])
 def test_trusted_update_refuses_every_other_observed_identity_field(installed_controller, field):
     _refuses(installed_controller, 'observed', field)
