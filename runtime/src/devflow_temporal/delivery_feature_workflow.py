@@ -101,15 +101,37 @@ async def _worker(controller, spec, chunk_id, kind, active):
     if not assignment["completed"]:
         # The transactional outbox dispatches both initial and resumed workers.
         # A coordinator crash cannot lose the start or create a second workflow.
+        compact_wait = workflow.patched("feature-worker-bounded-wait-v1")
         while True:
             if controller.cancel_requested:
                 raise RuntimeError("feature cancellation requested")
-            observation = await controller._activity(
-                "delivery_feature_worker_result", {"spec": spec, "child_id": child["run_id"]}
-            )
+            if compact_wait:
+                pending = asyncio.create_task(controller._activity(
+                    "delivery_feature_wait_worker", {
+                        "config_path": spec["config_path"], "run_id": spec["run_id"],
+                        "spec_digest": digest(spec), "child_id": child["run_id"],
+                    },
+                ))
+                try:
+                    await workflow.wait_condition(
+                        lambda task=pending: task.done() or controller.cancel_requested
+                    )
+                    if controller.cancel_requested:
+                        raise RuntimeError("feature cancellation requested")
+                    observation = await pending
+                finally:
+                    if not pending.done():
+                        pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+            else:
+                # Retain the original commands for pre-patch history replay.
+                observation = await controller._activity(
+                    "delivery_feature_worker_result", {"spec": spec, "child_id": child["run_id"]}
+                )
             if observation["closed"]:
                 break
-            await workflow.sleep(timedelta(seconds=5))
+            if not compact_wait:
+                await workflow.sleep(timedelta(seconds=5))
     finished = await controller._activity(
         "delivery_feature_finish_worker", {"spec": spec, "child_id": child["run_id"]}
     )

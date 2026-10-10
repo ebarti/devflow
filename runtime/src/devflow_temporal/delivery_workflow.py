@@ -209,6 +209,17 @@ class DeliveryWorkflow:
             options = {"retry_policy": RetryPolicy(maximum_attempts=3),
                        "heartbeat_timeout": timedelta(seconds=30),
                        "schedule_to_close_timeout": timedelta(minutes=15)}
+        elif name == "delivery_feature_wait_worker":
+            options = {
+                "heartbeat_timeout": timedelta(seconds=10),
+                "schedule_to_close_timeout": timedelta(minutes=6),
+                "retry_policy": RetryPolicy(
+                    maximum_attempts=3, initial_interval=timedelta(seconds=1),
+                    maximum_interval=timedelta(seconds=10),
+                    non_retryable_error_types=["ValueError", "TypeError", "OwnershipConflict"],
+                ),
+                "cancellation_type": workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+            }
         elif name == "delivery_feature_settle_workers":
             options = {"retry_policy": RetryPolicy(maximum_attempts=3),
                        "heartbeat_timeout": timedelta(seconds=30),
@@ -253,6 +264,8 @@ class DeliveryWorkflow:
         timeout = timedelta(hours=hours)
         if name == "delivery_merge":
             timeout = timedelta(minutes=10)
+        if name == "delivery_feature_wait_worker":
+            timeout = timedelta(minutes=6)
         if name == "delivery_project" and request["spec"].get("projection_retry_version") == 1:
             timeout = timedelta(seconds=45)
         if patient_ci:

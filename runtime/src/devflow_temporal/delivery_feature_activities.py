@@ -501,6 +501,47 @@ async def delivery_feature_worker_result(request):
     return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"])}
 
 
+def _worker_wait_spec(request):
+    from .delivery_config import DeliveryConfig
+    from .delivery_store import DeliveryStore
+
+    store = DeliveryStore(DeliveryConfig.load(Path(request["config_path"])))
+    spec = store.effective_spec(request["run_id"])
+    if digest(spec) != request["spec_digest"]:
+        raise OwnershipConflict("feature wait no longer matches its frozen specification")
+    _, _, shared, token = _feature_context(spec)
+    with shared.connect() as db:
+        assigned = db.execute(
+            "SELECT 1 FROM execution_workers WHERE issue_id=? AND generation=? AND worker_key=?",
+            (token["issue_id"], token["generation"], worker_key(request["child_id"], token)),
+        ).fetchone()
+    if not assigned:
+        raise OwnershipConflict("feature wait does not own this worker")
+    return spec
+
+
+async def _wait_worker(request):
+    spec = await asyncio.to_thread(_worker_wait_spec, request)
+    deadline = time.monotonic() + 300
+    while True:
+        result = await delivery_feature_worker_result(
+            {"spec": spec, "child_id": request["child_id"]}
+        )
+        if result["closed"] or time.monotonic() >= deadline:
+            return result
+        await asyncio.sleep(5)
+
+
+@activity.defn(name="delivery_feature_wait_worker")
+async def delivery_feature_wait_worker(request):
+    from .delivery_activities import _with_heartbeat
+
+    # Only this digest-bound reference enters workflow history. Heartbeats and
+    # repeated observations stay within the activity, including after a retry.
+    return await _with_heartbeat(_wait_worker(request),
+                                 {"spec": {"run_id": request["run_id"]}}, "feature_worker_wait")
+
+
 @activity.defn(name="delivery_feature_settle_workers")
 async def delivery_feature_settle_workers(request):
     from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
@@ -637,6 +678,7 @@ FEATURE_ACTIVITIES = [
     delivery_feature_finish_worker,
     delivery_feature_stop,
     delivery_feature_worker_result,
+    delivery_feature_wait_worker,
     delivery_feature_settle_workers,
     delivery_feature_merge,
     delivery_feature_begin_integration,
