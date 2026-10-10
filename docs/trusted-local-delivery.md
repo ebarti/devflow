@@ -122,6 +122,29 @@ and verification. Exact closed history, cleanup, configuration and source checks
 and the existing finite gate-retry allowance still apply. An unregistered local
 environment is never silently adopted or removed to make recovery pass.
 
+Configured browser `artifact_paths` are reserved before native local checks and
+implementation prerequisites run, since those commands can invoke a fixture and
+create its reports before the dedicated browser gate. Nested output parents are
+created only inside an authenticated checkout. Existing unregistered outputs,
+tracked contents, protected paths and symlinked parents remain rejected.
+
+An older run stopped by that browser-output registration defect can use one
+`published_check_prelaunch_retry` with zero additional implementation turns.
+Admission requires its exact closed UNKNOWN checkpoint, passed local checks and
+review, the sole pending browser intent, its unchanged profile, no possible
+browser launch, and fresh observation of every registered actor, port and root.
+The original UNKNOWN result and report remain preserved. The unlaunched intent
+is completed as a preparation failure; a repaired measured runtime runs fresh
+gates in a separate namespace. Admission and readback authenticate the original
+evidence, and a second prelaunch recovery in the same history is refused.
+When that worker later closes, the feature continuation command can settle its
+draining coordinator through the normal worker and owner closure checks before
+admitting the next generation. Live workers, uncertain cleanup and unresolved
+remote effects continue to prevent handoff.
+The dashboard offers **Continue this feature** once the parent and current
+workers project closed, confirmed results with no pending effects or attempts;
+the command still authenticates Temporal closure and native resources afresh.
+
 New terminal runs synchronize tracker status and read back assignment, Project
 and claim through the existing tracker helper. Blocked/cancelled outcomes select
 Blocked; delivered outcomes select In review. Claims release only after proven

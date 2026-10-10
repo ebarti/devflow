@@ -592,8 +592,12 @@ class DeliveryBroker:
                             raise ValueError('locked Python environment left controller ownership')
                         environment['UV_PROJECT_ENVIRONMENT'] = str(isolated_python)
                     generated = self._register_generated(checkout,
-                        [] if isolated_python is not None else
-                        ["node_modules", *check.get("generated_directories", [])])
+                        list(dict.fromkeys([
+                            *([] if isolated_python is not None else
+                              ["node_modules", *check.get("generated_directories", [])]),
+                            *(self.spec["policy"].get("browser_qa") or {}).get(
+                                "artifact_paths", []),
+                        ])))
                 except (ValueError, OSError) as exc:
                     raise CheckPreparationFailure(check['id'], exc, results) from exc
                 # The same frozen lock populates an owned store before offline
@@ -957,17 +961,25 @@ class DeliveryBroker:
         return result
 
     def _register_generated(self, checkout: Path, names: list[str]) -> list[Path]:
-        from .delivery_resources import RunResources
+        from .delivery_resources import RunResources, private_directory
 
         resources = RunResources(self.spec)
         roots = []
         for name in names:
-            if (not isinstance(name, str) or Path(name).is_absolute()
-                    or ".." in Path(name).parts):
+            if (not isinstance(name, str) or not Path(name).parts
+                    or Path(name).as_posix() != name or Path(name).is_absolute()
+                    or any(part in {"..", ".git", ".codex", ".agents"}
+                           for part in Path(name).parts)):
                 raise ValueError("generated directory left its owned checkout")
             root = checkout / name
             if _git(checkout, "ls-files", "--", name):
                 raise ValueError("configured generated directory contains tracked source")
+            if name in (self.spec["policy"].get("browser_qa") or {}).get("artifact_paths", []):
+                # Regression checks and implementation probes can invoke the
+                # browser fixture before the dedicated browser gate. Reserve its
+                # configured output before any of those commands can create it.
+                resources._allowed(root, "generated", finalizing=True)
+                private_directory(root.parent)
             if not root.parent.is_dir() or root.parent.resolve() != root.parent:
                 raise ValueError("generated directory parent is not a fixed candidate directory")
             resources.register(root, "generated")
