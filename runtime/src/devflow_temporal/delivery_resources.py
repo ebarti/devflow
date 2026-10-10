@@ -403,15 +403,31 @@ class RunResources:
                 names = set(allowed_names)
                 if (path.name == '.venv' and path.is_relative_to(root)
                         and self.spec['policy'].get('host_sandbox') == 'trusted-local'):
+                    from .delivery_configured_resources import (
+                        python_environment_authority,
+                        require_locked_project,
+                    )
+
+                    relative = path.relative_to(root).as_posix()
+                    configured = python_environment_authority(self.spec, relative)
                     retained = ownership.get(str(path), {})
+                    if ('configured_environment_sha256' in retained
+                            and configured != retained['configured_environment_sha256']):
+                        raise ValueError('generated environment configured authority changed')
                     if finalizing:
-                        if (retained.get('kind') != 'generated'
-                                or retained.get('accepted_plan_sha256')
-                                != digest(self.spec['accepted_plan'])):
+                        if 'configured_environment_sha256' in retained:
+                            matches = configured == retained['configured_environment_sha256']
+                        else:
+                            matches = (retained.get('accepted_plan_sha256')
+                                       == digest(self.spec['accepted_plan']))
+                        if retained.get('kind') != 'generated' or not matches:
                             raise ValueError('generated environment recorded plan changed')
                         # Partial implementation can change test discovery. Cleanup
                         # authenticates recorded custody, parent and resource identity.
-                        names.add(path.relative_to(root).as_posix())
+                        names.add(relative)
+                    elif configured and root.exists():
+                        require_locked_project(root, relative)
+                        names.add(relative)
                     elif root.exists():
                         from .delivery_plan_checks import planned_projects
 
@@ -456,7 +472,16 @@ class RunResources:
                 raise ValueError("cannot adopt an existing unregistered resource")
             manifest["roots"][str(path)] = {"kind": kind, "state": "allocated", "identity": None}
             if kind == 'generated' and path.name == '.venv':
-                manifest['roots'][str(path)]['accepted_plan_sha256'] = digest(
+                from .delivery_configured_resources import python_environment_authority
+
+                configured = next((python_environment_authority(
+                    self.spec, path.relative_to(Path(root)).as_posix())
+                    for root, entry in manifest['roots'].items()
+                    if entry['kind'] in {'checkout', 'gate'} and path.is_relative_to(Path(root))),
+                    None)
+                binding = ('configured_environment_sha256' if configured
+                           else 'accepted_plan_sha256')
+                manifest['roots'][str(path)][binding] = configured or digest(
                     self.spec['accepted_plan'])
             write_private(self.manifest, manifest)
 
