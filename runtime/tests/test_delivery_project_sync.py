@@ -37,13 +37,15 @@ class Remote:
         return {"status": feature["status"], "assignee": "owner"}
 
 
-def published(service):
+def published(service, *, active=False):
     store, request = service
     store.submit(request)
     receipt = {"url": "https://github.com/example/fixture/pull/7", "state": "OPEN",
                "head": "a" * 40, "number": 7}
-    store.project(request["run_id"], phase="delivered", execution_state="terminal",
-                  event_type="delivered", message="published", outcome="published_unmerged",
+    store.project(request["run_id"], phase="merging" if active else "delivered",
+                  execution_state="running" if active else "terminal",
+                  event_type="published", message="published",
+                  outcome=None if active else "published_unmerged",
                   pull_request=receipt)
     return store, request, receipt
 
@@ -640,7 +642,7 @@ def test_unchanged_pr_refresh_reconciles_project_drift_before_daily_deadline(ser
 
 
 def test_same_status_event_requires_new_readback_with_durable_failure_retry(service):
-    store, request, _ = published(service)
+    store, request, _ = published(service, active=True)
     remote = Remote()
     remote.state = "MERGED"
     stamp = datetime(2026, 10, 10, tzinfo=UTC)
@@ -648,7 +650,7 @@ def test_same_status_event_requires_new_readback_with_durable_failure_retry(serv
     first = sync.tick()[request["issue_url"]]
     # The final execution event follows PR observation and issue closure.
     store.project(request["run_id"], phase="merged", execution_state="terminal",
-                  event_type="merged", message="Issue closure confirmed", outcome="merged")
+                  event_type="delivered", message="Issue closure confirmed", outcome="delivered")
     remote.failure = True
     assert sync.next_delay() == 15
     pending = sync.tick()[request["issue_url"]]
@@ -667,7 +669,7 @@ def test_same_status_event_requires_new_readback_with_durable_failure_retry(serv
 
 
 def test_same_status_revision_during_mirror_cannot_acknowledge_old_event(service):
-    store, request, _ = published(service)
+    store, request, _ = published(service, active=True)
     remote = Remote()
     remote.state = "MERGED"
     mirror = remote.mirror
@@ -675,7 +677,8 @@ def test_same_status_revision_during_mirror_cannot_acknowledge_old_event(service
     def superseded(feature, fence):
         result = mirror(feature, fence)
         store.project(request["run_id"], phase="merged", execution_state="terminal",
-                      event_type="merged", message="Issue closure confirmed", outcome="merged")
+                      event_type="delivered", message="Issue closure confirmed",
+                      outcome="delivered")
         return result
 
     remote.mirror = superseded
