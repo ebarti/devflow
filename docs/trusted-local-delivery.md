@@ -91,6 +91,16 @@ Historical inputs without the baseline marker keep their recorded behavior.
 Resolve upstream defects through their owning change, then admit work against
 the verified corrected base; never silently rewrite an existing frozen input.
 
+In trusted-local mode, a configured Python prerequisite can declare
+`generated_directories: ["workers/automation/.venv"]` relative to the checkout
+root. The directory must belong to a fixed, tracked `pyproject.toml` and
+`uv.lock` project. Devflow registers it before launching the check, including
+baseline checks before intake has produced a plan. It retains the exact recipe
+binding for cleanup after later planning or partial source edits. Existing
+unregistered environments, symlinked project metadata, and changed declarations
+remain rejected. A declared output does not prepare dependencies by itself;
+the configured command must still perform the locked installation.
+
 New terminal runs synchronize tracker status and read back assignment, Project
 and claim through the existing tracker helper. Blocked/cancelled outcomes select
 Blocked; delivered outcomes select In review. Claims release only after proven
