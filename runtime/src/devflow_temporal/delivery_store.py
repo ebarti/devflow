@@ -70,6 +70,10 @@ class DeliveryStore:
         module_spec.loader.exec_module(module)
         self.state = module
         with self._connect() as db:
+            # Initialization also backfills feature projections. Reserve the write
+            # transaction before reading executions, so a concurrent writer cannot
+            # deadlock that read cursor while it upgrades to its first write.
+            db.execute("BEGIN IMMEDIATE")
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_runs (
                     run_id TEXT PRIMARY KEY,
