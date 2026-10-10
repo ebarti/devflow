@@ -350,3 +350,7 @@ th:nth-child(3), td:nth-child(3) { width: 24%; }
   .nav-rail { min-width: 0; flex-wrap: wrap; gap: 8px 0; }
   .primary-nav { order: 2; width: 100%; }
 }
+
+.feature-workers-table { min-width: 540px; }
+.feature-workers-table th, .feature-workers-table td { width: auto; padding-right: 18px; }
+.feature-revision-form { margin-top: 16px; }

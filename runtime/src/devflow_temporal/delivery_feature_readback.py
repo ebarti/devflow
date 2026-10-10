@@ -28,6 +28,8 @@ def settle_one(store, spec, entry, gh):
         if result.get("state") == "pending":
             raise UnresolvedEffect("original publication readback is pending")
         return
+    if kind in {"github_child_plan", "github_plan_revision"}:
+        return gh.settle_plan_effect(issue, entry, shared, token)
     if kind in {"feature_merge", "close_merged_issue"}:
         from .delivery_feature_merge import merge
 

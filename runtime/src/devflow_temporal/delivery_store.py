@@ -442,7 +442,8 @@ class DeliveryStore:
         transition(db, self.config, run_id)
         return int(cursor.lastrowid)
 
-    def submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None) -> dict[str, Any]:
+    def submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None,
+               _feature_revision: dict | None = None) -> dict[str, Any]:
         run_id = supplied.get("run_id")
         command_id = supplied.get("command_id")
         if not isinstance(run_id, str) or not isinstance(command_id, str):
@@ -483,6 +484,14 @@ class DeliveryStore:
         spec = (self.config.admit(supplied, _base_ref=reference) if reference
                 else self.config.admit(supplied))
         spec["request_digest"] = request_digest
+        if spec.get("feature_predecessor"):
+            from .delivery_feature_revisions import authenticate_continued_plan
+
+            authenticate_continued_plan(self, spec)
+        if _feature_revision is not None:
+            from .delivery_feature_revisions import authenticate_revision_submission
+
+            authenticate_revision_submission(self, spec, _feature_revision)
         temporal_result = None
         superseded = spec.get("supersedes_run_id")
         if superseded and _automatic is None:
@@ -2592,6 +2601,14 @@ class DeliveryStore:
             original = self._prepared_original(db, json.loads(row["request_json"]))
             if not original.get("intake_required"):
                 raise ValueError("run was submitted with an accepted plan")
+            if original.get("feature_plan_version") == 2:
+                from .delivery_feature_gates import validate_chunk_gates
+                from .delivery_plan_model import validate_plan
+
+                if not isinstance(plan, dict) or plan.get("version") != 2:
+                    raise ValueError("new feature intake requires the explicit v2 plan contract")
+                validate_plan(plan)
+                validate_chunk_gates(plan, original)
             automatic = original.get("plan_approval", "required") == "automatic"
             expected_authorization = {
                 "source": "run_authorization", "command_id": original["command_id"],
@@ -2650,6 +2667,12 @@ class DeliveryStore:
         return None
 
     def effective_spec(self, run_id: str) -> dict[str, Any]:
+        """Read immutable execution overlays while preserving original request bytes."""
+        from .delivery_feature_revisions import effective_spec
+
+        return effective_spec(self, self._effective_spec(run_id))
+
+    def _effective_spec(self, run_id: str) -> dict[str, Any]:
         """Read an explicit amended authority while preserving request_json."""
 
         with self._connect() as db:
@@ -2985,6 +3008,8 @@ class DeliveryStore:
                     "key": key,
                     "iteration": values["iteration"],
                     "candidate_id": candidate["id"] if candidate else None,
+                    **({"decision": decision} if event_type == "feature_revision_approval_pending"
+                       and decision and decision.get("kind") == "plan_revision" else {}),
                 },
             )
             if event_type == "question_pending" and json.loads(row["request_json"]).get(
@@ -3409,7 +3434,9 @@ class DeliveryStore:
         # A plain successor inherits the earlier scope receipt unchanged.
         while (scope_source and scope_source.get('kind') == 'stopped_delivery_resume'
                and 'added_paths' not in scope_source['command']):
-            scope_source = scope_source['original_recovery']
+            from .delivery_feature_revision_recovery import retained_recovery
+
+            scope_source = retained_recovery(scope_source)['original_recovery']
         scope_recovery = self._scope_recovery(scope_source)
         scope_amendment = (
             {
@@ -3636,9 +3663,15 @@ class DeliveryStore:
             "intake": json.loads(row["intake_json"]) if row["intake_json"] else None,
             "question_notifications": self.question_notifications(run_id),
             "feature_delivery": self.feature_delivery_detail(spec),
+            "feature_plan": self.feature_plan_detail(spec),
             "events": events,
             "error": row["error"],
         }
+
+    def feature_plan_detail(self, spec):
+        from .delivery_feature_revisions import revision_readback
+
+        return revision_readback(self, spec)
 
     def feature_delivery_detail(self, spec):
         from .delivery_feature_execution import detail

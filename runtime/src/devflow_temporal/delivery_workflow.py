@@ -205,6 +205,20 @@ class DeliveryWorkflow:
                     ],
                 ),
             }
+        elif name in {"delivery_feature_revision_propose", "delivery_feature_revision_review"}:
+            # New revision commands exist only behind the evolution patch. Native
+            # attempts retain their durable identity across activity retries.
+            options = {
+                "heartbeat_timeout": timedelta(seconds=15),
+                "schedule_to_close_timeout": timedelta(hours=hours),
+                "retry_policy": RetryPolicy(
+                    maximum_attempts=3, initial_interval=timedelta(seconds=1),
+                    maximum_interval=timedelta(seconds=10),
+                    non_retryable_error_types=[
+                        "ValueError", "TypeError", "OwnershipConflict", "NativeProcessUnknown",
+                    ],
+                ),
+            }
         elif name in {"delivery_merge", "delivery_feature_merge"}:
             options = {"retry_policy": RetryPolicy(maximum_attempts=3),
                        "heartbeat_timeout": timedelta(seconds=30),
@@ -572,6 +586,31 @@ class DeliveryWorkflow:
             await self._wait_repair_readback(min(delay, remaining))
             delay = min(delay * 2, 30)
 
+    def _planning_request(self, spec):
+        if spec.get("feature_worker") and workflow.patched("feature-plan-evolution-v1"):
+            return {"planning_defects_version": 1}
+        return {}
+
+    def _capture_planning_defect(self, spec, result):
+        if (not spec.get("feature_worker") or not result.get("planning_defect")
+                or result.get("cleanup") == "unknown"
+                or not workflow.patched("feature-plan-evolution-v1")):
+            return False
+        from .delivery_feature_revision_roles import validate_diagnostic
+
+        candidate = result.get("candidate") or self.state["candidate"]
+        try:
+            diagnostic = validate_diagnostic(
+                result["planning_defect"], chunk_id=spec["feature_worker"]["chunk_id"],
+                candidate_id=candidate["id"],
+            )
+        except (ValueError, KeyError, TypeError):
+            return False
+        self.state["checks"]["planning_defect"] = diagnostic
+        if result.get("planning_defect_repair"):
+            self.state["checks"]["planning_defect_repair"] = result["planning_defect_repair"]
+        return True
+
     async def _stop(
         self, spec: dict[str, Any], reason: str, *, cause: Exception | None = None,
         controller_cause: str | None = None,
@@ -843,8 +882,11 @@ class DeliveryWorkflow:
                 continue
             if result.get("status") == "plan":
                 plan = result.get("plan")
+                required = (("acceptance", "workstreams")
+                            if spec.get("feature_plan_version") == 2 else
+                            ("steps", "verification", "acceptance"))
                 if not isinstance(plan, dict) or not plan.get("scope") or not all(
-                    plan.get(field) for field in ("steps", "verification", "acceptance")
+                    plan.get(field) for field in required
                 ):
                     await self._stop(spec, "intake returned an incomplete plan")
                     return None
@@ -1579,8 +1621,8 @@ class DeliveryWorkflow:
         # repair reuses its existing iteration and shared budget debit.
         pending = recovery.get('pending_repair')
         return await self._run_iterations(
-            spec, start_iteration=(pending['iteration'] if pending
-                                   else recovery['state']['iteration'] + 1),
+            spec, start_iteration=recovery.get('resume_iteration', (
+                pending['iteration'] if pending else recovery['state']['iteration'] + 1)),
             prior_implementer_session=recovery['session_id'],
             repair_findings=(pending['findings'] if pending else [recovery['state']['error'], *[
                 finding for role in recovery['state'].get('roles', [])
@@ -1589,6 +1631,7 @@ class DeliveryWorkflow:
             operator_brief=None, continuation=None, recovery=None,
             authorized_max_iteration=recovery['maximum_iteration'],
             allow_first_session=recovery['session_id'] is None,
+            resume_prechecks=recovery.get('resume_stage') == 'checks',
         )
 
     async def _resume_repair(
@@ -1979,6 +2022,7 @@ class DeliveryWorkflow:
                             {
                                 "spec": spec,
                                 "role": "implement",
+                                **self._planning_request(spec),
                                 "iteration": iteration,
                                 "candidate": self.state["candidate"],
                                 **({"evidence_context": evidence_context}
@@ -2006,6 +2050,7 @@ class DeliveryWorkflow:
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                     if implementation.get("status") != "pass":
+                        self._capture_planning_defect(spec, implementation)
                         return await self._stop(spec, "implementer did not establish a pass")
                     if (
                         continuation
@@ -2062,6 +2107,9 @@ class DeliveryWorkflow:
                 if self.cancel_requested:
                     return await self._cancelled(spec)
                 if prechecked.get("state") != "passed":
+                    if self._capture_planning_defect(spec, prechecked):
+                        return await self._stop(
+                            spec, "prepublication gate revealed a planning defect")
                     prerequisite = _preparation_failure(prechecked)
                     if prerequisite:
                         return await self._stop(
@@ -2156,6 +2204,8 @@ class DeliveryWorkflow:
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                     if checked.get("state") != "passed":
+                        if self._capture_planning_defect(spec, checked):
+                            return await self._stop(spec, "local gate revealed a planning defect")
                         prerequisite = _preparation_failure(checked)
                         if prerequisite:
                             return await self._stop(
@@ -2194,6 +2244,8 @@ class DeliveryWorkflow:
                         self.state["cleanup"] = "unknown"
                         return await self._stop(spec, "browser QA child cleanup is unknown")
                     if browser_qa.get("state") != "passed":
+                        if self._capture_planning_defect(spec, browser_qa):
+                            return await self._stop(spec, "browser gate revealed a planning defect")
                         repair_findings.extend(
                             _broker_findings("browser_qa", browser_qa, iteration=iteration)
                         )
@@ -2219,6 +2271,7 @@ class DeliveryWorkflow:
                         {
                             "spec": spec,
                             "role": role,
+                            **self._planning_request(spec),
                             "iteration": iteration,
                             "candidate": self.state["candidate"],
                             "findings": [acceptance_note] if acceptance_note else [],
@@ -2255,6 +2308,8 @@ class DeliveryWorkflow:
                     "candidate_id": self.state["candidate"]["id"],
                 }
                 if result.get("status") != "pass":
+                    if self._capture_planning_defect(spec, result):
+                        return await self._stop(spec, role + " revealed a planning defect")
                     repair_findings.extend(result.get("findings") or [f"{role} did not pass"])
                     break
             if repair_findings:
@@ -2395,6 +2450,8 @@ class DeliveryWorkflow:
                 raise ApplicationError("answer is outside the decision options", non_retryable=True)
             if pending.get("kind") == "merge":
                 self.feature_merge_authorization = dict(request)
+            if pending.get("kind") == "plan_revision":
+                self.feature_revision_authorization = dict(request)
             self.decision_answer = answer
         self.state["decision"] = None
         self.state["revision"] += 1

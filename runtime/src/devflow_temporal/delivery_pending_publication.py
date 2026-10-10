@@ -13,6 +13,7 @@ from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
 from .delivery_resources import read_private
+from .delivery_source_scope import outside_scope
 
 KIND = 'pending_publication_retry'
 
@@ -73,7 +74,8 @@ def snapshot(store, run_id):
             or observed['head'] == candidate['head']
             or _git(broker.checkout, 'rev-parse', 'HEAD^') != candidate['head']
             or broker._changed_paths()
-            or not broker._changed_paths(spec['base_sha']) <= set(spec['policy']['allowed_paths'])
+            or outside_scope(spec['policy'], broker._changed_paths(spec['base_sha']),
+                             checkout=broker.checkout)
             or _git(broker.checkout, 'branch', '--show-current') != spec['branch']
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') != spec['origin_url']
             or not remote or remote.split()[0] != observed['head']

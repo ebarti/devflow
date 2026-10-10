@@ -15,6 +15,7 @@ from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _prepare, _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
 from .delivery_resources import read_private, write_private
+from .delivery_source_scope import outside_scope
 
 KIND = 'published_gate_retry'
 PREPUBLICATION_KIND = 'prepublication_gate_retry'
@@ -277,7 +278,7 @@ def snapshot(store, run_id, kind=KIND):
             != (spec.get('local_branch', spec['branch']) if unpublished else spec['branch'])
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') != spec['origin_url']
             or _git(broker.source, 'remote', 'get-url', 'origin') != spec['origin_url']
-            or not broker._changed_paths() <= set(spec['policy']['allowed_paths'])):
+            or outside_scope(spec['policy'], broker._changed_paths(), checkout=broker.checkout)):
         raise ValueError('gate retry lost unchanged owned source or exact published PR head')
     config = DeliveryConfig.load(Path(spec['config_path']))
     if digest(config.raw) != spec['config_digest']:
@@ -540,7 +541,8 @@ def readback(store, spec, recovery):
         if (not _unpublished_remote_matches(broker, pr, remote)
                 or recovery['publication'] is not None
                 or recovery['candidate']['head'] != spec['base_sha']
-                or not broker._changed_paths() <= set(spec['policy']['allowed_paths'])):
+                or outside_scope(spec['policy'], broker._changed_paths(),
+                                 checkout=broker.checkout)):
             raise ValueError('gate retry unpublished candidate acquired publication or lost scope')
     elif (not pr or pr['number'] != recovery['publication']['number'] or pr['state'] != 'OPEN'
             or pr['headRefOid'] != recovery['candidate']['head']):

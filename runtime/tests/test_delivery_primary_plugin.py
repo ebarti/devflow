@@ -371,7 +371,7 @@ async def test_pinned_sdk_automatically_discovers_selected_primary_skill_and_all
                 'reconcile_tracker',
                 'gates_only_preflight', 'admit_gates_only',
                 'repair_admission_preflight', 'continue_repair',
-                'continue_feature', 'merge_feature',
+                'continue_feature', 'merge_feature', 'revise_feature_plan',
             }
         finally:
             process.stdin.close()

@@ -175,8 +175,17 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
         from .delivery_feature_pass import checkpoints as current_checkpoints
 
         checkpoints = current_checkpoints(spec)
+        from .delivery_feature_revisions import adopted_plan, local_revision_readback
+
+        shared = registry(spec)
         raw_plan = row.get("accepted_plan_text") or spec.get("accepted_plan")
-        plan = json.loads(raw_plan) if raw_plan else {}
+        plan = adopted_plan(spec, shared=shared) or (json.loads(raw_plan) if raw_plan else {})
+        payload["feature_plan"] = local_revision_readback(
+            spec, expected_revision=row["revision"], phase=row["phase"], cleanup=row["cleanup"])
+        members = (receipt or {}).get("pull_requests", [])
+        observation_by_url = {item["url"]: item for item in observations}
+        member_by_chunk = {member["chunk_id"]: member for member in members
+                           if member.get("chunk_id")}
         workstreams = []
         for stream in plan.get("workstreams", []):
             binding = checkpoints.get("workstream-issues", {}).get(stream["id"])
@@ -194,9 +203,22 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
                                         (assignment["run_id"],)).fetchone()
                     if worker:
                         workers.append(dict(worker))
+            chunk_ids = [chunk["id"] for chunk in stream["chunks"]]
+            child_members = [member_by_chunk[chunk_id] for chunk_id in chunk_ids
+                             if chunk_id in member_by_chunk]
+            child_observations = [observation_by_url[member["url"]] for member in child_members
+                                  if member["url"] in observation_by_url]
+            observed = [item.get("observation") for item in child_observations]
+            fully_merged = (len(child_members) == len(chunk_ids)
+                            and len(observed) == len(chunk_ids)
+                            and all(item and item["state"] == "MERGED" for item in observed))
             status = "Queued"
-            if payload["status"] == "Merged":
+            if fully_merged:
                 status = "Merged"
+            elif any(item and item["state"] == "MERGED" for item in observed):
+                status = "Partially merged"
+            elif any(item and item["state"] == "CLOSED" for item in observed):
+                status = "PR closed"
             elif finished == len(stream["chunks"]):
                 status = "Awaiting merge"
             elif any(worker["outcome"] == "blocked" for worker in workers):
@@ -205,11 +227,11 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
                 status = payload["status"]
             elif workers:
                 status = "In progress"
-            urls = {url for worker in workers
-                    for url in publication_urls(json.loads(worker["pr_json"] or "null"))}
-            workstreams.append({"issue": issue_key(binding["url"]), "status": status,
-                                "pull_requests": [item for item in observations
-                                                  if item["url"] in urls]})
+            workstreams.append({"id": stream["id"], "issue_id": binding["id"],
+                                "issue": issue_key(binding["url"]),
+                                "issue_number": binding["number"], "status": status,
+                                "required_chunks": chunk_ids,
+                                "pull_requests": child_observations})
         payload["workstreams"] = workstreams
     encoded = canonical_json(payload)
     prior = db.execute("SELECT * FROM delivery_features WHERE issue=?", (key,)).fetchone()

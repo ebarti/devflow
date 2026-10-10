@@ -6,7 +6,28 @@ For new GitHub-owned feature admissions, see
 The sections below describing per-run automatic retries and legacy public repair
 grants apply to their original frozen versions. Feature mode uses one shared
 execution claim, ten cumulative product repair cycles by default, and explicit
-continuations of the same GitHub plan and stack.
+continuations of the same GitHub feature and stack. Version 2 child plans record
+expected files separately from frozen execution authority and select admitted
+checks for each chunk and its prerequisites. Required final acceptance remains.
+
+A stopped feature can request a bounded plan correction with
+`devflow-delivery --config /absolute/service.json revise-feature-plan --id RUN --request /absolute/revision.json`.
+The request requires `command_id`, the observed `feature_plan.expected_revision`
+(the local projection revision), and `reason` (1–4000 characters). Optional
+`evidence` contains up to 16 existing owned `{path, sha256}` artifact references.
+The authenticated HTTP route is `POST /api/runs/{id}/revise-feature-plan`; the
+client and MCP operation are `revise_feature_plan`. The runtime crafts and
+independently reviews the proposal. A caller cannot replace the plan or policy.
+Exact retries return the recorded receipt; read the run after an uncertain
+response and retain the command ID and request. Ordinary `continue_feature`
+retains the adopted plan. Both flows preserve PR/session identity and repair use.
+Readback includes the GitHub plan revision, child comment links, correction phase,
+evidence, affected chunks, execution scope, expected files, and action eligibility.
+Automatic correction requires a structured native planning defect tied to the
+current plan, candidate and sealed evidence. Generic findings remain normal repair.
+Reviewed future-work splits retain existing chunk IDs and acceptance, fixed started
+dependencies and the published stack prefix, within the original authority. The
+owned workflow performs this assessment without an external watcher.
 
 
 ### Native provider turn retries

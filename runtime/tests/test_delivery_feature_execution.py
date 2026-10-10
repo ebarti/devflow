@@ -62,6 +62,7 @@ def test_admission_claims_remote_identity_and_never_creates_business_features(se
     assert not store.submit(request)["existing"]
     spec = store.effective_spec(request["run_id"])
     assert spec["feature_delivery"]["owner"]["issue_id"] == "I_feature"
+    assert "feature_plan_version" not in spec
     assert spec["policy"]["max_repairs"] == 10
     assert store.submit(request)["run_id"] == spec["run_id"]
     with registry(spec).connect() as db:
@@ -70,6 +71,51 @@ def test_admission_claims_remote_identity_and_never_creates_business_features(se
         )
     assert snapshot["issue"]["body"] == "Human scope"
 
+
+
+def test_new_feature_intake_adopts_v2_without_broadening_legacy_authority(service, monkeypatch):
+    store, request, _ = feature_service(service, monkeypatch)
+    raw = deepcopy(store.config.raw)
+    raw["roles"]["intake"] = {"model": "fixture", "effort": "low"}
+    store.config.path.write_text(json.dumps(raw))
+    store = DeliveryStore(DeliveryConfig.load(store.config.path))
+    request.pop("accepted_plan")
+    store.submit(request)
+    spec = store.effective_spec(request["run_id"])
+    assert spec["intake_required"] is True and spec["feature_plan_version"] == 2
+    assert spec["policy"]["allowed_paths"] == ["README.md"]
+    assert "source_scope" not in spec["policy"]
+    assert store.config.public_policy()["feature_plan_versions"] == [1, 2]
+
+
+def test_explicit_source_scope_is_frozen_independently_from_expected_files(service, monkeypatch):
+    store, request, _ = feature_service(service, monkeypatch)
+    raw = deepcopy(store.config.raw)
+    repository = raw["repositories"]["fixture"]
+    repository.pop("allowed_paths")
+    scope = {"version": 1, "allowed_roots": ["."], "allowed_files": [],
+             "protected_paths": ["protected.txt", ".git", ".codex"]}
+    repository["source_scope"] = deepcopy(scope)
+    store.config.path.write_text(json.dumps(raw))
+    store = DeliveryStore(DeliveryConfig.load(store.config.path))
+    value = json.loads(request["accepted_plan"])
+    value.update(version=2, final_gates=[])
+    for stream in value["workstreams"]:
+        for chunk in stream["chunks"]:
+            chunk["expected_paths"] = chunk.pop("allowed_paths")
+            chunk["gates"] = []
+    request["accepted_plan"] = json.dumps(value)
+    store.submit(request)
+    spec = store.effective_spec(request["run_id"])
+    assert spec["policy"]["source_scope"] == scope
+    assert spec["policy"]["allowed_paths"] == []
+    child = worker_spec(spec, ordered_chunks(value)[0],
+                        {"url": "https://github.com/example/fixture/issues/10"},
+                        kind="build", base_sha=spec["base_sha"], base_branch="main")
+    assert child["policy"]["source_scope"] == scope and child["expected_paths"] == ["README.md"]
+    from devflow_temporal.delivery_source_scope import outside_scope
+
+    assert outside_scope(child["policy"], ["src/new.py", "protected.txt"]) == {"protected.txt"}
 
 def test_legacy_default_budget_does_not_change_before_feature_migration(service):
     store, request = service
@@ -311,6 +357,8 @@ async def test_independent_builds_overlap_but_integration_follows_the_shared_sta
         }
 
     monkeypatch.setattr(protocol, "_worker", worker)
+    # These are legacy protocol stubs, not a Temporal replay environment.
+    monkeypatch.setattr(protocol.workflow, "patched", lambda _marker: False)
     result = await protocol.coordinate(
         controller, {"run_id": "run-one", "authorized_endpoint": "merged"}
     )
@@ -331,6 +379,8 @@ async def test_cancel_during_build_does_not_start_integration_or_merge(monkeypat
         return {"outcome": "delivered"}
 
     monkeypatch.setattr(protocol, "_worker", worker)
+    # These are legacy protocol stubs, not a Temporal replay environment.
+    monkeypatch.setattr(protocol.workflow, "patched", lambda _marker: False)
     result = await protocol.coordinate(
         controller, {"run_id": "run-one", "authorized_endpoint": "merged"}
     )

@@ -138,6 +138,8 @@ export const api = {
     command('/api/runs', body),
   continueFeature: async (runId: string, body: { command_id: string; expected_revision: number }): Promise<{ run_id: string; phase: string }> =>
     command(`/api/runs/${encodeURIComponent(runId)}/continue-feature`, body),
+  reviseFeaturePlan: async (runId: string, body: { command_id: string; expected_revision: number; reason: string }): Promise<{ run_id: string; phase: string; revision_phase: string }> =>
+    command(`/api/runs/${encodeURIComponent(runId)}/revise-feature-plan`, body),
   answer: async (runId: string, body: { command_id: string; expected_revision: number; decision_id: string; decision_revision: number; candidate_revision: number; answer: string; response?: string }): Promise<void> => {
     await command(`/api/runs/${encodeURIComponent(runId)}/decision`, body)
   },

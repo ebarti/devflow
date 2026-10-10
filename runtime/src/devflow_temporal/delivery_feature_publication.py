@@ -9,44 +9,62 @@ from .contracts import digest
 from .delivery_execution_registry import OwnershipConflict, UnresolvedEffect
 from .delivery_feature_execution import registry, require_execution
 from .delivery_feature_pass import checkpoints as current_checkpoints
-from .delivery_github_contract import GitHubDelivery, decode_manifest, ordered_chunks
+from .delivery_github_contract import GitHubDelivery, ordered_chunks
 
 
 def current_record(spec, gh=None):
+    """Fence the exact adopted revision, then hydrate only its recorded children."""
+    from .delivery_feature_revisions import adopted_plan_identity
+
     gh = gh or GitHubDelivery()
     feature = spec["feature_delivery"]
     issue = feature["snapshot"]["issue"]
-    reference = registry(spec).checkpoints(issue["id"]).get("github-record")
-    if reference is None:
+    shared = registry(spec)
+    identity = adopted_plan_identity(spec, shared)
+    explicit = spec.get("feature_plan_revision")
+    if explicit is not None and any(explicit.get(key) != identity.get(key)
+                                    for key in ("plan_revision", "plan_digest")):
+        raise OwnershipConflict("worker or coordinator carries a superseded plan revision")
+    if spec.get("feature_worker") and explicit is None:
+        original = (feature["snapshot"].get("delivery") or {}).get("manifest", {})
+        if original.get("plan_revision", 1) != identity["plan_revision"]:
+            raise OwnershipConflict("legacy worker carries a superseded plan revision")
+    reference = {key: identity.get(key) for key in ("comment_id", "comment_node_id")}
+    if reference["comment_id"] is None:
+        reference = shared.checkpoints(issue["id"]).get("github-record")
+    if reference is None or reference.get("comment_id") is None:
         reference = feature["snapshot"].get("delivery")
     if reference is None:
         raise OwnershipConflict("feature has no published delivery record")
-    raw = gh.api(f"repos/{issue['repository']}/issues/comments/{reference['comment_id']}")
-    if (
-        raw["id"] != reference["comment_id"]
-        or raw["node_id"] != reference["comment_node_id"]
-        or raw["issue_url"].casefold()
-        != (
-            f"https://api.github.com/repos/{issue['repository']}/issues/{issue['number']}".casefold()
-        )
-    ):
-        raise OwnershipConflict("recorded delivery comment identity changed")
-    manifest = decode_manifest(raw["body"], issue)
-    accepted = registry(spec).checkpoints(issue["id"]).get("accepted-plan")
-    if accepted and accepted["digest"] != digest(manifest["plan"]):
+    record = gh.load_record(issue, reference)
+    manifest = record["manifest"]
+    if manifest["version"] == 2:
+        from .delivery_github_plans import verify_parent_binding
+
+        verify_parent_binding(gh, issue, reference)
+    if (manifest.get("plan_revision", 1) != identity["plan_revision"]
+            or (identity.get("plan_digest") is not None
+                and identity["plan_digest"] != digest(manifest["plan"]))):
         raise OwnershipConflict("GitHub plan changed after execution acceptance")
-    bindings = registry(spec).checkpoints(issue["id"]).get("workstream-issues")
-    if bindings is not None and bindings != manifest["workstream_issues"]:
+    bindings = identity.get("workstream_issues")
+    if bindings and bindings != manifest["workstream_issues"]:
         raise OwnershipConflict("GitHub workstream bindings changed after execution acceptance")
-    record = {
-        "comment_id": raw["id"],
-        "comment_node_id": raw["node_id"],
-        "manifest": manifest,
-    }
-    shared = registry(spec)
     token = shared.token(shared.current(issue["id"]))
     gh.reconcile_record(issue, record, shared, token)
     return record
+
+
+def publication_child_binding(record, chunk_id):
+    """Bind one PR to the actual child that owns its stable chunk identity."""
+    chunks = ordered_chunks(record["manifest"]["plan"])
+    chunk = next((item for item in chunks if item["id"] == chunk_id), None)
+    if chunk is None:
+        raise OwnershipConflict("publication names an unknown feature chunk")
+    child = record["manifest"]["workstream_issues"].get(chunk["workstream_id"])
+    if child is None:
+        raise OwnershipConflict("publication chunk has no exact child issue binding")
+    return {"workstream_id": chunk["workstream_id"], "issue_id": child["id"],
+            "issue_number": child["number"], "issue_url": child["url"]}
 
 
 def publish(store, broker, request, *, reconcile=False, settlement=False):
@@ -62,6 +80,9 @@ def publish(store, broker, request, *, reconcile=False, settlement=False):
         }
     )
     with shared.mutation(token):
+        if spec.get("feature_worker"):
+            # Authenticate before any broker push/PR effect, including retries.
+            current_record(spec)
         if settlement and shared.effect(token["issue_id"], key) is None:
             raise OwnershipConflict("settlement cannot originate a new publication")
         intent = shared.intent(
@@ -187,6 +208,12 @@ def record_publication(store, spec, receipt, gh=None, *, settlement=False):
         "head": receipt["head"],
         "base_branch": spec["publication_base_ref"],
     }
+    if manifest["version"] == 2:
+        binding = publication_child_binding(record, chunk_id)
+        if (spec["feature_worker"].get("workstream_id") != binding["workstream_id"]
+                or spec["issue_url"] != binding["issue_url"]):
+            raise OwnershipConflict("worker publication differs from its actual child issue")
+        member.update(binding)
     previous = next((item for item in members if item["chunk_id"] == chunk_id), None)
     if previous == member:
         live_members(spec, record, gh)

@@ -18,12 +18,23 @@ The final chunk also carries the whole feature's acceptance criteria.
 | Runtime database | Immutable admitted requests, workflow IDs and revisions, original role sessions and evidence, candidate/gate receipts, durable start outbox, derived status events and cached Project readbacks |
 | Independent synchronizer | Event consumption, Project updates, retry receipts and the daily PR/Project drift schedule |
 
-The accepted plan and stack membership live in an issue comment with a
-`devflow-delivery:v1` record. The issue's `devflow-plan-<comment-id>` label is the
-direct pointer to that comment. Human issue bodies are preserved. A local plan
-snapshot authorizes an execution; it is not a second editable feature definition.
-Changing the GitHub plan after acceptance stops the old execution from publishing
-under changed scope. A missing or conflicting binding never selects a newer PR.
+Version 2 publishes a compact `devflow-delivery:v2` index on the parent and
+readable, immutable detailed plan comments on each exact child issue. The parent
+index records the plan revision, resolved child identities, exact child-comment
+references and digests, dependencies, and stack membership. Child plans contain
+scope, steps, acceptance, verification, expected files, and chunk gate selections.
+The issue's `devflow-plan-<comment-id>` label points directly to its parent index.
+Human issue bodies are preserved. Existing v1 records remain readable until an
+explicit supported revision adopts v2. Child records publish first; the parent
+pointer commits the revision last. Every referenced child comment is authenticated
+against its exact repository, issue, node ID and digest before adoption.
+
+A local immutable snapshot records what an execution may do. Expected paths are
+planning hints; frozen exact-file or versioned root/file restrictions, protected
+paths, and resource authority remain execution limits. A plan correction cannot
+expand that authority. Unrecorded GitHub changes stop the old execution from
+publishing under changed scope. A missing or conflicting binding never selects a
+newer issue, comment or PR.
 
 All local runtimes use
 `~/.local/state/devflow/execution-ownership/registry.sqlite3`. Claims have no expiry.
@@ -59,6 +70,41 @@ learning flag. **Continue this feature** submits
 `continue_feature`. The response identifies the successor coordinator. Retrying
 the exact command returns the same result.
 
+A stopped feature can request correction of a demonstrated planning defect with
+`POST /api/runs/{id}/revise-feature-plan`, CLI `revise-feature-plan`, or MCP
+`revise_feature_plan`. Supply a stable `command_id`, `expected_revision` from the
+run's `feature_plan.expected_revision` (the local projection revision), and a
+bounded `reason` of 1–4000 characters. Optional `evidence` lists at most 16 existing
+owned `{path, sha256}` artifact references. Callers cannot supply a replacement
+plan, command, policy, or authority override. An identical command returns its
+original receipt; a reused ID with different input, a stale revision, or unsafe
+custody is rejected before external mutations.
+
+The configured intake role investigates sealed evidence and proposes the smallest
+correction; independent review checks it against the original outcome and
+acceptance. Replanning covers flawed assumptions, decomposition, dependencies or
+gate placement. Automatic revision requires a structured native planning diagnostic
+bound to the current plan, candidate and sealed evidence; generic findings retain
+normal implementation repair. A reviewed proposal may split future work within an
+existing child by adding chunks while retaining existing IDs and acceptance. Started
+chunk dependencies and the published stack prefix remain fixed. A correction
+shares the cumulative ten-cycle allowance, including bounded rejected attempts;
+an already charged product cycle is not charged again. Adoption waits for known
+worker/resource closure, settled external effects and exact GitHub readback.
+Historical inputs, sessions and evidence remain immutable. Affected chunks and
+transitive dependents are requalified under the new revision; unaffected completed
+work, native sessions, child identities and the existing stack are retained. Human
+plan review remains required when the original policy requests it. Broader outcome
+or authority changes are outside autonomous revision and require new authorization.
+Ordinary continuation preserves the adopted plan.
+
+The run's `feature_plan` reports the adopted GitHub revision and digests, child
+plan links, correction phase and reason, evidence, affected chunks, frozen source
+authority, expected files, repair use and projected action eligibility. Eligibility
+comes from local custody; the command rechecks native, Temporal and GitHub state.
+Automatic assessment runs inside the owned workflow; it adds no external watcher.
+These readbacks describe recorded evidence, not a new remote polling service.
+
 After all chunks pass, the coordinator remains durably **Awaiting merge**.
 **Merge this feature** answers its exact pending merge decision. MCP exposes
 `merge_feature`; the existing decision API/CLI carries the same authority. The
@@ -74,7 +120,17 @@ stack, or a head-bound `gh pr merge` for one chunk. Unknown submission results a
 read back without blind replay. A changed head or target requiring new integration
 cannot reuse previous proof. Only confirmed merges whose trees match the verified
 chunks and are incorporated into the target close the issues. An incomplete
-feature with merged PRs is **Partially merged**, never **Merged**.
+feature with merged PRs is **Partially merged**, never **Merged**. Each child is
+**Merged** only when every required chunk has a confirmed merge observation.
+Closure intents identify that child's required chunks and exact merge receipts.
+
+Every published PR records its chunk, workstream, exact child issue and parent,
+and remains in the same native stack. Its body uses parent and child `Refs`
+links. GitHub's native development links and closing keywords automatically close
+linked issues on default-branch merge, so they cannot safely represent an early
+chunk of a child with several required chunks. The runtime closes the child after
+all its required chunks merge and closes the parent after the whole accepted
+feature merges. See [GitHub's documented linking semantics](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue).
 
 If the target advances, the coordinator creates a new integration pass and
 rechecks every layer in dependency order. Unique local branches preserve earlier

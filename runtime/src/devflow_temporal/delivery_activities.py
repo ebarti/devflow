@@ -49,6 +49,20 @@ def _cancelled_check_result(request: dict[str, Any], broker: DeliveryBroker) -> 
     return result
 
 
+def _bind_planning_repair(request, result):
+    if (result.get("planning_defect") and request["spec"].get("feature_worker")
+            and result.get("cleanup") == "confirmed"):
+        from .delivery_feature_revisions import planning_defect_repair_binding
+
+        binding = planning_defect_repair_binding(
+            request["spec"], request["spec"]["run_id"], request["iteration"],
+            result["planning_defect"],
+        )
+        if binding:
+            result["planning_defect_repair"] = binding
+    return result
+
+
 def _try_check_lock(path: Path) -> int | None:
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
@@ -81,7 +95,7 @@ async def _execute_check(
         broker.check_cancelled = cancelled.is_set
         if request["spec"]["provider"] != "codex":
             admitted.set()
-            return execute(broker)
+            return _bind_planning_repair(request, execute(broker))
         root = store.config.state_root / "check-execution"
         private_directory(root)
         slots = store.config.raw.get("check_concurrency", 2)
@@ -116,7 +130,7 @@ async def _execute_check(
                     result = execute(broker)
                     if not broker.native_cleanup_confirmed:
                         result = {**result, "state": "unknown", "cleanup": "unknown"}
-                    return result
+                    return _bind_planning_repair(request, result)
                 cancelled.wait(0.1)
             raise CheckCancelledBeforeLaunch("native check cancelled while queued for a slot")
         except CheckCancelledBeforeLaunch:
@@ -441,7 +455,12 @@ def _role_context(request, store, broker, supervisor):
             review_diff = retained['review_diff']
         else:
             workspace = broker.gate_checkout(role, iteration, candidate)
-            review_diff = broker.gate_diff(role, iteration, candidate)
+            if request.get("revision_context"):
+                from .delivery_feature_revision_roles import revision_diff
+
+                review_diff = revision_diff(broker, request)
+            else:
+                review_diff = broker.gate_diff(role, iteration, candidate)
     if role == 'implement' and retained is None:
         if broker.candidate() != candidate:
             raise ValueError('implementer checkout changed before its role')
@@ -462,6 +481,14 @@ async def _run_role(request: dict[str, Any]) -> dict[str, Any]:
         await asyncio.to_thread(shared.repair, token,
                                 f"{request['spec']['run_id']}:{request['iteration']}",
                                 "Product repair at worker iteration " + str(request["iteration"]))
+    if request.get("planning_defects_version") == 1 and request["spec"].get("feature_worker"):
+        from .delivery_feature_revisions import adopted_plan_identity
+
+        identity = await asyncio.to_thread(adopted_plan_identity, request["spec"])
+        request = {**request, "planning_context": {
+            "chunk_id": request["spec"]["feature_worker"]["chunk_id"],
+            "plan_revision": identity["plan_revision"], "plan_sha256": identity["plan_digest"],
+        }}
     supervisor = get_supervisor(store)
     request, workspace, review_diff, retained = await asyncio.to_thread(
         _role_context, request, store, broker, supervisor,
@@ -549,6 +576,29 @@ def _role_result(request, broker, workspace, review_diff, result):
                 "candidate or controller diff changed during independent gate"
             )
         after = candidate
+    diagnostic = result.get("planning_defect")
+    if diagnostic is not None:
+        from .delivery_feature_revision_roles import validate_diagnostic
+
+        try:
+            if (request.get("planning_defects_version") != 1
+                    or not request["spec"].get("feature_worker")
+                    or result.get("status") == "pass" or result.get("cleanup") != "confirmed"):
+                raise ValueError("planning defect has no closed nonpassing worker assessment")
+            diagnostic = validate_diagnostic(
+                diagnostic, chunk_id=request["spec"]["feature_worker"]["chunk_id"],
+                candidate_id=after["id"],
+            )
+            expected = request["planning_context"]
+            if any(diagnostic[key] != expected[key]
+                   for key in ("chunk_id", "plan_revision", "plan_sha256")):
+                raise ValueError("planning defect assessed a stale plan")
+            result["planning_defect"] = diagnostic
+            _bind_planning_repair(request, result)
+        except (ValueError, KeyError, TypeError):
+            # A malformed or stale diagnostic never turns ordinary failure text
+            # into revision authority. Existing findings remain product evidence.
+            result.pop("planning_defect", None)
     return {
         **result,
         "role": role,

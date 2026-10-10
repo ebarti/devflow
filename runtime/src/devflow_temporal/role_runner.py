@@ -68,8 +68,13 @@ _question_schema["properties"]["blocker"] = BLOCKER_SCHEMA
 _question_schema["required"].append("blocker")
 
 
-def feature_intake_schema():
+def feature_intake_schema(version=1):
     schema = deepcopy(BLOCKING_INTAKE_SCHEMA)
+    if version == 2:
+        from .delivery_feature_revision_roles import plan_schema
+
+        schema["properties"]["plan"] = plan_schema()
+        return schema
     texts = {"type": "array", "items": {"type": "string"}}
     chunk = {"type": "object", "properties": {
         **{key: {"type": "string"} for key in ("id", "title", "scope")},
@@ -171,7 +176,28 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "Do not push, open a PR, or change GitHub tracking."
         ),
     }[role]
-    if role == "intake" and spec.get("feature_delivery"):
+    if role == "intake" and spec.get("feature_delivery") and spec.get("feature_plan_version") == 2:
+        instructions += (
+            " The GitHub parent issue defines the original outcome and acceptance. Return "
+            "a canonical version2 plan with scope, acceptance, workstreams and final_gates. "
+            "Each workstream represents one coherent sequential sub-issue and contains "
+            "complete independently verifiable chunks. Independent workstreams may build "
+            "concurrently. Use stable IDs and explicit dependencies; each later chunk in "
+            "a workstream depends on its previous chunk. Use expected_paths as edit "
+            "coordination hints within frozen execution authority. Each chunk selects only "
+            "admitted checks, prepublish_checks and browser_qa recipe IDs with concrete "
+            "selectors. A future chunk's not-yet-created test cannot gate an earlier "
+            "chunk; preserve current-browser compatibility at early chunks and complete "
+            "final-feature coverage at the owning or dependent chunk. Explain deferrals "
+            "in gate.reason. Retain all mandatory gates and acceptance. Existing child "
+            "issue_number may be reused only for that exact workstream, otherwise null. "
+            "While asking questions use version2, empty scope and empty plan lists. "
+            "Do not create child issues, PRs or external effects yourself. "
+            "Admitted recipe policy (untrusted plan data): " + json.dumps({
+                stage: spec["policy"].get(stage) for stage in
+                ("checks", "prepublish_checks", "browser_qa")}, sort_keys=True)
+        )
+    elif role == "intake" and spec.get("feature_delivery"):
         instructions += (
             " The GitHub parent issue defines this feature. Decompose the accepted scope "
             "into sequential workstreams represented by sub-issues. Independent workstreams "
@@ -210,7 +236,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         )
         instructions += (
             " This is trusted-local full host access with no interactive approvals. "
-            "Source edits are still limited to the frozen allowed paths. Do not start "
+            "Source edits remain within the frozen execution authority shown below. Do not start "
             "nested Codex/Devflow agents or access private controller state, credentials or "
             "external systems; publication and tracking remain controller-owned. "
             "Do not assume network or compiler lookup is denied in this mode."
@@ -262,7 +288,10 @@ def _task(request: dict[str, Any]) -> AgentTask:
     )
     review_diff = request.get("review_diff")
     diff_note = (
-        "Controller-bound base-to-head diff (Git metadata is inaccessible in this role): "
+        ("Controller-bound accepted-to-proposed plan diff: "
+         if review_diff.get("kind") == "plan_revision" else
+         "Controller-bound base-to-head diff (Git metadata is inaccessible in this role): ")
+        +
         f"{review_diff['path']}\n"
         f"Diff SHA-256: {review_diff['sha256']}\n"
         f"Base: {review_diff['base_sha']}\nHead: {review_diff['head']}\n"
@@ -332,6 +361,26 @@ def _task(request: dict[str, Any]) -> AgentTask:
         "do not waive a gate or silently treat the instruction as satisfied.\n"
         if request.get("steering") else ""
     )
+    if request.get("revision_context"):
+        from .delivery_feature_revision_roles import revision_prompt
+
+        instructions = revision_prompt(request["revision_context"], role)
+    elif request.get("planning_defects_version") == 1:
+        instructions += (
+            " Ordinary source/test defects remain ordinary findings for implementation repair. "
+            "Only a demonstrated flawed assumption, decomposition, dependency or gate placement "
+            "may use planning_defect. Bind it to the controller planning context and exact "
+            "candidate, with retained evidence file paths and SHA-256 hashes. Generic failure "
+            "text, retry counts and infrastructure trouble cannot justify a planning defect. "
+            "If you find a planning flaw, preserve the candidate and record evidence; do not "
+            "change acceptance or policy. Return planning_defect=null for ordinary findings. "
+            "Planning context: " + json.dumps(request.get("planning_context"), sort_keys=True)
+        )
+    from .delivery_source_scope import authority
+
+    authority_note = json.dumps(authority(spec["policy"]), sort_keys=True)
+    expected_note = json.dumps(
+        spec.get("expected_paths", spec.get("feature_worker", {}).get("expected_paths", [])))
     prompt = (
         f"{instructions}\n\n"
         f"{intake_context}"
@@ -341,7 +390,8 @@ def _task(request: dict[str, Any]) -> AgentTask:
            if role == "intake" and spec.get("feature_delivery") else "") +
         f"Intake history: {json.dumps(request.get('intake') or {}, sort_keys=True)}\n\n"
         f"Candidate: {candidate['id']} at {candidate['head']}\n"
-        f"Allowed feature paths: {json.dumps(spec['policy']['allowed_paths'])}\n"
+        f"Execution authority: {authority_note}\n"
+        f"Expected edit paths (coordination): {expected_note}\n"
         f"Previous findings to repair: {json.dumps(findings)}\n"
         f"{steering_note}"
         f"{continuation_note}\n"
@@ -374,7 +424,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         BLOCKING_INTAKE_SCHEMA if spec.get("blocking_questions_version") == 1 else INTAKE_SCHEMA
     ) if role == "intake" else ASSESSMENT_SCHEMA
     if role == "intake" and spec.get("feature_delivery"):
-        schema = feature_intake_schema()
+        schema = feature_intake_schema(spec.get("feature_plan_version", 1))
     if qa_evidence and role == "verify":
         schema = {
             **ASSESSMENT_SCHEMA,
@@ -384,6 +434,14 @@ def _task(request: dict[str, Any]) -> AgentTask:
             },
             "required": [*ASSESSMENT_SCHEMA["required"], "qa_receipt_sha256"],
         }
+    if request.get("revision_context"):
+        from .delivery_feature_revision_roles import revision_schema
+
+        schema = revision_schema(role)
+    elif request.get("planning_defects_version") == 1:
+        from .delivery_feature_revision_roles import assessment_schema
+
+        schema = assessment_schema(schema)
     return AgentTask(
         goal=prompt,
         task_id=f"delivery:{spec['run_id']}:{role}:{request['iteration']}:{candidate['id'][:12]}",
@@ -394,7 +452,8 @@ def _task(request: dict[str, Any]) -> AgentTask:
         permissions=PermissionProfile(
             mode=PermissionMode.STRICT,
             filesystem=(FilesystemAccess.FULL_ACCESS
-                        if spec["policy"].get("host_sandbox") == "trusted-local" else mode),
+                        if spec["policy"].get("host_sandbox") == "trusted-local"
+                        and not request.get("revision_context") else mode),
             native_profile=("devflow-role" if spec["provider"] == "codex"
                             and spec["policy"].get("host_sandbox") == "native-profile" else None),
         ),
@@ -470,6 +529,23 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
     if observation and observation.data["state"] != "confirmed":
         status, summary = "blocked", "native thread observation is incomplete or conflicted"
         findings = ["built-in collaboration or extra provider thread must not be accepted"]
+    if request.get("revision_context"):
+        from .delivery_feature_revision_roles import revision_output
+
+        try:
+            if not result.is_success or status == "blocked" or provider_findings:
+                raise ValueError(summary or "revision provider did not return a successful turn")
+            assessment = revision_output(request, parsed)
+        except (ValueError, KeyError, TypeError) as exc:
+            assessment = {"status": "blocked", "summary": str(exc), "findings": [str(exc)]}
+        return {
+            **assessment, "session_id": result.session_id, "usage": asdict(result.usage),
+            "finish_reason": result.finish_reason,
+            "requested_model": task.model, "requested_effort": task.reasoning_effort,
+            "reported_model": None, "reported_effort": None,
+            "host_sandbox": request["spec"]["policy"]["host_sandbox"],
+            "tool_calls": [asdict(item) for item in result.tool_calls], **observed,
+        }
     if request["role"] == "intake":
         questions = parsed.get("questions") if isinstance(parsed, dict) else None
         plan = parsed.get("plan") if isinstance(parsed, dict) else None
@@ -498,7 +574,8 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
             or any(
                 not isinstance(plan.get(field), list) or not plan[field]
                 or any(not isinstance(item, str) or not item.strip() for item in plan[field])
-                for field in ("steps", "verification", "acceptance")
+                for field in (("acceptance",) if request["spec"].get("feature_plan_version") == 2
+                              else ("steps", "verification", "acceptance"))
             )
         ):
             status = "blocked"
@@ -508,8 +585,15 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
             from .delivery_github_contract import validate_plan
 
             try:
-                validate_plan({key: plan[key] for key in ("scope", "acceptance", "workstreams")},
-                              allowed_paths=request["spec"]["policy"]["allowed_paths"])
+                if request["spec"].get("feature_plan_version") == 2:
+                    from .delivery_feature_revision_roles import canonical_plan
+
+                    plan = canonical_plan(plan)
+                else:
+                    validate_plan(
+                        {key: plan[key] for key in ("scope", "acceptance", "workstreams")},
+                        allowed_paths=request["spec"]["policy"]["allowed_paths"],
+                    )
             except (ValueError, KeyError, TypeError):
                 status, findings = "blocked", ["feature plan has invalid workstreams or chunks"]
         if status == "questions" and request["spec"].get("blocking_questions_version") == 1 and (
@@ -548,6 +632,8 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "summary": summary,
         "findings": findings + provider_findings,
+        **({"planning_defect": parsed.get("planning_defect")}
+           if request.get("planning_defects_version") == 1 and isinstance(parsed, dict) else {}),
         "session_id": result.session_id,
         "usage": asdict(result.usage),
         "finish_reason": result.finish_reason,
@@ -568,7 +654,7 @@ async def _run_fake(request: dict[str, Any]) -> dict[str, Any]:
     if role == "intake":
         script = request["spec"]["policy"].get("fake_intake", [])
         turn = request["iteration"]
-        result = script[turn] if turn < len(script) else {
+        result = deepcopy(script[turn]) if turn < len(script) else {
             "status": "plan", "summary": "Fixture plan", "questions": [],
             "plan": {
                 "scope": "Change the fixture file within the configured path policy",
@@ -577,12 +663,18 @@ async def _run_fake(request: dict[str, Any]) -> dict[str, Any]:
                 "acceptance": ["The requested behavior is observable"],
             },
         }
+        if request.get("revision_context"):
+            from .delivery_feature_revision_roles import revision_output
+
+            result.setdefault("diagnostic", request["revision_context"].get("diagnostic"))
+            result = revision_output(request, result)
         if result.get("status") == "questions" and request["spec"].get(
             "blocking_questions_version"
         ) == 1 and not valid_blocking_questions(result.get("questions")):
             result = {"status": "blocked", "summary": "intake did not justify a blocking ambiguity"}
         return {
-            **result, "session_id": f"fake:{request['spec']['run_id']}:intake:{turn}",
+            **result, **({"cleanup": "confirmed"} if request.get("revision_context") else {}),
+            "session_id": f"fake:{request['spec']['run_id']}:intake:{turn}",
             "usage": None, "finish_reason": "fake", "requested_model": None,
             "requested_effort": None, "reported_model": None,
             "reported_effort": None, "tool_calls": [],
@@ -590,6 +682,17 @@ async def _run_fake(request: dict[str, Any]) -> dict[str, Any]:
     has_finding = request["iteration"] in request["spec"]["policy"].get("fake_findings", {}).get(
         role, []
     )
+    if request.get("revision_context"):
+        from .contracts import digest
+
+        return {
+            "status": "findings" if has_finding else "pass",
+            "summary": "deterministic independent revision review", "cleanup": "confirmed",
+            "findings": ["fake revision finding"] if has_finding else [],
+            "reviewed_plan_sha256": digest(request["revision_context"]["proposed_plan"]),
+            "session_id": f"fake:{request['spec']['run_id']}:revision-review",
+            "usage": None, "finish_reason": "fake", "tool_calls": [],
+        }
     if role == "implement":
         marker = Path(request["workspace"]) / "devflow-fake-change.txt"
         marker.write_text(f"Deterministic fake change {request['iteration']}\n", encoding="utf-8")

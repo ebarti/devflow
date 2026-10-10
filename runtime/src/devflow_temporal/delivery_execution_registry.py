@@ -216,6 +216,9 @@ class ExecutionRegistry:
                 if predecessor != self.token(old) or old["state"] != "stopped":
                     raise OwnershipConflict("feature already has an execution; continue its owner")
                 self._settled(db, issue["id"])
+                pending = self._pending_revision(db, issue["id"])
+                if pending and pending.get("successor_id") != run_id:
+                    raise OwnershipConflict("feature has a recorded plan revision in custody")
                 generation = old["generation"] + 1
             elif predecessor is not None:
                 raise OwnershipConflict("continuation predecessor is missing")
@@ -257,6 +260,121 @@ class ExecutionRegistry:
                 "store_path": store_path,
                 "generation": generation,
             }
+
+    @staticmethod
+    def _pending_revision(db, issue_id):
+        values = {
+            row["checkpoint_key"]: json.loads(row["content_json"])
+            for row in db.execute(
+                "SELECT checkpoint_key,content_json FROM execution_checkpoints "
+                "WHERE issue_id=? AND checkpoint_key LIKE 'plan-revision:%'",
+                (issue_id,),
+            )
+        }
+        requests = [
+            value
+            for key, value in values.items()
+            if key.startswith("plan-revision:request:")
+            and not any(
+                value["revision_id"] == terminal.get("revision_id")
+                for name, terminal in values.items()
+                if name.startswith(("plan-revision:adopted:", "plan-revision:rejected:"))
+            )
+        ]
+        if len(requests) > 1:
+            raise OwnershipConflict("feature has conflicting revision custody")
+        return requests[0] if requests else None
+
+    def revision_checkpoint(self, token: dict, key: str, value: dict, *, stopped=False) -> None:
+        """Append a revision admission without rewriting historic input snapshots."""
+        if not key.startswith("plan-revision:"):
+            raise ValueError("revision checkpoint must use its versioned namespace")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self.require(db, token, active=False)
+            if row["state"] not in ({"stopped"} if stopped else {"active", "draining"}):
+                raise OwnershipConflict("revision owner is not at its required checkpoint")
+            if stopped:
+                self._settled(db, token["issue_id"])
+                pending = self._pending_revision(db, token["issue_id"])
+                if pending and pending.get("revision_id") != value.get("revision_id"):
+                    raise OwnershipConflict("feature has another revision command in custody")
+            self._checkpoint(db, token, key, value)
+
+    def adopt_plan_revision(self, token: dict, receipt: dict, spec: dict) -> None:
+        """Commit a read-back plan and effective input overlay in one append-only transaction."""
+        identity = receipt["identity"]
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.require_settlement(db, token)
+            self._settled(db, token["issue_id"])
+            rows = list(
+                db.execute(
+                    "SELECT content_json FROM execution_checkpoints WHERE issue_id=? "
+                    "AND checkpoint_key LIKE 'plan-revision:adopted:%'",
+                    (token["issue_id"],),
+                )
+            )
+            previous = [json.loads(row[0]) for row in rows]
+            current = (
+                max(previous, key=lambda item: item["identity"]["plan_revision"])
+                if previous
+                else None
+            )
+            if current and current["identity"] == identity:
+                if current != receipt:
+                    raise OwnershipConflict("plan revision adoption receipt changed")
+                return
+            expected = receipt["old_identity"]
+            if current and current["identity"] != expected:
+                raise OwnershipConflict("plan revision was superseded before local adoption")
+            if identity["plan_revision"] != expected["plan_revision"] + 1:
+                raise OwnershipConflict("plan revision did not advance exactly once")
+            self._checkpoint(
+                db,
+                token,
+                "plan-revision:spec:" + spec["run_id"] + ":" + str(identity["plan_revision"]),
+                {
+                    "spec": spec,
+                    "spec_digest": digest(spec),
+                    "identity": identity,
+                    "revision_id": receipt["revision_id"],
+                },
+            )
+            self._checkpoint(
+                db, token, "plan-revision:adopted:" + str(identity["plan_revision"]), receipt
+            )
+            db.execute(
+                "UPDATE execution_claims SET state='active',updated_at=? WHERE issue_id=?",
+                (now(), token["issue_id"]),
+            )
+
+    def initialize_plan_revision(self, token: dict, receipt: dict, spec: dict) -> None:
+        """Seal only initial v2 child-number normalization; it grants no repair allowance."""
+        if receipt["identity"]["plan_revision"] != 1 or receipt.get("affected_chunks"):
+            raise ValueError("initial normalization cannot invalidate executed work")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.require(db, token)
+            if db.execute(
+                "SELECT 1 FROM execution_checkpoints WHERE issue_id=? "
+                "AND checkpoint_key LIKE 'plan-revision:adopted:%' "
+                "AND checkpoint_key!='plan-revision:adopted:1'",
+                (token["issue_id"],),
+            ).fetchone():
+                raise OwnershipConflict("initial plan is already superseded")
+            self._checkpoint(
+                db,
+                token,
+                "plan-revision:spec:" + spec["run_id"] + ":1",
+                {
+                    "spec": spec,
+                    "spec_digest": digest(spec),
+                    "identity": receipt["identity"],
+                    "revision_id": receipt["revision_id"],
+                },
+            )
+            self._checkpoint(db, token, "plan-revision:adopted:1", receipt)
 
     @staticmethod
     def _settled(db, issue_id):
@@ -330,6 +448,106 @@ class ExecutionRegistry:
                     "INSERT INTO execution_workers VALUES (?,?,?,?,'reserved',NULL)",
                     (token["issue_id"], worker_key, workstream_id, token["generation"]),
                 )
+            except sqlite3.IntegrityError as exc:
+                raise OwnershipConflict("workstream already has an active writer") from exc
+            return {
+                "worker_key": worker_key,
+                "workstream_id": workstream_id,
+                "generation": token["generation"],
+                "state": "reserved",
+            }
+
+    def reserve_revision_worker(self, token, worker_key, workstream_id, admission):
+        """Reactivate only a closed original assignment under an adopted correction."""
+        custody_key = "plan-revision:worker-custody:" + digest(
+            {
+                "worker_key": worker_key,
+                "revision_id": admission["revision_id"],
+            }
+        )
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.require(db, token)
+            receipt_row = db.execute(
+                "SELECT content_json FROM execution_checkpoints "
+                "WHERE issue_id=? AND checkpoint_key LIKE 'plan-revision:adopted:%' "
+                "ORDER BY json_extract(content_json,'$.identity.plan_revision') DESC LIMIT 1",
+                (token["issue_id"],),
+            ).fetchone()
+            receipt = json.loads(receipt_row[0]) if receipt_row else None
+            if (
+                not receipt
+                or receipt["revision_id"] != admission["revision_id"]
+                or {key: receipt["identity"][key] for key in ("plan_revision", "plan_digest")}
+                != admission["plan_identity"]
+                or admission["parent_run_id"] != token["run_id"]
+            ):
+                raise OwnershipConflict("worker reactivation has no exact adopted correction")
+            old = db.execute(
+                "SELECT * FROM execution_workers WHERE issue_id=? AND worker_key=?",
+                (token["issue_id"], worker_key),
+            ).fetchone()
+            prior = db.execute(
+                "SELECT content_json FROM execution_checkpoints "
+                "WHERE issue_id=? AND checkpoint_key=?",
+                (token["issue_id"], custody_key),
+            ).fetchone()
+            if prior:
+                if json.loads(prior[0])["admission"] != admission or not old:
+                    raise OwnershipConflict("worker revision reactivation custody changed")
+                if (
+                    old["generation"] != token["generation"]
+                    or old["workstream_id"] != workstream_id
+                ):
+                    raise OwnershipConflict("worker revision assignment changed ownership")
+                if old["state"] != "finished":
+                    return dict(old)
+            if old:
+                closed = json.loads(old["receipt_json"] or "null")
+                if (
+                    old["generation"] != token["generation"]
+                    or old["workstream_id"] != workstream_id
+                    or old["state"] != "finished"
+                    or not closed
+                    or closed.get("cleanup") != "confirmed"
+                ):
+                    raise OwnershipConflict(
+                        "worker revision requires its confirmed closed assignment"
+                    )
+            else:
+                # A continuation generation creates a new assignment; the old
+                # generation's row and its confirmed completion remain unchanged.
+                predecessor = db.execute(
+                    "SELECT * FROM execution_workers WHERE issue_id=? "
+                    "AND substr(worker_key,1,instr(worker_key,':generation:')-1)=? "
+                    "AND state='finished' ORDER BY generation DESC LIMIT 1",
+                    (token["issue_id"], worker_key.split(":generation:")[0]),
+                ).fetchone()
+                closed = json.loads(predecessor["receipt_json"] or "null") if predecessor else None
+                if not closed or closed.get("cleanup") != "confirmed":
+                    raise OwnershipConflict("worker revision has no retained closed assignment")
+            if not prior:
+                self._checkpoint(
+                    db,
+                    token,
+                    custody_key,
+                    {
+                        "admission": admission,
+                        "predecessor_assignment": dict(old or predecessor),
+                    },
+                )
+            try:
+                if old:
+                    db.execute(
+                        "UPDATE execution_workers SET state='reserved',receipt_json=NULL "
+                        "WHERE issue_id=? AND worker_key=?",
+                        (token["issue_id"], worker_key),
+                    )
+                else:
+                    db.execute(
+                        "INSERT INTO execution_workers VALUES (?,?,?,?,'reserved',NULL)",
+                        (token["issue_id"], worker_key, workstream_id, token["generation"]),
+                    )
             except sqlite3.IntegrityError as exc:
                 raise OwnershipConflict("workstream already has an active writer") from exc
             return {
@@ -443,7 +661,10 @@ class ExecutionRegistry:
     def repair(self, token: dict, key: str, reason: str, *, devflow_defect: bool = False) -> dict:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self.require(db, token)
+            if key.startswith("plan-revision:"):
+                self.require_settlement(db, token)
+            else:
+                self.require(db, token)
             limit = db.execute(
                 "SELECT * FROM execution_repair_limits WHERE issue_id=?", (token["issue_id"],)
             ).fetchone()
@@ -454,6 +675,28 @@ class ExecutionRegistry:
             count = db.execute(
                 "SELECT COUNT(*) FROM execution_repairs WHERE issue_id=?", (token["issue_id"],)
             ).fetchone()[0]
+            alias = db.execute(
+                "SELECT content_json FROM execution_checkpoints "
+                "WHERE issue_id=? AND checkpoint_key=?",
+                (token["issue_id"], "plan-revision:repair-alias:" + key),
+            ).fetchone()
+            if alias:
+                bound = json.loads(alias[0])
+                debit = db.execute(
+                    "SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+                    (token["issue_id"], bound["repair_key"]),
+                ).fetchone()
+                if (
+                    not debit
+                    or bound.get("reason") != reason
+                    or bound.get("generation") != token["generation"]
+                ):
+                    raise OwnershipConflict("revision repair alias lost its exact cumulative debit")
+                return {
+                    "used": count,
+                    "maximum": limit["maximum"],
+                    "learning_required": bool(limit["learning_required"]),
+                }
             if old and old["reason"] != reason:
                 raise OwnershipConflict("repair identity changed")
             if not old and not devflow_defect:

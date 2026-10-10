@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_execution_registry import ExecutionRegistry, OwnershipConflict
+from .delivery_feature_gates import derive_chunk_gates, validate_chunk_gates
 from .delivery_github_contract import GitHubDelivery, ordered_chunks, validate_plan
 
 
@@ -34,10 +35,13 @@ def plan_for(spec):
     value = json.loads(spec["accepted_plan"])
     if not isinstance(value, dict) or not {"scope", "acceptance", "workstreams"} <= value.keys():
         raise ValueError("feature delivery requires a structured GitHub workstream plan")
-    return validate_plan(
-        {key: value[key] for key in ("scope", "acceptance", "workstreams")},
-        allowed_paths=spec["policy"]["allowed_paths"],
-    )
+    keys = ("version", "scope", "acceptance", "workstreams", "final_gates") \
+        if value.get("version") == 2 else ("scope", "acceptance", "workstreams")
+    plan = validate_plan({key: value[key] for key in keys},
+                         allowed_paths=spec["policy"].get("allowed_paths"))
+    validate_chunk_gates(plan, spec)
+    return plan
+
 
 
 def admit(store, db, spec):
@@ -70,11 +74,14 @@ def admit(store, db, spec):
         )
     if snapshot["delivery"]:
         accepted = snapshot["delivery"]["manifest"]["plan"]
-        validate_plan(accepted, allowed_paths=spec["policy"]["allowed_paths"])
         spec["accepted_plan"] = canonical_json(accepted)
+        plan_for(spec)
         spec["intake_required"] = False
     elif spec["accepted_plan"]:
         plan_for(spec)
+    if (not spec["accepted_plan"] and not snapshot["delivery"]
+            or spec["accepted_plan"] and json.loads(spec["accepted_plan"]).get("version") == 2):
+        spec["feature_plan_version"] = 2
     token = shared.claim(
         snapshot,
         spec["run_id"],
@@ -115,6 +122,14 @@ def require_execution(store, spec, *, allow_stopped=False):
             ).fetchone()
         if not row or row["generation"] != current["generation"] or row["state"] == "finished":
             raise OwnershipConflict("worker no longer has an active execution assignment")
+        identity = spec.get("feature_plan_revision")
+        from .delivery_feature_revisions import adopted_plan_identity
+
+        adopted = adopted_plan_identity(spec, shared=shared)
+        bound_adopted = {key: adopted[key] for key in ("plan_revision", "plan_digest")}
+        if ((identity is not None and identity != bound_adopted)
+                or (identity is None and adopted["plan_revision"] > 1)):
+            raise OwnershipConflict("worker belongs to a superseded feature plan revision")
         if activity.in_activity() and (
             activity.info().workflow_id != store.active_workflow_id(spec["run_id"])
         ):
@@ -132,12 +147,15 @@ def worker_key(run_id, token):
 
 
 def worker_spec(parent, chunk, issue, *, kind, base_sha, base_branch, seed=None):
-    """Derive a narrower worker authority before native preparation, never after it."""
+    """Derive an immutable worker input with version-specific authority and gates."""
     from .delivery_feature_pass import checkpoints
 
     integration = checkpoints(parent)["integration-pass"] if kind == "chunk" else None
     suffix = digest({"owner": parent["feature_delivery"]["owner"], "chunk": chunk["id"],
-                     "kind": kind, "integration_pass": integration})[:20]
+                     "kind": kind, "integration_pass": integration,
+                     **({"plan_revision": parent.get("feature_plan_revision"),
+                         "plan_digest": digest(plan_for(parent))}
+                        if json.loads(parent["accepted_plan"]).get("version") == 2 else {})})[:20]
     run_id = "worker-" + suffix
     spec = deepcopy(parent)
     for key in (
@@ -150,17 +168,27 @@ def worker_spec(parent, chunk, issue, *, kind, base_sha, base_branch, seed=None)
         "origin_thread_id",
     ):
         spec.pop(key, None)
+    plan = plan_for(parent)
+    final = chunk["id"] == ordered_chunks(plan)[-1]["id"]
+    selected = derive_chunk_gates(parent, plan, chunk, final=final and kind == "chunk")
+    spec.update(selected)
     policy = spec["policy"]
     for key in ("security_binding_sha256", "environment_proof_sha256"):
         policy.pop(key, None)
-    policy["allowed_paths"] = list(chunk["allowed_paths"])
+    if plan.get("version") != 2:
+        policy["allowed_paths"] = list(chunk["allowed_paths"])
+    else:
+        spec["feature_plan_revision"] = parent.get("feature_plan_revision", {
+            "plan_revision": 1, "plan_digest": digest(plan)})
     policy["initial_decision_prompt"] = None
     policy["recovery"] = None
     policy["pr_body"] = (
         chunk["scope"]
         + "\n\nAcceptance:\n"
         + "\n".join("- " + text for text in chunk["acceptance"])
-        + f"\n\nRefs {parent['issue_url']}\nRefs {issue['url']}\n"
+        + f"\n\nParent feature: Refs {parent['issue_url']}"
+        + f"\nWorkstream {chunk['workstream_id']}: Refs {issue['url']}"
+        + f"\nChunk: {chunk['id']}\n"
     )
     accepted = {key: chunk[key] for key in ("scope", "steps", "verification", "acceptance")}
     if kind == "chunk":
@@ -169,8 +197,8 @@ def worker_spec(parent, chunk, issue, *, kind, base_sha, base_branch, seed=None)
             "base. Inspect the imported implementation, resolve any "
             "integration conflicts and preserve other chunks."
         )
-        if chunk["id"] == ordered_chunks(plan_for(parent))[-1]["id"]:
-            accepted["feature_acceptance"] = plan_for(parent)["acceptance"]
+        if final:
+            accepted["feature_acceptance"] = plan["acceptance"]
     spec.update(
         run_id=run_id,
         work_id=run_id,
@@ -223,6 +251,58 @@ def worker_spec(parent, chunk, issue, *, kind, base_sha, base_branch, seed=None)
     policy.pop("baseline_checks", None)
     spec["policy_digest"] = digest(policy)
     return spec
+
+
+def revised_worker_spec(parent_spec, proposed_plan, chunk_id, *, expected_revision, worker=None):
+    """Derive a fresh execution snapshot; never alter original stored authority."""
+    plan = validate_plan(proposed_plan, allowed_paths=parent_spec["policy"].get("allowed_paths"))
+    if plan.get("version") != 2:
+        raise ValueError("worker revision requires explicit v2 plan adoption")
+    if (not isinstance(expected_revision, dict)
+            or set(expected_revision) != {"plan_revision", "plan_digest"}
+            or type(expected_revision["plan_revision"]) is not int
+            or expected_revision["plan_revision"] < 1
+            or expected_revision["plan_digest"] != digest(plan)):
+        raise ValueError("worker revision identity does not bind the proposed plan")
+    chunks = ordered_chunks(plan)
+    chunk = next((item for item in chunks if item["id"] == chunk_id), None)
+    if chunk is None:
+        raise ValueError("worker revision names an unknown original chunk")
+    if worker is not None and (worker.get("feature_worker", {}).get("chunk_id") != chunk_id
+            or worker.get("feature_delivery", {}).get("owner", {}).get("issue_id")
+            != parent_spec["feature_delivery"]["owner"]["issue_id"]):
+        raise ValueError("worker revision cannot change feature or chunk custody")
+    result = deepcopy(worker if worker is not None else parent_spec)
+    selected = derive_chunk_gates(parent_spec, plan, chunk,
+                                  final=chunks[-1]["id"] == chunk_id and
+                                  result.get("feature_worker", {}).get("kind") == "chunk")
+    result.update(selected)
+    policy = result["policy"]
+    for name in ("security_binding_sha256", "environment_proof_sha256"):
+        policy.pop(name, None)
+    policy["initial_decision_prompt"] = None
+    policy["recovery"] = None
+    if worker is not None:
+        policy["pr_body"] = (
+            chunk["scope"] + "\n\nAcceptance:\n"
+            + "\n".join("- " + text for text in chunk["acceptance"])
+            + f"\n\nParent feature: Refs {parent_spec['issue_url']}"
+            + f"\nWorkstream {chunk['workstream_id']}: Refs {worker['issue_url']}"
+            + f"\nChunk: {chunk_id}\n")
+    policy.pop("baseline_checks", None)
+    accepted = {key: chunk[key] for key in ("scope", "steps", "verification", "acceptance")}
+    if worker is not None:
+        previous_plan = json.loads(worker["accepted_plan"])
+        if previous_plan.get("integration"):
+            accepted["integration"] = previous_plan["integration"]
+    if chunks[-1]["id"] == chunk_id and result.get("feature_worker", {}).get("kind") == "chunk":
+        accepted["feature_acceptance"] = plan["acceptance"]
+    result.update(accepted_plan=canonical_json(accepted),
+                  feature_plan_revision=deepcopy(expected_revision), policy_digest=digest(policy))
+    result.pop("baseline_checks_version", None)
+    for name in ("prepared_environment", "preparation"):
+        result.pop(name, None)
+    return result
 
 
 def register_worker(store, parent, spec):
@@ -282,7 +362,7 @@ def register_worker(store, parent, spec):
     return spec
 
 
-def continue_feature(store, run_id, request):
+def continue_feature(store, run_id, request, *, _revision=None):
     from .delivery_config import COMMAND_RE
     from .delivery_feature_closure import closed_coordinator
 
@@ -371,8 +451,11 @@ def continue_feature(store, run_id, request):
     )
     accepted = store.effective_spec(run_id).get("accepted_plan")
     if accepted:
+        # The supplied plan is already accepted. Store admission restores the
+        # original approval policy from its authenticated stopped predecessor.
         supplied.update(accepted_plan=accepted, plan_approval="automatic")
-    return store.submit(supplied)
+    return (store.submit(supplied, _feature_revision=_revision) if _revision is not None
+            else store.submit(supplied))
 
 
 def _draining_handoff_ready(store, shared, token):
@@ -429,6 +512,9 @@ def detail(store, spec):
                         **assignment,
                         **dict(row),
                         "pull_request": json.loads(row["pr_json"] or "null"),
+                        "workstream_id": store.effective_spec(row["run_id"]).get(
+                            "feature_worker", {}).get("workstream_id"),
+                        "issue_url": store.effective_spec(row["run_id"]).get("issue_url"),
                     }
                 )
                 workers[-1].pop("pr_json")

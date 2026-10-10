@@ -56,6 +56,11 @@ def observe(spec, state, effects, *, resource_spec=None, evidence_root=None):
     expected = {'iteration': state['iteration'], 'candidate_id': candidate['id'],
                 'policy_digest': spec['policy_digest'], 'qa_config_sha256': digest(qa),
                 'ports': qa['ports'], 'argv': qa['argv']}
+    if qa.get("required_selectors"):
+        from .delivery_feature_gates import resolve_required_selectors
+
+        expected["selector_sources"] = resolve_required_selectors(
+            qa, root / "gates" / str(state["iteration"]) / "verify", spec=spec)
     pending = [e for e in effects if e['state'] != 'complete' or not e['observed_json']]
     if (len(pending) != 1 or pending[0]['effect_key'] != key
             or pending[0]['run_id'] != spec['run_id'] or pending[0]['kind'] != 'browser_qa'

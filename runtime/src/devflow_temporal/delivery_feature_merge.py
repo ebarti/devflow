@@ -120,6 +120,39 @@ def evidence(store, parent, record, live, gh):
     return trees
 
 
+def closure_groups(record):
+    """Map each required chunk to its exact child before admitting a merge effect."""
+    manifest = record["manifest"]
+    plan = manifest["plan"]
+    members = manifest["publication"]["members"]
+    required = ordered_chunks(plan)
+    if [member["chunk_id"] for member in members] != [chunk["id"] for chunk in required]:
+        raise OwnershipConflict("merge publication does not contain every required chunk once")
+    by_chunk = {member["chunk_id"]: member for member in members}
+    groups, seen_issues = [], set()
+    for stream in plan["workstreams"]:
+        child = manifest["workstream_issues"].get(stream["id"])
+        if not child or child["id"] in seen_issues:
+            raise OwnershipConflict("workstream closure has no unique recorded child issue")
+        if stream.get("issue_number") not in {None, child["number"]}:
+            raise OwnershipConflict("workstream plan and child identity disagree")
+        seen_issues.add(child["id"])
+        chunk_ids = [chunk["id"] for chunk in stream["chunks"]]
+        for chunk_id in chunk_ids:
+            member = by_chunk[chunk_id]
+            expected = {"workstream_id": stream["id"], "issue_id": child["id"],
+                        "issue_number": child["number"], "issue_url": child["url"]}
+            explicit = any(field in member for field in expected)
+            if (manifest["version"] >= 2 or explicit) and any(
+                member.get(field) != value for field, value in expected.items()
+            ):
+                raise OwnershipConflict("chunk publication belongs to another child issue")
+        groups.append((child, chunk_ids))
+    if set(manifest["workstream_issues"]) != {stream["id"] for stream in plan["workstreams"]}:
+        raise OwnershipConflict("workstream closure includes an unplanned child issue")
+    return groups
+
+
 def hierarchy(spec, record, gh):
     issue = spec["feature_delivery"]["snapshot"]["issue"]
     for child in [issue, *record["manifest"]["workstream_issues"].values()]:
@@ -142,6 +175,7 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
     record = current_record(spec, gh)
     if publication(record, complete=True) != requested:
         raise OwnershipConflict("feature plan or stack changed after merge authorization")
+    groups = closure_groups(record)
     key = "feature-merge:" + digest(authority)
     if settlement and shared.effect(token["issue_id"], key) is None:
         raise OwnershipConflict("settlement cannot originate a new merge")
@@ -264,19 +298,38 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
     # GitHub issues represent the business outcome. Close the feature and its
     # workstreams only after every accepted chunk is actually merged.
     issue = spec["feature_delivery"]["snapshot"]["issue"]
-    closures = [*record["manifest"]["workstream_issues"].values(), issue]
-    hierarchy(spec, current_record(spec, gh), gh)
-    for child in closures:
+    closures = [*groups, (issue, [member["chunk_id"] for member in members])]
+    closure_record = current_record(spec, gh)
+    if publication(closure_record, complete=True) != requested:
+        raise OwnershipConflict("feature plan or stack changed before issue closure")
+    hierarchy(spec, closure_record, gh)
+    merged_by_chunk = {member["chunk_id"]: receipt
+                       for member, receipt in zip(members, merged, strict=True)}
+    confirmed = {member["chunk_id"] for member, raw in zip(members, live, strict=True)
+                 if raw.get("merged") is True and raw.get("merged_at")
+                 and raw.get("merge_commit_sha")}
+    for child, chunk_ids in closures:
+        if not chunk_ids or not set(chunk_ids) <= confirmed:
+            raise OwnershipConflict("issue still has required chunks without confirmed merges")
+        child_merges = [merged_by_chunk[chunk_id] for chunk_id in chunk_ids]
         endpoint = f"repos/{spec['github_repo']}/issues/{child['number']}"
         with shared.mutation(token):
             if cancelled and cancelled.is_set():
                 raise OwnershipConflict("merge completed; issue closure still needs reconciliation")
-            receipt = shared.intent(
-                token,
-                key + ":close:" + child["id"],
-                "close_merged_issue",
-                {"issue": child["id"], "merges": merged},
-            )
+            close_key = key + ":close:" + child["id"]
+            prior_closure = shared.effect(token["issue_id"], close_key)
+            closure_request = {"issue": child["id"], "required_chunks": chunk_ids,
+                               "merges": child_merges}
+            if prior_closure:
+                original = prior_closure["request"]
+                # Preserve historical v1 effects. They recorded all feature
+                # merges for each child, after the same complete-feature fence.
+                expected = closure_request if "required_chunks" in original else {
+                    "issue": child["id"], "merges": merged}
+                if prior_closure["kind"] != "close_merged_issue" or original != expected:
+                    raise OwnershipConflict("original issue closure obligation changed")
+                closure_request = original
+            receipt = shared.intent(token, close_key, "close_merged_issue", closure_request)
             raw = gh.api(endpoint)
             if raw["node_id"] != child["id"] or raw.get("pull_request"):
                 raise OwnershipConflict("merged issue identity changed")
