@@ -34,6 +34,9 @@ def initialize(db: sqlite3.Connection) -> None:
         next_check_at TEXT NOT NULL, error TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_pr_refresh_requests (
         url TEXT PRIMARY KEY, request_id TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_legacy_publication_bindings (
+        issue TEXT PRIMARY KEY, projection_run_id TEXT NOT NULL,
+        publication_run_id TEXT NOT NULL, publication_json TEXT NOT NULL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_pr_observation_inputs (
         url TEXT PRIMARY KEY, publication_key TEXT NOT NULL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_feature_views (
@@ -68,9 +71,9 @@ def publication_urls(receipt: dict | None) -> list[str]:
     return sorted({member["url"] for member in members if member.get("url")})
 
 
-def _status(row: dict, observations: list[dict]) -> str:
+def _status(row: dict, observations: list[dict], receipt: dict | None = None) -> str:
     known = [item.get("observation") for item in observations]
-    receipt = json.loads(row["pr_json"] or "{}")
+    receipt = receipt or json.loads(row["pr_json"] or "{}")
     spec = json.loads(row["request_json"])
     complete = not spec.get("feature_delivery") or receipt.get("scope_complete") is True
     if complete and known and all(item and item["state"] == "MERGED" for item in known):
@@ -141,8 +144,11 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
         "project": tracking.get("project") or repository.get("project_url"),
         "assignee": (tracking.get("sync") or {}).get("assignee") or repository.get("assignee"),
     }
+    from .delivery_legacy_publication import publication
+
+    receipt, publication_binding = publication(db, row)
     observations = []
-    for url in publication_urls(json.loads(row["pr_json"] or "null")):
+    for url in publication_urls(receipt):
         observation = db.execute(
             "SELECT * FROM delivery_pr_observations WHERE url=?", (url,),
         ).fetchone()
@@ -156,10 +162,11 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
     payload = {
         "issue": key, "run_id": run_id, "work_id": row["work_id"],
         "admitted_at": row["created_at"], "run_revision": row["revision"],
-        "status": _status(row, observations), "binding": binding,
+        "status": _status(row, observations, receipt), "binding": binding,
         "legacy_tracking": spec.get("project_sync_version") != 1
         and row["execution_state"] not in {"terminal", "blocked", "cancelled"},
         "pull_requests": observations,
+        **({"legacy_publication_binding": publication_binding} if publication_binding else {}),
         **({"execution_owner": owner, "repair_budget": registry(spec).budget(owner["issue_id"]),
             "github_record": registry(spec).checkpoints(owner["issue_id"]).get("github-record")}
            if owner else {}),
