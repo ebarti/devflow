@@ -67,12 +67,13 @@ def scope_spec(store, seal, command):
     return effective
 
 
-def fixed_budget_allows(spec, iteration, iterations):
+def fixed_budget_allows(spec, iteration, iterations, *, pending=False):
     """A resume may spend unused original turns, never enlarge the frozen ceiling."""
     maximum = spec.get('policy', {}).get('max_repairs')
     allowed = range(1, 101) if spec.get('feature_worker') else (1, 2)
     return (type(iteration) is int and iteration >= 0
-            and type(iterations) is int and iterations in allowed
+            and type(iterations) is int
+            and (iterations in allowed or (iterations == 0 and pending))
             and type(maximum) is int and maximum >= 0
             and iteration + iterations <= maximum)
 
@@ -110,7 +111,8 @@ def custody(db, recovery):
     spec = recovery['execution_spec']
     if (spec.get('retry_budget_version') == 1
             and not fixed_budget_allows(spec, recovery['state']['iteration'],
-                                        recovery['command']['additional_iterations'])):
+                                        recovery['command']['additional_iterations'],
+                                        pending=bool(recovery.get('pending_repair')))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
     path = Path(spec['state_dir']) / namespace(recovery) / 'admission.json'
     command = db.execute('SELECT request_digest,response_json FROM delivery_commands '
@@ -123,8 +125,10 @@ def custody(db, recovery):
             or recovery['maximum_iteration'] != (recovery['state']['iteration']
                                                  + recovery['command']['additional_iterations'])):
         raise ValueError('stopped resume lost its immutable command authority')
-    if ('pending_repair' in recovery
-            and pending_repair(recovery) != recovery['pending_repair']):
+    if (('pending_repair' in recovery
+             and pending_repair(recovery) != recovery['pending_repair'])
+            or (recovery['command']['additional_iterations'] == 0
+                and not recovery.get('pending_repair'))):
         raise ValueError('stopped resume changed its unstarted repair authority')
     if SCOPE_FIELDS <= recovery['command'].keys():
         scope = recovery['command']
@@ -274,7 +278,7 @@ def _unpublished_remote(broker):
 
 def admit(store, run_id, command, *, preflight=False):
     original = store.submitted_spec(run_id)
-    allowed = range(1, 101) if original.get('feature_worker') else (1, 2)
+    allowed = range(0, 101) if original.get('feature_worker') else (0, 1, 2)
     if (not isinstance(command, dict) or set(command) not in (FIELDS, FIELDS | SCOPE_FIELDS)
             or command.get('continuation_kind') != KIND
             or not isinstance(command.get('command_id'), str)
@@ -303,10 +307,13 @@ def admit(store, run_id, command, *, preflight=False):
             or command['expected_candidate_id'] != seal['candidate']['id']
             or command['expected_candidate_head'] != seal['candidate']['head']):
         raise ValueError('stopped resume checkpoint is stale')
+    if command['additional_iterations'] == 0 and not pending:
+        raise ValueError('zero additional iterations require an authenticated pending repair')
     maximum = seal['state']['iteration'] + command['additional_iterations']
     if (original.get('retry_budget_version') == 1
             and not fixed_budget_allows(original, seal['state']['iteration'],
-                                        command['additional_iterations'])):
+                                        command['additional_iterations'],
+                                        pending=bool(pending))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
     amended = scope_spec(store, seal, command)
     if preflight:
