@@ -181,6 +181,21 @@ historical fixtures and separately checks the runtime and dashboard. These
 checks do not perform live installation, model-driven delivery, target-project
 checks, merges or deployment.
 
+The runtime suite runs in four isolated macOS jobs. `runtime/runtime_ci.py`
+collects the full suite on each host and assigns whole modules using the measured
+weights in `runtime/ci_timings.json`; new modules are included automatically.
+Cases within a module retain their order and share no host with another shard.
+Each job uploads its test inventory, result and JUnit timings. The required
+`temporal-runtime-macos` check passes only when all four jobs pass and their
+inventories prove complete, non-overlapping coverage of the same Git revision.
+Update the timing weights from the uploaded results as the suite grows. From
+`runtime/`, `uv run --frozen pytest` still runs the complete suite. To run one
+partition locally:
+
+```sh
+uv run --frozen python runtime_ci.py --index 0 --count 4 --revision "$(git rev-parse HEAD)"
+```
+
 [Architecture](docs/architecture.md)
 
 Automatic retries keep the accepted plan and frozen per-issue attempt ceiling. Later cleanup and acknowledged Blocked/claim release can finish after that ceiling is exhausted, but cannot create another attempt. Cleanup maintenance preserves the exact original resource manifest and finalization bytes before updating their canonical latest observations; interrupted maintenance reuses and authenticates the immutable originals. Completed provider journals without the original result binding remain unresolved rather than inferred clean.

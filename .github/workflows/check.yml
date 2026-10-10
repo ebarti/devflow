@@ -37,10 +37,15 @@ jobs:
         with:
           python-version: '3.12'
       - run: python3.12 -B -m unittest discover -s tests -v
-  temporal-runtime-macos:
+  temporal-runtime-tests:
+    name: runtime shard ${{ matrix.shard }}
     runs-on: macos-latest
-    # The composed suite reached 84% before the observed 30-minute job timeout.
-    timeout-minutes: 45
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -58,10 +63,38 @@ jobs:
       - run: echo "$RUNNER_TEMP/devflow-uv/bin" >> "$GITHUB_PATH"
       - run: uv sync --locked --python python
         working-directory: runtime
-      - run: uv run --frozen ruff check src tests
+      - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
-      - run: uv run --frozen pytest -v --tb=short -ra --durations=20
+      - run: uv run --frozen python runtime_ci.py --index ${{ matrix.shard }} --count 4
         working-directory: runtime
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() }}
+        with:
+          name: runtime-shard-${{ matrix.shard }}
+          path: runtime/ci-results/
+          if-no-files-found: error
+  temporal-runtime-macos:
+    # Preserve the required context and fail closed on missing/failed shards.
+    if: ${{ always() }}
+    needs: temporal-runtime-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every runtime shard to pass
+        env:
+          SHARDS_RESULT: ${{ needs.temporal-runtime-tests.result }}
+        run: test "$SHARDS_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: runtime-shard-*
+          path: runtime/ci-results/
+          merge-multiple: true
+      - name: Verify complete and disjoint coverage at this revision
+        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 4
   temporal-dashboard:
     runs-on: macos-latest
     timeout-minutes: 5
