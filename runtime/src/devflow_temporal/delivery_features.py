@@ -32,6 +32,8 @@ def initialize(db: sqlite3.Connection) -> None:
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_pr_observations (
         url TEXT PRIMARY KEY, observation_json TEXT, checked_at TEXT,
         next_check_at TEXT NOT NULL, error TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_pr_refresh_requests (
+        url TEXT PRIMARY KEY, request_id TEXT NOT NULL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_pr_observation_inputs (
         url TEXT PRIMARY KEY, publication_key TEXT NOT NULL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_feature_views (
