@@ -97,6 +97,21 @@ the mirror pending while delivery continues. External PR changes and Project
 drift retain the configured **86,400-second** checks. Event-triggered updates and
 merge-command readbacks do not wait for the daily check.
 
+After an authorized external merge or closure, request immediate reconciliation
+without changing that schedule or rewriting a historical execution receipt:
+
+```sh
+devflow-project-sync --config /absolute/path/to/synchronizer.json \
+  --refresh-pr https://github.com/owner/repository/pull/123
+```
+
+Repeat `--refresh-pr` for additional recorded PRs. The command accepts only PRs
+already bound to the configured deliveries. It durably queues a readback and
+wakes the independent service; `queued` is not confirmation of remote state or
+Project synchronization. If the service is unavailable, its next startup consumes
+the request. Read the run's feature status and mirror receipt to confirm completion.
+It does not reopen execution, merge a PR, or change the product repair allowance.
+
 ## Upgrade and historical custody
 
 Stop admission and establish that all participating runtime workflows are idle.

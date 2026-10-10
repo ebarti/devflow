@@ -578,3 +578,127 @@ def test_terminal_tracking_retains_publication_custody_readback(monkeypatch, fre
     }))
     assert seen == (["guard"] if drift else ["guard", "local"])
     assert result["state"] == ("pending" if drift else "recorded" if fresh else "consistent")
+
+
+def test_explicit_refresh_is_durable_and_preserves_execution_and_daily_schedule(
+    service, monkeypatch,
+):
+    store, request, receipt = published(service)
+    remote = Remote()
+    stamp = datetime(2026, 10, 10, tzinfo=UTC)
+    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    sync.tick()
+    original = store.detail(request["run_id"])
+    notified = []
+    monkeypatch.setattr("devflow_temporal.delivery_project_sync.notify", notified.append)
+    queued = sync.request_pr_refresh([receipt["url"]])
+    assert queued == {"state": "queued", "pull_requests": [receipt["url"]]}
+    assert notified == [store.config.tracking_db]
+    assert len(remote.reads) == 1 and len(remote.writes) == 1
+    assert sync.next_delay() == 15
+    remote.state = "MERGED"
+    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, clock=lambda: stamp)
+    assert restarted.tick()[request["issue_url"]]["status"] == "Merged"
+    detail = store.detail(request["run_id"])
+    for key in ("outcome", "phase", "pull_request", "iteration"):
+        assert detail[key] == original[key]
+    restarted.tick()
+    assert len(remote.reads) == 2
+    with store._connect() as db:
+        assert not db.execute("SELECT * FROM delivery_pr_refresh_requests").fetchall()
+        due = db.execute("SELECT next_check_at FROM delivery_pr_observations").fetchone()[0]
+        assert datetime.fromisoformat(due) == stamp + timedelta(days=1)
+
+
+def test_refresh_rejects_unbound_urls_before_queueing_any_request(service):
+    store, _, receipt = published(service)
+    remote = Remote()
+    sync = ProjectSynchronizer([store], remote)
+    with pytest.raises(ValueError, match="bound"):
+        sync.request_pr_refresh([receipt["url"], "https://github.com/another/repo/pull/99"])
+    with store._connect() as db:
+        assert not db.execute("SELECT * FROM delivery_pr_refresh_requests").fetchall()
+    assert not remote.reads and not remote.writes
+
+
+def test_request_arriving_during_remote_read_is_not_lost(service):
+    store, _, receipt = published(service)
+    remote = Remote()
+    sync = ProjectSynchronizer([store], remote)
+    sync.tick()
+    sync.request_pr_refresh([receipt["url"]])
+    read = remote.pull_request
+
+    def another_request(url):
+        sync.request_pr_refresh([url])
+        return read(url)
+
+    remote.pull_request = another_request
+    sync.tick()
+    with store._connect() as db:
+        assert db.execute("SELECT * FROM delivery_pr_refresh_requests").fetchone()
+    remote.pull_request = read
+    sync.tick()
+    assert len(remote.reads) == 3
+    with store._connect() as db:
+        assert not db.execute("SELECT * FROM delivery_pr_refresh_requests").fetchall()
+
+
+def test_refresh_cli_does_not_compete_for_active_consumer_lock(
+    service, tmp_path, monkeypatch, capsys,
+):
+    from devflow_temporal.delivery_project_sync import main
+
+    store, _, receipt = published(service)
+    config = tmp_path / "synchronizer.json"
+    config.write_text(json.dumps({"version": 1, "owners": [str(store.config.path)]}))
+    monkeypatch.setattr("sys.argv", ["devflow-project-sync", "--config", str(config),
+                                    "--refresh-pr", receipt["url"]])
+    sync = ProjectSynchronizer([store], Remote())
+    with sync.ownership():
+        main()
+    assert json.loads(capsys.readouterr().out)["state"] == "queued"
+
+
+def test_shared_pr_refresh_reads_once_across_owners(service, tmp_path):
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    first, request, receipt = published(service)
+    raw = {**first.config.raw, "tracking_db": str(tmp_path / "other.sqlite3"),
+           "state_root": str(tmp_path / "other-state")}
+    config = tmp_path / "other.json"
+    config.write_text(json.dumps(raw))
+    second = DeliveryStore(DeliveryConfig.load(config))
+    other = {**request, "run_id": "run-2", "work_id": "work-2", "command_id": "command-2"}
+    published((second, other))
+    remote = Remote()
+    sync = ProjectSynchronizer([first, second], remote)
+    sync.tick()
+    sync.request_pr_refresh([receipt["url"], receipt["url"]])
+    remote.state = "MERGED"
+    sync.tick()
+    assert remote.reads == [receipt["url"], receipt["url"]]
+    for store in (first, second):
+        with store._connect() as db:
+            assert json.loads(db.execute(
+                "SELECT observation_json FROM delivery_pr_observations").fetchone()[0])[
+                    "state"] == "MERGED"
+            assert not db.execute("SELECT * FROM delivery_pr_refresh_requests").fetchall()
+
+
+def test_explicit_failed_read_preserves_last_fact_and_discloses_failure(service):
+    store, request, receipt = published(service)
+    remote = Remote()
+    sync = ProjectSynchronizer([store], remote)
+    previous = sync.tick()[request["issue_url"]]
+    sync.request_pr_refresh([receipt["url"]])
+
+    def failure(_url):
+        raise RuntimeError("remote unavailable")
+
+    remote.pull_request = failure
+    after = sync.tick()[request["issue_url"]]
+    assert after["status"] == previous["status"]
+    assert after["pull_requests"][0]["observation"] == previous["pull_requests"][0]["observation"]
+    assert after["pull_requests"][0]["error"] == "remote unavailable"
+    assert store.detail(request["run_id"])["outcome"] == "published_unmerged"

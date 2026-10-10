@@ -15,6 +15,7 @@ import os
 import subprocess
 import tempfile
 import time
+import uuid
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
@@ -24,7 +25,7 @@ from urllib.parse import urlsplit
 from .contracts import canonical_json, digest
 from .delivery_config import DeliveryConfig
 from .delivery_features import issue_key, publication_urls, transition
-from .delivery_project_events import Notifications
+from .delivery_project_events import Notifications, notify
 from .delivery_store import DeliveryStore, _private_directory
 
 logger = logging.getLogger(__name__)
@@ -215,12 +216,42 @@ class ProjectSynchronizer:
                                (key, interval))
         self._schedule_configured = True
 
+    def request_pr_refresh(self, urls: list[str]) -> dict:
+        """Queue explicit readbacks without delivery or remote mutation authority."""
+        selected = {issue_key(url) for url in urls}
+        if not selected:
+            raise ValueError("at least one bound PR is required")
+        bindings = {}
+        for store in self.stores:
+            with store._connect() as db:
+                for row in db.execute("SELECT pr_json,issue_url FROM delivery_runs "
+                                      "WHERE pr_json IS NOT NULL"):
+                    for url in publication_urls(json.loads(row["pr_json"])):
+                        if (urlsplit(url).netloc == urlsplit(row["issue_url"]).netloc
+                                and url.rsplit("/pull/", 1)[0]
+                                == row["issue_url"].rsplit("/issues/", 1)[0]):
+                            bindings.setdefault(issue_key(url), (store, url))
+        if selected - bindings.keys():
+            raise ValueError("refresh requires a PR bound to a configured delivery")
+        for key in sorted(selected):
+            store, url = bindings[key]
+            with store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("INSERT INTO delivery_pr_refresh_requests VALUES (?,?) "
+                           "ON CONFLICT(url) DO UPDATE SET request_id=excluded.request_id",
+                           (url, str(uuid.uuid4())))
+            notify(store.config.tracking_db)
+        return {"state": "queued", "pull_requests": [bindings[key][1]
+                                                      for key in sorted(selected)]}
+
     def next_delay(self) -> float:
         """Sleep until a retry/daily deadline; a committed event wakes us earlier."""
         stamp = self.clock()
         deadlines = [stamp + timedelta(seconds=DAY)]  # Lost-notification safety sweep.
         for store in self.stores:
             with store._connect() as db:
+                if db.execute("SELECT 1 FROM delivery_pr_refresh_requests LIMIT 1").fetchone():
+                    deadlines.append(stamp)
                 for row in db.execute("SELECT next_check_at FROM delivery_pr_observations"):
                     deadlines.append(datetime.fromisoformat(row[0]))
         for issue, (store, feature) in self.selected().items():
@@ -286,6 +317,7 @@ class ProjectSynchronizer:
         saved = {}
         inputs: dict[str, set[tuple[str, str, str]]] = {}
         consumed = {}
+        requested = {}
         for store in self.stores:
             source = str(store.config.tracking_db.resolve())
             with store._connect() as db:
@@ -308,13 +340,17 @@ class ProjectSynchronizer:
                         saved[row["url"]] = dict(row)
                 for row in db.execute("SELECT * FROM delivery_pr_observation_inputs"):
                     consumed[source, row["url"]] = row["publication_key"]
+                for row in db.execute("SELECT * FROM delivery_pr_refresh_requests"):
+                    requested[source, row["url"]] = row["request_id"]
         for url, owners in references.items():
             stamp = self.clock()
             prior = saved.get(url)
             publication_key = digest(sorted(inputs[url]))
             changed = any(consumed.get((str(store.config.tracking_db.resolve()), url))
                           != publication_key for store, _ in owners)
-            due = changed or not prior or prior["next_check_at"] <= stamp.isoformat()
+            explicit = any((str(store.config.tracking_db.resolve()), url) in requested
+                           for store, _ in owners)
+            due = explicit or changed or not prior or prior["next_check_at"] <= stamp.isoformat()
             observed, error = None, None
             if due:
                 try:
@@ -345,6 +381,11 @@ class ProjectSynchronizer:
                                "ON CONFLICT(url) DO UPDATE SET "
                                "publication_key=excluded.publication_key",
                                (url, publication_key))
+                    if due:
+                        # A request arriving during the remote call remains pending.
+                        db.execute("DELETE FROM delivery_pr_refresh_requests "
+                                   "WHERE url=? AND request_id=?", (url, requested.get(
+                                       (str(store.config.tracking_db.resolve()), url))))
                     transition(db, store.config, run_id)
 
     @staticmethod
@@ -485,13 +526,18 @@ def serve(synchronizer: ProjectSynchronizer, notifications: Notifications, *, on
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--once", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true")
+    mode.add_argument("--refresh-pr", action="append", metavar="URL",
+                      help="queue a readback of an already-bound PR; repeat for several PRs")
     parser.add_argument("--activation-file", type=Path)
     parser.add_argument("--activation-token")
     parser.add_argument("--expected-revision")
     parser.add_argument("--config-sha256")
     args = parser.parse_args()
     if args.activation_file:
+        if args.refresh_pr:
+            raise ValueError("managed consumer activation cannot request PR refreshes")
         if not all((args.activation_token, args.expected_revision, args.config_sha256)):
             raise ValueError("managed synchronization requires complete activation identity")
         while True:
@@ -516,6 +562,9 @@ def main() -> None:
         stores, interval=config.get("pr_interval_seconds", DAY),
         project_interval=config.get("project_interval_seconds", DAY))
     logging.basicConfig(level=logging.INFO)
+    if args.refresh_pr:
+        print(canonical_json(synchronizer.request_pr_refresh(args.refresh_pr)))
+        return
     with synchronizer.ownership():
         logger.info("Project sync active: event notifications; PR interval=%s; drift interval=%s",
                     synchronizer.interval, synchronizer.project_interval)
