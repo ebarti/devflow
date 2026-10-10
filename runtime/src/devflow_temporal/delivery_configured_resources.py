@@ -36,3 +36,34 @@ def require_locked_project(root: Path, relative: str) -> None:
         if (not path.is_file() or path.is_symlink() or path.resolve(strict=True) != path
                 or _git(root, "ls-files", "--", raw) != raw):
             raise ValueError("configured Python environment lacks fixed tracked project metadata")
+
+
+def implementation_prerequisites(spec: dict) -> list[dict]:
+    """Reuse frozen pre-feature environment recipes before implementation probes."""
+    baseline = spec["policy"].get("baseline_checks", [])
+    if ("baseline_checks" not in spec["policy"] and spec.get("feature_worker")
+            and "baseline_checks_version" not in spec):
+        from .delivery_config import DeliveryConfig
+
+        # Workers omit the coordinator's baseline gate. Its already frozen
+        # configuration still authenticates which recipes are prerequisites.
+        # Read it without changing the sealed child policy or old reservations.
+        config = DeliveryConfig.load(Path(spec["config_path"]))
+        if digest(config.raw) != spec["config_digest"]:
+            raise ValueError("worker prerequisite configuration changed after admission")
+        repository = config.raw["repositories"][spec["repository_key"]]
+        selected = repository.get("baseline_check_ids", [])
+        baseline = [check for check in repository.get("prepublish_checks", [])
+                    if check["id"] in selected]
+    result = []
+    for check in spec["policy"].get("prepublish_checks", []):
+        generated = check.get("generated_directories", [])
+        python = (
+            check in baseline and check.get("kind") != "test"
+            and isinstance(generated, list)
+            and any(isinstance(name, str) and python_environment_authority(spec, name)
+                    for name in generated)
+        )
+        if "/store" in check["argv"] or python:
+            result.append(check)
+    return result

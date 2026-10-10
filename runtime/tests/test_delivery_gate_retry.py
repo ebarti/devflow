@@ -59,6 +59,74 @@ def unpublished(service, monkeypatch):
     return store, broker, state, request
 
 
+def preparation_stop(store, state, *, installer=False):
+    failure = state['checks']['prepublish']['results'][0]
+    failure.update(id='locked-environment', exit_code=None,
+                   failure_kind='preparation', launched=False)
+    if installer:
+        failure.update(argv=['uv', 'sync', '--locked'], exit_code=1, launched=True)
+        failure.pop('failure_kind')
+    state['error'] = ('environment preparation failed: locked-environment; '
+                      'candidate retained without requesting code repair')
+    store.project(state['run_id'], phase='blocked', execution_state='blocked',
+                  event_type='blocked', message=state['error'], error=state['error'],
+                  checks=state['checks'], outcome='blocked')
+
+
+@pytest.mark.parametrize('installer', [False, True])
+def test_preparation_retry_preserves_zero_repair_authority(unpublished, installer):
+    store, broker, state, request = unpublished
+    preparation_stop(store, state, installer=installer)
+    original = store.spec('run-1')
+    candidate = broker.candidate()
+    assert store.repair_admission_preflight('run-1', request)['additional_iterations'] == 0
+    result = store.continue_repair('run-1', request)
+    assert result['implementation_authority'] is False and result['additional_iterations'] == 0
+    assert broker.candidate() == candidate
+    assert store.effective_spec('run-1')['policy'] == original['policy']
+    with store._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_gate_admissions WHERE run_id='run-1'"
+        ).fetchone()[0])
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
+    assert recovery['state'] == state
+    assert recovery['state']['iteration'] == 0
+
+
+@pytest.mark.parametrize('drift', ['error', 'untyped', 'launched', 'cleanup', 'candidate',
+                                 'source_unchanged', 'implementation', 'projection'])
+def test_preparation_retry_rejects_unsealed_failure(unpublished, drift):
+    store, _, state, request = unpublished
+    preparation_stop(store, state)
+    precheck = state['checks']['prepublish']
+    failure = precheck['results'][0]
+    if drift == 'error':
+        state['error'] = state['error'].replace('locked-environment', 'unrelated-check')
+    elif drift == 'untyped':
+        failure.pop('failure_kind')
+    elif drift == 'launched':
+        failure['launched'] = True
+    elif drift == 'cleanup':
+        failure['cleanup'] = 'unknown'
+    elif drift == 'candidate':
+        precheck['candidate_id'] = 'f' * 64
+    elif drift == 'source_unchanged':
+        precheck['source_unchanged'] = False
+    elif drift == 'implementation':
+        state['roles'][0]['status'] = 'findings'
+    else:
+        failure['id'] = 'different-result'
+    if drift != 'projection':
+        store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                      message=state['error'], error=state['error'], checks=state['checks'],
+                      outcome='blocked')
+    with pytest.raises(ValueError, match='closed, finalized failed gate'):
+        store.continue_repair('run-1', request)
+    with store._connect() as db:
+        assert not db.execute('SELECT 1 FROM delivery_gate_admissions').fetchone()
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
+
+
 def test_unpublished_retry_retains_candidate_failure_budget_and_one_admission(unpublished):
     store, broker, state, request = unpublished
     before = broker.candidate()
@@ -121,11 +189,14 @@ def test_report_assessment_has_a_distinct_role_attempt_even_at_same_generation(m
 
 
 @pytest.mark.parametrize('gate_passes', [True, False])
+@pytest.mark.parametrize('preparation_failed', [True, False])
 def test_unpublished_retry_runs_checks_before_publication_and_independent_roles(
-    unpublished, monkeypatch, gate_passes,
+    unpublished, monkeypatch, gate_passes, preparation_failed,
 ):
     monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     store, _, state, request = unpublished
+    if preparation_failed:
+        preparation_stop(store, state)
     store.continue_repair('run-1', request)
     spec = store.effective_spec('run-1')
     with store._connect() as db:

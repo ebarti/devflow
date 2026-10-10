@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -16,7 +17,36 @@ from test_delivery_resources import spec
 from test_delivery_store import _git
 
 from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_configured_resources import implementation_prerequisites
 from devflow_temporal.delivery_resources import RunResources, read_private
+
+
+def test_implementation_preparation_preserves_exact_frozen_recipe_order():
+    node = {"id": "node", "argv": ["corepack", "pnpm", "install", "--store-dir", "/store"]}
+    python = {"id": "python", "kind": "check", "argv": ["uv", "sync", "--locked"],
+              "generated_directories": ["worker/.venv"]}
+    consumer = {"id": "consumer", "argv": ["node", "benchmark.mjs"]}
+    candidate_only = {**python, "id": "candidate-only"}
+    tests = {**python, "id": "tests", "kind": "test"}
+    owned = {"policy": {"host_sandbox": "trusted-local",
+                        "baseline_checks": [node, python, consumer, tests],
+                        "prepublish_checks": [node, consumer, python, candidate_only, tests]}}
+    frozen = copy.deepcopy(owned)
+    assert implementation_prerequisites(owned) == [node, python]
+    assert owned == frozen
+    # Matching an ID cannot authorize an altered recipe.
+    owned["policy"]["baseline_checks"][1] = {**python, "argv": ["different-command"]}
+    assert implementation_prerequisites(owned) == [node]
+
+
+@pytest.mark.parametrize("declaration", ["worker/.venv", ["worker/../.venv"],
+                                         ["/tmp/worker/.venv"], ["worker/output"], [None]])
+def test_implementation_preparation_does_not_infer_python_authority(declaration):
+    recipe = {"id": "candidate", "argv": ["unrelated-command"],
+              "generated_directories": declaration}
+    owned = {"policy": {"host_sandbox": "trusted-local", "baseline_checks": [recipe],
+                        "prepublish_checks": [recipe]}}
+    assert implementation_prerequisites(owned) == []
 
 
 def configured(tmp_path, kind="gate"):
@@ -124,7 +154,10 @@ def test_configured_environment_does_not_adopt_foreign_or_unlocked_paths(tmp_pat
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="native macOS execution authority")
 @pytest.mark.parametrize("fails", [False, True])
-def test_real_native_baseline_prepares_locked_python_before_intake(api_fixture, tmp_path, fails):
+@pytest.mark.parametrize("stage", ["baseline", "implementation"])
+def test_real_native_preparation_owns_locked_python_before_consumers(
+    api_fixture, tmp_path, fails, stage,
+):
     from devflow_temporal.delivery_baseline import run_baseline_checks
     from devflow_temporal.delivery_config import DeliveryConfig
     from devflow_temporal.delivery_preparation import prepare_authority
@@ -174,20 +207,44 @@ def test_real_native_baseline_prepares_locked_python_before_intake(api_fixture, 
     raw["roles"] = {role: {"model": "gpt-6.1-sol", "effort": "high"}
                     for role in ["intake", "implement", "review", "verify"]}
     config_path.write_text(json.dumps(raw))
-    request.pop("accepted_plan")
+    if stage == "baseline":
+        request.pop("accepted_plan")
+    else:
+        # Cross-language probes need the worker even without a named pytest file.
+        request["accepted_plan"] = json.dumps({"verification": ["Run API acceptance checks"]})
     store = DeliveryStore(DeliveryConfig.load(config_path))
     store.submit(request)
     owned = prepare_authority(store, store.submitted_spec(request["run_id"]))
-    assert owned["accepted_plan"] == "" and owned["baseline_checks_version"] == 2
+    if stage == "baseline":
+        assert owned["accepted_plan"] == "" and owned["baseline_checks_version"] == 2
     broker = DeliveryBroker(store, owned)
     broker.prepare()
     try:
-        result = run_baseline_checks(broker)
+        if stage == "baseline":
+            result = run_baseline_checks(broker)
+            environment = broker._gate_path("baseline", 0) / "worker/.venv"
+        else:
+            candidate = broker.candidate()
+            prepared = broker.run_implementation_preparation(0, candidate)
+            assert prepared["state"] == "passed"
+            assert [r["id"] for r in prepared["results"]] == [prerequisite["id"]]
+            environment = broker.checkout / "worker/.venv"
+            assert (environment / "bin/python").exists()
+            custody = read_private(RunResources(owned).manifest)["roots"][str(environment)]
+            assert custody["identity"] and custody["configured_environment_sha256"]
+            # Retrying preparation reattaches the same native execution, then the
+            # later candidate gates reuse the registered environment normally.
+            assert broker.run_implementation_preparation(0, candidate) == prepared
+            result = broker._run_check_list(
+                broker.checkout, [prerequisite, consumer],
+                broker.evidence_dir / "prechecks/0", candidate,
+            )
+            assert broker.candidate() == candidate
         assert result["state"] == ("failed" if fails else "passed")
-        assert result["feature_unchanged"]
+        if stage == "baseline":
+            assert result["feature_unchanged"]
         assert [r["passed"] for r in result["results"]] == [True, not fails]
         assert all(r["native_process"]["monitoring_complete"] for r in result["results"])
-        environment = broker._gate_path("baseline", 0) / "worker/.venv"
         assert environment.is_dir()
         owned["accepted_plan"] = json.dumps({"verification": ["Run the product suite"]})
     finally:

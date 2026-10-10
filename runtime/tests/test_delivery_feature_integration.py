@@ -135,9 +135,13 @@ def test_initial_chunk_import_can_pass_without_rewriting_its_sealed_build(servic
 
 
 @pytest.mark.parametrize("drift", [None, "local_branch", "remote_head", "closed_pr", "binding"])
+@pytest.mark.parametrize("preparation_failed", [False, True])
 def test_stopped_integration_resumes_only_its_frozen_local_and_remote_custody(
-    service, monkeypatch, drift,
+    service, monkeypatch, drift, preparation_failed,
 ):
+    from test_delivery_gate_retry import preparation_stop
+
+    from devflow_temporal.delivery_gate_retry import readback as gate_readback
     from devflow_temporal.delivery_stopped_resume import readback
 
     store, parent, child, broker, candidate, member, _ = integration(service, monkeypatch)
@@ -157,6 +161,15 @@ def test_stopped_integration_resumes_only_its_frozen_local_and_remote_custody(
                   cleanup="confirmed", event_type="blocked", message=state["error"],
                   candidate=candidate, pull_request=None, checks={}, iteration=0,
                   protocol_revision=9, error=state["error"])
+    if preparation_failed:
+        state["checks"] = {"prepublish": {"state": "failed", "source_unchanged": True,
+                                         "candidate_id": candidate["id"], "results": [
+                                             {"passed": False, "cleanup": "confirmed"}]}}
+        preparation_stop(store, state)
+        monkeypatch.setattr("devflow_temporal.delivery_gate_retry._stopped_cleanup", lambda _: {})
+        monkeypatch.setattr(DeliveryBroker, "_existing_pr", lambda *_a, **_k: {
+            "number": member["number"], "state": "OPEN", "isDraft": False,
+            "headRefOid": member["head"]})
     with store._connect() as db:
         store.state.release_work(db, child["work_id"], "external:devflow:" + child["run_id"])
         db.execute("INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,state,"
@@ -173,7 +186,9 @@ def test_stopped_integration_resumes_only_its_frozen_local_and_remote_custody(
     monkeypatch.setattr(store, "_completed_temporal_result", lambda *_a, **_k: closed)
     if drift == "local_branch":
         _git(broker.checkout, "branch", "-m", "feat/unrelated-local-owner")
-        with pytest.raises(ValueError, match="stopped checkout branch or origin changed"):
+        error = ("retained integration publication identity changed" if preparation_failed
+                 else "stopped checkout branch or origin changed")
+        with pytest.raises(ValueError, match=error):
             activities.resume_worker(store, parent, child, row)
     elif drift is not None:
         if drift == "remote_head":
@@ -193,7 +208,17 @@ def test_stopped_integration_resumes_only_its_frozen_local_and_remote_custody(
             recovery = json.loads(db.execute(
                 "SELECT recovery_json FROM delivery_runs WHERE run_id=?",
                 (child["run_id"],)).fetchone()[0])
-        assert readback(store, resumed["spec"], recovery)["state"] == "confirmed"
+        if preparation_failed:
+            assert recovery["kind"] == "prepublication_gate_retry"
+            assert recovery["command"]["additional_iterations"] == 0
+            assert recovery["state"]["iteration"] == 0
+            assert gate_readback(store, resumed["spec"], recovery) is None
+        else:
+            assert readback(store, resumed["spec"], recovery)["state"] == "confirmed"
         _git(broker.checkout, "branch", "-m", "feat/changed-after-admission")
         with pytest.raises(ValueError, match="retained integration publication identity changed"):
-            asyncio.run(delivery_repair_preflight({"spec": resumed["spec"], "recovery": recovery}))
+            if preparation_failed:
+                gate_readback(store, resumed["spec"], recovery)
+            else:
+                asyncio.run(delivery_repair_preflight({"spec": resumed["spec"],
+                                                      "recovery": recovery}))
