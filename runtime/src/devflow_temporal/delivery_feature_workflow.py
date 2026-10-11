@@ -10,17 +10,17 @@ from temporalio.exceptions import ActivityError, ApplicationError, ServerError
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from .contracts import digest
+from .delivery_workflow import TRANSIENT_FAILURE_TYPES
 
 # Bounds of the coordinator paths gated on `delivery-feature-liveness-v1`.
 AUTOMATIC_RECOVERIES = 2
+OBSERVATION_RETRIES = 6
 OBSERVATION_PAUSE = timedelta(seconds=30)
-MERGE_READBACK_POLLS = 60
+OBSERVATION_PAUSE_CAP = timedelta(minutes=10)
+MERGE_READBACK_CAP = timedelta(minutes=15)
 READBACK_FAST_POLLS = 20
 READBACK_INTERVAL = timedelta(seconds=30)
 READBACK_SLOW_INTERVAL = timedelta(minutes=10)
-# Activity failure types the feature activities declare non-retryable: verdicts
-# about the request or ownership, never transport.
-FINAL_FAILURE_TYPES = frozenset({"ValueError", "TypeError", "OwnershipConflict"})
 
 
 class PlanningCorrectionRequired(Exception):
@@ -38,33 +38,59 @@ class FeatureWorkerStopped(RuntimeError):
         self.chunk_id, self.kind, self.closure = chunk_id, kind, closure
 
 
+class ObservationLost(RuntimeError):
+    """A coordinator observation stayed lost to infrastructure past its retry bound."""
+
+    def __init__(self, name, child_id, retries, cause):
+        super().__init__(f"{name} for worker {child_id} stayed lost across {retries} "
+                         f"re-issues ({cause})")
+        self.name, self.child_id, self.cause_description = name, child_id, cause
+
+
 def _liveness(controller):
     return bool(getattr(controller, "feature_liveness_v1", False))
 
 
+def _describe(exc):
+    """Name the failing condition behind an SDK wrapper."""
+    cause = getattr(exc, "cause", None)
+    if isinstance(exc, ActivityError) and cause is not None:
+        kind = getattr(cause, "type", None)
+        name = kind if isinstance(kind, str) and kind else type(cause).__name__
+        return f"{name}: {str(getattr(cause, 'message', cause))[:200]}"
+    return f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
 def _transient_activity_failure(exc):
-    """Timeouts and failures Temporal already retried are infrastructure, not verdicts."""
+    """Only timeouts, retryable server errors and the allowlisted infrastructure
+    failure types (the same set the worker side classifies transient) count;
+    every other failure is a verdict about the request, ownership or GitHub."""
     cause = getattr(exc, "cause", None)
     if isinstance(cause, ActivityTimeoutError):
         return True
     if isinstance(cause, ServerError):
         return not cause.non_retryable
     if isinstance(cause, ApplicationError):
-        return not cause.non_retryable and cause.type not in FINAL_FAILURE_TYPES
+        return not cause.non_retryable and cause.type in TRANSIENT_FAILURE_TYPES
     return False
 
 
 def _resumable(closure):
-    """Only a closure its own controller classified as infrastructure, with no
-    unknown cleanup and no planning verdict, may be resumed without an operator."""
-    return bool(closure) and closure.get("cleanup") != "unknown" and (
-        (closure.get("failure") or {}).get("classification") == "transient"
-    ) and not closure.get("planning_defect")
+    """Only a blocked closure its own controller classified as infrastructure,
+    with confirmed cleanup and no planning verdict, is offered to the admission.
+    Cancelled workers and inherited classifications never are."""
+    return bool(closure) and closure.get("outcome") == "blocked" and (
+        closure.get("cleanup") != "unknown"
+    ) and (closure.get("failure") or {}).get("classification") == "transient" and (
+        not closure.get("planning_defect")
+    )
 
 
 def _infrastructure_failure(exc):
     if isinstance(exc, FeatureWorkerStopped):
         return _resumable(exc.closure)
+    if isinstance(exc, ObservationLost):
+        return True
     return isinstance(exc, ActivityError) and _transient_activity_failure(exc)
 
 
@@ -76,19 +102,33 @@ async def _pause(controller, delay):
         pass
 
 
-async def _observe(controller, resilient, child_id, name, request):
-    """Repeat an observation lost to timeouts or transport; verdicts propagate."""
+async def _observe(controller, resilient, spec, child_id, name, request):
+    """Repeat an observation lost to infrastructure, bounded; verdicts propagate.
+
+    A lost observation decides nothing: the worker's closure stays in the store.
+    Each re-issue backs off and projects what is stuck; past the bound the
+    worker's supervisor decides, so a permanent fault ends in a named stop
+    instead of a loop that only grows history.
+    """
+    retries = 0
     while True:
         try:
             return await controller._activity(name, request)
         except ActivityError as exc:
             if not (resilient and _transient_activity_failure(exc)) or controller.cancel_requested:
                 raise
-            # A lost observation decides nothing: the worker's closure stays in
-            # the store. Look again after a short pause.
-            retries = controller.state["checks"].setdefault("feature_observation_retries", {})
-            retries[child_id] = retries.get(child_id, 0) + 1
-            await _pause(controller, OBSERVATION_PAUSE)
+            if retries >= OBSERVATION_RETRIES:
+                raise ObservationLost(name, child_id, retries, _describe(exc)) from exc
+            retries += 1
+            lost = controller.state["checks"].setdefault("feature_observation_retries", {})
+            lost[child_id] = lost.get(child_id, 0) + 1
+            delay = min(OBSERVATION_PAUSE * 2 ** (retries - 1), OBSERVATION_PAUSE_CAP)
+            controller.state["revision"] += 1
+            await controller._project(
+                spec, "feature_worker_observation_lost",
+                f"{name} for worker {child_id} lost ({_describe(exc)}); retry {retries} of "
+                f"{OBSERVATION_RETRIES} in {int(delay.total_seconds())} s")
+            await _pause(controller, delay)
             if controller.cancel_requested:
                 raise RuntimeError("feature cancellation requested") from exc
 
@@ -180,10 +220,12 @@ async def run_build(controller, spec, *, start_iteration=0, session=None, maximu
         )
 
 
-async def _worker(controller, spec, chunk_id, kind, active, *, resume_allowed=False):
-    assignment = await controller._activity(
-        "delivery_feature_reserve", {"spec": spec, "chunk_id": chunk_id, "kind": kind}
-    )
+async def _worker(controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                  assignment=None):
+    if assignment is None:
+        assignment = await controller._activity(
+            "delivery_feature_reserve", {"spec": spec, "chunk_id": chunk_id, "kind": kind}
+        )
     child = assignment["spec"]
     workflow_id = assignment["workflow_id"]
     active[child["run_id"]] = workflow_id
@@ -198,7 +240,7 @@ async def _worker(controller, spec, chunk_id, kind, active, *, resume_allowed=Fa
                 raise RuntimeError("feature cancellation requested")
             if compact_wait:
                 pending = asyncio.create_task(_observe(
-                    controller, resilient, child["run_id"], "delivery_feature_wait_worker", {
+                    controller, resilient, spec, child["run_id"], "delivery_feature_wait_worker", {
                         "config_path": spec["config_path"], "run_id": spec["run_id"],
                         "spec_digest": digest(spec), "child_id": child["run_id"],
                     },
@@ -230,7 +272,7 @@ async def _worker(controller, spec, chunk_id, kind, active, *, resume_allowed=Fa
         # and reserve() admits the supported continuation under its own checks.
         raise FeatureWorkerStopped(chunk_id, kind, closure=closure)
     finished = await _observe(
-        controller, resilient, child["run_id"], "delivery_feature_finish_worker",
+        controller, resilient, spec, child["run_id"], "delivery_feature_finish_worker",
         {"spec": spec, "child_id": child["run_id"]},
     )
     active.pop(child["run_id"], None)
@@ -250,31 +292,54 @@ async def _recovering_worker(controller, spec, chunk_id, kind, active):
     """Run one worker, re-issuing it across a bounded number of infrastructure failures.
 
     Gate verdicts, ownership conflicts and unknown cleanup stop it at once. An
-    infrastructure closure resumes through the continuation reserve() admits; a
-    transport failure before admission is re-issued after a pause.
+    infrastructure closure is resumed only once the real admission
+    (reserve() -> resume_worker()) accepted it; a refusal stops the feature with
+    the worker's own reason, its chunk and the refusal. A transport failure
+    before admission is re-issued after a pause, under the same bound.
     """
     key = chunk_id + ":" + kind
+    assignment = None
     while True:
         count = controller.state["checks"].get("feature_worker_recoveries", {}).get(key, 0)
         try:
             return await _worker(controller, spec, chunk_id, kind, active,
-                                 resume_allowed=count < AUTOMATIC_RECOVERIES)
+                                 resume_allowed=count < AUTOMATIC_RECOVERIES,
+                                 assignment=assignment)
         except PlanningCorrectionRequired:
             raise
         except Exception as exc:
+            assignment = None
             if controller.cancel_requested or not _infrastructure_failure(exc):
                 raise
             if count >= AUTOMATIC_RECOVERIES:
                 raise FeatureWorkerStopped(
                     chunk_id, kind, closure=getattr(exc, "closure", None),
                     detail=f"exhausted {count} automatic recoveries: {exc}") from exc
+            resumed = isinstance(exc, FeatureWorkerStopped)
+            if resumed:
+                # The admission decides; the workflow never duplicates its checks.
+                try:
+                    assignment = await controller._activity(
+                        "delivery_feature_reserve",
+                        {"spec": spec, "chunk_id": chunk_id, "kind": kind})
+                except ActivityError as refusal:
+                    if not _transient_activity_failure(refusal):
+                        raise FeatureWorkerStopped(
+                            chunk_id, kind, closure=exc.closure,
+                            detail=f"stopped ({(exc.closure or {}).get('error') or 'blocked'}); "
+                                   f"automatic resume refused: {_describe(refusal)}",
+                        ) from refusal
+                    resumed = False
             controller.state["checks"].setdefault("feature_worker_recoveries", {})[key] = count + 1
             controller.state["revision"] += 1
-            await controller._project(
-                spec, "feature_worker_recovering",
-                f"Recovering the {kind} worker for {chunk_id} after an infrastructure failure "
-                f"({count + 1} of {AUTOMATIC_RECOVERIES})")
-            if isinstance(exc, ActivityError):
+            if resumed:
+                message = (f"Resumed the {kind} worker for {chunk_id} after an infrastructure "
+                           f"failure ({count + 1} of {AUTOMATIC_RECOVERIES})")
+            else:
+                message = (f"Re-issuing the {kind} worker assignment for {chunk_id} after "
+                           f"{_describe(exc)} ({count + 1} of {AUTOMATIC_RECOVERIES})")
+            await controller._project(spec, "feature_worker_recovering", message)
+            if not resumed:
                 await _pause(controller, OBSERVATION_PAUSE)
 
 
@@ -396,6 +461,7 @@ async def _coordinate_pass(controller, spec, active, builds):
                     spec, "feature_merging", "Merging the authorized feature stack"
                 )
                 pending_polls = 0
+                delay = READBACK_INTERVAL
                 while True:
                     merged = await controller._activity(
                         "delivery_feature_merge",
@@ -420,12 +486,24 @@ async def _coordinate_pass(controller, spec, active, builds):
                             "merge was submitted; its remote result still requires readback"
                         )
                     pending_polls += 1
-                    if resilient and pending_polls >= MERGE_READBACK_POLLS:
-                        raise RuntimeError(
-                            f"feature merge readback stayed pending across {pending_polls} "
-                            "polls; the submitted stack merge needs operator readback"
-                        )
-                    await workflow.sleep(READBACK_INTERVAL)
+                    if not resilient:
+                        await workflow.sleep(READBACK_INTERVAL)
+                        continue
+                    if pending_polls == 2:
+                        # One projection names the pending merge. History then grows
+                        # only at the backed-off cadence, and a slow but successful
+                        # merge still ends this feature merged.
+                        numbers = ", ".join(
+                            "#" + str(item["number"])
+                            for item in controller.state["pull_request"]["pull_requests"])
+                        controller.state["revision"] += 1
+                        await controller._project(
+                            spec, "feature_merging",
+                            f"Stack merge submitted for {numbers}; GitHub readback still "
+                            f"pending, polling with backoff up to "
+                            f"{int(MERGE_READBACK_CAP.total_seconds() // 60)} minutes")
+                    await workflow.sleep(delay)
+                    delay = min(delay * 2, MERGE_READBACK_CAP)
                 receipts = {item["number"]: item for item in merged["pull_requests"]}
                 for member in controller.state["pull_request"]["pull_requests"]:
                     member.update(receipts[member["number"]], state="MERGED")
@@ -457,11 +535,11 @@ async def _coordinate_pass(controller, spec, active, builds):
         if controller.cancel_requested:
             await controller._cancelled(spec)
         else:
-            reason = f"feature delivery stopped: {type(exc).__name__}: {str(exc)[:300]}"
+            limit = 600 if isinstance(exc, FeatureWorkerStopped) else 300
+            reason = f"feature delivery stopped: {type(exc).__name__}: {str(exc)[:limit]}"
             if resilient and cause is not exc:
                 # Name the failing condition, not only the SDK's generic wrapper.
-                reason += (f" ({getattr(cause, 'type', None) or type(cause).__name__}: "
-                           f"{str(cause)[:200]})")
+                reason += f" ({_describe(exc)})"
             await controller._stop(spec, reason, cause=exc)
     return controller.state
 

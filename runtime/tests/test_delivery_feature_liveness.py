@@ -1,10 +1,11 @@
 """Feature coordination stays live across infrastructure failures without weakening gates.
 
-Lost worker observations are re-issued, one chunk's failure leaves healthy
-siblings running, infrastructure closures resume within a durable bound, and
-the merge and readback loops are bounded. Real local Temporal servers verify the
-new command sequence and its replay; the asyncio protocol stubs cover the fast
-paths, and a history recorded before the marker replays on the old commands.
+Lost worker observations are re-issued within a bound, one chunk's failure
+leaves healthy siblings running, infrastructure closures resume only through the
+real admission and within a durable bound, and the merge and readback loops back
+off instead of stopping. Real local Temporal servers verify the command sequence
+and its replay; the real store drives the admission; the asyncio protocol stubs
+cover the fast paths; a history recorded before the marker replays unchanged.
 """
 from __future__ import annotations
 
@@ -22,26 +23,30 @@ from temporalio.exceptions import ActivityError, ApplicationError, TimeoutType
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, Worker
 from test_delivery_feature_execution import Controller, feature_service
+from test_delivery_feature_integration import integration
 from test_delivery_feature_workflow_temporal import FeatureActivities
 from test_delivery_github_contract import plan
 from test_delivery_store import service as service
 
 import devflow_temporal.delivery_feature_workflow as protocol
 from devflow_temporal import delivery_feature_activities as activities
+from devflow_temporal import delivery_feature_publication as publications
 from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
-from devflow_temporal.delivery_feature_execution import register_worker, worker_spec
+from devflow_temporal.delivery_feature_execution import register_worker, registry, worker_spec
+from devflow_temporal.delivery_feature_pass import checkpoint_key
 from devflow_temporal.delivery_github_contract import ordered_chunks
 from devflow_temporal.delivery_store import DeliveryStore
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
+from devflow_temporal.delivery_workflow import DeliveryWorkflow, _interrupted_role
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MARKER = "delivery-feature-liveness-v1"
-TRANSIENT = {"phase": "blocked", "cleanup": "confirmed", "planning_defect": False,
-             "error": "workstream build failed: ActivityError",
+TRANSIENT = {"outcome": "blocked", "phase": "blocked", "cleanup": "confirmed",
+             "planning_defect": False, "error": "workstream build failed: ActivityError",
              "failure": {"classification": "transient", "cause_type": "ActivityTimeoutError"}}
-TERMINAL = {"phase": "blocked", "cleanup": "confirmed", "planning_defect": False,
-            "error": "workstream product repair limit exhausted",
+TERMINAL = {"outcome": "blocked", "phase": "blocked", "cleanup": "confirmed",
+            "planning_defect": False, "error": "workstream product repair limit exhausted",
             "failure": {"classification": "terminal"}}
+REFUSAL = "blocked implementation has no authenticated launch outcome"
 
 
 def _activity_error(cause, name="delivery_feature_reserve"):
@@ -53,6 +58,10 @@ def _activity_error(cause, name="delivery_feature_reserve"):
 
 def _lost_heartbeat():
     return ActivityTimeoutError("heartbeat", type=TimeoutType.HEARTBEAT, last_heartbeat_details=[])
+
+
+def _transient_error(name, type="ConnectionError", message="connection reset"):
+    return _activity_error(ApplicationError(message, type=type), name)
 
 
 def _delivered(controller, chunk_id, kind):
@@ -73,6 +82,7 @@ class LivenessController(Controller):
         self.feature_liveness_v1 = liveness
         self.messages = []
         self.sleeps = []
+        self.admissions = []
 
     async def _project(self, spec, event, message):
         self.messages.append((event, message))
@@ -81,6 +91,15 @@ class LivenessController(Controller):
     async def _stop(self, spec, message, **kwargs):
         self.messages.append(("stopped", message))
         return await super()._stop(spec, message, **kwargs)
+
+    async def _activity(self, name, request):
+        if name == "delivery_feature_reserve":
+            # The real admission is modeled as accepted; refusal tests override it.
+            self.admissions.append((request["chunk_id"], request["kind"]))
+            child = request["kind"] + ":" + request["chunk_id"]
+            return {"spec": {"run_id": child}, "workflow_id": "wf-" + child,
+                    "completed": False, "resumed": True}
+        return await super()._activity(name, request)
 
 
 def _protocol_stubs(monkeypatch, controller, *, bounded_wait=False):
@@ -131,6 +150,11 @@ async def _scheduled(history, name):
     return scheduled
 
 
+def _timers(history):
+    return [e.timer_started_event_attributes.start_to_fire_timeout.ToTimedelta()
+            for e in history.events if e.HasField("timer_started_event_attributes")]
+
+
 # --- H-6a: the coordinator's worker wait survives lost attempts -------------------------------
 
 
@@ -161,13 +185,13 @@ async def test_worker_wait_options_let_a_lost_attempt_retry_with_a_full_window(m
 
 
 @pytest.mark.asyncio
-async def test_lost_wait_observations_are_reissued_and_ownership_conflicts_stop(monkeypatch):
+async def test_lost_wait_observations_are_reissued_with_backoff_and_verdicts_stop(monkeypatch):
     controller = LivenessController(plan())
     _protocol_stubs(monkeypatch, controller, bounded_wait=True)
     observations = iter([
         _activity_error(_lost_heartbeat(), "delivery_feature_wait_worker"),
-        _activity_error(ApplicationError("database is locked", type="OperationalError"),
-                        "delivery_feature_wait_worker"),
+        _transient_error("delivery_feature_wait_worker", type="GitHubTransientError",
+                         message="gh: HTTP 502"),
         {"closed": False},
         {"closed": True, "outcome": "delivered", "closure": {"cleanup": "confirmed"}},
     ])
@@ -191,23 +215,82 @@ async def test_lost_wait_observations_are_reissued_and_ownership_conflicts_stop(
     assert finished["outcome"] == "delivered"
     assert calls.count("delivery_feature_wait_worker") == 4
     assert controller.state["checks"]["feature_observation_retries"] == {"build:model": 2}
-    assert controller.sleeps == [protocol.OBSERVATION_PAUSE] * 2
+    assert controller.sleeps == [protocol.OBSERVATION_PAUSE, protocol.OBSERVATION_PAUSE * 2]
+    lost = [m for e, m in controller.messages if e == "feature_worker_observation_lost"]
+    assert len(lost) == 2 and "delivery_feature_wait_worker for worker build:model" in lost[0]
+    assert "TimeoutError" in lost[0] and "GitHubTransientError: gh: HTTP 502" in lost[1]
+    assert "retry 2 of" in lost[1]
 
-    conflict = LivenessController(plan())
-    _protocol_stubs(monkeypatch, conflict, bounded_wait=True)
+    for verdict in (
+        ApplicationError("feature wait does not own this worker", type="OwnershipConflict",
+                         non_retryable=True),
+        ApplicationError("gh: HTTP 401: Bad credentials", type="GitHubContractError"),
+        ApplicationError("database is locked", type="OperationalError"),
+    ):
+        refused = LivenessController(plan())
+        _protocol_stubs(monkeypatch, refused, bounded_wait=True)
 
-    async def conflicting(name, request):
-        if name == "delivery_feature_reserve":
-            return {"spec": {"run_id": "build:model"}, "workflow_id": "wf-1", "completed": False}
-        raise _activity_error(ApplicationError(
-            "feature wait does not own this worker", type="OwnershipConflict", non_retryable=True,
-        ), name)
+        async def refusing(name, request, _verdict=verdict):
+            if name == "delivery_feature_reserve":
+                return {"spec": {"run_id": "build:model"}, "workflow_id": "wf-1",
+                        "completed": False}
+            raise _activity_error(_verdict, name)
 
-    conflict._activity = conflicting
-    with pytest.raises(ActivityError, match="activity failed"):
-        await protocol._worker(conflict, spec, "model", "build", {})
-    assert "feature_observation_retries" not in conflict.state["checks"]
-    assert conflict.sleeps == []
+        refused._activity = refusing
+        with pytest.raises(ActivityError, match="activity failed"):
+            await protocol._worker(refused, spec, "model", "build", {})
+        assert "feature_observation_retries" not in refused.state["checks"]
+        assert refused.sleeps == [] and refused.messages == []
+
+
+@pytest.mark.asyncio
+async def test_observations_stay_bounded_and_the_stop_names_the_stuck_observation(monkeypatch):
+    controller = LivenessController(plan())
+    _protocol_stubs(monkeypatch, controller)
+    attempts = []
+
+    async def failing(name, request):
+        attempts.append(name)
+        raise _transient_error(name, type="GitHubTransientError", message="gh: HTTP 502")
+
+    controller._activity = failing
+    spec = {"run_id": "feature", "config_path": "/frozen/config"}
+    with pytest.raises(protocol.ObservationLost) as info:
+        await protocol._observe(controller, True, spec, "build:model",
+                                "delivery_feature_finish_worker", {"child_id": "build:model"})
+    assert len(attempts) == protocol.OBSERVATION_RETRIES + 1
+    assert controller.state["checks"]["feature_observation_retries"] == {
+        "build:model": protocol.OBSERVATION_RETRIES}
+    assert controller.sleeps == [
+        timedelta(seconds=30), timedelta(seconds=60), timedelta(minutes=2), timedelta(minutes=4),
+        timedelta(minutes=8), protocol.OBSERVATION_PAUSE_CAP]
+    assert [e for e, _ in controller.messages] == (
+        ["feature_worker_observation_lost"] * protocol.OBSERVATION_RETRIES)
+    assert "delivery_feature_finish_worker for worker build:model" in str(info.value)
+    assert "GitHubTransientError: gh: HTTP 502" in str(info.value)
+
+    # Past the bound the supervisor re-issues the worker (bounded) and then stops
+    # with a reason that names the observation, not a generic wrapper.
+    coordinator = LivenessController(plan())
+    _protocol_stubs(monkeypatch, coordinator)
+
+    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                     assignment=None):
+        if (chunk_id, kind) == ("model", "build"):
+            raise protocol.ObservationLost("delivery_feature_finish_worker", "build:model",
+                                           protocol.OBSERVATION_RETRIES,
+                                           "GitHubTransientError: gh: HTTP 502")
+        return _delivered(coordinator, chunk_id, kind)
+
+    monkeypatch.setattr(protocol, "_worker", worker)
+    result = await protocol.coordinate(
+        coordinator, {"run_id": "run-one", "authorized_endpoint": "merged"})
+    assert result["outcome"] == "blocked"
+    assert coordinator.state["checks"]["feature_worker_recoveries"] == {"model:build": 2}
+    assert "exhausted 2 automatic recoveries" in result["error"]
+    assert "delivery_feature_finish_worker for worker build:model stayed lost" in result["error"]
+    assert "GitHubTransientError" in result["error"] and "model" in result["error"]
+    assert coordinator.admissions == [], "a lost observation is re-issued, never re-admitted"
 
 
 @pytest.mark.asyncio
@@ -229,9 +312,9 @@ async def test_real_temporal_coordinator_reissues_a_wait_lost_after_exhausted_re
         child = payload["child_id"]
         calls[child] = calls.get(child, 0) + 1
         if child == "build:model" and calls[child] <= 3:
-            raise ApplicationError("database is locked", type="OperationalError")
+            raise ApplicationError("connection reset by peer", type="ConnectionError")
         return {"closed": True, "outcome": "delivered",
-                "closure": {"phase": "delivered", "cleanup": "confirmed"}}
+                "closure": {"outcome": "delivered", "phase": "delivered", "cleanup": "confirmed"}}
 
     monkeypatch.setattr(protocol, "OBSERVATION_PAUSE", timedelta(seconds=1))
     spec = _feature_spec("reissued-wait")
@@ -249,6 +332,9 @@ async def test_real_temporal_coordinator_reissues_a_wait_lost_after_exhausted_re
     assert result["phase"] == "merged"
     assert calls["build:model"] == 4
     assert result["checks"]["feature_observation_retries"] == {"build:model": 1}
+    lost = [p["message"] for n, p in fixtures.calls
+            if n == "delivery_project" and p["event_type"] == "feature_worker_observation_lost"]
+    assert len(lost) == 1 and "ConnectionError: connection reset by peer" in lost[0]
     waits = [attributes for request, attributes in await _scheduled(
         history, "delivery_feature_wait_worker") if request["child_id"] == "build:model"]
     assert len(waits) == 2, "the exhausted wait was re-issued as one new command"
@@ -261,6 +347,45 @@ async def test_real_temporal_coordinator_reissues_a_wait_lost_after_exhausted_re
         assert attributes.retry_policy.maximum_attempts == 3
 
 
+@pytest.mark.asyncio
+async def test_real_temporal_permanent_github_refusal_stops_without_an_observation_loop():
+    fixtures = FeatureActivities()
+
+    @activity.defn(name="delivery_feature_reserve")
+    async def reserve(payload):
+        child = payload["kind"] + ":" + payload["chunk_id"]
+        return {"spec": {"run_id": child}, "workflow_id": "wf-" + child,
+                "completed": payload["kind"] == "chunk"}
+
+    @activity.defn(name="delivery_feature_wait_worker")
+    async def wait_worker(payload):
+        return {"closed": True, "outcome": "delivered",
+                "closure": {"outcome": "delivered", "phase": "delivered", "cleanup": "confirmed"}}
+
+    @activity.defn(name="delivery_feature_finish_worker")
+    async def finish_worker(payload):
+        # GitHubDelivery.api raises GitHubContractError for every gh failure.
+        raise ApplicationError("gh: HTTP 401: Bad credentials", type="GitHubContractError")
+
+    spec = _feature_spec("github-refusal")
+    async with local_temporal() as environment:
+        async with Worker(environment.client, task_queue=spec["run_id"],
+                          workflows=[DeliveryWorkflow],
+                          activities=_handlers(fixtures, reserve, wait_worker, finish_worker)):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run, spec, id=spec["run_id"], task_queue=spec["run_id"])
+            result = await asyncio.wait_for(handle.result(), 60)
+            history = await handle.fetch_history()
+        await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+    assert result["outcome"] == "blocked"
+    assert "GitHubContractError: gh: HTTP 401" in result["error"]
+    assert "feature_observation_retries" not in result["checks"]
+    assert "feature_worker_recoveries" not in result["checks"]
+    events = [p["event_type"] for n, p in fixtures.calls if n == "delivery_project"]
+    assert "feature_worker_observation_lost" not in events
+    assert len(history.events) < 120
+
+
 # --- H-6b: per-chunk failure isolation and bounded infrastructure resume ----------------------
 
 
@@ -270,10 +395,12 @@ async def test_real_temporal_coordinator_reissues_a_wait_lost_after_exhausted_re
     (TRANSIENT, False, True, True, protocol.FeatureWorkerStopped),
     ({**TRANSIENT, "cleanup": "unknown"}, True, True, True, protocol.FeatureWorkerStopped),
     ({**TRANSIENT, "planning_defect": True}, True, True, True, protocol.FeatureWorkerStopped),
+    ({**TRANSIENT, "outcome": "cancelled", "phase": "cancelled"}, True, True, True,
+     protocol.FeatureWorkerStopped),
     (TERMINAL, True, True, True, protocol.FeatureWorkerStopped),
     (TRANSIENT, True, False, True, RuntimeError),
 ])
-async def test_worker_resumes_an_infrastructure_closure_before_retiring_its_assignment(
+async def test_worker_hands_back_only_blocked_infrastructure_closures_before_retiring_them(
     monkeypatch, closure, resume_allowed, liveness, finishes, raised,
 ):
     controller = LivenessController(plan(), liveness=liveness)
@@ -285,15 +412,14 @@ async def test_worker_resumes_an_infrastructure_closure_before_retiring_its_assi
         if name == "delivery_feature_reserve":
             return {"spec": {"run_id": "build:model"}, "workflow_id": "wf-1", "completed": False}
         if name == "delivery_feature_wait_worker":
-            return {"closed": True, "outcome": "blocked", "closure": deepcopy(closure)}
+            return {"closed": True, "outcome": closure["outcome"], "closure": deepcopy(closure)}
         assert name == "delivery_feature_finish_worker"
-        return {"outcome": "blocked", "record": deepcopy(controller.record), "budget": {}}
+        return {"outcome": closure["outcome"], "record": deepcopy(controller.record), "budget": {}}
 
     controller._activity = execute
-    active = {}
     with pytest.raises(raised) as info:
         await protocol._worker(controller, {"run_id": "feature", "config_path": "/frozen"},
-                               "model", "build", active, resume_allowed=resume_allowed)
+                               "model", "build", {}, resume_allowed=resume_allowed)
     # finish_worker retires the registry assignment, which a continuation cannot
     # reuse: a resumable closure is handed back before it, every other after it.
     assert ("delivery_feature_finish_worker" in calls) is finishes
@@ -306,13 +432,16 @@ async def test_worker_resumes_an_infrastructure_closure_before_retiring_its_assi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("recovers", [True, False])
-async def test_infrastructure_closures_resume_within_a_durable_bound(monkeypatch, recovers):
+async def test_infrastructure_closures_resume_through_admission_within_a_durable_bound(
+    monkeypatch, recovers,
+):
     controller = LivenessController(plan())
     _protocol_stubs(monkeypatch, controller)
     attempts = []
 
-    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False):
-        attempts.append((chunk_id, kind, resume_allowed))
+    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                     assignment=None):
+        attempts.append((chunk_id, kind, resume_allowed, assignment))
         failures = sum(1 for item in attempts if item[:2] == (chunk_id, kind))
         if (chunk_id, kind) == ("client", "build") and (failures <= 2 or not recovers):
             raise protocol.FeatureWorkerStopped(chunk_id, kind, closure=deepcopy(TRANSIENT))
@@ -321,11 +450,19 @@ async def test_infrastructure_closures_resume_within_a_durable_bound(monkeypatch
     monkeypatch.setattr(protocol, "_worker", worker)
     result = await protocol.coordinate(
         controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
-    assert [allowed for c, k, allowed in attempts if (c, k) == ("client", "build")] == [
-        True, True, False]
+    client = [(allowed, assignment) for c, k, allowed, assignment in attempts
+              if (c, k) == ("client", "build")]
+    assert [allowed for allowed, _ in client] == [True, True, False]
+    assert client[0][1] is None, "the first attempt reserves on its own"
+    assert all(assignment["resumed"] for _, assignment in client[1:]), (
+        "every re-issue carries the admitted continuation instead of reserving again")
+    assert controller.admissions == [("client", "build")] * 2
     assert controller.state["checks"]["feature_worker_recoveries"] == {"client:build": 2}
     recovering = [m for e, m in controller.messages if e == "feature_worker_recovering"]
-    assert len(recovering) == 2 and "client" in recovering[0] and "(2 of 2)" in recovering[1]
+    assert recovering == [
+        "Resumed the build worker for client after an infrastructure failure (1 of 2)",
+        "Resumed the build worker for client after an infrastructure failure (2 of 2)",
+    ]
     if recovers:
         assert result["phase"] == "merged"
     else:
@@ -336,17 +473,56 @@ async def test_infrastructure_closures_resume_within_a_durable_bound(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_transport_failures_before_admission_are_reissued_but_conflicts_stop(monkeypatch):
+async def test_refused_admission_stops_with_the_chunk_the_worker_failure_and_the_refusal(
+    monkeypatch,
+):
+    controller = LivenessController(plan())
+    _protocol_stubs(monkeypatch, controller)
+    closure = {**TRANSIENT, "error": "workstream execution needs recovery",
+               "failure": {"classification": "transient", "cause_type": "role_interrupted"}}
+
+    async def refusing(name, request):
+        if name == "delivery_feature_reserve":
+            controller.admissions.append((request["chunk_id"], request["kind"]))
+            raise _activity_error(ApplicationError(REFUSAL, type="ValueError", non_retryable=True))
+        return await Controller._activity(controller, name, request)
+
+    controller._activity = refusing
+    attempts = []
+
+    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                     assignment=None):
+        attempts.append((chunk_id, kind))
+        if (chunk_id, kind) == ("model", "build"):
+            raise protocol.FeatureWorkerStopped(chunk_id, kind, closure=deepcopy(closure))
+        return _delivered(controller, chunk_id, kind)
+
+    monkeypatch.setattr(protocol, "_worker", worker)
+    result = await protocol.coordinate(
+        controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
+    assert result["outcome"] == "blocked"
+    assert attempts.count(("model", "build")) == 1 and controller.admissions == [("model", "build")]
+    assert "feature build worker for chunk model" in result["error"]
+    assert "stopped (workstream execution needs recovery)" in result["error"]
+    assert "automatic resume refused: ValueError: " + REFUSAL in result["error"]
+    assert "feature_worker_recoveries" not in controller.state["checks"]
+    assert not any(e == "feature_worker_recovering" for e, _ in controller.messages), (
+        "resumption is projected only after the admission accepted it")
+
+
+@pytest.mark.asyncio
+async def test_transport_failures_before_admission_are_reissued_but_verdicts_stop(monkeypatch):
     controller = LivenessController(plan())
     _protocol_stubs(monkeypatch, controller)
     failures = iter([
-        _activity_error(ApplicationError(
-            "command failed (128): git fetch: could not resolve host", type="RuntimeError")),
+        _transient_error("delivery_feature_reserve", type="BrokerReadbackUnavailable",
+                         message="stack prerequisite fetch failed: could not resolve host"),
         _activity_error(_lost_heartbeat(), "delivery_feature_finish_worker"),
     ])
     attempts = []
 
-    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False):
+    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                     assignment=None):
         attempts.append((chunk_id, kind))
         if (chunk_id, kind) == ("model", "build") and attempts.count(("model", "build")) <= 2:
             raise next(failures)
@@ -356,28 +532,37 @@ async def test_transport_failures_before_admission_are_reissued_but_conflicts_st
     result = await protocol.coordinate(
         controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
     assert result["phase"] == "merged"
-    assert attempts.count(("model", "build")) == 3
+    assert attempts.count(("model", "build")) == 3 and controller.admissions == []
     assert controller.state["checks"]["feature_worker_recoveries"] == {"model:build": 2}
     assert controller.sleeps == [protocol.OBSERVATION_PAUSE] * 2
+    reissued = [m for e, m in controller.messages if e == "feature_worker_recovering"]
+    assert len(reissued) == 2 and "BrokerReadbackUnavailable" in reissued[0]
+    assert "TimeoutError" in reissued[1] and "(2 of 2)" in reissued[1]
 
-    conflict = LivenessController(plan())
-    _protocol_stubs(monkeypatch, conflict)
-    verdicts = []
+    for verdict in (
+        ApplicationError("worker's prerequisites have not passed their integrated gates",
+                         type="OwnershipConflict", non_retryable=True),
+        ApplicationError("command failed (128): git fetch: not a git repository",
+                         type="RuntimeError"),
+    ):
+        refused = LivenessController(plan())
+        _protocol_stubs(monkeypatch, refused)
+        verdicts = []
 
-    async def refused(_controller, spec, chunk_id, kind, active, *, resume_allowed=False):
-        verdicts.append((chunk_id, kind))
-        if (chunk_id, kind) == ("model", "build"):
-            raise _activity_error(ApplicationError(
-                "worker's prerequisites have not passed their integrated gates",
-                type="OwnershipConflict", non_retryable=True))
-        return _delivered(conflict, chunk_id, kind)
+        async def stopping(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                           assignment=None, _verdict=verdict, _refused=refused,
+                           _verdicts=verdicts):
+            _verdicts.append((chunk_id, kind))
+            if (chunk_id, kind) == ("model", "build"):
+                raise _activity_error(_verdict)
+            return _delivered(_refused, chunk_id, kind)
 
-    monkeypatch.setattr(protocol, "_worker", refused)
-    result = await protocol.coordinate(
-        conflict, {"run_id": "run-two", "authorized_endpoint": "merged"})
-    assert result["outcome"] == "blocked" and "OwnershipConflict" in result["error"]
-    assert verdicts.count(("model", "build")) == 1
-    assert "feature_worker_recoveries" not in conflict.state["checks"]
+        monkeypatch.setattr(protocol, "_worker", stopping)
+        result = await protocol.coordinate(
+            refused, {"run_id": "run-two", "authorized_endpoint": "merged"})
+        assert result["outcome"] == "blocked" and verdict.type in result["error"]
+        assert verdicts.count(("model", "build")) == 1
+        assert "feature_worker_recoveries" not in refused.state["checks"]
 
 
 @pytest.mark.asyncio
@@ -387,7 +572,8 @@ async def test_one_chunk_verdict_lets_the_running_sibling_build_close_first(monk
     _protocol_stubs(monkeypatch, controller)
     release = asyncio.Event()
 
-    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False):
+    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                     assignment=None):
         if (chunk_id, kind) == ("model", "build"):
             raise protocol.FeatureWorkerStopped(chunk_id, kind, closure=deepcopy(TERMINAL))
         if (chunk_id, kind) == ("client", "build"):
@@ -445,7 +631,7 @@ async def test_real_temporal_infrastructure_closure_resumes_while_the_sibling_ke
         if child == "build:model":
             await asyncio.wait_for(release_model.wait(), 30)
         return {"closed": True, "outcome": "delivered",
-                "closure": {"phase": "delivered", "cleanup": "confirmed"}}
+                "closure": {"outcome": "delivered", "phase": "delivered", "cleanup": "confirmed"}}
 
     @activity.defn(name="delivery_feature_finish_worker")
     async def finish_worker(payload):
@@ -472,7 +658,7 @@ async def test_real_temporal_infrastructure_closure_resumes_while_the_sibling_ke
     assert result["checks"]["feature_worker_recoveries"] == {"client:build": 1}
     recovering = [p["message"] for n, p in fixtures.calls
                   if n == "delivery_project" and p["event_type"] == "feature_worker_recovering"]
-    assert recovering == ["Recovering the build worker for client after an infrastructure "
+    assert recovering == ["Resumed the build worker for client after an infrastructure "
                           "failure (1 of 2)"]
     settled = [p["workers"] for n, p in fixtures.calls if n == "delivery_feature_settle_workers"]
     assert settled == [{}], "every worker closed through finish_worker; none was cancelled"
@@ -501,7 +687,7 @@ async def test_real_temporal_chunk_verdict_drains_the_running_sibling_before_sto
             return {"closed": True, "outcome": "blocked", "closure": deepcopy(TERMINAL)}
         await asyncio.wait_for(release_client.wait(), 30)
         return {"closed": True, "outcome": "delivered",
-                "closure": {"phase": "delivered", "cleanup": "confirmed"}}
+                "closure": {"outcome": "delivered", "phase": "delivered", "cleanup": "confirmed"}}
 
     @activity.defn(name="delivery_feature_finish_worker")
     async def finish_worker(payload):
@@ -544,15 +730,185 @@ async def test_real_temporal_chunk_verdict_drains_the_running_sibling_before_sto
                    for n, p in fixtures.calls)
 
 
-# --- M-24: merge and readback loops are bounded ----------------------------------------------
+# --- Real admission: what the coordinator offers, reserve() -> resume_worker() admits ----------
+
+IMPLEMENTED = {"role": "implement", "iteration": 0, "status": "pass",
+               "session_id": "modeled-implementation", "cleanup": "confirmed"}
+ADMITTED = {
+    # Latest implementation passed; a controller deadline at a gate stage.
+    "implement_pass_then_ci_deadline": ([IMPLEMENTED], "ci_deadline", "waiting_ci"),
+    # Latest implementation passed; the review role process died with teardown.
+    "review_role_exception": ([IMPLEMENTED, {
+        "role": "review", "iteration": 0, "status": "blocked", "session_id": None,
+        "cleanup": "confirmed", "finish_reason": "exception", "usage": None,
+        "summary": "role process failed: ConnectionError", "findings": ["reset"]}],
+        "role_interrupted", "review"),
+    # The implementation never launched: nothing unrecorded can exist.
+    "implement_prelaunch": ([{
+        "role": "implement", "iteration": 0, "status": "blocked", "session_id": None,
+        "cleanup": "confirmed", "finish_reason": "prelaunch", "usage": None,
+        "summary": "native launch refused", "findings": ["sandbox profile unavailable"]}],
+        "role_prelaunch", "implement"),
+}
+# The implementation process itself died: its launch outcome is unauthenticated.
+IMPLEMENT_DEATH = [{"role": "implement", "iteration": 0, "status": "blocked",
+                    "session_id": None, "cleanup": "confirmed", "finish_reason": "exception",
+                    "usage": None, "summary": "role process failed: ConnectionError",
+                    "findings": ["Connection reset by peer"]}]
+
+
+def _closed_chunk_worker(service, monkeypatch, *, roles, failure, error, revision=9,
+                         execution="modeled-closed"):
+    """A real store, registry and git checkout; only the provider receipts and the
+    Temporal closure proof are modeled. Returns what the coordinator observes."""
+    store, parent, child, broker, candidate, member, _ = integration(service, monkeypatch)
+    value = json.loads(parent["accepted_plan"])
+    record = {"manifest": {"revision": 1, "plan": value,
+                           "publication": {"stack_id": None, "members": [member]},
+                           "workstream_issues": {
+                               stream["id"]: {"url": "https://github.com/example/fixture/issues/10"}
+                               for stream in value["workstreams"]}}}
+    monkeypatch.setattr(activities, "current_record", lambda *_, **__: deepcopy(record))
+    monkeypatch.setattr(publications, "current_record", lambda *_, **__: deepcopy(record))
+    monkeypatch.setattr(publications, "live_members", lambda *_, **__: [
+        {"number": member["number"], "state": "open", "merged": False}])
+    roles = [{"candidate": candidate, **role} for role in roles]
+    checks = {"failure": failure}
+    state = {"run_id": child["run_id"], "phase": "blocked", "outcome": "blocked",
+             "execution_state": "blocked", "cleanup": "confirmed", "revision": revision,
+             "iteration": 0, "candidate": candidate, "pull_request": None,
+             "roles": roles, "checks": checks, "error": error}
+    store.project(child["run_id"], phase="blocked", execution_state="blocked", outcome="blocked",
+                  cleanup="confirmed", event_type="blocked", message=error,
+                  candidate=candidate, pull_request=None, checks=checks, iteration=0,
+                  protocol_revision=revision, error=error)
+    with store._connect() as db:
+        store.state.release_work(db, child["work_id"], "external:devflow:" + child["run_id"])
+        for index, role in enumerate(roles):
+            receipt = {k: v for k, v in role.items() if k not in {"role", "iteration", "candidate"}}
+            db.execute("INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
+                       "state,session_id,result_json,cleanup) "
+                       "VALUES (?,?,?,0,?,'finished',?,?,'confirmed')",
+                       (f"modeled-{index}", child["run_id"], role["role"], candidate["id"],
+                        role.get("session_id"), json.dumps(receipt)))
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                              (child["run_id"],)).fetchone())
+    closed = {"workflow_id": row["workflow_id"], "execution_run_id": execution,
+              "request_digest": child["request_digest"], "recovery_digest": None,
+              "result": state}
+    monkeypatch.setattr(DeliveryStore, "_completed_temporal_result",
+                        lambda self, run_id, **kwargs: deepcopy(closed))
+    chunk_id = child["feature_worker"]["chunk_id"]
+    registry(parent).checkpoint(
+        parent["feature_delivery"]["owner"],
+        checkpoint_key(child, f"assignment:{chunk_id}:chunk"),
+        {"run_id": child["run_id"], "store_path": str(store.config.tracking_db),
+         "chunk_id": chunk_id, "kind": "chunk"})
+    return store, parent, child, candidate, state
+
+
+def _commands(store, child):
+    with store._connect() as db:
+        recovery = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                              (child["run_id"],)).fetchone()[0]
+        commands = [r[0] for r in db.execute(
+            "SELECT command_id FROM delivery_commands WHERE run_id=? ORDER BY rowid",
+            (child["run_id"],))]
+    return (json.loads(recovery) if recovery else None), commands
+
+
+@pytest.mark.parametrize("variant", sorted(ADMITTED))
+def test_every_closure_the_coordinator_offers_is_admitted_by_the_real_reserve_path(
+    service, monkeypatch, variant,
+):
+    roles, cause, stage = ADMITTED[variant]
+    error = "modeled infrastructure stop"
+    failure = {"classification": "transient", "cause_type": cause, "stage": stage,
+               "reason": error}
+    store, parent, child, candidate, _ = _closed_chunk_worker(
+        service, monkeypatch, roles=roles, failure=failure, error=error)
+    # The child side classifies these exactly as the closure records them.
+    assert _interrupted_role([{"candidate": candidate, **r} for r in roles]) == (
+        cause if cause != "ci_deadline" else None)
+    closure = {"outcome": "blocked", "phase": "blocked", "cleanup": "confirmed", "error": error,
+               "failure": failure, "planning_defect": False}
+    assert protocol._resumable(closure)
+    admitted = activities.reserve(parent, child["feature_worker"]["chunk_id"], "chunk")
+    assert admitted["resumed"] is True and admitted["completed"] is False
+    assert admitted["spec"]["run_id"] == child["run_id"]
+    recovery, commands = _commands(store, child)
+    assert recovery["kind"] == "stopped_delivery_resume"
+    assert recovery["state"]["checks"]["failure"] == failure, "the continuation inherits it"
+    assert len(commands) == 1 and commands[0].startswith("feature-resume-")
+
+
+def test_an_implementation_death_is_neither_offered_nor_admitted(service, monkeypatch):
+    from devflow_temporal.delivery_workflow import _failure_classification
+
+    error = "workstream execution needs recovery"
+    roles = [{"candidate": None, **r} for r in IMPLEMENT_DEATH]
+    # What the worker's own _stop now records for this closure: a verdict.
+    assert _interrupted_role(roles) is None
+    failure = {**_failure_classification(None, None), "stage": "implement", "reason": error}
+    assert failure["classification"] == "terminal"
+    store, parent, child, candidate, _ = _closed_chunk_worker(
+        service, monkeypatch, roles=IMPLEMENT_DEATH, failure=failure, error=error)
+    closure = {"outcome": "blocked", "phase": "blocked", "cleanup": "confirmed", "error": error,
+               "failure": failure, "planning_defect": False}
+    assert not protocol._resumable(closure)
+    # And were it ever offered, the admission refuses it with the reason the
+    # coordinator surfaces in its stop.
+    with pytest.raises(ValueError, match=REFUSAL):
+        activities.reserve(parent, child["feature_worker"]["chunk_id"], "chunk")
+    recovery, commands = _commands(store, child)
+    assert recovery is None and commands == []
+
+
+def test_a_second_in_generation_resume_admits_its_own_command(service, monkeypatch):
+    from devflow_temporal.contracts import digest
+
+    roles, cause, stage = ADMITTED["implement_pass_then_ci_deadline"]
+    error = "modeled infrastructure stop"
+    failure = {"classification": "transient", "cause_type": cause, "stage": stage,
+               "reason": error}
+    store, parent, child, candidate, state = _closed_chunk_worker(
+        service, monkeypatch, roles=roles, failure=failure, error=error)
+    chunk_id = child["feature_worker"]["chunk_id"]
+    first = activities.reserve(parent, chunk_id, "chunk")
+    recovery, commands = _commands(store, child)
+    assert first["resumed"] and len(commands) == 1
+    # The admitted continuation closes blocked again for infrastructure.
+    with store._connect() as db:
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                              (child["run_id"],)).fetchone())
+    later = {**state, "revision": 20, "checks": {"failure": failure}}
+    store.project(child["run_id"], phase="blocked", execution_state="blocked", outcome="blocked",
+                  cleanup="confirmed", event_type="blocked", message=error,
+                  candidate=candidate, pull_request=None, checks={"failure": failure},
+                  iteration=0, protocol_revision=20, error=error)
+    with store._connect() as db:
+        # The continuation's own finalization releases the claim it was admitted with.
+        store.state.release_work(db, child["work_id"], "external:devflow:" + child["run_id"])
+    closed = {"workflow_id": row["workflow_id"], "execution_run_id": "modeled-closed-again",
+              "request_digest": child["request_digest"], "recovery_digest": digest(recovery),
+              "result": later}
+    monkeypatch.setattr(DeliveryStore, "_completed_temporal_result",
+                        lambda self, run_id, **kwargs: deepcopy(closed))
+    second = activities.reserve(parent, chunk_id, "chunk")
+    assert second["resumed"] and second["spec"]["run_id"] == child["run_id"]
+    _, commands = _commands(store, child)
+    assert len(commands) == 2 and commands[0] != commands[1]
+
+
+# --- M-24: merge and readback loops back off instead of stopping ------------------------------
 
 
 @pytest.mark.asyncio
-async def test_pending_merge_readback_stops_with_a_reason_and_settlement_slows_down(monkeypatch):
+async def test_slow_merge_readback_backs_off_and_still_ends_merged(monkeypatch):
     controller = LivenessController(plan())
     _protocol_stubs(monkeypatch, controller)
-    monkeypatch.setattr(protocol, "MERGE_READBACK_POLLS", 3)
     monkeypatch.setattr(protocol, "READBACK_FAST_POLLS", 2)
+    merges = iter([{"state": "pending"}] * 4)
     settlements = iter([
         {"state": "pending", "effect_key": "merge:stack-42", "reason": "RPCError: unavailable"},
         {"state": "pending", "effect_key": "merge:stack-42", "reason": "RPCError: unavailable"},
@@ -564,7 +920,11 @@ async def test_pending_merge_readback_stops_with_a_reason_and_settlement_slows_d
     async def execute(name, request):
         if name == "delivery_feature_merge":
             controller.events.append((name, deepcopy(request)))
-            return {"state": "pending"}
+            pending = next(merges, None)
+            if pending is not None:
+                return pending
+            return {"state": "confirmed", "pull_requests": [
+                {"number": item["number"]} for item in request["publication"]["pull_requests"]]}
         if name == "delivery_feature_settle_effects":
             controller.events.append((name, deepcopy(request)))
             return next(settlements)
@@ -572,19 +932,24 @@ async def test_pending_merge_readback_stops_with_a_reason_and_settlement_slows_d
 
     controller._activity = execute
 
-    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False):
+    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                     assignment=None):
         return _delivered(controller, chunk_id, kind)
 
     monkeypatch.setattr(protocol, "_worker", worker)
     result = await protocol.coordinate(
         controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
-    assert result["outcome"] == "blocked"
-    assert "merge readback stayed pending across 3 polls" in result["error"]
-    assert sum(1 for name, _ in controller.events if name == "delivery_feature_merge") == 3
+    # A merge confirmed after any number of pending polls ends the feature merged.
+    assert result["phase"] == "merged" and result["outcome"] == "delivered"
+    assert sum(1 for name, _ in controller.events if name == "delivery_feature_merge") == 5
     assert controller.sleeps == [
-        protocol.READBACK_INTERVAL, protocol.READBACK_INTERVAL,
+        timedelta(seconds=30), timedelta(minutes=1), timedelta(minutes=2), timedelta(minutes=4),
         protocol.READBACK_INTERVAL, protocol.READBACK_INTERVAL, protocol.READBACK_SLOW_INTERVAL,
     ]
+    merging = [m for e, m in controller.messages if e == "feature_merging"]
+    assert len(merging) == 2, "one projection names the pending merge"
+    assert "#1, #2, #3" in merging[1] and "readback still pending" in merging[1]
+    assert "up to 15 minutes" in merging[1]
     readback = [m for e, m in controller.messages if e == "feature_readback_pending"]
     assert readback[:2] == ["Reconciling the original GitHub operation"] * 2
     assert ("merge:stack-42" in readback[2] and "after 3 polls" in readback[2]
@@ -594,30 +959,25 @@ async def test_pending_merge_readback_stops_with_a_reason_and_settlement_slows_d
 
 
 @pytest.mark.asyncio
-async def test_real_temporal_bounded_merge_readback_records_timers_and_replays(monkeypatch):
+async def test_real_temporal_slow_merge_records_backoff_timers_and_replays(monkeypatch):
     fixtures = FeatureActivities()
-    settlements = []
+    base_merge = _base_handler(fixtures, "delivery_feature_merge")
+    merges = []
 
     @activity.defn(name="delivery_feature_merge")
     async def merge(payload):
-        return {"state": "pending"}
+        merges.append(payload["publication"]["stack_id"])
+        if len(merges) <= 3:
+            return {"state": "pending"}
+        return await base_merge(payload)
 
-    @activity.defn(name="delivery_feature_settle_effects")
-    async def settle_effects(payload):
-        settlements.append(payload["spec"]["run_id"])
-        if len(settlements) < 4:
-            return {"state": "pending", "effect_key": "merge:stack-42", "reason": "pending"}
-        return {"state": "confirmed"}
-
-    monkeypatch.setattr(protocol, "MERGE_READBACK_POLLS", 3)
-    monkeypatch.setattr(protocol, "READBACK_FAST_POLLS", 2)
     monkeypatch.setattr(protocol, "READBACK_INTERVAL", timedelta(seconds=1))
-    monkeypatch.setattr(protocol, "READBACK_SLOW_INTERVAL", timedelta(seconds=2))
-    spec = _feature_spec("bounded-merge-readback")
+    monkeypatch.setattr(protocol, "MERGE_READBACK_CAP", timedelta(seconds=2))
+    spec = _feature_spec("slow-merge-readback")
     async with local_temporal() as environment:
         async with Worker(environment.client, task_queue=spec["run_id"],
                           workflows=[DeliveryWorkflow],
-                          activities=_handlers(fixtures, merge, settle_effects),
+                          activities=_handlers(fixtures, merge),
                           workflow_runner=UnsandboxedWorkflowRunner()):
             handle = await environment.client.start_workflow(
                 DeliveryWorkflow.run, spec, id=spec["run_id"], task_queue=spec["run_id"])
@@ -625,12 +985,11 @@ async def test_real_temporal_bounded_merge_readback_records_timers_and_replays(m
             history = await handle.fetch_history()
         await Replayer(workflows=[DeliveryWorkflow],
                        workflow_runner=UnsandboxedWorkflowRunner()).replay_workflow(history)
-    assert result["outcome"] == "blocked"
-    assert "merge readback stayed pending across 3 polls" in result["error"]
-    assert len(settlements) == 4
-    timers = [e.timer_started_event_attributes.start_to_fire_timeout.ToTimedelta()
-              for e in history.events if e.HasField("timer_started_event_attributes")]
-    assert timers == [timedelta(seconds=1)] * 4 + [timedelta(seconds=2)]
+    assert result["phase"] == "merged" and len(merges) == 4
+    assert _timers(history) == [timedelta(seconds=1), timedelta(seconds=2), timedelta(seconds=2)]
+    merging = [p["message"] for n, p in fixtures.calls
+               if n == "delivery_project" and p["event_type"] == "feature_merging"]
+    assert len(merging) == 2 and "readback still pending" in merging[1]
     assert fixtures.calls[-1][0] == "delivery_feature_stop"
 
 
@@ -671,22 +1030,25 @@ async def test_history_recorded_before_feature_liveness_marker_replays_with_flag
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("liveness, last_role, cause, expected", [
-    (True, {"status": "blocked", "finish_reason": "exception", "cleanup": "confirmed"}, None,
-     ("transient", "role_interrupted")),
-    (True, {"status": "recovery_unknown", "finish_reason": "interrupted_monitor",
-            "cleanup": "confirmed"}, None, ("transient", "role_interrupted")),
-    (True, {"status": "blocked", "finish_reason": "exception", "cleanup": "unknown"}, None,
+@pytest.mark.parametrize("liveness, roles, cause, expected", [
+    (True, IMPLEMENT_DEATH, None, ("terminal", None)),
+    (True, [{"role": "implement", "status": "recovery_unknown",
+             "finish_reason": "interrupted_monitor", "cleanup": "confirmed"}], None,
      ("terminal", None)),
-    (True, {"status": "findings", "finish_reason": "done", "cleanup": "confirmed"}, None,
-     ("terminal", None)),
-    (True, {"status": "findings", "finish_reason": "done", "cleanup": "confirmed"},
+    (True, ADMITTED["review_role_exception"][0], None, ("transient", "role_interrupted")),
+    (True, [{"role": "implement", "status": "findings", "finish_reason": "done",
+             "cleanup": "confirmed"},
+            {"role": "review", "status": "blocked", "finish_reason": "exception",
+             "cleanup": "confirmed"}], None, ("terminal", None)),
+    (True, ADMITTED["implement_prelaunch"][0], None, ("transient", "role_prelaunch")),
+    (True, [{**IMPLEMENT_DEATH[0], "cleanup": "unknown"}], None, ("terminal", None)),
+    (True, [{"role": "implement", "status": "findings", "finish_reason": "done",
+             "cleanup": "confirmed"}],
      _activity_error(_lost_heartbeat(), "delivery_role"), ("transient", "ActivityTimeoutError")),
-    (False, {"status": "blocked", "finish_reason": "exception", "cleanup": "confirmed"}, None,
-     None),
+    (False, ADMITTED["review_role_exception"][0], None, None),
 ])
-async def test_feature_worker_stop_records_only_infrastructure_as_transient(
-    liveness, last_role, cause, expected,
+async def test_feature_worker_stop_records_only_admissible_infrastructure_as_transient(
+    liveness, roles, cause, expected,
 ):
     from devflow_temporal.delivery_workflow import _initial_controller_state
 
@@ -695,7 +1057,7 @@ async def test_feature_worker_stop_records_only_infrastructure_as_transient(
     controller = DeliveryWorkflow()
     controller.feature_liveness_v1 = liveness
     controller.state = _initial_controller_state(spec)
-    controller.state["roles"].append(last_role)
+    controller.state["roles"].extend(deepcopy(roles))
 
     async def project(_spec, _event, _message):
         return None
@@ -711,7 +1073,34 @@ async def test_feature_worker_stop_records_only_infrastructure_as_transient(
         assert failure["classification"] == classification
         assert failure.get("cause_type") == cause_type
         assert failure["reason"] == "workstream execution needs recovery"
-    assert state["cleanup"] == ("unknown" if last_role["cleanup"] == "unknown" else "none")
+    assert state["cleanup"] == ("unknown" if roles[-1]["cleanup"] == "unknown" else "none")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("liveness", [True, False])
+async def test_feature_worker_continuation_drops_its_predecessors_failure_record(liveness):
+    spec = {"run_id": "build:model", "provider": "fake", "policy": {},
+            "feature_worker": {"parent_run_id": "feature", "chunk_id": "model", "kind": "build"}}
+    controller = DeliveryWorkflow()
+    controller.feature_liveness_v1 = liveness
+    inherited = {"classification": "transient", "cause_type": "role_interrupted",
+                 "stage": "review", "reason": "modeled infrastructure stop"}
+    recovery = {"execution_spec": spec, "maximum_iteration": 0,
+                "command": {"additional_iterations": 0},
+                "execution_candidate": {"id": "c" * 64, "head": "h" * 40},
+                "state": {"iteration": 0, "phase": "blocked", "revision": 3, "roles": [],
+                          "checks": {"failure": inherited, "repair_budget": {"used": 1}}}}
+
+    async def preflight(_spec, _recovery):
+        return False
+
+    controller._confirm_repair_preflight = preflight
+    state = await controller._resume_stopped(spec, recovery)
+    # A closure's classification describes only its own execution: a cancelled
+    # or otherwise closed continuation must never look transient by inheritance.
+    assert ("failure" in state["checks"]) is not liveness
+    assert state["checks"]["repair_budget"] == {"used": 1}
+    assert state["phase"] == "repair_preflight" and state["outcome"] is None
 
 
 @pytest.mark.asyncio
@@ -727,7 +1116,7 @@ async def test_worker_result_carries_the_closure_its_own_controller_recorded(ser
     register_worker(store, parent, child)
     reference = {"spec": parent, "child_id": child["run_id"]}
     assert await activities.delivery_feature_worker_result(reference) == {"closed": False}
-    failure = {"classification": "transient", "cause_type": "role_interrupted",
+    failure = {"classification": "transient", "cause_type": "role_prelaunch",
                "stage": "implement", "reason": "workstream execution needs recovery"}
     with store._connect() as db:
         db.execute("UPDATE delivery_runs SET phase='blocked',outcome='blocked',"
@@ -738,11 +1127,13 @@ async def test_worker_result_carries_the_closure_its_own_controller_recorded(ser
                         lambda self, run_id, **kwargs: {"result": {"outcome": "blocked"}})
     observation = await activities.delivery_feature_worker_result(reference)
     assert observation == {"closed": True, "outcome": "blocked", "closure": {
-        "phase": "blocked", "cleanup": "confirmed", "error": "workstream execution needs recovery",
-        "failure": failure, "planning_defect": False,
+        "outcome": "blocked", "phase": "blocked", "cleanup": "confirmed",
+        "error": "workstream execution needs recovery", "failure": failure,
+        "planning_defect": False,
     }}
     assert protocol._resumable(observation["closure"])
     assert not protocol._resumable({**observation["closure"], "cleanup": "unknown"})
+    assert not protocol._resumable({**observation["closure"], "outcome": "cancelled"})
     with store._connect() as db:
         assigned = db.execute("SELECT 1 FROM delivery_runs WHERE run_id=? AND outcome='blocked'",
                               (child["run_id"],)).fetchone()

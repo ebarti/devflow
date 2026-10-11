@@ -15,7 +15,7 @@ from pathlib import Path
 from temporalio import activity
 
 from .contracts import digest
-from .delivery_broker import _git
+from .delivery_broker import BrokerReadbackUnavailable, _git
 from .delivery_execution_registry import OwnershipConflict
 from .delivery_feature_execution import (
     plan_for,
@@ -161,7 +161,13 @@ def reserve(spec, chunk_id, kind):
     )
     # Ensure the exact remote prerequisite object is available locally before
     # admitting a checkout. Never move the configured source working tree.
-    _git(Path(spec["source_path"]), "fetch", "--no-tags", "origin", branch)
+    try:
+        _git(Path(spec["source_path"]), "fetch", "--no-tags", "origin", branch)
+    except RuntimeError as exc:
+        # A failed remote query is infrastructure the coordinator may re-issue,
+        # never a verdict about the assignment.
+        raise BrokerReadbackUnavailable(
+            "stack prerequisite fetch failed: " + str(exc)[:300]) from exc
     if _git(Path(spec["source_path"]), "rev-parse", "FETCH_HEAD") != head:
         raise OwnershipConflict("stack prerequisite moved before worker admission")
     register_worker(store, spec, child)
@@ -558,8 +564,8 @@ async def delivery_feature_worker_result(request):
     checks = json.loads(row["checks_json"] or "{}")
     # The coordinator decides a resume from this closure before finish_worker
     # retires the registry assignment; a retired assignment cannot continue.
-    closure = {"phase": row["phase"], "cleanup": row["cleanup"], "error": row["error"],
-               "failure": checks.get("failure"),
+    closure = {"outcome": row["outcome"], "phase": row["phase"], "cleanup": row["cleanup"],
+               "error": row["error"], "failure": checks.get("failure"),
                "planning_defect": bool(checks.get("planning_defect"))}
     try:
         result = await asyncio.to_thread(

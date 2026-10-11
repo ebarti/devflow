@@ -18,12 +18,20 @@ from .delivery_baseline_contract import repairable_baseline
 from .delivery_metadata_contract import evidence_applicability
 from .delivery_questions import valid_blocking_questions
 
+# Activity failure types that describe infrastructure rather than a verdict. The
+# feature coordinator re-issues observations only for these same types.
+TRANSIENT_FAILURE_TYPES = frozenset({
+    "ConnectionError", "TimeoutError", "TimeoutExpired", "GitHubTransientError",
+    "BrokerReadbackUnavailable", "ResourceCleanupTransient",
+})
+
 
 def _failure_classification(cause: Exception | None, controller_cause: str | None) -> dict:
     """Classify controller observations, never human or model diagnostic text."""
     result = {"classification": "terminal"}
     if controller_cause in {
         "ci_deadline", "tracker_readback", "publication_deadline", "role_interrupted",
+        "role_prelaunch",
     }:
         return {"classification": "transient", "cause_type": controller_cause}
     if not isinstance(cause, ActivityError):
@@ -35,19 +43,31 @@ def _failure_classification(cause: Exception | None, controller_cause: str | Non
         return {"classification": "transient", "cause_type": "ServerError"}
     if isinstance(failure, ApplicationError):
         result["cause_type"] = (failure.type or "ApplicationError")[:128]
-        if not failure.non_retryable and failure.type in {
-            "ConnectionError", "TimeoutError", "TimeoutExpired", "GitHubTransientError",
-            "BrokerReadbackUnavailable", "ResourceCleanupTransient",
-        }:
+        if not failure.non_retryable and failure.type in TRANSIENT_FAILURE_TYPES:
             result["classification"] = "transient"
     return result
 
 
 def _interrupted_role(roles: list[dict[str, Any]]) -> str | None:
-    """A role process that died with confirmed teardown is infrastructure, not a verdict."""
+    """Name a role-process death the stopped resume can re-admit.
+
+    The admission authenticates the implementation: a gate role (review, verify,
+    ...) that died after the latest implementation passed, or an implementation
+    that never launched (``prelaunch``), leaves no unrecorded provider work. An
+    implementation process that died mid-run has no authenticated launch outcome
+    and is a verdict for the operator, not infrastructure.
+    """
     last = roles[-1] if roles else {}
-    if (last.get("cleanup") == "confirmed"
-            and last.get("finish_reason") in {"exception", "interrupted_monitor"}):
+    if last.get("cleanup") != "confirmed":
+        return None
+    implementations = [role for role in roles if role.get("role") == "implement"]
+    latest = implementations[-1] if implementations else None
+    if last.get("role") == "implement":
+        if last.get("status") == "blocked" and last.get("finish_reason") == "prelaunch":
+            return "role_prelaunch"
+        return None
+    if (last.get("finish_reason") in {"exception", "interrupted_monitor"}
+            and latest is not None and latest.get("status") == "pass"):
         return "role_interrupted"
     return None
 
@@ -1664,6 +1684,10 @@ class DeliveryWorkflow:
                           error=None, cleanup='none', candidate=recovery['execution_candidate'])
         for key in ('resource_cleanup', 'terminal_tracker_checkpoint'):
             self.state['checks'].pop(key, None)
+        if self.feature_liveness_v1 and spec.get('feature_worker'):
+            # A closure's classification describes only its own execution; the
+            # coordinator must never resume this continuation on its predecessor's.
+            self.state['checks'].pop('failure', None)
         if not await self._confirm_repair_preflight(spec, recovery):
             return self.state
         tracker_pending_projected = False
