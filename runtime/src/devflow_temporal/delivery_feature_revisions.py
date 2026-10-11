@@ -1118,8 +1118,9 @@ def _historical_rejection(store, spec, rejected, values, *, closure=None):
 
 def _worker_subject(store, parent, previous, proposal, values):
     from .delivery_feature_execution import revised_worker_spec
-    from .delivery_feature_review_context import candidate_subject, preserved_worker
+    from .delivery_feature_review_context import preserved_worker
     from .delivery_feature_revision_recovery import retained_recovery
+    from .delivery_feature_revision_subject import retained_worker_subject
 
     plan, affected, _ = _admit_plan(
         parent, previous["old_plan"], proposal["plan"], previous["old_identity"],
@@ -1140,7 +1141,7 @@ def _worker_subject(store, parent, previous, proposal, values):
         with store._connect() as db:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             attempts = list(db.execute(
-                "SELECT state,cleanup,session_id FROM delivery_attempts WHERE run_id=? "
+                "SELECT * FROM delivery_attempts WHERE run_id=? "
                 "ORDER BY job_key", (run_id,),
             ))
         worker = original.get("feature_worker") or {}
@@ -1159,14 +1160,7 @@ def _worker_subject(store, parent, previous, proposal, values):
         _checkpoint_proof(_registry(parent), parent["feature_delivery"]["owner"]["issue_id"],
                           values, input_keys)
         recovery = retained_recovery(json.loads(row["recovery_json"] or "null"))
-        candidate = json.loads(row["candidate_json"] or "null")
-        if recovery:
-            if (recovery.get("execution_spec") != original
-                    or candidate_subject(recovery["execution_candidate"])
-                    != candidate_subject(candidate)):
-                raise ValueError("retained worker recovery changed candidate or input custody")
-        if candidate_subject(_candidate(store, original)) != candidate_subject(candidate):
-            raise ValueError("retained worker product content changed after its stopped receipt")
+        observation = retained_worker_subject(store, original, row, attempts, recovery)
         derived = revised_worker_spec(
             parent, plan, assignment["chunk_id"],
             expected_revision={"plan_revision": previous["old_identity"]["plan_revision"] + 1,
@@ -1176,11 +1170,16 @@ def _worker_subject(store, parent, previous, proposal, values):
         sessions = sorted({r["session_id"] for r in attempts if r["session_id"]}
                           | ({recovery["session_id"]} if recovery and recovery.get("session_id")
                              else set()))
-        summary.update(candidate=candidate_subject(candidate), session_ids=sessions)
+        summary.update(candidate=observation["candidate"], session_ids=sessions)
+        if observation["current_review_subject"] is not None:
+            summary["current_review_subject"] = observation["current_review_subject"]
         summaries.append(summary)
         inputs[run_id] = {"submitted_spec_sha256": digest(submitted),
                           "effective_spec_sha256": digest(original),
-                          "recovery_sha256": digest(recovery) if recovery else None}
+                          "recovery_sha256": digest(recovery) if recovery else None,
+                          "progress_custody": observation["progress_custody"],
+                          "continuation_prerequisites_sha256":
+                          observation["continuation_prerequisites_sha256"]}
         subjects.append({**summary, "custody": {key: original.get(key) for key in (
             "run_id", "work_id", "request_digest", "config_path", "config_digest",
             "state_dir", "checkout", "branch", "base_sha", "issue_url", "authorized_endpoint",
@@ -1192,7 +1191,7 @@ def _worker_subject(store, parent, previous, proposal, values):
             "current_worker_subject_sha256": digest(subjects)}
 
 
-def _prove_reconsideration(store, spec, selectors, record, closure, values):
+def _prove_reconsideration(store, spec, selectors, record, closure, values, *, planning_paid=False):
     from .delivery_feature_review_context import SCHEMA, candidate_subject, current_runtime_context
 
     selected_id = selectors["rejected_revision_id"]
@@ -1219,6 +1218,10 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values):
     if current["context_sha256"] == historical["runtime"]["context_sha256"]:
         raise ValueError("reconsideration requires a changed relevant derivation context")
     subject = _worker_subject(store, spec, previous, proposal, values)
+    budget = _registry(spec).budget(previous["owner"]["issue_id"])
+    if (any(worker.get("current_review_subject") for worker in subject["worker_summaries"])
+            and budget["maximum"] - budget["used"] < 1 + int(not planning_paid)):
+        raise ValueError("unpassed retained worker lacks the ordinary planning and repair budget")
     findings, predecessors = [], []
     for item in sorted(
         (item for key, item in values.items() if key.startswith(PREFIX + "rejected:")
@@ -1240,7 +1243,11 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values):
                              "classification": proof["classification"],
                              "review_request_sha256": proof["review"]["request_sha256"],
                              "review_result_sha256": proof["review"]["result_sha256"]})
-    if len(findings) > 32 or sum(len(text.encode()) for text in findings) > 16 * 1024:
+    product_findings = [text for worker in subject["worker_summaries"]
+                        for text in (worker.get("current_review_subject") or {}).get(
+                            "unresolved_product_findings", [])]
+    bounded = findings + product_findings
+    if len(bounded) > 32 or sum(len(text.encode()) for text in bounded) > 16 * 1024:
         raise ValueError("unresolved genuine findings exceed bounded fresh review context")
     key = digest({"context_schema": SCHEMA, "issue_id": previous["owner"]["issue_id"],
                   "old_identity": identity, "publication": record["manifest"]["publication"],
@@ -1264,14 +1271,15 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values):
         "current_worker_subject_sha256": subject["current_worker_subject_sha256"],
         "worker_summaries": subject["worker_summaries"], "prior_rejections": predecessors,
         "unresolved_prior_findings_sha256": digest(findings),
-        "original_repair_budget": _registry(spec).budget(previous["owner"]["issue_id"]),
+        "original_repair_budget": budget,
     }
     return receipt, findings
 
 
-def _reconsideration_proof(store, spec, selectors, record, closure, values):
+def _reconsideration_proof(store, spec, selectors, record, closure, values, *, planning_paid=False):
     try:
-        return _prove_reconsideration(store, spec, selectors, record, closure, values)
+        return _prove_reconsideration(store, spec, selectors, record, closure, values,
+                                     planning_paid=planning_paid)
     except (KeyError, TypeError, OSError, StopIteration, SyntaxError) as exc:
         raise OwnershipConflict("reconsideration evidence is missing or unsupported") from exc
 
@@ -1292,9 +1300,19 @@ def _recheck_reconsideration(store, spec, context, *, candidate=None):
                       [PREFIX + "request:" + context["revision_id"]])
     original = store.effective_spec(public["predecessor_run_id"])
     authenticate_adopted_plan_custody(store, spec, {"owner": public["owner"]})
+    begun = values.get(PREFIX + "begin:" + context["revision_id"])
+    paid = False
+    if begun:
+        _checkpoint_proof(_registry(spec), context["owner"]["issue_id"], values,
+                          [PREFIX + "begin:" + context["revision_id"]])
+        with _registry(spec).connect() as db:
+            debit = db.execute("SELECT generation FROM execution_repairs WHERE issue_id=? "
+                               "AND repair_key=?", (context["owner"]["issue_id"],
+                                                    begun["repair_key"])).fetchone()
+        paid = bool(debit and debit[0] == context["owner"]["generation"])
     proof, findings = _reconsideration_proof(
         store, original, public["request"]["reconsideration"], public["record"],
-        public["predecessor_closure"], values,
+        public["predecessor_closure"], values, planning_paid=paid,
     )
     # The normal repair debit is intentionally newer; its budget cannot rewrite
     # the original pre-admission receipt, nor redefine deduplication identity.

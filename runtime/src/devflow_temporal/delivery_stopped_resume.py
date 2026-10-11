@@ -100,9 +100,11 @@ def pending_repair(seal):
             'findings': [finding for finding in findings if finding is not None]}
 
 
-def observed_native_cleanup(spec):
+def observed_native_cleanup(spec, *, read_only=False):
     """Preflight and readback observe closure without controlling any process."""
-    return digest({'provider': 'fake'} if spec['provider'] == 'fake' else _stopped_cleanup(spec))
+    if spec['provider'] == 'fake':
+        return digest({'provider': 'fake'})
+    return digest(_stopped_cleanup(spec, read_only=True) if read_only else _stopped_cleanup(spec))
 
 
 def namespace(recovery):
@@ -220,6 +222,15 @@ def _candidate(broker, state, attempts, *, missing_rollout=None):
 
 
 def snapshot(store, run_id, *, _revision=None):
+    return _snapshot(store, run_id, _revision=_revision)
+
+
+def review_snapshot(store, run_id):
+    """Observe complete stopped-worker custody without admitting or creating resources."""
+    return _snapshot(store, run_id, review_subject=True)
+
+
+def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     spec = store.effective_spec(run_id)
     if spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local':
         raise ValueError('stopped resume preserves an already trusted execution policy')
@@ -234,6 +245,9 @@ def snapshot(store, run_id, *, _revision=None):
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     stopped = ({'blocked', 'cancelled'} if spec.get('feature_worker') else {'blocked'})
+    if review_subject and spec.get('feature_worker', {}).get('kind') == 'build':
+        # A completed build remains source evidence; this observer grants no resume.
+        stopped.add('delivered')
     if _revision is not None:
         from .delivery_feature_revision_recovery import validate_revision_recovery
 
@@ -272,7 +286,19 @@ def snapshot(store, run_id, *, _revision=None):
             raise ValueError('implementation resume requires the passed immutable baseline'
                              if spec.get('baseline_checks_version') == 1 else
                              'implementation resume requires an authenticated immutable baseline')
-    broker = DeliveryBroker(store, spec)
+    observe_publication = bool(spec.get('feature_worker')
+                               and (review_subject or _revision is not None))
+    if observe_publication:
+        from .delivery_feature_revision_subject import ObservationBroker
+
+        # Only the already authenticated revision admission may observe the old
+        # worker under a newly adopted definition; execution remains fenced.
+        broker = ObservationBroker(store, spec, revision=(
+            _revision['plan_identity'] if _revision is not None else None))
+    else:
+        broker = DeliveryBroker(store, spec)
+    if review_subject:
+        broker.validate_candidate_scope()
     from .delivery_feature_revision_recovery import retained_recovery
     from .delivery_session_custody import implementation_custody
 
@@ -285,13 +311,17 @@ def snapshot(store, run_id, *, _revision=None):
     else:
         if any(e['kind'] == 'publish' for e in effects):
             raise ValueError('unpublished resume has an unresolved publication')
-        _unpublished_remote(broker)
+        if observe_publication:
+            broker.observe_unpublished()
+        else:
+            _unpublished_remote(broker)
     with store._connect() as db:
         binding = work_binding(store, spec, db)
     return {'predecessor_spec': spec, 'row': row, 'attempts': attempts, 'effects': effects,
             'closed': closed, 'state': state, 'candidate': candidate, 'session_id': session,
             'publication': publication, 'original_recovery': previous,
-            'cleanup_digest': observed_native_cleanup(spec), 'work_binding': binding,
+            'cleanup_digest': (observed_native_cleanup(spec, read_only=True) if review_subject
+                               else observed_native_cleanup(spec)), 'work_binding': binding,
             **({'session_custody': session_custody} if session_custody else {})}
 
 
