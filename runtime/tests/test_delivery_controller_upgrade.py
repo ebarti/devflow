@@ -185,7 +185,7 @@ elif kind=='proof':
         spec['policy']['environment_proof_sha256']=hash
         spec['policy_digest']=digest(spec['policy'])
 elif kind=='context' and name=='configuration':
-    path=Path(spec['config_path'])
+    path=Path(spec['state_dir']).parents[1]/'configuration-snapshots'/(spec['config_digest']+'.json')
     raw=json.loads(path.read_text()); raw['max_repairs']=2
     path.write_text(json.dumps(raw))
 try:

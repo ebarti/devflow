@@ -32,7 +32,10 @@ def pending(service, monkeypatch):
     store, broker, original, gate_request = unpublished.__wrapped__(service, monkeypatch)
 
     def renew(spec, *_args):
-        return {**deepcopy(spec), 'policy_digest': digest({'measured_runtime': 'renewed'})}
+        renewed = deepcopy(spec)
+        renewed['policy']['measured_runtime'] = 'renewed'
+        renewed['policy_digest'] = digest(renewed['policy'])
+        return renewed
 
     monkeypatch.setattr('devflow_temporal.delivery_gate_retry.prepare_runtime', renew)
     store.continue_repair('run-1', gate_request)

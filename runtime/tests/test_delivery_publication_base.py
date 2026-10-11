@@ -69,6 +69,7 @@ def test_unbound_native_pin_is_rejected_before_accepting_work(native_configurati
     head = bind_default(source)
     repository.update(base_ref=head, expected_base_sha=head)
     _git(source, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
     with pytest.raises(ValueError, match="publication"):
         store.submit({**request, "base_ref": head})

@@ -13,7 +13,7 @@ import pytest
 from temporalio.service import RPCError, RPCStatusCode
 from test_delivery_api import api_fixture as api_fixture
 
-from devflow_temporal.contracts import canonical_json
+from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
@@ -75,6 +75,7 @@ async def test_startup_preserves_retired_outbox_before_any_temporal_call(
         native = store.spec("native-next")
         native["provider"] = "codex"
         native["policy"]["execution_backend"] = "native-macos"
+        native["policy_digest"] = digest(native["policy"])
         with store._connect() as db:
             db.execute(
                 "UPDATE delivery_runs SET request_json=? WHERE run_id='native-next'",

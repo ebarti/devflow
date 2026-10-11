@@ -129,6 +129,7 @@ def test_local_tracking_releases_claim_without_any_remote_call(
         store.config.raw["repositories"]["fixture"]["project_statuses"] = {
             status: "Needs validation",
         }
+        store.config.path.write_text(json.dumps(store.config.raw))
     store.submit(request)
     spec = store.spec(request["run_id"])
     monkeypatch.setattr(delivery_activities, "_context", lambda *_: (store, None))

@@ -136,6 +136,15 @@ def test_worker_prerequisites_require_original_configuration(service, monkeypatc
         store.config.path.write_text(json.dumps(raw))
     else:
         child["repository_key"] = "unrelated"
+    if drift != "repository":
+        frozen = deepcopy(child)
+        assert [c["id"] for c in implementation_prerequisites(child)] == ["python-worker"]
+        assert child == frozen == store.submitted_spec(child["run_id"])
+        # An old reservation with no snapshot still requires the exact original
+        # live config. Removing the snapshot does not permit authority fallback.
+        snapshot = store.config.state_root / "configuration-snapshots" / (
+            child["config_digest"] + ".json")
+        snapshot.unlink()
     with pytest.raises((OSError, ValueError, KeyError)):
         implementation_prerequisites(child)
 
@@ -146,9 +155,11 @@ def test_worker_prerequisites_intersect_whole_recipes_without_changing_policy(se
     assert [c["id"] for c in implementation_prerequisites(child)] == ["python-worker"]
     assert child == frozen
     child["policy"]["prepublish_checks"][0]["argv"].append("--different-authority")
+    child["policy_digest"] = digest(child["policy"])
     assert implementation_prerequisites(child) == []
     child = deepcopy(frozen)
     child["policy"]["baseline_checks"] = []
+    child["policy_digest"] = digest(child["policy"])
     assert implementation_prerequisites(child) == []
     child = deepcopy(frozen)
     child.pop("feature_worker")

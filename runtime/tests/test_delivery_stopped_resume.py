@@ -202,6 +202,7 @@ def test_resume_rejects_failed_baseline_before_feature_work(stopped, monkeypatch
     store, broker, _, command = stopped
     spec = {**broker.spec, 'baseline_checks_version': 1,
             'policy': {**broker.spec['policy'], 'baseline_checks': [{'id': 'docs-runtime'}]}}
+    spec['policy_digest'] = digest(spec['policy'])
     monkeypatch.setattr(store, 'effective_spec', lambda _: spec)
     with pytest.raises(ValueError, match='passed immutable baseline'):
         store.continue_repair('run-1', command)
@@ -220,6 +221,12 @@ def test_resume_requires_same_authoritative_baseline_contract(stopped, monkeypat
             'policy': {**broker.spec['policy'], **{
                 key: fresh['policy'][key]
                 for key in ('baseline_checks', 'prepublish_checks', 'checks')}}}
+    spec['policy_digest'] = digest(spec['policy'])
+    candidate = DeliveryBroker(store, spec).candidate()
+    assert candidate['id'] == state['candidate']['id']
+    assert candidate['head'] == state['candidate']['head']
+    state['candidate'] = candidate
+    state['roles'][0]['candidate'] = candidate
     state['checks']['baseline'] = baseline
     project(store, state)
     monkeypatch.setattr(store, 'effective_spec', lambda _: spec)
@@ -231,6 +238,7 @@ def test_resume_requires_same_authoritative_baseline_contract(stopped, monkeypat
         assert result['state']['checks']['baseline'] == baseline
         assert result['candidate'] == state['candidate']
         spec['policy']['checks'] = []
+        spec['policy_digest'] = digest(spec['policy'])
         with pytest.raises(ValueError, match='authenticated immutable baseline'):
             resume.snapshot(store, 'run-1')
 

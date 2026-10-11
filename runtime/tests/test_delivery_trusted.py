@@ -1,6 +1,7 @@
 """Trusted host permission selection and truthful terminal tracker projection."""
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +46,7 @@ def test_invalid_project_status_mapping_is_rejected(intake_fixture, mapping):
 def test_trusted_mode_uses_supported_noninteractive_sdk_contract(native_configuration):
     config, request = native_configuration
     config.raw['execution_mode'] = 'trusted-local'
+    config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
     store.submit(request)
     spec = store.spec(request['run_id'])
@@ -71,6 +73,7 @@ def test_trusted_mode_uses_supported_noninteractive_sdk_contract(native_configur
 def test_implementation_and_repair_leave_commits_to_publisher(native_configuration, iteration):
     config, request = native_configuration
     config.raw['execution_mode'] = 'trusted-local'
+    config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
     store.submit(request)
     spec = store.spec(request['run_id'])
@@ -254,6 +257,7 @@ def test_legacy_terminal_tracker_uses_actual_helper_ack_before_release(
                       assignee='example')
     if mapped:
         repository['project_statuses'] = {status: 'Needs validation'}
+    config.path.write_text(json.dumps(config.raw))
     # This contract predates asynchronous Project tracking. Freeze the historical
     # admission before submitting it, retaining the actual helper and audit checks.
     admit = DeliveryConfig.admit
@@ -574,6 +578,7 @@ def test_independent_roles_receive_same_candidate_receipts_and_reject_stale_evid
 ):
     config, request = native_configuration
     config.raw['execution_mode'] = 'trusted-local'
+    config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
     store.submit(request)
     spec = store.spec(request['run_id'])

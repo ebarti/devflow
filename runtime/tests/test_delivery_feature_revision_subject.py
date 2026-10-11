@@ -686,9 +686,18 @@ def test_approved_revision_snapshot_reads_exact_canonical_record_and_keeps_old_w
     with store._connect() as db:
         db.execute("DELETE FROM delivery_effects WHERE effect_key='unsettled'")
     raw_config = Path(child["config_path"]).read_bytes()
-    Path(child["config_path"]).write_text(json.dumps({**store.config.raw, "max_repairs": 9}))
-    with pytest.raises(ValueError, match="configuration changed"):
+    snapshot = store.config.state_root / "configuration-snapshots" / (
+        child["config_digest"] + ".json")
+    frozen_config = snapshot.read_bytes()
+    changed_config = json.dumps({**store.config.raw, "max_repairs": 9})
+    Path(child["config_path"]).write_text(changed_config)
+    observed = stopped_resume.snapshot(store, child["run_id"], _revision=admission)
+    assert observed["candidate"] == current and observed["state"] == state
+    assert snapshot.read_bytes() == frozen_config
+    snapshot.write_text(changed_config)
+    with pytest.raises(ValueError, match="configuration.*changed"):
         stopped_resume.snapshot(store, child["run_id"], _revision=admission)
+    snapshot.write_bytes(frozen_config)
     Path(child["config_path"]).write_bytes(raw_config)
     with shared.connect() as db:
         db.execute("UPDATE execution_claims SET store_path='foreign'")
