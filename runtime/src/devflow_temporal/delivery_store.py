@@ -3086,10 +3086,11 @@ class DeliveryStore:
             if row is None:
                 return
             state = "unknown" if uncertain else row[0]
-            # Admissions re-queue a row by clearing last_error only; a failure
-            # after that starts a fresh attempt sequence instead of inheriting
-            # the backoff of an earlier execution.
-            attempts = row[2] if not counted else (row[2] + 1 if row[1] is not None else 1)
+            # Accepted starts count attempts too, and admissions re-queue a row
+            # by clearing last_error only: a failure after that starts a fresh
+            # sequence, and an outage that reached no row arms no backoff.
+            fresh = row[1] is None
+            attempts = (1 if fresh else row[2] + 1) if counted else (0 if fresh else row[2])
             db.execute(
                 """UPDATE delivery_outbox SET state=?,attempts=?,last_error=?,updated_at=?
                    WHERE run_id=?""",
@@ -3108,38 +3109,28 @@ class DeliveryStore:
             )
 
     def mark_start_conflict(self, run_id: str, workflow_id: str, reason: str) -> None:
-        """Retire a start whose workflow ID is held by a different request.
+        """Block a run whose workflow ID is held by a different request.
 
-        The remote memo proves the ID belongs to another request; retrying can
-        never acknowledge it, so the outbox entry becomes terminal and the run
-        is told once instead of on every dispatch cycle.
+        The remote memo proves the ID belongs to another request, so no retry
+        can acknowledge it. The run is projected blocked like any other stop
+        before roles, which a new submission of the same work supersedes, and
+        the outbox entry becomes terminal, so the row is told once instead of
+        polled. The projection comes first: a row left pending is retried and
+        the keyed event is not repeated.
         """
+        self.project(
+            run_id, phase="blocked", execution_state="blocked", event_type="blocked",
+            message="Temporal workflow ID is held by a different request",
+            outcome="blocked", error=reason, key=f"temporal-conflict:{workflow_id}",
+        )
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                """SELECT r.revision FROM delivery_outbox o
-                   JOIN delivery_runs r ON r.run_id=o.run_id
-                   WHERE o.run_id=? AND o.state IN ('pending','unknown')""",
-                (run_id,),
-            ).fetchone()
-            if row is None:
-                return
-            revision = row[0] + 1
-            db.execute(
-                "UPDATE delivery_runs SET revision=?,updated_at=? WHERE run_id=?",
-                (revision, _now(), run_id),
-            )
             db.execute(
                 """UPDATE delivery_outbox SET state='conflict',last_error=?,updated_at=?
-                   WHERE run_id=?""",
+                   WHERE run_id=? AND state IN ('pending','unknown')""",
                 (reason, _now(), run_id),
             )
-            self._event(
-                db, run_id, revision, "temporal_conflict",
-                "Temporal workflow ID is held by a different request",
-                {"error": reason, "workflow_id": workflow_id},
-            )
-        logger.warning("Run %s is not dispatched: %s", run_id, reason)
+        logger.warning("Run %s is blocked: %s", run_id, reason)
 
     def project(
         self,

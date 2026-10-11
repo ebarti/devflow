@@ -503,13 +503,26 @@ async def test_poison_row_cannot_starve_newer_runs_or_churn_their_timelines(
     assert first["run-1"]["revision"] == before["run-1"]["revision"] + 1
     assert first["run-1"]["events"] == before["run-1"]["events"] + 1
     assert first["run-2"]["outbox"][0] == "sent"
-    # A different request holds run-3's workflow ID: terminal, surfaced once.
+    # A different request holds run-3's workflow ID: the run is blocked once,
+    # its outbox entry is terminal, and a new submission supersedes it.
     assert first["run-3"]["outbox"][0] == "conflict"
     assert "belongs to a different request" in first["run-3"]["outbox"][2]
     assert first["run-3"]["revision"] == before["run-3"]["revision"] + 1
     assert first["run-3"]["events"] == before["run-3"]["events"] + 1
-    assert service.store.detail("run-3")["dispatch"]["state"] == "conflict"
+    blocked = service.store.detail("run-3")
+    assert (blocked["phase"], blocked["outcome"], blocked["execution_state"]) == (
+        "blocked", "blocked", "blocked")
+    assert "belongs to a different request" in blocked["error"]
+    assert blocked["dispatch"]["state"] == "conflict"
+    assert blocked["events"][-1]["type"] == "blocked"
     assert [row["run_id"] for row in service.store.pending_starts()] == ["run-1"]
+    superseding = service.store.submit({
+        **request, "command_id": "submit-3b", "run_id": "run-3b", "work_id": "work-3",
+        "branch": "feat/fixture-3b", "supersedes_run_id": "run-3",
+        "issue_url": "https://github.com/example/fixture/issues/3",
+    })
+    assert superseding["run_id"] == "run-3b"
+    assert [row["run_id"] for row in service.store.pending_starts()] == ["run-1", "run-3b"]
     # The first retry is immediate and counts an attempt without a new event;
     # the row then backs off, so further immediate cycles touch nothing.
     for _ in range(3):
@@ -519,7 +532,8 @@ async def test_poison_row_cannot_starve_newer_runs_or_churn_their_timelines(
     assert repeated["run-1"]["revision"] == first["run-1"]["revision"]
     assert repeated["run-1"]["events"] == first["run-1"]["events"]
     assert repeated["run-3"] == first["run-3"]
-    assert started == ["delivery-run-2"]
+    # The superseding run starts in the meantime; the blocked one stays retired.
+    assert started == ["delivery-run-2", "delivery-run-3b"]
     # A changed reason after the backoff is surfaced once more.
     describe_errors["delivery-run-1"] = RPCStatusCode.UNAVAILABLE
     clock[0] += 25
@@ -534,7 +548,7 @@ async def test_poison_row_cannot_starve_newer_runs_or_churn_their_timelines(
     describe_errors.clear()
     clock[0] += 45
     await service.dispatch_once()
-    assert started == ["delivery-run-2", "delivery-run-1"]
+    assert started == ["delivery-run-2", "delivery-run-3b", "delivery-run-1"]
     assert _dispatch_snapshot(service.store, run_ids)["run-1"]["outbox"][0] == "sent"
     assert service.store.pending_starts() == []
 
@@ -625,6 +639,58 @@ async def test_transport_outage_is_surfaced_once_per_reason(api_fixture, monkeyp
         assert changed[run_id]["outbox"] == (
             "pending", 0, "ConnectionError: name resolution failed")
         assert changed[run_id]["events"] == once[run_id]["events"] + 1
+
+
+@pytest.mark.asyncio
+async def test_requeued_row_with_stale_attempts_starts_promptly_after_an_outage(
+    api_fixture, monkeypatch,
+):
+    path, request = api_fixture
+    service = create_app(path).state.delivery
+    service.store.submit(request)
+    run_id = request["run_id"]
+    # Accepted starts count attempts, and admissions re-queue a row by clearing
+    # last_error only: the row carries a history no current failure explains.
+    with service.store._connect() as db:
+        db.execute("UPDATE delivery_outbox SET attempts=5,state='pending',last_error=NULL "
+                   "WHERE run_id=?", (run_id,))
+    clock = [time.time()]
+    monkeypatch.setattr("devflow_temporal.delivery_api.time",
+                        SimpleNamespace(time=lambda: clock[0]))
+
+    async def unavailable():
+        raise ConnectionError("temporal down")
+
+    async def stop_loop(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(service, "healthy_client", unavailable)
+    monkeypatch.setattr("devflow_temporal.delivery_api.asyncio.sleep", stop_loop)
+    with pytest.raises(asyncio.CancelledError):
+        await service.dispatch_loop()
+    assert _dispatch_snapshot(service.store, [run_id])[run_id]["outbox"] == (
+        "pending", 0, "ConnectionError: temporal down")
+    started = []
+
+    async def missing():
+        raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+
+    class Temporal:
+        def get_workflow_handle(self, _workflow_id):
+            return SimpleNamespace(describe=missing)
+
+        async def start_workflow(self, _workflow, **kwargs):
+            started.append(kwargs["id"])
+
+    async def healthy():
+        return Temporal()
+
+    monkeypatch.setattr(service, "healthy_client", healthy)
+    clock[0] += 5
+    # The outage armed no backoff: the row starts on the first cycle after recovery.
+    await service.dispatch_once()
+    assert started == ["delivery-" + run_id]
+    assert _dispatch_snapshot(service.store, [run_id])[run_id]["outbox"][0] == "sent"
 
 
 @pytest.mark.asyncio
