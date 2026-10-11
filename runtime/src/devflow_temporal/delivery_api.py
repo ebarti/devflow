@@ -30,6 +30,7 @@ from temporalio.service import RPCError, RPCStatusCode
 from .contracts import digest
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
+from .delivery_execution_config import transport_digest
 from .delivery_preparation import execution_retired
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
@@ -68,6 +69,7 @@ class DeliveryService:
     def __init__(self, config_path: Path) -> None:
         self.config = DeliveryConfig.load(config_path)
         self.store = DeliveryStore(self.config)
+        self._seed_execution_snapshots()
         self.session = LocalSession()
         self.temporal_status = "disconnected"
         self._health_client: Client | None = None
@@ -98,21 +100,42 @@ class DeliveryService:
         self.temporal_status = "connected"
         return self._health_client
 
+    def _seed_execution_snapshots(self) -> None:
+        """Service start seeds snapshots explicitly and names the runs it cannot seed."""
+        try:
+            report = self.store.seed_execution_snapshots()
+        except (OSError, ValueError) as exc:
+            logger.warning("admitted configuration snapshot publication failed: %s", exc)
+            return
+        for item in report["unavailable"]:
+            logger.warning("Run %s cannot be served by this service: %s",
+                           item["run_id"], item["reason"])
+
     async def dispatch_once(self) -> None:
         pending = self.store.pending_starts()
         starts = []
         for item in pending:
             try:
                 spec = self.store.effective_spec(item["run_id"])
-                owned = not execution_retired(spec) and self.store.owns_execution(spec)
+                retired = execution_retired(spec)
+                blocked = None if retired else self.store.execution_ownership(spec)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 logger.warning(
                     "Run %s skipped: execution specification unavailable (%s)",
                     item["run_id"], type(exc).__name__,
                 )
                 continue
-            if owned:
+            if retired:
+                continue
+            if blocked is None:
                 starts.append((item, spec))
+                continue
+            try:
+                # An owner must see why its own queued run never dispatches.
+                self.store.record_dispatch_block(item["run_id"], spec, blocked)
+            except Exception as exc:
+                logger.warning("Run %s dispatch block not recorded (%s)",
+                               item["run_id"], type(exc).__name__)
         # Retired and foreign outbox entries cannot authorize this service's transport.
         if pending and not starts:
             return
@@ -345,6 +368,10 @@ def create_app(config_path: Path) -> FastAPI:
             ),
             "runtime_identity": identity,
             "temporal": service.temporal_status,
+            # The lifecycle controller compares these with the live file to reload
+            # only a stale API, or the whole stack after a transport change.
+            "config_digest": digest(service.config.raw),
+            "transport_digest": transport_digest(service.config),
             "capacity": {"limit": service.config.raw.get("capacity", 2), "active": active},
             "policy": service.config.public_policy(),
             "repository_access": await asyncio.to_thread(
@@ -407,7 +434,7 @@ def create_app(config_path: Path) -> FastAPI:
         _mutation(request)
         try:
             return await asyncio.to_thread(service.store.submit, await request.json())
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/revise-feature-plan")

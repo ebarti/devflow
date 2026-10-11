@@ -116,8 +116,11 @@ uv run --frozen devflow-delivery --config /absolute/private/config.json start
 uv run --frozen devflow-delivery --config /absolute/private/config.json status
 uv run --frozen devflow-delivery --config /absolute/private/config.json submit --request /absolute/private/submit.json
 uv run --frozen devflow-delivery --config /absolute/private/config.json run --id local-001
+uv run --frozen devflow-delivery --config /absolute/private/config.json restart
 uv run --frozen devflow-delivery --config /absolute/private/config.json stop
 ```
+
+The API loads the configuration once; after an edit it refuses new admissions with a 409 that names `restart`. `restart` reloads only the API when the stack is ready and the transport (tracking database, state root, Temporal address, namespace, task queue) is unchanged, so roles in flight continue; a transport change or an incomplete stack goes through the ordinary stop and start. CLI and MCP writes that ensure the service also reload a stale API on their own. Admitted runs keep executing from their sealed configuration snapshot regardless of later edits; `start` seeds snapshots for runs admitted under the live configuration and names any run whose admitted configuration is no longer available.
 
 The local dashboard, CLI and MCP require no login credential or token file. Reads and SSE work without cookies. Commands automatically bootstrap or renew an anonymous HttpOnly, SameSite=Strict cookie solely for CSRF protection; exact loopback peer, Host and Origin checks remain enforced. Cached clients may still POST the old session request, but its token has no authority. Existing token files are left untouched for cached callers. The dashboard serves `/`, `/new`, `/settings`, `/statistics`, and `/runs/{id}` with the built static assets. It renders authoritative phase gates, roles, candidate and PR identity, checks, tracker status, usage unknowns, decisions, and durable events. SSE resumes from its event cursor and shows stale state on disconnect. No display refresh calls a model.
 

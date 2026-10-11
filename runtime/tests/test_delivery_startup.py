@@ -13,6 +13,7 @@ import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import uvicorn
@@ -380,7 +381,8 @@ def test_startup_timeout_cleans_launched_processes(config, monkeypatch):
     monkeypatch.setattr(control, "_wait_port", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(control, "_ready", lambda *_args: False)
     monkeypatch.setattr(control, "_free", lambda *_args: True)
-    monkeypatch.setattr(control, "DeliveryStore", lambda _config: None)
+    monkeypatch.setattr(control, "DeliveryStore",
+                        lambda _config: SimpleNamespace(seed_execution_snapshots=dict))
     monkeypatch.setattr(control.shutil, "which", lambda _name: sys.executable)
     with pytest.raises(ValueError, match="timed out.*logs:"):
         control.ensure_service_running(configured)
@@ -429,3 +431,117 @@ def test_cross_process_lock_times_out_without_starting(config, monkeypatch):
     finally:
         holder.kill()
         holder.wait()
+
+
+def _api_info(current, manifest, _deadline=None, *, config_digest=None, transport=None):
+    return {"pid": manifest["processes"]["api"]["pid"], "temporal": "connected",
+            "config_digest": config_digest or control.digest(current.raw),
+            "transport_digest": transport or control.transport_digest(current)}
+
+
+def test_ensure_service_running_reloads_only_a_stale_api(config, monkeypatch):
+    manifest = _manifest(config)
+    alive = {1, 2, 3}
+    signals, launched = [], []
+    monkeypatch.setattr(control, "_process_identity",
+                        lambda pid: "fixture" if pid in alive else None)
+    monkeypatch.setattr(control.os, "waitpid", lambda *_args: (0, 0))
+    monkeypatch.setattr(control.os, "getpgid", lambda pid: pid)
+
+    def kill(pid, sig):
+        signals.append((pid, sig))
+        alive.discard(pid)
+
+    def launch(_config, name, argv):
+        launched.append((name, argv[-1]))
+        alive.add(4)
+        return {"pid": 4, "identity": "fixture"}
+
+    monkeypatch.setattr(control.os, "killpg", kill)
+    monkeypatch.setattr(control, "_launch", launch)
+    monkeypatch.setattr(control, "_free", lambda *_args: True)
+    monkeypatch.setattr(control, "_stop", lambda *_args: pytest.fail("stopped the stack"))
+    monkeypatch.setattr(control, "_start",
+                        lambda *_args, **_kwargs: pytest.fail("restarted the stack"))
+    # The API advertising an earlier configuration is the only stale member.
+    monkeypatch.setattr(control, "_ready", lambda current, manifest, _deadline: _api_info(
+        current, manifest,
+        config_digest="0" * 64 if manifest["processes"]["api"]["pid"] == 3 else None))
+    result = control.ensure_service_running(config)
+    assert signals == [(3, signal.SIGTERM)]
+    assert launched == [("api", "api")]
+    assert result["processes"]["api"]["pid"] == 4
+    assert {name: result["processes"][name] for name in ("temporal", "worker")} == {
+        name: manifest["processes"][name] for name in ("temporal", "worker")}
+    assert control._read_manifest(config)["processes"]["api"]["pid"] == 4
+    # A current API is left alone on the next call.
+    assert control.ensure_service_running(config)["processes"]["api"]["pid"] == 4
+    assert signals == [(3, signal.SIGTERM)] and launched == [("api", "api")]
+
+
+def test_restart_reloads_the_api_member_without_signalling_the_worker(config, monkeypatch):
+    original_launch = control._launch
+
+    def launch(current, name, _argv):
+        return original_launch(
+            current, name, [sys.executable, "-c", "import time; time.sleep(30)"])
+
+    control._private_directory(config.state_root)
+    processes = {"temporal": {"pid": 1, "identity": "fixture"},
+                 "worker": {"pid": 2, "identity": "fixture"}}
+    processes["api"] = launch(config, "api", [])
+    control._write_manifest(config, processes)
+    real_identity = control._process_identity
+    monkeypatch.setattr(control, "_process_identity",
+                        lambda pid: "fixture" if pid in {1, 2} else real_identity(pid))
+    monkeypatch.setattr(control, "_launch", launch)
+    monkeypatch.setattr(control, "_free", lambda *_args: True)
+    monkeypatch.setattr(control, "_stop", lambda *_args: pytest.fail("signalled the worker"))
+    monkeypatch.setattr(control, "_start",
+                        lambda *_args, **_kwargs: pytest.fail("restarted the stack"))
+    monkeypatch.setattr(control, "_ready", _api_info)
+    old = processes["api"]
+    try:
+        result = control.service_restart(config)
+        new = result["processes"]["api"]
+        assert result["restarted"] == ["api"]
+        assert new["pid"] != old["pid"]
+        assert not control._owned(old)
+        assert control._owned(new)
+        assert result["processes"]["worker"] == processes["worker"]
+        assert control._read_manifest(config)["processes"]["api"] == new
+    finally:
+        for pid in {old["pid"], control._read_manifest(config)["processes"]["api"]["pid"]}:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_restart_after_a_transport_change_takes_the_ordinary_stop_and_start(config, monkeypatch):
+    manifest = _manifest(config)
+    calls = []
+    monkeypatch.setattr(control, "_owned", lambda _process: True)
+    monkeypatch.setattr(control, "_ready", lambda current, manifest, _deadline: _api_info(
+        current, manifest, transport="0" * 64))
+    monkeypatch.setattr(control, "_restart_api",
+                        lambda *_args: pytest.fail("reloaded only the API"))
+    monkeypatch.setattr(control, "service_stop", lambda _current: calls.append("stop") or {})
+    monkeypatch.setattr(control, "ensure_service_running", lambda _current: (
+        calls.append("start") or {"processes": manifest["processes"]}))
+    assert control.service_restart(config)["restarted"] == ["temporal", "worker", "api"]
+    assert calls == ["stop", "start"]
+
+
+def test_start_reports_seeded_snapshots(config, monkeypatch):
+    report = {"published": "0" * 64, "unavailable": [{"run_id": "run-1", "reason": "fixture"}]}
+    monkeypatch.setattr(control, "DeliveryStore",
+                        lambda _config: SimpleNamespace(seed_execution_snapshots=lambda: report))
+    monkeypatch.setattr(control, "_launch", lambda _config, name, _argv: {
+        "pid": {"temporal": 1, "worker": 2, "api": 3}[name], "identity": "fixture"})
+    monkeypatch.setattr(control, "_owned", lambda _process: True)
+    monkeypatch.setattr(control, "_wait_port", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(control, "_ready", lambda *_args: True)
+    monkeypatch.setattr(control, "_free", lambda *_args: True)
+    monkeypatch.setattr(control.shutil, "which", lambda _name: sys.executable)
+    assert control.ensure_service_running(config)["configuration_snapshots"] == report

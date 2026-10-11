@@ -35,6 +35,7 @@ from .delivery_execution_config import (
     load_execution_config,
     preserve_execution_config,
     transport_binding,
+    transport_difference,
 )
 from .delivery_preparation import execution_retired
 
@@ -74,7 +75,12 @@ class DeliveryStore:
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
         self.state = module
-        preserve_execution_config(config)
+        try:
+            preserve_execution_config(config)
+        except (OSError, ValueError) as exc:
+            # Publication problems refuse new admission and the operations that
+            # need this snapshot; they must not take every read surface down.
+            logger.warning("admitted configuration snapshot publication failed: %s", exc)
         with self._connect() as db:
             # Initialization also backfills feature projections. Reserve the write
             # transaction before reading executions, so a concurrent writer cannot
@@ -481,9 +487,23 @@ class DeliveryStore:
                     "existing": True,
                     "phase": prior_run[1],
                 }
-        if digest(DeliveryConfig.load(self.config.path).raw) != digest(self.config.raw):
+        reload = f"run `devflow-delivery --config {self.config.path} restart`"
+        try:
+            live = DeliveryConfig.load(self.config.path)
+        except OSError as exc:
             raise ValueError(
-                "service configuration changed; reload the service before new admission"
+                f"service configuration file is unavailable ({exc}); restore it, then "
+                f"{reload} before new admission"
+            ) from exc
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(
+                f"service configuration file is invalid ({exc}); repair it, then "
+                f"{reload} before new admission"
+            ) from exc
+        if digest(live.raw) != digest(self.config.raw):
+            raise ValueError(
+                f"service configuration changed; {reload} to reload the service before "
+                "new admission"
             )
         preserve_execution_config(self.config)
         reference = None
@@ -688,8 +708,8 @@ class DeliveryStore:
         spec["policy"]["max_attempts"] = maximum
         spec["policy_digest"] = digest(spec["policy"])
 
-    def owns_execution(self, spec: dict[str, Any]) -> bool:
-        """Shared database visibility does not grant another service's transport."""
+    def execution_ownership(self, spec: dict[str, Any]) -> str | None:
+        """None when this service owns the run's transport, else the named reason."""
         try:
             frozen = load_execution_config(spec)
         except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -697,9 +717,75 @@ class DeliveryStore:
                 "Run %s skipped: frozen execution configuration unavailable (%s)",
                 spec.get("run_id", "unknown"), type(exc).__name__,
             )
-            return False
+            return f"admitted execution configuration is unavailable ({exc})"
+        if transport_binding(frozen) == transport_binding(self.config):
+            return None
+        return (
+            "admitted transport differs from this service in "
+            + ", ".join(transport_difference(frozen, self.config))
+            + "; a run stays bound to the tracking database, state root, Temporal address, "
+            "namespace and task queue it was admitted with"
+        )
 
-        return transport_binding(frozen) == transport_binding(self.config)
+    def owns_execution(self, spec: dict[str, Any]) -> bool:
+        """Shared database visibility does not grant another service's transport."""
+        return self.execution_ownership(spec) is None
+
+    def record_dispatch_block(self, run_id: str, spec: dict[str, Any], reason: str) -> None:
+        """Explain once, durably, why this service's own queued run is not dispatched.
+
+        Runs admitted from another service's configuration merely share the
+        database; their owner reports on them. The outbox entry stays pending
+        and is never acknowledged here.
+        """
+        if spec.get("config_path") != str(self.config.path):
+            return
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT o.last_error,r.revision FROM delivery_outbox o
+                   JOIN delivery_runs r ON r.run_id=o.run_id
+                   WHERE o.run_id=? AND o.state IN ('pending','unknown')""",
+                (run_id,),
+            ).fetchone()
+            if row is None or row[0] == reason:
+                return
+            revision = row[1] + 1
+            db.execute(
+                "UPDATE delivery_runs SET revision=?,updated_at=? WHERE run_id=?",
+                (revision, _now(), run_id),
+            )
+            db.execute(
+                "UPDATE delivery_outbox SET last_error=?,updated_at=? WHERE run_id=?",
+                (reason, _now(), run_id),
+            )
+            self._event(db, run_id, revision, "dispatch_blocked", reason, {"reason": reason})
+        logger.warning("Run %s is not dispatched: %s", run_id, reason)
+
+    def seed_execution_snapshots(self) -> dict[str, Any]:
+        """Publish the live snapshot and name admitted runs whose configuration is unavailable.
+
+        Every non-terminal run whose frozen digest equals the live configuration
+        is covered by this publication. A run admitted under bytes that no longer
+        exist cannot be reconstructed; it is reported with the seeding remedy.
+        """
+        preserve_execution_config(self.config)
+        unavailable = []
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT run_id FROM delivery_runs
+                   WHERE execution_state NOT IN ('terminal','blocked','cancelled')
+                   ORDER BY created_at""",
+            ).fetchall()
+        for row in rows:
+            try:
+                spec = self.effective_spec(row["run_id"])
+                if execution_retired(spec):
+                    continue
+                load_execution_config(spec)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                unavailable.append({"run_id": row["run_id"], "reason": str(exc)})
+        return {"published": digest(self.config.raw), "unavailable": unavailable}
 
     def _completed_temporal_result(
         self, run_id: str, *, workflow_id: str | None = None
@@ -3423,6 +3509,10 @@ class DeliveryStore:
             if saved is None:
                 raise ValueError("run ID not found")
             row = dict(saved)
+            outbox = db.execute(
+                "SELECT state,attempts,last_error,updated_at FROM delivery_outbox WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
             attempts = [
                 dict(item)
                 for item in db.execute(
@@ -3698,6 +3788,7 @@ class DeliveryStore:
             "feature_plan": self.feature_plan_detail(spec),
             "events": events,
             "error": row["error"],
+            "dispatch": dict(outbox) if outbox else None,
         }
 
     def feature_plan_detail(self, spec):

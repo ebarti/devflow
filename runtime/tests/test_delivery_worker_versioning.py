@@ -334,7 +334,8 @@ def test_pinned_selection_precedes_temporal_only_partial_start(tmp_path, monkeyp
     monkeypatch.setattr(control, "_dashboard_bundle", lambda: bundle)
     monkeypatch.setattr(control, "_ports", lambda _config: ("127.0.0.1", 1, 2, 3))
     monkeypatch.setattr(control, "_free", lambda *_args: True)
-    monkeypatch.setattr(control, "DeliveryStore", lambda _config: None)
+    monkeypatch.setattr(control, "DeliveryStore",
+                        lambda _config: SimpleNamespace(seed_execution_snapshots=dict))
     monkeypatch.setattr(control, "_launch", lambda *_args: {
         "pid": 99_999_999, "identity": "dead-fixture",
     })

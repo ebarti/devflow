@@ -359,7 +359,6 @@ async def test_invalid_foreign_row_does_not_block_owned_dispatch(
     ("temporal_address", "127.0.0.1:17399"),
     ("temporal_namespace", "another-namespace"),
     ("queue", "another-queue"),
-    ("dashboard_url", "http://127.0.0.1:18799"),
 ])
 async def test_shared_database_cannot_dispatch_another_service_run(
     api_fixture, monkeypatch, key, value,

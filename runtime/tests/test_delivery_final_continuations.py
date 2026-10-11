@@ -503,8 +503,16 @@ def test_controller_effort_amendment_preserves_frozen_non_role_authority(
         "active_config": {"path": active_path, "roles": active["roles"], "sha256": "f" * 64},
     }
     monkeypatch.setattr(adjudication, "reference", lambda *_: controller)
-    blobs = {spec["config_path"]: frozen, active_path: active, str(processes_path): processes}
-    monkeypatch.setattr(adjudication, "_bytes", lambda p, *_: json.dumps(blobs[str(p)]).encode())
+    blobs = {active_path: active, str(processes_path): processes}
+    reads = []
+
+    def evidence_bytes(path, *_):
+        reads.append(str(path))
+        return json.dumps(blobs[str(path)]).encode()
+
+    monkeypatch.setattr(adjudication, "_bytes", evidence_bytes)
+    # The live file is edited after admission; the sealed snapshot is the authority.
+    Path(spec["config_path"]).write_text(json.dumps({**frozen, "capacity": 9}))
     monkeypatch.setattr(adjudication, "_git", lambda _p, *a:
                         "" if a[0] == "status" else "c" * 40 if a[-1].endswith("^{tree}")
                         else "b" * 40)
@@ -518,6 +526,7 @@ def test_controller_effort_amendment_preserves_frozen_non_role_authority(
     else:
         assert adjudication._controller(store, spec, command) == controller
         assert store.config.raw == frozen
+        assert spec["config_path"] not in reads
 
 
 def test_browser_checkpoint_accepts_report_projection_and_binds_test_evidence():
