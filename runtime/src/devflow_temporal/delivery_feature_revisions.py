@@ -649,7 +649,10 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
                              "abandoned by continuation command " + request["command_id"])
         return None
     if _started_reservation(shared, token, revision_id, values):
-        # The stopped generation began this attempt; no continuation can carry it.
+        # A begun (or charged) attempt belongs to the generation that began it: no
+        # continuation can transport it and no later begin may resume it, so this
+        # refusal is final. Unstarted reservations are never closed here; their
+        # refusals leave the reservation pending for the next command.
         _abandon_reservation(
             store, spec, shared, public, values,
             "plan revision attempt stopped with generation " + str(token["generation"])

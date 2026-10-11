@@ -597,3 +597,48 @@ def test_retry_receipt_cannot_authorize_direct_submission_or_another_command(
     response = execution.continue_feature(store, spec["run_id"], p["request"])
     assert response == execution.continue_feature(store, spec["run_id"], p["request"])
     assert shared.budget(issue_id)["used"] == 6
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
+def test_expired_worker_closure_refuses_intake_without_abandoning_the_reservation(
+    pending_preparation, monkeypatch,
+):
+    """The live shape: an unstarted reservation whose last continuation failed only
+    because the retained worker's closed history was gone. The refusal moves nothing;
+    once the closure is readable again the next command continues the same reservation
+    and the replan begin charges its cycle exactly once."""
+    p = pending_preparation
+    store, shared, spec = (p[k] for k in ("store", "shared", "spec"))
+    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
+    reserved = deepcopy(spec["feature_plan_revision_request"])
+    revision_id = reserved["revision_id"]
+    boundary = _boundary_snapshot(store, shared, issue_id)
+    proof = revisions._reconsideration_proof
+
+    def expired(*_args, **_kwargs):
+        raise ValueError("continuation predecessor Temporal closure is unproven")
+
+    monkeypatch.setattr(revisions, "_reconsideration_proof", expired)
+    with pytest.raises(ValueError, match="Temporal closure is unproven"):
+        execution.continue_feature(store, spec["run_id"], p["request"])
+    assert _boundary_snapshot(store, shared, issue_id) == boundary
+    assert revisions.PREFIX + "rejected:" + revision_id not in shared.checkpoints(issue_id)
+    assert revisions.revision_request(spec)["revision_id"] == revision_id
+    monkeypatch.setattr(revisions, "_reconsideration_proof", proof)
+
+    request = {"command_id": "continue-after-closure-import",
+               "expected_revision": p["row"]["revision"]}
+    response = execution.continue_feature(store, spec["run_id"], request)
+    assert response == execution.continue_feature(store, spec["run_id"], request)
+    successor = prepare_authority(store, store.effective_spec(response["run_id"]))
+    assert successor["feature_plan_revision_request"] == reserved
+    assert successor["feature_delivery"]["owner"]["generation"] == (
+        spec["feature_delivery"]["owner"]["generation"] + 1)
+    assert shared.budget(issue_id)["used"] == 6
+    DeliveryBroker(store, successor).prepare()
+    context = revisions.begin_revision(store, successor)
+    assert context["revision_id"] == revision_id
+    assert context["repair_key"] == "plan-revision:" + revision_id
+    assert context["budget"]["used"] == 7 == shared.budget(issue_id)["used"]
+    assert revisions.begin_revision(store, successor) == context
+    assert shared.budget(issue_id)["used"] == 7
