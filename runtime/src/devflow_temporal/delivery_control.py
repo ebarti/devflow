@@ -482,7 +482,10 @@ def ensure_service_running(
                         _write_manifest(config, {}, deployment=existing["worker_deployment"])
                 info = _await_ready(config, existing, deadline)
                 if info:
-                    if (deployment is not None and existing["processes"]["worker"].get(
+                    # An empty or partial inventory reports readiness only through
+                    # patched probes; members it lacks have nothing to compare.
+                    members = existing.get("processes") or {}
+                    if (deployment is not None and members.get("worker", {}).get(
                             "deployment") != _deployment_identity(deployment)):
                         raise ValueError(
                             "running worker deployment differs; drain it before changing")
@@ -490,7 +493,7 @@ def ensure_service_running(
                     # A stale API keeps answering (its 409s name `restart`); ensuring
                     # never reloads a member, which could split the API's transport
                     # from the worker's.
-                    listening = existing["processes"]["api"].get("dashboard_url")
+                    listening = members.get("api", {}).get("dashboard_url")
                     if isinstance(listening, str) and listening != config.dashboard_url:
                         raise ValueError(
                             f"the running API listens at {listening}; run `devflow-delivery "
