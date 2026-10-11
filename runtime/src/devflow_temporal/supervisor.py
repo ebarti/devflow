@@ -7,6 +7,7 @@ import contextvars
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -20,6 +21,28 @@ from .contracts import canonical_json, digest
 from .delivery_native_process import NativeProcessUnknown
 from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
+
+_LOG = logging.getLogger(__name__)
+
+
+def activity_attempt_replaced() -> bool:
+    """Whether Temporal superseded this attempt without an operator cancel request.
+
+    A heartbeat timeout, a lost attempt or a worker shutdown replaces only the
+    waiter; the durable native work it joined keeps running for the retry.
+    """
+    from temporalio import activity
+
+    if not activity.in_activity():
+        return False
+    try:
+        details = activity.cancellation_details()
+    except RuntimeError:
+        # Only a real activity context knows why it was cancelled.
+        return False
+    return bool(details and not details.cancel_requested and (
+        details.timed_out or details.not_found or details.worker_shutdown
+    ))
 
 
 def _process_identity(pid: int) -> str | None:
@@ -50,12 +73,18 @@ class DeliverySupervisor:
         self.job_locks: dict[str, asyncio.Lock] = {}
 
     def _reconcile_capacity(self) -> None:
+        """Release dead native owners before admission; a failed sweep only retains slots."""
         from .delivery_orphans import _complete_attempt
 
-        with self.store._connect() as db:
-            attempts = [dict(row) for row in db.execute(
-                "SELECT * FROM delivery_attempts WHERE state IN ('starting','running','unknown')"
-            )]
+        try:
+            with self.store._connect() as db:
+                attempts = [dict(row) for row in db.execute(
+                    "SELECT * FROM delivery_attempts"
+                    " WHERE state IN ('starting','running','unknown')"
+                )]
+        except Exception as exc:
+            _LOG.warning("Capacity sweep could not read native attempts: %s", exc)
+            return
         for attempt in attempts:
             try:
                 spec = self.store.effective_spec(attempt["run_id"])
@@ -66,6 +95,12 @@ class DeliverySupervisor:
             except (OSError, ValueError, KeyError, RuntimeError):
                 # Missing evidence, a live owner or a changed reservation retains
                 # its slot; one unresolved row must not hide another dead owner.
+                continue
+            except Exception as exc:
+                # An unavailable process table, port inspection or store retains
+                # the slot too: the sweep is never charged to a waiting role.
+                _LOG.warning("Capacity sweep could not resolve native attempt %s: %s",
+                             attempt["job_key"], exc)
                 continue
 
     def _enter_capacity(self, job_key: str, *, cancelled=None, stop_requested=None) -> str | None:
@@ -548,12 +583,7 @@ class DeliverySupervisor:
             _, result = await asyncio.shield(pending)
             return result
         except asyncio.CancelledError:
-            from temporalio import activity
-
-            details = activity.cancellation_details() if activity.in_activity() else None
-            replacement = details and not details.cancel_requested and (
-                details.timed_out or details.not_found or details.worker_shutdown
-            )
+            replacement = activity_attempt_replaced()
             if entered_monitor.is_set() and replacement:
                 # An already entered durable monitor survives replacement of its
                 # Temporal waiter and still observes cancellation of its run.
