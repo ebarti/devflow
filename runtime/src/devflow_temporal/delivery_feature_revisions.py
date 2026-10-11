@@ -1117,12 +1117,13 @@ def _historical_rejection(store, spec, rejected, values, *, closure=None):
 
 
 def _worker_subject(store, parent, previous, proposal, values):
+    from .delivery_feature_completed_build import completed_build_subject
     from .delivery_feature_execution import revised_worker_spec
     from .delivery_feature_review_context import preserved_worker
     from .delivery_feature_revision_recovery import retained_recovery
     from .delivery_feature_revision_subject import retained_worker_subject
 
-    plan, affected, _ = _admit_plan(
+    plan, affected, implementation = _admit_plan(
         parent, previous["old_plan"], proposal["plan"], previous["old_identity"],
     )
     _preserve_started_custody(parent, previous["old_plan"], plan, previous["record"], values)
@@ -1160,7 +1161,13 @@ def _worker_subject(store, parent, previous, proposal, values):
         _checkpoint_proof(_registry(parent), parent["feature_delivery"]["owner"]["issue_id"],
                           values, input_keys)
         recovery = retained_recovery(json.loads(row["recovery_json"] or "null"))
-        observation = retained_worker_subject(store, original, row, attempts, recovery)
+        if (worker.get("kind") == "build" and row["outcome"] == "delivered"
+                and worker["chunk_id"] not in implementation):
+            observation = completed_build_subject(
+                store, parent, original, row, attempts, assignment, values, _registry(parent),
+            )
+        else:
+            observation = retained_worker_subject(store, original, row, attempts, recovery)
         derived = revised_worker_spec(
             parent, plan, assignment["chunk_id"],
             expected_revision={"plan_revision": previous["old_identity"]["plan_revision"] + 1,
