@@ -35,6 +35,7 @@ from .delivery_client import client as api_client
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
 from .delivery_store import DeliveryStore, _private_directory
+from .delivery_temporal_retention import ensure_namespace_retention
 from .delivery_workflow import DeliveryWorkflow
 from .payload import payload_digest
 from .supervisor import _process_identity
@@ -114,6 +115,22 @@ def _remaining(deadline: float) -> float:
     if remaining <= 0:
         raise ValueError("local service startup timed out")
     return remaining
+
+
+def _ensure_namespace_retention(config: DeliveryConfig, deadline: float) -> None:
+    async def ensure() -> None:
+        try:
+            async with asyncio.timeout(_remaining(deadline)):
+                client = await Client.connect(
+                    config.temporal_address,
+                    namespace=config.raw.get("temporal_namespace", "default"),
+                    data_converter=DELIVERY_DATA_CONVERTER,
+                )
+                await ensure_namespace_retention(client)
+        except Exception as exc:
+            raise RuntimeError(f"Temporal retention startup check failed: {exc}") from exc
+
+    asyncio.run(ensure())
 
 
 @contextmanager
@@ -328,6 +345,7 @@ def ensure_service_running(
                                 "deployment") != _deployment_identity(deployment)):
                             raise ValueError(
                                 "running worker deployment differs; drain it before changing")
+                        _ensure_namespace_retention(config, deadline)
                         return {"dashboard_url": config.dashboard_url, **existing}
                     processes = existing["processes"]
                     if set(processes) != {"temporal", "worker", "api"} or not all(
@@ -402,6 +420,7 @@ def _start(
         )
         _write_manifest(config, processes)
         _wait_port(host, temporal_port, processes["temporal"], deadline=deadline)
+        _ensure_namespace_retention(config, deadline)
         processes["worker"] = _launch(
             config,
             "worker",
@@ -473,6 +492,7 @@ async def worker(
         namespace=config.raw.get("temporal_namespace", "default"),
         data_converter=DELIVERY_DATA_CONVERTER,
     )
+    await ensure_namespace_retention(client)
     async with Worker(
         client,
         task_queue=config.queue,
@@ -585,6 +605,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     if args.command == "api":
         host, port, _, _ = _ports(config)
+        _ensure_namespace_retention(config, _deadline(config))
         uvicorn.run(create_app(config.path), host=host, port=port, access_log=False)
         return
     if args.command == "token":

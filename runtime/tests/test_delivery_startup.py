@@ -25,6 +25,9 @@ from devflow_temporal.delivery_config import DeliveryConfig
 
 @pytest.fixture
 def config(tmp_path, monkeypatch):
+    # These lifecycle fixtures have no Temporal namespace; its admission gate
+    # is exercised separately with authenticated RPC fixtures.
+    monkeypatch.setattr(control, "_ensure_namespace_retention", lambda *_args: None)
     bundle = tmp_path / "dashboard.html"
     bundle.write_text("dashboard fixture")
     monkeypatch.setattr(control, "_dashboard_bundle", lambda: bundle)

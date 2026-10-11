@@ -9,6 +9,20 @@ terminal. Previously admitted inputs keep their recorded projection options;
 scope amendments preserve that choice. No database migration or operator retry
 is needed after an ordinary deployment.
 
+Managed service startup authenticates the configured Temporal namespace and verifies
+at least 90 days of closed workflow history retention before launching delivery
+workers or the API. Direct worker/API startup uses the same check; an already
+running owned service is checked without restarting its processes. A lower TTL is
+raised through Temporal's supported `UpdateNamespace` API, with exact readback;
+higher retention and other namespace settings are preserved. Validation, update
+or readback failure blocks startup with a concrete error. This does not change
+service configuration, recreate the namespace or enable archival.
+
+Retention changes protect workflows that close after the update. Already closed
+executions keep their previous cleanup timers, and expired history cannot be
+restored by increasing retention. This provides a bounded recovery window, not
+indefinite archival. See [Temporal's retention behavior](https://docs.temporal.io/encyclopedia/temporal-service/temporal-server).
+
 The runtime under `runtime/` is a single-host, local development service. It accepts a raw goal with an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. A read-only intake role investigates repository evidence, asks only blocking questions, and records a scoped plan before autonomous implementation. The managed path then owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. The default endpoint is a **published, unmerged PR**. A fresh native run can instead explicitly authorize `merged`. That endpoint keeps all original checks, independent roles and required CI, then confirms owned cleanup before requesting a head-pinned squash merge. It independently verifies the actual merged commit/tree and closes only the admitted issue before reconciling Done and releasing the claim. A divergent base, uncertain effect or failed gate blocks completion; a lost response is reconciled through the original intent without blindly repeating the mutation. Existing unmerged histories retain their endpoint. Release, deployment and personal production data remain separate authority.
 
 The older `devflow-temporal` CLI remains a disposable role-ordering demonstration. It does not publish a PR or reconcile an issue. Use the managed `devflow-delivery` service for an end-to-end delivery.

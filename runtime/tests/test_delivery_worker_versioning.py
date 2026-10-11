@@ -42,6 +42,10 @@ async def test_worker_uses_explicit_pinned_deployment_without_changing_config(
         return SimpleNamespace(namespace="default", workflow_service=SimpleNamespace(
             describe_task_queue=describe))
 
+    async def retained(_client):
+        pass
+
+    monkeypatch.setattr(control, "ensure_namespace_retention", retained)
     monkeypatch.setattr(control, "Worker", Worker)
     monkeypatch.setattr(control.Client, "connect", connect)
     deployment = WorkerDeploymentConfig(
