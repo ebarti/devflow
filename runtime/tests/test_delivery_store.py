@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -55,6 +56,18 @@ def _git(path: Path, *args: str) -> str:
         ["git", "-C", str(path), *args], check=True, capture_output=True, text=True
     )
     return completed.stdout.strip()
+
+
+def _write_lock_free(store: DeliveryStore) -> None:
+    """External observations must not run while the store holds the write lock."""
+    probe = sqlite3.connect(store.config.tracking_db, timeout=0)
+    try:
+        probe.execute("BEGIN IMMEDIATE")
+        probe.rollback()
+    except sqlite3.OperationalError as exc:
+        raise AssertionError("tracking database write lock held during observation") from exc
+    finally:
+        probe.close()
 
 
 @pytest.fixture
@@ -1767,7 +1780,12 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     }
     store.config.path.write_text(json.dumps(configuration))
     successor = DeliveryStore(DeliveryConfig.load(store.config.path))
-    monkeypatch.setattr(successor, "_ensure_no_remote_pr", lambda *_args: None)
+    # Git, file and GitHub observations must not run under the tracking write lock.
+    monkeypatch.setattr(successor, "_ensure_no_remote_pr",
+                        lambda *_args: _write_lock_free(successor))
+    measured_candidate = delivery_store.candidate_for
+    monkeypatch.setattr(delivery_store, "candidate_for",
+                        lambda path: _write_lock_free(successor) or measured_candidate(path))
     live = {
         "workflow_id": "delivery-run-1",
         "execution_run_id": "closed-temporal-execution",
