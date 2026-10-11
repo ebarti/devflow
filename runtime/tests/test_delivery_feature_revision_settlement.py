@@ -247,12 +247,24 @@ def test_later_generation_closes_a_legacy_stranded_investigation_at_its_next_beg
         "repair_key": "plan-revision:revision-stranded", "diagnostic": diagnostic,
     }
     shared.revision_checkpoint(current, PREFIX + "begin:revision-stranded", stale)
+    shared.repair(current, stale["repair_key"], "Planning correction revision-stranded")
+    assert shared.budget(owner["issue_id"])["used"] == 1
     context = revisions.begin_revision(store, successor)
-    closed = shared.checkpoints(owner["issue_id"])[PREFIX + "rejected:revision-stranded"]
+    values = shared.checkpoints(owner["issue_id"])
+    closed = values[PREFIX + "rejected:revision-stranded"]
     assert closed["closed_by"] == current and closed["repair_key"] == stale["repair_key"]
     assert "stopped with generation 1 before adoption; closed by generation 2" in closed["reason"]
+    # The closed attempt keeps its debit; the pending reservation (still continuable) is
+    # neither closed nor refunded: it is begun and charged exactly once more.
+    with shared.connect() as db:
+        assert db.execute("SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+                          (owner["issue_id"], stale["repair_key"])).fetchone()
+    assert PREFIX + "rejected:" + receipt["revision_id"] not in values
+    assert values[PREFIX + "request:" + receipt["revision_id"]]["phase"] == "requested"
     assert context["revision_id"] == receipt["revision_id"]
+    assert context["budget"]["used"] == 2 == shared.budget(owner["issue_id"])["used"]
     assert revisions.begin_revision(store, successor) == context
+    assert shared.budget(owner["issue_id"])["used"] == 2
 
 
 def test_continuation_closes_a_stopped_investigation_once_and_then_proceeds(
