@@ -443,7 +443,21 @@ class DeliverySupervisor:
             expected = None
             fresh = False
             process = None
+            owner_lock = None
             try:
+                # The owner lock proves this worker is alive for the whole
+                # prelaunch window. Its release by process death, together with
+                # a free monitor lock and no journal, is the only launch-absence
+                # proof a later reconciler may use; a held lock means wait.
+                owner_lock = self._owner_lock(spec, job_key)
+                if owner_lock is None:
+                    with self.store._connect() as db:
+                        current = db.execute(
+                            "SELECT state FROM delivery_attempts WHERE job_key=?", (job_key,),
+                        ).fetchone()
+                    if current is not None and current["state"] == "queued":
+                        # Another live owner is admitting this attempt; join its outcome.
+                        owner_lock = self._owner_lock(spec, job_key, blocking=True)
                 with self.store._connect() as db:
                     expected = dict(db.execute(
                         "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,),
@@ -484,9 +498,19 @@ class DeliverySupervisor:
                             break
                         stopped.wait(1)
                 elif not (folder / "native-process.json").is_file():
-                    return {"cleanup": "unknown"}, self._mark_unknown(
-                        job_key, "native prelaunch identity gap", expected=expected,
-                    )
+                    # A claimed slot without a journal belongs to a dead owner
+                    # when nobody holds the owner or monitor locks; a provider
+                    # child cannot exist before its monitor journals.
+                    result = None
+                    if owner_lock is not None:
+                        result = self._reconcile_launch_window(
+                            spec, job_key, expected, locks={"attempt-owner": owner_lock},
+                        )
+                    if result is None:
+                        result = self._mark_unknown(
+                            job_key, "native prelaunch identity gap", expected=expected,
+                        )
+                    return {"cleanup": result["cleanup"]}, result
                 if cancelled():
                     raise ValueError("native role cancelled before monitor entry")
                 from .delivery_native_guard import validate_revision_role
@@ -533,6 +557,9 @@ class DeliverySupervisor:
                     monitor_entered=entered_monitor.is_set(), preserve_queued=replaced.is_set(),
                 )
                 return {"cleanup": result["cleanup"]}, result
+            finally:
+                if owner_lock is not None:
+                    os.close(owner_lock)
 
         # Submit once, independently of the cancellable asyncio waiter. Runner
         # shutdown can cancel that task without cancelling or hiding its thread.
@@ -681,6 +708,125 @@ class DeliverySupervisor:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
+    @staticmethod
+    def _owner_lock_path(spec: dict[str, Any], job_key: str) -> Path:
+        # Kept outside the attempt folder: retry-prelaunch requires that folder
+        # to stay empty after a failure that never launched.
+        return Path(spec["state_dir"]) / "attempt-owners" / job_key
+
+    @classmethod
+    def _owner_lock(cls, spec: dict[str, Any], job_key: str, *,
+                    blocking: bool = False) -> int | None:
+        """Hold the attempt's owner lock; None when another live owner holds it."""
+        import stat
+
+        from .delivery_resources import private_directory
+
+        path = cls._owner_lock_path(spec, job_key)
+        private_directory(path.parent)
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                raise ValueError("native owner lock is not a private owned file")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                os.close(descriptor)
+                return None
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _reconcile_launch_window(self, spec, job_key, expected, *, locks=None, on_observed=None):
+        """Finalize a claimed slot whose dead owner never reached a journaled launch.
+
+        A provider child only starts after its monitor journals under the
+        monitor lock, and a live owner holds the owner lock throughout its
+        prelaunch window. Holding both locks with no journal or launch
+        artifacts proves no provider ever received GO. Returns None whenever
+        that proof is unavailable so callers retain the slot.
+        """
+        import stat
+
+        if (expected is None or expected["state"] not in {"starting", "unknown"}
+                or expected["cleanup"] == "confirmed"
+                or any(expected[name] is not None for name in (
+                    "pid", "process_identity", "session_id", "result_json"))):
+            return None
+        folder = Path(spec["state_dir"]) / "attempts" / job_key
+        if not Path(spec["state_dir"]).is_dir():
+            return None
+        descriptors = []
+        try:
+            # Nothing is created inside the attempt folder: its emptiness is the
+            # retry-prelaunch predicate. A missing monitor lock means run() never
+            # started, and the held owner lock excludes a concurrent launch.
+            for name, path in (("attempt-owner", self._owner_lock_path(spec, job_key)),
+                               ("native-monitor.lock", folder / "native-monitor.lock")):
+                descriptor = (locks or {}).get(name)
+                if descriptor is None:
+                    if name == "attempt-owner":
+                        descriptor = self._owner_lock(spec, job_key)
+                        if descriptor is None:
+                            return None
+                    elif os.path.lexists(path):
+                        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+                    else:
+                        continue
+                    descriptors.append(descriptor)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                info = os.fstat(descriptor)
+                named = path.lstat()
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                        or (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)):
+                    raise ValueError("native lock ownership changed")
+            if any(os.path.lexists(folder / name) for name in (
+                    "native-process.json", "launch.json", "ready.json", "start.json",
+                    "result.json", "cancel")):
+                return None
+            receipt = {
+                "journal": str(folder / "native-process.json"),
+                "cleanup": "observed-native-confirmed", "launch_absent": True,
+                "observed_pids": [], "previous_state": expected["state"], "reason": None,
+            }
+            if on_observed is not None:
+                on_observed(receipt)
+            reason = "native owner lost before its monitor journaled a launch"
+            result = {
+                "status": "blocked",
+                "summary": "role launch failed before any provider process started",
+                "findings": [reason], "session_id": None, "cleanup": "confirmed",
+                "usage": None, "finish_reason": "prelaunch", "native_process": receipt,
+            }
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,),
+                ).fetchone()
+                if row is None or dict(row) != expected:
+                    return None
+                run = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                                 (row["run_id"],)).fetchone()
+                self.store._event(db, row["run_id"], run["revision"],
+                    "native_attempt_cleanup_reconciled",
+                    "Lost native owner finalized before any provider process started",
+                    {"original_attempts": [expected], "native_observations": [receipt]})
+                db.execute(
+                    """UPDATE delivery_attempts SET state='finished',result_json=?,
+                       cleanup='confirmed',finished_at=? WHERE job_key=?""",
+                    (canonical_json(result), _now(), job_key),
+                )
+            return result
+        except (OSError, ValueError):
+            return None
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
     def _complete_native(self, request, native_request, process, job_key, outcome,
                          *, expected=None):
         from .delivery_resources import read_private, write_private
@@ -706,7 +852,14 @@ class DeliverySupervisor:
             if outcome["cleanup"] == "unknown":
                 return self._mark_unknown(job_key, "native monitoring/provider outcome ambiguous")
             interrupted = outcome.get("interrupted_monitor") is True
-            if interrupted:
+            if interrupted and outcome.get("provider_outcome") == "not_started":
+                # The monitor died before authorizing its child: no provider ran,
+                # so the attempt is a retryable prelaunch failure, not a verdict.
+                result = {"status": "blocked",
+                          "summary": "role launch failed before any provider process started",
+                          "findings": ["native monitor lost before any provider process started"],
+                          "session_id": None, "usage": None, "finish_reason": "prelaunch"}
+            elif interrupted:
                 result = {"status": "recovery_unknown",
                           "summary": "native monitor lost; owned teardown independently confirmed",
                           "findings": ["provider outcome unknown; attempt will not be repeated"],

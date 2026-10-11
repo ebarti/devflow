@@ -587,6 +587,7 @@ class DeliveryBroker:
                     )
                 range_binding = self._diff_range_binding(checkout, candidate)
             native_result = None
+            interrupted = []
             check_evidence = None
             if self.spec["provider"] == "codex":
                 from .delivery_native_process import NativeProcess
@@ -624,15 +625,24 @@ class DeliveryBroker:
                 command = [
                     native_dependencies["store"] if item == "/store" else item for item in argv
                 ]
+
+                options = {
+                    "argv": native_check_argv(self.spec, profile, cwd, command),
+                    "cwd": cwd,
+                    "environment": environment,
+                    "timeout": int(check.get("timeout_seconds", 600)),
+                    "cancelled": self._native_cancelled,
+                }
                 native_result = self._run_native_check(NativeProcess(
-                    self.spec,
-                    evidence_dir / check["id"] / "native",
-                    argv=native_check_argv(self.spec, profile, cwd, command),
-                    cwd=cwd,
-                    environment=environment,
-                    timeout=int(check.get("timeout_seconds", 600)),
-                    cancelled=self._native_cancelled,
+                    self.spec, evidence_dir / check["id"] / "native", **options,
                 ))
+                if native_result.get("interrupted_monitor") is True:
+                    # A lost monitor yields no verdict. One fresh invocation
+                    # re-runs the gate; the interrupted journal stays as evidence.
+                    interrupted.append(native_result)
+                    native_result = self._run_native_check(NativeProcess(
+                        self.spec, evidence_dir / check["id"] / "native-retry", **options,
+                    ))
                 self._record_generated(generated)
                 if native_result["cleanup"] == "unknown":
                     return {
@@ -640,6 +650,19 @@ class DeliveryBroker:
                         "cleanup": "unknown",
                         "candidate_id": candidate["id"],
                         "native_process": native_result,
+                    }
+                if native_result.get("interrupted_monitor") is True:
+                    interrupted.append(native_result)
+                    return {
+                        "state": "unknown",
+                        "cleanup": "confirmed",
+                        "process_cleanup": native_result["cleanup"],
+                        "candidate_id": candidate["id"],
+                        "check_id": check["id"],
+                        "reason": "native check monitor was lost twice; "
+                                  "the gate produced no verdict",
+                        "native_process": native_result,
+                        "interrupted_native_processes": interrupted,
                     }
                 artifact = Path(native_result["log"])
                 output = artifact.read_text(encoding="utf-8", errors="replace")
@@ -746,6 +769,7 @@ class DeliveryBroker:
                         if native_result
                         else {}
                     ),
+                    **({"interrupted_native_processes": interrupted} if interrupted else {}),
                 }
             )
             if not passed:
@@ -1066,14 +1090,23 @@ class DeliveryBroker:
         environment.update({
             "COREPACK_ENABLE_NETWORK": "0", "npm_config_registry": "https://" + REGISTRY + "/",
         })
-        process = self._run_native_check(NativeProcess(
-            self.spec, folder / "process",
-            argv=native_check_argv(self.spec, profile, staging, [
-                "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
-                "--ignore-pnpmfile", "--store-dir", str(dependencies),
-            ]),
-            cwd=staging, environment=environment, timeout=1800, cancelled=self._native_cancelled,
-        ))
+        def launch(name):
+            return self._run_native_check(NativeProcess(
+                self.spec, folder / name,
+                argv=native_check_argv(self.spec, profile, staging, [
+                    "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
+                    "--ignore-pnpmfile", "--store-dir", str(dependencies),
+                ]),
+                cwd=staging, environment=environment, timeout=1800,
+                cancelled=self._native_cancelled,
+            ))
+
+        process = launch("process")
+        if process.get("interrupted_monitor") is True:
+            # A lost monitor leaves no fetch outcome; one fresh invocation repeats it.
+            process = launch("process-retry")
+            if process.get("interrupted_monitor") is True:
+                raise ValueError("native dependency preparation monitor was lost twice")
         unchanged = hashes == write_frozen_inputs(staging, inputs)
         passed = (
             process["exit_code"] == 0

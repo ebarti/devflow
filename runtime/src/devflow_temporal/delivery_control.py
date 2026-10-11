@@ -561,6 +561,7 @@ _COMMANDS = (
     "revise-feature-plan",
     "retry-prelaunch",
     "amend-scope",
+    "reconcile-attempt",
 )
 
 
@@ -579,6 +580,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=50, help="run page size (1-100)")
     parser.add_argument("--cursor", help="next_cursor from a previous run page")
     parser.add_argument("--archived", action="store_true", help="list archived runs")
+    parser.add_argument("--job-key", help="native attempt key for reconcile-attempt")
+    parser.add_argument("--role", help="role of the attempt for reconcile-attempt")
+    parser.add_argument("--iteration", type=int, help="iteration of the attempt")
     args = parser.parse_args()
     try:
         _run(args, parser)
@@ -610,6 +614,22 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     if args.command == "token":
         print((config.state_root / "service-token").read_text(encoding="utf-8").strip())
+        return
+    if args.command == "reconcile-attempt":
+        from .delivery_orphans import reconcile_attempt
+
+        if not args.job_key and not (args.id and args.role and args.iteration is not None):
+            parser.error("reconcile-attempt needs --job-key or --id with --role and --iteration")
+        try:
+            outcome = reconcile_attempt(
+                DeliveryStore(config), job_key=args.job_key, run_id=args.id,
+                role=args.role, iteration=args.iteration,
+            )
+        except ValueError as exc:
+            parser.exit(1, f"devflow-delivery: {exc}\n")
+        print(json.dumps(outcome, sort_keys=True, indent=2))
+        if outcome["state"] != "finished":
+            parser.exit(1)
         return
     if args.command in {
         "submit",

@@ -108,7 +108,27 @@ def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) 
                "reason": "interrupted monitoring has no independently confirmed teardown"}
     monitor = journal.get("monitor")
     ports = journal.get("ports")
-    if (not owned or not isinstance(monitor, dict)
+    # A monitor that died in phase "allocated" never authorized a child, so no
+    # provider received GO: an empty owned set is that journal's expected shape.
+    prelaunch = (journal.get("phase") == "allocated"
+                 or (journal.get("cleanup_reconciliation") or {}).get("previous_phase")
+                 == "allocated")
+    if journal.get("phase") == "allocated":
+        # ready.json names the only child a dying monitor could have spawned. It
+        # exits on its closed GO pipe but is still observed stopped before proof.
+        try:
+            ready = read_private(path.with_name("ready.json"))
+        except FileNotFoundError:
+            ready = None
+        except (OSError, ValueError) as exc:
+            receipt["reason"] = str(exc)[:300]
+            return receipt
+        if ready is not None:
+            if (type(ready.get("pid")) is not int or ready["pid"] <= 1
+                    or not isinstance(ready.get("identity"), str) or not ready["identity"]):
+                return receipt
+            owned = {**owned, ready["pid"]: {"identity": ready["identity"]}}
+    if ((not owned and not prelaunch) or not isinstance(monitor, dict)
             or type(monitor.get("pid")) is not int or monitor["pid"] <= 1
             or not isinstance(monitor.get("identity"), str) or not monitor["identity"]
             or not isinstance(ports, list) or ports != journal.get("intent", {}).get("ports")
@@ -178,7 +198,8 @@ def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) 
                      "observed_at": datetime.now(UTC).isoformat()}
             result = {"state": "finished", "cleanup": "observed-native-confirmed",
                       "exit_code": None, "timed_out": False, "cancelled": False,
-                      "interrupted_monitor": True, "provider_outcome": "unknown",
+                      "interrupted_monitor": True,
+                      "provider_outcome": "not_started" if prelaunch else "unknown",
                       "monitoring_complete": journal.get("monitoring_complete", False),
                       "stdio_drained": False, "observed_owned_pids": sorted(all_owned),
                       "journal": str(path), "cleanup_reconciliation": proof,

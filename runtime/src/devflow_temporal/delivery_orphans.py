@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +14,7 @@ from temporalio.client import WorkflowExecutionStatus
 from .contracts import digest
 from .delivery_native_process import listeners, process_table, reconcile_process
 from .delivery_resources import RunResources, read_private
-from .supervisor import get_supervisor
+from .supervisor import DeliverySupervisor, get_supervisor
 
 _LOG = logging.getLogger(__name__)
 
@@ -28,11 +30,33 @@ def _unchanged(store, original):
     return dict(row)
 
 
+def _prelaunch_journal(journal):
+    """A monitor that died before authorizing its child never started a provider."""
+    return (journal.get('phase') == 'allocated'
+            or (journal.get('cleanup_reconciliation') or {}).get('previous_phase') == 'allocated')
+
+
+def _launch_binding(folder, journal):
+    # launch.json follows the journal; only a prelaunch death can lack it.
+    launch_path = folder / 'launch.json'
+    if not launch_path.exists() and _prelaunch_journal(journal):
+        return None
+    return read_private(launch_path)
+
+
 def _complete_attempt(store, spec, row, on_observed=None):
     supervisor = get_supervisor(store)
     folder = Path(spec['state_dir']) / 'attempts' / row['job_key']
     if not folder.is_absolute() or folder.resolve() != folder:
         raise ValueError('original native attempt path changed')
+    if not os.path.lexists(folder / 'native-process.json'):
+        # No monitor ever journaled, so no provider child could have started.
+        # Only a dead owner's released locks prove that; a live owner keeps its slot.
+        result = supervisor._reconcile_launch_window(
+            spec, row['job_key'], row, on_observed=on_observed)
+        if result is None:
+            raise ValueError('original native launch window is not provably absent')
+        return result['native_process']
     request = read_private(folder / 'request.json')
     if (request.get('spec') != spec or supervisor._job_key(request) != row['job_key']
             or request['role'] != row['role'] or request['iteration'] != row['iteration']
@@ -42,18 +66,20 @@ def _complete_attempt(store, spec, row, on_observed=None):
         raise ValueError('orphaned role original request binding changed')
     journal_path = folder / 'native-process.json'
     journal = read_private(journal_path)
-    launch = read_private(folder / 'launch.json')
+    launch = _launch_binding(folder, journal)
     intent = journal['intent']
     if (intent['run_id'] != spec['run_id']
             or intent['policy_digest'] != spec['policy_digest']
             or intent['cwd'] != request['workspace']
-            or intent['argv'] != launch['argv']
-            or intent['environment_sha256'] != digest(launch['environment'])
+            or (launch is not None and (
+                intent['argv'] != launch['argv']
+                or intent['environment_sha256'] != digest(launch['environment'])))
             or type(intent['timeout']) is not int or intent['timeout'] <= 0
             or intent['timeout'] > spec['policy']['roles'][request['role']].get(
                 'timeout_seconds', 7200)
             or intent['ports'] != [] or journal.get('ports') != []
-            or not journal.get('owned') or not journal.get('monitor')):
+            or (not journal.get('owned') and not _prelaunch_journal(journal))
+            or not journal.get('monitor')):
         raise ValueError('original native monitor is incomplete or changed')
     observed = process_table()
     owned = {int(pid): identity for pid, identity in journal['owned'].items()}
@@ -97,13 +123,15 @@ def _observe_registered_process(spec, path):
         raise ValueError('registered native process path changed')
     journal = read_private(path)
     intent = journal['intent']
-    launch = read_private(path.with_name('launch.json'))
+    launch = _launch_binding(path.parent, journal)
     if (intent['run_id'] != spec['run_id']
             or intent['policy_digest'] != spec['policy_digest']
-            or intent['argv'] != launch['argv']
-            or intent['environment_sha256'] != digest(launch['environment'])
+            or (launch is not None and (
+                intent['argv'] != launch['argv']
+                or intent['environment_sha256'] != digest(launch['environment'])))
             or intent['ports'] != journal.get('ports')
-            or not journal.get('owned') or not journal.get('monitor')):
+            or (not journal.get('owned') and not _prelaunch_journal(journal))
+            or not journal.get('monitor')):
         raise ValueError('registered native monitor is incomplete or changed')
     observed = process_table()
     owned = {int(pid): identity for pid, identity in journal['owned'].items()}
@@ -178,7 +206,13 @@ def _reconcile(store, original, spec, closed):
             raise ValueError('original native resource ownership manifest is missing')
         with resources.locked() as manifest:
             processes = list(manifest['processes'])
-        if attempts and not processes:
+        # Attempts finalized before any launch registered no process on purpose.
+        with store._connect() as db:
+            launched = [row for row in db.execute(
+                'SELECT result_json FROM delivery_attempts WHERE run_id=?', (spec['run_id'],))
+                if not (row['result_json'] and json.loads(row['result_json']).get(
+                    'finish_reason') == 'prelaunch')]
+        if launched and not processes:
             raise ValueError('original native process ownership is missing')
         observations.extend(_observe_registered_process(spec, Path(path)) for path in processes)
         receipt = resources.finalize(outcome, uncertain=uncertain)
@@ -235,3 +269,81 @@ async def reconcile_closed_native(store, client):
             # A transient read or foreign/edited configuration cannot stop another row.
             _LOG.warning('Native cleanup observation unavailable for %s: %s',
                          row['run_id'], type(exc).__name__)
+
+
+def _held_locks(spec, job_key):
+    held = []
+    for name, path in (
+        ('attempt-owner', DeliverySupervisor._owner_lock_path(spec, job_key)),
+        ('native-monitor.lock', Path(spec['state_dir']) / 'attempts' / job_key
+         / 'native-monitor.lock'),
+    ):
+        if not os.path.lexists(path):
+            continue
+        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            held.append(name)
+        finally:
+            os.close(descriptor)
+    return held
+
+
+def reconcile_attempt(store, *, job_key=None, run_id=None, role=None, iteration=None):
+    """Reconcile one unfinished native attempt after verifying no owned process remains."""
+    with store._connect() as db:
+        if job_key:
+            rows = [dict(row) for row in db.execute(
+                'SELECT * FROM delivery_attempts WHERE job_key=?', (job_key,))]
+        else:
+            rows = [dict(row) for row in db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=? AND role=? AND iteration=? "
+                "AND state!='finished'", (run_id, role, iteration))]
+    if not rows:
+        raise ValueError('no matching unfinished native attempt')
+    if len(rows) > 1:
+        raise ValueError('several attempts match; name one with --job-key: '
+                         + ', '.join(row['job_key'] for row in rows))
+    row = rows[0]
+    outcome = {key: row[key] for key in ('job_key', 'run_id', 'role', 'iteration')}
+    outcome.update(state_before=row['state'], changed=False, reason=None)
+    if row['state'] == 'finished':
+        outcome.update(state='finished', cleanup=row['cleanup'],
+                       result=json.loads(row['result_json']) if row['result_json'] else None)
+        return outcome
+    spec = store.effective_spec(row['run_id'])
+    if (spec.get('provider') != 'codex'
+            or spec['policy'].get('execution_backend') != 'native-macos'
+            or not store.owns_execution(spec)):
+        raise ValueError('attempt is not a native execution owned by this service')
+    folder = Path(spec['state_dir']) / 'attempts' / row['job_key']
+    journal_path = folder / 'native-process.json'
+    live = []
+    if journal_path.exists():
+        journal = read_private(journal_path)
+        tracked = {int(pid): entry for pid, entry in journal.get('owned', {}).items()}
+        if journal.get('monitor'):
+            tracked[journal['monitor']['pid']] = journal['monitor']
+        table = process_table()
+        live = sorted(pid for pid, entry in tracked.items()
+                      if table.get(pid, {}).get('identity') == entry['identity']
+                      and not table[pid]['stat'].startswith('Z'))
+    held = _held_locks(spec, row['job_key'])
+    if live or held:
+        outcome.update(state=row['state'], cleanup=row['cleanup'], live_pids=live,
+                       held_locks=held, reason='original native owner, monitor or child is '
+                       'still alive; nothing was changed')
+        return outcome
+    try:
+        receipt = _complete_attempt(store, spec, row)
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        receipt = None
+        outcome['reason'] = f'{type(exc).__name__}: {str(exc)[:300]}'
+    with store._connect() as db:
+        after = dict(db.execute('SELECT * FROM delivery_attempts WHERE job_key=?',
+                                (row['job_key'],)).fetchone())
+    outcome.update(state=after['state'], cleanup=after['cleanup'],
+                   changed=after['state'] != row['state'], receipt=receipt,
+                   result=json.loads(after['result_json']) if after['result_json'] else None)
+    return outcome
