@@ -25,7 +25,7 @@ from typing import Any
 from temporalio.client import WorkflowExecutionStatus, WorkflowHistory
 from temporalio.service import RPCError, RPCStatusCode
 
-from .contracts import digest
+from .contracts import canonical_json, digest
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,15 @@ async def closure_facts(history: WorkflowHistory) -> dict[str, Any]:
     }
 
 
+def history_json(history: WorkflowHistory) -> bytes:
+    """Canonical bytes of a history; protobuf JSON emits map entries in arbitrary order."""
+    return canonical_json(json.loads(history.to_json())).encode("utf-8")
+
+
+def history_sha256(history: WorkflowHistory) -> str:
+    return hashlib.sha256(history_json(history)).hexdigest()
+
+
 def _private_root(store) -> Path:
     root = Path(store.config.state_root) / "closures"
     try:
@@ -236,7 +245,7 @@ def seal(
     """Record one closed history once; a different history for it is refused."""
     if source not in {"temporal", "archive"}:
         raise ValueError("sealed closure source must be temporal or archive")
-    data = history.to_json().encode("utf-8")
+    data = history_json(history)
     sha256 = _write_sealed(_private_root(store), data)
     record = {
         "workflow_id": facts["workflow_id"],

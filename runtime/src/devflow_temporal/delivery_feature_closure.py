@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 
 from temporalio.client import Client, WorkflowExecutionStatus
 
+from .delivery_closures import history_sha256
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 
 SETTLEMENT = {'delivery_feature_settle_workers'}
@@ -95,7 +95,7 @@ async def failed_checkpoint(history, spec, row, closed):
     state.update(run_id=spec['run_id'], revision=projected['protocol_revision'])
     return {**closed, 'workflow_status': 'FAILED', 'result': state,
             'terminal_projection_event_id': acknowledged,
-            'history_sha256': hashlib.sha256(history.to_json().encode()).hexdigest()}
+            'history_sha256': history_sha256(history)}
 
 
 def closed_coordinator(store, run_id):

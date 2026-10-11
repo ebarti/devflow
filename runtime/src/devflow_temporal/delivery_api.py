@@ -613,7 +613,16 @@ def create_app(config_path: Path) -> FastAPI:
                 if saved is not None:
                     service.store.finish_mutation(command_id, saved)
                     return saved
-                description = await handle.describe()
+                try:
+                    description = await handle.describe()
+                except RPCError as exc:
+                    if exc.status != RPCStatusCode.NOT_FOUND:
+                        raise
+                    # Retention removed the closed predecessor; recover() authenticates
+                    # its sealed original (a tail an update already advanced is refused).
+                    response = await recover(service.store, run_id, payload, client)
+                    service.store.finish_mutation(command_id, response)
+                    return response
                 if description.status != WorkflowExecutionStatus.RUNNING:
                     # A lost acknowledged update and a fresh closed-tail command
                     # are different cases. Observe the existing update first.

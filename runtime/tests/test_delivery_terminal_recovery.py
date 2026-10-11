@@ -17,6 +17,7 @@ from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 
+from devflow_temporal import delivery_closures as closures
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_activities import (
     delivery_accept_plan,
@@ -183,10 +184,30 @@ class ClosedTerminalFixture(DeliveryWorkflow):
         return await super()._finish_terminal_tracker(spec, checkpoint)
 
 
+class _Expired:
+    """Temporal after retention removed one closed execution; all else is unchanged."""
+
+    def __init__(self, client, workflow_id):
+        self._client, self._workflow_id = client, workflow_id
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def get_workflow_handle(self, workflow_id, **kwargs):
+        handle = self._client.get_workflow_handle(workflow_id, **kwargs)
+        if workflow_id == self._workflow_id:
+            async def missing(*_args, **_kwargs):
+                raise RPCError('workflow execution not found', RPCStatusCode.NOT_FOUND, b'')
+
+            handle.describe = handle.fetch_history = missing
+        return handle
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize('timed_out', [False, True])
+@pytest.mark.parametrize(('timed_out', 'expired'), [(False, False), (True, False), (False, True)],
+                         ids=['completed', 'timed-out', 'expired'])
 async def test_authentic_closed_tail_queues_only_tracker_successor(
-    native_configuration, monkeypatch, timed_out,
+    native_configuration, monkeypatch, timed_out, expired,
 ):
     config, request = native_configuration
     app = create_app(config.path)
@@ -286,6 +307,21 @@ async def test_authentic_closed_tail_queues_only_tracker_successor(
                 with service.store._connect() as db:
                     service.store.state.update(db, 'work', {'id': spec['work_id'],
                                                           'issue': spec['issue_url']}, None)
+                # Authenticating the closed tail sealed it, even though admission refused.
+                record = closures.sealed_record(service.store, handle.id)
+                assert record['execution_run_id'] == handle.result_run_id
+                predecessor_run_id = (await handle.describe()).run_id
+                if expired:
+                    # Retention deleted the closed predecessor (the dev server takes ~30 s
+                    # to delete one): the public command must authenticate its sealed
+                    # original instead of failing with 503.
+                    retained = environment.client
+
+                    async def expired_client():
+                        return _Expired(retained, handle.id)
+
+                    monkeypatch.setattr(service, 'client', expired_client)
+                    monkeypatch.setattr(service, 'healthy_client', expired_client)
                 receipt = await browser.post(endpoint, json=payload, headers=headers)
                 assert receipt.status_code == 200, receipt.text
                 assert receipt.json()['reconciliation_only']
@@ -299,7 +335,9 @@ async def test_authentic_closed_tail_queues_only_tracker_successor(
                 assert proof['reconciliation_only']
                 assert proof['closed_history_sha256'] == sealed['closed']['history_sha256']
                 assert proof['seal'] == sealed['seal']
-                assert proof['predecessor_execution_run_id'] == (await handle.describe()).run_id
+                assert proof['predecessor_execution_run_id'] == predecessor_run_id
+                # The successor binds the exact sealed content address of its predecessor.
+                assert sealed['closed']['history_sha256'] == record['history_sha256']
                 repeated = await browser.post(endpoint, json=payload, headers=headers)
                 assert repeated.json() == receipt.json()
                 if timed_out:

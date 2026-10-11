@@ -223,6 +223,33 @@ async def test_retained_closures_are_sealed_by_reads_and_maintenance(service):
 
 
 @pytest.mark.asyncio
+async def test_resealing_one_execution_ignores_protobuf_map_order(service):
+    original_store, request = service
+    async with local_temporal() as environment, _worker(environment.client):
+        store = _bound_store(original_store,
+                             environment.client.service_client.config.target_host)
+        row = _admit(store, request, "run-1")
+        _closed, history = await _close(environment.client, "delivery-run-1", "run-1",
+                                        row["request_digest"])
+    facts = await closures.closure_facts(history)
+    first = closures.seal(store, history, facts, run_id="run-1", source="temporal")
+
+    def reordered(value):
+        if isinstance(value, dict):
+            return {key: reordered(value[key]) for key in reversed(list(value))}
+        return [reordered(item) for item in value] if isinstance(value, list) else value
+
+    # Two reads of one closed execution can serialize map entries (memo, payload
+    # metadata) in different orders; the second read must not look like a new history.
+    again = WorkflowHistory.from_json("delivery-run-1", history.to_json())
+    text = json.dumps(reordered(json.loads(history.to_json())))
+    object.__setattr__(again, "to_json", lambda: text)
+    assert text.encode() != history.to_json().encode()
+    assert closures.seal(store, again, facts, run_id="run-1", source="temporal") == first
+    assert closures.history_sha256(again) == first["history_sha256"]
+
+
+@pytest.mark.asyncio
 async def test_sealed_history_corruption_is_refused(service):
     original_store, request = service
     async with local_temporal() as environment, _worker(environment.client):

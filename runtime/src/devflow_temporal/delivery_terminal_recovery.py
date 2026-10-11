@@ -3,18 +3,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 from copy import deepcopy
 from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_broker import BrokerReadbackUnavailable, DeliveryBroker, _git
+from .delivery_closures import history_sha256
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_resources import RunResources, read_private
 
+logger = logging.getLogger(__name__)
 
-async def _closed_execution(store, workflow_id, client):
+
+async def _closed_execution(store, workflow_id, client, run_id):
     """Describe the closed execution from Temporal, or from its sealed original."""
     from .delivery_closures import not_found, sealed_closure
 
@@ -44,11 +48,27 @@ async def _closed_execution(store, workflow_id, client):
         return closed, None
     history = await client.get_workflow_handle(
         description.id, run_id=description.run_id).fetch_history()
+    await _preserve(store, history, run_id)
     return closed, history
 
 
+async def _preserve(store, history, run_id):
+    """Seal the history this recovery authenticates; preservation never fails the read."""
+    from .delivery_closures import SealConflict, closure_facts, seal
+
+    try:
+        facts = await closure_facts(history)
+        await asyncio.to_thread(seal, store, history, facts, run_id=run_id, source='temporal')
+    except SealConflict:
+        raise
+    except Exception as exc:
+        logger.warning('Run %s: terminal predecessor was not sealed (%s: %s)',
+                       run_id, type(exc).__name__, exc)
+
+
 async def closed_tail(store, run_id, client):
-    closed, history = await _closed_execution(store, store.active_workflow_id(run_id), client)
+    closed, history = await _closed_execution(
+        store, store.active_workflow_id(run_id), client, run_id)
     if (closed['status'] not in {'COMPLETED', 'TIMED_OUT'}
             or not closed['closed_at'] or history is None
             or closed['workflow_type'] != 'DevflowDeliveryWorkflow'):
@@ -84,7 +104,7 @@ async def closed_tail(store, run_id, client):
         'status': closed['status'], 'closed_at': closed['closed_at'],
         'request_digest': closed['request_digest'],
         'recovery_digest': closed['recovery_digest'],
-        'history_sha256': digest(history.to_json()), 'projection': tail,
+        'history_sha256': history_sha256(history), 'projection': tail,
         'input_spec': input_spec,
         'input_recovery_sha256': digest(input_recovery) if input_recovery else None,
     }

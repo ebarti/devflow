@@ -1,8 +1,6 @@
 """A failed feature coordinator continues from its sealed history after retention."""
 from __future__ import annotations
 
-import hashlib
-
 import pytest
 from temporalio.client import WorkflowHistory
 from temporalio.service import RPCError, RPCStatusCode
@@ -50,5 +48,7 @@ async def test_failed_coordinator_continues_from_its_sealed_history(failed_paren
     monkeypatch.setattr(closure.Client, "connect", connect)
     continue_feature(store, spec["run_id"], command)
     proof = shared.checkpoints(token["issue_id"])["stopped:1"]["failed_coordinator_closure"]
-    retained = hashlib.sha256(WorkflowHistory(workflow_id, events).to_json().encode()).hexdigest()
+    # The canonical digest is the same whether the history comes from Temporal or its seal.
+    retained = closures.history_sha256(WorkflowHistory(workflow_id, events))
+    assert retained == record["history_sha256"]
     assert proof["workflow_status"] == "FAILED" and proof["history_sha256"] == retained
