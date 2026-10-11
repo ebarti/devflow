@@ -452,6 +452,195 @@ def revise_feature_plan(store, run_id, request):
     return receipt
 
 
+def _preparation_retry_key(revision_id):
+    return PREFIX + "preparation-retry:" + revision_id
+
+
+def _preparation_retry(store, spec, public, values):
+    reference = spec.get("feature_plan_revision_preparation_retry")
+    if reference is None:
+        return None
+    key = _preparation_retry_key(public["revision_id"])
+    saved = values.get(key)
+    if (reference != {"checkpoint_key": key, "sha256": digest(saved)}
+            or not saved or saved["revision_id"] != public["revision_id"]
+            or saved["admission_sha256"] != digest(public)
+            or saved["successor_id"] != spec["run_id"]):
+        raise OwnershipConflict("preparation continuation lost its sealed reservation lineage")
+    _checkpoint_proof(_registry(spec), saved["predecessor"]["issue_id"], values, [key])
+    authenticate_adopted_plan_custody(store, spec, {"owner": saved["predecessor"]})
+    previous = store.effective_spec(saved["predecessor"]["run_id"])
+    with store._connect() as db:
+        row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                         (previous["run_id"],)).fetchone()
+    closed, observed = _preparation_observation(store, previous, row, custodian=spec)
+    if (digest(previous) != saved["predecessor_spec_sha256"]
+            or digest(dict(row)) != saved["stopped_row_sha256"]
+            or digest(closed["result"]) != saved["closed_state_sha256"]
+            or {k: v for k, v in closed.items() if k != "result"} != saved["closure"]
+            or observed != saved["observation"]):
+        raise OwnershipConflict("preparation predecessor custody changed after continuation")
+    return saved
+
+
+def _refresh_preparation_reconsideration(store, original, public, values):
+    from .delivery_feature_review_context import current_runtime_context
+
+    receipt = public.get("reconsideration")
+    if not receipt:
+        raise OwnershipConflict("pending preparation lacks its authenticated review context")
+    current = current_runtime_context()
+    provenance = {"revision", "runtime_payload_sha256"}
+    if ({k: v for k, v in current.items() if k not in provenance}
+            != {k: v for k, v in receipt["current_runtime"].items() if k not in provenance}):
+        raise OwnershipConflict("preparation retry changed its normalized review context")
+    selectors = {**public["request"]["reconsideration"],
+                 "expected_runtime_revision": current["revision"],
+                 "expected_runtime_payload_sha256": current["runtime_payload_sha256"]}
+    proof, findings = _reconsideration_proof(
+        store, original, selectors, public["record"], public["predecessor_closure"], values,
+    )
+    if ({**proof, "current_runtime": receipt["current_runtime"]} != receipt
+            or findings != public["unresolved_prior_findings"]):
+        raise OwnershipConflict("preparation retry changed its reserved subject or prerequisites")
+    return proof, selectors
+
+
+def _preparation_observation(store, spec, row, *, custodian=None):
+    from .delivery_broker import DeliveryBroker, _git
+    from .delivery_feature_closure import closed_coordinator
+    from .delivery_policy_recovery import _remote, _stopped_cleanup, work_binding
+    from .delivery_resources import RunResources, _identity, read_private
+
+    closed = closed_coordinator(store, spec["run_id"])
+    state = closed["result"]
+    candidate = json.loads(row["candidate_json"] or "null")
+    if (state.get("roles") != [] or state.get("iteration") != 0
+            or state.get("outcome") != "blocked" or state.get("cleanup") != "confirmed"
+            or state.get("pull_request") is not None or state.get("decision") is not None
+            or state.get("candidate") != candidate
+            or state.get("revision") != row["protocol_revision"]
+            or closed["workflow_id"] != store.active_workflow_id(spec["run_id"])
+            or closed["request_digest"] != spec["request_digest"]
+            or closed.get("recovery_digest") is not None
+            or candidate is None or _candidate(store, spec) != candidate
+            or state.get("checks") != json.loads(row["checks_json"] or "{}")):
+        raise OwnershipConflict("preparation continuation lost its exact closed candidate or state")
+    baseline = state.get("checks", {}).get("baseline", {})
+    if (baseline.get("state") != "failed" or baseline.get("base_sha") != spec["base_sha"]
+            or baseline.get("feature_unchanged") is not True
+            or baseline.get("source_unchanged") is not True
+            or baseline.get("baseline_candidate", {}).get("head") != spec["base_sha"]
+            or not any(result.get("passed") is False for result in baseline.get("results", []))
+            or any(result.get("cleanup") != "confirmed" for result in baseline["results"])):
+        raise OwnershipConflict("pending revision has no confirmed failed immutable baseline")
+    broker = DeliveryBroker(store, spec)
+    broker.validate_candidate_scope()
+    _git(broker.checkout, "merge-base", "--is-ancestor", spec["base_sha"], candidate["head"])
+    if (_git(broker.checkout, "branch", "--show-current")
+            != spec.get("local_branch", spec["branch"])):
+        raise OwnershipConflict("preparation checkout branch changed")
+    recorded = state["checks"].get("resource_cleanup", {})
+    receipt_path = Path(spec["state_dir"]) / "resources/finalization.json"
+    expected_cleanup = {k: v for k, v in recorded.items()
+                        if k not in {"receipt", "receipt_sha256"}}
+    if (recorded.get("receipt") != str(receipt_path)
+            or _private_canonical(receipt_path, expected_cleanup)
+            != recorded.get("receipt_sha256")):
+        raise OwnershipConflict("preparation finalization differs from its closed cleanup receipt")
+    manifest = read_private(RunResources(spec, read_only=True).manifest)
+    if (manifest.get("run_id") != spec["run_id"]
+            or manifest.get("state_identity") != _identity(Path(spec["state_dir"]))
+            or manifest.get("finalization") != expected_cleanup
+            or set(manifest.get("processes", [])) != {
+                item["journal"] for item in expected_cleanup.get("processes", [])}):
+        raise OwnershipConflict("preparation cleanup lost its complete resource ownership")
+    cleanup = _stopped_cleanup(spec, read_only=True)
+    with store._connect() as db:
+        claim = store.state.claim_for(db, spec["work_id"])
+        if claim is not None and (custodian is None
+                                  or custodian["work_id"] != spec["work_id"]):
+            raise OwnershipConflict("preparation work ownership is not released")
+        binding = work_binding(store, custodian or spec, db)
+        effects = [dict(item) for item in db.execute(
+            "SELECT * FROM delivery_effects WHERE run_id=? ORDER BY effect_key", (spec["run_id"],))]
+    expected = {"base_sha": spec["base_sha"], "branch": spec["branch"],
+                "checkout": spec["checkout"], "recovery": spec["policy"].get("recovery")}
+    if (len(effects) != 1 or effects[0]["effect_key"] != "prepare:" + spec["run_id"]
+            or effects[0]["kind"] != "prepare" or effects[0]["state"] != "complete"
+            or json.loads(effects[0]["request_json"]) != expected
+            or json.loads(effects[0]["observed_json"] or "null") != {
+                "checkout": spec["checkout"], "candidate": candidate,
+                "provenance": None, "continuation": None}):
+        raise OwnershipConflict("preparation effects differ from the completed checkout receipt")
+    return closed, {"cleanup": cleanup, "work_binding": binding, "effects_sha256": digest(effects),
+                    "remote": _remote(broker)}
+
+
+def continue_pending_preparation(store, spec, row, request, successor_id):
+    """Transport one unstarted reservation to fresh owned preparation paths."""
+    shared = _registry(spec)
+    token = spec["feature_delivery"]["owner"]
+    values = _values(spec, shared)
+    public = revision_request(spec, shared)
+    if not public:
+        return None
+    revision_id = public["revision_id"]
+    key = _preparation_retry_key(revision_id)
+    saved = values.get(key)
+    if saved and (saved["command"] != request or saved["successor_id"] != successor_id
+                  or saved["predecessor"] != token):
+        raise OwnershipConflict("reserved revision already has a preparation continuation")
+    with shared.connect() as db:
+        pending = shared._pending_revision(db, token["issue_id"])
+        paid = db.execute("SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+                          (token["issue_id"], "plan-revision:" + revision_id)).fetchone()
+        effects = list(db.execute("SELECT * FROM execution_effects WHERE issue_id=? "
+                                 "AND generation=?", (token["issue_id"], token["generation"])))
+    with store._connect() as db:
+        attempts = list(db.execute("SELECT * FROM delivery_attempts WHERE run_id=?",
+                                   (spec["run_id"],)))
+    if (pending != public or public["successor_id"] != spec["run_id"]
+            or public["owner"]["generation"] + 1 != token["generation"]
+            or _terminal(values, revision_id) or paid or attempts or effects
+            or any(name in values for name in (
+                PREFIX + "begin:" + revision_id, PREFIX + "proposal:" + revision_id))
+            or row["iteration"] != 0 or row["cleanup"] != "confirmed"
+            or row["outcome"] != "blocked" or row["recovery_json"] is not None
+            or row["pr_json"] is not None or not store.owns_execution(spec)):
+        raise OwnershipConflict("reserved revision is not an unstarted preparation checkpoint")
+    closed, observation = _preparation_observation(store, spec, row)
+    state = closed["result"]
+    candidate = json.loads(row["candidate_json"])
+    original = store.effective_spec(public["predecessor_run_id"])
+    proof, selectors = _refresh_preparation_reconsideration(store, original, public, values)
+    budget = shared.budget(token["issue_id"])
+    if budget != proof["original_repair_budget"]:
+        raise OwnershipConflict("preparation continuation changed its unspent planning budget")
+    receipt = {
+        "version": 1, "revision_id": revision_id, "admission_sha256": digest(public),
+        "predecessor": token, "successor_id": successor_id, "command": deepcopy(request),
+        "predecessor_spec_sha256": digest(spec), "stopped_row_sha256": digest(dict(row)),
+        "closed_state_sha256": digest(state), "candidate": deepcopy(candidate),
+        "closure": {k: v for k, v in closed.items() if k != "result"},
+        "observation": observation,
+        "plan_approval": spec.get("plan_approval", "required"),
+        "config_digest": spec["config_digest"], "budget": budget,
+        "reconsideration": proof, "selectors": selectors,
+    }
+    if saved is not None and saved != receipt:
+        raise OwnershipConflict("preparation continuation evidence changed before replay")
+    with shared.serialized(token["issue_id"]):
+        with store._connect() as db:
+            current = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                                      (spec["run_id"],)).fetchone())
+        if current != dict(row):
+            raise OwnershipConflict("preparation checkpoint changed before continuation")
+        if saved is None:
+            shared.revision_checkpoint(token, key, receipt, stopped=True)
+    return {"admission": deepcopy(public), "preparation_retry": receipt}
+
+
 def authenticate_revision_submission(store, spec, admission):
     if not isinstance(admission, dict) or not spec.get("feature_predecessor"):
         raise OwnershipConflict("revision continuation has no sealed predecessor")
@@ -460,19 +649,44 @@ def authenticate_revision_submission(store, spec, admission):
 
     shared = ExecutionRegistry(registry_path(store.config))
     predecessor = spec["feature_predecessor"]
+    retry = None
+    if set(admission) == {"admission", "preparation_retry"}:
+        retry = admission["preparation_retry"]
+        admission = admission["admission"]
+    values = shared.checkpoints(predecessor["issue_id"])
     saved = shared.checkpoints(predecessor["issue_id"]).get(
         PREFIX + "request:" + admission["revision_id"]
     )
     if (
         saved != admission
-        or admission["owner"] != predecessor
-        or admission["successor_id"] != spec["run_id"]
+        or (retry is None and (admission["owner"] != predecessor
+                              or admission["successor_id"] != spec["run_id"]))
         or digest(json.loads(spec["accepted_plan"])) != admission["old_identity"]["plan_digest"]
     ):
         raise OwnershipConflict("revision continuation changed its sealed plan admission")
     original = store.effective_spec(admission["predecessor_run_id"])
-    if original["feature_delivery"]["owner"] != predecessor:
+    if original["feature_delivery"]["owner"] != admission["owner"]:
         raise OwnershipConflict("revision continuation changed original owner custody")
+    if retry is not None:
+        key = _preparation_retry_key(admission["revision_id"])
+        if (values.get(key) != retry or retry["predecessor"] != predecessor
+                or retry["successor_id"] != spec["run_id"]
+                or retry["admission_sha256"] != digest(admission)
+                or retry["config_digest"] != spec["config_digest"]
+                or retry["plan_approval"] != original.get("plan_approval", "required")):
+            raise OwnershipConflict("preparation continuation has no authentic server receipt")
+        _checkpoint_proof(shared, predecessor["issue_id"], values, [key])
+        previous = store.effective_spec(predecessor["run_id"])
+        with store._connect() as db:
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                             (predecessor["run_id"],)).fetchone()
+        confirmed = continue_pending_preparation(
+            store, previous, row, retry["command"], retry["successor_id"])
+        if confirmed != {"admission": admission, "preparation_retry": retry}:
+            raise OwnershipConflict("preparation continuation changed before successor admission")
+        spec["feature_plan_revision_preparation_retry"] = {
+            "checkpoint_key": key, "sha256": digest(retry),
+        }
     spec["plan_approval"] = original.get("plan_approval", "required")
     spec["feature_plan_revision_request"] = deepcopy(admission)
     spec["feature_plan_revision"] = {
@@ -490,9 +704,18 @@ def authenticate_continued_plan(store, spec):
         raise OwnershipConflict("feature continuation changed its original owner custody")
     shared = _registry(original)
     with shared.connect() as db:
-        owner = shared.require(db, predecessor, active=False)
-        if owner["state"] != "stopped":
-            raise OwnershipConflict("feature continuation has no settled predecessor")
+        current = shared.current(predecessor["issue_id"])
+        retry = next((item for key, item in shared.checkpoints(predecessor["issue_id"]).items()
+                      if key.startswith(PREFIX + "preparation-retry:")
+                      and item["successor_id"] == spec["run_id"]
+                      and item["predecessor"] == predecessor), None)
+        replay = bool(retry and current and current["run_id"] == spec["run_id"]
+                      and current["state"] == "active"
+                      and shared.snapshot(spec["run_id"], str(store.config.tracking_db)))
+        if not replay:
+            owner = shared.require(db, predecessor, active=False)
+            if owner["state"] != "stopped":
+                raise OwnershipConflict("feature continuation has no settled predecessor")
         shared._settled(db, predecessor["issue_id"])
     accepted = spec.get("accepted_plan")
     previous = original.get("accepted_plan")
@@ -661,7 +884,9 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
         diagnostic = validate_diagnostic(
             store, spec, diagnostic, identity=identity, candidate_id=candidate["id"]
         )
-    reconsideration = ({"reconsideration": deepcopy(public["reconsideration"]),
+    retry = _preparation_retry(store, spec, public, values) if public else None
+    reconsideration = ({"reconsideration": deepcopy(
+                            retry["reconsideration"] if retry else public["reconsideration"]),
                         "unresolved_prior_findings": deepcopy(public["unresolved_prior_findings"])}
                        if public and public.get("reconsideration") else {})
     if reconsideration:
@@ -1297,14 +1522,18 @@ def _recheck_reconsideration(store, spec, context, *, candidate=None):
         return None
     public = spec.get("feature_plan_revision_request")
     values = _values(spec)
+    retry = _preparation_retry(store, spec, public, values) if public else None
+    expected = retry["reconsideration"] if retry else (public or {}).get("reconsideration")
     if (not public or values.get(PREFIX + "request:" + context["revision_id"]) != public
-            or public.get("reconsideration") != receipt
+            or expected != receipt
             or public.get("unresolved_prior_findings") != context.get("unresolved_prior_findings")
             or digest(context["unresolved_prior_findings"])
             != receipt["unresolved_prior_findings_sha256"]):
         raise OwnershipConflict("reconsideration lost its exact server-owned admission")
     _checkpoint_proof(_registry(spec), context["owner"]["issue_id"], values,
                       [PREFIX + "request:" + context["revision_id"]])
+    with _registry(spec).connect() as db:
+        _registry(spec).require_settlement(db, context["owner"])
     original = store.effective_spec(public["predecessor_run_id"])
     authenticate_adopted_plan_custody(store, spec, {"owner": public["owner"]})
     begun = values.get(PREFIX + "begin:" + context["revision_id"])
@@ -1318,7 +1547,8 @@ def _recheck_reconsideration(store, spec, context, *, candidate=None):
                                                     begun["repair_key"])).fetchone()
         paid = bool(debit and debit[0] == context["owner"]["generation"])
     proof, findings = _reconsideration_proof(
-        store, original, public["request"]["reconsideration"], public["record"],
+        store, original, retry["selectors"] if retry else public["request"]["reconsideration"],
+        public["record"],
         public["predecessor_closure"], values, planning_paid=paid,
     )
     # The normal repair debit is intentionally newer; its budget cannot rewrite
@@ -1823,6 +2053,7 @@ def adopt_revision(store, spec, revision_id, proposed_plan, review, gh=None):
         raise OwnershipConflict("plan adoption changed retained stack publication identities")
     revised = deepcopy(spec)
     revised.pop("feature_plan_revision_request", None)
+    revised.pop("feature_plan_revision_preparation_retry", None)
     revised["accepted_plan"] = canonical_json(proposal["plan"])
     revised["feature_plan_revision"] = {
         key: identity[key] for key in ("plan_revision", "plan_digest")
@@ -1970,6 +2201,15 @@ def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup
         if attempts
         else spec.get("feature_plan_revision_request")
     )
+    public = spec.get("feature_plan_revision_request")
+    reference = spec.get("feature_plan_revision_preparation_retry")
+    if public and reference:
+        retry = values.get(_preparation_retry_key(public["revision_id"]))
+        if reference != {"checkpoint_key": _preparation_retry_key(public["revision_id"]),
+                         "sha256": digest(retry)}:
+            raise OwnershipConflict("preparation readback lost its sealed continuation")
+        current = values.get(PREFIX + "begin:" + public["revision_id"], {
+            **public, "reconsideration": retry["reconsideration"]})
     terminal = _terminal(values, current["revision_id"]) if current else None
     proposal = values.get(PREFIX + "proposal:" + current["revision_id"]) if current else None
     selected = terminal or proposal or current or {}

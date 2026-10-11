@@ -217,7 +217,8 @@ class ExecutionRegistry:
                     raise OwnershipConflict("feature already has an execution; continue its owner")
                 self._settled(db, issue["id"])
                 pending = self._pending_revision(db, issue["id"])
-                if pending and pending.get("successor_id") != run_id:
+                if (pending and pending.get("successor_id") != run_id
+                        and not self._preparation_successor(db, pending, predecessor, run_id)):
                     raise OwnershipConflict("feature has a recorded plan revision in custody")
                 generation = old["generation"] + 1
             elif predecessor is not None:
@@ -260,6 +261,31 @@ class ExecutionRegistry:
                 "store_path": store_path,
                 "generation": generation,
             }
+
+    @staticmethod
+    def _preparation_successor(db, pending, predecessor, run_id):
+        key = "plan-revision:preparation-retry:" + pending["revision_id"]
+        row = db.execute("SELECT content_digest,content_json FROM execution_checkpoints "
+                         "WHERE issue_id=? AND checkpoint_key=?",
+                         (predecessor["issue_id"], key)).fetchone()
+        if not row:
+            return False
+        receipt = json.loads(row["content_json"])
+        begun = db.execute("SELECT 1 FROM execution_checkpoints WHERE issue_id=? "
+                           "AND checkpoint_key IN (?,?)", (predecessor["issue_id"],
+                           "plan-revision:begin:" + pending["revision_id"],
+                           "plan-revision:proposal:" + pending["revision_id"])).fetchone()
+        paid = db.execute("SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+                          (predecessor["issue_id"], "plan-revision:" + pending["revision_id"])
+                          ).fetchone()
+        return bool(not begun and not paid and row["content_digest"] == digest(receipt)
+                    and receipt.get("version") == 1
+                    and receipt.get("revision_id") == pending["revision_id"]
+                    and receipt.get("admission_sha256") == digest(pending)
+                    and receipt.get("predecessor") == predecessor
+                    and pending["successor_id"] == predecessor["run_id"]
+                    and pending["owner"]["generation"] + 1 == predecessor["generation"]
+                    and receipt.get("successor_id") == run_id)
 
     @staticmethod
     def _pending_revision(db, issue_id):

@@ -60,6 +60,17 @@ def admit(store, db, spec):
     if snapshot is None:
         snapshot = GitHubDelivery().snapshot(spec["issue_url"], spec["github_repo"])
     predecessor = spec.pop("feature_predecessor", None)
+    retry_values = shared.checkpoints(snapshot["issue"]["id"])
+    for key, receipt in retry_values.items():
+        if (key.startswith("plan-revision:preparation-retry:")
+                and receipt["successor_id"] == spec["run_id"]):
+            if (spec.get("feature_plan_revision_preparation_retry")
+                    != {"checkpoint_key": key, "sha256": digest(receipt)}
+                    or spec.get("feature_plan_revision_request") != retry_values.get(
+                        "plan-revision:request:" + receipt["revision_id"])
+                    or receipt["predecessor"] != predecessor):
+                raise OwnershipConflict(
+                    "preparation successor lacks its server reservation binding")
     # Existing legacy publication is never silently reclassified as a stack.
     legacy = db.execute(
         "SELECT run_id FROM delivery_runs WHERE issue_url=? "
@@ -386,7 +397,7 @@ def continue_feature(store, run_id, request, *, _revision=None):
         raise ValueError("select a feature coordinator to continue its recorded delivery")
     with store._connect() as db:
         row = db.execute(
-            "SELECT revision,outcome FROM delivery_runs WHERE run_id=?", (run_id,)
+            "SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)
         ).fetchone()
         prior = db.execute(
             "SELECT response_json FROM delivery_commands WHERE command_id=?",
@@ -405,7 +416,16 @@ def continue_feature(store, run_id, request, *, _revision=None):
         raise OwnershipConflict("feature is not at the specified stopped checkpoint")
     shared = registry(original)
     token = original["feature_delivery"]["owner"]
+    if _revision is None:
+        from .delivery_feature_revisions import continue_pending_preparation, revision_request
+
+        execution = store.effective_spec(run_id)
+        if revision_request(execution, shared):
+            _revision = continue_pending_preparation(store, execution, row, request, successor_id)
     current = shared.current(token["issue_id"])
+    replay_claim = bool(_revision and "preparation_retry" in _revision and current
+                       and current["run_id"] == successor_id and current["state"] == "active"
+                       and shared.snapshot(successor_id, str(store.config.tracking_db)))
     if current and shared.token(current) == token and current["state"] == "draining":
         # A worker can complete a separately admitted infrastructure recovery
         # after its coordinator has stopped. Reconcile that closed work through
@@ -433,7 +453,9 @@ def continue_feature(store, run_id, request, *, _revision=None):
                                      key: value for key, value in closed.items() if key != 'result'
                                  }} if closed.get('workflow_status') == 'FAILED' else {})})
         current = shared.current(token['issue_id'])
-    if current is None or shared.token(current) != token or current["state"] != "stopped":
+    if not replay_claim and (
+        current is None or shared.token(current) != token or current["state"] != "stopped"
+    ):
         raise OwnershipConflict("feature workers or effects have not reached a safe handoff")
     closed_coordinator(store, run_id)
     fields = {
