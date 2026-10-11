@@ -45,9 +45,9 @@ def work_binding(store, spec, db):
     return {'issue_resource': resource, 'repository': repository}
 
 
-def _stopped_cleanup(spec):
+def _stopped_cleanup(spec, *, read_only=False):
     """Observe only: preflight must never kill a process to manufacture stopped evidence."""
-    resources = RunResources(spec)
+    resources = RunResources(spec, read_only=True) if read_only else RunResources(spec)
     manifest = read_private(resources.manifest)
     receipt_path = resources.root / 'finalization.json'
     receipt = read_private(receipt_path)

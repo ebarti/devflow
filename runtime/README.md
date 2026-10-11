@@ -42,6 +42,14 @@ cumulative allowance. Only a fresh independent passing review and the existing
 approval, custody and publication checks can adopt a correction. Keep the complete
 request unchanged when recovering an uncertain response.
 
+An authenticated stopped worker may expose its exact latest implementation findings
+as an unpassed review subject, while preserving the original admission and terminal
+candidate separately. Fresh roles receive its bounded original product findings as
+unresolved evidence distinct from prior planning-review findings. A passing plan
+review does not pass the product or reuse gates for changed content. After ordinary
+approval and adoption, the original implementation session still requires normal
+repair, fresh gates and product review.
+
 
 ### Native provider turn retries
 

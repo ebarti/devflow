@@ -1189,7 +1189,7 @@ class DeliveryBroker:
     def run_browser_qa(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         return execute_browser_qa(self, iteration, candidate)
 
-    def _legacy_published_base(self, found: dict[str, Any]) -> str:
+    def _legacy_published_base(self, found: dict[str, Any], *, read_only: bool = False) -> str:
         """Authenticate an unchanged published target independently of its tip."""
         with self.store._connect() as db:
             receipts = db.execute(
@@ -1285,6 +1285,10 @@ class DeliveryBroker:
             try:
                 _git(self.source, "cat-file", "-e", live_tip + "^{commit}")
             except RuntimeError:
+                if read_only:
+                    raise ValueError(
+                        "legacy published target requires an existing live object"
+                    ) from None
                 if _git(self.source, "remote", "get-url", "origin") != self.spec["origin_url"]:
                     raise ValueError("legacy published source origin changed") from None
                 # Fetch objects for the authenticated live SHA without moving refs or FETCH_HEAD.

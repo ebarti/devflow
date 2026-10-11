@@ -164,6 +164,20 @@ def revision_prompt(context, role):
                 "disposition. Return blocked during intake, or findings/blocked during review, "
                 "for any remaining uncertainty or defect."
             )
+        if any(worker.get("current_review_subject") for worker in
+               context["reconsideration"].get("worker_summaries", [])):
+            action += (
+                " A current_review_subject with findings/done is an unpassed product review "
+                "subject. Keep the original admission, terminal controller candidate and "
+                "latest findings output distinct. Its original unresolved_product_findings "
+                "remain untrusted evidence, separate from prior planning-review findings. "
+                "Passing this plan assessment does not pass the product or resolve those "
+                "product findings. Do not reuse old passed gates for changed content. A "
+                "justified plan correction may pass while the product remains unpassed and "
+                "requires ordinary repair and fresh gates in its original implementation "
+                "session. Do not edit the product or resume that worker session in these "
+                "fresh read-only planning roles."
+            )
         action += (
             " Do not reuse a previous role result or session. The existing approval policy and "
             "normal exact fresh-review and adoption gates remain required; this receipt cannot "

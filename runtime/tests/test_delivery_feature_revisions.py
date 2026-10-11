@@ -318,12 +318,13 @@ def _native_rejected_fixture(native_configuration, monkeypatch, *, prior_cycles=
     original = prepare_authority(store, original)
     owner = original["feature_delivery"]["owner"]
     if retain_worker:
+        kind = retain_worker if isinstance(retain_worker, str) else "build"
         chunk = ordered_chunks(json.loads(original["accepted_plan"]))[0]
         child = worker_spec(original, chunk, {"url": "https://github.com/example/fixture/issues/10"},
-                            kind="build", base_sha=original["base_sha"], base_branch="main")
+                            kind=kind, base_sha=original["base_sha"], base_branch="main")
         register_worker(store, original, child)
-        shared.checkpoint(owner, "assignment:" + chunk["id"] + ":build", {
-            "run_id": child["run_id"], "chunk_id": chunk["id"], "kind": "build",
+        shared.checkpoint(owner, "assignment:" + chunk["id"] + ":" + kind, {
+            "run_id": child["run_id"], "chunk_id": chunk["id"], "kind": kind,
             "store_path": str(store.config.tracking_db),
         })
         broker = DeliveryBroker(store, child)
@@ -343,6 +344,25 @@ def _native_rejected_fixture(native_configuration, monkeypatch, *, prior_cycles=
                  "retained-original-session", "2026-10-10T19:00:00+00:00"),
             )
         shared.finish_worker(owner, worker_key(child["run_id"], owner), {"cleanup": "confirmed"})
+        # This existing control fixture has a synthetic finished build rather
+        # than a Temporal/native worker closure. Native progress and full readonly
+        # observation are qualified separately in test_delivery_feature_revision_subject.
+        from devflow_temporal import delivery_stopped_resume
+
+        def observed_build(_store, run_id):
+            observed = store.effective_spec(run_id)
+            with store._connect() as db:
+                row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                                      (run_id,)).fetchone())
+                attempts = [dict(value) for value in db.execute(
+                    "SELECT * FROM delivery_attempts WHERE run_id=? ORDER BY job_key", (run_id,))]
+            current = DeliveryBroker(store, observed).candidate()
+            return {"predecessor_spec": observed, "row": row, "attempts": attempts,
+                    "state": {"candidate": json.loads(row["candidate_json"]), "roles": []},
+                    "candidate": current, "effects": [], "session_id": "retained-original-session",
+                    "cleanup_digest": "synthetic-finished-build", "work_binding": {}}
+
+        monkeypatch.setattr(delivery_stopped_resume, "review_snapshot", observed_build)
     for n in range(prior_cycles):
         shared.repair(owner, str(n), "Preserved product cycle " + str(n))
     row = _stop_revision_fixture(store, original, shared)
@@ -737,10 +757,10 @@ def _complete_native_role_fixture(store, spec, context, plan, diagnostic, role, 
     return result
 
 
-@pytest.fixture
-def _genuine_reconsideration(native_configuration, monkeypatch, tmp_path):
-    values = _native_rejected_fixture(native_configuration, monkeypatch, prior_cycles=5,
-                                      retain_worker=True)
+def _genuine_fixture(native_configuration, monkeypatch, tmp_path, *, retain_kind="build",
+                     prior_cycles=5):
+    values = _native_rejected_fixture(native_configuration, monkeypatch, prior_cycles=prior_cycles,
+                                      retain_worker=retain_kind)
     store, spec, shared, plan, diagnostic, _, context, _, _, row = values
     root, sources, historical, current = context_repository(tmp_path, monkeypatch)
     for role in ("intake", "review"):
@@ -753,6 +773,11 @@ def _genuine_reconsideration(native_configuration, monkeypatch, tmp_path):
                "reason": "Fresh independent review after a relevant controller repair.",
                "reconsideration": selectors}
     return values, command, root, sources, historical, current
+
+
+@pytest.fixture
+def _genuine_reconsideration(native_configuration, monkeypatch, tmp_path):
+    return _genuine_fixture(native_configuration, monkeypatch, tmp_path)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS preparation required")
