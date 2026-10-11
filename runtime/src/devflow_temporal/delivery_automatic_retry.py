@@ -1,4 +1,8 @@
-"""Finite fresh attempts for closed, unpublished original transient failures."""
+"""Finite unattended continuations after classified transient stops.
+
+Unpublished original failures get a fresh attempt; published runs get bounded
+same-run gate or CI continuations on their unchanged head.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -8,6 +12,7 @@ import sqlite3
 import subprocess
 import time
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .contracts import digest
@@ -21,6 +26,10 @@ from .delivery_resources import (
     private_directory,
     read_private,
 )
+
+# The n-th automatic continuation of one run waits this long, doubled per
+# generation, after the stop it answers; the row timestamp persists it.
+CONTINUATION_BACKOFF_SECONDS = 30
 
 
 def eligible(row, spec):
@@ -371,5 +380,109 @@ def retry_once(store, *, stopped=lambda: False):
         except (ValueError, KeyError, TypeError, OSError, RuntimeError,
                 subprocess.SubprocessError, sqlite3.Error):
             # Wait for conclusive fresh observations; no absence inferred from errors.
+            continue
+    return admitted + retry_published_once(store, stopped=stopped)
+
+
+def _recovery_chain(row):
+    recovery = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    chain = []
+    while recovery:
+        chain.append(recovery)
+        recovery = recovery.get('original_recovery')
+    return chain
+
+
+def published_continuation(store, row, spec):
+    """The bounded same-run continuation a classified transient stop qualifies for.
+
+    Returns (admit, generation, payload) or None. Nothing here creates a run,
+    branch or PR; the admission re-reads every identity it relies on.
+    """
+    from .delivery_gate_retry import CI_KIND, CI_OBSERVATION_RETRIES, KIND, TRANSIENT_GATE_RETRIES
+    from .delivery_pending_publication import KIND as PUBLICATION_KIND
+    from .delivery_pending_publication import PUBLICATION_RETRIES
+
+    checks = json.loads(row['checks_json'] or '{}')
+    failure = checks.get('failure') or {}
+    candidate = json.loads(row['candidate_json'] or 'null')
+    publication = json.loads(row['pr_json'] or 'null')
+    if (spec.get('automatic_retry_version') != 1 or spec.get('continuation')
+            or row['outcome'] != 'blocked' or row['phase'] != 'blocked'
+            or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
+            or failure.get('classification') != 'transient'
+            or failure.get('cause_type') == 'tracker_readback'
+            or not isinstance(candidate, dict)):
+        return None
+    identity = digest({'run_id': spec['run_id'],
+                       'request_digest': row['request_digest']})[:24]
+    chain = _recovery_chain(row)
+    if failure.get('cause_type') == 'publication_deadline':
+        # Complete the stopped publication, with or without an earlier PR; the
+        # admission seals the checkout head it finds (committed or not).
+        generation = 1 + sum(1 for r in chain if r.get('kind') == PUBLICATION_KIND)
+        if generation > PUBLICATION_RETRIES:
+            return None
+        return store.recover_publication, generation, {
+            'command_id': f'automatic-publication-{identity}-{generation}',
+            'expected_revision': row['protocol_revision'],
+            'expected_candidate_id': candidate['id'],
+            'expected_head': DeliveryBroker(store, spec).candidate()['head'],
+            'expected_pr_number': 0}
+    if not isinstance(publication, dict):
+        return None
+    kind = CI_KIND if failure.get('cause_type') == 'ci_deadline' else KIND
+    if kind == CI_KIND:
+        bound, label = CI_OBSERVATION_RETRIES, 'ci'
+        generation = 1 + sum(1 for r in chain if r.get('kind') == CI_KIND)
+    else:
+        bound, label = TRANSIENT_GATE_RETRIES, 'gates'
+        generation = 1 + sum(
+            1 for r in chain if r.get('kind') == KIND
+            and r.get('execution_spec', {}).get('gate_retry_stage') == 'transient')
+    if generation > bound:
+        return None
+    return store.continue_repair, generation, {
+        'continuation_kind': kind,
+        'command_id': f'automatic-{label}-{identity}-{generation}',
+        'expected_revision': row['protocol_revision'], 'expected_iteration': row['iteration'],
+        'expected_candidate_id': candidate['id'], 'expected_pr_number': publication['number'],
+        'expected_pr_head': candidate['head'], 'additional_iterations': 0}
+
+
+def retry_published_once(store, *, stopped=lambda: False):
+    """Bounded same-run continuations for classified transient stops; no new branch or PR."""
+    with store._connect() as db:
+        rows = [dict(row) for row in db.execute(
+            "SELECT * FROM delivery_runs WHERE outcome='blocked' "
+            "AND checks_json LIKE '%transient%'")]
+    # Separate from the fresh-attempt waits: that loop marks a row before
+    # deciding it is ineligible, which would silence this one forever.
+    waits = getattr(store, '_automatic_continuation_waits', {})
+    store._automatic_continuation_waits = waits
+    admitted = []
+    for row in rows:
+        if stopped():
+            break
+        delay, due = waits.get(row['run_id'], (5, 0))
+        if time.monotonic() < due:
+            continue
+        try:
+            spec = json.loads(row['request_json'])
+            continuation = published_continuation(store, row, spec)
+            if continuation is None or not store.owns_execution(spec):
+                continue
+            admit, generation, payload = continuation
+            stopped_at = datetime.fromisoformat(row['updated_at'])
+            if stopped_at.tzinfo is None:
+                stopped_at = stopped_at.replace(tzinfo=UTC)
+            backoff = min(CONTINUATION_BACKOFF_SECONDS * 2 ** (generation - 1), 600)
+            if datetime.now(UTC) < stopped_at + timedelta(seconds=backoff):
+                continue
+            waits[row['run_id']] = (min(delay * 2, 300), time.monotonic() + delay)
+            admitted.append(admit(spec['run_id'], payload))
+        except (ValueError, KeyError, TypeError, OSError, RuntimeError,
+                subprocess.SubprocessError, sqlite3.Error):
+            # The admission re-reads every identity; a refusal authorizes nothing.
             continue
     return admitted
