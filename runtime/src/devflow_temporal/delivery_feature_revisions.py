@@ -13,6 +13,7 @@ import os
 import re
 import stat
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 from .contracts import canonical_json, digest
@@ -794,6 +795,236 @@ def _admit_plan(spec, old, proposed, identity):
     return plan, sorted(changed), sorted(implementation)
 
 
+def _role_context(store, spec, context, proposal=None):
+    diagnostic = proposal["diagnostic"] if proposal else context["diagnostic"]
+    references = (
+        diagnostic["evidence"] if diagnostic else (context.get("request") or {}).get("evidence", [])
+    )
+    references = list(
+        {
+            item["path"]: item
+            for item in (
+                [*references, *context.get("custody_evidence", [])]
+                if diagnostic
+                else [*context.get("custody_evidence", []), *references]
+            )
+        }.values()
+    )[:16]
+    return {
+        **deepcopy(context),
+        "phase": "proposed" if proposal else "investigating",
+        "namespace": "plan-revisions/" + context["revision_id"],
+        "diagnostic": deepcopy(diagnostic),
+        "proposed_plan_sha256": proposal["proposal_digest"] if proposal else None,
+        "trusted_evidence": _evidence(store, spec, references),
+    }
+
+
+def _unreviewed_rejection(store, spec, context, rejected, values):
+    """Prove an earlier closed review failed before launch, without reopening it.
+
+    A missing session or caller reason cannot establish this exception. The
+    supervisor's typed terminal result, exact historical requests and sealed
+    public closure are all required; any missing or changed proof keeps the veto.
+    """
+    from .delivery_feature_revision_roles import revision_comparison
+    from .delivery_resources import read_private
+    from .supervisor import DeliverySupervisor
+
+    try:
+        revision_id = rejected["revision_id"]
+        previous = values[PREFIX + "begin:" + revision_id]
+        proposal = values[PREFIX + "proposal:" + revision_id]
+        owner = previous["owner"]
+        public = spec.get("feature_plan_revision_request")
+        if (
+            not public
+            or values.get(PREFIX + "request:" + context["revision_id"]) != public
+            or public["revision_id"] != context["revision_id"]
+            or owner["generation"] >= context["owner"]["generation"]
+            or previous["revision_id"] != revision_id
+            or previous["phase"] != "investigating"
+            or rejected["phase"] != "rejected"
+            or _terminal(values, revision_id) != rejected
+            or previous["old_identity"] != context["old_identity"]
+            or previous["old_plan"] != context["old_plan"]
+            or previous["candidate_id"] != context["candidate_id"]
+            or proposal["revision_id"] != revision_id
+            or proposal["phase"] != "proposed"
+            or proposal["old_identity"] != previous["old_identity"]
+            or proposal["proposal_digest"] != rejected["proposal_digest"]
+            or digest(proposal["plan"]) != proposal["proposal_digest"]
+            or proposal["repair_key"] != rejected["repair_key"]
+            or proposal["repair_key"] != previous["repair_key"]
+            or context["repair_key"] == previous["repair_key"]
+        ):
+            return None
+        authenticate_adopted_plan_custody(store, spec, {"owner": owner})
+        # Resolve this old run's immutable prepared authority, never the current
+        # successor's input or a spec supplied by the saved role request.
+        historical = store.effective_spec(owner["run_id"])
+        with store._connect() as db:
+            row = db.execute(
+                "SELECT * FROM delivery_runs WHERE run_id=?", (owner["run_id"],)
+            ).fetchone()
+        if (
+            not row
+            or row["outcome"] not in {"blocked", "cancelled"}
+            or row["cleanup"] != "confirmed"
+            or row["recovery_json"] is not None
+            or historical.get("provider") != "codex"
+            or historical["policy"].get("execution_backend") != "native-macos"
+            or not historical.get("preparation")
+            or historical["feature_delivery"]["owner"] != owner
+            or owner["store_path"] != str(store.config.tracking_db)
+            or not store.owns_execution(historical)
+            or row["request_digest"] != historical["request_digest"]
+            or _assert_identity(previous["record"], previous["old_identity"])
+            != context["old_identity"]
+        ):
+            return None
+        closure_key, admission = next(
+            (key, item)
+            for key, item in values.items()
+            if key.startswith(PREFIX + "request:")
+            and item["owner"] == owner
+            and item["predecessor_run_id"] == owner["run_id"]
+            and item["old_identity"] == previous["old_identity"]
+            and item["old_plan"] == previous["old_plan"]
+        )
+        closure = admission["predecessor_closure"]
+        if (
+            closure["workflow_id"] != store.active_workflow_id(owner["run_id"])
+            or closure["request_digest"] != historical["request_digest"]
+            or not isinstance(closure["execution_run_id"], str)
+            or not closure["execution_run_id"]
+        ):
+            return None
+        closed_at = datetime.fromisoformat(closure["closed_at"])
+        candidate = json.loads(row["candidate_json"])
+        if candidate["id"] != previous["candidate_id"] or closed_at.tzinfo is None:
+            return None
+        shared = _registry(spec)
+        with shared.connect() as db:
+            paid = db.execute(
+                "SELECT generation FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+                (owner["issue_id"], previous["repair_key"]),
+            ).fetchone()
+            for key in (
+                PREFIX + "begin:" + revision_id, PREFIX + "proposal:" + revision_id,
+                PREFIX + "rejected:" + revision_id, closure_key,
+                PREFIX + "request:" + context["revision_id"],
+            ):
+                checkpoint = db.execute(
+                    "SELECT content_digest,content_json FROM execution_checkpoints "
+                    "WHERE issue_id=? AND checkpoint_key=?", (owner["issue_id"], key),
+                ).fetchone()
+                if (not checkpoint or checkpoint["content_digest"] != digest(values[key])
+                        or json.loads(checkpoint["content_json"]) != values[key]):
+                    return None
+        if not paid or paid["generation"] != owner["generation"]:
+            return None
+        proof = {}
+        for role in ("intake", "review"):
+            expected_context = _role_context(
+                store, historical, previous, proposal if role == "review" else None
+            )
+            if role == "review":
+                expected_context["proposed_plan"] = proposal["plan"]
+            expected = {
+                "spec": historical, "role": role, "iteration": 0,
+                "candidate": candidate, "resume_session": None,
+                "revision_context": expected_context,
+            }
+            key = DeliverySupervisor._job_key(expected)
+            with store._connect() as db:
+                attempt = db.execute(
+                    "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
+                    (owner["run_id"], key),
+                ).fetchone()
+            folder = Path(historical["state_dir"]) / "attempts" / key
+            expected.update(
+                findings=[], native_authorized=True, role_evidence_key=key,
+                result_path=str(folder / "result.json"), start_path=str(folder / "start.json"),
+                workspace=(historical["checkout"] if role == "intake" else
+                           str(Path(historical["state_dir"]) / "gates" / "0" / "review")),
+            )
+            request_path = folder / "request.json"
+            if request_path.resolve(strict=True) != request_path:
+                return None
+            request = read_private(request_path)
+            if role == "review":
+                relative, comparison = revision_comparison(expected)
+                comparison_path = Path(historical["state_dir"]) / relative
+                diff = request.get("review_diff") or {}
+                if comparison_path.resolve(strict=True) != comparison_path:
+                    return None
+                encoded = (json.dumps(comparison, sort_keys=True, indent=2) + "\n").encode()
+                fd = os.open(comparison_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                            or stream.read(len(encoded) + 1) != encoded):
+                        return None
+                expected["review_diff"] = {
+                    "kind": "plan_revision", "path": str(comparison_path),
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                    "base_sha": historical["base_sha"], "head": candidate["head"],
+                    # The original producer omitted this outer field. Its inner
+                    # receipt already binds the candidate; no other omission passes.
+                    **({"candidate_id": candidate["id"]} if "candidate_id" in diff else {}),
+                }
+            result = json.loads(attempt["result_json"] or "null") if attempt else None
+            if (
+                request != expected
+                or DeliverySupervisor._job_key(request) != key
+                or not attempt
+                or attempt["role"] != role
+                or attempt["iteration"] != 0
+                or attempt["candidate_id"] != candidate["id"]
+                or attempt["result_path"] != str(folder / "result.json")
+                or attempt["state"] != "finished"
+                or attempt["cleanup"] != "confirmed"
+                or not result
+                or result.get("cleanup") != "confirmed"
+                or datetime.fromisoformat(attempt["finished_at"]) > closed_at
+            ):
+                return None
+            if role == "intake":
+                if (
+                    result.get("status") != "plan"
+                    or result.get("plan") != proposal["plan"]
+                    or result.get("diagnostic") != proposal["diagnostic"]
+                    or not attempt["session_id"]
+                    or result.get("session_id") != attempt["session_id"]
+                ):
+                    return None
+            elif (
+                result.get("status") != "blocked"
+                or result.get("finish_reason") != "prelaunch"
+                or any(
+                    attempt[name] is not None for name in ("pid", "process_identity", "session_id")
+                )
+                or result.get("session_id") is not None
+                or result.get("usage") is not None
+                or any(os.path.lexists(folder / name) for name in (
+                    "native-process.json", "launch.json", "ready.json", "start.json",
+                    "result.json", "cancel",
+                ))
+            ):
+                return None
+            else:
+                proof = {
+                    "revision_id": revision_id, "review_job_key": key,
+                    "review_request_digest": digest(request),
+                    "review_result_digest": digest(result), "predecessor_closure": closure,
+                }
+        return proof
+    except (KeyError, TypeError, ValueError, OSError, StopIteration):
+        return None
+
+
 def record_proposal(store, spec, revision_id, proposed_plan, *, diagnostic=None):
     context, values, terminal = _context(spec, revision_id)
     if terminal:
@@ -815,12 +1046,14 @@ def record_proposal(store, spec, revision_id, proposed_plan, *, diagnostic=None)
     if selected["chunk_id"] not in affected:
         raise ValueError("proposal does not correct the evidenced affected chunk")
     rejected = [value for key, value in values.items() if key.startswith(PREFIX + "rejected:")]
-    if any(
-        value.get("proposal_digest") == digest(plan)
-        and value.get("old_identity") == context["old_identity"]
-        for value in rejected
-    ):
-        raise ValueError("nonprogressing repeated proposal is already rejected")
+    unreviewed = []
+    for value in rejected:
+        if (value.get("proposal_digest") == digest(plan)
+                and value.get("old_identity") == context["old_identity"]):
+            proof = _unreviewed_rejection(store, spec, context, value, values)
+            if not proof:
+                raise ValueError("nonprogressing repeated proposal is already rejected")
+            unreviewed.append(proof)
     receipt = {
         "revision_id": revision_id,
         "phase": "proposed",
@@ -831,6 +1064,7 @@ def record_proposal(store, spec, revision_id, proposed_plan, *, diagnostic=None)
         "implementation_chunks": implementation,
         "old_identity": context["old_identity"],
         "repair_key": context["repair_key"],
+        **({"unreviewed_predecessors": unreviewed} if unreviewed else {}),
     }
     shared = _registry(spec)
     with shared.serialized(context["owner"]["issue_id"]):
@@ -1117,28 +1351,7 @@ def authenticate_revision_role(store, request):
         not proposal or digest(supplied.get("proposed_plan")) != proposal["proposal_digest"]
     ):
         raise OwnershipConflict("revision review changed its sealed proposal")
-    diagnostic = proposal["diagnostic"] if proposal else context["diagnostic"]
-    references = (
-        diagnostic["evidence"] if diagnostic else (context.get("request") or {}).get("evidence", [])
-    )
-    references = list(
-        {
-            item["path"]: item
-            for item in (
-                [*references, *context.get("custody_evidence", [])]
-                if diagnostic
-                else [*context.get("custody_evidence", []), *references]
-            )
-        }.values()
-    )[:16]
-    return {
-        **deepcopy(context),
-        "phase": "proposed" if proposal else "investigating",
-        "namespace": "plan-revisions/" + context["revision_id"],
-        "diagnostic": deepcopy(diagnostic),
-        "proposed_plan_sha256": proposal["proposal_digest"] if proposal else None,
-        "trusted_evidence": _evidence(store, spec, references),
-    }
+    return _role_context(store, spec, context, proposal)
 
 
 def revision_checkpoints(spec, values):

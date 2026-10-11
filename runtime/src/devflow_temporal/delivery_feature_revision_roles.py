@@ -199,14 +199,31 @@ def revision_output(request, parsed):
 
 
 
-def revision_diff(broker, request):
-    """Seal a proposal diff for review when the coordinator has no product diff."""
+def revision_comparison(request):
+    """Derive the comparison sealed by already authenticated revision admission."""
+    import re
     from difflib import unified_diff
+    from pathlib import Path
 
-    from .delivery_resources import read_private, write_private
+    from .delivery_native_guard import revision_role_identity
 
-    context = request["revision_context"]
-    previous, proposed = context["old_plan"], context["proposed_plan"]
+    identity = revision_role_identity(request)
+    context = request.get("revision_context")
+    candidate = request["candidate"]
+    if (identity is None or request["role"] != "review"
+            or not re.fullmatch(r"revision-[0-9a-f]{24}", identity["revision_id"])
+            or context.get("namespace") != "plan-revisions/" + identity["revision_id"]
+            or context.get("candidate_id") != candidate.get("id")
+            or not re.fullmatch(r"[0-9a-f]{64}", candidate.get("id", ""))
+            or not re.fullmatch(r"[0-9a-f]{40}", candidate.get("head", ""))
+            or candidate.get("base_sha") != request["spec"]["base_sha"]):
+        raise ValueError("revision comparison does not match its admitted identity")
+    previous, proposed = context.get("old_plan"), context["proposed_plan"]
+    old_identity = context.get("old_identity")
+    if (not isinstance(previous, dict) or not isinstance(old_identity, dict)
+            or old_identity.get("plan_digest") != digest(previous)
+            or context.get("proposed_plan_sha256") != identity["proposed_plan_sha256"]):
+        raise ValueError("revision comparison changed its accepted or proposed plan")
     text = "".join(unified_diff(
         json.dumps(previous, sort_keys=True, indent=2).splitlines(keepends=True),
         json.dumps(proposed, sort_keys=True, indent=2).splitlines(keepends=True),
@@ -214,18 +231,27 @@ def revision_diff(broker, request):
     ))
     if not text:
         raise ValueError("revision review requires a changed proposal")
-    proposal_digest = digest(proposed)
-    path = (broker.evidence_dir / context["namespace"] / proposal_digest / "review-diff.json")
+    proposal_digest = identity["proposed_plan_sha256"]
+    path = Path(context["namespace"]) / proposal_digest / "review-diff.json"
     receipt = {"version": 1, "revision_id": context["revision_id"],
-               "candidate_id": request["candidate"]["id"], "old_plan_sha256": digest(previous),
+               "candidate_id": candidate["id"], "old_plan_sha256": digest(previous),
                "proposed_plan_sha256": proposal_digest, "diff": text}
+    return path, receipt
+
+
+def revision_diff(broker, request):
+    """Seal a proposal diff for review when the coordinator has no product diff."""
+    import hashlib
+
+    from .delivery_resources import read_private, write_private
+
+    relative, receipt = revision_comparison(request)
+    path = broker.evidence_dir / relative
     if path.exists() or path.is_symlink():
         if read_private(path) != receipt:
             raise ValueError("sealed proposal diff changed across native attempts")
     else:
         write_private(path, receipt)
-    import hashlib
-
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "base_sha": request["spec"]["base_sha"], "head": request["candidate"]["head"],
-            "kind": "plan_revision"}
+            "candidate_id": request["candidate"]["id"], "kind": "plan_revision"}
