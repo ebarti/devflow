@@ -308,7 +308,8 @@ def revise_feature_plan(store, run_id, request):
     if (
         not isinstance(request, dict)
         or not {"command_id", "expected_revision", "reason"} <= request.keys()
-        or request.keys() - {"command_id", "expected_revision", "reason", "evidence"}
+        or request.keys() - {"command_id", "expected_revision", "reason", "evidence",
+                             "reconsideration"}
         or not isinstance(request.get("command_id"), str)
         or not COMMAND_RE.fullmatch(request["command_id"])
         or type(request.get("expected_revision")) is not int
@@ -319,6 +320,10 @@ def revise_feature_plan(store, run_id, request):
         )
     _text(request["reason"], "revision reason")
     _evidence_shape(request.get("evidence", []))
+    if "reconsideration" in request:
+        if request["reconsideration"] is None:
+            raise ValueError("reconsideration must be an exact version1 selector object")
+        _reconsideration_shape(request["reconsideration"])
     command_digest = digest({"run_id": run_id, "request": request})
     with store._connect() as db:
         prior = db.execute(
@@ -353,6 +358,8 @@ def revise_feature_plan(store, run_id, request):
     if saved:
         if saved["request_digest"] != command_digest or saved["request"] != request:
             raise OwnershipConflict("recorded revision admission changed")
+        _checkpoint_proof(shared, token["issue_id"], _values(spec),
+                          [PREFIX + "request:" + revision_id])
         admission = saved
     else:
         closed = closed_coordinator(store, run_id)
@@ -378,6 +385,12 @@ def revise_feature_plan(store, run_id, request):
             "record": record,
             "predecessor_closure": {key: value for key, value in closed.items() if key != "result"},
         }
+        if request.get("reconsideration"):
+            proof, findings = _reconsideration_proof(
+                store, spec, request["reconsideration"], record,
+                admission["predecessor_closure"], _values(spec),
+            )
+            admission.update(reconsideration=proof, unresolved_prior_findings=findings)
         with shared.serialized(token["issue_id"]):
             with store._connect() as db:
                 current = db.execute(
@@ -385,6 +398,26 @@ def revise_feature_plan(store, run_id, request):
                 ).fetchone()
             if dict(current) != dict(row):
                 raise OwnershipConflict("stopped feature changed before revision admission")
+            if request.get("reconsideration"):
+                # Recheck and reserve under the same existing issue lock. A new
+                # command, run, or unrelated source commit cannot spend again.
+                values = _values(spec, shared)
+                fresh_record = current_record(spec)
+                live_members(spec, fresh_record)
+                current_proof, current_findings = _reconsideration_proof(
+                    store, spec, request["reconsideration"], fresh_record,
+                    admission["predecessor_closure"], values,
+                )
+                if current_proof != proof or current_findings != findings:
+                    raise OwnershipConflict("reconsideration proof changed before reservation")
+                for key, item in values.items():
+                    existing = item.get("reconsideration") if isinstance(item, dict) else None
+                    if (key.startswith(PREFIX + "request:") and existing
+                            and existing["context_key"] == proof["context_key"]
+                            and item["request_digest"] != command_digest):
+                        raise OwnershipConflict(
+                            "review context already reserved by " + item["revision_id"]
+                        )
             shared.revision_checkpoint(
                 token, PREFIX + "request:" + revision_id, admission, stopped=True
             )
@@ -399,6 +432,8 @@ def revise_feature_plan(store, run_id, request):
         "expected_plan_revision": admission["old_identity"]["plan_revision"],
         "affected_chunks": [],
         "repair_budget": shared.budget(token["issue_id"]),
+        **({"reconsideration": deepcopy(admission["reconsideration"])}
+           if admission.get("reconsideration") else {}),
     }
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -626,6 +661,14 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
         diagnostic = validate_diagnostic(
             store, spec, diagnostic, identity=identity, candidate_id=candidate["id"]
         )
+    reconsideration = ({"reconsideration": deepcopy(public["reconsideration"]),
+                        "unresolved_prior_findings": deepcopy(public["unresolved_prior_findings"])}
+                       if public and public.get("reconsideration") else {})
+    if reconsideration:
+        _recheck_reconsideration(
+            store, spec, {"revision_id": revision_id, "owner": token, **reconsideration},
+            candidate=candidate,
+        )
     with shared.serialized(token["issue_id"]):
         with shared.connect() as db:
             shared.require_settlement(db, token)
@@ -641,6 +684,11 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
         ]
         if any(value["revision_id"] != revision_id for value in begun):
             raise OwnershipConflict("feature has an active plan investigation")
+        if reconsideration:
+            _recheck_reconsideration(
+                store, spec, {"revision_id": revision_id, "owner": token, **reconsideration},
+                candidate=candidate,
+            )
         repair_key = "plan-revision:" + revision_id
         # Explicitly reuse a product cycle only when the diagnostic's exact worker
         # candidate has a documented debit; caller-supplied keys are never accepted.
@@ -703,6 +751,7 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
             "paid_worker_run_id": paid_worker,
             "budget": budget,
             "candidate_id": candidate["id"],
+            **reconsideration,
         }
         shared.revision_checkpoint(token, PREFIX + "begin:" + revision_id, context)
         return deepcopy(context)
@@ -818,6 +867,462 @@ def _role_context(store, spec, context, proposal=None):
         "proposed_plan_sha256": proposal["proposal_digest"] if proposal else None,
         "trusted_evidence": _evidence(store, spec, references),
     }
+
+
+def _reconsideration_shape(value):
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {
+        "version", "kind", "rejected_revision_id", "proposal_sha256",
+        "expected_runtime_revision", "expected_runtime_payload_sha256",
+    } or type(value.get("version")) is not int or value["version"] != 1
+            or value.get("kind") != "derivation_context_change"
+            or not isinstance(value.get("rejected_revision_id"), str)
+            or not re.fullmatch(r"revision-[0-9a-f]{24}", value["rejected_revision_id"])
+            or not isinstance(value.get("expected_runtime_revision"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", value["expected_runtime_revision"])
+            or any(not isinstance(value.get(key), str) or not SHA256.fullmatch(value[key])
+                   for key in ("proposal_sha256", "expected_runtime_payload_sha256"))):
+        raise ValueError("reconsideration requires exact version1 rejection/runtime selectors")
+    return value
+
+
+def _checkpoint_proof(shared, issue_id, values, keys):
+    with shared.connect() as db:
+        for key in keys:
+            row = db.execute(
+                "SELECT content_json,content_digest FROM execution_checkpoints "
+                "WHERE issue_id=? AND checkpoint_key=?", (issue_id, key),
+            ).fetchone()
+            if (key not in values or not row or json.loads(row["content_json"]) != values[key]
+                    or row["content_digest"] != digest(values[key])):
+                raise OwnershipConflict("reconsideration lost its immutable checkpoint proof")
+
+
+def _private_canonical(path, expected):
+    encoded = (json.dumps(expected, sort_keys=True, indent=2) + "\n").encode()
+    if path.resolve(strict=True) != path:
+        raise ValueError("native review proof left its canonical owned path")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                or stream.read(len(encoded) + 1) != encoded):
+            raise ValueError("native review comparison lost its exact canonical bytes")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _saved_revision_role(store, spec, context, proposal, candidate, role, *, closed_at=None):
+    """Authenticate the exact supervised launcher and actual completed provider."""
+    from .delivery_feature_revision_roles import revision_comparison
+    from .delivery_resources import read_private
+    from .supervisor import DeliverySupervisor
+
+    expected_context = _role_context(store, spec, context, proposal if role == "review" else None)
+    if role == "review":
+        expected_context["proposed_plan"] = proposal["plan"]
+    expected = {"spec": spec, "role": role, "iteration": 0, "candidate": candidate,
+                "resume_session": None, "revision_context": expected_context}
+    key = DeliverySupervisor._job_key(expected)
+    folder = Path(spec["state_dir"]) / "attempts" / key
+    with store._connect() as db:
+        saved = db.execute(
+            "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
+            (spec["run_id"], key),
+        ).fetchone()
+        steering = db.execute(
+            "SELECT notes_json FROM delivery_steering_launches WHERE job_key=?", (key,),
+        ).fetchone()
+    if (not saved or saved["role"] != role or saved["iteration"] != 0
+            or saved["candidate_id"] != candidate["id"] or saved["state"] != "finished"
+            or saved["cleanup"] != "confirmed"
+            or saved["result_path"] != str(folder / "result.json")):
+        raise ValueError("reconsideration lacks an exact finished supervised role")
+    finished = datetime.fromisoformat(saved["finished_at"])
+    if finished.tzinfo is None or closed_at is not None and finished > closed_at:
+        raise ValueError("native role did not finish before the coordinator closure")
+    expected.update(
+        findings=[], native_authorized=True, role_evidence_key=key,
+        result_path=str(folder / "result.json"), start_path=str(folder / "start.json"),
+        workspace=spec["checkout"] if role == "intake" else
+        str(Path(spec["state_dir"]) / "gates" / "0" / "review"),
+    )
+    if steering and json.loads(steering[0]):
+        expected["steering"] = json.loads(steering[0])
+    request_path = folder / "request.json"
+    if request_path.resolve(strict=True) != request_path:
+        raise ValueError("historical native request left its exact owned path")
+    request = read_private(request_path)
+    if role == "review":
+        relative, comparison = revision_comparison(expected)
+        path = Path(spec["state_dir"]) / relative
+        expected["review_diff"] = {
+            "kind": "plan_revision", "path": str(path),
+            "sha256": _private_canonical(path, comparison),
+            "base_sha": spec["base_sha"], "head": candidate["head"],
+            **({"candidate_id": candidate["id"]}
+               if "candidate_id" in request.get("review_diff", {}) else {}),
+        }
+    if request != expected or DeliverySupervisor._job_key(request) != key:
+        raise ValueError("historical native launcher differs from its exact sealed role")
+    request_bytes_sha = _private_canonical(request_path, expected)
+    result = json.loads(saved["result_json"] or "null")
+    if not result or result.get("cleanup") != "confirmed":
+        raise ValueError("native provider result cleanup is unconfirmed")
+    proof = {"run_id": spec["run_id"], "job_key": key, "request_bytes_sha256": request_bytes_sha,
+             "request_sha256": digest(request), "result_sha256": digest(result),
+             "session_id": saved["session_id"]}
+    if result.get("finish_reason") == "prelaunch":
+        if (result.get("status") != "blocked"
+                or any(saved[k] is not None for k in ("pid", "process_identity", "session_id"))
+                or result.get("session_id") is not None or result.get("usage") is not None
+                or any(os.path.lexists(folder / name) for name in (
+                    "native-process.json", "launch.json", "ready.json", "start.json",
+                    "result.json", "cancel",
+                ))):
+            raise ValueError("claimed prelaunch rejection retains independent launch evidence")
+        return result, {**proof, "classification": "prelaunch"}
+    native = result.get("native_process") or {}
+    if (result.get("finish_reason") != "done" or not saved["pid"]
+            or not saved["process_identity"] or not saved["session_id"]
+            or saved["session_id"] != result.get("session_id")
+            or native.get("state") != "finished"
+            or native.get("cleanup") != "observed-native-confirmed"
+            or native.get("monitoring_complete") is not True
+            or native.get("stdio_drained") is not True or native.get("exit_code") != 0
+            or any(native.get(k) is not False for k in ("cancelled", "timed_out"))
+            or native.get("journal") != str(folder / "native-process.json")):
+        raise ValueError("reconsideration needs the actual completed native provider identity")
+    journal = read_private(folder / "native-process.json")
+    intent = journal.get("intent") or {}
+    session = journal.get("provider_session") or {}
+    argv = intent.get("argv") or []
+    if (journal.get("phase") != "finished" or not journal.get("owned")
+            or journal.get("result") != native
+            or journal.get("runtime_identity") != native.get("runtime_identity")
+            or intent.get("run_id") != spec["run_id"]
+            or intent.get("policy_digest") != spec["policy_digest"]
+            or intent.get("cwd") != expected["workspace"]
+            or len(argv) != 5 or argv[1:4] != ["-I", "-m", "devflow_temporal.role_runner"]
+            or argv[4] != str(request_path) or not Path(argv[0]).is_absolute()
+            or session.get("session_id") != saved["session_id"]
+            or session.get("resumed_from") is not None or session.get("role") != role
+            or session.get("iteration") != 0 or session.get("result_digest") != digest(result)
+            or str(saved["pid"]) not in journal["owned"]
+            or journal["owned"][str(saved["pid"])].get("identity") != saved["process_identity"]):
+        raise ValueError("completed native provider lost its durable process/session binding")
+    raw = read_private(folder / "result.json")
+    server = {"cleanup", "process_cleanup", "resource_cleanup", "native_process"}
+    if ({k: v for k, v in raw.items() if k not in server}
+            != {k: v for k, v in result.items() if k not in server}):
+        raise ValueError("completed native result differs from its immutable provider receipt")
+    return result, {**proof, "classification": "native",
+                    "runtime_identity": native["runtime_identity"]}
+
+
+def _historical_rejection(store, spec, rejected, values, *, closure=None):
+    """Bind genuine findings to their original input, closure and actual runtime."""
+    from .delivery_feature_review_context import authenticated_runtime_context
+
+    revision_id = rejected["revision_id"]
+    previous = values[PREFIX + "begin:" + revision_id]
+    proposal = values[PREFIX + "proposal:" + revision_id]
+    owner = previous["owner"]
+    if (previous.get("phase") != "investigating" or previous["revision_id"] != revision_id
+            or rejected.get("phase") != "rejected" or _terminal(values, revision_id) != rejected
+            or proposal.get("phase") != "proposed" or proposal["revision_id"] != revision_id
+            or proposal["old_identity"] != previous["old_identity"]
+            or proposal["proposal_digest"] != rejected["proposal_digest"]
+            or digest(proposal["plan"]) != proposal["proposal_digest"]
+            or rejected["old_identity"] != previous["old_identity"]
+            or any(item["repair_key"] != previous["repair_key"] for item in (proposal, rejected))):
+        raise OwnershipConflict("selected rejection lost its exact begin/proposal custody")
+    authenticate_adopted_plan_custody(store, spec, {"owner": owner})
+    historical = store.effective_spec(owner["run_id"])
+    with store._connect() as db:
+        row = db.execute(
+            "SELECT * FROM delivery_runs WHERE run_id=?", (owner["run_id"],),
+        ).fetchone()
+        preparation = db.execute(
+            "SELECT * FROM delivery_preparations WHERE run_id=?", (owner["run_id"],),
+        ).fetchone()
+    if (not row or row["outcome"] not in {"blocked", "cancelled"}
+            or row["cleanup"] != "confirmed" or row["recovery_json"] is not None
+            or historical.get("provider") != "codex"
+            or historical["policy"].get("execution_backend") != "native-macos"
+            or not historical.get("preparation") or not preparation
+            or historical["feature_delivery"]["owner"] != owner
+            or owner["store_path"] != str(store.config.tracking_db)
+            or not store.owns_execution(historical)
+            or row["request_digest"] != historical["request_digest"]
+            or preparation["submitted_spec_digest"] != digest(json.loads(row["request_json"]))
+            or preparation["effective_spec_digest"] != digest(historical)
+            or json.loads(preparation["effective_spec_json"]) != historical
+            or _assert_identity(previous["record"], previous["old_identity"])
+            != previous["old_identity"]):
+        raise OwnershipConflict("reconsideration lacks original immutable native preparation")
+    keys = [PREFIX + stage + ":" + revision_id for stage in ("begin", "proposal", "rejected")]
+    if closure is None:
+        key, admission = next(
+            (key, item) for key, item in values.items()
+            if key.startswith(PREFIX + "request:") and item["owner"] == owner
+            and item["predecessor_run_id"] == owner["run_id"]
+        )
+        keys.append(key)
+        closure = admission["predecessor_closure"]
+    if (closure.get("workflow_id") != store.active_workflow_id(owner["run_id"])
+            or closure.get("request_digest") != historical["request_digest"]
+            or closure.get("recovery_digest") is not None
+            or not isinstance(closure.get("execution_run_id"), str)
+            or not closure["execution_run_id"]):
+        raise ValueError("selected rejection lacks its confirmed original Temporal closure")
+    closed_at = datetime.fromisoformat(closure["closed_at"])
+    if closed_at.tzinfo is None:
+        raise ValueError("selected rejection closure time is unbound")
+    shared = _registry(spec)
+    _checkpoint_proof(shared, owner["issue_id"], values, keys)
+    with shared.connect() as db:
+        paid = db.execute(
+            "SELECT generation FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+            (owner["issue_id"], previous["repair_key"]),
+        ).fetchone()
+    if not paid or paid[0] != owner["generation"]:
+        raise ValueError("selected rejection lost its original paid product cycle")
+    candidate = json.loads(row["candidate_json"])
+    if candidate["id"] != previous["candidate_id"]:
+        raise ValueError("selected rejection changed its original candidate")
+    intake, intake_proof = _saved_revision_role(
+        store, historical, previous, proposal, candidate, "intake", closed_at=closed_at,
+    )
+    review, review_proof = _saved_revision_role(
+        store, historical, previous, proposal, candidate, "review", closed_at=closed_at,
+    )
+    if (intake.get("status") != "plan" or intake.get("plan") != proposal["plan"]
+            or intake.get("diagnostic") != proposal["diagnostic"]
+            or intake_proof["classification"] != "native"):
+        raise ValueError("selected rejection lacks its original native proposal")
+    if review_proof["classification"] == "prelaunch":
+        return {"revision_id": revision_id, "classification": "prelaunch",
+                "review": review_proof}
+    if (review.get("status") != "findings" or not review.get("findings")
+            or review.get("reviewed_plan_sha256") != proposal["proposal_digest"]
+            or intake_proof["session_id"] == review_proof["session_id"]):
+        raise ValueError("selected rejection has no genuine independent native findings")
+    runtime = authenticated_runtime_context(review_proof["runtime_identity"])
+    return {"revision_id": revision_id, "classification": "genuine", "review": review_proof,
+            "runtime": runtime, "findings": review["findings"],
+            "candidate": candidate, "prepared_spec_sha256": digest(historical),
+            "closure": deepcopy(closure)}
+
+
+def _worker_subject(store, parent, previous, proposal, values):
+    from .delivery_feature_execution import revised_worker_spec
+    from .delivery_feature_review_context import candidate_subject, preserved_worker
+    from .delivery_feature_revision_recovery import retained_recovery
+
+    plan, affected, _ = _admit_plan(
+        parent, previous["old_plan"], proposal["plan"], previous["old_identity"],
+    )
+    _preserve_started_custody(parent, previous["old_plan"], plan, previous["record"], values)
+    workers = {}
+    for key, assignment in values.items():
+        if ("assignment:" in key and isinstance(assignment, dict)
+                and assignment.get("chunk_id") in affected):
+            if assignment.get("store_path") != str(store.config.tracking_db):
+                raise ValueError("reconsideration retained worker belongs to another store")
+            workers[assignment["run_id"]] = assignment
+    if len(workers) > 32:
+        raise ValueError("reconsideration worker evidence exceeds its bounded context")
+    summaries, inputs, subjects = [], {}, []
+    for run_id, assignment in sorted(workers.items()):
+        original = store.effective_spec(run_id)
+        with store._connect() as db:
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            attempts = list(db.execute(
+                "SELECT state,cleanup,session_id FROM delivery_attempts WHERE run_id=? "
+                "ORDER BY job_key", (run_id,),
+            ))
+        worker = original.get("feature_worker") or {}
+        if (not row or row["cleanup"] != "confirmed"
+                or row["outcome"] not in {"blocked", "cancelled", "delivered", "merged"}
+                or any(r["state"] != "finished" or r["cleanup"] != "confirmed" for r in attempts)
+                or worker.get("chunk_id") != assignment["chunk_id"]
+                or original["feature_delivery"]["owner"]["issue_id"]
+                != parent["feature_delivery"]["owner"]["issue_id"]):
+            raise ValueError("reconsideration worker/session cleanup or chunk custody is unproven")
+        submitted = json.loads(row["request_json"])
+        input_keys = [key for key, value in values.items()
+                      if key.startswith("worker-input:" + run_id + ":") and value == submitted]
+        if not input_keys:
+            raise ValueError("reconsideration lacks an immutable original worker input")
+        _checkpoint_proof(_registry(parent), parent["feature_delivery"]["owner"]["issue_id"],
+                          values, input_keys)
+        recovery = retained_recovery(json.loads(row["recovery_json"] or "null"))
+        candidate = json.loads(row["candidate_json"] or "null")
+        if recovery:
+            if (recovery.get("execution_spec") != original
+                    or candidate_subject(recovery["execution_candidate"])
+                    != candidate_subject(candidate)):
+                raise ValueError("retained worker recovery changed candidate or input custody")
+        if candidate_subject(_candidate(store, original)) != candidate_subject(candidate):
+            raise ValueError("retained worker product content changed after its stopped receipt")
+        derived = revised_worker_spec(
+            parent, plan, assignment["chunk_id"],
+            expected_revision={"plan_revision": previous["old_identity"]["plan_revision"] + 1,
+                               "plan_digest": digest(plan)}, worker=original,
+        )
+        summary = preserved_worker(original, derived)
+        sessions = sorted({r["session_id"] for r in attempts if r["session_id"]}
+                          | ({recovery["session_id"]} if recovery and recovery.get("session_id")
+                             else set()))
+        summary.update(candidate=candidate_subject(candidate), session_ids=sessions)
+        summaries.append(summary)
+        inputs[run_id] = {"submitted_spec_sha256": digest(submitted),
+                          "effective_spec_sha256": digest(original),
+                          "recovery_sha256": digest(recovery) if recovery else None}
+        subjects.append({**summary, "custody": {key: original.get(key) for key in (
+            "run_id", "work_id", "request_digest", "config_path", "config_digest",
+            "state_dir", "checkout", "branch", "base_sha", "issue_url", "authorized_endpoint",
+        )}, "accepted_outcome": {key: json.loads(original["accepted_plan"]).get(key)
+                                for key in ("scope", "acceptance", "integration")}})
+    if len(canonical_json(summaries).encode()) > 16 * 1024:
+        raise ValueError("reconsideration derived worker proof exceeds its role context bound")
+    return {"worker_summaries": summaries, "retained_worker_inputs": inputs,
+            "current_worker_subject_sha256": digest(subjects)}
+
+
+def _prove_reconsideration(store, spec, selectors, record, closure, values):
+    from .delivery_feature_review_context import SCHEMA, candidate_subject, current_runtime_context
+
+    selected_id = selectors["rejected_revision_id"]
+    rejected = values.get(PREFIX + "rejected:" + selected_id)
+    previous = values.get(PREFIX + "begin:" + selected_id)
+    proposal = values.get(PREFIX + "proposal:" + selected_id)
+    identity = _assert_identity(record, adopted_plan_identity(spec))
+    if (not rejected or not previous or not proposal
+            or previous["owner"] != spec["feature_delivery"]["owner"]
+            or rejected.get("proposal_digest") != selectors["proposal_sha256"]
+            or previous["old_identity"] != identity
+            or not _same_publication(previous["record"]["manifest"]["publication"],
+                                     record["manifest"]["publication"])):
+        raise ValueError("reconsideration must select this stopped owner's exact genuine rejection")
+    historical = _historical_rejection(store, spec, rejected, values, closure=closure)
+    if historical["classification"] != "genuine":
+        raise ValueError("reconsideration requires a genuine completed independent review")
+    current = current_runtime_context()
+    if (current["revision"] != selectors["expected_runtime_revision"]
+            or current["runtime_payload_sha256"] != selectors["expected_runtime_payload_sha256"]):
+        raise OwnershipConflict("reconsideration current runtime expectation is stale")
+    if current["guards"] != historical["runtime"]["guards"]:
+        raise ValueError("reconsideration changed an external authority/model binding")
+    if current["context_sha256"] == historical["runtime"]["context_sha256"]:
+        raise ValueError("reconsideration requires a changed relevant derivation context")
+    subject = _worker_subject(store, spec, previous, proposal, values)
+    findings, predecessors = [], []
+    for item in sorted(
+        (item for key, item in values.items() if key.startswith(PREFIX + "rejected:")
+         and item.get("proposal_digest") == proposal["proposal_digest"]
+         and item.get("old_identity") == identity),
+        key=lambda item: values[PREFIX + "begin:" + item["revision_id"]]["owner"]["generation"],
+    ):
+        proof = historical if item == rejected else _historical_rejection(store, spec, item, values)
+        if proof["classification"] == "genuine":
+            if proof["runtime"]["guards"] != current["guards"]:
+                raise ValueError("prior genuine review has unsupported external bindings")
+            if proof["runtime"]["context_sha256"] == current["context_sha256"]:
+                raise ValueError("proposal already received genuine findings in current context")
+            for text in proof["findings"]:
+                _text(text, "unresolved prior finding", maximum=16 * 1024)
+                if text not in findings:
+                    findings.append(text)
+        predecessors.append({"revision_id": proof["revision_id"],
+                             "classification": proof["classification"],
+                             "review_request_sha256": proof["review"]["request_sha256"],
+                             "review_result_sha256": proof["review"]["result_sha256"]})
+    if len(findings) > 32 or sum(len(text.encode()) for text in findings) > 16 * 1024:
+        raise ValueError("unresolved genuine findings exceed bounded fresh review context")
+    key = digest({"context_schema": SCHEMA, "issue_id": previous["owner"]["issue_id"],
+                  "old_identity": identity, "publication": record["manifest"]["publication"],
+                  "proposal_sha256": proposal["proposal_digest"],
+                  "current_context_sha256": current["context_sha256"],
+                  "worker_subject_sha256": subject["current_worker_subject_sha256"]})
+    receipt = {
+        "version": 1, "kind": "derivation_context_change", "context_schema": SCHEMA,
+        "authority": "fresh_intake_and_independent_review_only", "context_key": key,
+        "selected_rejected_revision_id": selected_id,
+        "proposal_sha256": proposal["proposal_digest"], "old_identity": identity,
+        "historical_review": {k: v for k, v in historical["review"].items()
+                              if k not in {"classification", "runtime_identity"}},
+        "historical_runtime": historical["runtime"], "current_runtime": current,
+        "closure": historical["closure"],
+        "input_digests": {"old_prepared_spec": historical["prepared_spec_sha256"],
+                          "product_candidate_custody": digest(
+                              candidate_subject(historical["candidate"])),
+                          "retained_worker_inputs": subject["retained_worker_inputs"]},
+        "product_candidate": candidate_subject(historical["candidate"]),
+        "current_worker_subject_sha256": subject["current_worker_subject_sha256"],
+        "worker_summaries": subject["worker_summaries"], "prior_rejections": predecessors,
+        "unresolved_prior_findings_sha256": digest(findings),
+        "original_repair_budget": _registry(spec).budget(previous["owner"]["issue_id"]),
+    }
+    return receipt, findings
+
+
+def _reconsideration_proof(store, spec, selectors, record, closure, values):
+    try:
+        return _prove_reconsideration(store, spec, selectors, record, closure, values)
+    except (KeyError, TypeError, OSError, StopIteration, SyntaxError) as exc:
+        raise OwnershipConflict("reconsideration evidence is missing or unsupported") from exc
+
+
+def _recheck_reconsideration(store, spec, context, *, candidate=None):
+    receipt = context.get("reconsideration")
+    if not receipt:
+        return None
+    public = spec.get("feature_plan_revision_request")
+    values = _values(spec)
+    if (not public or values.get(PREFIX + "request:" + context["revision_id"]) != public
+            or public.get("reconsideration") != receipt
+            or public.get("unresolved_prior_findings") != context.get("unresolved_prior_findings")
+            or digest(context["unresolved_prior_findings"])
+            != receipt["unresolved_prior_findings_sha256"]):
+        raise OwnershipConflict("reconsideration lost its exact server-owned admission")
+    _checkpoint_proof(_registry(spec), context["owner"]["issue_id"], values,
+                      [PREFIX + "request:" + context["revision_id"]])
+    original = store.effective_spec(public["predecessor_run_id"])
+    authenticate_adopted_plan_custody(store, spec, {"owner": public["owner"]})
+    proof, findings = _reconsideration_proof(
+        store, original, public["request"]["reconsideration"], public["record"],
+        public["predecessor_closure"], values,
+    )
+    # The normal repair debit is intentionally newer; its budget cannot rewrite
+    # the original pre-admission receipt, nor redefine deduplication identity.
+    proof["original_repair_budget"] = receipt["original_repair_budget"]
+    if proof != receipt or findings != context["unresolved_prior_findings"]:
+        raise OwnershipConflict("reconsideration proof or current derived subject changed")
+    if candidate is not None:
+        from .delivery_feature_review_context import candidate_subject
+
+        if candidate_subject(candidate) != receipt["product_candidate"]:
+            raise OwnershipConflict("fresh investigation changed product candidate custody")
+    return receipt
+
+
+def _completed_reconsideration_role(store, spec, context, proposal, role):
+    receipt = _recheck_reconsideration(store, spec, context, candidate=_candidate(store, spec))
+    if not receipt:
+        return None
+    from .delivery_feature_review_context import authenticated_runtime_context
+
+    result, proof = _saved_revision_role(
+        store, spec, context, proposal, _candidate(store, spec), role,
+    )
+    if (proof["classification"] != "native"
+            or authenticated_runtime_context(proof["runtime_identity"])
+            != receipt["current_runtime"]):
+        raise OwnershipConflict("completed fresh native role ran a different sealed review context")
+    return result
 
 
 def _unreviewed_rejection(store, spec, context, rejected, values):
@@ -1045,6 +1550,14 @@ def record_proposal(store, spec, revision_id, proposed_plan, *, diagnostic=None)
     _preserve_started_custody(spec, context["old_plan"], plan, context["record"], values)
     if selected["chunk_id"] not in affected:
         raise ValueError("proposal does not correct the evidenced affected chunk")
+    reconsideration = context.get("reconsideration")
+    if reconsideration:
+        if digest(plan) != reconsideration["proposal_sha256"]:
+            raise ValueError("fresh reconsideration proposal differs from selected review subject")
+        result = _completed_reconsideration_role(store, spec, context, None, "intake")
+        if (result.get("status") != "plan" or result.get("plan") != plan
+                or result.get("diagnostic") != selected):
+            raise ValueError("reconsideration requires its exact newly completed native proposal")
     rejected = [value for key, value in values.items() if key.startswith(PREFIX + "rejected:")]
     unreviewed = []
     for value in rejected:
@@ -1052,8 +1565,13 @@ def record_proposal(store, spec, revision_id, proposed_plan, *, diagnostic=None)
                 and value.get("old_identity") == context["old_identity"]):
             proof = _unreviewed_rejection(store, spec, context, value, values)
             if not proof:
-                raise ValueError("nonprogressing repeated proposal is already rejected")
-            unreviewed.append(proof)
+                admitted = next((item for item in reconsideration.get("prior_rejections", [])
+                                 if item["revision_id"] == value["revision_id"]), None) \
+                    if reconsideration else None
+                if not admitted:
+                    raise ValueError("nonprogressing repeated proposal is already rejected")
+            else:
+                unreviewed.append(proof)
     receipt = {
         "revision_id": revision_id,
         "phase": "proposed",
@@ -1065,6 +1583,8 @@ def record_proposal(store, spec, revision_id, proposed_plan, *, diagnostic=None)
         "old_identity": context["old_identity"],
         "repair_key": context["repair_key"],
         **({"unreviewed_predecessors": unreviewed} if unreviewed else {}),
+        **({"reconsideration_context_key": reconsideration["context_key"]}
+           if reconsideration else {}),
     }
     shared = _registry(spec)
     with shared.serialized(context["owner"]["issue_id"]):
@@ -1100,6 +1620,8 @@ def reject_revision(store, spec, revision_id, reason):
         "proposal_digest": proposal.get("proposal_digest"),
         "repair_key": context["repair_key"],
         "budget": shared.budget(context["owner"]["issue_id"]),
+        **({"reconsideration_context_key": context["reconsideration"]["context_key"]}
+           if context.get("reconsideration") else {}),
     }
     shared.revision_checkpoint(context["owner"], PREFIX + "rejected:" + revision_id, receipt)
     return receipt
@@ -1121,6 +1643,9 @@ def _review_authorized(store, spec, context, proposal, review):
         or review["session_id"] == review["proposal_session_id"]
     ):
         raise ValueError("native plan review must use an independent recorded session")
+    if context.get("reconsideration"):
+        for role in ("intake", "review"):
+            _completed_reconsideration_role(store, spec, context, proposal, role)
     if spec["provider"] != "fake":
         from .supervisor import DeliverySupervisor
 
@@ -1324,7 +1849,8 @@ def authenticate_revision_role(store, request):
     context, values, terminal = _context(spec, supplied.get("revision_id"))
     if terminal or adopted_plan_identity(spec) != context["old_identity"]:
         raise OwnershipConflict("revision role belongs to a superseded or closed proposal")
-    for key in ("old_plan", "old_identity", "repair_key", "candidate_id"):
+    for key in ("old_plan", "old_identity", "repair_key", "candidate_id",
+                "reconsideration", "unresolved_prior_findings"):
         if key in supplied and supplied[key] != context[key]:
             raise OwnershipConflict("revision role changed its sealed investigation context")
     shared = _registry(spec)
@@ -1340,6 +1866,7 @@ def authenticate_revision_role(store, request):
         or request["candidate"]["id"] != context["candidate_id"]
     ):
         raise OwnershipConflict("revision role has no matching repair debit or candidate")
+    _recheck_reconsideration(store, spec, context, candidate=request["candidate"])
     # Intake replay must retain its original begin context after the proposal
     # checkpoint was persisted but before Temporal acknowledged its result.
     proposal = (
@@ -1471,6 +1998,10 @@ def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup
         },
         "can_revise": reason is None,
         "reason_ineligible": reason,
+        **({"reconsideration": {key: current["reconsideration"][key] for key in (
+            "selected_rejected_revision_id", "proposal_sha256", "context_schema", "context_key",
+            "current_worker_subject_sha256", "current_runtime", "authority",
+        )}} if (current or {}).get("reconsideration") else {}),
     }
 
 
