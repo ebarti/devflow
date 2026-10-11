@@ -72,8 +72,6 @@ class DeliveryService:
         self.temporal_status = "disconnected"
         self._health_client: Client | None = None
         self.dispatch_task: asyncio.Task | None = None
-        self._closed_projection_seen: set[tuple[str, str | None]] = set()
-        self._closed_projection_cursor = ""
 
     async def client(self) -> Client:
         return await Client.connect(
@@ -242,12 +240,8 @@ class DeliveryService:
         from .delivery_closed_projection import reconcile_completed_projections
 
         client = await self.healthy_client()
-        observations = await reconcile_completed_projections(
-            self.store, client, seen=self._closed_projection_seen,
-            after_run_id=self._closed_projection_cursor,
-        )
-        if observations:
-            self._closed_projection_cursor = observations[-1]["run_id"]
+        # Due candidates and backoff live in SQLite; SQLite work runs off the loop.
+        await reconcile_completed_projections(self.store, client)
 
     async def dispatch_questions_once(self) -> None:
         from .delivery_question_sender import pump_blocking_questions

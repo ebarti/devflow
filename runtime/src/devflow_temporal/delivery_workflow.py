@@ -159,6 +159,8 @@ class DeliveryWorkflow:
         self.controller_only_resource_closure = False
         self.original_execution = True
         self.controller_failure_boundary = False
+        self.liveness_v2 = False
+        self.terminal_closing = False
         self.controller_spec = None
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
@@ -376,6 +378,21 @@ class DeliveryWorkflow:
             delay = min(delay * 2, 30)
 
     async def _project(self, spec: dict[str, Any], event: str, message: str) -> None:
+        # A bounded terminal projection makes the readback projections nested in
+        # it (tracker_pending inside the terminal tracker loop) non-fatal, so a
+        # stop never ends unproven. Recorded histories keep raising.
+        closing = (event in {"delivered", "blocked", "cancelled"}
+                   and self.controller_failure_boundary and self.liveness_v2
+                   and not self.terminal_closing)
+        if closing:
+            self.terminal_closing = True
+        try:
+            await self._project_event(spec, event, message)
+        finally:
+            if closing:
+                self.terminal_closing = False
+
+    async def _project_event(self, spec: dict[str, Any], event: str, message: str) -> None:
         self.controller_spec = spec
         terminal_projection = event in {"delivered", "blocked", "cancelled"}
         # Only newly admitted resource-aware inputs add this activity. Recorded
@@ -491,23 +508,45 @@ class DeliveryWorkflow:
         except workflow.NondeterminismError:
             raise
         except Exception as exc:
-            if not self.controller_failure_boundary or not terminal_projection:
-                raise
-            self.state["checks"]["terminal_projection_failure"] = {
+            record = {
                 "version": 1, "event_type": event,
                 "protocol_revision": self.state["revision"],
                 "projection_sha256": digest(projection),
                 "scheduled_event_id": getattr(exc, "scheduled_event_id", None),
-                "original_error": (self.state.get("error") or "")[:600],
                 **_controller_error(exc),
             }
-            if self.state.get("cleanup") != "confirmed":
-                self.state["cleanup"] = "unknown"
+            if self.controller_failure_boundary and terminal_projection:
+                self.state["checks"]["terminal_projection_failure"] = {
+                    **record, "original_error": (self.state.get("error") or "")[:600],
+                }
+                if self.state.get("cleanup") != "confirmed":
+                    self.state["cleanup"] = "unknown"
+            elif self.terminal_closing:
+                # The terminal projection that follows, or its reconciler, carries
+                # this readback record; the row is behind by a pending event only.
+                pending = self.state["checks"].setdefault(
+                    "pending_projection_failures", {"version": 1, "count": 0, "failures": []})
+                pending["count"] += 1
+                pending["failures"] = [*pending["failures"], record][-10:]
+            else:
+                raise
         if (event in {"delivered", "blocked", "cancelled"}
                 and spec.get("feature_delivery") and not spec.get("feature_worker")
                 and not getattr(self, "feature_coordinating", False)):
-            await self._activity("delivery_feature_stop", {
+            request = deepcopy({
                 "spec": spec, "checkpoint": {"state": self.state, "completed_chunks": []}})
+            try:
+                await self._activity("delivery_feature_stop", request)
+            except Exception as exc:
+                if not self.terminal_closing:
+                    raise
+                # The feature stop is replayed by maintenance from this exact
+                # scheduled request once the completed result authenticates it.
+                self.state["checks"]["feature_stop_failure"] = {
+                    "version": 1, "request_sha256": digest(request),
+                    "scheduled_event_id": getattr(exc, "scheduled_event_id", None),
+                    **_controller_error(exc),
+                }
 
     async def _finish_terminal_tracker(self, spec: dict[str, Any], checkpoint: dict) -> bool:
         """Keep the original execution open; each reconciliation cycle is finite."""
@@ -1041,6 +1080,12 @@ class DeliveryWorkflow:
     async def run(
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        # Single program-wide liveness gate, evaluated before any command. Every
+        # fix-program change to this workflow's command sequence checks it:
+        # executions recorded before the marker replay with False and keep their
+        # original behaviour; executions started after the upgrade, including
+        # recovery executions of older runs, get True.
+        self.liveness_v2 = workflow.patched("delivery-liveness-v2")
         if (spec.get("workflow_failure_boundary_version") != 1
                 or not workflow.patched("delivery-controller-failure-boundary-v1")):
             return await self._run_protocol(spec, recovery)
@@ -1052,13 +1097,23 @@ class DeliveryWorkflow:
             raise
         except Exception as exc:
             required_state = {"phase", "revision", "iteration", "roles", "checks"}
-            if (not isinstance(self.state, dict)
-                    or not required_state <= self.state.keys()
-                    or not isinstance(self.state["checks"], dict)
-                    or not isinstance(self.state["roles"], list)):
+            synthesized = (not isinstance(self.state, dict)
+                           or not required_state <= self.state.keys()
+                           or not isinstance(self.state["checks"], dict)
+                           or not isinstance(self.state["roles"], list))
+            if synthesized:
                 self.state = _initial_controller_state(spec)
+            stage = self.state["phase"]
+            if synthesized and recovery is not None:
+                # No controller state was loaded: name the admitted recovery
+                # instead of a preparation phase this execution never entered.
+                resumed = recovery.get("state") if isinstance(recovery, dict) else None
+                stage = (resumed["phase"] if isinstance(resumed, dict)
+                         and isinstance(resumed.get("phase"), str)
+                         else "recovery:" + str(recovery.get("kind")
+                                                if isinstance(recovery, dict) else "unknown"))
             self.state["checks"]["controller_failure"] = {
-                "version": 1, "stage": self.state["phase"], **_controller_error(exc),
+                "version": 1, "stage": stage, **_controller_error(exc),
             }
             self.state["cleanup"] = "unknown"
             try:

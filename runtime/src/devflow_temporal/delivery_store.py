@@ -389,6 +389,22 @@ class DeliveryStore:
                     authorized_at TEXT NOT NULL
                 )"""
             )
+            # Closed-projection maintenance state per execution identity, so a
+            # restart neither rescans history nor re-polls settled executions.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_closed_projections (
+                    run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
+                    workflow_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL,
+                    next_check_at TEXT,
+                    error TEXT,
+                    key TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, workflow_id)
+                )"""
+            )
 
             from .delivery_dashboard import initialize
 
