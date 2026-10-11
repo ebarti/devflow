@@ -813,12 +813,13 @@ class ExecutionRegistry:
             return json.loads(row[0]) if row else None
 
     def checkpoints(self, issue_id: str) -> dict:
+        """Immutable checkpoints in journal order; readers rely on that order as history."""
         with self.connect() as db:
             return {
                 row["checkpoint_key"]: json.loads(row["content_json"])
                 for row in db.execute(
                     "SELECT checkpoint_key,content_json FROM execution_checkpoints "
-                    "WHERE issue_id=?",
+                    "WHERE issue_id=? ORDER BY rowid",
                     (issue_id,),
                 )
             }

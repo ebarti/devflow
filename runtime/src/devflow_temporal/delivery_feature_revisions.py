@@ -2184,25 +2184,64 @@ def authenticate_revision_role(store, request):
     return _role_context(store, spec, context, proposal)
 
 
+def _revised_chunk(alias):
+    """The chunk an execution checkpoint proves and the receipt field that re-qualifies it."""
+    if alias.startswith("verified:"):
+        return alias.removeprefix("verified:"), "affected_chunks"
+    if alias.startswith("build:"):
+        return alias.removeprefix("build:"), "implementation_chunks"
+    if alias.startswith("assignment:"):
+        return alias.split(":")[1], "affected_chunks"
+    return None, None
+
+
+def _superseding_receipt(values, alias):
+    """The highest adopted revision that re-qualified the alias's chunk, with its key."""
+    chunk, field = _revised_chunk(alias)
+    if chunk is None:
+        return None
+    listing = [
+        (key, value)
+        for key, value in values.items()
+        if key.startswith(PREFIX + "adopted:") and chunk in value[field]
+    ]
+    return max(listing, key=lambda item: item[1]["identity"]["plan_revision"]) if listing else None
+
+
 def revision_checkpoints(spec, values):
-    """Expose unaffected proof plus explicitly revised namespaces, keeping source history."""
+    """Expose unaffected proof plus explicitly revised namespaces, keeping source history.
+
+    A chunk's proof belongs to the highest adopted revision that re-qualified it. ``values``
+    arrive in journal order, so a plain key appended after that receipt (an earlier namespacing
+    rule wrote it there) is current evidence rather than superseded history.
+    """
     result = dict(values)
+    journal = {key: index for index, key in enumerate(values)}
     receipts = sorted(
-        (value for key, value in values.items() if key.startswith(PREFIX + "adopted:")),
-        key=lambda value: value["identity"]["plan_revision"],
+        ((key, value) for key, value in values.items() if key.startswith(PREFIX + "adopted:")),
+        key=lambda item: item[1]["identity"]["plan_revision"],
     )
-    for receipt in receipts:
+    current_pass = values.get("integration-pass")
+    pass_prefix = "pass:" + str(current_pass["number"]) + ":" if current_pass else None
+    for receipt_key, receipt in receipts:
         affected = set(receipt["affected_chunks"])
         implementation = set(receipt["implementation_chunks"])
         for key in list(result):
             alias = key.split(":", 2)[-1] if key.startswith("pass:") else key
-            if alias.startswith("verified:") and alias.removeprefix("verified:") in affected:
-                result.pop(key)
-            elif alias.startswith("build:") and alias.removeprefix("build:") in implementation:
+            if not (
+                (alias.startswith("verified:") and alias.removeprefix("verified:") in affected)
+                or (alias.startswith("build:") and alias.removeprefix("build:") in implementation)
+            ):
+                continue
+            # A pass alias is journalled under its pass key, never at the alias position.
+            source = key
+            if pass_prefix and not key.startswith("pass:") and pass_prefix + key in journal:
+                source = pass_prefix + key
+            if key in values and journal.get(source, -1) > journal[receipt_key]:
+                result[key] = values[key]
+            else:
                 result.pop(key)
         prefix = "revision:" + str(receipt["identity"]["plan_revision"]) + ":"
-        current_pass = values.get("integration-pass")
-        pass_prefix = "pass:" + str(current_pass["number"]) + ":" if current_pass else None
         for key, value in values.items():
             if not key.startswith(prefix):
                 continue
@@ -2216,21 +2255,12 @@ def revision_checkpoints(spec, values):
 
 
 def revision_checkpoint_key(spec, key):
-    receipt = _latest(_values(spec))
-    if not receipt:
-        return key
+    """Namespace proof under the highest adopted revision that re-qualified its chunk."""
     alias = key.split(":", 2)[-1] if key.startswith("pass:") else key
-    affected = receipt["affected_chunks"]
-    if (
-        (alias.startswith("verified:") and alias.removeprefix("verified:") in affected)
-        or (
-            alias.startswith("build:")
-            and alias.removeprefix("build:") in receipt["implementation_chunks"]
-        )
-        or (alias.startswith("assignment:") and alias.split(":")[1] in affected)
-    ):
-        return "revision:" + str(receipt["identity"]["plan_revision"]) + ":" + key
-    return key
+    superseding = _superseding_receipt(_values(spec), alias)
+    if not superseding:
+        return key
+    return "revision:" + str(superseding[1]["identity"]["plan_revision"]) + ":" + key
 
 
 def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup=None):
