@@ -7,12 +7,14 @@ import contextvars
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import stat
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +34,13 @@ from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
 from .supervisor import activity_attempt_replaced, activity_retry_pending, get_supervisor
 
+_LOG = logging.getLogger(__name__)
 _CHECK_HEARTBEAT_INTERVAL = 5
-_UNCLEAN_CHECK_SLOTS: list[int] = []
+_UNCLEAN_CHECK_RECHECK_INTERVAL = 5.0
+# Gates with unknown teardown: their lock descriptors plus the processes and
+# ports their journals recorded, retained while any of those is observably live.
+_UNCLEAN_CHECK_SLOTS: list[dict[str, Any]] = []
+_UNCLEAN_CHECK_LOCK = threading.Lock()
 
 
 def _cancelled_check_result(request: dict[str, Any], broker: DeliveryBroker) -> dict[str, Any]:
@@ -47,6 +54,60 @@ def _cancelled_check_result(request: dict[str, Any], broker: DeliveryBroker) -> 
     else:
         result["base_sha"] = request["spec"]["base_sha"]
     return result
+
+
+def _retain_unclean_check(
+    descriptors: list[int], broker: DeliveryBroker, ports: tuple[int, ...],
+) -> None:
+    """Hold a gate's slot and port locks while what it recorded may still be live."""
+    from .delivery_resources import read_private
+
+    owned: dict[int, dict[str, Any]] = {}
+    journals = list(dict.fromkeys(broker.native_journals))
+    for journal in journals:
+        try:
+            recorded = read_private(journal).get("owned", {})
+        except (OSError, ValueError, KeyError, TypeError):
+            # A journal that never recorded a launch leaves nothing observable.
+            continue
+        owned.update({
+            int(pid): identity for pid, identity in recorded.items()
+            if isinstance(identity, dict) and identity.get("identity")
+        })
+    with _UNCLEAN_CHECK_LOCK:
+        _UNCLEAN_CHECK_SLOTS.append({
+            "descriptors": list(descriptors), "owned": owned, "ports": sorted(set(ports)),
+            "journals": [str(journal) for journal in journals],
+        })
+
+
+def _unclean_check_settled(entry: dict[str, Any]) -> bool:
+    """Proof that every process and port a retained gate recorded is gone."""
+    from .delivery_native_process import listeners, process_table
+
+    table = process_table()
+    if any(table.get(pid, {}).get("identity") == identity["identity"]
+           and not table[pid]["stat"].startswith("Z")
+           for pid, identity in entry["owned"].items()):
+        return False
+    return not any(listeners(port) for port in entry["ports"])
+
+
+def _release_settled_check_slots() -> None:
+    """Release retained gates whose recorded processes and ports are proven gone."""
+    with _UNCLEAN_CHECK_LOCK:
+        for entry in list(_UNCLEAN_CHECK_SLOTS):
+            try:
+                settled = _unclean_check_settled(entry)
+            except Exception as exc:
+                # Unavailable inspection proves nothing; the gate stays retained.
+                _LOG.warning("Retained check slot could not be re-proven for %s: %s",
+                             entry["journals"], exc)
+                continue
+            if settled:
+                _UNCLEAN_CHECK_SLOTS.remove(entry)
+                for descriptor in entry["descriptors"]:
+                    os.close(descriptor)
 
 
 def _bind_planning_repair(request, result):
@@ -103,7 +164,17 @@ async def _execute_check(
         slots = store.config.raw.get("check_concurrency", 2)
         descriptor = None
         port_descriptors = []
+        rechecked = float("-inf")
+
+        def recheck() -> None:
+            # Retained gates are re-proven at admission and while queued behind them.
+            nonlocal rechecked
+            if time.monotonic() - rechecked >= _UNCLEAN_CHECK_RECHECK_INTERVAL:
+                rechecked = time.monotonic()
+                _release_settled_check_slots()
+
         try:
+            recheck()
             # Frozen port sets may overlap across runs. Acquire them in one
             # consistent order, before consuming generic check capacity.
             for port in sorted(set(ports)):
@@ -112,6 +183,7 @@ async def _execute_check(
                     if handle is not None:
                         port_descriptors.append(handle)
                         break
+                    recheck()
                     cancelled.wait(0.1)
                 else:
                     raise CheckCancelledBeforeLaunch(
@@ -136,6 +208,7 @@ async def _execute_check(
                     if not broker.native_cleanup_confirmed:
                         result = {**result, "state": "unknown", "cleanup": "unknown"}
                     return _bind_planning_repair(request, result)
+                recheck()
                 cancelled.wait(0.1)
             raise CheckCancelledBeforeLaunch("native check cancelled while queued for a slot")
         except CheckCancelledBeforeLaunch:
@@ -147,8 +220,9 @@ async def _execute_check(
                 for handle in port_descriptors:
                     os.close(handle)
             else:
-                # Unknown teardown cannot supply ports or capacity to another gate.
-                _UNCLEAN_CHECK_SLOTS.extend(port_descriptors)
+                # Unknown teardown cannot supply ports or capacity to another gate
+                # until the processes and ports it recorded are proven gone.
+                _retain_unclean_check(port_descriptors, broker, ports)
 
     execution = asyncio.get_running_loop().run_in_executor(
         None, contextvars.copy_context().run, run,

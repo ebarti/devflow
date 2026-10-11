@@ -24,7 +24,7 @@ from devflow_temporal import delivery_activities as activities
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_process import NativeProcess, process_table, reconcile_process
-from devflow_temporal.delivery_resources import RunResources, read_private
+from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -81,12 +81,14 @@ def owned_checks(tmp_path, monkeypatch):
                     f"time.sleep({self.spec['sleep']})"
                 )
                 self.native_cleanup_confirmed = False
-                self.result = NativeProcess(
+                process = NativeProcess(
                     self.spec, Path(self.spec["state_dir"]) / "native",
                     argv=[sys.executable, "-c", code], cwd=tmp_path,
                     environment={"PATH": os.environ["PATH"]},
                     timeout=self.spec["timeout"], cancelled=self._native_cancelled,
-                ).run()
+                )
+                self.native_journals += (process.journal,)
+                self.result = process.run()
                 self.native_cleanup_confirmed = (
                     self.result["cleanup"] == "observed-native-confirmed"
                 )
@@ -120,8 +122,9 @@ def owned_checks(tmp_path, monkeypatch):
         in_activity=in_activity, heartbeat=heartbeat,
         retained_slots=retained,
     )
-    for descriptor in activities._UNCLEAN_CHECK_SLOTS[retained:]:
-        os.close(descriptor)
+    for entry in activities._UNCLEAN_CHECK_SLOTS[retained:]:
+        for descriptor in entry["descriptors"]:
+            os.close(descriptor)
     del activities._UNCLEAN_CHECK_SLOTS[retained:]
 
 
@@ -527,14 +530,23 @@ async def test_slot_is_held_until_real_monitor_confirms_cleanup(owned_checks, mo
     assert_stopped(owned_checks.brokers["first"])
 
 
-async def test_unknown_cleanup_does_not_release_occupied_slot(owned_checks, monkeypatch):
+async def test_unknown_cleanup_retains_slot_until_recorded_processes_are_gone(
+    owned_checks, monkeypatch,
+):
     owned_checks.config.raw["check_concurrency"] = 1
+    monkeypatch.setattr(activities, "_UNCLEAN_CHECK_RECHECK_INTERVAL", 0.05, raising=False)
     original = NativeProcess.run
     retained = len(activities._UNCLEAN_CHECK_SLOTS)
+    stray = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
 
     def unknown(process):
         result = original(process)
-        result["cleanup"] = "unknown"  # Simulate uncertain evidence after real teardown.
+        # Uncertain evidence after teardown: the journal still records one
+        # live descendant whose exit nobody observed.
+        journal = read_private(process.journal)
+        journal["owned"][str(stray.pid)] = process_table()[stray.pid]
+        write_private(process.journal, journal)
+        result["cleanup"] = "unknown"
         return result
 
     monkeypatch.setattr(NativeProcess, "run", unknown)
@@ -542,15 +554,26 @@ async def test_unknown_cleanup_does_not_release_occupied_slot(owned_checks, monk
         result = await activities.delivery_checks(owned_checks.request("uncertain"))
         assert result == {"state": "unknown", "cleanup": "unknown"}
         assert len(activities._UNCLEAN_CHECK_SLOTS) == retained + 1
+        entry = activities._UNCLEAN_CHECK_SLOTS[-1]
+        monkeypatch.setattr(NativeProcess, "run", original)
         task = asyncio.create_task(activities.delivery_checks(owned_checks.request("queued")))
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.3)
+        # A live recorded process keeps the slot retained across admissions.
         assert not owned_checks.brokers["queued"].started.is_set()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained + 1
+        stray.kill()
+        stray.wait()
+        # Once every recorded process is proven gone, the queued gate is admitted.
+        assert await asyncio.wait_for(task, 10) == {"state": "passed", "cleanup": "confirmed"}
+        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained
+        assert_stopped(owned_checks.brokers["queued"])
+        assert stray.pid in entry["owned"] and entry["ports"] == []
     finally:
-        for descriptor in activities._UNCLEAN_CHECK_SLOTS[retained:]:
-            os.close(descriptor)
+        stray.kill()
+        stray.wait()
+        for entry in activities._UNCLEAN_CHECK_SLOTS[retained:]:
+            for descriptor in entry["descriptors"]:
+                os.close(descriptor)
         del activities._UNCLEAN_CHECK_SLOTS[retained:]
 
 

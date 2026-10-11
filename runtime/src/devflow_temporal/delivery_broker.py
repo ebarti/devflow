@@ -117,6 +117,10 @@ class CheckCancelledBeforeLaunch(RuntimeError):
 
 
 class DeliveryBroker:
+    # Journals of the native gates a broker ran or joined, so an unknown
+    # teardown can be re-proven against the processes they recorded.
+    native_journals: tuple[Path, ...] = ()
+
     def __init__(self, store: DeliveryStore, spec: dict[str, Any]) -> None:
         from .delivery_preparation import require_native_execution
 
@@ -978,6 +982,7 @@ class DeliveryBroker:
         if self._native_cancelled():
             raise CheckCancelledBeforeLaunch("native check cancelled before launch")
         self.native_cleanup_confirmed = False
+        self.native_journals += (process.journal,)
         result = process.run()
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
         return result
@@ -986,6 +991,7 @@ class DeliveryBroker:
         from .delivery_native_process import reconcile_process
 
         self.native_cleanup_confirmed = False
+        self.native_journals += (journal,)
         result = reconcile_process(journal)
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
         return result
