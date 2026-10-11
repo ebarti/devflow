@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 from temporalio import activity
-from test_delivery_api import api_fixture  # noqa: F401
-from test_delivery_prelaunch_capacity import native_role  # noqa: F401
+from test_delivery_api import api_fixture as api_fixture
+from test_delivery_prelaunch_capacity import native_role as native_role
 
 import devflow_temporal.delivery_broker as broker_module
 import devflow_temporal.delivery_native_preparation as native
