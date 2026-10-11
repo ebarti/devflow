@@ -426,13 +426,17 @@ def continue_feature(store, run_id, request, *, _revision=None):
     shared = registry(original)
     token = original["feature_delivery"]["owner"]
     if _revision is None:
-        from .delivery_feature_revisions import continue_pending_preparation, revision_request
+        from .delivery_feature_revisions import (
+            abandon_reserved_revision,
+            continue_pending_preparation,
+            revision_request,
+        )
 
         execution = store.effective_spec(run_id)
-        reserved = revision_request(execution, shared)
-        if abandon is not None and not reserved:
-            raise OwnershipConflict("feature has no reserved revision to abandon")
-        if reserved:
+        if abandon is not None:
+            # Idempotent: a reservation this command already closed is simply absent.
+            abandon_reserved_revision(store, execution, abandon, request["command_id"])
+        elif revision_request(execution, shared):
             _revision = continue_pending_preparation(store, execution, row, request, successor_id)
     current = shared.current(token["issue_id"])
     replay_claim = bool(_revision and "preparation_retry" in _revision and current

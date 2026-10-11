@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_config import COMMAND_RE
-from .delivery_execution_registry import OwnershipConflict
+from .delivery_execution_registry import OwnershipConflict, UnresolvedEffect
 
 PREFIX = "plan-revision:"
 DIAGNOSTIC_FIELDS = {
@@ -423,11 +423,18 @@ def revise_feature_plan(store, run_id, request):
                     raise OwnershipConflict("reconsideration proof changed before reservation")
                 for key, item in values.items():
                     existing = item.get("reconsideration") if isinstance(item, dict) else None
-                    if (key.startswith(PREFIX + "request:") and existing
-                            and existing["context_key"] == proof["context_key"]
-                            and item["request_digest"] != command_digest):
+                    if (not key.startswith(PREFIX + "request:") or not existing
+                            or existing["context_key"] != proof["context_key"]
+                            or item["request_digest"] == command_digest):
+                        continue
+                    holder = item["revision_id"]
+                    if not _terminal(values, holder):
+                        raise OwnershipConflict("review context already reserved by " + holder)
+                    # A closed reservation keeps the context only if it was spent on it.
+                    if _started_reservation(shared, token, holder, values):
                         raise OwnershipConflict(
-                            "review context already reserved by " + item["revision_id"]
+                            "review context already consumed by " + holder
+                            + ", which was closed after it was charged"
                         )
             if unstarted:
                 raise OwnershipConflict(
@@ -639,15 +646,6 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
         return None
     revision_id = public["revision_id"]
     replay = "; replay continue-feature " + request["command_id"] + " to continue without it"
-    if request.get("abandon_revision") is not None:
-        if request["abandon_revision"] != revision_id:
-            raise OwnershipConflict(
-                "feature has no reserved revision " + request["abandon_revision"]
-                + "; its recorded reservation is " + revision_id
-            )
-        _abandon_reservation(store, spec, shared, public, values,
-                             "abandoned by continuation command " + request["command_id"])
-        return None
     if _started_reservation(shared, token, revision_id, values):
         # A begun (or charged) attempt belongs to the generation that began it: no
         # continuation can transport it and no later begin may resume it, so this
@@ -1082,7 +1080,15 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
                             in _legacy_binding_ids(shared, token["issue_id"], diagnostic)
                         )
                     )
-                    if bound:
+                    # One worker debit backs at most one attempt: an earlier begin that
+                    # already named it (closed or not) leaves this attempt to pay anew.
+                    spent = any(
+                        name.startswith(PREFIX + "begin:")
+                        and item.get("revision_id") != revision_id
+                        and item.get("repair_key") == expected_key
+                        for name, item in values.items()
+                    )
+                    if bound and not spent:
                         with shared.connect() as db:
                             paid = db.execute(
                                 "SELECT repair_key FROM execution_repairs "
@@ -2004,9 +2010,72 @@ def reject_revision(store, spec, revision_id, reason):
         ).fetchone()
     if pending:
         raise OwnershipConflict("revision cannot release custody with unsettled external effects")
+    release = _releasable_custody(shared, context["owner"]["issue_id"], revision_id)
     receipt = _rejection_receipt(shared, context, values, reason)
     shared.revision_checkpoint(context["owner"], PREFIX + "rejected:" + revision_id, receipt)
+    _release_custody(shared, context["owner"], release)
     return receipt
+
+
+def _publication_custody(shared, issue_id, revision_id):
+    """The staged publication an attempt may hold: its stage and this operation's effects."""
+    stage_key = "github-plan-stage:" + digest(revision_id)
+    with shared.connect() as db:
+        stage = db.execute(
+            "SELECT content_json FROM execution_checkpoints "
+            "WHERE issue_id=? AND checkpoint_key=?", (issue_id, stage_key),
+        ).fetchone()
+        rows = [dict(row) for row in db.execute(
+            "SELECT effect_key,kind,state,request_json,result_json FROM execution_effects "
+            "WHERE issue_id=? AND kind IN ('github_child_plan','github_plan_revision')",
+            (issue_id,),
+        )]
+    effects = [row for row in rows
+               if json.loads(row["request_json"]).get("operation_id") == revision_id]
+    return (json.loads(stage[0]) if stage else None), stage_key, effects
+
+
+def _releasable_custody(shared, issue_id, revision_id):
+    """Refuse to close an attempt whose publication may have reached the parent record.
+
+    A stage whose parent effect was never intended (and whose child-plan effects
+    are settled) can be released: the parent record provably never changed for it.
+    """
+    stage, stage_key, effects = _publication_custody(shared, issue_id, revision_id)
+    if any(e["kind"] == "github_plan_revision" and e["state"] == "complete" for e in effects):
+        raise OwnershipConflict(
+            "revision attempt already published its plan revision and cannot be closed"
+        )
+    if any(e["state"] == "pending" for e in effects):
+        raise OwnershipConflict(
+            "revision attempt holds an unsettled plan publication; settle its readback first"
+        )
+    if stage is None:
+        return None
+    return {
+        "version": 1,
+        "operation_id": revision_id,
+        "stage_key": stage_key,
+        "target_plan_revision": stage.get("target_plan_revision"),
+        # Child-plan comments already written for this operation. Their bodies carry
+        # this operation's creation key and the parent index never referenced them,
+        # so they stay inert; this ledger keeps them accounted for.
+        "children": [
+            {"effect_key": e["effect_key"], "state": e["state"],
+             "child": json.loads(e["request_json"]).get("child"),
+             "reference": json.loads(e["result_json"] or "null")}
+            for e in effects if e["kind"] == "github_child_plan"
+        ],
+    }
+
+
+def _release_custody(shared, token, release, *, stopped=False):
+    if release is None:
+        return
+    shared.revision_checkpoint(
+        token, PREFIX + "publication-released:" + release["operation_id"],
+        {**release, "released_by": token}, stopped=stopped,
+    )
 
 
 def _rejection_receipt(shared, context, values, reason):
@@ -2033,8 +2102,10 @@ def _close_attempt(shared, token, context, values, reason, *, stopped=False):
             (token["issue_id"], "plan-revision:" + revision_id),
         ).fetchone()
     subject = {**context, "repair_key": context.get("repair_key") or (paid[0] if paid else None)}
+    release = _releasable_custody(shared, token["issue_id"], revision_id)
     receipt = {**_rejection_receipt(shared, subject, values, reason), "closed_by": token}
     shared.revision_checkpoint(token, PREFIX + "rejected:" + revision_id, receipt, stopped=stopped)
+    _release_custody(shared, token, release, stopped=stopped)
     return receipt
 
 
@@ -2086,6 +2157,35 @@ def _close_stopped_attempts(shared, token, values, reason):
     for key, context in list(values.items()):
         if key.startswith(PREFIX + "begin:") and not _terminal(values, context["revision_id"]):
             _close_attempt(shared, token, context, values, reason, stopped=True)
+
+
+def abandon_reserved_revision(store, spec, revision_id, command_id):
+    """Close the named reservation held by this stopped run; an exact replay is a no-op.
+
+    The reservation may be carried by this run, or it may have been reserved from
+    this run without its successor ever being admitted (an orphaned request).
+    """
+    shared = _registry(spec)
+    token = spec["feature_delivery"]["owner"]
+    values = _values(spec, shared)
+    if _terminal(values, revision_id):
+        return None
+    public = revision_request(spec, shared)
+    if not public or public["revision_id"] != revision_id:
+        with shared.connect() as db:
+            pending = shared._pending_revision(db, token["issue_id"])
+        if (pending and pending["revision_id"] == revision_id
+                and pending.get("predecessor_run_id") == spec["run_id"]):
+            public = pending
+        else:
+            recorded = (public or pending or {}).get("revision_id")
+            raise OwnershipConflict(
+                "feature has no reserved revision " + revision_id
+                + (("; its recorded reservation is " + recorded) if recorded
+                   else " to abandon")
+            )
+    return _abandon_reservation(store, spec, shared, public, values,
+                                "abandoned by continuation command " + command_id)
 
 
 def _review_authorized(store, spec, context, proposal, review):
@@ -2279,8 +2379,13 @@ def settle_adoption(store, spec, revision_id, proposed_plan, review, gh=None):
         return _replayed_adoption(store, spec, context, terminal)
     try:
         return _publish_adoption(store, spec, context, proposal, gh)
-    except Exception as failure:
-        return _reconcile_adoption(store, spec, context, proposal, review, gh, failure)
+    except UnresolvedEffect:
+        raise
+    except ValueError as refusal:
+        # Deterministic refusals only. Transport failures (GitHubContractError,
+        # OSError, timeouts) propagate so the activity's retry resumes the same
+        # idempotent operation instead of ending the reviewed correction.
+        return _reconcile_adoption(store, spec, context, proposal, review, gh, refusal)
 
 
 def _refused_adoption(store, spec, revision_id, refusal):
@@ -2323,7 +2428,12 @@ def _reconcile_adoption(store, spec, context, proposal, review, gh, failure):
         return adopt_revision(
             store, spec, context["revision_id"], proposal["plan"], review, gh=gh
         )
-    if observed == {key: original[key] for key in observed}:
+    shared = _registry(spec)
+    stage, _, effects = _publication_custody(
+        shared, context["owner"]["issue_id"], context["revision_id"]
+    )
+    if observed == {key: original[key] for key in observed} and stage is None and not effects:
+        # Refused before any remote write of this operation: nothing to settle.
         return _refused_adoption(store, spec, context["revision_id"], failure)
     raise failure
 

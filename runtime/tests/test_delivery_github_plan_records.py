@@ -614,3 +614,42 @@ def test_initial_v2_uncertain_effects_recover_original_comments_before_stop(
     assert len({raw["body"] for raw in remote.comments.values()}) == len(remote.comments)
     assert remote.load_record(issue, corrected) == corrected
     registry.stop(token, "settled-initial-stop", {})
+
+
+def test_closed_staged_operation_releases_custody_for_a_later_revision(tmp_path):
+    remote, issue, registry, token = setup(tmp_path)
+    original = legacy_publication(remote, issue, registry, token)
+    revised = converted(original)
+    before = {number: deepcopy(raw) for number, raw in remote.comments.items()}
+    remote.stage_plan_revision(issue, original, revised, registry, token, operation_id="first")
+    orphaned = set(remote.comments) - set(before)
+    assert orphaned
+    staged = {number: deepcopy(remote.comments[number]) for number in orphaned}
+    with pytest.raises(OwnershipConflict, match="retains publication custody"):
+        remote.publish_plan_revision(issue, original, revised, registry, token,
+                                     operation_id="competing")
+    # The attempt behind "first" ends without its parent revision ever being intended:
+    # the closing receipt releases the stage; the staged child comments stay inert.
+    registry.revision_checkpoint(token, "plan-revision:rejected:first", {
+        "revision_id": "first", "phase": "rejected", "reason": "independent review refused it"})
+    current = remote.publish_plan_revision(issue, original, revised, registry, token,
+                                           operation_id="competing")
+    assert current["manifest"]["plan_revision"] == 2
+    referenced = {ref["comment_id"] for ref in current["manifest"]["workstream_plans"].values()}
+    assert not referenced & orphaned
+    assert all(remote.comments[number] == staged[number] for number in orphaned)
+    assert all(remote.comments[number] == before[number]
+               for number in before if number != original["comment_id"])
+    assert remote.load_record(issue, current)["manifest"]["plan_revision"] == 2
+    assert registry.effect(issue["id"], "github-plan-revision:" + digest("first")) is None
+    # A closed operation whose parent revision was intended stays uncertain custody.
+    registry.checkpoint(token, "github-plan-stage:" + digest("ghost"), {
+        "operation_id": "ghost", "before_record": current, "target_plan_revision": 3,
+        "plan_digest": digest(revised)})
+    registry.intent(token, "github-plan-revision:" + digest("ghost"), "github_plan_revision",
+                    {"operation_id": "ghost"})
+    registry.revision_checkpoint(token, "plan-revision:rejected:ghost", {
+        "revision_id": "ghost", "phase": "rejected", "reason": "closed while uncertain"})
+    with pytest.raises(OwnershipConflict, match="retains publication custody"):
+        remote.publish_plan_revision(issue, current, revised, registry, token,
+                                     operation_id="later")

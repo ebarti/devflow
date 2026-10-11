@@ -378,3 +378,34 @@ async def test_fresh_native_intake_is_readable_before_an_accepted_plan_exists(se
     assert current["child_plan_links"] == {} and current["expected_paths"] == {}
     assert current["can_revise"] is False and current["reason_ineligible"]
     assert store.feature(request["run_id"])["feature_plan"]["phase"] == "unplanned"
+
+
+@pytest.mark.asyncio
+async def test_http_continuation_reports_transport_failures_as_retryable(service, monkeypatch):
+    store, spec, _record, _gh, _original, _command = stopped_feature(service, monkeypatch)
+    app = create_app(store.config.path)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+    url = store.config.dashboard_url
+    route = "/api/runs/" + spec["run_id"] + "/continue-feature"
+    command = {"command_id": "continue-1", "expected_revision": 1}
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError(
+            "continuation predecessor Temporal closure is unavailable (ConnectionRefusedError)")
+
+    def refused(*_args, **_kwargs):
+        raise OwnershipConflict("feature is not at the specified stopped checkpoint")
+
+    async with httpx.AsyncClient(transport=transport, base_url=url) as browser:
+        session = await browser.get("/api/session")
+        headers = {"Origin": url, "X-Devflow-CSRF": session.json()["csrf_token"]}
+        monkeypatch.setattr("devflow_temporal.delivery_feature_execution.continue_feature",
+                            unavailable)
+        retryable = await browser.post(route, json=command, headers=headers)
+        assert retryable.status_code == 503
+        assert "Temporal closure is unavailable" in retryable.json()["detail"]
+        monkeypatch.setattr("devflow_temporal.delivery_feature_execution.continue_feature",
+                            refused)
+        conflict = await browser.post(route, json=command, headers=headers)
+        assert conflict.status_code == 409
+        assert "stopped checkpoint" in conflict.json()["detail"]

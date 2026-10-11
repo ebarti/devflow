@@ -89,6 +89,14 @@ def test_lost_publication_response_completes_adoption_from_github_readback(featu
             return deepcopy(published)
 
     publisher = Publisher()
+    # The lost response is a transport failure: it propagates so the activity retry
+    # resumes the same operation; nothing is rejected in between.
+    with pytest.raises(ConnectionError, match="response lost after remote commit"):
+        revisions.settle_adoption(
+            store, spec, context["revision_id"], value, passing(context, value), gh=publisher
+        )
+    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
+    assert PREFIX + "rejected:" + context["revision_id"] not in shared.checkpoints(issue_id)
     result = revisions.settle_adoption(
         store, spec, context["revision_id"], value, passing(context, value), gh=publisher
     )
@@ -278,8 +286,9 @@ def test_unstarted_reservation_names_itself_and_can_be_abandoned_explicitly(
     successor = store.effective_spec(receipt["run_id"])
     stopped = _stop_revision_fixture(store, successor, shared)
     reserved = successor["feature_delivery"]["owner"]
-    with pytest.raises(OwnershipConflict, match="reserved by command revise-1 for run "
-                       + receipt["run_id"] + "; continue that run, or continue-feature"):
+    with pytest.raises(OwnershipConflict, match="reserved by command revise-1 on run "
+                       + spec["run_id"] + " for successor " + receipt["run_id"]
+                       + "; replay that revise-feature-plan command"):
         shared.claim(spec["feature_delivery"]["snapshot"], "run-feature-other",
                      str(store.config.tracking_db), predecessor=reserved)
     with pytest.raises(OwnershipConflict, match="another revision command in custody: revision "
@@ -306,10 +315,15 @@ def test_unstarted_reservation_names_itself_and_can_be_abandoned_explicitly(
     assert revisions.revision_request(third) is None
     assert execution.continue_feature(store, successor["run_id"], request) == response
     plain = _stop_revision_fixture(store, third, shared)
-    with pytest.raises(OwnershipConflict, match="no reserved revision to abandon"):
+    with pytest.raises(OwnershipConflict, match="no reserved revision revision-unknown to abandon"):
         execution.continue_feature(store, third["run_id"], {
             "command_id": "abandon-3", "expected_revision": plain["revision"],
-            "abandon_revision": receipt["revision_id"]})
+            "abandon_revision": "revision-unknown"})
+    # Naming the reservation this feature already closed is idempotent, not a refusal.
+    again = execution.continue_feature(store, third["run_id"], {
+        "command_id": "abandon-4", "expected_revision": plain["revision"],
+        "abandon_revision": receipt["revision_id"]})
+    assert store.effective_spec(again["run_id"])["feature_delivery"]["owner"]["generation"] == 4
 
 
 def test_remote_pull_request_lookup_failure_is_retryable_not_a_refusal(monkeypatch):
@@ -329,10 +343,8 @@ def test_remote_pull_request_lookup_failure_is_retryable_not_a_refusal(monkeypat
         DeliveryStore._ensure_no_remote_pr("example/fixture", "feat/df-1")
 
 
-def test_worker_paid_planning_defect_is_charged_once_across_a_continuation(
-    feature, monkeypatch,
-):
-    from devflow_temporal.contracts import digest
+def _bound_worker_defect(store, spec, shared, record, diagnostic):
+    """A finished worker whose product repair at iteration 1 bound a planning defect."""
     from devflow_temporal.delivery_feature_execution import (
         register_worker,
         worker_key,
@@ -340,7 +352,6 @@ def test_worker_paid_planning_defect_is_charged_once_across_a_continuation(
     )
     from devflow_temporal.delivery_github_contract import ordered_chunks
 
-    store, spec, shared, record, diagnostic = feature
     owner = spec["feature_delivery"]["owner"]
     plan = record["manifest"]["plan"]
     chunk = next(item for item in ordered_chunks(plan) if item["id"] == "model")
@@ -367,6 +378,17 @@ def test_worker_paid_planning_defect_is_charged_once_across_a_continuation(
         "chunk_id": "model", "kind": "build", "run_id": child["run_id"],
         "store_path": str(store.config.tracking_db)})
     shared.finish_worker(owner, worker_key(child["run_id"], owner), {"cleanup": "confirmed"})
+    return child, defect, binding
+
+
+def test_worker_paid_planning_defect_is_charged_once_across_a_continuation(
+    feature, monkeypatch,
+):
+    from devflow_temporal.contracts import digest
+
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    child, defect, binding = _bound_worker_defect(store, spec, shared, record, diagnostic)
     assert shared.budget(owner["issue_id"])["used"] == 1
 
     frozen = _stopped_feature(store, spec, shared, monkeypatch)
@@ -404,3 +426,215 @@ def test_repair_alias_written_by_an_earlier_generation_keeps_its_single_debit(tm
     with pytest.raises(OwnershipConflict, match="alias lost its exact cumulative debit"):
         shared.repair(second, "worker:5", "Product repair at worker iteration 6")
     assert shared.budget(issue["id"])["used"] == 1
+
+
+def test_worker_debit_backs_at_most_one_attempt(feature, monkeypatch):
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    child, defect, _ = _bound_worker_defect(store, spec, shared, record, diagnostic)
+    first = revisions.begin_revision(store, spec, defect)
+    assert first["repair_key"] == child["run_id"] + ":1"
+    assert shared.budget(owner["issue_id"])["used"] == 1
+    revisions.reject_revision(store, spec, first["revision_id"],
+                              "independent plan review rejected the correction")
+    frozen = _stopped_feature(store, spec, shared, monkeypatch)
+    response = execution.continue_feature(store, spec["run_id"], {
+        "command_id": "continue-1", "expected_revision": frozen["revision"]})
+    successor = store.effective_spec(response["run_id"])
+    DeliveryBroker(store, successor).prepare()
+    second = revisions.begin_revision(store, successor, defect)
+    assert second["revision_id"] != first["revision_id"]
+    # The worker's cycle already backed the first attempt; the next one pays anew.
+    assert second["repair_key"] == "plan-revision:" + second["revision_id"]
+    assert second["paid_worker_run_id"] is None
+    assert second["budget"]["used"] == 2 == shared.budget(owner["issue_id"])["used"]
+
+
+def test_transient_publication_failure_propagates_for_the_activity_retry(feature):
+    from devflow_temporal.delivery_github_contract import GitHubContractError
+
+    store, spec, shared, record, diagnostic = feature
+    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
+    context, value = _sealed(store, spec, record, diagnostic)
+    published = _published(record, value)
+
+    class Flaky:
+        healthy = False
+
+        def publish_plan_revision(self, issue, old, plan, journal, token, *, operation_id):
+            if not self.healthy:
+                raise GitHubContractError("gh: HTTP 502: Bad Gateway", 502)
+            journal.intent(token, "commit", "github_plan_revision", {"operation_id": operation_id})
+            journal.finish_effect(token, "commit", {"revision": 2})
+            return deepcopy(published)
+
+        def load_record(self, issue, reference):
+            return deepcopy(record)
+
+    gh = Flaky()
+    review = passing(context, value)
+    with pytest.raises(GitHubContractError, match="HTTP 502"):
+        revisions.settle_adoption(store, spec, context["revision_id"], value, review, gh=gh)
+    assert PREFIX + "rejected:" + context["revision_id"] not in shared.checkpoints(issue_id)
+    gh.healthy = True  # the activity's next retry attempt
+    result = revisions.settle_adoption(store, spec, context["revision_id"], value, review, gh=gh)
+    assert result["state"] == "adopted" and result["budget"]["used"] == 1
+
+
+def _staging_publisher(record, failure):
+    """Mirror _stage_locked's order: competing check, stage, child plans, then a failure."""
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_github_plans import _ensure_no_competing_effects, _stage_key
+
+    class Staging:
+        def publish_plan_revision(self, issue, old, plan, journal, token, *, operation_id):
+            _ensure_no_competing_effects(journal, token, operation_id)
+            journal.checkpoint(token, _stage_key(operation_id), {
+                "operation_id": operation_id, "before_record": old,
+                "target_plan_revision": 2, "plan_digest": digest(plan)})
+            key = "github-child-plan:" + digest({"operation_id": operation_id, "stream": "api"})
+            journal.intent(token, key, "github_child_plan", {
+                "operation_id": operation_id, "child": {"id": "child-api", "number": 10}})
+            journal.finish_effect(token, key, {"comment_id": 7, "comment_node_id": "IC_7"})
+            raise failure
+
+        def load_record(self, issue, reference):
+            return deepcopy(record)
+
+    return Staging()
+
+
+def test_closed_staged_attempt_releases_custody_for_the_next_correction(feature):
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_github_contract import GitHubContractError
+    from devflow_temporal.delivery_github_plans import _ensure_no_competing_effects, _stage_key
+
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    context, value = _sealed(store, spec, record, diagnostic)
+    staging = _staging_publisher(
+        record, GitHubContractError("gh: HTTP 502 while hydrating staged child plans", 502))
+    with pytest.raises(GitHubContractError):
+        revisions.settle_adoption(
+            store, spec, context["revision_id"], value, passing(context, value), gh=staging)
+    values = shared.checkpoints(owner["issue_id"])
+    assert PREFIX + "rejected:" + context["revision_id"] not in values
+    assert _stage_key(context["revision_id"]) in values
+    # The attempt ends (independent review refused it); its staged custody is released
+    # with a ledger of the child plans it already wrote.
+    revisions.reject_revision(store, spec, context["revision_id"],
+                              "independent plan review rejected the correction")
+    ledger = shared.checkpoints(owner["issue_id"])[
+        PREFIX + "publication-released:" + context["revision_id"]]
+    assert ledger["stage_key"] == _stage_key(context["revision_id"])
+    assert ledger["released_by"] == owner and ledger["target_plan_revision"] == 2
+    assert ledger["children"] == [{
+        "effect_key": "github-child-plan:" + digest(
+            {"operation_id": context["revision_id"], "stream": "api"}),
+        "state": "complete", "child": {"id": "child-api", "number": 10},
+        "reference": {"comment_id": 7, "comment_node_id": "IC_7"}}]
+    another = {**diagnostic, "detail": "A second evidenced planning defect."}
+    second = revisions.begin_revision(store, spec, another)
+    assert second["budget"]["used"] == 2
+    value2 = deepcopy(value)
+    value2["workstreams"][0]["chunks"][0]["verification"].append("Verify the second defect")
+    revisions.record_proposal(store, spec, second["revision_id"], value2)
+    published = _published(record, value2)
+
+    class Clean:
+        def publish_plan_revision(self, issue, old, plan, journal, token, *, operation_id):
+            _ensure_no_competing_effects(journal, token, operation_id)
+            key = "github-plan-revision:" + digest(operation_id)
+            journal.intent(token, key, "github_plan_revision", {"operation_id": operation_id})
+            journal.finish_effect(token, key, {"plan_revision": 2})
+            return deepcopy(published)
+
+        def load_record(self, issue, reference):
+            return deepcopy(record)
+
+    result = revisions.settle_adoption(
+        store, spec, second["revision_id"], value2, passing(second, value2), gh=Clean())
+    assert result["state"] == "adopted" and result["budget"]["used"] == 2
+
+
+def test_published_attempt_cannot_be_closed_as_rejected(feature):
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_github_plans import _stage_key
+
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    context, value = _sealed(store, spec, record, diagnostic)
+    rid = context["revision_id"]
+    shared.checkpoint(owner, _stage_key(rid), {"operation_id": rid, "target_plan_revision": 2})
+    key = "github-plan-revision:" + digest(rid)
+    shared.intent(owner, key, "github_plan_revision", {"operation_id": rid})
+    shared.finish_effect(owner, key, {"plan_revision": 2})
+    with pytest.raises(OwnershipConflict, match="already published its plan revision"):
+        revisions.reject_revision(store, spec, rid, "operator closed the attempt")
+    assert PREFIX + "rejected:" + rid not in shared.checkpoints(owner["issue_id"])
+
+
+def test_abandon_replays_exactly_after_a_failure_past_the_closure(feature, monkeypatch):
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    frozen = _stopped_feature(store, spec, shared, monkeypatch)
+    receipt = _revise(store, spec, frozen["revision"])
+    successor = store.effective_spec(receipt["run_id"])
+    stopped = _stop_revision_fixture(store, successor, shared)
+    closed = {"result": {"cleanup": "confirmed"}, "workflow_id": "closed"}
+    calls = []
+
+    def flaky(*_args):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("continuation predecessor Temporal closure is unavailable (x)")
+        return closed
+
+    monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator", flaky)
+    request = {"command_id": "abandon-1", "expected_revision": stopped["revision"],
+               "abandon_revision": receipt["revision_id"]}
+    with pytest.raises(RuntimeError, match="unavailable"):
+        execution.continue_feature(store, successor["run_id"], request)
+    assert PREFIX + "rejected:" + receipt["revision_id"] in shared.checkpoints(owner["issue_id"])
+    response = execution.continue_feature(store, successor["run_id"], request)
+    assert store.effective_spec(response["run_id"])["feature_delivery"]["owner"]["generation"] == 3
+    assert execution.continue_feature(store, successor["run_id"], request) == response
+
+
+@pytest.mark.parametrize("remedy", ["replay", "abandon"])
+def test_orphaned_reservation_is_replayable_or_abandonable_from_its_run(
+    feature, monkeypatch, remedy,
+):
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    frozen = _stopped_feature(store, spec, shared, monkeypatch)
+    real = execution.continue_feature
+
+    def failing(*_args, **_kwargs):
+        raise RuntimeError("continuation predecessor Temporal closure is unavailable (x)")
+
+    monkeypatch.setattr(execution, "continue_feature", failing)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        _revise(store, spec, frozen["revision"])
+    monkeypatch.setattr(execution, "continue_feature", real)
+    with shared.connect() as db:
+        reserved = shared._pending_revision(db, owner["issue_id"])
+    with store._connect() as db:
+        assert db.execute("SELECT 1 FROM delivery_runs WHERE run_id=?",
+                          (reserved["successor_id"],)).fetchone() is None
+    plain = {"command_id": "continue-1", "expected_revision": frozen["revision"]}
+    with pytest.raises(OwnershipConflict, match="reserved by command revise-1 on run "
+                       + spec["run_id"] + " for successor " + reserved["successor_id"]
+                       + "; replay that revise-feature-plan command to admit the successor"):
+        execution.continue_feature(store, spec["run_id"], plain)
+    if remedy == "replay":
+        replay = _revise(store, spec, frozen["revision"])
+        assert replay["run_id"] == reserved["successor_id"]
+        assert revisions.revision_request(store.effective_spec(replay["run_id"])) == reserved
+        return
+    request = {**plain, "command_id": "abandon-1", "abandon_revision": reserved["revision_id"]}
+    response = execution.continue_feature(store, spec["run_id"], request)
+    closed = shared.checkpoints(owner["issue_id"])[PREFIX + "rejected:" + reserved["revision_id"]]
+    assert closed["closed_by"] == owner and closed["repair_key"] is None
+    assert revisions.revision_request(store.effective_spec(response["run_id"])) is None
+    assert execution.continue_feature(store, spec["run_id"], request) == response

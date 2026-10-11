@@ -221,12 +221,20 @@ def _ensure_no_competing_effects(registry, token, operation_id):
     with registry.connect() as db:
         pending = list(db.execute("SELECT kind,request_json FROM execution_effects "
                                   "WHERE issue_id=? AND state='pending'", (token["issue_id"],)))
-    for stage_key, stage in registry.checkpoints(token["issue_id"]).items():
+    values = registry.checkpoints(token["issue_id"])
+    for stage_key, stage in values.items():
         if stage_key.startswith("github-plan-stage:") and stage["operation_id"] != operation_id:
             effect = registry.effect(token["issue_id"],
                                      "github-plan-revision:" + digest(stage["operation_id"]))
-            if effect is None or effect["state"] != "complete":
-                raise OwnershipConflict("another staged plan revision retains publication custody")
+            if effect is not None and effect["state"] == "complete":
+                continue
+            # A closed attempt whose parent revision was never intended holds no
+            # custody: its parent record provably never changed and its child-plan
+            # comments stay unreferenced (the closing receipt ledgers them).
+            closed = values.get("plan-revision:rejected:" + stage["operation_id"])
+            if closed and (effect is None or effect["state"] == "absent"):
+                continue
+            raise OwnershipConflict("another staged plan revision retains publication custody")
     for row in pending:
         request = json.loads(row["request_json"])
         if row["kind"] in {"github_child_plan", "github_plan_revision"}:

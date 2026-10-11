@@ -642,3 +642,51 @@ def test_expired_worker_closure_refuses_intake_without_abandoning_the_reservatio
     assert context["budget"]["used"] == 7 == shared.budget(issue_id)["used"]
     assert revisions.begin_revision(store, successor) == context
     assert shared.budget(issue_id)["used"] == 7
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
+def test_abandoned_unspent_reservation_releases_its_review_context(
+    findings_reconsideration, monkeypatch,
+):
+    """A reconsideration reserved from the stopped owner whose successor was never admitted
+    can be abandoned from that same run; because nothing was charged, the same review
+    context may be reserved again by a new command."""
+    fixture, command, _runtime, _child, _seal, _observe, _files = findings_reconsideration
+    store, original, shared, *_rest = fixture
+    issue_id = original["feature_delivery"]["owner"]["issue_id"]
+    real = execution.continue_feature
+
+    def failing(*_args, **_kwargs):
+        raise RuntimeError("continuation predecessor Temporal closure is unavailable (x)")
+
+    monkeypatch.setattr(execution, "continue_feature", failing)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        revisions.revise_feature_plan(store, original["run_id"], command)
+    monkeypatch.setattr(execution, "continue_feature", real)
+    with shared.connect() as db:
+        reserved = shared._pending_revision(db, issue_id)
+    assert reserved["predecessor_run_id"] == original["run_id"]
+    context_key = reserved["reconsideration"]["context_key"]
+    budget = shared.budget(issue_id)
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_feature_closure.closed_coordinator",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("continuation predecessor Temporal closure is unavailable (x)")),
+    )
+    with pytest.raises(RuntimeError, match="unavailable"):
+        execution.continue_feature(store, original["run_id"], {
+            "command_id": "abandon-reconsideration",
+            "expected_revision": command["expected_revision"],
+            "abandon_revision": reserved["revision_id"]})
+    closed = shared.checkpoints(issue_id)[revisions.PREFIX + "rejected:" + reserved["revision_id"]]
+    assert closed["repair_key"] is None and closed["reconsideration_context_key"] == context_key
+    assert shared.budget(issue_id) == budget
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_feature_closure.closed_coordinator",
+        lambda s, run: _closed_revision_fixture(s, run),
+    )
+    again = revisions.revise_feature_plan(
+        store, original["run_id"], {**command, "command_id": "reconsider-again"})
+    assert again["revision_id"] != reserved["revision_id"]
+    assert again["reconsideration"]["context_key"] == context_key
+    assert shared.budget(issue_id) == budget

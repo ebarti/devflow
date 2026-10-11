@@ -288,8 +288,11 @@ class ExecutionRegistry:
                         "feature has a recorded plan revision in custody: revision "
                         + str(pending.get("revision_id")) + " reserved by command "
                         + str((pending.get("request") or {}).get("command_id"))
-                        + " for run " + str(pending.get("successor_id"))
-                        + "; continue that run, or continue-feature with abandon_revision"
+                        + " on run " + str(pending.get("predecessor_run_id"))
+                        + " for successor " + str(pending.get("successor_id"))
+                        + "; replay that revise-feature-plan command to admit the successor,"
+                        " continue the successor if it exists, or continue-feature the"
+                        " reserving run with abandon_revision"
                     )
                 generation = old["generation"] + 1
             elif predecessor is not None:
