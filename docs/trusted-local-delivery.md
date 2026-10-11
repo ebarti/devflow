@@ -31,19 +31,25 @@ dirty or untracked files inside the installed runtime package and a non-installe
 copy are refused (editor or tool directories elsewhere in the checkout do not
 affect the payload and are ignored). Every other measured native identity field
 must still match, including the interpreter, architecture, bundled CLI, locked
-dependencies, sandbox overrides and tool roots. The macOS version is recorded with
-the identity but not pinned, so an OS point update does not stop in-flight runs.
+dependencies, sandbox overrides and tool roots. Because a `trusted-local` proof
+claims no sandbox denials, its macOS version is recorded with the identity but not
+pinned, so an OS update does not stop in-flight runs; `native-profile` keeps the OS
+version pinned because its proof measures denials under that OS.
 Verification authenticates the original private proof, evidence hashes,
 measurements, fingerprint, policy and run binding against its frozen identity.
 It preserves that specification and proof; the old observations remain historical
 measurements rather than measurements of the replacement source. `native-profile`
 retains its existing strict update checks.
 
-A measured identity change found when a gate starts is reported as an environment
-preparation failure with confirmed cleanup (nothing launched), not as an unknown
-process teardown. Role homes keep the newest Codex credential: a token the owner's
-CLI refreshed replaces the private copy, a copy the role refreshed more recently is
-kept, and a changed credential never blocks a later implementation iteration.
+Any failure to verify the native execution authority when a local check list
+starts (a measured identity change, a missing binary) is reported as the
+`native-execution-authority` environment preparation failure with confirmed cleanup
+(nothing launched), not as an unknown process teardown. Role homes keep the newest
+Codex credential: for the same auth mode and account, a token the owner's CLI
+refreshed replaces the private copy and a copy the role refreshed more recently is
+kept; a switched auth mode or account takes the owner's credential, a credential
+caught mid-rewrite never replaces a usable copy, and a changed credential never
+blocks a later implementation iteration.
 
 The native launch journal and process result retain the actual controller revision
 and payload at launch. Reattachment preserves that launch identity; later roles

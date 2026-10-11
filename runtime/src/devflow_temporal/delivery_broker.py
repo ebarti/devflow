@@ -21,7 +21,6 @@ from .delivery_browser_qa import run_browser_qa as execute_browser_qa
 from .delivery_config import publication_base_ref
 from .delivery_continuation import copy_session_state, selected_digest, session_state_digest
 from .delivery_output import observed_test_count, rejection_causes, visible_output
-from .delivery_preparation import PreparationError
 from .delivery_publication import conventional, publication_summary
 from .delivery_source_scope import outside_scope, require_authorized
 from .delivery_store import DeliveryStore, _now
@@ -596,10 +595,11 @@ class DeliveryBroker:
 
                 try:
                     verify_prepared_spec(self.spec)
-                except PreparationError as exc:
-                    # Nothing launched: report the changed authority with confirmed
-                    # cleanup instead of an unknown process teardown.
-                    raise CheckPreparationFailure(check["id"], exc, results) from exc
+                except Exception as exc:
+                    # Nothing launched: report the unverifiable native authority with
+                    # confirmed cleanup instead of an unknown process teardown.
+                    raise CheckPreparationFailure(
+                        "native-execution-authority", exc, results) from exc
                 try:
                     profile, environment = prepare_native_check(
                         self.spec, checkout, evidence_dir, check,
@@ -1040,8 +1040,8 @@ class DeliveryBroker:
 
         try:
             verify_prepared_spec(self.spec)
-        except PreparationError as exc:
-            raise CheckPreparationFailure("native-dependency-store", exc) from exc
+        except Exception as exc:
+            raise CheckPreparationFailure("native-execution-authority", exc) from exc
         provenance = {}
         manager, inputs = frozen_pnpm_inputs(self.spec, checkout, provenance=provenance)
         resources = RunResources(self.spec)

@@ -35,12 +35,37 @@ def _spec(tmp_path, identity):
     }
 
 
-def test_os_point_update_is_recorded_but_not_pinned(tmp_path, monkeypatch):
+def test_os_update_is_recorded_but_not_pinned_for_trusted_local(tmp_path, monkeypatch):
     spec = _spec(tmp_path, dict(FROZEN))
-    monkeypatch.setattr(native, "native_identity", lambda _spec: {**FROZEN, "os_version": "26.1"})
+    monkeypatch.setattr(native, "native_identity", lambda _spec: {**FROZEN, "os_version": "27.0"})
     # Identity verification passes; the next authenticated step is the proof location.
     with pytest.raises(PreparationError, match="left its canonical private cache"):
         native.verify_native_spec(spec)
+
+
+def test_native_profile_keeps_the_os_pinned_because_its_proof_measures_denials(
+    tmp_path, monkeypatch,
+):
+    spec = _spec(tmp_path, dict(FROZEN))
+    spec["policy"]["host_sandbox"] = "native-profile"
+    monkeypatch.setattr(native, "native_identity", lambda _spec: {**FROZEN, "os_version": "26.1"})
+    with pytest.raises(PreparationError, match="has not been frozen or changed"):
+        native.verify_native_spec(spec)
+
+
+def test_renewal_and_closure_readiness_tolerate_a_trusted_os_update():
+    from devflow_temporal.delivery_native_renewal import _payload_only, _unchanged
+
+    trusted = {"policy": {"host_sandbox": "trusted-local"}}
+    profile = {"policy": {"host_sandbox": "native-profile"}}
+    updated = {**FROZEN, "os_version": "26.1"}
+    _payload_only(FROZEN, updated, trusted)
+    assert _unchanged(FROZEN, updated, trusted)
+    with pytest.raises(ValueError, match="non-payload identity"):
+        _payload_only(FROZEN, updated, profile)
+    assert not _unchanged(FROZEN, updated, profile)
+    with pytest.raises(ValueError, match="non-payload identity"):
+        _payload_only(FROZEN, {**updated, "codex_bin_sha256": "changed"}, trusted)
 
 
 @pytest.mark.parametrize("field", ["codex_bin_sha256", "architecture", "config_overrides"])
@@ -70,7 +95,8 @@ def test_trusted_payload_update_checks_only_the_runtime_package(tmp_path, monkey
     with pytest.raises(PreparationError, match="left its canonical private cache"):
         native.verify_native_spec(spec)
     status = next(args for args in calls if args[0] == "status")
-    assert status[-2:] == ("--", str(native.PACKAGE.relative_to(source)))
+    # The editable import root, not the whole checkout (editor directories ignored).
+    assert status[-2:] == ("--", str(native.PACKAGE.parent.relative_to(source)))
 
 
 def test_changed_native_authority_is_a_preparation_failure_with_confirmed_cleanup(
@@ -82,18 +108,19 @@ def test_changed_native_authority_is_a_preparation_failure_with_confirmed_cleanu
     broker.spec = {"provider": "codex", "run_id": "run-1",
                    "policy": {"execution_backend": "native-macos"}}
 
-    def refuse(_spec):
-        raise PreparationError("native execution authority has not been frozen or changed")
+    for failure in (PreparationError("native execution authority has not been frozen or changed"),
+                    FileNotFoundError("codex binary is missing")):
+        def refuse(_spec, failure=failure):
+            raise failure
 
-    monkeypatch.setattr(preparation, "verify_prepared_spec", refuse)
-    with pytest.raises(CheckPreparationFailure) as raised:
-        broker._run_check_list(checkout, [{"id": "unit", "argv": ["true"]}],
-                               tmp_path / "evidence", {"id": "candidate"})
-    assert raised.value.results[-1] == {
-        "id": "unit", "passed": False, "cleanup": "confirmed", "launched": False,
-        "failure_kind": "preparation",
-        "diagnostic": "native execution authority has not been frozen or changed",
-    }
+        monkeypatch.setattr(preparation, "verify_prepared_spec", refuse)
+        with pytest.raises(CheckPreparationFailure) as raised:
+            broker._run_check_list(checkout, [{"id": "unit", "argv": ["true"]}],
+                                   tmp_path / "evidence", {"id": "candidate"})
+        assert raised.value.results[-1] == {
+            "id": "native-execution-authority", "passed": False, "cleanup": "confirmed",
+            "launched": False, "failure_kind": "preparation", "diagnostic": str(failure),
+        }
 
 
 def _auth(path, access, refreshed=None):
@@ -121,6 +148,20 @@ def test_role_credential_copy_keeps_the_newest_token(tmp_path):
     _auth(copy, "C", "2026-10-11T12:00:00Z")
     delivery_sandbox._refresh_credential(copy, source.read_bytes())
     assert json.loads(copy.read_text())["tokens"]["access_token"] == "C"
+    # A source caught mid-rewrite never replaces a usable copy.
+    current = copy.read_bytes()
+    delivery_sandbox._refresh_credential(copy, b'{"tokens": {"acc')
+    assert copy.read_bytes() == current
+    # A switched auth mode or account wins even over a more recently refreshed copy.
+    api_key = json.dumps({"OPENAI_API_KEY": "sk-test", "tokens": None,
+                          "last_refresh": None}).encode()
+    delivery_sandbox._refresh_credential(copy, api_key)
+    assert copy.read_bytes() == api_key
+    _auth(copy, "D", "2026-10-11T23:00:00Z")
+    other = json.dumps({"tokens": {"access_token": "E", "account_id": "other"},
+                        "last_refresh": "2026-10-11T09:00:00Z"}).encode()
+    delivery_sandbox._refresh_credential(copy, other)
+    assert copy.read_bytes() == other
     # A foreign or widened copy is still refused.
     os.chmod(copy, 0o644)
     with pytest.raises(ValueError, match="private owned regular file"):

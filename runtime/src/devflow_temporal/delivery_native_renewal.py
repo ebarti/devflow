@@ -26,12 +26,22 @@ from .delivery_resources import read_private, write_private
 REQUEST_FIELDS = {"preparation_authority_path", "preparation_authority_sha256"}
 
 
-def _payload_only(before, after):
+def _payload_only(before, after, spec=None):
+    from .delivery_native_preparation import pinned_identity
+
     if not isinstance(before, dict) or not isinstance(after, dict):
         raise ValueError("native renewal identity is absent or invalid")
-    if (canonical_json({k: v for k, v in before.items() if k != 'runtime_payload_sha256'})
-            != canonical_json({k: v for k, v in after.items() if k != 'runtime_payload_sha256'})):
+    scope = spec or {}
+    if (canonical_json(pinned_identity(before, scope, 'runtime_payload_sha256'))
+            != canonical_json(pinned_identity(after, scope, 'runtime_payload_sha256'))):
         raise ValueError("native renewal changed an installed non-payload identity")
+
+
+def _unchanged(before, after, spec):
+    from .delivery_native_preparation import pinned_identity
+
+    return canonical_json(pinned_identity(before, spec)) == canonical_json(
+        pinned_identity(after, spec))
 
 
 def _same_execution(before, after):
@@ -44,7 +54,8 @@ def _same_execution(before, after):
             value['policy'].pop(key, None)
     if canonical_json(frozen) != canonical_json(effective):
         raise ValueError("native renewal changed frozen execution or feature authority")
-    _payload_only(before['policy']['native_identity'], after['policy']['native_identity'])
+    _payload_only(before['policy']['native_identity'], after['policy']['native_identity'],
+                  before)
 
 
 def _existing_bytes(path, root):
@@ -157,8 +168,8 @@ def readiness(spec, payload):
     authority = _authority(spec, payload) if REQUEST_FIELDS & set(payload) else None
     identity = native_identity(spec)
     before = spec['policy'].get('native_identity')
-    _payload_only(before, identity)
-    if canonical_json(before) == canonical_json(identity):
+    _payload_only(before, identity, spec)
+    if _unchanged(before, identity, spec):
         verify_native_spec(spec)
         return {'required': False}
     authority = authority or _authority(spec, payload)

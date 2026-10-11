@@ -139,23 +139,30 @@ def _write_once(path: Path, content: bytes) -> None:
         stream.write(content)
 
 
-def _credential_refreshed_at(content: bytes) -> str:
+def _credential(content: bytes) -> dict | None:
     try:
         value = json.loads(content)
     except (ValueError, UnicodeDecodeError):
-        return ""
-    refreshed = value.get("last_refresh") if isinstance(value, dict) else None
-    return refreshed if isinstance(refreshed, str) else ""
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _credential_identity(value: dict) -> tuple:
+    tokens = value.get("tokens") if isinstance(value.get("tokens"), dict) else None
+    mode = value.get("auth_mode") or (
+        "chatgpt" if tokens else "apikey" if value.get("OPENAI_API_KEY") else None)
+    return mode, (tokens or {}).get("account_id")
 
 
 def _refresh_credential(path: Path, content: bytes) -> None:
-    """Keep the newest Codex credential in a role home.
+    """Keep the newest usable Codex credential in a role home.
 
     The owner's CLI and the role's own Codex process both refresh tokens, so the
-    private copy legitimately diverges from its source between attempts. A copy the
-    role refreshed more recently is kept (an older token could be revoked by
-    rotation); otherwise the source replaces it. A changed credential never blocks
-    a launch.
+    private copy legitimately diverges from its source between attempts. For the same
+    auth mode and account, a copy the role refreshed more recently is kept (an older
+    token could be revoked by rotation); a switched mode or account, or an unusable
+    copy, takes the source. A source caught mid-rewrite (Codex rewrites auth.json in
+    place) never replaces a usable copy, and a changed credential never blocks a launch.
     """
     if not path.exists():
         _write_once(path, content)
@@ -164,8 +171,12 @@ def _refresh_credential(path: Path, content: bytes) -> None:
     current = path.read_bytes()
     if current == content:
         return
-    if _credential_refreshed_at(current) > _credential_refreshed_at(content):
+    source, copy = _credential(content), _credential(current)
+    if source is None:
         return
+    if copy is not None and _credential_identity(copy) == _credential_identity(source):
+        if str(copy.get("last_refresh") or "") > str(source.get("last_refresh") or ""):
+            return
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".auth.", suffix=".new")
     try:
         with os.fdopen(descriptor, "wb") as stream:
