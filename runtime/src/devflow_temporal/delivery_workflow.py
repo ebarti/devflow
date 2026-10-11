@@ -22,7 +22,9 @@ from .delivery_questions import valid_blocking_questions
 def _failure_classification(cause: Exception | None, controller_cause: str | None) -> dict:
     """Classify controller observations, never human or model diagnostic text."""
     result = {"classification": "terminal"}
-    if controller_cause in {"ci_deadline", "tracker_readback", "publication_deadline"}:
+    if controller_cause in {
+        "ci_deadline", "tracker_readback", "publication_deadline", "role_interrupted",
+    }:
         return {"classification": "transient", "cause_type": controller_cause}
     if not isinstance(cause, ActivityError):
         return result
@@ -39,6 +41,15 @@ def _failure_classification(cause: Exception | None, controller_cause: str | Non
         }:
             result["classification"] = "transient"
     return result
+
+
+def _interrupted_role(roles: list[dict[str, Any]]) -> str | None:
+    """A role process that died with confirmed teardown is infrastructure, not a verdict."""
+    last = roles[-1] if roles else {}
+    if (last.get("cleanup") == "confirmed"
+            and last.get("finish_reason") in {"exception", "interrupted_monitor"}):
+        return "role_interrupted"
+    return None
 
 
 def _broker_findings(stage: str, result: dict[str, Any], *, iteration: int) -> list[str]:
@@ -160,6 +171,7 @@ class DeliveryWorkflow:
         self.original_execution = True
         self.controller_failure_boundary = False
         self.feature_revision_v1 = False
+        self.feature_liveness_v1 = False
         self.controller_spec = None
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
@@ -245,9 +257,11 @@ class DeliveryWorkflow:
                        "heartbeat_timeout": timedelta(seconds=30),
                        "schedule_to_close_timeout": timedelta(minutes=15)}
         elif name == "delivery_feature_wait_worker":
+            # Each attempt polls the store for up to 300 s. An attempt lost to a
+            # worker restart or host sleep must retry with a full window, so only
+            # start_to_close bounds an attempt and the heartbeat budget is wide.
             options = {
-                "heartbeat_timeout": timedelta(seconds=10),
-                "schedule_to_close_timeout": timedelta(minutes=6),
+                "heartbeat_timeout": timedelta(seconds=60),
                 "retry_policy": RetryPolicy(
                     maximum_attempts=3, initial_interval=timedelta(seconds=1),
                     maximum_interval=timedelta(seconds=10),
@@ -300,7 +314,7 @@ class DeliveryWorkflow:
         if name == "delivery_merge":
             timeout = timedelta(minutes=10)
         if name == "delivery_feature_wait_worker":
-            timeout = timedelta(minutes=6)
+            timeout = timedelta(minutes=7)
         if name == "delivery_project" and request["spec"].get("projection_retry_version") == 1:
             timeout = timedelta(seconds=45)
         if patient_ci:
@@ -667,6 +681,14 @@ class DeliveryWorkflow:
         if self.original_execution and spec.get("automatic_retry_version") == 1:
             self.state["checks"]["failure"] = {
                 **_failure_classification(cause, controller_cause),
+                "stage": self.state["phase"], "reason": reason[:600],
+            }
+        elif getattr(self, "feature_liveness_v1", False) and spec.get("feature_worker"):
+            # The coordinator resumes a closed worker only for infrastructure this
+            # controller observed itself, never for a gate verdict.
+            self.state["checks"]["failure"] = {
+                **_failure_classification(
+                    cause, controller_cause or _interrupted_role(self.state["roles"])),
                 "stage": self.state["phase"], "reason": reason[:600],
             }
         self.state["phase"] = "blocked"
@@ -1049,6 +1071,13 @@ class DeliveryWorkflow:
         # recorded behaviour; direct protocol calls outside a workflow have no
         # history: False.
         self.feature_revision_v1 = (workflow.patched("delivery-feature-revision-wedges-v1")
+                                    if workflow.in_workflow() else False)
+        # Feature-liveness gate for this change's command sequence (worker
+        # re-issue, per-chunk failure isolation, bounded readback loops).
+        # Executions recorded before the marker replay with False and keep
+        # their original commands; executions started after it get True. Direct
+        # protocol tests run this method outside a workflow.
+        self.feature_liveness_v1 = (workflow.patched("delivery-feature-liveness-v1")
                                     if workflow.in_workflow() else False)
         if (spec.get("workflow_failure_boundary_version") != 1
                 or not workflow.patched("delivery-controller-failure-boundary-v1")):

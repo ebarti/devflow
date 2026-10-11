@@ -6,15 +6,91 @@ import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, ServerError
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from .contracts import digest
+
+# Bounds of the coordinator paths gated on `delivery-feature-liveness-v1`.
+AUTOMATIC_RECOVERIES = 2
+OBSERVATION_PAUSE = timedelta(seconds=30)
+MERGE_READBACK_POLLS = 60
+READBACK_FAST_POLLS = 20
+READBACK_INTERVAL = timedelta(seconds=30)
+READBACK_SLOW_INTERVAL = timedelta(minutes=10)
+# Activity failure types the feature activities declare non-retryable: verdicts
+# about the request or ownership, never transport.
+FINAL_FAILURE_TYPES = frozenset({"ValueError", "TypeError", "OwnershipConflict"})
 
 
 class PlanningCorrectionRequired(Exception):
     def __init__(self, diagnostic):
         super().__init__("closed feature worker identified an evidenced planning defect")
         self.diagnostic = diagnostic
+
+
+class FeatureWorkerStopped(RuntimeError):
+    """A worker closed without delivering; its closure stays in the store."""
+
+    def __init__(self, chunk_id, kind, *, closure=None, detail=None):
+        super().__init__(f"feature {kind} worker for chunk {chunk_id} "
+                         + (detail or "stopped with preserved recovery evidence"))
+        self.chunk_id, self.kind, self.closure = chunk_id, kind, closure
+
+
+def _liveness(controller):
+    return bool(getattr(controller, "feature_liveness_v1", False))
+
+
+def _transient_activity_failure(exc):
+    """Timeouts and failures Temporal already retried are infrastructure, not verdicts."""
+    cause = getattr(exc, "cause", None)
+    if isinstance(cause, ActivityTimeoutError):
+        return True
+    if isinstance(cause, ServerError):
+        return not cause.non_retryable
+    if isinstance(cause, ApplicationError):
+        return not cause.non_retryable and cause.type not in FINAL_FAILURE_TYPES
+    return False
+
+
+def _resumable(closure):
+    """Only a closure its own controller classified as infrastructure, with no
+    unknown cleanup and no planning verdict, may be resumed without an operator."""
+    return bool(closure) and closure.get("cleanup") != "unknown" and (
+        (closure.get("failure") or {}).get("classification") == "transient"
+    ) and not closure.get("planning_defect")
+
+
+def _infrastructure_failure(exc):
+    if isinstance(exc, FeatureWorkerStopped):
+        return _resumable(exc.closure)
+    return isinstance(exc, ActivityError) and _transient_activity_failure(exc)
+
+
+async def _pause(controller, delay):
+    """Wait without missing a cancellation."""
+    try:
+        await workflow.wait_condition(lambda: controller.cancel_requested, timeout=delay)
+    except TimeoutError:
+        pass
+
+
+async def _observe(controller, resilient, child_id, name, request):
+    """Repeat an observation lost to timeouts or transport; verdicts propagate."""
+    while True:
+        try:
+            return await controller._activity(name, request)
+        except ActivityError as exc:
+            if not (resilient and _transient_activity_failure(exc)) or controller.cancel_requested:
+                raise
+            # A lost observation decides nothing: the worker's closure stays in
+            # the store. Look again after a short pause.
+            retries = controller.state["checks"].setdefault("feature_observation_retries", {})
+            retries[child_id] = retries.get(child_id, 0) + 1
+            await _pause(controller, OBSERVATION_PAUSE)
+            if controller.cancel_requested:
+                raise RuntimeError("feature cancellation requested") from exc
 
 
 def ordered(plan):
@@ -104,13 +180,15 @@ async def run_build(controller, spec, *, start_iteration=0, session=None, maximu
         )
 
 
-async def _worker(controller, spec, chunk_id, kind, active):
+async def _worker(controller, spec, chunk_id, kind, active, *, resume_allowed=False):
     assignment = await controller._activity(
         "delivery_feature_reserve", {"spec": spec, "chunk_id": chunk_id, "kind": kind}
     )
     child = assignment["spec"]
     workflow_id = assignment["workflow_id"]
     active[child["run_id"]] = workflow_id
+    resilient = _liveness(controller)
+    closure = None
     if not assignment["completed"]:
         # The transactional outbox dispatches both initial and resumed workers.
         # A coordinator crash cannot lose the start or create a second workflow.
@@ -119,8 +197,8 @@ async def _worker(controller, spec, chunk_id, kind, active):
             if controller.cancel_requested:
                 raise RuntimeError("feature cancellation requested")
             if compact_wait:
-                pending = asyncio.create_task(controller._activity(
-                    "delivery_feature_wait_worker", {
+                pending = asyncio.create_task(_observe(
+                    controller, resilient, child["run_id"], "delivery_feature_wait_worker", {
                         "config_path": spec["config_path"], "run_id": spec["run_id"],
                         "spec_digest": digest(spec), "child_id": child["run_id"],
                     },
@@ -142,11 +220,18 @@ async def _worker(controller, spec, chunk_id, kind, active):
                     "delivery_feature_worker_result", {"spec": spec, "child_id": child["run_id"]}
                 )
             if observation["closed"]:
+                closure = observation.get("closure")
                 break
             if not compact_wait:
                 await workflow.sleep(timedelta(seconds=5))
-    finished = await controller._activity(
-        "delivery_feature_finish_worker", {"spec": spec, "child_id": child["run_id"]}
+    if resilient and resume_allowed and _resumable(closure):
+        # Decided before finish_worker retires the registry assignment, which a
+        # continuation could not reuse. The supervisor re-issues this assignment
+        # and reserve() admits the supported continuation under its own checks.
+        raise FeatureWorkerStopped(chunk_id, kind, closure=closure)
+    finished = await _observe(
+        controller, resilient, child["run_id"], "delivery_feature_finish_worker",
+        {"spec": spec, "child_id": child["run_id"]},
     )
     active.pop(child["run_id"], None)
     if finished["outcome"] != "delivered":
@@ -155,12 +240,49 @@ async def _worker(controller, spec, chunk_id, kind, active):
 
             diagnostic = validate_diagnostic(finished["planning_defect"], chunk_id=chunk_id)
             raise PlanningCorrectionRequired(diagnostic)
+        if resilient:
+            raise FeatureWorkerStopped(chunk_id, kind, closure=closure)
         raise RuntimeError("feature worker stopped with preserved recovery evidence")
     return finished
 
 
+async def _recovering_worker(controller, spec, chunk_id, kind, active):
+    """Run one worker, re-issuing it across a bounded number of infrastructure failures.
+
+    Gate verdicts, ownership conflicts and unknown cleanup stop it at once. An
+    infrastructure closure resumes through the continuation reserve() admits; a
+    transport failure before admission is re-issued after a pause.
+    """
+    key = chunk_id + ":" + kind
+    while True:
+        count = controller.state["checks"].get("feature_worker_recoveries", {}).get(key, 0)
+        try:
+            return await _worker(controller, spec, chunk_id, kind, active,
+                                 resume_allowed=count < AUTOMATIC_RECOVERIES)
+        except PlanningCorrectionRequired:
+            raise
+        except Exception as exc:
+            if controller.cancel_requested or not _infrastructure_failure(exc):
+                raise
+            if count >= AUTOMATIC_RECOVERIES:
+                raise FeatureWorkerStopped(
+                    chunk_id, kind, closure=getattr(exc, "closure", None),
+                    detail=f"exhausted {count} automatic recoveries: {exc}") from exc
+            controller.state["checks"].setdefault("feature_worker_recoveries", {})[key] = count + 1
+            controller.state["revision"] += 1
+            await controller._project(
+                spec, "feature_worker_recovering",
+                f"Recovering the {kind} worker for {chunk_id} after an infrastructure failure "
+                f"({count + 1} of {AUTOMATIC_RECOVERIES})")
+            if isinstance(exc, ActivityError):
+                await _pause(controller, OBSERVATION_PAUSE)
+
+
 async def _coordinate_pass(controller, spec, active, builds):
     completed = set()
+    resilient = _liveness(controller)
+    start = _recovering_worker if resilient else _worker
+    stopped = None
     try:
         opened = await controller._activity("delivery_feature_open", {"spec": spec})
         spec = opened.get("spec", spec)
@@ -189,15 +311,33 @@ async def _coordinate_pass(controller, spec, active, builds):
                     and set(ready["depends_on"]) <= completed
                 ):
                     builds[ready["id"]] = asyncio.create_task(
-                        _worker(controller, spec, ready["id"], "build", active)
+                        start(controller, spec, ready["id"], "build", active)
                     )
-            await builds[chunk["id"]]
+            if resilient:
+                try:
+                    await builds[chunk["id"]]
+                except PlanningCorrectionRequired:
+                    raise
+                except Exception as exc:
+                    stopped = exc
+                    break
+            else:
+                await builds[chunk["id"]]
             if controller.cancel_requested:
                 break
             controller.state["phase"] = "feature_integration"
             controller.state["revision"] += 1
             await controller._project(spec, "chunk_integrating", "Integrating " + chunk["title"])
-            finished = await _worker(controller, spec, chunk["id"], "chunk", active)
+            if resilient:
+                try:
+                    finished = await start(controller, spec, chunk["id"], "chunk", active)
+                except PlanningCorrectionRequired:
+                    raise
+                except Exception as exc:
+                    stopped = exc
+                    break
+            else:
+                finished = await _worker(controller, spec, chunk["id"], "chunk", active)
             record = finished["record"]
             completed.add(chunk["id"])
             controller.state["pull_request"] = publication(record)
@@ -211,6 +351,19 @@ async def _coordinate_pass(controller, spec, active, builds):
             await controller._project(
                 spec, "chunk_verified", "Verified and published " + chunk["title"]
             )
+        if stopped is not None:
+            # Sibling builds are independent of the stopped chunk; only the stack
+            # order is blocked. Let them reach their own sealed closure before
+            # stopping, so a continuation reuses that work instead of redoing it.
+            running = [task for task in builds.values() if not task.done()]
+            if running:
+                controller.state["revision"] += 1
+                await controller._project(
+                    spec, "feature_worker_stopped",
+                    f"{str(stopped)[:300]}; waiting for {len(running)} running build(s) "
+                    "to close before stopping")
+                await asyncio.gather(*running, return_exceptions=True)
+            raise stopped
         if not controller.cancel_requested:
             controller.state["pull_request"] = publication(record, complete=True)
             controller.state["phase"] = "awaiting_merge"
@@ -242,6 +395,7 @@ async def _coordinate_pass(controller, spec, active, builds):
                 await controller._project(
                     spec, "feature_merging", "Merging the authorized feature stack"
                 )
+                pending_polls = 0
                 while True:
                     merged = await controller._activity(
                         "delivery_feature_merge",
@@ -265,7 +419,13 @@ async def _coordinate_pass(controller, spec, active, builds):
                         raise RuntimeError(
                             "merge was submitted; its remote result still requires readback"
                         )
-                    await workflow.sleep(timedelta(seconds=30))
+                    pending_polls += 1
+                    if resilient and pending_polls >= MERGE_READBACK_POLLS:
+                        raise RuntimeError(
+                            f"feature merge readback stayed pending across {pending_polls} "
+                            "polls; the submitted stack merge needs operator readback"
+                        )
+                    await workflow.sleep(READBACK_INTERVAL)
                 receipts = {item["number"]: item for item in merged["pull_requests"]}
                 for member in controller.state["pull_request"]["pull_requests"]:
                     member.update(receipts[member["number"]], state="MERGED")
@@ -297,9 +457,12 @@ async def _coordinate_pass(controller, spec, active, builds):
         if controller.cancel_requested:
             await controller._cancelled(spec)
         else:
-            await controller._stop(
-                spec, f"feature delivery stopped: {type(exc).__name__}: {str(exc)[:300]}", cause=exc
-            )
+            reason = f"feature delivery stopped: {type(exc).__name__}: {str(exc)[:300]}"
+            if resilient and cause is not exc:
+                # Name the failing condition, not only the SDK's generic wrapper.
+                reason += (f" ({getattr(cause, 'type', None) or type(cause).__name__}: "
+                           f"{str(cause)[:200]})")
+            await controller._stop(spec, reason, cause=exc)
     return controller.state
 
 
@@ -509,6 +672,8 @@ async def coordinate(controller, spec):
             terminal = {key: controller.state.get(key) for key in
                         ("phase", "execution_state", "outcome", "error", "cleanup")}
             waiting = False
+            polls = 0
+            resilient = _liveness(controller)
             while True:
                 try:
                     readback = await controller._activity(
@@ -519,14 +684,28 @@ async def coordinate(controller, spec):
                 controller.state["checks"]["feature_readback"] = readback
                 if readback["state"] == "confirmed":
                     break
+                polls += 1
                 controller.state.update(phase="waiting_feature_readback", execution_state="waiting",
                                         outcome=None)
                 controller.state["revision"] += 1
+                waiting = True
+                if resilient and polls > READBACK_FAST_POLLS:
+                    # Nothing but this coordinator can settle a pending external
+                    # operation, so stopping here would strand the feature. Keep
+                    # reading back at a slow cadence that bounds history growth,
+                    # and name what is stuck.
+                    await controller._project(
+                        spec, "feature_readback_pending",
+                        f"Original GitHub operation {readback.get('effect_key') or 'readback'} "
+                        f"still unconfirmed after {polls} polls "
+                        f"({readback.get('reason') or 'pending'}); retrying every "
+                        f"{int(READBACK_SLOW_INTERVAL.total_seconds() // 60)} minutes")
+                    await workflow.sleep(READBACK_SLOW_INTERVAL)
+                    continue
                 await controller._project(
                     spec, "feature_readback_pending", "Reconciling the original GitHub operation"
                 )
-                waiting = True
-                await workflow.sleep(timedelta(seconds=30))
+                await workflow.sleep(READBACK_INTERVAL)
             if controller.cancel_requested and terminal["outcome"] != "delivered":
                 terminal.update(phase="cancelled", execution_state="terminal", outcome="cancelled")
             controller.state.update(terminal)

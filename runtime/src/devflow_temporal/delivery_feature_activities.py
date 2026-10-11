@@ -550,10 +550,17 @@ async def delivery_feature_worker_result(request):
     child_id = request["child_id"]
     with store._connect() as db:
         row = db.execute(
-            "SELECT outcome,workflow_id FROM delivery_runs WHERE run_id=?", (child_id,)
+            "SELECT outcome,workflow_id,phase,cleanup,error,checks_json FROM delivery_runs "
+            "WHERE run_id=?", (child_id,)
         ).fetchone()
     if not row or row["outcome"] is None:
         return {"closed": False}
+    checks = json.loads(row["checks_json"] or "{}")
+    # The coordinator decides a resume from this closure before finish_worker
+    # retires the registry assignment; a retired assignment cannot continue.
+    closure = {"phase": row["phase"], "cleanup": row["cleanup"], "error": row["error"],
+               "failure": checks.get("failure"),
+               "planning_defect": bool(checks.get("planning_defect"))}
     try:
         result = await asyncio.to_thread(
             store._completed_temporal_result,
@@ -567,7 +574,8 @@ async def delivery_feature_worker_result(request):
                     "continuation predecessor Temporal closure is unavailable")):
             raise
         return {"closed": False, "reason": "temporal_closure_pending"}
-    return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"])}
+    return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"]),
+            "closure": closure}
 
 
 def _worker_wait_spec(request):
