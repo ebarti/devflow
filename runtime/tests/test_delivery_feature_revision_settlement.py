@@ -288,12 +288,17 @@ def test_unstarted_reservation_names_itself_and_can_be_abandoned_explicitly(
     reserved = successor["feature_delivery"]["owner"]
     with pytest.raises(OwnershipConflict, match="reserved by command revise-1 on run "
                        + spec["run_id"] + " for successor " + receipt["run_id"]
-                       + "; replay that revise-feature-plan command"):
+                       + "; replay that revise-feature-plan command") as custody:
         shared.claim(spec["feature_delivery"]["snapshot"], "run-feature-other",
                      str(store.config.tracking_db), predecessor=reserved)
+    # Refusals lead with the non-destructive remedy; abandonment is named only as a
+    # permanent owner decision, never as the retry an orchestrator should follow.
+    assert "would permanently reject the pending revision" in str(custody.value)
     with pytest.raises(OwnershipConflict, match="another revision command in custody: revision "
-                       + receipt["revision_id"] + " reserved by command revise-1"):
+                       + receipt["revision_id"] + " reserved by command revise-1") as held:
         _revise(store, successor, stopped["revision"], command_id="revise-2")
+    assert "replay that revise-feature-plan command" in str(held.value)
+    assert "would permanently reject the pending revision" in str(held.value)
     with pytest.raises(ValueError, match="requires a command ID"):
         execution.continue_feature(store, successor["run_id"], {
             "command_id": "abandon-0", "expected_revision": stopped["revision"],

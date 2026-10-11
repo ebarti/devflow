@@ -291,8 +291,9 @@ class ExecutionRegistry:
                         + " on run " + str(pending.get("predecessor_run_id"))
                         + " for successor " + str(pending.get("successor_id"))
                         + "; replay that revise-feature-plan command to admit the successor,"
-                        " continue the successor if it exists, or continue-feature the"
-                        " reserving run with abandon_revision"
+                        " or continue-feature the successor if it exists"
+                        " (abandon_revision would permanently reject the pending revision;"
+                        " that is an owner decision, not a retry)"
                     )
                 generation = old["generation"] + 1
             elif predecessor is not None:

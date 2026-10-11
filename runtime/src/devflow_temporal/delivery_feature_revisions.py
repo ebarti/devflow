@@ -442,7 +442,9 @@ def revise_feature_plan(store, run_id, request):
                     + reserved["revision_id"] + " reserved by command "
                     + str((reserved.get("request") or {}).get("command_id")) + " for run "
                     + str(reserved.get("successor_id"))
-                    + "; continue that run, or continue-feature with abandon_revision"
+                    + "; replay that revise-feature-plan command or continue-feature that"
+                    " run to carry it (abandon_revision would permanently reject the"
+                    " pending revision; that is an owner decision, not a retry)"
                 )
             shared.revision_checkpoint(
                 token, PREFIX + "request:" + revision_id, admission, stopped=True
