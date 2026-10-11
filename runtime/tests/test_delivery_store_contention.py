@@ -21,6 +21,7 @@ def test_feature_backfill_does_not_deadlock_a_concurrent_execution_write(service
         # Model an existing execution database before feature projections existed.
         db.execute('DELETE FROM delivery_feature_events')
         db.execute('DELETE FROM delivery_features')
+        db.execute('DELETE FROM delivery_feature_projections')
     reading, release, writing = (threading.Event() for _ in range(3))
     original = delivery_features.transition
 

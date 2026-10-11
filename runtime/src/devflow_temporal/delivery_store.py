@@ -419,12 +419,11 @@ class DeliveryStore:
             from .delivery_settings import initialize as initialize_settings
 
             initialize_settings(db)
+            from .delivery_features import backfill
             from .delivery_features import initialize as initialize_features
-            from .delivery_features import transition
 
             initialize_features(db)
-            for row in db.execute("SELECT run_id FROM delivery_runs ORDER BY created_at,run_id"):
-                transition(db, self.config, row[0])
+            backfill(db, self.config)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -466,9 +465,10 @@ class DeliveryStore:
                VALUES (?, ?, ?, ?, ?, ?)""",
             (run_id, _now(), event_type, message, revision, canonical_json(payload or {})),
         )
-        from .delivery_features import transition
+        from .delivery_features import record_projection, transition
 
         transition(db, self.config, run_id)
+        record_projection(db, self.config, run_id)
         return int(cursor.lastrowid)
 
     def submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None,
@@ -3521,11 +3521,14 @@ class DeliveryStore:
         }
 
     def detail(self, run_id: str) -> dict[str, Any]:
+        from .delivery_features import projection_failures
+
         with self._connect() as db:
             saved = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             if saved is None:
                 raise ValueError("run ID not found")
             row = dict(saved)
+            projection_failure = next(iter(projection_failures(db, run_id)), None)
             outbox = db.execute(
                 "SELECT state,attempts,last_error,updated_at FROM delivery_outbox WHERE run_id=?",
                 (run_id,),
@@ -3737,6 +3740,9 @@ class DeliveryStore:
                 "implementation_authority": False,
             } if gates_admission else None,
             "queued": row["execution_state"] == "queued",
+            "feature_projection_error": (
+                projection_failure["error"] if projection_failure else None
+            ),
             "cleanup": "unknown"
             if row["cleanup"] == "unknown" or any(a["cleanup"] == "unknown" for a in attempts)
             else cleanup,

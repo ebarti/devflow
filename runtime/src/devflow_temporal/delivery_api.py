@@ -376,9 +376,17 @@ def create_app(config_path: Path) -> FastAPI:
             "policy": service.config.public_policy(),
             "repository_access": await asyncio.to_thread(
                 _read_repository_access, service.store),
+            "feature_projection_failures": await asyncio.to_thread(
+                _projection_failures, service.store),
         }
 
     from .delivery_settings import read_repository_access as _read_repository_access
+
+    def _projection_failures(store: DeliveryStore) -> list[dict[str, Any]]:
+        from .delivery_features import projection_failures
+
+        with store._connect() as db:
+            return projection_failures(db)
 
     @app.post("/api/settings/repositories")
     async def save_repositories(request: Request) -> dict[str, Any]:

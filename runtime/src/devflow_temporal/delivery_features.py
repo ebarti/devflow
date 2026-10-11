@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json
+
+logger = logging.getLogger(__name__)
 
 STATUSES = (
     "Queued", "Planning", "In progress", "In review", "Validating", "Awaiting merge",
@@ -48,6 +52,9 @@ def initialize(db: sqlite3.Connection) -> None:
         checked_at TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_sync_settings (
         key TEXT PRIMARY KEY, value INTEGER NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_feature_projections (
+        run_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, generation TEXT NOT NULL,
+        error TEXT, projected_at TEXT NOT NULL)""")
 
 
 def issue_key(url: str) -> str:
@@ -245,6 +252,89 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
         (key, run_id, version, encoded, stamp))
     db.execute("INSERT INTO delivery_feature_events(issue,version,payload_json,created_at) "
                "VALUES (?,?,?,?)", (key, version, encoded, stamp))
+
+
+_generation: str | None = None
+_retried: set[tuple[str, str]] = set()
+
+
+def projection_generation() -> str:
+    """Identity of the runtime code that shapes a projection.
+
+    The whole package is digested: a projection reads registry, scope and
+    GitHub contract modules well beyond this file, and any code change then
+    re-projects history once per database. Nothing from a configuration enters,
+    so processes running the same code agree whichever admitted configuration
+    (live file or sealed per-run snapshot) builds their store.
+    """
+    global _generation
+    if _generation is None:
+        source = hashlib.sha256()
+        for module in sorted(Path(__file__).parent.glob("*.py")):
+            source.update(module.name.encode())
+            source.update(module.read_bytes())
+        _generation = source.hexdigest()
+    return _generation
+
+
+def backfill(db: sqlite3.Connection, config: Any) -> dict[str, Any]:
+    """Project the runs whose revision or projection code changed since last time.
+
+    Runs in the store's initialization transaction. One unreadable historical
+    row is recorded and skipped: it must not stop the API, activities or CLI.
+    Skipped rows are retried once per process, and whenever they change.
+    """
+    generation = projection_generation()
+    key = (str(config.tracking_db), generation)
+    retry_skipped = key not in _retried
+    _retried.add(key)
+    pending = db.execute(
+        "SELECT r.run_id, r.revision FROM delivery_runs r "
+        "LEFT JOIN delivery_feature_projections p ON p.run_id = r.run_id "
+        "WHERE p.run_id IS NULL OR p.revision != r.revision OR p.generation != ? "
+        "OR (p.error IS NOT NULL AND ?) ORDER BY r.created_at, r.run_id",
+        (generation, retry_skipped),
+    ).fetchall()
+    skipped: dict[str, str] = {}
+    for run_id, revision in pending:
+        db.execute("SAVEPOINT feature_projection")
+        try:
+            transition(db, config, run_id)
+        except Exception as exc:
+            db.execute("ROLLBACK TO feature_projection")
+            skipped[run_id] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            logger.warning("Feature projection for run %s skipped: %s", run_id, skipped[run_id])
+        db.execute("RELEASE feature_projection")
+        record_projection(db, config, run_id, revision=revision, error=skipped.get(run_id))
+    return {"projected": len(pending) - len(skipped), "skipped": skipped}
+
+
+def record_projection(db: sqlite3.Connection, config: Any, run_id: str, *,
+                      revision: int | None = None, error: str | None = None) -> None:
+    """Remember which revision of a run the current projection code has seen."""
+    if revision is None:
+        row = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            return
+        revision = row[0]
+    db.execute(
+        "INSERT INTO delivery_feature_projections VALUES (?,?,?,?,?) "
+        "ON CONFLICT(run_id) DO UPDATE SET revision=excluded.revision,"
+        "generation=excluded.generation,error=excluded.error,projected_at=excluded.projected_at",
+        (run_id, revision, projection_generation(), error, now()),
+    )
+
+
+def projection_failures(db: sqlite3.Connection, run_id: str | None = None,
+                        limit: int = 20) -> list[dict[str, Any]]:
+    """Rows whose last projection was skipped, newest first, for operators."""
+    rows = db.execute(
+        "SELECT run_id,revision,error,projected_at FROM delivery_feature_projections "
+        "WHERE error IS NOT NULL AND (? IS NULL OR run_id=?) "
+        "ORDER BY projected_at DESC, run_id LIMIT ?",
+        (run_id, run_id, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def current(db: sqlite3.Connection, issue: str) -> dict | None:
