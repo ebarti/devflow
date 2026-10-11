@@ -40,7 +40,7 @@ from .delivery_store import DeliveryStore, _private_directory
 from .delivery_temporal_retention import ensure_namespace_retention
 from .delivery_workflow import DeliveryWorkflow
 from .payload import payload_digest
-from .supervisor import _process_identity
+from .supervisor import _process_identity as _local_identity
 
 
 def _config(path: str) -> DeliveryConfig:
@@ -170,6 +170,11 @@ def _lifecycle_lock(config: DeliveryConfig, deadline: float):
         os.close(descriptor)
 
 
+def _process_identity(pid: int) -> str | None:
+    """A member's start identity, independent of the controller's locale and zone."""
+    return _local_identity(pid, canonical=True)
+
+
 def _owned(process: dict) -> bool:
     if not isinstance(process, dict) or not isinstance(process.get("pid"), int):
         return False
@@ -178,8 +183,13 @@ def _owned(process: dict) -> bool:
         os.waitpid(process["pid"], os.WNOHANG)
     except ChildProcessError:
         pass
-    return (
-        bool(process.get("identity")) and _process_identity(process["pid"]) == process["identity"]
+    recorded = process.get("identity")
+    if not recorded:
+        return False
+    live = _process_identity(process["pid"])
+    # Manifests written before identities were canonical hold the local form.
+    return live is not None and (
+        live == recorded or _local_identity(process["pid"]) == recorded
     )
 
 
@@ -309,9 +319,11 @@ def _registered_worker(config: DeliveryConfig, processes: dict) -> dict | None:
         return None
     if not isinstance(registered, dict):
         return None
-    # The transport the worker polls is recorded for restart decisions; workers
-    # that predate its recording still register.
-    identity = {key: value for key, value in registered.items() if key != "transport_digest"}
+    # The transport the worker polls, its interpreter and its source root are
+    # recorded for restart and upgrade decisions; workers that predate their
+    # recording still register.
+    identity = {key: value for key, value in registered.items()
+                if key in {"pid", "identity", "config_path", "deployment"}}
     expected = {
         "pid": worker.get("pid"),
         "identity": worker.get("identity"),
@@ -717,6 +729,10 @@ async def worker(
             # The transport this worker polls; `restart` reloads only the API
             # while an edited configuration still names the same transport.
             "transport_digest": transport_digest(config),
+            # Where this worker runs from; an upgrade refuses to change that
+            # checkout underneath it.
+            "interpreter": sys.executable,
+            "source_root": str(Path(__file__).resolve().parents[2]),
         }
         if deployment is not None:
             readiness["deployment"] = _deployment_identity(deployment)

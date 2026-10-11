@@ -784,3 +784,27 @@ def test_service_lock_mode_drift_heals_but_a_symlink_never_does(config):
     lock.symlink_to(config.path)
     with pytest.raises(ValueError, match="owned private file"):
         control.service_stop(config)
+
+
+def test_lifecycle_identity_is_zone_independent_and_accepts_legacy_manifests(monkeypatch):
+    from devflow_temporal.supervisor import _process_identity as local_identity
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             start_new_session=True)
+    try:
+        monkeypatch.setenv("TZ", "UTC")
+        canonical = control._process_identity(child.pid)
+        local = local_identity(child.pid)
+        assert canonical and local
+        monkeypatch.setenv("TZ", "Asia/Tokyo")
+        # The recorded form does not move with the host's zone; the local one does.
+        assert control._process_identity(child.pid) == canonical
+        assert local_identity(child.pid) != local
+        monkeypatch.setenv("TZ", "UTC")
+        # Manifests written before identities were canonical still prove ownership.
+        assert control._owned({"pid": child.pid, "identity": canonical})
+        assert control._owned({"pid": child.pid, "identity": local})
+        assert not control._owned({"pid": child.pid, "identity": "Thu Jan  1 00:00:00 1970"})
+    finally:
+        child.kill()
+        child.wait()
