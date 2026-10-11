@@ -16,7 +16,17 @@ from .contracts import digest
 from .delivery_baseline_contract import preparation_failure as _preparation_failure
 from .delivery_baseline_contract import repairable_baseline
 from .delivery_metadata_contract import evidence_applicability
+from .delivery_publication import stopped_at_publication
 from .delivery_questions import valid_blocking_questions
+
+# One publish attempt is bounded; the readback window that follows it must
+# outlast an attempt before a lost one can be considered ended.
+_PUBLISH_ATTEMPT_SECONDS = 180
+_PUBLISH_ATTEMPTS = 4
+
+
+class PublicationDeadline(RuntimeError):
+    """A bounded publication wait ended without the owned PR reading back."""
 
 
 def _failure_classification(cause: Exception | None, controller_cause: str | None) -> dict:
@@ -160,6 +170,7 @@ class DeliveryWorkflow:
         self.original_execution = True
         self.controller_failure_boundary = False
         self.liveness_v2 = False
+        self.publication_v1 = False
         self.terminal_closing = False
         self.controller_spec = None
 
@@ -295,6 +306,17 @@ class DeliveryWorkflow:
                     maximum_interval=timedelta(seconds=10),
                 ),
             }
+        elif (name == "delivery_publish"
+              and request["spec"].get("publication_readback_version") == 1
+              and not request["spec"].get("feature_worker")):
+            # Pre-push transport failures are confirmed before any remote
+            # mutation and retried; the bound effect keeps later attempts
+            # idempotent across the push and the PR creation.
+            options = {"retry_policy": RetryPolicy(
+                maximum_attempts=_PUBLISH_ATTEMPTS, initial_interval=timedelta(seconds=2),
+                maximum_interval=timedelta(seconds=30),
+                non_retryable_error_types=["PublicationRejected", "ValueError", "TypeError"],
+            )}
         else:
             options = {"retry_policy": RetryPolicy(maximum_attempts=1)}
         timeout = timedelta(hours=hours)
@@ -322,9 +344,11 @@ class DeliveryWorkflow:
             )
         if (name in {"delivery_publish", "delivery_reconcile_publish"}
                 and request["spec"].get("publication_readback_version") == 1):
-            limit = 180 if name == "delivery_publish" else 60
+            limit = _PUBLISH_ATTEMPT_SECONDS if name == "delivery_publish" else 60
             timeout = timedelta(seconds=min(request.get("timeout_seconds", limit), limit))
-            options["schedule_to_close_timeout"] = timeout
+            attempts = options["retry_policy"].maximum_attempts or 1
+            options["schedule_to_close_timeout"] = timeout * attempts + timedelta(
+                seconds=60 if attempts > 1 else 0)
         return await workflow.execute_activity(
             name,
             request,
@@ -743,25 +767,62 @@ class DeliveryWorkflow:
         return self.state
 
     async def _publish_original(self, spec, iteration, candidate):
-        """Invoke mutation once; a lost completion can only inspect its existing effect."""
+        """Invoke the mutation; only a confirmed pre-mutation failure invokes it again.
+
+        A lost completion can only inspect its existing effect.
+        """
         self.state["cleanup"] = "unknown"
-        try:
-            initial = await self._activity("delivery_publish", {
-                "spec": spec, "iteration": iteration, "candidate": candidate,
-            })
-        except ActivityError as exc:
-            if (spec.get("publication_readback_version") == 1
-                    and isinstance(exc.cause, ApplicationError)
-                    and exc.cause.type == "PublicationRejected" and exc.cause.non_retryable):
-                self.state["cleanup"] = "none"
-                raise
-            initial = None
+        deadline, delay = None, 5
+        while True:
+            try:
+                initial = await self._activity("delivery_publish", {
+                    "spec": spec, "iteration": iteration, "candidate": candidate,
+                })
+            except ActivityError as exc:
+                failure = exc.cause if isinstance(exc.cause, ApplicationError) else None
+                if (spec.get("publication_readback_version") == 1 and failure is not None
+                        and failure.type == "PublicationRejected" and failure.non_retryable):
+                    self.state["cleanup"] = "none"
+                    raise
+                if (self.publication_v1 and spec.get("publication_readback_version") == 1
+                        and failure is not None and failure.type == "PublicationTransient"):
+                    # Confirmed before any remote mutation: there is nothing to
+                    # reconcile, so the publication itself waits for GitHub
+                    # within the same bound as a post-push readback.
+                    self.state["cleanup"] = "none"
+                    if deadline is None:
+                        deadline = workflow.now() + timedelta(
+                            seconds=spec["publication_readback_seconds"])
+                    remaining = (deadline - workflow.now()).total_seconds()
+                    if remaining <= 0:
+                        raise PublicationDeadline("remote unavailable before push") from exc
+                    self.state["phase"] = "publishing_pending"
+                    self.state["revision"] += 1
+                    await self._project(spec, "publication_pending",
+                                        "Waiting for GitHub availability before publishing")
+                    await self._wait_repair_readback(min(delay, max(0, remaining)))
+                    if self.cancel_requested:
+                        await self._cancelled(spec)
+                        return {"state": "cancelled"}
+                    delay = min(delay * 2, 60)
+                    self.state["cleanup"] = "unknown"
+                    continue
+                initial = None
+            break
         previous = self.state.get("pull_request") or {}
         return await self._published_result(
             spec, iteration, candidate, initial,
             expected_head=initial.get("head") if initial else None,
             expected_pr_number=previous.get("number"),
         )
+
+    async def _publication_stop(self, spec, exc, prefix):
+        if self.publication_v1 and isinstance(exc, PublicationDeadline):
+            # A controller-observed deadline on an unchanged candidate: the
+            # reason is stable and the stop is classified transient.
+            return await self._stop(spec, prefix + str(exc),
+                                    controller_cause="publication_deadline")
+        return await self._stop(spec, prefix + type(exc).__name__, cause=exc)
 
     @staticmethod
     def _publication_transport_failure(exc):
@@ -787,6 +848,12 @@ class DeliveryWorkflow:
                 return {"state": "cancelled"}
             remaining = (deadline - workflow.now()).total_seconds()
             if remaining <= 0:
+                if self.publication_v1:
+                    # A readback window longer than one publish attempt outlasts
+                    # any lost attempt; only the PR projection stays unknown.
+                    if spec["publication_readback_seconds"] >= _PUBLISH_ATTEMPT_SECONDS:
+                        self.state["cleanup"] = "none"
+                    raise PublicationDeadline("readback deadline exhausted")
                 raise ApplicationError("original publication readback deadline exhausted")
             if result is None:
                 try:
@@ -1089,6 +1156,10 @@ class DeliveryWorkflow:
         # protocol calls outside a workflow have no history: False.
         self.liveness_v2 = (workflow.patched("delivery-liveness-v2")
                             if workflow.in_workflow() else False)
+        # Publication self-heal commands: the pre-push retry wait and the
+        # classified readback deadline stop.
+        self.publication_v1 = (workflow.patched("delivery-publication-self-heal-v1")
+                               if workflow.in_workflow() else False)
         if (spec.get("workflow_failure_boundary_version") != 1
                 or not workflow.patched("delivery-controller-failure-boundary-v1")):
             return await self._run_protocol(spec, recovery)
@@ -1321,7 +1392,8 @@ class DeliveryWorkflow:
         if (
             previous.get("run_id") != spec["run_id"]
             or previous.get("phase") != "blocked"
-            or previous.get("error") != "publication unresolved: ActivityError"
+            or not (previous.get("error") == "publication unresolved: ActivityError"
+                    or self.publication_v1 and stopped_at_publication(previous))
             or previous.get("cleanup") not in {"none", "pending_publication_readback"}
             or not previous.get("roles")
             or previous["roles"][-1].get("role") != "implement"
@@ -1389,7 +1461,7 @@ class DeliveryWorkflow:
             self.state["revision"] += 1
             await self._project(spec, "published", "Pending controller publication completed")
         except Exception as exc:
-            return await self._stop(spec, "publication retry failed: " + type(exc).__name__)
+            return await self._publication_stop(spec, exc, "publication retry failed: ")
         implementation = next(r for r in reversed(self.state["roles"])
                               if r.get("role") == "implement")
         return await self._run_iterations(
@@ -2270,9 +2342,7 @@ class DeliveryWorkflow:
                                 ),
                             )
                 except Exception as exc:
-                    return await self._stop(
-                        spec, f"publication unresolved: {type(exc).__name__}", cause=exc,
-                    )
+                    return await self._publication_stop(spec, exc, "publication unresolved: ")
                 if published.get("state") == "cancelled":
                     return self.state
                 if published["candidate"]["id"] != self.state["candidate"]["id"]:

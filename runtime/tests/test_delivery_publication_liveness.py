@@ -39,8 +39,10 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
             'policy': {'max_repairs': 0, 'browser_qa': None}}
     if versioned:
         spec.update(publication_readback_version=1, publication_readback_seconds=30)
-    if failure in {'deadline', 'cancel', 'semantic', 'pre_mutation'}:
+    if failure in {'deadline', 'cancel', 'semantic', 'pre_mutation', 'pre_push_exhausted'}:
         spec.update(resource_cleanup_version=1, terminal_tracker_version=1)
+    if failure in {'deadline', 'pre_push_transient', 'pre_push_exhausted'}:
+        spec.update(automatic_retry_version=1)
 
     @activity.defn(name='delivery_project')
     async def project(payload):
@@ -74,6 +76,11 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
         if failure == 'pre_mutation':
             raise ApplicationError('candidate rejected before remote mutation',
                                    type='PublicationRejected', non_retryable=True)
+        if failure == 'pre_push_exhausted' or (
+                failure == 'pre_push_transient' and calls['publish'] <= 5):
+            # Confirmed before any remote mutation; outlasts one activity's attempts.
+            raise ApplicationError('owned branch PR readback unavailable',
+                                   type='PublicationTransient')
         if failure == 'failed_mutation':
             raise RuntimeError('mutation command failed; its remote outcome is unconfirmed')
         if failure == 'lost_initial':
@@ -109,7 +116,7 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
 
     @activity.defn(name='delivery_finalize_resources')
     async def finalize_resources(payload):
-        if failure == 'pre_mutation':
+        if failure in {'pre_mutation', 'pre_push_exhausted'}:
             assert payload['uncertain'] is False
             return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
                     'resource_cleanup': 'confirmed'}
@@ -118,7 +125,7 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
 
     @activity.defn(name='delivery_terminal_tracker')
     async def terminal_tracker(payload):
-        assert payload['release'] is (failure == 'pre_mutation')
+        assert payload['release'] is (failure in {'pre_mutation', 'pre_push_exhausted'})
         return {'state': 'consistent'}
 
     activities = [project, prepare, tracker_start, role, precheck, publish,
@@ -148,7 +155,10 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
 async def test_publication_transport_failure_reconciles_original_inside_run(failure):
     result, calls, events = await run_publication_probe(failure=failure)
     assert result['outcome'] == 'delivered'
-    assert calls['publish'] == calls['implement'] == 1
+    assert calls['implement'] == 1
+    # An unconfirmed mutation failure is retried on the bound effect before
+    # read-only reconciliation; a pending readback is not a failure.
+    assert calls['publish'] == (1 if failure == 'read_timeout' else 4)
     assert calls['reconcile'] == (2 if failure == 'read_timeout' else 1)
     assert result['pull_request']['head'] == 'original-head'
     assert 'published' in events
@@ -177,6 +187,37 @@ async def test_publication_wait_is_bounded_cancellable_and_semantic_errors_termi
     assert calls['reconcile'] <= 3
     if failure == 'semantic':
         assert calls['reconcile'] == 1
+    if failure == 'deadline':
+        assert result['error'] == 'publication unresolved: readback deadline exhausted'
+        assert result['checks']['failure']['classification'] == 'transient'
+        assert result['checks']['failure']['cause_type'] == 'publication_deadline'
+
+
+@pytest.mark.asyncio
+async def test_pre_push_transport_failures_retry_the_publication_inside_the_run():
+    result, calls, events = await run_publication_probe(failure='pre_push_transient')
+    assert result['outcome'] == 'delivered'
+    assert calls['implement'] == 1
+    # One activity exhausts its attempts; the workflow waits and invokes again.
+    assert calls['publish'] == 6
+    assert calls['reconcile'] == 1
+    assert 'publication_pending' in events
+    assert result['pull_request']['head'] == 'original-head'
+
+
+@pytest.mark.asyncio
+async def test_pre_push_exhaustion_stops_transient_with_confirmed_cleanup():
+    result, calls, _events = await run_publication_probe(failure='pre_push_exhausted')
+    assert result['outcome'] == 'blocked'
+    assert result['error'] == 'publication unresolved: remote unavailable before push'
+    assert result['checks']['failure'] == {
+        'classification': 'transient', 'cause_type': 'publication_deadline',
+        'stage': 'publishing_pending', 'reason': result['error'],
+    }
+    assert result['cleanup'] == 'confirmed'
+    assert result['pull_request'] is None
+    assert calls['implement'] == 1 and calls['reconcile'] == 0
+    assert calls['publish'] >= 8 and calls['publish'] % 4 == 0
 
 
 @pytest.mark.asyncio

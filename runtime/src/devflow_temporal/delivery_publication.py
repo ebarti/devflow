@@ -13,6 +13,18 @@ _BIDI_CONTROLS = {"LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"}
 _BIDI_MARKS = {"\u061c", "\u200e", "\u200f"}
 
 
+def stopped_at_publication(state: dict) -> bool:
+    """A controller stop at the publication boundary.
+
+    New runs classify it (``publication_deadline``); stops recorded before the
+    classification carry one of the historical reasons, which keep admitting.
+    """
+    failure = (state.get("checks") or {}).get("failure") or {}
+    error = state.get("error") or ""
+    return (failure.get("cause_type") == "publication_deadline"
+            or error.startswith("publication unresolved: "))
+
+
 def conventional(subject: str) -> bool:
     return bool(re.fullmatch(r"[a-z][a-z0-9-]*(?:\([^()\r\n]+\))?!?: \S.*", subject))
 

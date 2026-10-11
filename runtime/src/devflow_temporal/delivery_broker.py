@@ -133,6 +133,7 @@ class DeliveryBroker:
         self.check_cancelled = lambda: False
         self.native_cleanup_confirmed = True
         self.publication_may_have_effect = True
+        self.effect_inserted = False
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -146,7 +147,9 @@ class DeliveryBroker:
             if saved:
                 if saved[0] != kind or saved[1] != serialized:
                     raise ValueError("effect identity belongs to a different request")
+                self.effect_inserted = False
                 return json.loads(saved[3]) if saved[2] == "complete" and saved[3] else None
+            self.effect_inserted = True
             db.execute(
                 """INSERT INTO delivery_effects
                    (effect_key,run_id,kind,request_json,state,updated_at)
@@ -1440,6 +1443,8 @@ class DeliveryBroker:
         before = self.candidate()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
         done = self._effect(key, "publish", request)
+        if self.spec.get("publication_readback_version") == 1 and not self.effect_inserted:
+            self.publication_may_have_effect = True
         if done:
             found = self._existing_pr()
             if found is None or found["headRefOid"] != done["head"]:
@@ -1484,7 +1489,12 @@ class DeliveryBroker:
             raise ValueError("no meaningful commit is available for publication")
         if self.spec.get("publication_readback_version") == 1:
             self._bind_pending_publication(key, head, existing["number"] if existing else None)
-        remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        try:
+            remote = _git(self.source, "ls-remote", "origin",
+                          f"refs/heads/{self.spec['branch']}")
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            raise BrokerReadbackUnavailable(
+                "remote branch readback unavailable before push") from exc
         if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
             raise RuntimeError("Git push destination changed from the admitted origin")
         remote_head = remote.split()[0] if remote else None
@@ -1511,38 +1521,8 @@ class DeliveryBroker:
                 key, head, existing["number"] if existing else None, remote_confirmed=True,
             )
         if existing is None:
-            title = publication_title(publication_subject(self.spec))
-            body = self.state_dir / "pull-request.md"
-            body.write_text(
-                self.spec["policy"].get("pr_body")
-                or (
-                    f"{title}\n\n"
-                    f"Addresses {self.spec['issue_url']} under the accepted local plan. "
-                    "This PR is published for review and remains unmerged.\n"
-                ),
-                encoding="utf-8",
-            )
-            os.chmod(body, 0o600)
             self.publication_may_have_effect = True
-            _run(
-                [
-                    "gh",
-                    "pr",
-                    "create",
-                    "--repo",
-                    self.spec["github_repo"],
-                    "--head",
-                    self.spec["branch"],
-                    "--base",
-                    publication_branch,
-                    "--title",
-                    title,
-                    "--body-file",
-                    str(body),
-                ],
-                cwd=self.checkout,
-                timeout=90,
-            )
+            self._create_owned_pr(publication_branch)
         # A successful push can precede GitHub's PR-head projection. The
         # durable effect remains pending until a separate read-only
         # reconciliation proves all three heads equal.
@@ -1565,6 +1545,63 @@ class DeliveryBroker:
         self._finish_effect(key, result)
         return result
 
+    def _create_owned_pr(self, publication_branch: str) -> None:
+        """Open the regular PR for the pushed head; an existing one is read back."""
+        title = publication_title(publication_subject(self.spec))
+        body = self.state_dir / "pull-request.md"
+        body.write_text(
+            self.spec["policy"].get("pr_body")
+            or (
+                f"{title}\n\n"
+                f"Addresses {self.spec['issue_url']} under the accepted local plan. "
+                "This PR is published for review and remains unmerged.\n"
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(body, 0o600)
+        try:
+            _run(
+                [
+                    "gh",
+                    "pr",
+                    "create",
+                    "--repo",
+                    self.spec["github_repo"],
+                    "--head",
+                    self.spec["branch"],
+                    "--base",
+                    publication_branch,
+                    "--title",
+                    title,
+                    "--body-file",
+                    str(body),
+                ],
+                cwd=self.checkout,
+                timeout=90,
+            )
+        except RuntimeError as exc:
+            # GitHub refuses a second open PR for one head and base: the
+            # existing PR is this publication, and the caller reads it back.
+            if "already exists" not in str(exc).casefold():
+                raise
+
+    def discard_unused_publication(self, iteration: int) -> None:
+        """Forget the pending effect of an invocation confirmed to precede any mutation.
+
+        A retained row would make the next attempt treat the same transport
+        failure as a possible lost mutation. Only the invocation that inserted
+        the row and never reached push or PR creation may remove it.
+        """
+        if self.publication_may_have_effect is not False or not self.effect_inserted:
+            raise ValueError("publication effect may have taken effect; it cannot be discarded")
+        with self.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "DELETE FROM delivery_effects WHERE effect_key=? AND kind='publish' "
+                "AND state='pending'",
+                (f"publish:{self.spec['run_id']}:{iteration}",),
+            )
+
     def reconcile_publish(
         self,
         iteration: int,
@@ -1573,11 +1610,14 @@ class DeliveryBroker:
         expected_head: str | None = None,
         expected_pr_number: int | None = None,
         complete: bool = True,
+        create_missing: bool = False,
     ) -> dict[str, Any]:
-        """Complete only an existing publish effect after external readback.
+        """Complete an existing publish effect after external readback.
 
-        This path cannot commit, push, or create a PR. It is safe after a
-        successful push followed by a stale GitHub PR projection.
+        This path cannot commit or push. It is safe after a successful push
+        followed by a stale GitHub PR projection. With ``create_missing`` it
+        opens the PR for a pushed head that has none, so a publication whose
+        PR creation failed converges instead of waiting for nothing.
         """
         key = f"publish:{self.spec['run_id']}:{iteration}"
         self._validate_publication_commits()
@@ -1646,6 +1686,17 @@ class DeliveryBroker:
         if saved["state"] == "pending" and self.spec.get("publication_readback_version") == 1:
             self._bind_pending_publication(key, head, expected_pr_number, remote_confirmed=True)
         found = self._existing_pr()
+        if (found is None and create_missing and saved["state"] == "pending"
+                and self.spec.get("publication_readback_version") == 1
+                and expected_pr_number is None):
+            # The push is confirmed at this exact head and no PR uses the
+            # branch; finish the original mutation instead of waiting for it.
+            try:
+                self._create_owned_pr(self._publication_base_ref())
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+                raise BrokerReadbackUnavailable(
+                    "owned PR creation is unconfirmed; remote readback required") from exc
+            found = self._existing_pr()
         if found is not None:
             if (self.spec.get("publication_readback_version") == 1
                     and expected_pr_number is not None and found["number"] != expected_pr_number):

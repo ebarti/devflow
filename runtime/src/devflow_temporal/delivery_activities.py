@@ -618,6 +618,14 @@ async def delivery_publish(request: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:
             if (request["spec"].get("publication_readback_version") == 1
                     and broker.publication_may_have_effect is False):
+                if (not request["spec"].get("feature_worker")
+                        and isinstance(exc, (BrokerReadbackUnavailable,
+                                             subprocess.TimeoutExpired))):
+                    # Confirmed before any remote command took effect: the
+                    # publication is retried whole instead of stopping the run
+                    # on GitHub or network availability.
+                    broker.discard_unused_publication(request["iteration"])
+                    raise ApplicationError(str(exc)[:600], type="PublicationTransient") from exc
                 raise ApplicationError(str(exc)[:600], type="PublicationRejected",
                                        non_retryable=True) from exc
             raise
@@ -638,6 +646,7 @@ async def delivery_reconcile_publish(request: dict[str, Any]) -> dict[str, Any]:
             request["candidate"],
             expected_head=request.get("expected_head"),
             expected_pr_number=request.get("expected_pr_number"),
+            create_missing=request["spec"].get("publication_readback_version") == 1,
         )
         return result
 
