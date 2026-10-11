@@ -413,10 +413,218 @@ async def test_dispatch_failure_does_not_acknowledge_foreign_outbox(
     with pytest.raises(asyncio.CancelledError):
         await owner.dispatch_loop()
     with foreign.store._connect() as db:
-        assert db.execute("SELECT state FROM delivery_outbox WHERE run_id=?",
-                          (request["run_id"],)).fetchone()[0] == "pending"
-        assert db.execute("SELECT state FROM delivery_outbox WHERE run_id=?",
-                          (own_request["run_id"],)).fetchone()[0] == "unknown"
+        assert tuple(db.execute("SELECT state,last_error FROM delivery_outbox WHERE run_id=?",
+                                (request["run_id"],)).fetchone()) == ("pending", None)
+        own = tuple(db.execute("SELECT state,last_error FROM delivery_outbox WHERE run_id=?",
+                               (own_request["run_id"],)).fetchone())
+    # Nothing was sent: the own row stays queued and names the outage once rather
+    # than becoming unknown on every cycle.
+    assert own == ("pending", "ConnectionError: own transport unavailable")
+
+
+def _dispatch_snapshot(store, run_ids):
+    with store._connect() as db:
+        return {
+            run_id: {
+                "outbox": tuple(db.execute(
+                    "SELECT state,attempts,last_error FROM delivery_outbox WHERE run_id=?",
+                    (run_id,)).fetchone()),
+                "revision": db.execute(
+                    "SELECT revision FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()[0],
+                "events": db.execute(
+                    "SELECT COUNT(*) FROM delivery_events WHERE run_id=?", (run_id,)).fetchone()[0],
+            }
+            for run_id in run_ids
+        }
+
+
+def _queued_runs(service, request, count):
+    run_ids = []
+    for number in range(1, count + 1):
+        run_id = f"run-{number}"
+        service.store.submit({
+            **request, "command_id": f"submit-{number}", "run_id": run_id,
+            "work_id": f"work-{number}", "branch": f"feat/fixture-{number}",
+            "issue_url": f"https://github.com/example/fixture/issues/{number}",
+        })
+        run_ids.append(run_id)
+    return run_ids
+
+
+class _Description:
+    def __init__(self, memo):
+        self.memo = memo
+
+    async def memo_value(self, key, default=None):
+        return self.memo.get(key, default)
+
+
+@pytest.mark.asyncio
+async def test_poison_row_cannot_starve_newer_runs_or_churn_their_timelines(
+    api_fixture, monkeypatch,
+):
+    path, request = api_fixture
+    service = create_app(path).state.delivery
+    run_ids = _queued_runs(service, request, 3)
+    describe_errors = {"delivery-run-1": RPCStatusCode.INTERNAL}
+    started = []
+
+    class Handle:
+        def __init__(self, workflow_id):
+            self.workflow_id = workflow_id
+
+        async def describe(self):
+            if self.workflow_id in describe_errors:
+                raise RPCError("deadline exceeded", describe_errors[self.workflow_id], b"")
+            if self.workflow_id == "delivery-run-3":
+                return _Description({"request_digest": "stale-digest"})
+            raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+
+    class Temporal:
+        def get_workflow_handle(self, workflow_id):
+            return Handle(workflow_id)
+
+        async def start_workflow(self, _workflow, **kwargs):
+            started.append(kwargs["id"])
+
+    async def healthy():
+        return Temporal()
+
+    clock = [time.time()]
+    monkeypatch.setattr(service, "healthy_client", healthy)
+    monkeypatch.setattr("devflow_temporal.delivery_api.time",
+                        SimpleNamespace(time=lambda: clock[0]))
+    before = _dispatch_snapshot(service.store, run_ids)
+    await service.dispatch_once()
+    # The newer run-2 starts although the older run-1 fails ahead of it.
+    assert started == ["delivery-run-2"]
+    first = _dispatch_snapshot(service.store, run_ids)
+    assert first["run-1"]["outbox"] == ("pending", 1, "RPCError INTERNAL: deadline exceeded")
+    assert first["run-1"]["revision"] == before["run-1"]["revision"] + 1
+    assert first["run-1"]["events"] == before["run-1"]["events"] + 1
+    assert first["run-2"]["outbox"][0] == "sent"
+    # A different request holds run-3's workflow ID: terminal, surfaced once.
+    assert first["run-3"]["outbox"][0] == "conflict"
+    assert "belongs to a different request" in first["run-3"]["outbox"][2]
+    assert first["run-3"]["revision"] == before["run-3"]["revision"] + 1
+    assert first["run-3"]["events"] == before["run-3"]["events"] + 1
+    assert service.store.detail("run-3")["dispatch"]["state"] == "conflict"
+    assert [row["run_id"] for row in service.store.pending_starts()] == ["run-1"]
+    # The first retry is immediate and counts an attempt without a new event;
+    # the row then backs off, so further immediate cycles touch nothing.
+    for _ in range(3):
+        await service.dispatch_once()
+    repeated = _dispatch_snapshot(service.store, run_ids)
+    assert repeated["run-1"]["outbox"] == ("pending", 2, "RPCError INTERNAL: deadline exceeded")
+    assert repeated["run-1"]["revision"] == first["run-1"]["revision"]
+    assert repeated["run-1"]["events"] == first["run-1"]["events"]
+    assert repeated["run-3"] == first["run-3"]
+    assert started == ["delivery-run-2"]
+    # A changed reason after the backoff is surfaced once more.
+    describe_errors["delivery-run-1"] = RPCStatusCode.UNAVAILABLE
+    clock[0] += 25
+    await service.dispatch_once()
+    changed = _dispatch_snapshot(service.store, run_ids)
+    assert changed["run-1"]["outbox"] == ("pending", 3, "RPCError UNAVAILABLE: deadline exceeded")
+    assert changed["run-1"]["revision"] == first["run-1"]["revision"] + 1
+    assert changed["run-1"]["events"] == first["run-1"]["events"] + 1
+    await service.dispatch_once()
+    assert _dispatch_snapshot(service.store, run_ids) == changed
+    # Once the failure clears, the row starts on its next due cycle.
+    describe_errors.clear()
+    clock[0] += 45
+    await service.dispatch_once()
+    assert started == ["delivery-run-2", "delivery-run-1"]
+    assert _dispatch_snapshot(service.store, run_ids)["run-1"]["outbox"][0] == "sent"
+    assert service.store.pending_starts() == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_start_is_unknown_for_that_row_only_and_backs_off(
+    api_fixture, monkeypatch,
+):
+    path, request = api_fixture
+    service = create_app(path).state.delivery
+    run_ids = _queued_runs(service, request, 2)
+    started = []
+
+    async def missing():
+        raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+
+    class Temporal:
+        def get_workflow_handle(self, _workflow_id):
+            return SimpleNamespace(describe=missing)
+
+        async def start_workflow(self, _workflow, **kwargs):
+            if kwargs["id"] == "delivery-run-1":
+                raise RPCError("payload too large", RPCStatusCode.INVALID_ARGUMENT, b"")
+            started.append(kwargs["id"])
+
+    async def healthy():
+        service.temporal_status = "connected"
+        return Temporal()
+
+    clock = [time.time()]
+    monkeypatch.setattr(service, "healthy_client", healthy)
+    monkeypatch.setattr("devflow_temporal.delivery_api.time",
+                        SimpleNamespace(time=lambda: clock[0]))
+    await service.dispatch_once()
+    assert started == ["delivery-run-2"]
+    assert service.temporal_status == "connected"
+    first = _dispatch_snapshot(service.store, run_ids)
+    # The start was sent, so its acknowledgement is unknown until the memo is read.
+    assert first["run-1"]["outbox"] == (
+        "unknown", 1, "RPCError INVALID_ARGUMENT: payload too large")
+    assert first["run-2"]["outbox"][0] == "sent"
+    # The immediate retry reads no memo (not found) and fails the same way; the
+    # row then backs off without further timeline noise.
+    for _ in range(2):
+        await service.dispatch_once()
+    again = _dispatch_snapshot(service.store, run_ids)
+    assert again["run-1"]["outbox"] == (
+        "unknown", 2, "RPCError INVALID_ARGUMENT: payload too large")
+    assert again["run-1"]["revision"] == first["run-1"]["revision"]
+    assert again["run-1"]["events"] == first["run-1"]["events"]
+    clock[0] += 25
+    await service.dispatch_once()
+    assert _dispatch_snapshot(service.store, run_ids)["run-1"]["outbox"][1] == 3
+    assert started == ["delivery-run-2"]
+
+
+@pytest.mark.asyncio
+async def test_transport_outage_is_surfaced_once_per_reason(api_fixture, monkeypatch):
+    path, request = api_fixture
+    service = create_app(path).state.delivery
+    run_ids = _queued_runs(service, request, 2)
+    reasons = ["own transport unavailable"]
+
+    async def unavailable():
+        raise ConnectionError(reasons[0])
+
+    async def stop_loop(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(service, "healthy_client", unavailable)
+    monkeypatch.setattr("devflow_temporal.delivery_api.asyncio.sleep", stop_loop)
+    before = _dispatch_snapshot(service.store, run_ids)
+    for _ in range(3):
+        with pytest.raises(asyncio.CancelledError):
+            await service.dispatch_loop()
+    once = _dispatch_snapshot(service.store, run_ids)
+    for run_id in run_ids:
+        assert once[run_id]["outbox"] == (
+            "pending", 0, "ConnectionError: own transport unavailable")
+        assert once[run_id]["revision"] == before[run_id]["revision"] + 1
+        assert once[run_id]["events"] == before[run_id]["events"] + 1
+    assert service.temporal_status == "disconnected"
+    reasons[0] = "name resolution failed"
+    with pytest.raises(asyncio.CancelledError):
+        await service.dispatch_loop()
+    changed = _dispatch_snapshot(service.store, run_ids)
+    for run_id in run_ids:
+        assert changed[run_id]["outbox"] == (
+            "pending", 0, "ConnectionError: name resolution failed")
+        assert changed[run_id]["events"] == once[run_id]["events"] + 1
 
 
 @pytest.mark.asyncio

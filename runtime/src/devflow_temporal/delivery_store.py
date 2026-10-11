@@ -2977,7 +2977,9 @@ class DeliveryStore:
         with self._connect() as db:
             rows = db.execute(
                 """SELECT r.run_id,r.request_digest,r.request_json,r.workflow_id,
-                          r.recovery_json FROM delivery_runs r
+                          r.recovery_json,o.state AS outbox_state,o.attempts,
+                          o.last_error,o.updated_at AS outbox_updated_at
+                   FROM delivery_runs r
                    JOIN delivery_outbox o ON o.run_id=r.run_id
                    WHERE o.state IN ('pending','unknown') ORDER BY r.created_at"""
             ).fetchall()
@@ -3060,6 +3062,84 @@ class DeliveryStore:
                 "Temporal accepted the run" if accepted else "Temporal dispatch remains pending",
                 {"error": error} if error else {},
             )
+
+    def record_dispatch_failure(
+        self, run_id: str, reason: str, *, uncertain: bool = False, counted: bool = True,
+    ) -> None:
+        """Record why this cycle did not dispatch the run, once per distinct reason.
+
+        The outbox row carries the failure (``last_error``, ``attempts``); the
+        run's revision and timeline move only when the reason changes, so a
+        poison row or a transport outage polled every few seconds does not
+        churn every dashboard command and bury the timeline. ``uncertain``
+        marks a start whose acknowledgement is unknown; ``counted`` is False
+        for a cycle that reached no row (the per-row backoff stays untouched).
+        """
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT o.state,o.last_error,o.attempts,r.revision FROM delivery_outbox o
+                   JOIN delivery_runs r ON r.run_id=o.run_id
+                   WHERE o.run_id=? AND o.state IN ('pending','unknown')""",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return
+            state = "unknown" if uncertain else row[0]
+            # Admissions re-queue a row by clearing last_error only; a failure
+            # after that starts a fresh attempt sequence instead of inheriting
+            # the backoff of an earlier execution.
+            attempts = row[2] if not counted else (row[2] + 1 if row[1] is not None else 1)
+            db.execute(
+                """UPDATE delivery_outbox SET state=?,attempts=?,last_error=?,updated_at=?
+                   WHERE run_id=?""",
+                (state, attempts, reason, _now(), run_id),
+            )
+            if row[1] == reason:
+                return
+            revision = row[3] + 1
+            db.execute(
+                "UPDATE delivery_runs SET revision=?,updated_at=? WHERE run_id=?",
+                (revision, _now(), run_id),
+            )
+            self._event(
+                db, run_id, revision, "temporal_pending",
+                "Temporal dispatch remains pending", {"error": reason},
+            )
+
+    def mark_start_conflict(self, run_id: str, workflow_id: str, reason: str) -> None:
+        """Retire a start whose workflow ID is held by a different request.
+
+        The remote memo proves the ID belongs to another request; retrying can
+        never acknowledge it, so the outbox entry becomes terminal and the run
+        is told once instead of on every dispatch cycle.
+        """
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT r.revision FROM delivery_outbox o
+                   JOIN delivery_runs r ON r.run_id=o.run_id
+                   WHERE o.run_id=? AND o.state IN ('pending','unknown')""",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return
+            revision = row[0] + 1
+            db.execute(
+                "UPDATE delivery_runs SET revision=?,updated_at=? WHERE run_id=?",
+                (revision, _now(), run_id),
+            )
+            db.execute(
+                """UPDATE delivery_outbox SET state='conflict',last_error=?,updated_at=?
+                   WHERE run_id=?""",
+                (reason, _now(), run_id),
+            )
+            self._event(
+                db, run_id, revision, "temporal_conflict",
+                "Temporal workflow ID is held by a different request",
+                {"error": reason, "workflow_id": workflow_id},
+            )
+        logger.warning("Run %s is not dispatched: %s", run_id, reason)
 
     def project(
         self,
