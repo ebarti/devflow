@@ -267,11 +267,16 @@ def _terminate(name: str, process: dict) -> str:
 
 
 def _stop(config: DeliveryConfig, manifest: dict) -> dict:
+    """Stop the owned members and retain the recorded selection.
+
+    Stopping never compares the recorded source payload with the checkout:
+    stopping a drifted stack is the safe action, and each member is still
+    proven owned by its identity before it is signalled. The next start
+    validates the retained selection before launching anything.
+    """
     recorded = _recorded_deployment(manifest)
     if recorded is None:
         recorded = _recorded_deployment(_read_manifest(config) or {})
-    if recorded is not None:
-        _validated_deployment(recorded)
     results = {}
     for name in ("api", "worker", "temporal"):
         process = manifest.get("processes", {}).get(name)
@@ -464,22 +469,17 @@ def ensure_service_running(
                 ):
                     raise ValueError("state root has a running service for another configuration")
                 recorded = _recorded_deployment(existing)
-                if recorded is not None:
-                    different = isinstance(recorded, dict) and deployment is not None and (
-                        deployment.version.deployment_name != recorded.get("name")
-                        or deployment.version.build_id != recorded.get("build_id"))
-                    replace = different and not existing["processes"]
-                    selected = _validated_deployment(recorded, same_payload=not replace)
-                    if different and not replace:
-                        raise ValueError(
-                            "running worker deployment differs; drain it before changing")
-                    if not replace:
-                        deployment = selected
-                    else:
-                        # Explicit owner selection only after the prior lifecycle was stopped.
-                        existing = {**existing,
-                                    "worker_deployment": _deployment_identity(deployment)}
-                        _write_manifest(config, {}, deployment=existing["worker_deployment"])
+                different = isinstance(recorded, dict) and deployment is not None and (
+                    deployment.version.deployment_name != recorded.get("name")
+                    or deployment.version.build_id != recorded.get("build_id"))
+                replace = different and not existing["processes"]
+                if different and not replace:
+                    raise ValueError(
+                        "running worker deployment differs; drain it before changing")
+                # A ready stack keeps running whatever the checkout now contains: its
+                # members already hold the source they were launched from. The
+                # recorded payload is compared only when a member must be launched
+                # from the current source.
                 info = _await_ready(config, existing, deadline)
                 if info:
                     # An empty or partial inventory reports readiness only through
@@ -500,6 +500,15 @@ def ensure_service_running(
                             f"--config {config.path} restart` to move it to "
                             f"{config.dashboard_url}")
                     return {"dashboard_url": config.dashboard_url, **existing}
+                if recorded is not None:
+                    selected = _validated_deployment(recorded, same_payload=not replace)
+                    if not replace:
+                        deployment = selected
+                    else:
+                        # Explicit owner selection only after the prior lifecycle was stopped.
+                        existing = {**existing,
+                                    "worker_deployment": _deployment_identity(deployment)}
+                        _write_manifest(config, {}, deployment=existing["worker_deployment"])
                 if _only_api_missing(config, existing):
                     # A registered worker is never stopped because its API died or
                     # failed to relaunch; only the API member is brought back, and
