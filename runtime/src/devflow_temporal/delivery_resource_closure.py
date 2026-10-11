@@ -150,7 +150,7 @@ def _readiness(store, spec, payload, authority, parent):
     if _unchanged(before, identity, spec):
         verify_native_spec(spec)
     return {
-        "required": identity != before,
+        "required": not _unchanged(before, identity, spec),
         "identity": identity,
         "before": before,
         "authority": authority,

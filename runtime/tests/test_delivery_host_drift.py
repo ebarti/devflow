@@ -68,6 +68,22 @@ def test_renewal_and_closure_readiness_tolerate_a_trusted_os_update():
         _payload_only(FROZEN, {**updated, "codex_bin_sha256": "changed"}, trusted)
 
 
+def test_resource_closure_needs_no_renewal_generation_for_a_trusted_os_update(monkeypatch):
+    from devflow_temporal import delivery_resource_closure as closure
+
+    spec = {"policy": {"host_sandbox": "trusted-local", "native_identity": dict(FROZEN)}}
+    monkeypatch.setattr(native, "native_identity", lambda _spec: {**FROZEN, "os_version": "26.1"})
+    monkeypatch.setattr(native, "verify_native_spec", lambda _spec: None)
+    monkeypatch.setattr(closure, "_controller", lambda *_args: {
+        "installed_source_root": "/source", "source_revision": "revision",
+        "config_sha256": "config"})
+    readiness, _controller = closure._readiness(None, spec, {}, None, None)
+    assert readiness["required"] is False
+    spec["policy"]["host_sandbox"] = "native-profile"
+    with pytest.raises(ValueError, match="non-payload identity"):
+        closure._readiness(None, spec, {}, None, None)
+
+
 @pytest.mark.parametrize("field", ["codex_bin_sha256", "architecture", "config_overrides"])
 def test_measured_identity_drift_still_refuses(tmp_path, monkeypatch, field):
     spec = _spec(tmp_path, dict(FROZEN))
