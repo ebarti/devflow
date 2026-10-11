@@ -454,6 +454,13 @@ def _native_role_home(request: dict[str, Any]) -> Path:
             # A retained independent config binds its old workspace. Keep it intact
             # and allocate the new independent home from authenticated custody.
             home /= namespace.parent.name
+        if 'revision_context' in request:
+            from .delivery_feature_revision_roles import revision_comparison
+
+            comparison, _ = revision_comparison(request)
+            # Proposal reads vary at iteration zero. Preserve each frozen config
+            # and derive its retry-stable home from the same admitted comparison.
+            home /= comparison.parent
     return home
 
 
@@ -466,6 +473,10 @@ def _review_diff_path(request: dict[str, Any]) -> Path | None:
         return None
     if not isinstance(review_diff, dict):
         raise ValueError('independent role requires the controller-bound diff')
+    if review_diff.get('kind') == 'plan_revision':
+        return _revision_diff_path(request)
+    if 'revision_context' in request or review_diff.get('kind') is not None:
+        raise ValueError('independent role received the wrong controller-bound diff kind')
     from .delivery_resources import _ancestors, _gate_evidence_root, _gate_path
 
     spec = request['spec']
@@ -488,6 +499,37 @@ def _review_diff_path(request: dict[str, Any]) -> Path | None:
                 or hashlib.file_digest(stream, 'sha256').hexdigest() != review_diff.get('sha256')):
             raise ValueError('controller-bound diff is unavailable or changed')
     return diff_path
+
+
+def _revision_diff_path(request: dict[str, Any]) -> Path:
+    """Consume only the exact admitted plan comparison, without source-patch authority."""
+    from .delivery_feature_revision_roles import revision_comparison
+    from .delivery_resources import _ancestors, _gate_evidence_root, _gate_path
+
+    relative, receipt = revision_comparison(request)
+    spec, review_diff = request['spec'], request['review_diff']
+    path = Path(review_diff['path'])
+    if (path != _gate_evidence_root(spec) / relative
+            or Path(request['workspace']) != _gate_path(spec, 'review', 0)
+            or review_diff.get('head') != request['candidate']['head']
+            or review_diff.get('base_sha') != spec['base_sha']
+            or review_diff.get('candidate_id', receipt['candidate_id']) != receipt['candidate_id']):
+        raise ValueError('controller-bound revision comparison is unavailable or changed')
+    # Compare content and hash on one descriptor. Rehashed arbitrary JSON, even
+    # in a private file, cannot substitute a different accepted/proposed plan.
+    expected = (json.dumps(receipt, sort_keys=True, indent=2) + '\n').encode()
+    _ancestors(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise ValueError('controller-bound revision comparison is not a private owned file')
+        content = stream.read(len(expected) + 1)
+        if (content != expected
+                or hashlib.sha256(content).hexdigest() != review_diff.get('sha256')):
+            raise ValueError('controller-bound revision comparison is unavailable or changed')
+    return path
 
 
 def _browser_qa_evidence(request: dict[str, Any]) -> None:
