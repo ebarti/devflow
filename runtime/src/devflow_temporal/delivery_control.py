@@ -29,7 +29,7 @@ from temporalio.client import Client
 from temporalio.common import VersioningBehavior
 from temporalio.worker import Worker, WorkerDeploymentConfig, WorkerDeploymentVersion
 
-from .delivery_activities import DELIVERY_ACTIVITIES
+from .delivery_activities import DELIVERY_ACTIVITIES, DatabaseContentionInterceptor
 from .delivery_api import create_app
 from .delivery_client import DeliveryClient, ServiceUnavailable, read_only_client
 from .delivery_client import client as api_client
@@ -677,6 +677,7 @@ async def worker(
         task_queue=config.queue,
         workflows=[DeliveryWorkflow],
         activities=DELIVERY_ACTIVITIES,
+        interceptors=[DatabaseContentionInterceptor()],
         workflow_failure_exception_types=[ValueError, KeyError, TypeError],
         identity=identity,
         **({"deployment_config": deployment} if deployment is not None else {}),

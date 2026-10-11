@@ -112,13 +112,17 @@ class DeliveryService:
                            item["run_id"], item["reason"])
 
     async def dispatch_once(self) -> None:
-        pending = self.store.pending_starts()
+        # Store work runs off the loop: a contended database must not stall
+        # the dashboard, the question pump or any other request.
+        pending = await asyncio.to_thread(self.store.pending_starts)
         starts = []
         for item in pending:
             try:
-                spec = self.store.effective_spec(item["run_id"])
+                spec = await asyncio.to_thread(self.store.effective_spec, item["run_id"])
                 retired = execution_retired(spec)
-                blocked = None if retired else self.store.execution_ownership(spec)
+                blocked = None if retired else await asyncio.to_thread(
+                    self.store.execution_ownership, spec
+                )
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 logger.warning(
                     "Run %s skipped: execution specification unavailable (%s)",
@@ -132,7 +136,9 @@ class DeliveryService:
                 continue
             try:
                 # An owner must see why its own queued run never dispatches.
-                self.store.record_dispatch_block(item["run_id"], spec, blocked)
+                await asyncio.to_thread(
+                    self.store.record_dispatch_block, item["run_id"], spec, blocked
+                )
             except Exception as exc:
                 logger.warning("Run %s dispatch block not recorded (%s)",
                                item["run_id"], type(exc).__name__)
@@ -156,11 +162,12 @@ class DeliveryService:
                 if remote_digest != item["request_digest"] or remote_recovery != (
                     digest(recovery) if recovery else None
                 ):
-                    self.store.mark_start(
-                        spec["run_id"], accepted=False, error="Temporal ID conflict"
+                    await asyncio.to_thread(
+                        self.store.mark_start,
+                        spec["run_id"], accepted=False, error="Temporal ID conflict",
                     )
                     continue
-                self.store.mark_start(spec["run_id"], accepted=True)
+                await asyncio.to_thread(self.store.mark_start, spec["run_id"], accepted=True)
                 continue
             try:
                 await client.start_workflow(
@@ -188,7 +195,7 @@ class DeliveryService:
             except WorkflowAlreadyStartedError:
                 # The next dispatch inspects the durable remote memo before acking.
                 continue
-            self.store.mark_start(spec["run_id"], accepted=True)
+            await asyncio.to_thread(self.store.mark_start, spec["run_id"], accepted=True)
 
     async def dispatch_loop(self) -> None:
         self._retry_stopped = threading.Event()
@@ -208,15 +215,18 @@ class DeliveryService:
                 raise
             except Exception as exc:
                 self.temporal_status = "disconnected"
-                for item in self.store.pending_starts():
+                for item in await asyncio.to_thread(self.store.pending_starts):
                     try:
-                        spec = self.store.effective_spec(item["run_id"])
-                        if execution_retired(spec) or not self.store.owns_execution(spec):
+                        spec = await asyncio.to_thread(self.store.effective_spec, item["run_id"])
+                        if execution_retired(spec) or not await asyncio.to_thread(
+                            self.store.owns_execution, spec
+                        ):
                             continue
                     except Exception:
                         # Unknown authority cannot authorize an outbox acknowledgement.
                         continue
-                    self.store.mark_start(item["run_id"], accepted=False, error=type(exc).__name__)
+                    await asyncio.to_thread(self.store.mark_start, item["run_id"],
+                                            accepted=False, error=type(exc).__name__)
             try:
                 await self.dispatch_questions_once()
             except asyncio.CancelledError:
@@ -352,11 +362,14 @@ def create_app(config_path: Path) -> FastAPI:
             await asyncio.wait_for(service.healthy_client(), timeout=2)
         except Exception:
             service.temporal_status = "disconnected"
-        with service.store._connect() as db:
-            active = db.execute(
-                """SELECT COUNT(*) FROM delivery_attempts
-                   WHERE state IN ('starting','running','unknown')"""
-            ).fetchone()[0]
+        def active_attempts() -> int:
+            with service.store._connect() as db:
+                return db.execute(
+                    """SELECT COUNT(*) FROM delivery_attempts
+                       WHERE state IN ('starting','running','unknown')"""
+                ).fetchone()[0]
+
+        active = await asyncio.to_thread(active_attempts)
         from .delivery_dashboard import runtime_identity
 
         identity = runtime_identity()
@@ -537,19 +550,20 @@ def create_app(config_path: Path) -> FastAPI:
     async def detail(request: Request, run_id: str) -> dict[str, Any]:
         _host(request)
         try:
-            value = service.store.detail(run_id)
+            value = await asyncio.to_thread(service.store.detail, run_id)
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
         events = value.pop("events")
         run = {key: item for key, item in value.items() if key != "run"}
         run["sequence"] = events[-1]["sequence"] if events else 0
-        return {"run": run, "events": events, "evidence": service.store.evidence_index(run_id)}
+        evidence = await asyncio.to_thread(service.store.evidence_index, run_id)
+        return {"run": run, "events": events, "evidence": evidence}
 
     @app.get("/api/runs/{run_id}/evidence/{evidence_id}")
     async def evidence(request: Request, run_id: str, evidence_id: str) -> dict[str, Any]:
         _host(request)
         try:
-            return service.store.evidence(run_id, evidence_id)
+            return await asyncio.to_thread(service.store.evidence, run_id, evidence_id)
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
 
@@ -557,7 +571,7 @@ def create_app(config_path: Path) -> FastAPI:
     async def evidence_content(request: Request, run_id: str, evidence_id: str):
         _host(request)
         try:
-            value = service.store.evidence(run_id, evidence_id)
+            value = await asyncio.to_thread(service.store.evidence, run_id, evidence_id)
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
         from fastapi.responses import Response
@@ -569,20 +583,25 @@ def create_app(config_path: Path) -> FastAPI:
     @app.get("/api/runs/{run_id}/events")
     async def events(request: Request, run_id: str, after: int = 0) -> StreamingResponse:
         _host(request)
-        service.store.spec(run_id)
+        await asyncio.to_thread(service.store.spec, run_id)
         cursor = max(after, int(request.headers.get("last-event-id", "0")))
 
         async def stream():
             nonlocal cursor
             feature = None
+            def observe(after: int) -> tuple[Any, list[dict[str, Any]]]:
+                return service.store.feature(run_id), service.store.events(run_id, after)
+
             while not await request.is_disconnected():
-                current_feature = json.dumps(service.store.feature(run_id), sort_keys=True)
+                # One off-loop read per tick; both yields below then follow
+                # without a suspension point, as one observation of the run.
+                current_feature, updates = await asyncio.to_thread(observe, cursor)
+                current_feature = json.dumps(current_feature, sort_keys=True)
                 if current_feature != feature:
                     feature = current_feature
                     # A separate event domain: do not rewrite historical run
                     # sequence numbers when only the current feature changes.
                     yield 'event: feature\ndata: {}\n\n'
-                updates = service.store.events(run_id, cursor)
                 if updates:
                     for event in updates:
                         cursor = event["sequence"]
@@ -618,7 +637,9 @@ def create_app(config_path: Path) -> FastAPI:
         if set(payload) != expected:
             raise HTTPException(400, "mutation fields do not match the contract")
         try:
-            prior = service.store.begin_mutation(run_id, command_id, name, payload)
+            prior = await asyncio.to_thread(
+                service.store.begin_mutation, run_id, command_id, name, payload
+            )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         if prior is not None:
@@ -626,14 +647,14 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             client = await service.client()
             handle = client.get_workflow_handle(
-                service.store.active_workflow_id(run_id)
+                await asyncio.to_thread(service.store.active_workflow_id, run_id)
             )
             if name == "reconcile_tracker":
                 from .delivery_terminal_recovery import receipt, recover
 
-                saved = receipt(service.store, run_id, payload)
+                saved = await asyncio.to_thread(receipt, service.store, run_id, payload)
                 if saved is not None:
-                    service.store.finish_mutation(command_id, saved)
+                    await asyncio.to_thread(service.store.finish_mutation, command_id, saved)
                     return saved
                 description = await handle.describe()
                 if description.status != WorkflowExecutionStatus.RUNNING:
@@ -647,7 +668,9 @@ def create_app(config_path: Path) -> FastAPI:
                         if exc.status != RPCStatusCode.NOT_FOUND:
                             raise
                         response = await recover(service.store, run_id, payload, client)
-                        service.store.finish_mutation(command_id, response)
+                        await asyncio.to_thread(
+                            service.store.finish_mutation, command_id, response
+                        )
                         return response
                 else:
                     result = await handle.execute_update(name, payload, id=command_id)
@@ -655,21 +678,22 @@ def create_app(config_path: Path) -> FastAPI:
                 result = await handle.execute_update(name, payload, id=command_id)
         except WorkflowUpdateFailedError as exc:
             reason = str(exc.__cause__ or exc)
-            service.store.reject_mutation(command_id, reason)
+            await asyncio.to_thread(service.store.reject_mutation, command_id, reason)
             raise HTTPException(409, reason) from exc
         except RPCError as exc:
-            service.store.mark_mutation_unknown(command_id)
+            await asyncio.to_thread(service.store.mark_mutation_unknown, command_id)
             raise HTTPException(503, type(exc).__name__) from exc
         except (ValueError, RuntimeError) as exc:
             if name == "reconcile_tracker":
-                service.store.mark_mutation_unknown(command_id)
+                await asyncio.to_thread(service.store.mark_mutation_unknown, command_id)
             else:
-                service.store.reject_mutation(command_id, str(exc))
+                await asyncio.to_thread(service.store.reject_mutation, command_id, str(exc))
             raise HTTPException(409, str(exc)) from exc
         response = {"run_id": run_id, "phase": result["phase"], "revision": result["revision"]}
-        service.store.finish_mutation(command_id, response)
+        await asyncio.to_thread(service.store.finish_mutation, command_id, response)
         if name == "cancel":
-            service.store.project(
+            await asyncio.to_thread(
+                service.store.project,
                 run_id,
                 phase="cancelling",
                 execution_state="cancelling",

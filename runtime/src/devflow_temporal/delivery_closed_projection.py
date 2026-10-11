@@ -1,6 +1,7 @@
 """Reconcile a failed terminal projection from its authentic completed execution."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from copy import deepcopy
@@ -71,13 +72,37 @@ async def _settled_feature_checks(history, spec, state, projection_id, expected)
     return {**expected, "feature_readback": readback}
 
 
-async def reconcile_projection(store, client, row):
-    """Only controller-owned history/result bytes may repair this read model."""
-    run_id = row["run_id"]
+def _owned_spec(store, run_id):
     spec = store.effective_spec(run_id)
     if (spec.get("workflow_failure_boundary_version") != 1
             or execution_retired(spec) or not store.owns_execution(spec)):
         raise ValueError("completed projection has no current service authority")
+    return spec
+
+
+def _start_inputs(store, run_id, spec):
+    return [store.submitted_spec(run_id), store.spec(run_id), spec]
+
+
+def _run_events(store, run_id):
+    with store._connect() as db:
+        return [dict(item) for item in db.execute(
+            "SELECT * FROM delivery_events WHERE run_id=? ORDER BY sequence", (run_id,))]
+
+
+def _outbox_rows(store):
+    with store._connect() as db:
+        return [dict(row) for row in db.execute(
+            "SELECT r.* FROM delivery_runs r JOIN delivery_outbox o ON o.run_id=r.run_id "
+            "ORDER BY r.run_id")]
+
+
+async def reconcile_projection(store, client, row):
+    """Only controller-owned history/result bytes may repair this read model."""
+    run_id = row["run_id"]
+    # Store reads and the repair write run off the loop: this pass follows a
+    # projection failure, exactly when the database is likely contended.
+    spec = await asyncio.to_thread(_owned_spec, store, run_id)
     workflow_id = row["workflow_id"] or "delivery-" + run_id
     description = await client.get_workflow_handle(workflow_id).describe()
     if description.status != WorkflowExecutionStatus.COMPLETED:
@@ -101,7 +126,7 @@ async def reconcile_projection(store, client, row):
         raise ValueError("completed projection start history is missing")
     inputs = await DELIVERY_DATA_CONVERTER.decode(
         history.events[0].workflow_execution_started_event_attributes.input.payloads)
-    starts = [spec] if recovery else [store.submitted_spec(run_id), store.spec(run_id), spec]
+    starts = [spec] if recovery else await asyncio.to_thread(_start_inputs, store, run_id, spec)
     if (len(inputs) != 2 or inputs[0] not in starts or inputs[1] != recovery
             or inputs[0].get("workflow_failure_boundary_version") != 1):
         raise ValueError("completed projection immutable start input changed")
@@ -147,9 +172,7 @@ async def reconcile_projection(store, client, row):
         raise ValueError("completed terminal result differs from its failed projection")
     desired = {**projection, "checks": deepcopy(state["checks"]), "cleanup": state["cleanup"]}
     key = "closed-project:" + description.run_id + ":" + digest(state)
-    with store._connect() as db:
-        events = [dict(item) for item in db.execute(
-            "SELECT * FROM delivery_events WHERE run_id=? ORDER BY sequence", (run_id,))]
+    events = await asyncio.to_thread(_run_events, store, run_id)
     observations = [event for event in events if event["type"] == EVENT
                     and json.loads(event["payload_json"]).get("key") == key]
     if observations:
@@ -169,7 +192,8 @@ async def reconcile_projection(store, client, row):
     if (projection.get("candidate") is None and row["candidate_json"] is not None
             or projection.get("pull_request") is None and row["pr_json"] is not None):
         raise ValueError("completed projection cannot discard a retained candidate or publication")
-    store.project(
+    await asyncio.to_thread(
+        store.project,
         run_id, **{name: desired.get(name) for name in (*FIELDS, *JSON_FIELDS,
                                                       "protocol_revision")},
         event_type=EVENT, message="Observed the authentic completed controller terminal result",
@@ -183,10 +207,7 @@ async def reconcile_completed_projections(store, client, *, seen=None, after_run
     """Bound each maintenance pass; a new same-run execution has a new identity."""
     if seen is None:
         seen = set()
-    with store._connect() as db:
-        rows = [dict(row) for row in db.execute(
-            "SELECT r.* FROM delivery_runs r JOIN delivery_outbox o ON o.run_id=r.run_id "
-            "ORDER BY r.run_id")]
+    rows = await asyncio.to_thread(_outbox_rows, store)
     selected = [row for row in rows
                 if json.loads(row["request_json"]).get("workflow_failure_boundary_version") == 1
                 and (row["run_id"], row["workflow_id"]) not in seen]
