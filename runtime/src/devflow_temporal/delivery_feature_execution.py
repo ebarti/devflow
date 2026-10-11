@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_execution_registry import ExecutionRegistry, OwnershipConflict
-from .delivery_feature_gates import derive_chunk_gates, validate_chunk_gates
+from .delivery_feature_gates import STAGES, derive_chunk_gates, validate_chunk_gates
 from .delivery_github_contract import GitHubDelivery, ordered_chunks, validate_plan
 
 
@@ -276,6 +276,11 @@ def revised_worker_spec(parent_spec, proposed_plan, chunk_id, *, expected_revisi
     selected = derive_chunk_gates(parent_spec, plan, chunk,
                                   final=chunks[-1]["id"] == chunk_id and
                                   result.get("feature_worker", {}).get("kind") == "chunk")
+    if worker is not None:
+        # Whole-feature admission uses the parent; the retained worker keeps its
+        # non-gate execution authority, including its original source boundary.
+        gate_policy = selected.pop("policy")
+        result["policy"].update({stage: gate_policy[stage] for stage in STAGES})
     result.update(selected)
     policy = result["policy"]
     for name in ("security_binding_sha256", "environment_proof_sha256"):
