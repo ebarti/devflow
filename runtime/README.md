@@ -29,6 +29,19 @@ Reviewed future-work splits retain existing chunk IDs and acceptance, fixed star
 dependencies and the published stack prefix, within the original authority. The
 owned workflow performs this assessment without an external watcher.
 
+After a genuine review rejection, an optional `reconsideration` object can request
+fresh investigation and independent review under an authenticated changed controller
+derivation context. It supplies `version: 1`, `kind: "derivation_context_change"`,
+`rejected_revision_id`, the exact `proposal_sha256`, `expected_runtime_revision`, and
+`expected_runtime_payload_sha256`. The service authenticates the completed earlier
+native review, changed runtime context and retained worker authority before reserving
+a successor. Missing, stale, unchanged or already consumed context refuses admission.
+Every prior finding remains unresolved input to the fresh roles. The original
+rejection and consumed cycles remain recorded; a new investigation uses the same
+cumulative allowance. Only a fresh independent passing review and the existing
+approval, custody and publication checks can adopt a correction. Keep the complete
+request unchanged when recovering an uncertain response.
+
 
 ### Native provider turn retries
 

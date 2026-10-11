@@ -113,7 +113,14 @@ def build_server(config_path: Path) -> FastMCP:
         list of existing owned artifact {path, sha256} references. The runtime
         crafts the proposal, preserves scope/acceptance/authority and stack,
         and shares the cumulative repair budget. No plan or policy overrides
-        are accepted. Keep the full request stable after an uncertain response.
+        are accepted. Optional reconsideration selects a genuine rejected review
+        after an authenticated derivation context change: {version: 1,
+        kind: "derivation_context_change", rejected_revision_id, proposal_sha256,
+        expected_runtime_revision, expected_runtime_payload_sha256}. It requests
+        fresh investigation and independent review only; the original rejection
+        and repair use remain. Unchanged, stale or already consumed context refuses
+        before admission. Normal approval and adoption checks still apply.
+        Keep the full request stable after an uncertain response.
         """
         return client(config_path).revise_feature_plan(run_id, json.loads(request_json))
 
