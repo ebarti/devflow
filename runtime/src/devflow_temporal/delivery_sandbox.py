@@ -139,6 +139,46 @@ def _write_once(path: Path, content: bytes) -> None:
         stream.write(content)
 
 
+def _credential_refreshed_at(content: bytes) -> str:
+    try:
+        value = json.loads(content)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    refreshed = value.get("last_refresh") if isinstance(value, dict) else None
+    return refreshed if isinstance(refreshed, str) else ""
+
+
+def _refresh_credential(path: Path, content: bytes) -> None:
+    """Keep the newest Codex credential in a role home.
+
+    The owner's CLI and the role's own Codex process both refresh tokens, so the
+    private copy legitimately diverges from its source between attempts. A copy the
+    role refreshed more recently is kept (an older token could be revoked by
+    rotation); otherwise the source replaces it. A changed credential never blocks
+    a launch.
+    """
+    if not path.exists():
+        _write_once(path, content)
+        return
+    _private_file(path)
+    current = path.read_bytes()
+    if current == content:
+        return
+    if _credential_refreshed_at(current) > _credential_refreshed_at(content):
+        return
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".auth.", suffix=".new")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def _remove_generated_project_directory(workspace: Path) -> None:
     """Discard only Codex's empty project directory between owned role turns.
 
@@ -391,7 +431,7 @@ def prepare_native_role(
     _private(scratch)
     source = Path(spec["policy"].get("codex_auth_path") or Path.home() / ".codex" / "auth.json")
     _private_file(source)
-    _write_once(codex_home / "auth.json", source.read_bytes())
+    _refresh_credential(codex_home / "auth.json", source.read_bytes())
     recovery = Path(spec["state_dir"]) / "recovery"
     toolchain_roots = tuple(Path(root) for root in spec["policy"].get("toolchain_roots", []))
     cache = spec["policy"].get("package_manager_cache")
