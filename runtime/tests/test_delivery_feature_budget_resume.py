@@ -12,6 +12,7 @@ from test_delivery_store import service as service
 from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_gate_retry as gates
 from devflow_temporal import delivery_stopped_resume as resume_mod
+from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_execution_registry import OwnershipConflict
 from devflow_temporal.delivery_feature_execution import (
@@ -51,12 +52,15 @@ def _row(store, child):
                                (child["run_id"],)).fetchone())
 
 
-def _sealed(monkeypatch, child, *, iteration=0, phase="cancelled", roles=(), checks=None):
+def _sealed(monkeypatch, child, *, iteration=0, phase="cancelled", roles=(), checks=None,
+            execution="closed-worker"):
     # Only Temporal closure and the final admission are modeled here; the
     # registry, feature admission and worker derivation are real.
     sealed = {"state": {"iteration": iteration, "revision": 3, "phase": phase,
                         "roles": list(roles), "checks": checks or {}},
-              "candidate": {"id": "c" * 64, "head": "h" * 40}, "predecessor_spec": child}
+              "candidate": {"id": "c" * 64, "head": "h" * 40}, "predecessor_spec": child,
+              "closed": {"workflow_id": "delivery-" + child["run_id"],
+                         "execution_run_id": execution}}
     monkeypatch.setattr(resume_mod, "snapshot", lambda store, run_id: sealed)
     monkeypatch.setattr(gates, "prepublication_preparation_failed", lambda closed: False)
     captured = {}
@@ -125,6 +129,18 @@ def test_resume_that_needs_a_new_repair_cycle_is_refused_with_budget(service, mo
     assert shared.budget(token["issue_id"])["used"] == 10
 
 
+def test_each_closed_execution_of_a_worker_admits_its_own_resume_command(service, monkeypatch):
+    store, parent, child, *_ = _worker(service, monkeypatch, used_by_others=9)
+    ids = []
+    for execution in ("closed-worker", "closed-worker", "closed-resume"):
+        captured = _sealed(monkeypatch, child, execution=execution)
+        activities.resume_worker(store, parent, child, _row(store, child))
+        ids.append(captured["command"]["command_id"])
+    # An exact replay of one closure reuses its command; a later closure gets its own.
+    assert ids[0] == ids[1] != ids[2]
+    assert all(command.startswith("feature-resume-") for command in ids)
+
+
 def test_exhausted_budget_admits_interrupted_build_and_reruns_its_iteration(service, monkeypatch):
     store, parent, child, shared, token = _worker(service, monkeypatch, used_by_others=10)
     broker = DeliveryBroker(store, child)
@@ -186,4 +202,23 @@ def test_exhausted_budget_admits_interrupted_build_and_reruns_its_iteration(serv
     # Iteration zero is never charged; the feature budget stays exactly exhausted.
     assert calls == [("delivery_tracker_start", None), ("delivery_role", 0),
                      ("delivery_feature_seal_build", None)]
+    assert shared.budget(token["issue_id"])["used"] == 10
+
+    # The resumed execution is cancelled again: its own closure admits a second
+    # zero-cost resume under a new command instead of colliding with the first.
+    again = {**state, "revision": 12}
+    store.project(child["run_id"], phase="cancelled", execution_state="terminal",
+                  outcome="cancelled", cleanup="confirmed", event_type="cancelled",
+                  message="Feature coordinator stopped again", candidate=candidate,
+                  pull_request=None, checks={}, iteration=0, protocol_revision=12, error=None)
+    with store._connect() as db:
+        store.state.release_work(db, child["work_id"], "external:devflow:" + child["run_id"])
+    closed = {**closed, "workflow_id": resumed["workflow_id"],
+              "execution_run_id": "closed-resume", "recovery_digest": digest(recovery),
+              "result": again}
+    second = activities.resume_worker(store, parent, child, _row(store, child))
+    assert second["resumed"] and second["workflow_id"] != resumed["workflow_id"]
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_commands WHERE run_id=?",
+                          (child["run_id"],)).fetchone()[0] == 2
     assert shared.budget(token["issue_id"])["used"] == 10

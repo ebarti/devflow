@@ -257,9 +257,16 @@ def resume_worker(store, parent, child, row):
                         "pending repair has no matching product allowance debit")
         kind = "stopped_delivery_resume"
     candidate = sealed["candidate"]
+    closed = sealed["closed"]
     command = {
         "continuation_kind": kind,
-        "command_id": "feature-resume-" + digest({"owner": token, "run": child["run_id"]})[:24],
+        # One idempotent command per closed execution: an exact replay reuses it
+        # and a later closure of the same worker admits its own.
+        "command_id": "feature-resume-" + digest({
+            "owner": token, "run": child["run_id"],
+            "closed": {"workflow_id": closed["workflow_id"],
+                       "execution_run_id": closed["execution_run_id"]},
+        })[:24],
         "expected_revision": state["revision"],
         "expected_iteration": state["iteration"],
         "expected_candidate_id": candidate["id"],
