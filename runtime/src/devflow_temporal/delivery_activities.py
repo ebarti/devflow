@@ -623,8 +623,10 @@ async def delivery_publish(request: dict[str, Any]) -> dict[str, Any]:
                                              subprocess.TimeoutExpired))):
                     # Confirmed before any remote command took effect: the
                     # publication is retried whole instead of stopping the run
-                    # on GitHub or network availability.
-                    broker.discard_unused_publication(request["iteration"])
+                    # on GitHub or network availability. A failure before the
+                    # effect row existed leaves nothing to discard.
+                    if broker.publication_effect_inserted(request["iteration"]):
+                        broker.discard_unused_publication(request["iteration"])
                     raise ApplicationError(str(exc)[:600], type="PublicationTransient") from exc
                 raise ApplicationError(str(exc)[:600], type="PublicationRejected",
                                        non_retryable=True) from exc

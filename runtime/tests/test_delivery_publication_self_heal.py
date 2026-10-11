@@ -373,3 +373,209 @@ def test_current_admission_resume_completes_the_effect_without_publishing_again(
     assert calls.index(('delivery_reconcile_publish', None)) < \
         calls.index(('delivery_role', 'review'))
     assert digest(result['candidate']) == digest(publication['candidate'])
+
+
+def test_discard_leaves_a_row_adopted_by_a_later_attempt(service, monkeypatch):
+    store, spec, _broker, checked, gh = prepared(service, monkeypatch)
+    key = 'publish:run-1:0'
+    timed_out = DeliveryBroker(store, spec)
+    timed_out._effect(key, 'publish', {'iteration': 0, 'input_candidate_id': checked['id']})
+    timed_out.publication_may_have_effect = False
+    adopted = DeliveryBroker(store, spec)
+    gh.ls_remote_failure = RuntimeError('command failed (128): git -c: fatal: unable to access')
+    with pytest.raises(delivery_broker.BrokerReadbackUnavailable):
+        adopted.publish(0, checked)
+    assert adopted.publication_may_have_effect is True
+    state, observed = effect_row(store)
+    assert state == 'pending' and observed['remote_confirmed'] is False
+    # The timed-out thread reports its pre-mutation failure after the adoption.
+    timed_out.discard_unused_publication(0)
+    assert effect_row(store) == (state, observed)
+    assert DeliveryBroker(store, spec).publish(0, checked)['number'] == 1
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_before_the_effect_row_is_transient_without_discard(
+    service, monkeypatch,
+):
+    store, spec, broker, checked, gh = prepared(service, monkeypatch)
+    real = gh.__call__
+    failures = {'left': 1}
+
+    def flaky_git(argv, **kwargs):
+        if failures['left'] and argv[0] == 'git' and 'rev-list' in argv:
+            failures['left'] -= 1
+            raise subprocess.TimeoutExpired(argv, 120)
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(delivery_broker, '_run', flaky_git)
+    request = {'spec': spec, 'iteration': 0, 'candidate': checked}
+    with pytest.raises(ApplicationError) as error:
+        await delivery_activities.delivery_publish(request)
+    assert error.value.type == 'PublicationTransient'
+    assert error.value.non_retryable is False
+    assert effect_row(store) is None and gh.mutations() == []
+    published = await delivery_activities.delivery_publish(request)
+    assert published['number'] == 1
+    assert effect_row(store)[0] == 'complete'
+
+
+@pytest.mark.asyncio
+async def test_real_deadline_stop_is_admitted_and_completed_without_an_implementation_turn(
+    service, monkeypatch,
+):
+    """A current admission, the real publish/reconcile/project activities and the
+    default readback window: GitHub refuses PR creation until the run stops."""
+    from temporalio import activity
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    from devflow_temporal.delivery_activities import (
+        delivery_gates_readback,
+        delivery_project,
+        delivery_publish,
+        delivery_reconcile_publish,
+    )
+
+    store, request = service
+    original_admit = type(store.config).admit
+
+    def closing_admit(config, supplied):
+        # The fixture provider is fake; production admissions finalize resources
+        # and reconcile the tracker at every stop, which is where cleanup and the
+        # claim release come from.
+        admitted = original_admit(config, supplied)
+        admitted.update(resource_cleanup_version=1, terminal_tracker_version=1)
+        return admitted
+
+    monkeypatch.setattr(type(store.config), 'admit', closing_admit)
+    store.submit(request)
+    spec = store.spec('run-1')
+    assert spec['publication_readback_seconds'] == 900
+    broker = DeliveryBroker(store, spec)
+    broker.prepare()
+    broker.state_dir.mkdir(parents=True, exist_ok=True)
+    _git(broker.checkout, 'config', 'user.name', 'Delivery Test')
+    _git(broker.checkout, 'config', 'user.email', 'delivery@example.invalid')
+    base_candidate = broker.candidate()
+    (broker.checkout / 'README.md').write_text('Owned edit\n')
+    checked = broker.candidate()
+    gh = FakeGitHub(broker, create_failures=10 ** 6)
+    monkeypatch.setattr(delivery_broker, '_run', gh)
+    monkeypatch.setattr(delivery_broker.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(delivery_activities, '_context',
+                        lambda given, **_kw: (store, DeliveryBroker(store, given)))
+    monkeypatch.setattr('devflow_temporal.delivery_pending_publication._stopped_cleanup',
+                        lambda _: {})
+    # The fake provider has no native resource manifest to archive at admission.
+    monkeypatch.setattr('devflow_temporal.delivery_pending_publication.preserve_resources',
+                        lambda *_args, **_kwargs: None)
+    store.mark_start('run-1', accepted=True)
+    seen = {'roles': [], 'uncertain': [], 'release': []}
+
+    @activity.defn(name='delivery_prepare')
+    async def prepare(_payload):
+        return {'candidate': base_candidate}
+
+    @activity.defn(name='delivery_tracker_start')
+    async def tracker_start(_payload):
+        return {'state': 'consistent'}
+
+    @activity.defn(name='delivery_role')
+    async def role(payload):
+        seen['roles'].append(payload['role'])
+        candidate = checked if payload['role'] == 'implement' else (
+            DeliveryBroker(store, payload['spec']).candidate())
+        return {'status': 'pass', 'role': payload['role'], 'iteration': payload['iteration'],
+                'session_id': payload['role'], 'cleanup': 'confirmed', 'candidate': candidate}
+
+    @activity.defn(name='delivery_precheck')
+    async def precheck(payload):
+        return {'state': 'passed', 'source_unchanged': True,
+                'candidate_id': payload['candidate']['id'],
+                'results': [{'id': 'packaging', 'passed': True, 'cleanup': 'confirmed',
+                             'exit_code': 0}]}
+
+    @activity.defn(name='delivery_checks')
+    async def checks(payload):
+        return {'state': 'passed', 'candidate_id': payload['candidate']['id'],
+                'cleanup': 'confirmed'}
+
+    @activity.defn(name='delivery_ci')
+    async def ci(_payload):
+        return {'state': 'passed'}
+
+    @activity.defn(name='delivery_tracker')
+    async def tracker(_payload):
+        return {'state': 'consistent'}
+
+    @activity.defn(name='delivery_finalize_resources')
+    async def finalize_resources(payload):
+        seen['uncertain'].append(payload['uncertain'])
+        if payload['uncertain']:
+            return {'state': 'unknown', 'process_cleanup': 'unknown',
+                    'resource_cleanup': 'unknown'}
+        return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+                'resource_cleanup': 'confirmed'}
+
+    @activity.defn(name='delivery_terminal_tracker')
+    async def terminal_tracker(payload):
+        seen['release'].append(payload['release'])
+        return {'state': 'consistent'}
+
+    activities = [delivery_project, delivery_publish, delivery_reconcile_publish,
+                  delivery_gates_readback, prepare, tracker_start, role, precheck, checks, ci,
+                  tracker, finalize_resources, terminal_tracker]
+    queue = 'publication-real-stop'
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(environment.client, task_queue=queue, workflows=[DeliveryWorkflow],
+                          activities=activities):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run, spec, id='delivery-run-1', task_queue=queue)
+            stopped = await handle.result()
+            pushed = _git(broker.checkout, 'rev-parse', 'HEAD')
+            assert stopped['outcome'] == 'blocked'
+            assert stopped['error'] == 'publication unresolved: readback deadline exhausted'
+            assert stopped['checks']['failure']['classification'] == 'transient'
+            assert stopped['checks']['failure']['cause_type'] == 'publication_deadline'
+            assert stopped['cleanup'] == 'confirmed'
+            assert seen['uncertain'] == [False] and seen['release'] == [True]
+            assert stopped['pull_request'] is None
+            assert remote_head(broker) == pushed and gh.created is False
+            assert effect_row(store) == ('pending', {'head': pushed, 'number': None,
+                                                     'remote_confirmed': True})
+            with store._connect() as db:
+                row = dict(db.execute(
+                    "SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+                # The terminal tracker releases the claim for codex providers.
+                store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
+            assert (row['phase'], row['cleanup'], row['error']) == (
+                'blocked', 'confirmed', stopped['error'])
+            closed = {'workflow_id': 'delivery-run-1', 'execution_run_id': handle.result_run_id,
+                      'closed_at': '2026-10-12T00:00:00Z',
+                      'request_digest': spec['request_digest'], 'recovery_digest': None,
+                      'result': stopped}
+            monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_k: closed)
+            admitted = store.recover_publication('run-1', {
+                'command_id': 'after-the-real-stop', 'expected_revision': stopped['revision'],
+                'expected_candidate_id': stopped['candidate']['id'], 'expected_head': pushed,
+                'expected_pr_number': 0})
+            assert admitted['phase'] == 'publication_recovery_queued'
+            assert admitted['implementation_authority'] is False
+            gh.create_failures = 0
+            store.mark_start('run-1', accepted=True)
+            with store._connect() as db:
+                recovery = json.loads(db.execute(
+                    "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
+                ).fetchone()[0])
+            effective = store.effective_spec('run-1')
+            resumed = await environment.client.execute_workflow(
+                DeliveryWorkflow.run, args=[effective, recovery], id=admitted['workflow_id'],
+                task_queue=queue)
+    assert resumed['outcome'] == 'delivered'
+    assert resumed['pull_request']['number'] == 1
+    assert resumed['pull_request']['head'] == pushed
+    assert seen['roles'] == ['implement', 'review', 'verify']
+    assert gh.created is True
+    assert effect_row(store)[0] == 'complete'
+    assert _git(broker.checkout, 'rev-list', '--count', spec['base_sha'] + '..HEAD') == '1'

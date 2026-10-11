@@ -45,7 +45,7 @@ def _failure_classification(cause: Exception | None, controller_cause: str | Non
         result["cause_type"] = (failure.type or "ApplicationError")[:128]
         if not failure.non_retryable and failure.type in {
             "ConnectionError", "TimeoutError", "TimeoutExpired", "GitHubTransientError",
-            "BrokerReadbackUnavailable", "ResourceCleanupTransient",
+            "BrokerReadbackUnavailable", "ResourceCleanupTransient", "PublicationTransient",
         }:
             result["classification"] = "transient"
     return result
@@ -807,6 +807,13 @@ class DeliveryWorkflow:
                     delay = min(delay * 2, 60)
                     self.state["cleanup"] = "unknown"
                     continue
+                if (spec.get("publication_readback_version") == 1 and failure is not None
+                        and failure.type == "PublicationTransient"):
+                    # An execution recorded before the marker: the activity proved
+                    # the failure preceded any mutation, so it stops as a confirmed
+                    # rejection instead of reconciling an effect that was never made.
+                    self.state["cleanup"] = "none"
+                    raise
                 initial = None
             break
         previous = self.state.get("pull_request") or {}

@@ -133,7 +133,8 @@ class DeliveryBroker:
         self.check_cancelled = lambda: False
         self.native_cleanup_confirmed = True
         self.publication_may_have_effect = True
-        self.effect_inserted = False
+        # (effect key, insertion stamp) of the row this broker inserted, if any.
+        self.inserted_effect: tuple[str, str] | None = None
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -147,15 +148,15 @@ class DeliveryBroker:
             if saved:
                 if saved[0] != kind or saved[1] != serialized:
                     raise ValueError("effect identity belongs to a different request")
-                self.effect_inserted = False
                 return json.loads(saved[3]) if saved[2] == "complete" and saved[3] else None
-            self.effect_inserted = True
+            stamp = _now()
             db.execute(
                 """INSERT INTO delivery_effects
                    (effect_key,run_id,kind,request_json,state,updated_at)
                    VALUES (?,?,?,?,'pending',?)""",
-                (key, self.spec["run_id"], kind, serialized, _now()),
+                (key, self.spec["run_id"], kind, serialized, stamp),
             )
+            self.inserted_effect = (key, stamp)
         return None
 
     def _finish_effect(self, key: str, result: dict[str, Any]) -> None:
@@ -1435,6 +1436,14 @@ class DeliveryBroker:
             with self.store._connect() as db:
                 prior = db.execute("SELECT 1 FROM delivery_effects WHERE effect_key=?",
                                    (f"publish:{self.spec['run_id']}:{iteration}",)).fetchone()
+                if prior is not None:
+                    # Adopting a retained row re-stamps it, so the invocation that
+                    # inserted it can no longer discard it from a timed-out thread.
+                    db.execute(
+                        "UPDATE delivery_effects SET updated_at=? "
+                        "WHERE effect_key=? AND state='pending'",
+                        (_now(), f"publish:{self.spec['run_id']}:{iteration}"),
+                    )
             self.publication_may_have_effect = prior is not None
         self.validate_candidate_scope()
         publication_branch = self._publication_base_ref()
@@ -1443,7 +1452,8 @@ class DeliveryBroker:
         before = self.candidate()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
         done = self._effect(key, "publish", request)
-        if self.spec.get("publication_readback_version") == 1 and not self.effect_inserted:
+        if (self.spec.get("publication_readback_version") == 1
+                and not self.publication_effect_inserted(iteration)):
             self.publication_may_have_effect = True
         if done:
             found = self._existing_pr()
@@ -1585,21 +1595,30 @@ class DeliveryBroker:
             if "already exists" not in str(exc).casefold():
                 raise
 
+    def publication_effect_inserted(self, iteration: int) -> bool:
+        """Whether this broker inserted the publish effect row of ``iteration``."""
+        return (self.inserted_effect is not None
+                and self.inserted_effect[0] == f"publish:{self.spec['run_id']}:{iteration}")
+
     def discard_unused_publication(self, iteration: int) -> None:
         """Forget the pending effect of an invocation confirmed to precede any mutation.
 
         A retained row would make the next attempt treat the same transport
         failure as a possible lost mutation. Only the invocation that inserted
-        the row and never reached push or PR creation may remove it.
+        the row and never reached push or PR creation may remove it, and only
+        while the row still carries its insertion stamp: a later attempt that
+        adopted the row re-stamped it and owns it from then on.
         """
-        if self.publication_may_have_effect is not False or not self.effect_inserted:
+        if (self.publication_may_have_effect is not False
+                or not self.publication_effect_inserted(iteration)):
             raise ValueError("publication effect may have taken effect; it cannot be discarded")
+        key, stamp = self.inserted_effect
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
                 "DELETE FROM delivery_effects WHERE effect_key=? AND kind='publish' "
-                "AND state='pending'",
-                (f"publish:{self.spec['run_id']}:{iteration}",),
+                "AND state='pending' AND updated_at=?",
+                (key, stamp),
             )
 
     def reconcile_publish(
