@@ -20,6 +20,71 @@ from typing import Any
 
 from .contracts import canonical_json, digest
 
+PREPARATION_CONTINUATION_LIMIT = 3
+
+
+def preparation_retry_key(revision_id, predecessor=None):
+    key = "plan-revision:preparation-retry:" + revision_id
+    return key if predecessor is None else key + ":from:" + predecessor["run_id"]
+
+
+def preparation_lineage(db, pending):
+    """Authenticate the bounded, append-only transport of one unstarted admission."""
+    first_key = preparation_retry_key(pending["revision_id"])
+    rows = list(db.execute(
+        "SELECT checkpoint_key,content_digest,content_json FROM execution_checkpoints "
+        "WHERE issue_id=? AND checkpoint_key LIKE ?",
+        (pending["owner"]["issue_id"], first_key + "%"),
+    ))
+    if len(rows) > PREPARATION_CONTINUATION_LIMIT:
+        raise OwnershipConflict("reserved revision preparation continuation limit reached")
+    remaining = {}
+    for row in rows:
+        receipt = json.loads(row["content_json"])
+        if (row["content_digest"] != digest(receipt)
+                or receipt.get("revision_id") != pending["revision_id"]
+                or receipt.get("admission_sha256") != digest(pending)
+                or receipt.get("predecessor", {}).get("run_id") in remaining):
+            raise OwnershipConflict("preparation continuation lost its immutable lineage")
+        remaining[receipt["predecessor"]["run_id"]] = (row["checkpoint_key"], receipt)
+    predecessor = {**pending["owner"], "run_id": pending["successor_id"],
+                   "generation": pending["owner"]["generation"] + 1}
+    chain = []
+    commands = set()
+    while predecessor["run_id"] in remaining:
+        key, receipt = remaining.pop(predecessor["run_id"])
+        sequence = len(chain) + 1
+        previous = {"checkpoint_key": chain[-1][0], "sha256": digest(chain[-1][1])} \
+            if chain else None
+        command = receipt.get("command", {})
+        if (key != preparation_retry_key(pending["revision_id"], predecessor if chain else None)
+                or receipt.get("predecessor") != predecessor
+                or receipt.get("version") != (2 if chain else 1)
+                or (chain and (receipt.get("sequence") != sequence
+                               or receipt.get("previous") != previous))
+                or set(command) != {"command_id", "expected_revision"}
+                or not isinstance(command["command_id"], str)
+                or type(command["expected_revision"]) is not int
+                or command["command_id"] in commands
+                or receipt.get("successor_id") != "run-feature-" + digest({
+                    "run": predecessor["run_id"], "command": command})[:20]):
+            raise OwnershipConflict("preparation continuation is branched or changed")
+        snapshot = db.execute(
+            "SELECT * FROM execution_snapshots WHERE store_path=? AND run_id=?",
+            (predecessor["store_path"], predecessor["run_id"]),
+        ).fetchone()
+        if (not snapshot or snapshot["generation"] != predecessor["generation"]
+                or snapshot["issue_id"] != predecessor["issue_id"]
+                or snapshot["input_digest"] != digest(json.loads(snapshot["input_json"]))):
+            raise OwnershipConflict("preparation continuation lost its predecessor snapshot")
+        commands.add(command["command_id"])
+        chain.append((key, receipt))
+        predecessor = {**predecessor, "run_id": receipt["successor_id"],
+                       "generation": predecessor["generation"] + 1}
+    if remaining:
+        raise OwnershipConflict("preparation continuation has an unrelated or missing predecessor")
+    return chain
+
 
 class OwnershipConflict(ValueError):
     """An execution cannot acquire or mutate another execution's delivery."""
@@ -264,13 +329,10 @@ class ExecutionRegistry:
 
     @staticmethod
     def _preparation_successor(db, pending, predecessor, run_id):
-        key = "plan-revision:preparation-retry:" + pending["revision_id"]
-        row = db.execute("SELECT content_digest,content_json FROM execution_checkpoints "
-                         "WHERE issue_id=? AND checkpoint_key=?",
-                         (predecessor["issue_id"], key)).fetchone()
-        if not row:
+        chain = preparation_lineage(db, pending)
+        if not chain:
             return False
-        receipt = json.loads(row["content_json"])
+        receipt = chain[-1][1]
         begun = db.execute("SELECT 1 FROM execution_checkpoints WHERE issue_id=? "
                            "AND checkpoint_key IN (?,?)", (predecessor["issue_id"],
                            "plan-revision:begin:" + pending["revision_id"],
@@ -278,13 +340,8 @@ class ExecutionRegistry:
         paid = db.execute("SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
                           (predecessor["issue_id"], "plan-revision:" + pending["revision_id"])
                           ).fetchone()
-        return bool(not begun and not paid and row["content_digest"] == digest(receipt)
-                    and receipt.get("version") == 1
-                    and receipt.get("revision_id") == pending["revision_id"]
-                    and receipt.get("admission_sha256") == digest(pending)
+        return bool(not begun and not paid
                     and receipt.get("predecessor") == predecessor
-                    and pending["successor_id"] == predecessor["run_id"]
-                    and pending["owner"]["generation"] + 1 == predecessor["generation"]
                     and receipt.get("successor_id") == run_id)
 
     @staticmethod

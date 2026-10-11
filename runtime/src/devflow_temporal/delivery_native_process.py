@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .contracts import digest
@@ -101,7 +102,103 @@ def listeners(port: int) -> set[int]:
     return {int(line) for line in result.stdout.splitlines() if line.isdecimal()}
 
 
-def reconcile_process(path: Path) -> dict:
+def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) -> dict:
+    """Confirm teardown independently; never reconstruct the provider's verdict."""
+    receipt = {"journal": str(path), "cleanup": "unknown",
+               "reason": "interrupted monitoring has no independently confirmed teardown"}
+    monitor = journal.get("monitor")
+    ports = journal.get("ports")
+    if (not owned or not isinstance(monitor, dict)
+            or type(monitor.get("pid")) is not int or monitor["pid"] <= 1
+            or not isinstance(monitor.get("identity"), str) or not monitor["identity"]
+            or not isinstance(ports, list) or ports != journal.get("intent", {}).get("ports")
+            or any(type(port) is not int or not 0 < port < 65536 for port in ports)
+            or any(pid <= 1 or not isinstance(entry.get("identity"), str)
+                   or not entry["identity"] for pid, entry in owned.items())
+            or not path.is_absolute() or path.resolve() != path):
+        return receipt
+    descriptors = []
+    try:
+        # These original lock inodes exclude a surviving monitor or another
+        # finalizer. Reattachment can supply the locks it already owns.
+        for name in ("native-monitor.lock", "native-process.lock"):
+            lock_path = path.parent / name
+            descriptor = locks.get(name)
+            if descriptor is None:
+                descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+                descriptors.append(descriptor)
+            info = os.fstat(descriptor)
+            current = lock_path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+                raise ValueError("original native lifecycle lock changed")
+            recorded = journal.get("lifecycle_locks")
+            if recorded is not None and (
+                    not isinstance(recorded, dict)
+                    or set(recorded) != {"native-monitor.lock", "native-process.lock"}
+                    or recorded.get(name) != {"device": info.st_dev, "inode": info.st_ino,
+                                             "uid": info.st_uid}):
+                raise ValueError("recorded native lifecycle lock changed")
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if digest(read_private(path)) != digest(journal):
+            raise ValueError("native journal changed during cleanup observation")
+        table = process_table()
+        if (table.get(monitor["pid"], {}).get("identity") == monitor["identity"]
+                and not table[monitor["pid"]]["stat"].startswith("Z")):
+            return receipt
+        stopped = stop_observed(owned)
+        all_owned = {**owned, monitor["pid"]: monitor}
+        table = process_table()
+        stopped = stopped and not any(
+            table.get(pid, {}).get("identity") == entry["identity"]
+            and not table[pid]["stat"].startswith("Z")
+            for pid, entry in all_owned.items()
+        )
+        ports_clear = all(not listeners(port) for port in ports)
+        receipt.update(observed_pids=sorted(all_owned), observed_owned_stopped=stopped,
+                       owned_ports_clear=ports_clear,
+                       monitoring_complete=journal.get("monitoring_complete", False))
+        if not stopped or not ports_clear:
+            return receipt
+        final_owned = {str(pid): entry for pid, entry in all_owned.items()}
+        proof = journal.get("cleanup_reconciliation")
+        if proof is not None:
+            if (proof.get("version") != 1 or proof.get("kind") != "interrupted_monitor"
+                    or proof.get("intent_sha256") != digest(journal["intent"])
+                    or proof.get("owned_sha256") != digest(final_owned)
+                    or journal.get("result", {}).get("interrupted_monitor") is not True):
+                raise ValueError("interrupted native cleanup binding changed")
+        else:
+            proof = {"version": 1, "kind": "interrupted_monitor",
+                     "previous_phase": journal.get("phase"),
+                     "previous_journal_sha256": digest(journal),
+                     "intent_sha256": digest(journal["intent"]),
+                     "owned_sha256": digest(final_owned),
+                     "observed_at": datetime.now(UTC).isoformat()}
+            result = {"state": "finished", "cleanup": "observed-native-confirmed",
+                      "exit_code": None, "timed_out": False, "cancelled": False,
+                      "interrupted_monitor": True, "provider_outcome": "unknown",
+                      "monitoring_complete": journal.get("monitoring_complete", False),
+                      "stdio_drained": False, "observed_owned_pids": sorted(all_owned),
+                      "journal": str(path), "cleanup_reconciliation": proof,
+                      "native_teardown_scope":
+                          "observed identity-bound descendants and owned ports"}
+            journal.update(phase="finished", owned=final_owned, result=result,
+                           cleanup_reconciliation=proof)
+            write_private(path, journal)
+        receipt.update(cleanup="observed-native-confirmed", reason=None,
+                       interrupted_monitor=True, cleanup_reconciliation=proof)
+        return receipt
+    except (OSError, ValueError, RuntimeError) as exc:
+        receipt["reason"] = str(exc)[:300]
+        return receipt
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def reconcile_process(path: Path, *, _locks: dict | None = None) -> dict:
     if not path.exists():
         return {
             "journal": str(path),
@@ -115,6 +212,8 @@ def reconcile_process(path: Path) -> dict:
         monitor = journal["monitor"]
         all_owned[monitor["pid"]] = monitor
         owned.pop(monitor["pid"], None)
+    if journal.get("phase") != "finished" or journal.get("monitoring_complete") is not True:
+        return _reconcile_interrupted(path, journal, owned, _locks or {})
     # An interrupted monitor must be allowed to collect its child's exit and
     # flush output. A finished monitor has no remaining command work to lose.
     stopped = stop_observed(all_owned if journal.get("phase") == "finished" else owned)
@@ -205,7 +304,7 @@ class NativeProcess:
                     time.sleep(0.03)
             if self.journal.exists() or self.journal.is_symlink():
                 reattaching = True
-                return self._run()
+                return self._run(monitor_lock=lock)
             descriptor = os.open(
                 self.folder / "monitor.log", os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW,
                 0o600,
@@ -228,7 +327,7 @@ class NativeProcess:
                 monitor.stdin.write(json.dumps({
                     "spec": self.spec, "folder": str(self.folder), "argv": self.argv,
                     "cwd": str(self.cwd), "environment": self.environment,
-                    "timeout": self.timeout, "ports": self.ports,
+                    "timeout": self.timeout, "ports": self.ports, "monitor_lock": lock,
                 }).encode())
             finally:
                 monitor.stdin.close()
@@ -238,7 +337,7 @@ class NativeProcess:
             monitor.wait()
             if not self.journal.exists():
                 raise RuntimeError("native monitor failed before recording its invocation")
-            return self._run()
+            return self._run(monitor_lock=lock)
         except Exception as exc:
             # The monitor journals its intent before any provider child starts.
             # A live or unjoined monitor, or an existing journal, never proves
@@ -287,7 +386,7 @@ class NativeProcess:
                     finally:
                         os.close(directory)
 
-    def _run(self, *, monitor: bool = False) -> dict:
+    def _run(self, *, monitor: bool = False, monitor_lock: int | None = None) -> dict:
         lock = os.open(
             self.folder / "native-process.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
         )
@@ -300,9 +399,12 @@ class NativeProcess:
                 old = read_private(self.journal)
                 if old["intent"] != intent:
                     raise ValueError("native attempt authority changed")
-                receipt = reconcile_process(self.journal)
+                locks = {"native-process.lock": lock}
+                if monitor_lock is not None:
+                    locks["native-monitor.lock"] = monitor_lock
+                receipt = reconcile_process(self.journal, _locks=locks)
                 if receipt["cleanup"] == "observed-native-confirmed":
-                    return old["result"]
+                    return read_private(self.journal)["result"]
                 return {
                     "state": "unknown",
                     "cleanup": "unknown",
@@ -330,6 +432,16 @@ class NativeProcess:
             }
             if monitor:
                 journal["monitor"] = {"pid": os.getpid(), **process_table()[os.getpid()]}
+                if monitor_lock is not None:
+                    journal["lifecycle_locks"] = {}
+                    for name, descriptor in (("native-monitor.lock", monitor_lock),
+                                             ("native-process.lock", lock)):
+                        info = os.fstat(descriptor)
+                        current = (self.folder / name).lstat()
+                        if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+                            raise ValueError("native lifecycle lock changed before allocation")
+                        journal["lifecycle_locks"][name] = {
+                            "device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid}
             write_private(self.journal, journal)
             RunResources(self.spec).process(self.journal)
             write_private(
@@ -490,7 +602,8 @@ if __name__ == "__main__":
     specification = request.pop("spec")
     request["cwd"] = Path(request["cwd"])
     request["ports"] = tuple(request["ports"])
+    monitor_lock = request.pop("monitor_lock", None)
     NativeProcess(
         specification, folder, **request,
         cancelled=lambda: _cancel_requested(folder),
-    )._run(monitor=True)
+    )._run(monitor=True, monitor_lock=monitor_lock)

@@ -104,9 +104,9 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
     namespace = None
     roots = {state}
     if 'config_path' in spec:
-        from .delivery_config import DeliveryConfig
+        from .delivery_execution_config import load_execution_config
 
-        config = DeliveryConfig.load(Path(spec['config_path']))
+        config = load_execution_config(spec)
         if (digest(config.raw) != spec['config_digest']
                 or config.path != Path(spec['config_path'])
                 or state != config.state_root / 'runs' / spec['run_id']):

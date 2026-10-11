@@ -43,14 +43,12 @@ def implementation_prerequisites(spec: dict) -> list[dict]:
     baseline = spec["policy"].get("baseline_checks", [])
     if ("baseline_checks" not in spec["policy"] and spec.get("feature_worker")
             and "baseline_checks_version" not in spec):
-        from .delivery_config import DeliveryConfig
+        from .delivery_execution_config import load_execution_config
 
         # Workers omit the coordinator's baseline gate. Its already frozen
         # configuration still authenticates which recipes are prerequisites.
         # Read it without changing the sealed child policy or old reservations.
-        config = DeliveryConfig.load(Path(spec["config_path"]))
-        if digest(config.raw) != spec["config_digest"]:
-            raise ValueError("worker prerequisite configuration changed after admission")
+        config = load_execution_config(spec)
         repository = config.raw["repositories"][spec["repository_key"]]
         selected = repository.get("baseline_check_ids", [])
         baseline = [check for check in repository.get("prepublish_checks", [])

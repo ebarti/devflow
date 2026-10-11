@@ -100,7 +100,9 @@ class DeliveryClient:
 
     def continue_feature(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request(
-            "POST", "/api/runs/" + quote(run_id, safe="") + "/continue-feature", payload)
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/continue-feature", payload,
+            timeout=180,
+        )
 
     def cancel(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/cancel", payload)

@@ -9,7 +9,8 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_baseline_contract import repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
-from .delivery_config import DeliveryConfig, scope_amended_spec, scope_amendment_config
+from .delivery_config import scope_amended_spec, scope_amendment_config
+from .delivery_execution_config import load_execution_config
 from .delivery_gate_retry import prepare_runtime
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _remote, _rows, _stopped_cleanup, work_binding
@@ -234,8 +235,7 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     spec = store.effective_spec(run_id)
     if spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local':
         raise ValueError('stopped resume preserves an already trusted execution policy')
-    if digest(DeliveryConfig.load(Path(spec['config_path'])).raw) != spec['config_digest']:
-        raise ValueError('stopped service configuration changed')
+    load_execution_config(spec)
     if not store.owns_execution(spec):
         raise ValueError('stopped execution belongs to a different service')
     row, attempts, effects, claim = _rows(store, run_id)
@@ -513,7 +513,7 @@ def readback(store, spec, recovery):
                     != recovery['session_custody']['generation']):
             raise ValueError('stopped implementation session custody changed before resume')
     if (not store.owns_execution(spec)
-            or digest(DeliveryConfig.load(Path(spec['config_path'])).raw) != spec['config_digest']):
+            or digest(load_execution_config(spec).raw) != spec['config_digest']):
         raise ValueError('stopped service configuration or owner changed')
     if observed_native_cleanup(predecessor) != details['cleanup_digest']:
         raise ValueError('stopped predecessor process ownership changed')

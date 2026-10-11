@@ -157,7 +157,7 @@ def _native_pass(spec, row, attempts, candidate):
 
 def completed_build_subject(store, parent, spec, row, attempts, assignment, values, shared):
     """Authenticate reusable source only; no Temporal result, session admission or debit."""
-    from .delivery_config import DeliveryConfig
+    from .delivery_execution_config import load_execution_config
     from .delivery_feature_execution import worker_key
     from .delivery_feature_revisions import _checkpoint_proof, revision_checkpoints
     from .delivery_policy_recovery import _rows, work_binding
@@ -189,7 +189,7 @@ def completed_build_subject(store, parent, spec, row, attempts, assignment, valu
             or spec["policy"].get("execution_backend") != "native-macos"
             or spec["policy_digest"] != digest(spec["policy"])
             or not store.owns_execution(spec)
-            or digest(DeliveryConfig.load(Path(spec["config_path"])).raw) != spec["config_digest"]):
+            or digest(load_execution_config(spec).raw) != spec["config_digest"]):
         raise ValueError("completed build lacks finalized original source ownership")
     issue_id = parent["feature_delivery"]["owner"]["issue_id"]
     _checkpoint_proof(shared, issue_id, values, checkpoint_keys + assignment_keys)

@@ -72,6 +72,8 @@ class DeliveryService:
         self.temporal_status = "disconnected"
         self._health_client: Client | None = None
         self.dispatch_task: asyncio.Task | None = None
+        self._closed_projection_seen: set[tuple[str, str | None]] = set()
+        self._closed_projection_cursor = ""
 
     async def client(self) -> Client:
         return await Client.connect(
@@ -151,7 +153,10 @@ class DeliveryService:
                         if recovery and recovery.get("kind") == "terminal_tracker_recovery"
                         else timedelta(hours=72)}
                        if spec.get("terminal_tracker_version") == 1
-                       and not spec.get("feature_delivery") else {}),
+                       and not spec.get("feature_delivery")
+                       and (spec.get("workflow_failure_boundary_version") != 1
+                            or (recovery and recovery.get("kind") == "terminal_tracker_recovery"))
+                       else {}),
                     memo={
                         "request_digest": item["request_digest"],
                         **({"recovery_digest": digest(recovery)} if recovery else {}),
@@ -205,6 +210,13 @@ class DeliveryService:
                 # Failed maintenance never acknowledges starts or releases claims.
                 pass
             try:
+                await self.reconcile_completed_projections_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Only an authenticated completed result can repair its read model.
+                pass
+            try:
                 from .delivery_automatic_retry import retry_once
 
                 if self._retry_task is None or self._retry_task.done():
@@ -225,6 +237,17 @@ class DeliveryService:
 
         client = await self.healthy_client()
         await reconcile_closed_native(self.store, client)
+
+    async def reconcile_completed_projections_once(self) -> None:
+        from .delivery_closed_projection import reconcile_completed_projections
+
+        client = await self.healthy_client()
+        observations = await reconcile_completed_projections(
+            self.store, client, seen=self._closed_projection_seen,
+            after_run_id=self._closed_projection_cursor,
+        )
+        if observations:
+            self._closed_projection_cursor = observations[-1]["run_id"]
 
     async def dispatch_questions_once(self) -> None:
         from .delivery_question_sender import pump_blocking_questions

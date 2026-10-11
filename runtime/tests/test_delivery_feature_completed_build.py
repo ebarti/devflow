@@ -178,7 +178,9 @@ def _source(tmp_path, monkeypatch, *, spec=None, store=None, shared=None, runtim
                         if p["run_id"] == spec["run_id"] else old_cleanup(p, **kw))
     if not hasattr(store, "_connect"):
         store._connect = shared.connect
-        monkeypatch.setattr("devflow_temporal.delivery_config.DeliveryConfig.load",
+        # Portable receipt fixtures isolate config authentication; integration
+        # cases below exercise the actual admitted snapshot and durable store.
+        monkeypatch.setattr("devflow_temporal.delivery_execution_config.load_execution_config",
                             lambda _: SimpleNamespace(raw=configuration))
 
     class Broker:
@@ -276,7 +278,7 @@ def test_public_mixed_completed_source_and_unpassed_chunk_keep_seven_and_eight(
     store, parent, shared, plan, _, _, prior, _, _, _ = fixture
     spec = deepcopy(child)
     spec.update(run_id="zz-completed-build", work_id="zz-build-work",
-                state_dir=str(tmp_path / "zz-completed-build"),
+                state_dir=str(store.config.state_root / "runs" / "zz-completed-build"),
                 checkout=str(tmp_path / "zz-build-checkout"), branch="fixture-build-source")
     spec["feature_worker"].update(kind="build", seed=None)
     f = _source(tmp_path, monkeypatch, spec=spec, store=store, shared=shared, runtime=runtime)

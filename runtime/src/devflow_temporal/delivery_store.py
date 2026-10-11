@@ -31,6 +31,11 @@ from .delivery_continuation import (
     selected_manifest,
     session_state_digest,
 )
+from .delivery_execution_config import (
+    load_execution_config,
+    preserve_execution_config,
+    transport_binding,
+)
 from .delivery_preparation import execution_retired
 
 logger = logging.getLogger(__name__)
@@ -69,6 +74,7 @@ class DeliveryStore:
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
         self.state = module
+        preserve_execution_config(config)
         with self._connect() as db:
             # Initialization also backfills feature projections. Reserve the write
             # transaction before reading executions, so a concurrent writer cannot
@@ -475,6 +481,11 @@ class DeliveryStore:
                     "existing": True,
                     "phase": prior_run[1],
                 }
+        if digest(DeliveryConfig.load(self.config.path).raw) != digest(self.config.raw):
+            raise ValueError(
+                "service configuration changed; reload the service before new admission"
+            )
+        preserve_execution_config(self.config)
         reference = None
         if _automatic is not None:
             old = json.loads(_automatic['row']['request_json'])
@@ -680,9 +691,7 @@ class DeliveryStore:
     def owns_execution(self, spec: dict[str, Any]) -> bool:
         """Shared database visibility does not grant another service's transport."""
         try:
-            frozen = DeliveryConfig.load(Path(spec["config_path"]))
-            if digest(frozen.raw) != spec["config_digest"]:
-                raise ValueError("frozen service configuration changed")
+            frozen = load_execution_config(spec)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning(
                 "Run %s skipped: frozen execution configuration unavailable (%s)",
@@ -690,14 +699,7 @@ class DeliveryStore:
             )
             return False
 
-        def binding(config: DeliveryConfig) -> tuple:
-            return (
-                config.tracking_db.resolve(), config.state_root.resolve(),
-                config.temporal_address, config.raw.get("temporal_namespace", "default"),
-                config.queue, config.dashboard_url.rstrip("/"),
-            )
-
-        return binding(frozen) == binding(self.config)
+        return transport_binding(frozen) == transport_binding(self.config)
 
     def _completed_temporal_result(
         self, run_id: str, *, workflow_id: str | None = None
@@ -1225,8 +1227,7 @@ class DeliveryStore:
         finalized = (spec.get("resource_cleanup_version") == 1
                      and row["cleanup"] == "confirmed")
         stopped_claim = finalized
-        if digest(DeliveryConfig.load(Path(spec["config_path"])).raw) != spec["config_digest"]:
-            raise ValueError("frozen service configuration changed before repair grant")
+        load_execution_config(spec)
         current_workflow_id = row["workflow_id"] or f"delivery-{run_id}"
         previous_recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         closed = self._completed_temporal_result(run_id, workflow_id=current_workflow_id)
@@ -1539,7 +1540,7 @@ class DeliveryStore:
         original = json.loads(row["recovery_json"])
         if (
             original.get("kind") != "repair_continuation"
-            or digest(DeliveryConfig.load(self.config.path).raw) != spec["config_digest"]
+            or digest(load_execution_config(spec).raw) != spec["config_digest"]
         ):
             raise ValueError("prelaunch retry changed the frozen repair authority")
         closed = self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
@@ -2923,12 +2924,15 @@ class DeliveryStore:
         cleanup: str | None = None,
         error: str | None = None,
         key: str | None = None,
+        expected_revision: int | None = None,
     ) -> dict[str, Any]:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
+            if expected_revision is not None and row["revision"] != expected_revision:
+                raise ValueError("projection row revision changed")
             feature_readback_wait = False
             if (event_type == "feature_readback_pending" and phase == "waiting_feature_readback"
                     and execution_state == "waiting" and outcome is None
@@ -2988,7 +2992,8 @@ class DeliveryStore:
                 "outcome": None if feature_readback_wait else (
                     outcome if outcome is not None else row["outcome"]),
                 "cleanup": cleanup if cleanup is not None else row["cleanup"],
-                "error": error if error is not None or event_type == "delivered"
+                "error": error if error is not None or event_type in {
+                    "delivered", "closed_projection_reconciled"}
                 or (checks or {}).get("terminal_tracker_checkpoint", {}).get("state") == "confirmed"
                 else row["error"],
                 "updated_at": _now(),

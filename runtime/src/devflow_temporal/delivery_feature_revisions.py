@@ -452,34 +452,60 @@ def revise_feature_plan(store, run_id, request):
     return receipt
 
 
-def _preparation_retry_key(revision_id):
-    return PREFIX + "preparation-retry:" + revision_id
+def _preparation_retry_key(revision_id, predecessor=None):
+    from .delivery_execution_registry import preparation_retry_key
+
+    return preparation_retry_key(revision_id, predecessor)
+
+
+def _preparation_lineage(shared, public, values):
+    from .delivery_execution_registry import preparation_lineage
+
+    with shared.connect() as db:
+        chain = preparation_lineage(db, public)
+    if any(values.get(key) != receipt for key, receipt in chain):
+        raise OwnershipConflict("preparation continuation changed during lineage observation")
+    return chain
 
 
 def _preparation_retry(store, spec, public, values):
     reference = spec.get("feature_plan_revision_preparation_retry")
     if reference is None:
         return None
-    key = _preparation_retry_key(public["revision_id"])
-    saved = values.get(key)
+    shared = _registry(spec)
+    chain = _preparation_lineage(shared, public, values)
+    key = reference.get("checkpoint_key")
+    saved = next((receipt for name, receipt in chain if name == key), None)
     if (reference != {"checkpoint_key": key, "sha256": digest(saved)}
             or not saved or saved["revision_id"] != public["revision_id"]
             or saved["admission_sha256"] != digest(public)
-            or saved["successor_id"] != spec["run_id"]):
+            or saved["successor_id"] != spec["run_id"]
+            or spec["feature_delivery"]["owner"] != {
+                **saved["predecessor"], "run_id": spec["run_id"],
+                "generation": saved["predecessor"]["generation"] + 1}):
         raise OwnershipConflict("preparation continuation lost its sealed reservation lineage")
-    _checkpoint_proof(_registry(spec), saved["predecessor"]["issue_id"], values, [key])
-    authenticate_adopted_plan_custody(store, spec, {"owner": saved["predecessor"]})
-    previous = store.effective_spec(saved["predecessor"]["run_id"])
-    with store._connect() as db:
-        row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
-                         (previous["run_id"],)).fetchone()
-    closed, observed = _preparation_observation(store, previous, row, custodian=spec)
-    if (digest(previous) != saved["predecessor_spec_sha256"]
-            or digest(dict(row)) != saved["stopped_row_sha256"]
-            or digest(closed["result"]) != saved["closed_state_sha256"]
-            or {k: v for k, v in closed.items() if k != "result"} != saved["closure"]
-            or observed != saved["observation"]):
-        raise OwnershipConflict("preparation predecessor custody changed after continuation")
+    for name, receipt in chain:
+        authenticate_adopted_plan_custody(store, spec, {"owner": receipt["predecessor"]})
+        previous = store.effective_spec(receipt["predecessor"]["run_id"])
+        with store._connect() as db:
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                             (previous["run_id"],)).fetchone()
+            attempted = db.execute("SELECT 1 FROM delivery_attempts WHERE run_id=?",
+                                   (previous["run_id"],)).fetchone()
+        with shared.connect() as db:
+            effects = db.execute("SELECT 1 FROM execution_effects WHERE issue_id=? "
+                                 "AND generation=?", (receipt["predecessor"]["issue_id"],
+                                                      receipt["predecessor"]["generation"]))
+            effected = effects.fetchone()
+        closed, observed = _preparation_observation(store, previous, row, custodian=spec)
+        if (attempted or effected or digest(previous) != receipt["predecessor_spec_sha256"]
+                or digest(dict(row)) != receipt["stopped_row_sha256"]
+                or digest(closed["result"]) != receipt["closed_state_sha256"]
+                or {k: v for k, v in closed.items() if k != "result"} != receipt["closure"]
+                or observed != receipt["observation"]):
+            raise OwnershipConflict("preparation predecessor custody changed after continuation")
+        if name == key:
+            break
     return saved
 
 
@@ -578,7 +604,10 @@ def _preparation_observation(store, spec, row, *, custodian=None):
 
 
 def continue_pending_preparation(store, spec, row, request, successor_id):
-    """Transport one unstarted reservation to fresh owned preparation paths."""
+    """Transport one unstarted reservation through at most three preparation continuations."""
+    from .delivery_config import DeliveryConfig
+    from .delivery_execution_registry import PREPARATION_CONTINUATION_LIMIT
+
     shared = _registry(spec)
     token = spec["feature_delivery"]["owner"]
     values = _values(spec, shared)
@@ -586,11 +615,23 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     if not public:
         return None
     revision_id = public["revision_id"]
-    key = _preparation_retry_key(revision_id)
+    chain = _preparation_lineage(shared, public, values)
+    initial = {**public["owner"], "run_id": public["successor_id"],
+               "generation": public["owner"]["generation"] + 1}
+    key = _preparation_retry_key(revision_id, token if token != initial else None)
     saved = values.get(key)
     if saved and (saved["command"] != request or saved["successor_id"] != successor_id
                   or saved["predecessor"] != token):
         raise OwnershipConflict("reserved revision already has a preparation continuation")
+    # This is a new admission, so match submit's live-versus-loaded config guard
+    # before appending a transport receipt. Existing execution stays frozen.
+    if digest(DeliveryConfig.load(store.config.path).raw) != digest(store.config.raw):
+        raise OwnershipConflict("preparation admission configuration changed")
+    incoming = _preparation_retry(store, spec, public, values)
+    sequence = next((index + 2 for index, (_, receipt) in enumerate(chain)
+                     if receipt == incoming), 1)
+    if sequence > PREPARATION_CONTINUATION_LIMIT:
+        raise OwnershipConflict("reserved revision preparation continuation limit reached")
     with shared.connect() as db:
         pending = shared._pending_revision(db, token["issue_id"])
         paid = db.execute("SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
@@ -600,8 +641,8 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     with store._connect() as db:
         attempts = list(db.execute("SELECT * FROM delivery_attempts WHERE run_id=?",
                                    (spec["run_id"],)))
-    if (pending != public or public["successor_id"] != spec["run_id"]
-            or public["owner"]["generation"] + 1 != token["generation"]
+    if (pending != public or (not incoming and token != initial)
+            or len(chain) != sequence - 1 + int(saved is not None)
             or _terminal(values, revision_id) or paid or attempts or effects
             or any(name in values for name in (
                 PREFIX + "begin:" + revision_id, PREFIX + "proposal:" + revision_id))
@@ -628,9 +669,14 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
         "config_digest": spec["config_digest"], "budget": budget,
         "reconsideration": proof, "selectors": selectors,
     }
+    if incoming:
+        receipt.update(version=2, sequence=sequence,
+                       previous=deepcopy(spec["feature_plan_revision_preparation_retry"]))
     if saved is not None and saved != receipt:
         raise OwnershipConflict("preparation continuation evidence changed before replay")
     with shared.serialized(token["issue_id"]):
+        if _preparation_lineage(shared, public, _values(spec, shared)) != chain:
+            raise OwnershipConflict("preparation continuation lineage changed before admission")
         with store._connect() as db:
             current = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
                                       (spec["run_id"],)).fetchone())
@@ -668,8 +714,9 @@ def authenticate_revision_submission(store, spec, admission):
     if original["feature_delivery"]["owner"] != admission["owner"]:
         raise OwnershipConflict("revision continuation changed original owner custody")
     if retry is not None:
-        key = _preparation_retry_key(admission["revision_id"])
-        if (values.get(key) != retry or retry["predecessor"] != predecessor
+        chain = _preparation_lineage(shared, admission, values)
+        key = next((name for name, receipt in chain if receipt == retry), None)
+        if (key is None or retry["predecessor"] != predecessor
                 or retry["successor_id"] != spec["run_id"]
                 or retry["admission_sha256"] != digest(admission)
                 or retry["config_digest"] != spec["config_digest"]
@@ -2204,9 +2251,11 @@ def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup
     public = spec.get("feature_plan_revision_request")
     reference = spec.get("feature_plan_revision_preparation_retry")
     if public and reference:
-        retry = values.get(_preparation_retry_key(public["revision_id"]))
-        if reference != {"checkpoint_key": _preparation_retry_key(public["revision_id"]),
-                         "sha256": digest(retry)}:
+        chain = _preparation_lineage(_registry(spec), public, values)
+        key = reference.get("checkpoint_key")
+        retry = next((value for name, value in chain if name == key), None)
+        if (not retry or retry["successor_id"] != spec["run_id"]
+                or reference != {"checkpoint_key": key, "sha256": digest(retry)}):
             raise OwnershipConflict("preparation readback lost its sealed continuation")
         current = values.get(PREFIX + "begin:" + public["revision_id"], {
             **public, "reconsideration": retry["reconsideration"]})

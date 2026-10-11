@@ -27,7 +27,7 @@ from .delivery_broker import (
     CheckPreparationFailure,
     DeliveryBroker,
 )
-from .delivery_config import DeliveryConfig
+from .delivery_execution_config import load_execution_config
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
 from .supervisor import get_supervisor
@@ -197,9 +197,7 @@ async def _with_heartbeat(operation, request: dict[str, Any], stage: str) -> dic
 def _context(
     spec: dict[str, Any], *, preparation_input: bool = False, allow_stopped_feature: bool = False
 ) -> tuple[DeliveryStore, DeliveryBroker]:
-    config = DeliveryConfig.load(Path(spec["config_path"]))
-    if digest(config.raw) != spec["config_digest"]:
-        raise ValueError("service configuration changed during an active run")
+    config = load_execution_config(spec)
     store = DeliveryStore(config)
     saved = store.effective_spec(spec["run_id"])
     if saved != spec and not (
@@ -386,9 +384,7 @@ async def delivery_finalize_resources(request: dict[str, Any]) -> dict[str, Any]
 @activity.defn(name="delivery_accept_plan")
 async def delivery_accept_plan(request: dict[str, Any]) -> dict[str, Any]:
     spec = request["spec"]
-    config = DeliveryConfig.load(Path(spec["config_path"]))
-    if digest(config.raw) != spec["config_digest"]:
-        raise ValueError("service configuration changed during intake")
+    config = load_execution_config(spec)
     store = DeliveryStore(config)
     saved = store.effective_spec(spec["run_id"])
     if {key: value for key, value in saved.items() if key != "accepted_plan"} != {

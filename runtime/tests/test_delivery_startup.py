@@ -256,6 +256,41 @@ def test_request_transport_failure_sends_mutation_once(config):
     assert caller.opener.calls == 1
 
 
+@pytest.mark.parametrize("dispatched_failure", [False, True])
+def test_feature_continuation_uses_extended_timeout_without_transport_replay(
+    config, dispatched_failure
+):
+    payload = {"command_id": "one-feature-continuation", "expected_revision": 5}
+    response = {"run_id": "recorded-successor"}
+
+    class RecordedTransport:
+        calls = []
+
+        def open(self, request, *, timeout):
+            self.calls.append((request.method, request.full_url, timeout))
+            assert timeout == 180
+            if request.method == "GET":
+                assert request.full_url.endswith("/api/session")
+                return io.BytesIO(b'{"csrf_token":"continuation-csrf"}')
+            assert request.method == "POST"
+            assert request.full_url.endswith("/api/runs/feature%2Fowner/continue-feature")
+            assert request.get_header("X-devflow-csrf") == "continuation-csrf"
+            assert request.get_header("Origin") == config.dashboard_url.rstrip("/")
+            assert json.loads(request.data) == payload
+            if dispatched_failure:
+                raise TimeoutError("response lost after continuation dispatch")
+            return io.BytesIO(json.dumps(response).encode())
+
+    caller = DeliveryClient(config)
+    caller.opener = RecordedTransport()
+    if dispatched_failure:
+        with pytest.raises(ServiceUnavailable, match="after continuation dispatch"):
+            caller.continue_feature("feature/owner", payload)
+    else:
+        assert caller.continue_feature("feature/owner", payload) == response
+    assert [method for method, _url, _timeout in caller.opener.calls] == ["GET", "POST"]
+
+
 def test_client_renews_anonymous_csrf_before_each_command_without_a_token_file(config):
     class Transport:
         sessions = 0

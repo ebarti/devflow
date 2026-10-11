@@ -14,7 +14,6 @@ import unicodedata
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from .contracts import digest
 from .delivery_origin import thread_uuid
 
 if TYPE_CHECKING:
@@ -147,7 +146,7 @@ def pump_blocking_questions(
                 return
             try:
                 spec = store.spec(item["run_id"])
-                if digest(store.config.raw) != spec["config_digest"]:
+                if not store.owns_execution(spec):
                     raise QueueFailure("configured sender authority changed", uncertain=False)
                 message = question_message(item, store.config.dashboard_url.rstrip("/"))
                 # Recheck answer/cancel/supersession after message preparation and
