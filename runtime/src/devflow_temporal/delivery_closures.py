@@ -255,12 +255,14 @@ def seal(
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         existing = db.execute(
-            "SELECT * FROM delivery_closures WHERE workflow_id=? AND execution_run_id=?",
-            (record["workflow_id"], record["execution_run_id"]),
+            "SELECT * FROM delivery_closures WHERE workflow_id=?", (record["workflow_id"],),
         ).fetchone()
         if existing is not None:
             existing = dict(existing)
-            if existing["history_sha256"] != sha256 or existing["run_id"] != run_id:
+            # Delivery workflow IDs are never reused (REJECT_DUPLICATE), so a workflow
+            # has exactly one closed execution; anything else is refused, not shadowed.
+            if (existing["execution_run_id"] != record["execution_run_id"]
+                    or existing["history_sha256"] != sha256 or existing["run_id"] != run_id):
                 raise SealConflict(
                     f"a different history is already sealed for workflow {record['workflow_id']}"
                 )
@@ -303,23 +305,32 @@ async def sealed_closure(store, workflow_id: str) -> dict[str, Any] | None:
 
 async def seal_from_temporal(store, client, description, *, run_id: str) -> dict[str, Any]:
     """Seal a retained closed execution unless the same execution is already sealed."""
+    import asyncio
+
     status = CLOSED_STATUSES.get(description.status)
     if status is None or not description.close_time:
         raise ValueError(f"workflow {description.id} is not closed")
-    with store._connect() as db:
-        existing = db.execute(
-            "SELECT * FROM delivery_closures WHERE workflow_id=? AND execution_run_id=?",
-            (description.id, description.run_id),
-        ).fetchone()
-    if existing is not None:
-        return dict(existing)
+
+    def existing() -> dict[str, Any] | None:
+        with store._connect() as db:
+            row = db.execute(
+                "SELECT * FROM delivery_closures WHERE workflow_id=? AND execution_run_id=?",
+                (description.id, description.run_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    found = await asyncio.to_thread(existing)
+    if found is not None:
+        return found
     exact = client.get_workflow_handle(description.id, run_id=description.run_id)
-    history = await exact.fetch_history()
+    history = await asyncio.wait_for(exact.fetch_history(), timeout=60)
     facts = await closure_facts(history)
     if (facts["execution_run_id"] != description.run_id or facts["status"] != status
             or facts["closed_at"] != description.close_time.isoformat()):
         raise ValueError(f"Temporal history of {description.id} disagrees with its description")
-    return seal(store, history, facts, run_id=run_id, source="temporal")
+    return await asyncio.to_thread(
+        seal, store, history, facts, run_id=run_id, source="temporal",
+    )
 
 
 def _current_workflow(store, run_id: str, row: dict[str, Any]) -> str:
@@ -380,16 +391,20 @@ async def import_archived_closure(
                 f"({result.get('outcome')}/{result.get('iteration')} vs "
                 f"{row['outcome']}/{row['iteration']})"
             )
-    handle = client.get_workflow_handle(workflow_id, run_id=facts["execution_run_id"])
-    try:
-        await handle.describe()
-    except Exception as exc:
-        if not not_found(exc):
-            raise ValueError(f"Temporal retention of {workflow_id} is unverified: {exc}") from exc
-    else:
-        raise ValueError(
-            f"Temporal still retains workflow {workflow_id}; it is sealed from Temporal directly"
-        )
+    for handle in (client.get_workflow_handle(workflow_id, run_id=facts["execution_run_id"]),
+                   client.get_workflow_handle(workflow_id)):
+        try:
+            retained = await handle.describe()
+        except Exception as exc:
+            if not not_found(exc):
+                raise ValueError(
+                    f"Temporal retention of {workflow_id} is unverified: {exc}"
+                ) from exc
+        else:
+            raise ValueError(
+                f"Temporal still retains workflow {workflow_id} (run {retained.run_id}); "
+                "it is sealed from Temporal directly"
+            )
     record = seal(store, history, facts, run_id=run_id, source="archive",
                   source_sha256=source_sha256)
     logger.info("Imported archived closure %s/%s for run %s", workflow_id,
@@ -449,6 +464,12 @@ async def seal_closed_executions(store, client, *, limit: int = 10) -> list[dict
         try:
             spec = await asyncio.to_thread(store.effective_spec, run_id)
             if not await asyncio.to_thread(store.owns_execution, spec):
+                # Another service's (or an unloadable) run: back off so it cannot keep
+                # occupying the batch ahead of runs this service must seal.
+                await asyncio.to_thread(_observe, store, workflow_id, run_id, "unowned",
+                                        "run is not owned by this service's transport")
+                results.append({"run_id": run_id, "workflow_id": workflow_id,
+                                "state": "unowned"})
                 continue
             handle = client.get_workflow_handle(workflow_id)
             description = await asyncio.wait_for(handle.describe(), timeout=15)

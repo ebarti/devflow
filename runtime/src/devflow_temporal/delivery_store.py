@@ -710,7 +710,7 @@ class DeliveryStore:
     ) -> dict[str, Any]:
         """Read a closed workflow from Temporal or its sealed copy, never caller JSON.
 
-        A retained closure is sealed on first read, so recovery keeps working after
+        A retained closure is sealed after it is read, so recovery keeps working after
         Temporal's namespace retention deletes the history; an expired closure that
         was never sealed must be imported from its authentic exported history.
         """
@@ -724,7 +724,7 @@ class DeliveryStore:
 
                 raise FailedFeatureCoordinator(closed)
 
-        async def read() -> dict[str, Any]:
+        async def read() -> tuple[dict[str, Any], bool]:
             client = await Client.connect(
                 self.config.temporal_address,
                 namespace=self.config.raw.get("temporal_namespace", "default"),
@@ -754,26 +754,8 @@ class DeliveryStore:
                     coordinator_failure(closed)
                 if sealed["status"] != "COMPLETED":
                     raise ValueError("continuation predecessor Temporal workflow is not closed")
-                return {**closed, "result": sealed["result"]}
-
-            async def preserve() -> None:
-                # Sealing is preservation, not authority: a slow or failed copy never
-                # fails the live read, while a conflicting sealed history still does.
-                if not description.close_time or description.status not in (
-                        closures.CLOSED_STATUSES):
-                    return
-                try:
-                    await asyncio.wait_for(closures.seal_from_temporal(
-                        self, client, description, run_id=run_id,
-                    ), timeout=10)
-                except closures.SealConflict:
-                    raise
-                except Exception as exc:
-                    logger.warning("Run %s: closure %s was not sealed (%s: %s)",
-                                   run_id, description.id, type(exc).__name__, exc)
-
+                return {**closed, "result": sealed["result"]}, True
             if description.status == WorkflowExecutionStatus.FAILED and description.close_time:
-                await preserve()
                 coordinator_failure({
                     "workflow_id": description.id, "execution_run_id": description.run_id,
                     "closed_at": description.close_time.isoformat(),
@@ -785,7 +767,7 @@ class DeliveryStore:
                 or not description.close_time
             ):
                 raise ValueError("continuation predecessor Temporal workflow is not closed")
-            closed = {
+            return {
                 "workflow_id": description.id,
                 "execution_run_id": description.run_id,
                 "closed_at": description.close_time.isoformat(),
@@ -794,25 +776,56 @@ class DeliveryStore:
                 "result": await client.get_workflow_handle(
                     description.id, run_id=description.run_id
                 ).result(),
-            }
-            await preserve()
-            return closed
+            }, False
 
         try:
             # submit() is shared by synchronous CLI and the async API route.
             with ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(
+                closed, sealed = pool.submit(
                     lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))
                 ).result(timeout=35)
         except Exception as exc:
             from .delivery_feature_closure import FailedFeatureCoordinator
 
-            if isinstance(exc, (FailedFeatureCoordinator, closures.ClosureUnavailable)):
+            if isinstance(exc, FailedFeatureCoordinator):
+                self._preserve_closure(run_id, exc.closed)
                 raise
-            raise ValueError(
-                "continuation predecessor Temporal closure is unproven "
-                f"({type(exc).__name__}: {str(exc)[:300]})"
-            ) from exc
+            if isinstance(exc, closures.ClosureUnavailable):
+                raise
+            # Callers match this exact message (a not-yet-closed worker is polled
+            # again); the cause stays chained for diagnosis.
+            logger.debug("Run %s: Temporal closure unproven (%s: %s)",
+                         run_id, type(exc).__name__, exc)
+            raise ValueError("continuation predecessor Temporal closure is unproven") from exc
+        if not sealed:
+            self._preserve_closure(run_id, closed)
+        return closed
+
+    def _preserve_closure(self, run_id: str, closed: dict[str, Any]) -> None:
+        """Seal a closure just read from Temporal; preservation never fails the read."""
+
+        async def preserve() -> None:
+            client = await Client.connect(
+                self.config.temporal_address,
+                namespace=self.config.raw.get("temporal_namespace", "default"),
+                data_converter=DELIVERY_DATA_CONVERTER,
+            )
+            description = await client.get_workflow_handle(
+                closed["workflow_id"], run_id=closed["execution_run_id"],
+            ).describe()
+            await closures.seal_from_temporal(self, client, description, run_id=run_id)
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(
+                    lambda: asyncio.run(asyncio.wait_for(preserve(), timeout=20))
+                ).result(timeout=25)
+        except closures.SealConflict:
+            raise
+        except Exception as exc:
+            if not closures.not_found(exc):
+                logger.warning("Run %s: closure %s was not sealed (%s: %s)", run_id,
+                               closed.get("workflow_id"), type(exc).__name__, exc)
 
     def recover_publication(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
         """Queue one same-run continuation after a pushed PR outlived readback.

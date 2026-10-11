@@ -23,15 +23,17 @@ executions keep their previous cleanup timers, and expired history cannot be
 restored by increasing retention. This provides a bounded recovery window, not
 indefinite archival. See [Temporal's retention behavior](https://docs.temporal.io/encyclopedia/temporal-service/temporal-server).
 
-Recovery does not depend on that window. Every closed execution a run started is
-sealed into the service state: the exact original history is stored compressed and
-content-addressed under `state_root/closures/` (private files) and indexed in the
-tracking database. The API's maintenance loop seals closures while Temporal still
-retains them, and every recovery read seals the closure it authenticates. When
-Temporal no longer returns a closed execution, recovery rebuilds the identical
-closure (workflow and run IDs, close time, memo digests and result) from the sealed
-history. Sealing never writes to Temporal and never replaces an existing sealed
-history with a different one.
+Recovery no longer depends on that window for sealed executions. The exact original
+history of a closed execution is stored compressed and content-addressed under
+`state_root/closures/` (private files) and indexed in the tracking database. The API's
+maintenance loop seals each run's current execution once it closes, and every recovery
+read (stopped resume, gate retries, pending publication, feature continuation, failed
+coordinator and terminal-tracker recovery) seals the execution it authenticates. When
+Temporal no longer returns a closed execution, recovery rebuilds the identical closure
+(workflow and run IDs, close time, memo digests and result) from the sealed history.
+Sealing never writes to Temporal, keeps one execution per workflow ID and never
+replaces a sealed history with a different one. An execution that closed and expired
+while the service was not running cannot be sealed retroactively.
 
 A closure that expired before it was sealed is refused with an explicit message.
 If an authentic exported history exists, import it once:

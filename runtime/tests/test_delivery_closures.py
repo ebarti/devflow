@@ -17,7 +17,8 @@ from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_closures as closures
-from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
+from devflow_temporal import delivery_control
+from devflow_temporal import delivery_feature_activities as feature_activities
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -80,7 +81,8 @@ def _bound_store(store, address):
 def _admit(store, request, run_id):
     item = {**request, "run_id": run_id, "work_id": f"work-{run_id}",
             "command_id": f"command-{run_id}",
-            "issue_url": f"https://github.com/example/fixture/issues/{run_id[-1]}"}
+            "issue_url": "https://github.com/example/fixture/issues/"
+                         + "".join(filter(str.isdigit, run_id))}
     store.submit(item)
     store.mark_start(run_id, accepted=True)
     with store._connect() as db:
@@ -157,9 +159,10 @@ async def test_expired_closure_is_restored_only_from_its_authentic_archive(servi
                             history_path=path)
                 assert closures.sealed_record(store, "delivery-run-1") is None
 
-                record = await closures.import_archived_closure(
-                    store, expired.client, run_id="run-1", workflow_id="delivery-run-1",
-                    history_path=archive)
+                # The CLI entry point, as the operator runs it.
+                record = await asyncio.to_thread(
+                    delivery_control._import_closure, store.config, "run-1",
+                    "delivery-run-1", archive)
                 assert record["source"] == "archive"
                 assert record["status"] == "COMPLETED"
                 assert record["execution_run_id"] == closed["execution_run_id"]
@@ -170,12 +173,29 @@ async def test_expired_closure_is_restored_only_from_its_authentic_archive(servi
                     store, expired.client, run_id="run-1", workflow_id="delivery-run-1",
                     history_path=archive)
                 assert again["history_sha256"] == record["history_sha256"]
+                altered = json.loads(history.to_json())
+                altered["events"][0]["workflowExecutionStartedEventAttributes"][
+                    "identity"] = "another-worker"
+                with pytest.raises(closures.SealConflict, match="different history"):
+                    await closures.import_archived_closure(
+                        store, expired.client, run_id="run-1",
+                        workflow_id="delivery-run-1",
+                        history_path=_write(tmp_path / "altered.json", altered))
 
                 sealed = Path(store.config.state_root) / "closures"
                 assert stat.S_IMODE(sealed.stat().st_mode) == 0o700
                 for item in sealed.iterdir():
                     assert stat.S_IMODE(item.stat().st_mode) == 0o600
                 assert foreign["workflow_id"] == "delivery-run-1-foreign"
+
+                # Never import over an execution Temporal still retains for the workflow.
+                async with _worker(expired.client):
+                    await _close(expired.client, "delivery-run-1", "run-1",
+                                 row["request_digest"])
+                    with pytest.raises(ValueError, match="Temporal still retains workflow"):
+                        await closures.import_archived_closure(
+                            store, expired.client, run_id="run-1",
+                            workflow_id="delivery-run-1", history_path=archive)
 
 
 @pytest.mark.asyncio
@@ -221,4 +241,53 @@ async def test_sealed_history_corruption_is_refused(service):
     path.write_bytes(lzma.compress(json.dumps(tampered).encode()))
     with pytest.raises(ValueError, match="does not match its recorded digest"):
         await closures.sealed_closure(store, "delivery-run-1")
-    assert DELIVERY_DATA_CONVERTER is not None
+
+
+@pytest.mark.asyncio
+async def test_unowned_runs_back_off_instead_of_starving_sealing(service):
+    original_store, request = service
+    async with local_temporal() as environment, _worker(environment.client):
+        address = environment.client.service_client.config.target_host
+        # Ten older runs admitted while the service used another Temporal address.
+        previous = _bound_store(original_store, "127.0.0.1:1")
+        for index in range(1, 11):
+            _admit(previous, request, f"run-{index:02d}")
+        store = _bound_store(previous, address)
+        row = _admit(store, request, "run-11")
+        await _close(environment.client, "delivery-run-11", "run-11", row["request_digest"])
+        first = await closures.seal_closed_executions(store, environment.client)
+        assert {item["state"] for item in first} == {"unowned"} and len(first) == 10
+        second = await closures.seal_closed_executions(store, environment.client)
+        assert second == [{"run_id": "run-11", "workflow_id": "delivery-run-11",
+                           "state": "sealed", "status": "COMPLETED"}]
+
+
+@activity.defn(name="delivery_prepare")
+async def _held_prepare(_request):
+    await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+async def test_worker_result_polls_again_while_the_child_has_not_closed(service, monkeypatch):
+    original_store, request = service
+    async with local_temporal() as environment:
+        async with Worker(environment.client, task_queue=QUEUE, workflows=[DeliveryWorkflow],
+                          activities=[_project, _held_prepare],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            store = _bound_store(original_store,
+                                 environment.client.service_client.config.target_host)
+            row = _admit(store, request, "run-1")
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run, args=[{"run_id": "run-1", "provider": "fake",
+                                             "policy": {}}, None],
+                id="delivery-run-1", task_queue=QUEUE,
+                memo={"request_digest": row["request_digest"]})
+            # The child's terminal projection is committed before Temporal closes it.
+            with store._connect() as db:
+                db.execute("UPDATE delivery_runs SET outcome='delivered' WHERE run_id='run-1'")
+            monkeypatch.setattr(feature_activities, "_feature_context",
+                                lambda _spec: (store, None, None, None))
+            outcome = await feature_activities.delivery_feature_worker_result(
+                {"spec": {}, "child_id": "run-1"})
+            await handle.terminate("test finished")
+    assert outcome == {"closed": False, "reason": "temporal_closure_pending"}
