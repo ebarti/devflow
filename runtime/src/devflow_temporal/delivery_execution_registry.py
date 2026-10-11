@@ -737,6 +737,23 @@ class ExecutionRegistry:
                 (state, canonical_json(result), now(), token["issue_id"], key),
             )
 
+    def note_effect(self, token: dict, key: str, result: dict) -> None:
+        """Retain submission diagnostics on a pending effect without settling it."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.require_settlement(db, token)
+            row = db.execute(
+                "SELECT state,generation FROM execution_effects WHERE issue_id=? AND effect_key=?",
+                (token["issue_id"], key),
+            ).fetchone()
+            if not row or row["state"] != "pending" or row["generation"] != token["generation"]:
+                raise OwnershipConflict("external operation has no matching pending intent")
+            db.execute(
+                "UPDATE execution_effects SET result_json=?,updated_at=? "
+                "WHERE issue_id=? AND effect_key=?",
+                (canonical_json(result), now(), token["issue_id"], key),
+            )
+
     def effect(self, issue_id: str, key: str) -> dict | None:
         with self.connect() as db:
             row = db.execute(

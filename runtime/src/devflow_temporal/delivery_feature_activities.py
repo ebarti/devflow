@@ -26,7 +26,7 @@ from .delivery_feature_execution import (
 )
 from .delivery_feature_pass import checkpoint_key
 from .delivery_feature_pass import checkpoints as current_checkpoints
-from .delivery_feature_publication import current_record, live_members
+from .delivery_feature_publication import current_record, live_members, observe_members
 from .delivery_github_contract import GitHubDelivery, ordered_chunks
 
 
@@ -73,12 +73,19 @@ def open_feature(spec):
             shared.checkpoint(token, "accepted-plan", {
                 "digest": digest(record["manifest"]["plan"]),
             })
-    live_members(spec, record, gh)
+    _, changes = observe_members(spec, record, gh)
     checkpoints = current_checkpoints(spec)
-    for member in record["manifest"]["publication"]["members"]:
+    members = record["manifest"]["publication"]["members"]
+    for member in members:
         proof = checkpoints.get("verified:" + member["chunk_id"])
         if proof and (proof["head"] != member["head"] or proof["number"] != member["number"]):
             raise OwnershipConflict("verified chunk no longer matches its recorded publication")
+    changed = next((index for index, change in enumerate(changes) if change), None)
+    if changed is not None:
+        # An owner-side change stops only its own layer, whose worker reports it;
+        # the layers above wait on it and the layers below stay verified.
+        for member in members[changed:]:
+            checkpoints.pop("verified:" + member["chunk_id"], None)
     return {"record": record, "checkpoints": checkpoints, "budget": shared.budget(issue["id"]),
             **({"spec": spec} if plan.get("version") == 2 else {})}
 
@@ -468,7 +475,7 @@ def finish_worker(spec, child_id):
     if row["outcome"] == "delivered" and child["feature_worker"]["kind"] == "chunk":
         pr = json.loads(row["pr_json"])
         record = current_record(spec)
-        live_members(spec, record)
+        live_members(spec, record, through=child["feature_worker"]["chunk_id"])
         member = next(
             item
             for item in record["manifest"]["publication"]["members"]
