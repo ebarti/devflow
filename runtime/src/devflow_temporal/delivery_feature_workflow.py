@@ -320,6 +320,7 @@ async def _revision_checkpoint(controller, spec, active, builds):
 async def _revise(controller, spec, active, builds, diagnostic=None):
     context = None
     adopting = False
+    rejected = None
     try:
         await _revision_checkpoint(controller, spec, active, builds)
         if controller.cancel_requested:
@@ -407,6 +408,14 @@ async def _revise(controller, spec, active, builds, diagnostic=None):
         adopted = await controller._activity("delivery_feature_revision_adopt", {
             "spec": spec, "context": context, "proposed_plan": plan, "review": reviewed,
         })
+        if (adopted.get("state") == "rejected"
+                and getattr(controller, "feature_revision_v1", False)):
+            # The activity closed the attempt itself after proving nothing reached
+            # GitHub, so its custody is released and nothing remote is uncertain.
+            adopting = False
+            rejected = adopted["plan_revision"]
+            raise RuntimeError("planning correction rejected: "
+                               + str(adopted.get("reason", ""))[:600])
         if adopted.get("state") != "adopted":
             raise RuntimeError("planning correction adoption is not confirmed")
         revised = adopted["spec"]
@@ -421,7 +430,11 @@ async def _revise(controller, spec, active, builds, diagnostic=None):
                                   "Resuming affected original workers under the recorded revision")
         return revised
     except Exception as exc:
-        if context and not adopting:
+        if rejected is not None:
+            controller.state["checks"]["plan_revision"] = rejected
+            if rejected.get("budget"):
+                controller.state["checks"]["repair_budget"] = rejected["budget"]
+        elif context and not adopting:
             try:
                 rejected = await controller._activity("delivery_feature_revision_reject", {
                     "spec": spec, "context": context,

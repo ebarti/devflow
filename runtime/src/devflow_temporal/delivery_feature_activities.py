@@ -779,13 +779,13 @@ async def delivery_feature_revision_review(request):
 @activity.defn(name="delivery_feature_revision_adopt")
 async def delivery_feature_revision_adopt(request):
     from .delivery_execution_config import load_execution_config
-    from .delivery_feature_revisions import adopt_revision
+    from .delivery_feature_revisions import settle_adoption
     from .delivery_store import DeliveryStore
 
     config = await asyncio.to_thread(load_execution_config, request["spec"])
     store = DeliveryStore(config)
     return await asyncio.to_thread(
-        adopt_revision, store, request["spec"], request["context"]["revision_id"],
+        settle_adoption, store, request["spec"], request["context"]["revision_id"],
         request["proposed_plan"], request["review"],
     )
 

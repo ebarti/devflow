@@ -159,6 +159,7 @@ class DeliveryWorkflow:
         self.controller_only_resource_closure = False
         self.original_execution = True
         self.controller_failure_boundary = False
+        self.feature_revision_v1 = False
         self.controller_spec = None
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
@@ -1041,6 +1042,14 @@ class DeliveryWorkflow:
     async def run(
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        # Marker for this change set's feature-revision commands only, evaluated
+        # before any command. A patch marker is replay-safe for exactly the change
+        # it shipped with, so a later command change defines its own marker next to
+        # this one. Executions recorded without it replay with False and keep their
+        # recorded behaviour; direct protocol calls outside a workflow have no
+        # history: False.
+        self.feature_revision_v1 = (workflow.patched("delivery-feature-revision-wedges-v1")
+                                    if workflow.in_workflow() else False)
         if (spec.get("workflow_failure_boundary_version") != 1
                 or not workflow.patched("delivery-controller-failure-boundary-v1")):
             return await self._run_protocol(spec, recovery)

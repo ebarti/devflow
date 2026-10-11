@@ -948,14 +948,21 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
             pending = shared._pending_revision(db, token["issue_id"])
         if pending and pending["revision_id"] != revision_id:
             raise OwnershipConflict("feature has a different proposal attempt in custody")
+        current = _values(spec, shared)
         begun = [
             value
-            for key, value in _values(spec, shared).items()
+            for key, value in current.items()
             if key.startswith(PREFIX + "begin:")
-            and not _terminal(_values(spec, shared), value["revision_id"])
+            and not _terminal(current, value["revision_id"])
         ]
-        if any(value["revision_id"] != revision_id for value in begun):
-            raise OwnershipConflict("feature has an active plan investigation")
+        for stale in begun:
+            if stale["revision_id"] == revision_id:
+                continue
+            if stale["owner"]["generation"] >= token["generation"]:
+                raise OwnershipConflict("feature has an active plan investigation")
+            # The earlier coordinator stopped mid-attempt. GitHub still shows the plan
+            # it began from (asserted above), so its attempt ends here, debit kept.
+            _close_stopped_investigation(shared, token, stale, current)
         if reconsideration:
             _recheck_reconsideration(
                 store, spec, {"revision_id": revision_id, "owner": token, **reconsideration},
@@ -1913,9 +1920,15 @@ def reject_revision(store, spec, revision_id, reason):
         ).fetchone()
     if pending:
         raise OwnershipConflict("revision cannot release custody with unsettled external effects")
-    proposal = values.get(PREFIX + "proposal:" + revision_id, {})
-    receipt = {
-        "revision_id": revision_id,
+    receipt = _rejection_receipt(shared, context, values, reason)
+    shared.revision_checkpoint(context["owner"], PREFIX + "rejected:" + revision_id, receipt)
+    return receipt
+
+
+def _rejection_receipt(shared, context, values, reason):
+    proposal = values.get(PREFIX + "proposal:" + context["revision_id"], {})
+    return {
+        "revision_id": context["revision_id"],
         "phase": "rejected",
         "reason": reason,
         "old_identity": context["old_identity"],
@@ -1925,7 +1938,18 @@ def reject_revision(store, spec, revision_id, reason):
         **({"reconsideration_context_key": context["reconsideration"]["context_key"]}
            if context.get("reconsideration") else {}),
     }
-    shared.revision_checkpoint(context["owner"], PREFIX + "rejected:" + revision_id, receipt)
+
+
+def _close_stopped_investigation(shared, token, context, values):
+    """End a stopped generation's unfinished attempt; its product cycle stays spent."""
+    reason = (
+        "plan revision attempt stopped with generation "
+        + str(context["owner"]["generation"])
+        + " before adoption; closed by generation "
+        + str(token["generation"])
+    )
+    receipt = {**_rejection_receipt(shared, context, values, reason), "closed_by": token}
+    shared.revision_checkpoint(token, PREFIX + "rejected:" + context["revision_id"], receipt)
     return receipt
 
 
@@ -2052,24 +2076,13 @@ def _review_authorized(store, spec, context, proposal, review):
             raise ValueError("revision approval is not an authenticated exact proposal decision")
 
 
-def adopt_revision(store, spec, revision_id, proposed_plan, review, gh=None):
-    """Publish exact remote revision first, then append its local adoption receipt."""
-    from .delivery_github_contract import GitHubDelivery
-
+def _adoption_subject(store, spec, revision_id, proposed_plan, review):
+    """Authenticate the sealed proposal and its review before anything reaches GitHub."""
     context, values, terminal = _context(spec, revision_id)
     if terminal:
         if terminal["phase"] != "adopted" or digest(proposed_plan) != digest(terminal["plan"]):
             raise OwnershipConflict("revision attempt already ended with a different result")
-        revised = effective_spec(store, spec)
-        _adoption_event(store, revised, terminal)
-        return {
-            "state": "adopted",
-            "spec": revised,
-            "plan_identity": terminal["identity"],
-            "affected_chunks": terminal["affected_chunks"],
-            "checkpoints": revision_checkpoints(revised, _values(revised)),
-            "budget": _registry(spec).budget(context["owner"]["issue_id"]),
-        }
+        return context, None, terminal
     proposal = values.get(PREFIX + "proposal:" + revision_id)
     if not proposal or proposal["proposal_digest"] != digest(proposed_plan):
         raise OwnershipConflict("adoption differs from its sealed correction proposal")
@@ -2082,7 +2095,108 @@ def adopt_revision(store, spec, revision_id, proposed_plan, review, gh=None):
         _settled_revision(db, shared, token, revision_id)
     if adopted_plan_identity(spec, shared) != context["old_identity"]:
         raise OwnershipConflict("plan adoption is stale")
+    return context, proposal, None
+
+
+def _replayed_adoption(store, spec, context, terminal):
+    revised = effective_spec(store, spec)
+    _adoption_event(store, revised, terminal)
+    return {
+        "state": "adopted",
+        "spec": revised,
+        "plan_identity": terminal["identity"],
+        "affected_chunks": terminal["affected_chunks"],
+        "checkpoints": revision_checkpoints(revised, _values(revised)),
+        "budget": _registry(spec).budget(context["owner"]["issue_id"]),
+    }
+
+
+def adopt_revision(store, spec, revision_id, proposed_plan, review, gh=None):
+    """Publish exact remote revision first, then append its local adoption receipt."""
+    from .delivery_github_contract import GitHubDelivery
+
+    context, proposal, terminal = _adoption_subject(
+        store, spec, revision_id, proposed_plan, review
+    )
+    if terminal:
+        return _replayed_adoption(store, spec, context, terminal)
+    return _publish_adoption(store, spec, context, proposal, gh or GitHubDelivery())
+
+
+def settle_adoption(store, spec, revision_id, proposed_plan, review, gh=None):
+    """Adopt, or close the attempt the way GitHub's record already proves.
+
+    A refusal before publication releases custody with a rejection receipt. A failure
+    during publication is reconciled against the remote record: the expected identity
+    means the adoption completes, the original identity with nothing pending means a
+    rejection, and anything else stays uncertain for the original generation.
+    """
+    from .delivery_github_contract import GitHubDelivery
+
     gh = gh or GitHubDelivery()
+    try:
+        context, proposal, terminal = _adoption_subject(
+            store, spec, revision_id, proposed_plan, review
+        )
+    except ValueError as refusal:
+        return _refused_adoption(store, spec, revision_id, refusal)
+    if terminal:
+        return _replayed_adoption(store, spec, context, terminal)
+    try:
+        return _publish_adoption(store, spec, context, proposal, gh)
+    except Exception as failure:
+        return _reconcile_adoption(store, spec, context, proposal, review, gh, failure)
+
+
+def _refused_adoption(store, spec, revision_id, refusal):
+    reason = (str(refusal) or type(refusal).__name__)[:4000]
+    try:
+        receipt = reject_revision(store, spec, revision_id, reason)
+    except Exception as unreleased:
+        raise refusal from unreleased
+    if receipt.get("phase") != "rejected":
+        raise refusal
+    return {
+        "state": "rejected",
+        "plan_revision": receipt,
+        "budget": receipt["budget"],
+        "reason": reason,
+    }
+
+
+def _reconcile_adoption(store, spec, context, proposal, review, gh, failure):
+    """Settle an interrupted publication by what GitHub records, never by assumption."""
+    issue = spec["feature_delivery"]["snapshot"]["issue"]
+    original = context["old_identity"]
+    try:
+        record = gh.load_record(
+            issue, {key: original[key] for key in ("comment_id", "comment_node_id")}
+        )
+    except Exception as unread:
+        raise failure from unread
+    manifest = record["manifest"]
+    observed = {
+        "plan_revision": manifest.get("plan_revision", 1),
+        "plan_digest": digest(manifest["plan"]),
+    }
+    expected = {
+        "plan_revision": original["plan_revision"] + 1,
+        "plan_digest": proposal["proposal_digest"],
+    }
+    if observed == expected:
+        # The remote revision committed; its idempotent readback finishes the adoption.
+        return adopt_revision(
+            store, spec, context["revision_id"], proposal["plan"], review, gh=gh
+        )
+    if observed == {key: original[key] for key in observed}:
+        return _refused_adoption(store, spec, context["revision_id"], failure)
+    raise failure
+
+
+def _publish_adoption(store, spec, context, proposal, gh):
+    shared = _registry(spec)
+    token = context["owner"]
+    revision_id = context["revision_id"]
     issue = spec["feature_delivery"]["snapshot"]["issue"]
     # The publisher owns the effect lock and journal; never hold a second flock.
     record = gh.publish_plan_revision(
