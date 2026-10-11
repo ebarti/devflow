@@ -23,6 +23,30 @@ executions keep their previous cleanup timers, and expired history cannot be
 restored by increasing retention. This provides a bounded recovery window, not
 indefinite archival. See [Temporal's retention behavior](https://docs.temporal.io/encyclopedia/temporal-service/temporal-server).
 
+Recovery does not depend on that window. Every closed execution a run started is
+sealed into the service state: the exact original history is stored compressed and
+content-addressed under `state_root/closures/` (private files) and indexed in the
+tracking database. The API's maintenance loop seals closures while Temporal still
+retains them, and every recovery read seals the closure it authenticates. When
+Temporal no longer returns a closed execution, recovery rebuilds the identical
+closure (workflow and run IDs, close time, memo digests and result) from the sealed
+history. Sealing never writes to Temporal and never replaces an existing sealed
+history with a different one.
+
+A closure that expired before it was sealed is refused with an explicit message.
+If an authentic exported history exists, import it once:
+
+```sh
+devflow-delivery --config "$CONFIG" import-closure --id RUN_ID \
+  --workflow-id WORKFLOW_ID --history exported-history.json
+```
+
+The import accepts only a complete, contiguous `DevflowDeliveryWorkflow` history
+that closed COMPLETED or FAILED, whose workflow ID is the run's bound execution,
+whose memo binds the run's request and recovery digests, whose inputs name the run
+and its recovery, and whose terminal result agrees with the run's projected outcome.
+It refuses while Temporal still retains the execution.
+
 The runtime under `runtime/` is a single-host, local development service. It accepts a raw goal with an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. A read-only intake role investigates repository evidence, asks only blocking questions, and records a scoped plan before autonomous implementation. The managed path then owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. The default endpoint is a **published, unmerged PR**. A fresh native run can instead explicitly authorize `merged`. That endpoint keeps all original checks, independent roles and required CI, then confirms owned cleanup before requesting a head-pinned squash merge. It independently verifies the actual merged commit/tree and closes only the admitted issue before reconciling Done and releasing the claim. A divergent base, uncertain effect or failed gate blocks completion; a lost response is reconciled through the original intent without blindly repeating the mutation. Existing unmerged histories retain their endpoint. Release, deployment and personal production data remain separate authority.
 
 The older `devflow-temporal` CLI remains a disposable role-ordering demonstration. It does not publish a PR or reconcile an issue. Use the managed `devflow-delivery` service for an end-to-end delivery.

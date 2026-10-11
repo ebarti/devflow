@@ -217,6 +217,13 @@ class DeliveryService:
                 # Only an authenticated completed result can repair its read model.
                 pass
             try:
+                await self.seal_closures_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Sealing only preserves retained histories; recovery still reads them.
+                pass
+            try:
                 from .delivery_automatic_retry import retry_once
 
                 if self._retry_task is None or self._retry_task.done():
@@ -237,6 +244,12 @@ class DeliveryService:
 
         client = await self.healthy_client()
         await reconcile_closed_native(self.store, client)
+
+    async def seal_closures_once(self) -> None:
+        from .delivery_closures import seal_closed_executions
+
+        client = await self.healthy_client()
+        await seal_closed_executions(self.store, client)
 
     async def reconcile_completed_projections_once(self) -> None:
         from .delivery_closed_projection import reconcile_completed_projections

@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Any
 
 from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.service import RPCError
 
+from . import delivery_closures as closures
 from .candidate import candidate_for
 from .contracts import canonical_json, digest
 from .delivery_codec import DELIVERY_DATA_CONVERTER
@@ -174,6 +176,8 @@ class DeliveryStore:
                     updated_at TEXT NOT NULL
                 )"""
             )
+            for statement in closures.SCHEMA:
+                db.execute(statement)
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -704,9 +708,21 @@ class DeliveryStore:
     def _completed_temporal_result(
         self, run_id: str, *, workflow_id: str | None = None
     ) -> dict[str, Any]:
-        """Read a closed workflow from Temporal, never from caller-authored JSON."""
+        """Read a closed workflow from Temporal or its sealed copy, never caller JSON.
+
+        A retained closure is sealed on first read, so recovery keeps working after
+        Temporal's namespace retention deletes the history; an expired closure that
+        was never sealed must be imported from its authentic exported history.
+        """
         if not self.owns_execution(self.effective_spec(run_id)):
             raise ValueError("continuation service transport ownership differs from frozen run")
+
+        def coordinator_failure(closed: dict[str, Any]) -> None:
+            spec = self.effective_spec(run_id)
+            if spec.get("feature_delivery") and not spec.get("feature_worker"):
+                from .delivery_feature_closure import FailedFeatureCoordinator
+
+                raise FailedFeatureCoordinator(closed)
 
         async def read() -> dict[str, Any]:
             client = await Client.connect(
@@ -715,24 +731,61 @@ class DeliveryStore:
                 data_converter=DELIVERY_DATA_CONVERTER,
             )
             handle = client.get_workflow_handle(workflow_id or "delivery-" + run_id)
-            description = await handle.describe()
-            if description.status == WorkflowExecutionStatus.FAILED and description.close_time:
-                spec = self.effective_spec(run_id)
-                if spec.get("feature_delivery") and not spec.get("feature_worker"):
-                    from .delivery_feature_closure import FailedFeatureCoordinator
+            missing: RPCError | None = None
+            try:
+                description = await handle.describe()
+            except RPCError as exc:
+                if not closures.not_found(exc):
+                    raise
+                missing = exc
+            if missing is not None:
+                sealed = await closures.sealed_closure(self, handle.id)
+                if sealed is None:
+                    raise closures.ClosureUnavailable(handle.id) from missing
+                closed = {
+                    "workflow_id": sealed["workflow_id"],
+                    "execution_run_id": sealed["execution_run_id"],
+                    "closed_at": sealed["closed_at"],
+                    "request_digest": (sealed["request_digest"]
+                                       if sealed["request_digest"] is not None else "unknown"),
+                    "recovery_digest": sealed["recovery_digest"],
+                }
+                if sealed["status"] == "FAILED":
+                    coordinator_failure(closed)
+                if sealed["status"] != "COMPLETED":
+                    raise ValueError("continuation predecessor Temporal workflow is not closed")
+                return {**closed, "result": sealed["result"]}
 
-                    raise FailedFeatureCoordinator({
-                        "workflow_id": description.id, "execution_run_id": description.run_id,
-                        "closed_at": description.close_time.isoformat(),
-                        "request_digest": await description.memo_value("request_digest", "unknown"),
-                        "recovery_digest": await description.memo_value("recovery_digest", None),
-                    })
+            async def preserve() -> None:
+                # Sealing is preservation, not authority: a slow or failed copy never
+                # fails the live read, while a conflicting sealed history still does.
+                if not description.close_time or description.status not in (
+                        closures.CLOSED_STATUSES):
+                    return
+                try:
+                    await asyncio.wait_for(closures.seal_from_temporal(
+                        self, client, description, run_id=run_id,
+                    ), timeout=10)
+                except closures.SealConflict:
+                    raise
+                except Exception as exc:
+                    logger.warning("Run %s: closure %s was not sealed (%s: %s)",
+                                   run_id, description.id, type(exc).__name__, exc)
+
+            if description.status == WorkflowExecutionStatus.FAILED and description.close_time:
+                await preserve()
+                coordinator_failure({
+                    "workflow_id": description.id, "execution_run_id": description.run_id,
+                    "closed_at": description.close_time.isoformat(),
+                    "request_digest": await description.memo_value("request_digest", "unknown"),
+                    "recovery_digest": await description.memo_value("recovery_digest", None),
+                })
             if (
                 description.status != WorkflowExecutionStatus.COMPLETED
                 or not description.close_time
             ):
                 raise ValueError("continuation predecessor Temporal workflow is not closed")
-            return {
+            closed = {
                 "workflow_id": description.id,
                 "execution_run_id": description.run_id,
                 "closed_at": description.close_time.isoformat(),
@@ -742,6 +795,8 @@ class DeliveryStore:
                     description.id, run_id=description.run_id
                 ).result(),
             }
+            await preserve()
+            return closed
 
         try:
             # submit() is shared by synchronous CLI and the async API route.
@@ -752,9 +807,12 @@ class DeliveryStore:
         except Exception as exc:
             from .delivery_feature_closure import FailedFeatureCoordinator
 
-            if isinstance(exc, FailedFeatureCoordinator):
+            if isinstance(exc, (FailedFeatureCoordinator, closures.ClosureUnavailable)):
                 raise
-            raise ValueError("continuation predecessor Temporal closure is unproven") from exc
+            raise ValueError(
+                "continuation predecessor Temporal closure is unproven "
+                f"({type(exc).__name__}: {str(exc)[:300]})"
+            ) from exc
 
     def recover_publication(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
         """Queue one same-run continuation after a pushed PR outlived readback.

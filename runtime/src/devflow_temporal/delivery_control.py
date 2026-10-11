@@ -47,6 +47,28 @@ def _config(path: str) -> DeliveryConfig:
     return config
 
 
+def _import_closure(
+    config: DeliveryConfig, run_id: str, workflow_id: str, history: Path,
+) -> dict:
+    """Seal an authentic exported history for a closure Temporal no longer retains."""
+    from .delivery_closures import import_archived_closure
+
+    store = DeliveryStore(config)
+
+    async def run() -> dict:
+        client = await Client.connect(
+            config.temporal_address,
+            namespace=config.raw.get("temporal_namespace", "default"),
+            data_converter=DELIVERY_DATA_CONVERTER,
+        )
+        return await import_archived_closure(
+            store, client, run_id=run_id, workflow_id=workflow_id,
+            history_path=history.expanduser().resolve(strict=True),
+        )
+
+    return asyncio.run(run())
+
+
 def _manifest(config: DeliveryConfig) -> Path:
     return config.state_root / "service-processes.json"
 
@@ -561,6 +583,7 @@ _COMMANDS = (
     "revise-feature-plan",
     "retry-prelaunch",
     "amend-scope",
+    "import-closure",
 )
 
 
@@ -579,6 +602,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=50, help="run page size (1-100)")
     parser.add_argument("--cursor", help="next_cursor from a previous run page")
     parser.add_argument("--archived", action="store_true", help="list archived runs")
+    parser.add_argument("--workflow-id", help="workflow ID of an archived closure")
+    parser.add_argument("--history", type=Path, help="exported Temporal history JSON file")
     args = parser.parse_args()
     try:
         _run(args, parser)
@@ -610,6 +635,12 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     if args.command == "token":
         print((config.state_root / "service-token").read_text(encoding="utf-8").strip())
+        return
+    if args.command == "import-closure":
+        if not (args.id and args.workflow_id and args.history):
+            parser.error("import-closure requires --id, --workflow-id and --history")
+        print(json.dumps(_import_closure(config, args.id, args.workflow_id, args.history),
+                         indent=2, sort_keys=True))
         return
     if args.command in {
         "submit",
