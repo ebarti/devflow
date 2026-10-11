@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_delivery_feature_revisions import _stop_revision_fixture, passing, proposed
@@ -11,9 +14,11 @@ from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 from test_delivery_store import service as service
 
+from devflow_temporal import delivery_feature_execution as execution
 from devflow_temporal import delivery_feature_revisions as revisions
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_execution_registry import OwnershipConflict
+from devflow_temporal.delivery_execution_registry import ExecutionRegistry, OwnershipConflict
+from devflow_temporal.delivery_store import DeliveryStore
 
 PREFIX = revisions.PREFIX
 
@@ -178,33 +183,224 @@ def test_foreign_remote_revision_keeps_the_attempt_uncertain(feature):
     assert PREFIX + "rejected:" + context["revision_id"] not in shared.checkpoints(issue_id)
 
 
-def test_later_generation_closes_a_stopped_investigation_and_keeps_its_debit(
+def _stopped_feature(store, spec, shared, monkeypatch):
+    frozen = _stop_revision_fixture(store, spec, shared)
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_feature_closure.closed_coordinator",
+        lambda *_a: {"result": {"cleanup": "confirmed"}, "workflow_id": "closed"},
+    )
+    return frozen
+
+
+def _revise(store, spec, revision, command_id="revise-1"):
+    return revisions.revise_feature_plan(store, spec["run_id"], {
+        "command_id": command_id,
+        "expected_revision": revision,
+        "reason": "Investigate the misplaced gate.",
+    })
+
+
+def test_new_revision_command_closes_the_stopped_attempt_and_keeps_its_debit(
     feature, monkeypatch,
 ):
     store, spec, shared, record, diagnostic = feature
     owner = spec["feature_delivery"]["owner"]
     stale = revisions.begin_revision(store, spec, diagnostic)
     assert stale["budget"]["used"] == 1
-    frozen = _stop_revision_fixture(store, spec, shared)
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_feature_closure.closed_coordinator",
-        lambda *_a: {"result": {"cleanup": "confirmed"}, "workflow_id": "closed"},
-    )
-    request = {
-        "command_id": "revise-1",
-        "expected_revision": frozen["revision"],
-        "reason": "Investigate the misplaced gate.",
-    }
-    receipt = revisions.revise_feature_plan(store, spec["run_id"], request)
+    frozen = _stopped_feature(store, spec, shared, monkeypatch)
+    receipt = _revise(store, spec, frozen["revision"])
+    closed = shared.checkpoints(owner["issue_id"])[PREFIX + "rejected:" + stale["revision_id"]]
+    assert closed["closed_by"] == owner
+    assert closed["repair_key"] == stale["repair_key"]
+    assert closed["old_identity"] == stale["old_identity"]
+    assert closed["reason"] == "superseded by revision command revise-1"
     successor = store.effective_spec(receipt["run_id"])
     DeliveryBroker(store, successor).prepare()
     context = revisions.begin_revision(store, successor)
     assert context["revision_id"] == receipt["revision_id"] != stale["revision_id"]
-    assert context["budget"]["used"] == 2
-    closed = shared.checkpoints(owner["issue_id"])[PREFIX + "rejected:" + stale["revision_id"]]
-    assert closed["closed_by"] == successor["feature_delivery"]["owner"]
-    assert closed["repair_key"] == stale["repair_key"]
-    assert closed["old_identity"] == stale["old_identity"]
-    assert "stopped with generation 1" in closed["reason"]
+    assert context["budget"]["used"] == 2 == shared.budget(owner["issue_id"])["used"]
     assert revisions.begin_revision(store, successor) == context
-    assert shared.budget(owner["issue_id"])["used"] == 2
+
+
+def test_later_generation_closes_a_legacy_stranded_investigation_at_its_next_begin(
+    feature, monkeypatch,
+):
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    frozen = _stopped_feature(store, spec, shared, monkeypatch)
+    receipt = _revise(store, spec, frozen["revision"])
+    successor = store.effective_spec(receipt["run_id"])
+    DeliveryBroker(store, successor).prepare()
+    current = successor["feature_delivery"]["owner"]
+    # A begin: left open by the stopped generation before this fix existed.
+    stale = {
+        "revision_id": "revision-stranded", "phase": "investigating", "owner": owner,
+        "old_identity": revisions.adopted_plan_identity(successor, shared),
+        "repair_key": "plan-revision:revision-stranded", "diagnostic": diagnostic,
+    }
+    shared.revision_checkpoint(current, PREFIX + "begin:revision-stranded", stale)
+    context = revisions.begin_revision(store, successor)
+    closed = shared.checkpoints(owner["issue_id"])[PREFIX + "rejected:revision-stranded"]
+    assert closed["closed_by"] == current and closed["repair_key"] == stale["repair_key"]
+    assert "stopped with generation 1 before adoption; closed by generation 2" in closed["reason"]
+    assert context["revision_id"] == receipt["revision_id"]
+    assert revisions.begin_revision(store, successor) == context
+
+
+def test_continuation_closes_a_stopped_investigation_once_and_then_proceeds(
+    feature, monkeypatch,
+):
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    stale = revisions.begin_revision(store, spec, diagnostic)
+    frozen = _stopped_feature(store, spec, shared, monkeypatch)
+    request = {"command_id": "continue-1", "expected_revision": frozen["revision"]}
+    with pytest.raises(OwnershipConflict, match="now closed; replay continue-feature continue-1"):
+        execution.continue_feature(store, spec["run_id"], request)
+    closed = shared.checkpoints(owner["issue_id"])[PREFIX + "rejected:" + stale["revision_id"]]
+    assert closed["closed_by"] == owner and closed["repair_key"] == stale["repair_key"]
+    assert "closed by continuation command continue-1" in closed["reason"]
+    assert shared.budget(owner["issue_id"])["used"] == 1
+    response = execution.continue_feature(store, spec["run_id"], request)
+    successor = store.effective_spec(response["run_id"])
+    assert successor["feature_delivery"]["owner"]["generation"] == 2
+    assert revisions.revision_request(successor) is None
+    assert execution.continue_feature(store, spec["run_id"], request) == response
+
+
+def test_unstarted_reservation_names_itself_and_can_be_abandoned_explicitly(
+    feature, monkeypatch,
+):
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    frozen = _stopped_feature(store, spec, shared, monkeypatch)
+    receipt = _revise(store, spec, frozen["revision"])
+    successor = store.effective_spec(receipt["run_id"])
+    stopped = _stop_revision_fixture(store, successor, shared)
+    reserved = successor["feature_delivery"]["owner"]
+    with pytest.raises(OwnershipConflict, match="reserved by command revise-1 for run "
+                       + receipt["run_id"] + "; continue that run, or continue-feature"):
+        shared.claim(spec["feature_delivery"]["snapshot"], "run-feature-other",
+                     str(store.config.tracking_db), predecessor=reserved)
+    with pytest.raises(OwnershipConflict, match="another revision command in custody: revision "
+                       + receipt["revision_id"] + " reserved by command revise-1"):
+        _revise(store, successor, stopped["revision"], command_id="revise-2")
+    with pytest.raises(ValueError, match="requires a command ID"):
+        execution.continue_feature(store, successor["run_id"], {
+            "command_id": "abandon-0", "expected_revision": stopped["revision"],
+            "abandon_revision": ""})
+    with pytest.raises(OwnershipConflict, match="no reserved revision revision-unknown; its "
+                       "recorded reservation is " + receipt["revision_id"]):
+        execution.continue_feature(store, successor["run_id"], {
+            "command_id": "abandon-1", "expected_revision": stopped["revision"],
+            "abandon_revision": "revision-unknown"})
+    request = {"command_id": "abandon-2", "expected_revision": stopped["revision"],
+               "abandon_revision": receipt["revision_id"]}
+    response = execution.continue_feature(store, successor["run_id"], request)
+    closed = shared.checkpoints(owner["issue_id"])[PREFIX + "rejected:" + receipt["revision_id"]]
+    assert closed["closed_by"] == reserved and closed["repair_key"] is None
+    assert closed["reason"] == "abandoned by continuation command abandon-2"
+    assert shared.budget(owner["issue_id"])["used"] == 0
+    third = store.effective_spec(response["run_id"])
+    assert third["feature_delivery"]["owner"]["generation"] == 3
+    assert revisions.revision_request(third) is None
+    assert execution.continue_feature(store, successor["run_id"], request) == response
+    plain = _stop_revision_fixture(store, third, shared)
+    with pytest.raises(OwnershipConflict, match="no reserved revision to abandon"):
+        execution.continue_feature(store, third["run_id"], {
+            "command_id": "abandon-3", "expected_revision": plain["revision"],
+            "abandon_revision": receipt["revision_id"]})
+
+
+def test_remote_pull_request_lookup_failure_is_retryable_not_a_refusal(monkeypatch):
+    from devflow_temporal import delivery_store
+
+    def run(argv, **_kwargs):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="gh: offline")
+
+    monkeypatch.setattr(delivery_store.subprocess, "run", run)
+    returncode, stdout = 1, ""
+    with pytest.raises(RuntimeError, match="lookup failed \\(1\\): gh: offline"):
+        DeliveryStore._ensure_no_remote_pr("example/fixture", "feat/df-1")
+    returncode, stdout = 0, "[]"
+    assert DeliveryStore._ensure_no_remote_pr("example/fixture", "feat/df-1") is None
+    stdout = '[{"number": 7}]'
+    with pytest.raises(ValueError, match="has a remote pull request"):
+        DeliveryStore._ensure_no_remote_pr("example/fixture", "feat/df-1")
+
+
+def test_worker_paid_planning_defect_is_charged_once_across_a_continuation(
+    feature, monkeypatch,
+):
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_feature_execution import (
+        register_worker,
+        worker_key,
+        worker_spec,
+    )
+    from devflow_temporal.delivery_github_contract import ordered_chunks
+
+    store, spec, shared, record, diagnostic = feature
+    owner = spec["feature_delivery"]["owner"]
+    plan = record["manifest"]["plan"]
+    chunk = next(item for item in ordered_chunks(plan) if item["id"] == "model")
+    stream = next(s for s in plan["workstreams"] if any(c["id"] == "model" for c in s["chunks"]))
+    child = worker_spec(spec, chunk, record["manifest"]["workstream_issues"][stream["id"]],
+                        kind="build", base_sha=spec["base_sha"], base_branch="main")
+    register_worker(store, spec, child)
+    broker = DeliveryBroker(store, child)
+    broker.prepare()
+    candidate = broker.candidate()
+    evidence = Path(child["state_dir"]) / "planning-evidence.json"
+    evidence.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    evidence.write_text('{"finding":"the model layer depends on an unbuilt endpoint"}')
+    defect = {**diagnostic, "candidate_id": candidate["id"], "evidence": [
+        {"path": str(evidence), "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}]}
+    shared.repair(owner, child["run_id"] + ":1", "Product repair at worker iteration 1")
+    binding = revisions.planning_defect_repair_binding(child, child["run_id"], 1, defect)
+    assert binding["repair_key"] == child["run_id"] + ":1"
+    store.project(child["run_id"], phase="blocked", execution_state="blocked",
+                  event_type="blocked", message="Planning defect diagnosed", candidate=candidate,
+                  checks={"planning_defect_repair": binding}, iteration=1, protocol_revision=2,
+                  outcome="blocked", cleanup="confirmed")
+    shared.checkpoint(owner, "assignment:model:build", {
+        "chunk_id": "model", "kind": "build", "run_id": child["run_id"],
+        "store_path": str(store.config.tracking_db)})
+    shared.finish_worker(owner, worker_key(child["run_id"], owner), {"cleanup": "confirmed"})
+    assert shared.budget(owner["issue_id"])["used"] == 1
+
+    frozen = _stopped_feature(store, spec, shared, monkeypatch)
+    response = execution.continue_feature(store, spec["run_id"], {
+        "command_id": "continue-1", "expected_revision": frozen["revision"]})
+    successor = store.effective_spec(response["run_id"])
+    DeliveryBroker(store, successor).prepare()
+    context = revisions.begin_revision(store, successor, defect)
+    assert context["repair_key"] == child["run_id"] + ":1"
+    assert context["paid_worker_run_id"] == child["run_id"]
+    assert context["budget"]["used"] == 1 == shared.budget(owner["issue_id"])["used"]
+    assert revisions.begin_revision(store, successor, defect) == context
+    # The binding names the debit and the defect, never the observing generation.
+    assert binding == {
+        "revision_id": "revision-" + digest({"worker_run_id": child["run_id"],
+                                             "repair_key": child["run_id"] + ":1",
+                                             "diagnostic": defect})[:24],
+        "repair_key": child["run_id"] + ":1",
+        "diagnostic_sha256": digest(defect),
+    }
+
+
+def test_repair_alias_written_by_an_earlier_generation_keeps_its_single_debit(tmp_path):
+    shared = ExecutionRegistry(tmp_path / "control" / "execution.sqlite3")
+    issue = {"id": "I_feature", "repository_id": "R_fixture", "url": "https://example.invalid/1"}
+    first = shared.claim({"issue": issue}, "run-1", str(tmp_path / "local.sqlite3"))
+    shared.repair(first, "plan-revision:revision-1", "Planning correction revision-1")
+    shared.revision_checkpoint(first, "plan-revision:repair-alias:worker:5", {
+        "revision_id": "revision-1", "repair_key": "plan-revision:revision-1",
+        "generation": 1, "reason": "Product repair at worker iteration 5"})
+    shared.stop(first, "stopped", {})
+    second = shared.claim({"issue": issue}, "run-2", str(tmp_path / "local.sqlite3"),
+                          predecessor=first)
+    assert shared.repair(second, "worker:5", "Product repair at worker iteration 5")["used"] == 1
+    with pytest.raises(OwnershipConflict, match="alias lost its exact cumulative debit"):
+        shared.repair(second, "worker:5", "Product repair at worker iteration 6")
+    assert shared.budget(issue["id"])["used"] == 1

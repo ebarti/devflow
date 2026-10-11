@@ -362,13 +362,19 @@ def test_public_retry_recovers_partial_claim_and_same_revision_then_charges_seve
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
 def test_three_preparation_links_are_bounded_and_each_ancestor_remains_authenticated(
-    pending_preparation,
+    pending_preparation, monkeypatch,
 ):
     p = pending_preparation
     store, shared, spec = (p[k] for k in ("store", "shared", "spec"))
     issue_id = spec["feature_delivery"]["owner"]["issue_id"]
     original = deepcopy(spec["feature_plan_revision_request"])
+    observed = []
+    live = revisions._preparation_observation
+    monkeypatch.setattr(revisions, "_preparation_observation",
+                        lambda *a, **k: observed.append(a[1]["run_id"]) or live(*a, **k))
     commands = []
+    observations = []
+    removed = p["removed"]
     for number in range(1, 4):
         row = _row(store, spec["run_id"])
         request = {"command_id": "bounded-preparation-" + str(number),
@@ -376,11 +382,15 @@ def test_three_preparation_links_are_bounded_and_each_ancestor_remains_authentic
         response = execution.continue_feature(store, spec["run_id"], request)
         commands.append((spec["run_id"], request, response))
         spec = prepare_authority(store, store.effective_spec(response["run_id"]))
+        observations.append(len(observed))
+        observed.clear()
         assert spec["feature_plan_revision_request"] == original
         assert shared.budget(issue_id)["used"] == 6
         if number < 3:
-            _, closed, _ = _failed_preparation(store, spec, shared)
+            _, closed, removed = _failed_preparation(store, spec, shared)
             p["closures"][spec["run_id"]] = closed
+    # Sealed ancestors are never re-observed live, so intake does not grow with depth.
+    assert observations[1] == observations[2]
     assert all(execution.continue_feature(store, run, request) == response
                for run, request, response in commands)
     chain = [(key, value) for key, value in shared.checkpoints(issue_id).items()
@@ -404,19 +414,33 @@ def test_three_preparation_links_are_bounded_and_each_ancestor_remains_authentic
         db.execute("UPDATE execution_checkpoints SET content_json=?,content_digest=? "
                    "WHERE issue_id=? AND checkpoint_key=?",
                    (canonical_json(first), digest(first), issue_id, key))
-    # Recreating an early finalized resource is also a refusal at the eventual
-    # planning consumer, independently of checkpoint digest authentication.
-    p["removed"].mkdir(parents=True)
+    # Recreating the immediate predecessor's finalized resource is also a refusal
+    # at the eventual planning consumer, independently of digest authentication.
+    removed.mkdir(parents=True)
     with pytest.raises(ValueError, match="recreated"):
         revisions.begin_revision(store, spec)
-    p["removed"].rmdir()
+    removed.rmdir()
     row, closed, _ = _failed_preparation(store, spec, shared)
     p["closures"][spec["run_id"]] = closed
-    boundary = _boundary_snapshot(store, shared, issue_id)
-    with pytest.raises(OwnershipConflict, match="limit reached"):
-        execution.continue_feature(store, spec["run_id"], {
-            "command_id": "fourth-preparation-refused", "expected_revision": row["revision"]})
-    assert _boundary_snapshot(store, shared, issue_id) == boundary
+    runs, recorded, current, _, _ = _boundary_snapshot(store, shared, issue_id)
+    fourth = {"command_id": "fourth-preparation-refused", "expected_revision": row["revision"]}
+    with pytest.raises(OwnershipConflict, match="limit reached; revision "
+                       + original["revision_id"] + " is closed; replay continue-feature "
+                       + fourth["command_id"]):
+        execution.continue_feature(store, spec["run_id"], fourth)
+    # The exhausted reservation ends in a terminal receipt; nothing else moved.
+    terminal = shared.checkpoints(issue_id)[revisions.PREFIX + "rejected:"
+                                            + original["revision_id"]]
+    assert terminal["closed_by"] == spec["feature_delivery"]["owner"]
+    assert terminal["repair_key"] is None
+    assert "limit reached after 3 continuations" in terminal["reason"]
+    assert _boundary_snapshot(store, shared, issue_id)[:3] == (runs, recorded, current)
+    assert shared.budget(issue_id)["used"] == 6
+    # The exact replay continues the feature without the closed reservation.
+    response = execution.continue_feature(store, spec["run_id"], fourth)
+    plain = store.effective_spec(response["run_id"])
+    assert "feature_plan_revision_request" not in plain
+    assert revisions.revision_request(plain) is None
     assert shared.budget(issue_id)["used"] == 6
 
 

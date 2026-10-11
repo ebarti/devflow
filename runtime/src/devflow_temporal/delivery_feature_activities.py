@@ -525,8 +525,11 @@ async def delivery_feature_worker_result(request):
             child_id,
             workflow_id=store.active_workflow_id(child_id),
         )
-    except ValueError as exc:
-        if str(exc) != "continuation predecessor Temporal closure is unproven":
+    except (ValueError, RuntimeError) as exc:
+        # A not-yet-closed child and an unreachable Temporal are both polled again.
+        if (str(exc) != "continuation predecessor Temporal closure is unproven"
+                and not str(exc).startswith(
+                    "continuation predecessor Temporal closure is unavailable")):
             raise
         return {"closed": False, "reason": "temporal_closure_pending"}
     return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"])}

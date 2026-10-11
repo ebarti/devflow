@@ -369,6 +369,17 @@ def revise_feature_plan(store, run_id, request):
         record = current_record(spec)
         live_members(spec, record)
         identity = _assert_identity(record, adopted_plan_identity(spec, shared))
+        with shared.connect() as db:
+            reserved = shared._pending_revision(db, token["issue_id"])
+        unstarted = bool(
+            reserved and reserved["revision_id"] != revision_id
+            and PREFIX + "begin:" + reserved["revision_id"] not in _values(spec, shared)
+        )
+        if not unstarted:
+            # GitHub still shows the adopted plan, so this stopped owner's unfinished
+            # attempts can end here before a new correction is reserved.
+            _close_stopped_attempts(shared, token, _values(spec, shared),
+                                    "superseded by revision command " + request["command_id"])
         budget = shared.budget(token["issue_id"])
         if budget["used"] >= budget["maximum"]:
             raise OwnershipConflict("feature product repair limit exhausted")
@@ -418,6 +429,14 @@ def revise_feature_plan(store, run_id, request):
                         raise OwnershipConflict(
                             "review context already reserved by " + item["revision_id"]
                         )
+            if unstarted:
+                raise OwnershipConflict(
+                    "feature has another revision command in custody: revision "
+                    + reserved["revision_id"] + " reserved by command "
+                    + str((reserved.get("request") or {}).get("command_id")) + " for run "
+                    + str(reserved.get("successor_id"))
+                    + "; continue that run, or continue-feature with abandon_revision"
+                )
             shared.revision_checkpoint(
                 token, PREFIX + "request:" + revision_id, admission, stopped=True
             )
@@ -497,15 +516,19 @@ def _preparation_retry(store, spec, public, values):
                                  "AND generation=?", (receipt["predecessor"]["issue_id"],
                                                       receipt["predecessor"]["generation"]))
             effected = effects.fetchone()
-        closed, observed = _preparation_observation(store, previous, row, custodian=spec)
         if (attempted or effected or digest(previous) != receipt["predecessor_spec_sha256"]
-                or digest(dict(row)) != receipt["stopped_row_sha256"]
-                or digest(closed["result"]) != receipt["closed_state_sha256"]
+                or digest(dict(row)) != receipt["stopped_row_sha256"]):
+            raise OwnershipConflict("preparation predecessor custody changed after continuation")
+        if name != key:
+            # An ancestor's closure and remote observation were sealed into this
+            # digest-chained receipt when its own continuation was admitted.
+            continue
+        closed, observed = _preparation_observation(store, previous, row, custodian=spec)
+        if (digest(closed["result"]) != receipt["closed_state_sha256"]
                 or {k: v for k, v in closed.items() if k != "result"} != receipt["closure"]
                 or observed != receipt["observation"]):
             raise OwnershipConflict("preparation predecessor custody changed after continuation")
-        if name == key:
-            break
+        break
     return saved
 
 
@@ -615,6 +638,27 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     if not public:
         return None
     revision_id = public["revision_id"]
+    replay = "; replay continue-feature " + request["command_id"] + " to continue without it"
+    if request.get("abandon_revision") is not None:
+        if request["abandon_revision"] != revision_id:
+            raise OwnershipConflict(
+                "feature has no reserved revision " + request["abandon_revision"]
+                + "; its recorded reservation is " + revision_id
+            )
+        _abandon_reservation(store, spec, shared, public, values,
+                             "abandoned by continuation command " + request["command_id"])
+        return None
+    if _started_reservation(shared, token, revision_id, values):
+        # The stopped generation began this attempt; no continuation can carry it.
+        _abandon_reservation(
+            store, spec, shared, public, values,
+            "plan revision attempt stopped with generation " + str(token["generation"])
+            + " before adoption; closed by continuation command " + request["command_id"],
+        )
+        raise OwnershipConflict(
+            "reserved revision " + revision_id
+            + " attempt stopped before adoption and is now closed" + replay
+        )
     chain = _preparation_lineage(shared, public, values)
     initial = {**public["owner"], "run_id": public["successor_id"],
                "generation": public["owner"]["generation"] + 1}
@@ -622,7 +666,10 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     saved = values.get(key)
     if saved and (saved["command"] != request or saved["successor_id"] != successor_id
                   or saved["predecessor"] != token):
-        raise OwnershipConflict("reserved revision already has a preparation continuation")
+        raise OwnershipConflict(
+            "reserved revision already has a preparation continuation; replay continue-feature "
+            + saved["command"]["command_id"] + " for run " + saved["successor_id"]
+        )
     # This is a new admission, so match submit's live-versus-loaded config guard
     # before appending a transport receipt. Existing execution stays frozen.
     if digest(DeliveryConfig.load(store.config.path).raw) != digest(store.config.raw):
@@ -631,7 +678,15 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     sequence = next((index + 2 for index, (_, receipt) in enumerate(chain)
                      if receipt == incoming), 1)
     if sequence > PREPARATION_CONTINUATION_LIMIT:
-        raise OwnershipConflict("reserved revision preparation continuation limit reached")
+        _abandon_reservation(
+            store, spec, shared, public, values,
+            "preparation continuation limit reached after " + str(len(chain))
+            + " continuations; closed by continuation command " + request["command_id"],
+        )
+        raise OwnershipConflict(
+            "reserved revision preparation continuation limit reached; revision "
+            + revision_id + " is closed" + replay
+        )
     with shared.connect() as db:
         pending = shared._pending_revision(db, token["issue_id"])
         paid = db.execute("SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
@@ -861,7 +916,7 @@ def planning_defect_repair_binding(spec, worker_run_id, iteration, diagnostic):
     key = f"{worker_run_id}:{iteration}"
     with shared.connect() as db:
         charged = db.execute(
-            "SELECT generation,reason FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+            "SELECT reason FROM execution_repairs WHERE issue_id=? AND repair_key=?",
             (issue_id, key),
         ).fetchone()
         assigned = db.execute(
@@ -870,24 +925,34 @@ def planning_defect_repair_binding(spec, worker_run_id, iteration, diagnostic):
         ).fetchone()
     if (
         not charged
-        or charged["generation"] != token["generation"]
         or charged["reason"] != "Product repair at worker iteration " + str(iteration)
         or not assigned
         or assigned["state"] not in {"reserved", "running"}
         or assigned["generation"] != token["generation"]
     ):
         return None
-    revision_id = (
-        "revision-"
-        + digest(
-            {
-                "owner": token,
-                "diagnostic": diagnostic,
-                "command_id": None,
-            }
-        )[:24]
-    )
-    return {"revision_id": revision_id, "repair_key": key}
+    # The worker's debit and its diagnosed defect identify this charge. No
+    # coordinator generation does, so a continuation before replanning reuses it.
+    return {
+        "revision_id": "revision-" + digest(
+            {"worker_run_id": worker_run_id, "repair_key": key, "diagnostic": diagnostic}
+        )[:24],
+        "repair_key": key,
+        "diagnostic_sha256": digest(diagnostic),
+    }
+
+
+def _legacy_binding_ids(shared, issue_id, diagnostic):
+    """Attempt identities earlier bindings derived from each coordinator generation."""
+    with shared.connect() as db:
+        tokens = [dict(row) for row in db.execute(
+            "SELECT issue_id,run_id,store_path,generation FROM execution_snapshots "
+            "WHERE issue_id=?", (issue_id,),
+        )]
+    return {
+        "revision-" + digest({"owner": owner, "diagnostic": diagnostic, "command_id": None})[:24]
+        for owner in tokens
+    }
 
 
 def begin_revision(store, spec, diagnostic=None, command_id=None):
@@ -945,9 +1010,6 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
         with shared.connect() as db:
             shared.require_settlement(db, token)
             shared._settled(db, token["issue_id"])
-            pending = shared._pending_revision(db, token["issue_id"])
-        if pending and pending["revision_id"] != revision_id:
-            raise OwnershipConflict("feature has a different proposal attempt in custody")
         current = _values(spec, shared)
         begun = [
             value
@@ -963,6 +1025,15 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
             # The earlier coordinator stopped mid-attempt. GitHub still shows the plan
             # it began from (asserted above), so its attempt ends here, debit kept.
             _close_stopped_investigation(shared, token, stale, current)
+        with shared.connect() as db:
+            pending = shared._pending_revision(db, token["issue_id"])
+        if pending and pending["revision_id"] != revision_id:
+            raise OwnershipConflict(
+                "feature has a different proposal attempt in custody: revision "
+                + pending["revision_id"] + " reserved by command "
+                + str((pending.get("request") or {}).get("command_id")) + " for run "
+                + str(pending.get("successor_id"))
+            )
         if reconsideration:
             _recheck_reconsideration(
                 store, spec, {"revision_id": revision_id, "owner": token, **reconsideration},
@@ -996,9 +1067,19 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
                 ):
                     pending_charge = json.loads(worker["checks_json"] or "{}").get(
                         "planning_defect_repair"
-                    )
+                    ) or {}
                     expected_key = f"{assignment['run_id']}:{worker['iteration']}"
-                    if pending_charge == {"revision_id": revision_id, "repair_key": expected_key}:
+                    # The binding names the debit and the diagnosed defect; earlier
+                    # bindings named the attempt by the generation that observed it.
+                    bound = pending_charge.get("repair_key") == expected_key and (
+                        pending_charge.get("diagnostic_sha256") == digest(diagnostic)
+                        or (
+                            "diagnostic_sha256" not in pending_charge
+                            and pending_charge.get("revision_id")
+                            in _legacy_binding_ids(shared, token["issue_id"], diagnostic)
+                        )
+                    )
+                    if bound:
                         with shared.connect() as db:
                             paid = db.execute(
                                 "SELECT repair_key FROM execution_repairs "
@@ -1933,11 +2014,25 @@ def _rejection_receipt(shared, context, values, reason):
         "reason": reason,
         "old_identity": context["old_identity"],
         "proposal_digest": proposal.get("proposal_digest"),
-        "repair_key": context["repair_key"],
+        "repair_key": context.get("repair_key"),
         "budget": shared.budget(context["owner"]["issue_id"]),
-        **({"reconsideration_context_key": context["reconsideration"]["context_key"]}
+        **({"reconsideration_context_key": context["reconsideration"].get("context_key")}
            if context.get("reconsideration") else {}),
     }
+
+
+def _close_attempt(shared, token, context, values, reason, *, stopped=False):
+    """Append the terminal rejection of an attempt no coordinator can finish; debit kept."""
+    revision_id = context["revision_id"]
+    with shared.connect() as db:
+        paid = db.execute(
+            "SELECT repair_key FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+            (token["issue_id"], "plan-revision:" + revision_id),
+        ).fetchone()
+    subject = {**context, "repair_key": context.get("repair_key") or (paid[0] if paid else None)}
+    receipt = {**_rejection_receipt(shared, subject, values, reason), "closed_by": token}
+    shared.revision_checkpoint(token, PREFIX + "rejected:" + revision_id, receipt, stopped=stopped)
+    return receipt
 
 
 def _close_stopped_investigation(shared, token, context, values):
@@ -1948,9 +2043,46 @@ def _close_stopped_investigation(shared, token, context, values):
         + " before adoption; closed by generation "
         + str(token["generation"])
     )
-    receipt = {**_rejection_receipt(shared, context, values, reason), "closed_by": token}
-    shared.revision_checkpoint(token, PREFIX + "rejected:" + context["revision_id"], receipt)
-    return receipt
+    return _close_attempt(shared, token, context, values, reason)
+
+
+def _started_reservation(shared, token, revision_id, values):
+    with shared.connect() as db:
+        paid = db.execute(
+            "SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+            (token["issue_id"], "plan-revision:" + revision_id),
+        ).fetchone()
+    return bool(paid or any(
+        name in values for name in (PREFIX + "begin:" + revision_id,
+                                    PREFIX + "proposal:" + revision_id)))
+
+
+def _abandon_reservation(store, spec, shared, public, values, reason):
+    """Close a stopped generation's reservation or attempt that no command can carry."""
+    from .delivery_feature_publication import current_record, live_members
+
+    token = spec["feature_delivery"]["owner"]
+    revision_id = public["revision_id"]
+    if _terminal(values, revision_id):
+        return None
+    begun = values.get(PREFIX + "begin:" + revision_id)
+    if begun:
+        # Only GitHub proves the stopped attempt never adopted its correction.
+        record = current_record(spec)
+        live_members(spec, record)
+        _assert_identity(record, adopted_plan_identity(spec, shared))
+    return _close_attempt(shared, token, begun or public, values, reason, stopped=True)
+
+
+def _close_stopped_attempts(shared, token, values, reason):
+    """Close every unfinished attempt before the stopped owner reserves anew.
+
+    Only the stopped claim owner reaches here, so each open attempt belongs to a
+    stopped generation and GitHub (asserted by the caller) never adopted it.
+    """
+    for key, context in list(values.items()):
+        if key.startswith(PREFIX + "begin:") and not _terminal(values, context["revision_id"]):
+            _close_attempt(shared, token, context, values, reason, stopped=True)
 
 
 def _review_authorized(store, spec, context, proposal, review):

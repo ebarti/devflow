@@ -284,7 +284,13 @@ class ExecutionRegistry:
                 pending = self._pending_revision(db, issue["id"])
                 if (pending and pending.get("successor_id") != run_id
                         and not self._preparation_successor(db, pending, predecessor, run_id)):
-                    raise OwnershipConflict("feature has a recorded plan revision in custody")
+                    raise OwnershipConflict(
+                        "feature has a recorded plan revision in custody: revision "
+                        + str(pending.get("revision_id")) + " reserved by command "
+                        + str((pending.get("request") or {}).get("command_id"))
+                        + " for run " + str(pending.get("successor_id"))
+                        + "; continue that run, or continue-feature with abandon_revision"
+                    )
                 generation = old["generation"] + 1
             elif predecessor is not None:
                 raise OwnershipConflict("continuation predecessor is missing")
@@ -769,10 +775,13 @@ class ExecutionRegistry:
                     "SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
                     (token["issue_id"], bound["repair_key"]),
                 ).fetchone()
+                # The alias is proven by its bound debit and reason; the generation
+                # that wrote it is provenance, so a continuation keeps the same charge.
                 if (
                     not debit
                     or bound.get("reason") != reason
-                    or bound.get("generation") != token["generation"]
+                    or type(bound.get("generation")) is not int
+                    or bound["generation"] > token["generation"]
                 ):
                     raise OwnershipConflict("revision repair alias lost its exact cumulative debit")
                 return {
