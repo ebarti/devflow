@@ -200,7 +200,7 @@ async def delivery_feature_begin_integration(request):
 
 def resume_worker(store, parent, child, row):
     from . import delivery_gate_retry as gates
-    from .delivery_stopped_resume import admit, pending_repair, snapshot
+    from .delivery_stopped_resume import admit, interrupted_iteration, pending_repair, snapshot
 
     shared = registry(parent)
     token = parent["feature_delivery"]["owner"]
@@ -222,20 +222,32 @@ def resume_worker(store, parent, child, row):
         budget = shared.budget(token["issue_id"])
         remaining = min(budget["maximum"] - budget["used"],
                         child["policy"]["max_repairs"] - state["iteration"])
-        if remaining < 0 or (remaining == 0 and not pending_repair(sealed)):
-            raise OwnershipConflict("feature product repair limit exhausted")
-        if remaining == 0:
-            # A zero-additional admission may only finish a cycle already charged
-            # to this worker, including after another workstream used the balance.
-            with shared.connect() as db:
-                shared.require(db, token)
-                paid = db.execute(
-                    "SELECT reason FROM execution_repairs WHERE issue_id=? AND repair_key=?",
-                    (token["issue_id"], f"{child['run_id']}:{state['iteration']}"),
-                ).fetchone()
-            if not paid or paid["reason"] != (
-                    "Product repair at worker iteration " + str(state["iteration"])):
-                raise OwnershipConflict("pending repair has no matching product allowance debit")
+        if remaining <= 0:
+            pending = pending_repair(sealed)
+            exhausted = OwnershipConflict(
+                f"feature product repair limit exhausted: {budget['used']} of "
+                f"{budget['maximum']} feature repair cycles used, worker iteration "
+                f"{state['iteration']} of {child['policy']['max_repairs']}; continuing "
+                "this worker needs a new repair cycle")
+            if not pending and not interrupted_iteration(sealed):
+                raise exhausted
+            remaining = 0
+            if state["iteration"]:
+                # A zero-additional admission may only finish or re-run a cycle already
+                # charged to this worker, including after another workstream used the
+                # balance. Iteration zero is never charged.
+                with shared.connect() as db:
+                    shared.require(db, token)
+                    paid = db.execute(
+                        "SELECT reason FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+                        (token["issue_id"], f"{child['run_id']}:{state['iteration']}"),
+                    ).fetchone()
+                if not paid or paid["reason"] != (
+                        "Product repair at worker iteration " + str(state["iteration"])):
+                    if not pending:
+                        raise exhausted
+                    raise OwnershipConflict(
+                        "pending repair has no matching product allowance debit")
         kind = "stopped_delivery_resume"
     candidate = sealed["candidate"]
     command = {

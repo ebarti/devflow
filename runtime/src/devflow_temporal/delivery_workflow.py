@@ -1678,8 +1678,11 @@ class DeliveryWorkflow:
         if spec.get("feature_worker", {}).get("kind") == "build":
             from .delivery_feature_workflow import run_build
 
+            # Older build histories never carry this flag; an interrupted build
+            # re-runs its sealed iteration without a new repair cycle.
             return await run_build(self, spec,
-                                   start_iteration=recovery['state']['iteration'] + 1,
+                                   start_iteration=recovery.get(
+                                       'resume_iteration', recovery['state']['iteration'] + 1),
                                    session=recovery['session_id'],
                                    maximum_iteration=recovery['maximum_iteration'])
         # This admission flag is absent from older histories. A proven unstarted
