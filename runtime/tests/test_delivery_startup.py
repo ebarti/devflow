@@ -608,14 +608,18 @@ def test_restart_reloads_the_api_member_without_signalling_the_worker(config, mo
                 pass
 
 
+@pytest.mark.parametrize("api_state", ["ready", "dead"])
 @pytest.mark.parametrize("registered", ["other-transport", "unrecorded"])
 def test_restart_after_a_transport_change_takes_the_ordinary_stop_and_start(
-    config, monkeypatch, registered,
+    config, monkeypatch, registered, api_state,
 ):
     manifest = _manifest(config)
     calls = []
-    monkeypatch.setattr(control, "_owned", lambda _process: True)
-    monkeypatch.setattr(control, "_ready", _api_info)
+    # A dead API beside a worker on another transport is not relaunched alone either.
+    monkeypatch.setattr(control, "_owned",
+                        lambda process: api_state == "ready" or process.get("pid") != 3)
+    monkeypatch.setattr(control, "_ready",
+                        _api_info if api_state == "ready" else lambda *_args: None)
     if registered == "other-transport":
         # The worker registered the transport it polls; the edited file names another.
         _register_worker(config, control.transport_digest(config))
@@ -690,3 +694,93 @@ def test_start_reports_seeded_snapshots(config, monkeypatch):
     monkeypatch.setattr(control, "_free", lambda *_args: True)
     monkeypatch.setattr(control.shutil, "which", lambda _name: sys.executable)
     assert control.ensure_service_running(config)["configuration_snapshots"] == report
+
+
+@pytest.mark.parametrize("transport", ["equal", "edited"])
+def test_ensure_relaunches_a_dead_api_only_onto_the_worker_transport(config, monkeypatch,
+                                                                     transport):
+    _manifest(config)
+    # The worker registered the transport it polls; the API then died.
+    _register_worker(config, control.transport_digest(config))
+    alive, signals, launched = _fake_stack(config, monkeypatch)
+    alive.discard(3)
+    monkeypatch.setattr(control, "_stop", lambda *_args: pytest.fail("stopped the worker"))
+    monkeypatch.setattr(control, "_start",
+                        lambda *_args, **_kwargs: pytest.fail("restarted the stack"))
+    if transport == "edited":
+        # A pending transport edit: relaunching the API on it would split the stack.
+        with pytest.raises(ValueError, match="restart` to move the whole service"):
+            control.ensure_service_running(_edited(config, queue="moved-queue"))
+        assert launched == [] and signals == []
+        assert set(control._read_manifest(config)["processes"]) == {"temporal", "worker", "api"}
+    else:
+        result = control.ensure_service_running(config)
+        assert [(name, url) for name, _argv, url in launched] == [("api", config.dashboard_url)]
+        assert result["processes"]["api"]["pid"] == 4 and signals == []
+
+
+@pytest.mark.parametrize("problem", ["hostname", "path", "occupied"])
+def test_restart_keeps_the_running_api_when_the_edited_one_cannot_start(config, monkeypatch,
+                                                                         problem):
+    manifest = _manifest(config)
+    manifest["processes"]["api"]["dashboard_url"] = config.dashboard_url
+    control._write_manifest(config, manifest["processes"])
+    _register_worker(config, control.transport_digest(config))
+    real_free = control._free
+    _alive, signals, launched = _fake_stack(config, monkeypatch)
+    monkeypatch.setattr(control, "_free", real_free)
+    monkeypatch.setattr(control, "service_stop", lambda *_args: pytest.fail("stopped the stack"))
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        if problem == "occupied":
+            sock.listen()
+        address = {"hostname": f"http://localhost:{port}", "path": f"http://127.0.0.1:{port}/",
+                   "occupied": f"http://127.0.0.1:{port}"}[problem]
+        expected = {"hostname": "loopback HTTP address", "path": "only a loopback host and port",
+                    "occupied": f"port {port} is already occupied"}[problem]
+        # The file loads, but the API could not start on it: refuse before stopping anything.
+        with pytest.raises(ValueError, match=expected):
+            control.service_restart(_edited(config, dashboard_url=address))
+    assert signals == [] and launched == []
+    assert control._read_manifest(config)["processes"] == manifest["processes"]
+
+
+def test_restart_after_an_api_that_exits_brings_back_only_the_api(config, monkeypatch):
+    _manifest(config)
+    _register_worker(config, control.transport_digest(config))
+    alive, signals, launched = _fake_stack(config, monkeypatch)
+    attempts = []
+
+    def launch(_config, name, _argv):
+        # The first relaunched API exits at once; the next one stays up.
+        pid = 4 + len(attempts)
+        attempts.append((name, pid))
+        if len(attempts) > 1:
+            alive.add(pid)
+        return {"pid": pid, "identity": "fixture"}
+
+    monkeypatch.setattr(control, "_launch", launch)
+    monkeypatch.setattr(control, "service_stop", lambda *_args: pytest.fail("stopped the stack"))
+    monkeypatch.setattr(control, "_stop", lambda *_args: pytest.fail("stopped the worker"))
+    with pytest.raises(ValueError, match="api exited during service startup"):
+        control.service_restart(config)
+    assert signals == [(3, signal.SIGTERM)]
+    # The obvious second restart relaunches only the API; the worker is never signalled.
+    result = control.service_restart(config)
+    assert result["restarted"] == ["api"]
+    assert result["processes"]["api"]["pid"] == 5
+    assert signals == [(3, signal.SIGTERM)] and launched == []
+
+
+def test_service_lock_mode_drift_heals_but_a_symlink_never_does(config):
+    control._private_directory(config.state_root)
+    lock = config.state_root / "service.lock"
+    lock.touch()
+    lock.chmod(0o644)
+    assert control.service_stop(config) == {}
+    assert lock.stat().st_mode & 0o777 == 0o600
+    lock.unlink()
+    lock.symlink_to(config.path)
+    with pytest.raises(ValueError, match="owned private file"):
+        control.service_stop(config)
