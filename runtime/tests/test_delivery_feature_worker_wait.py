@@ -38,10 +38,18 @@ def test_wait_reference_authenticates_frozen_input_and_existing_worker(service, 
         activities._worker_wait_spec({**reference, 'spec_digest': 'another-input'})
     with pytest.raises(OwnershipConflict, match='own this worker'):
         activities._worker_wait_spec({**reference, 'child_id': 'another-worker'})
+    original = deepcopy(spec)
+    snapshot = store.config.state_root / 'configuration-snapshots' / (
+        spec['config_digest'] + '.json')
+    frozen_bytes = snapshot.read_bytes()
     raw = deepcopy(store.config.raw)
     raw['max_repairs'] = 9
     store.config.path.write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match='configuration changed'):
+    assert activities._worker_wait_spec(reference) == original
+    assert snapshot.read_bytes() == frozen_bytes
+    assert store.submitted_spec(spec['run_id'])['policy'] == original['policy']
+    snapshot.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match='configuration.*changed'):
         activities._worker_wait_spec(reference)
 
 

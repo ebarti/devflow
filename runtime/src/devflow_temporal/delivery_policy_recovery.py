@@ -10,6 +10,7 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_config import DeliveryConfig
+from .delivery_execution_config import load_execution_config
 from .delivery_native_process import listeners, process_table
 from .delivery_preparation import _lock, _private_bytes, _write
 from .delivery_resources import RunResources, read_private, write_private
@@ -97,9 +98,7 @@ def amended_config(original, path, expected_hash):
     content = _private_bytes(path, root)
     if hashlib.sha256(content).hexdigest() != expected_hash:
         raise ValueError('trusted configuration bytes changed')
-    old = DeliveryConfig.load(Path(original['config_path']))
-    if digest(old.raw) != original['config_digest']:
-        raise ValueError('original frozen configuration changed')
+    old = load_execution_config(original)
     config = DeliveryConfig.load(path)
     before, after = deepcopy(old.raw), deepcopy(config.raw)
     if before.pop('execution_mode', 'native-profile') != 'native-profile':

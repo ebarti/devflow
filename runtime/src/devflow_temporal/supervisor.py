@@ -49,9 +49,29 @@ class DeliverySupervisor:
         self.capacity = capacity
         self.job_locks: dict[str, asyncio.Lock] = {}
 
+    def _reconcile_capacity(self) -> None:
+        from .delivery_orphans import _complete_attempt
+
+        with self.store._connect() as db:
+            attempts = [dict(row) for row in db.execute(
+                "SELECT * FROM delivery_attempts WHERE state IN ('starting','running','unknown')"
+            )]
+        for attempt in attempts:
+            try:
+                spec = self.store.effective_spec(attempt["run_id"])
+                if (spec.get("provider") == "codex"
+                        and spec["policy"].get("execution_backend") == "native-macos"
+                        and self.store.owns_execution(spec)):
+                    _complete_attempt(self.store, spec, attempt)
+            except (OSError, ValueError, KeyError, RuntimeError):
+                # Missing evidence, a live owner or a changed reservation retains
+                # its slot; one unresolved row must not hide another dead owner.
+                continue
+
     def _enter_capacity(self, job_key: str, *, cancelled=None, stop_requested=None) -> str | None:
         if cancelled is not None and cancelled():
             raise ValueError("native role cancelled before capacity admission")
+        self._reconcile_capacity()
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if stop_requested is not None and stop_requested():
@@ -661,7 +681,8 @@ class DeliverySupervisor:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
-    def _complete_native(self, request, native_request, process, job_key, outcome):
+    def _complete_native(self, request, native_request, process, job_key, outcome,
+                         *, expected=None):
         from .delivery_resources import read_private, write_private
         from .delivery_role_evidence import seal
 
@@ -672,14 +693,25 @@ class DeliverySupervisor:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             with self.store._connect() as db:
                 row = db.execute(
-                    "SELECT state,result_json FROM delivery_attempts WHERE job_key=?", (job_key,),
+                    "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,),
                 ).fetchone()
+            if row is None:
+                raise NativeProcessUnknown("native completion reservation disappeared")
             if row["state"] == "finished":
                 return json.loads(row["result_json"])
+            if expected is not None and dict(row) != expected:
+                raise NativeProcessUnknown("native completion reservation changed")
+            original_attempt = dict(row)
             result_path = process.folder / "result.json"
             if outcome["cleanup"] == "unknown":
                 return self._mark_unknown(job_key, "native monitoring/provider outcome ambiguous")
-            if result_path.is_file():
+            interrupted = outcome.get("interrupted_monitor") is True
+            if interrupted:
+                result = {"status": "recovery_unknown",
+                          "summary": "native monitor lost; owned teardown independently confirmed",
+                          "findings": ["provider outcome unknown; attempt will not be repeated"],
+                          "session_id": None, "usage": None, "finish_reason": "interrupted_monitor"}
+            elif result_path.is_file():
                 result = read_private(result_path)
             else:
                 reason = (
@@ -697,8 +729,9 @@ class DeliverySupervisor:
                     "usage": None,
                     "finish_reason": reason,
                 }
-            self._admit_role_output(native_request, result)
-            if native_request.get("role_evidence_key"):
+            if not interrupted:
+                self._admit_role_output(native_request, result)
+            if not interrupted and native_request.get("role_evidence_key"):
                 try:
                     result.update(seal(native_request))
                 except (ValueError, OSError) as exc:
@@ -723,6 +756,17 @@ class DeliverySupervisor:
             write_private(process.journal, journal)
             with self.store._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
+                current = db.execute("SELECT * FROM delivery_attempts WHERE job_key=?",
+                                     (job_key,)).fetchone()
+                if current is None or dict(current) != original_attempt:
+                    raise NativeProcessUnknown("native completion reservation changed at commit")
+                if interrupted:
+                    run = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                                     (original_attempt["run_id"],)).fetchone()
+                    self.store._event(db, original_attempt["run_id"], run["revision"],
+                        "native_attempt_cleanup_reconciled",
+                        "Lost native monitor cleanup confirmed without a provider verdict",
+                        {"original_attempts": [original_attempt], "native_observations": [outcome]})
                 db.execute(
                     """UPDATE delivery_attempts SET state='finished',result_json=?,
                        session_id=?,finished_at=?,cleanup='confirmed',pid=?,process_identity=?
@@ -796,6 +840,12 @@ class DeliverySupervisor:
         }
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if expected is None:
+                row = db.execute(
+                    "SELECT state,result_json FROM delivery_attempts WHERE job_key=?", (job_key,),
+                ).fetchone()
+                if row is not None and row["state"] == "finished" and row["result_json"]:
+                    return json.loads(row["result_json"])
             if expected is not None:
                 row = db.execute(
                     "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,),
@@ -826,9 +876,13 @@ _SUPERVISORS: dict[tuple[str, str], DeliverySupervisor] = {}
 
 def get_supervisor(store: DeliveryStore) -> DeliverySupervisor:
     key = (str(store.config.tracking_db.resolve()), str(store.config.state_root.resolve()))
-    capacity = int(store.config.raw.get("capacity", 2))
+    from .delivery_execution_config import operational_config
+
+    capacity = int(operational_config(store.config).raw.get("capacity", 2))
     if key not in _SUPERVISORS:
         _SUPERVISORS[key] = DeliverySupervisor(store, capacity=capacity)
-    elif _SUPERVISORS[key].capacity != capacity:
-        raise ValueError("shared delivery capacity changed across service configurations")
+    else:
+        # A lower limit waits for occupied slots to finish; operational capacity
+        # changes never rewrite any admitted execution policy.
+        _SUPERVISORS[key].capacity = capacity
     return _SUPERVISORS[key]

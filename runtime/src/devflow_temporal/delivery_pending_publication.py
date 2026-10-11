@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
-from .delivery_config import DeliveryConfig
+from .delivery_execution_config import load_execution_config
 from .delivery_gate_retry import prepare_runtime
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
@@ -81,8 +81,7 @@ def snapshot(store, run_id):
             or not remote or remote.split()[0] != observed['head']
             or (pr is not None and pr['headRefOid'] != observed['head'])):
         raise ValueError('pending publication source, remote head or scope changed')
-    if digest(DeliveryConfig.load(Path(spec['config_path'])).raw) != spec['config_digest']:
-        raise ValueError('pending publication frozen configuration changed')
+    load_execution_config(spec)
     with store._connect() as db:
         binding = work_binding(store, spec, db)
     return {'row': row, 'closed': closed, 'spec': spec, 'previous': previous,

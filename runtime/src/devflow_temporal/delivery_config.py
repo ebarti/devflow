@@ -66,7 +66,11 @@ class DeliveryConfig:
 
     @classmethod
     def load(cls, path: Path) -> DeliveryConfig:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        return cls._from_raw(path, json.loads(path.read_text(encoding="utf-8")))
+
+    @classmethod
+    def _from_raw(cls, path: Path, value: dict[str, Any]) -> DeliveryConfig:
+        """Validate an already authenticated frozen configuration without reopening it."""
         if not isinstance(value, dict) or value.get("version") != 1:
             raise ValueError("unsupported service configuration")
         for key in ("tracking_db", "state_root", "helpers_dir", "codex_bin"):
@@ -562,6 +566,7 @@ class DeliveryConfig:
             "checkout": str(checkout),
             "policy": policy,
             "policy_digest": digest(policy),
+            "workflow_failure_boundary_version": 1,
             "config_digest": digest(self.raw),
             "config_path": str(self.path),
         }
@@ -594,9 +599,9 @@ def scope_amendment_config(
         or hashlib.sha256(path.read_bytes()).hexdigest() != config_sha256
     ):
         raise ValueError("scope amendment configuration is not private or changed")
-    original_config = DeliveryConfig.load(Path(original["config_path"]))
-    if digest(original_config.raw) != original["config_digest"]:
-        raise ValueError("original service configuration changed")
+    from .delivery_execution_config import load_execution_config
+
+    original_config = load_execution_config(original)
     amended = DeliveryConfig.load(path)
     repository_key = original["repository_key"]
     old_raw, new_raw = deepcopy(original_config.raw), deepcopy(amended.raw)
@@ -657,7 +662,7 @@ def scope_amended_spec(
     if "blocking_questions_version" not in original:
         effective.pop("blocking_questions_version")
     for marker in ("automatic_retry_version", "retry_budget_version", "baseline_checks_version",
-                   "merge_version"):
+                   "merge_version", "workflow_failure_boundary_version"):
         if marker in original:
             effective[marker] = original[marker]
         else:

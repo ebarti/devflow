@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import httpx
 import pytest
@@ -18,6 +19,7 @@ def test_repository_permissions_are_deduplicated_durable_and_do_not_change_runs(
     store.config.raw['repositories']['another-profile'] = copy.deepcopy(
         store.config.raw['repositories']['fixture'])
     store.config.raw['repositories']['another-profile']['github_repo'] = 'EXAMPLE/fixture'
+    store.config.path.write_text(json.dumps(store.config.raw))
     before = copy.deepcopy(store.config.raw)
     receipt = store.submit(request)
     original = store.submitted_spec('run-1')

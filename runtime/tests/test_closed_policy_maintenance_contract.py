@@ -81,8 +81,15 @@ class HistoricalPolicyMaintenanceContract(unittest.TestCase):
                     )
                     return SimpleNamespace(path=path, raw=json.loads(recorded[field]))
 
+                def execution_config(spec, original=original):
+                    # The original configuration transport stays memory-only,
+                    # just like the explicit amended-file transport above.
+                    self.assertEqual(spec, original)
+                    return load(Path(original["config_path"]))
+
                 namespace.update(
-                    _private_bytes=private_bytes, DeliveryConfig=SimpleNamespace(load=load)
+                    _private_bytes=private_bytes, DeliveryConfig=SimpleNamespace(load=load),
+                    load_execution_config=execution_config,
                 )
                 before = deepcopy((original, recovery, grant))
                 validator = namespace["effective_spec"]

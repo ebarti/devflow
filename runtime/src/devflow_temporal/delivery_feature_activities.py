@@ -45,13 +45,11 @@ def _feature_context(spec):
 
 def open_feature(spec):
     if spec.get("feature_plan_version") == 2 and not spec.get("feature_plan_revision"):
-        from .delivery_config import DeliveryConfig
+        from .delivery_execution_config import load_execution_config
         from .delivery_feature_revisions import authenticate_initial_plan_input
         from .delivery_store import DeliveryStore
 
-        config = DeliveryConfig.load(Path(spec["config_path"]))
-        if digest(config.raw) != spec["config_digest"]:
-            raise ValueError("service configuration changed before initial plan adoption")
+        config = load_execution_config(spec)
         spec = authenticate_initial_plan_input(DeliveryStore(config), spec)
     store, _, shared, token = _feature_context(spec)
     gh = GitHubDelivery()
@@ -780,13 +778,11 @@ async def delivery_feature_revision_review(request):
 
 @activity.defn(name="delivery_feature_revision_adopt")
 async def delivery_feature_revision_adopt(request):
-    from .delivery_config import DeliveryConfig
+    from .delivery_execution_config import load_execution_config
     from .delivery_feature_revisions import adopt_revision
     from .delivery_store import DeliveryStore
 
-    config = await asyncio.to_thread(DeliveryConfig.load, Path(request["spec"]["config_path"]))
-    if digest(config.raw) != request["spec"]["config_digest"]:
-        raise OwnershipConflict("revision adoption configuration changed")
+    config = await asyncio.to_thread(load_execution_config, request["spec"])
     store = DeliveryStore(config)
     return await asyncio.to_thread(
         adopt_revision, store, request["spec"], request["context"]["revision_id"],

@@ -640,7 +640,16 @@ async def test_physical_worker_death_releases_os_slot_before_orphan_cleanup(tmp_
             assert original["intent"]["run_id"] == owned["run_id"]
             assert original["intent"]["policy_digest"] == owned["policy_digest"]
             assert original.get("monitor") and original["monitor"]["pid"] != worker.pid
-            reconcile_process(journal)
+            assert reconcile_process(journal)["cleanup"] == "unknown"
+            # A live monitor retains its lifecycle locks. Reconciliation must
+            # refuse it; stop this fixture through authenticated cancellation.
+            launch = read_private(folder / "launch.json")
+            NativeProcess(
+                owned, folder, argv=launch["argv"],
+                cwd=Path(original["intent"]["cwd"]), environment=launch["environment"],
+                timeout=original["intent"]["timeout"],
+                ports=tuple(original["intent"]["ports"]), cancelled=lambda: True,
+            )._request_cancel()
 
             def monitor_completed():
                 current = read_private(journal)

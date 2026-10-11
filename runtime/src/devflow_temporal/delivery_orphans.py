@@ -53,16 +53,20 @@ def _complete_attempt(store, spec, row, on_observed=None):
             or intent['timeout'] > spec['policy']['roles'][request['role']].get(
                 'timeout_seconds', 7200)
             or intent['ports'] != [] or journal.get('ports') != []
-            or not journal.get('owned') or not journal.get('monitor')
-            or journal.get('phase') != 'finished'
-            or journal.get('monitoring_complete') is not True):
+            or not journal.get('owned') or not journal.get('monitor')):
         raise ValueError('original native monitor is incomplete or changed')
     observed = process_table()
     owned = {int(pid): identity for pid, identity in journal['owned'].items()}
     monitor = journal['monitor']
     owned[monitor['pid']] = monitor
-    if (any(observed.get(pid, {}).get('identity') == identity['identity']
-            and not observed[pid]['stat'].startswith('Z') for pid, identity in owned.items())
+    monitor_active = (observed.get(monitor['pid'], {}).get('identity') == monitor['identity']
+                      and not observed[monitor['pid']]['stat'].startswith('Z'))
+    if (monitor_active or (journal.get('phase') == 'finished'
+            and journal.get('cleanup_reconciliation') is None
+            and journal.get('monitoring_complete') is True
+            and any(observed.get(pid, {}).get('identity') == identity['identity']
+                    and not observed[pid]['stat'].startswith('Z')
+                    for pid, identity in owned.items()))
             or any(listeners(port) for port in journal.get('ports', []))):
         raise ValueError('original native processes or ports remain active')
     if row['state'] == 'finished':
@@ -76,12 +80,14 @@ def _complete_attempt(store, spec, row, on_observed=None):
     receipt = reconcile_process(journal_path)
     if receipt['cleanup'] != 'observed-native-confirmed':
         raise ValueError('original native cleanup remains unknown')
+    journal = read_private(journal_path)
     if journal['result'].get('cleanup') != 'observed-native-confirmed':
         raise ValueError('original provider cleanup remains ambiguous')
     if on_observed is not None:
         on_observed(receipt)
     supervisor._complete_native(request, request,
-        SimpleNamespace(folder=folder, journal=journal_path), row['job_key'], journal['result'])
+        SimpleNamespace(folder=folder, journal=journal_path), row['job_key'], journal['result'],
+        expected=row)
     return receipt
 
 
@@ -97,8 +103,6 @@ def _observe_registered_process(spec, path):
             or intent['argv'] != launch['argv']
             or intent['environment_sha256'] != digest(launch['environment'])
             or intent['ports'] != journal.get('ports')
-            or journal.get('phase') != 'finished'
-            or journal.get('monitoring_complete') is not True
             or not journal.get('owned') or not journal.get('monitor')):
         raise ValueError('registered native monitor is incomplete or changed')
     observed = process_table()

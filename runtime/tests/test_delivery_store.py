@@ -1171,9 +1171,12 @@ def test_repair_grant_rejects_changed_authority_before_queue(service, monkeypatc
             },
         )
     elif drift == "policy":
-        config = json.loads(store.config.path.read_text())
+        spec = store.effective_spec("run-1")
+        path = (store.config.state_root / "configuration-snapshots"
+                / (spec["config_digest"] + ".json"))
+        config = json.loads(path.read_text())
         config["max_repairs"] = 1
-        store.config.path.write_text(json.dumps(config))
+        path.write_text(json.dumps(config))
     else:
         state["cleanup"] = "unknown"
     with pytest.raises(ValueError):

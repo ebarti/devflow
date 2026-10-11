@@ -32,18 +32,14 @@ from devflow_temporal import delivery_feature_review_context as review_context
 from devflow_temporal import delivery_feature_revisions as revisions
 from devflow_temporal import delivery_policy_recovery as policy_recovery
 from devflow_temporal import delivery_stopped_resume as stopped_resume
+from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_execution_registry import OwnershipConflict
 from devflow_temporal.delivery_preparation import prepare_authority
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 
 
-@pytest.fixture
-def pending_preparation(findings_reconsideration, monkeypatch):
-    fixture, command, runtime, child, seal, observe, files = findings_reconsideration
-    store, original, shared, plan, diagnostic, _, prior, _, rejection, parent_row = fixture
-    admitted = revisions.revise_feature_plan(store, original["run_id"], command)
-    spec = prepare_authority(store, store.effective_spec(admitted["run_id"]))
+def _failed_preparation(store, spec, shared):
     broker = DeliveryBroker(store, spec)
     broker.prepare()
     candidate = broker.candidate()
@@ -116,12 +112,23 @@ def pending_preparation(findings_reconsideration, monkeypatch):
             "checks": checks,
         },
     }
+    return row, closed, removed
+
+
+@pytest.fixture
+def pending_preparation(findings_reconsideration, monkeypatch):
+    fixture, command, runtime, child, seal, observe, files = findings_reconsideration
+    store, original, shared, plan, diagnostic, _, prior, _, rejection, parent_row = fixture
+    admitted = revisions.revise_feature_plan(store, original["run_id"], command)
+    spec = prepare_authority(store, store.effective_spec(admitted["run_id"]))
+    row, closed, removed = _failed_preparation(store, spec, shared)
+    closures = {spec["run_id"]: closed}
     # Exact completed Temporal transport is an isolated fixture. The admitted
     # retained worker's full native progress/custody remains the existing fixture.
     monkeypatch.setattr(
         "devflow_temporal.delivery_feature_closure.closed_coordinator",
         lambda s, run: (
-            deepcopy(closed) if run == spec["run_id"] else _closed_revision_fixture(s, run)
+            deepcopy(closures[run]) if run in closures else _closed_revision_fixture(s, run)
         ),
     )
     monkeypatch.setattr(store, "_ensure_no_remote_pr", lambda *_a: None)
@@ -154,6 +161,7 @@ def pending_preparation(findings_reconsideration, monkeypatch):
         "observe": observe,
         "files": files,
         "closed": closed,
+        "closures": closures,
         "removed": removed,
     }
 
@@ -214,6 +222,37 @@ def test_public_retry_recovers_partial_claim_and_same_revision_then_charges_seve
             ).fetchone()[0]
             == 1
         )
+    # A second real preparation/checkout finishes before any role or debit. Its
+    # closed Temporal transport remains a fixture, with the same exact observer.
+    first_successor = successor
+    second_row, second_closed, _ = _failed_preparation(store, successor, shared)
+    p["closures"][successor_id] = second_closed
+    second_request = {"command_id": "continue-second-preparation",
+                      "expected_revision": second_row["revision"]}
+    first_receipt = deepcopy(shared.checkpoints(issue_id)[
+        revisions._preparation_retry_key(p["admitted"]["revision_id"])])
+    monkeypatch.setattr(execution, "admit", lost_local_insert)
+    with pytest.raises(ConnectionError, match="before local successor insert"):
+        execution.continue_feature(store, successor_id, second_request)
+    second_successor_id = shared.current(issue_id)["run_id"]
+    assert second_successor_id != successor_id
+    assert shared.budget(issue_id)["used"] == 6
+    monkeypatch.setattr(execution, "admit", real_admit)
+    second_response = execution.continue_feature(store, successor_id, second_request)
+    assert second_response == execution.continue_feature(store, successor_id, second_request)
+    assert response == execution.continue_feature(store, spec["run_id"], request)
+    assert second_response["run_id"] == second_successor_id
+    successor = prepare_authority(store, store.effective_spec(second_successor_id))
+    assert successor["feature_plan_revision_request"] == spec["feature_plan_revision_request"]
+    assert successor["plan_approval"] == first_successor["plan_approval"]
+    key = successor["feature_plan_revision_preparation_retry"]["checkpoint_key"]
+    values = shared.checkpoints(issue_id)
+    assert values[key]["version"] == 2 and values[key]["sequence"] == 2
+    assert values[key]["previous"] == first_successor["feature_plan_revision_preparation_retry"]
+    assert values[revisions._preparation_retry_key(p["admitted"]["revision_id"])] == first_receipt
+    with pytest.raises(OwnershipConflict):
+        execution.continue_feature(store, first_successor["run_id"], {
+            **second_request, "command_id": "branch-from-old-preparation"})
     broker = DeliveryBroker(store, successor)
     broker.prepare()
     context = revisions.begin_revision(store, successor)
@@ -313,11 +352,72 @@ def test_public_retry_recovers_partial_claim_and_same_revision_then_charges_seve
         shared.checkpoints(issue_id)
     )
     assert _row(store, spec["run_id"]) == p["row"]
+    assert _row(store, first_successor["run_id"]) == second_row
     assert _row(store, p["original"]["run_id"]) == p["parent_row"]
     assert store.submitted_spec(spec["run_id"]) == raw_spec
     values = shared.checkpoints(issue_id)
     assert all(values[key] == value for key, value in original_values.items())
     assert values[revisions.PREFIX + "rejected:" + p["prior"]["revision_id"]] == p["rejection"]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
+def test_three_preparation_links_are_bounded_and_each_ancestor_remains_authenticated(
+    pending_preparation,
+):
+    p = pending_preparation
+    store, shared, spec = (p[k] for k in ("store", "shared", "spec"))
+    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
+    original = deepcopy(spec["feature_plan_revision_request"])
+    commands = []
+    for number in range(1, 4):
+        row = _row(store, spec["run_id"])
+        request = {"command_id": "bounded-preparation-" + str(number),
+                   "expected_revision": row["revision"]}
+        response = execution.continue_feature(store, spec["run_id"], request)
+        commands.append((spec["run_id"], request, response))
+        spec = prepare_authority(store, store.effective_spec(response["run_id"]))
+        assert spec["feature_plan_revision_request"] == original
+        assert shared.budget(issue_id)["used"] == 6
+        if number < 3:
+            _, closed, _ = _failed_preparation(store, spec, shared)
+            p["closures"][spec["run_id"]] = closed
+    assert all(execution.continue_feature(store, run, request) == response
+               for run, request, response in commands)
+    chain = [(key, value) for key, value in shared.checkpoints(issue_id).items()
+             if key.startswith(revisions._preparation_retry_key(original["revision_id"]))]
+    assert len(chain) == 3 and chain[0][1]["version"] == 1
+    broker = DeliveryBroker(store, spec)
+    broker.prepare()
+    key, first = chain[0]
+    # Even recomputing a tampered ancestor's DB digest cannot alter its sealed
+    # successor reference. No owner, outbox, receipt or debit can be gained.
+    changed = {**first, "successor_id": "run-feature-unrelated"}
+    with shared.connect() as db:
+        db.execute("UPDATE execution_checkpoints SET content_json=?,content_digest=? "
+                   "WHERE issue_id=? AND checkpoint_key=?",
+                   (canonical_json(changed), digest(changed), issue_id, key))
+    boundary = _boundary_snapshot(store, shared, issue_id)
+    with pytest.raises(OwnershipConflict):
+        revisions.begin_revision(store, spec)
+    assert _boundary_snapshot(store, shared, issue_id) == boundary
+    with shared.connect() as db:
+        db.execute("UPDATE execution_checkpoints SET content_json=?,content_digest=? "
+                   "WHERE issue_id=? AND checkpoint_key=?",
+                   (canonical_json(first), digest(first), issue_id, key))
+    # Recreating an early finalized resource is also a refusal at the eventual
+    # planning consumer, independently of checkpoint digest authentication.
+    p["removed"].mkdir(parents=True)
+    with pytest.raises(ValueError, match="recreated"):
+        revisions.begin_revision(store, spec)
+    p["removed"].rmdir()
+    row, closed, _ = _failed_preparation(store, spec, shared)
+    p["closures"][spec["run_id"]] = closed
+    boundary = _boundary_snapshot(store, shared, issue_id)
+    with pytest.raises(OwnershipConflict, match="limit reached"):
+        execution.continue_feature(store, spec["run_id"], {
+            "command_id": "fourth-preparation-refused", "expected_revision": row["revision"]})
+    assert _boundary_snapshot(store, shared, issue_id) == boundary
+    assert shared.budget(issue_id)["used"] == 6
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")

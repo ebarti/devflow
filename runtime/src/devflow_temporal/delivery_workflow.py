@@ -129,6 +129,24 @@ def _tracking_ready(spec: dict, tracker: dict) -> bool:
     )
 
 
+def _controller_error(exc: Exception) -> dict[str, str]:
+    result = {"error_type": type(exc).__name__[:128], "message": str(exc)[:600]}
+    cause = getattr(exc, "cause", None)
+    if cause is not None:
+        result.update(cause_type=type(cause).__name__[:128], cause_message=str(cause)[:600])
+    return result
+
+
+def _initial_controller_state(spec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": spec["run_id"], "phase": "preparing", "execution_state": "running",
+        "outcome": None, "revision": 1, "iteration": 0, "candidate": None,
+        "pull_request": None, "roles": [], "checks": {}, "tracker": {}, "usage": {},
+        "findings": [], "decision": None, "candidate_revision": 0,
+        "cleanup": "none", "error": None,
+    }
+
+
 @workflow.defn(name="DevflowDeliveryWorkflow")
 class DeliveryWorkflow:
     def __init__(self) -> None:
@@ -140,6 +158,8 @@ class DeliveryWorkflow:
         self.controller_only_adjudication = False
         self.controller_only_resource_closure = False
         self.original_execution = True
+        self.controller_failure_boundary = False
+        self.controller_spec = None
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
         if self.controller_only_resource_closure and name not in {
@@ -356,6 +376,8 @@ class DeliveryWorkflow:
             delay = min(delay * 2, 30)
 
     async def _project(self, spec: dict[str, Any], event: str, message: str) -> None:
+        self.controller_spec = spec
+        terminal_projection = event in {"delivered", "blocked", "cancelled"}
         # Only newly admitted resource-aware inputs add this activity. Recorded
         # legacy histories keep their original event/activity ordering on replay.
         if (
@@ -444,29 +466,43 @@ class DeliveryWorkflow:
             self.state["checks"]["terminal_tracker_checkpoint"] = checkpoint
             if not await self._finish_terminal_tracker(spec, checkpoint):
                 event, message = "tracker_deadline", "Terminal readback deadline requires recovery"
-        await self._activity(
-            "delivery_project",
-            {
-                "spec": spec,
-                "phase": self.state["phase"],
-                "execution_state": self.state["execution_state"],
-                "event_type": event,
-                "message": message,
-                "candidate": self.state.get("candidate"),
-                "pull_request": self.state.get("pull_request"),
-                "checks": self.state.get("checks"),
-                "tracker": self.state.get("tracker"),
-                "usage": self.state.get("usage"),
-                "decision": self.state.get("decision"),
-                "intake": self.state.get("intake"),
-                "iteration": self.state["iteration"],
+        projection = deepcopy({
+            "spec": spec,
+            "phase": self.state["phase"],
+            "execution_state": self.state["execution_state"],
+            "event_type": event,
+            "message": message,
+            "candidate": self.state.get("candidate"),
+            "pull_request": self.state.get("pull_request"),
+            "checks": self.state.get("checks"),
+            "tracker": self.state.get("tracker"),
+            "usage": self.state.get("usage"),
+            "decision": self.state.get("decision"),
+            "intake": self.state.get("intake"),
+            "iteration": self.state["iteration"],
+            "protocol_revision": self.state["revision"],
+            "outcome": self.state.get("outcome"),
+            "cleanup": self.state.get("cleanup"),
+            "error": self.state.get("error"),
+            "key": f"{event}:{self.state['iteration']}:{self.state['revision']}",
+        })
+        try:
+            await self._activity("delivery_project", projection)
+        except workflow.NondeterminismError:
+            raise
+        except Exception as exc:
+            if not self.controller_failure_boundary or not terminal_projection:
+                raise
+            self.state["checks"]["terminal_projection_failure"] = {
+                "version": 1, "event_type": event,
                 "protocol_revision": self.state["revision"],
-                "outcome": self.state.get("outcome"),
-                "cleanup": self.state.get("cleanup"),
-                "error": self.state.get("error"),
-                "key": f"{event}:{self.state['iteration']}:{self.state['revision']}",
-            },
-        )
+                "projection_sha256": digest(projection),
+                "scheduled_event_id": getattr(exc, "scheduled_event_id", None),
+                "original_error": (self.state.get("error") or "")[:600],
+                **_controller_error(exc),
+            }
+            if self.state.get("cleanup") != "confirmed":
+                self.state["cleanup"] = "unknown"
         if (event in {"delivered", "blocked", "cancelled"}
                 and spec.get("feature_delivery") and not spec.get("feature_worker")
                 and not getattr(self, "feature_coordinating", False)):
@@ -1005,6 +1041,43 @@ class DeliveryWorkflow:
     async def run(
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        if (spec.get("workflow_failure_boundary_version") != 1
+                or not workflow.patched("delivery-controller-failure-boundary-v1")):
+            return await self._run_protocol(spec, recovery)
+        self.controller_failure_boundary = True
+        self.controller_spec = spec
+        try:
+            return await self._run_protocol(spec, recovery)
+        except workflow.NondeterminismError:
+            raise
+        except Exception as exc:
+            required_state = {"phase", "revision", "iteration", "roles", "checks"}
+            if (not isinstance(self.state, dict)
+                    or not required_state <= self.state.keys()
+                    or not isinstance(self.state["checks"], dict)
+                    or not isinstance(self.state["roles"], list)):
+                self.state = _initial_controller_state(spec)
+            self.state["checks"]["controller_failure"] = {
+                "version": 1, "stage": self.state["phase"], **_controller_error(exc),
+            }
+            self.state["cleanup"] = "unknown"
+            try:
+                return await self._stop(
+                    self.controller_spec, "controller failed: " + type(exc).__name__, cause=exc,
+                )
+            except workflow.NondeterminismError:
+                raise
+            except Exception as stop_exc:
+                raise ApplicationError(
+                    "Controller stop remains unproven",
+                    {"original_error": _controller_error(exc),
+                     "stop_error": _controller_error(stop_exc)},
+                    type="ControllerStopUnproven", non_retryable=True,
+                ) from stop_exc
+
+    async def _run_protocol(
+        self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         self.original_execution = recovery is None
         if recovery is not None:
             if recovery.get("kind") == "stopped_delivery_resume":
@@ -1034,25 +1107,7 @@ class DeliveryWorkflow:
             if recovery.get("kind") in {"repair_continuation", "repair_prelaunch_retry"}:
                 return await self._resume_repair(spec, recovery)
             return await self._resume_publication(spec, recovery)
-        self.state = {
-            "run_id": spec["run_id"],
-            "phase": "preparing",
-            "execution_state": "running",
-            "outcome": None,
-            "revision": 1,
-            "iteration": 0,
-            "candidate": None,
-            "pull_request": None,
-            "roles": [],
-            "checks": {},
-            "tracker": {},
-            "usage": {},
-            "findings": [],
-            "decision": None,
-            "candidate_revision": 0,
-            "cleanup": "none",
-            "error": None,
-        }
+        self.state = _initial_controller_state(spec)
         try:
             await self._project(
                 spec, "preparing", "Preparing owned checkout and execution boundary"
@@ -1065,6 +1120,7 @@ class DeliveryWorkflow:
             reason = str(cause)[:600] if cause else type(exc).__name__
             return await self._stop(spec, f"preparation failed: {reason}", cause=exc)
         spec = prepared.get("spec", spec)
+        self.controller_spec = spec
         if self.cancel_requested:
             return await self._cancelled(spec)
         self.state["candidate"] = prepared["candidate"]

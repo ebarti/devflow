@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
-from .delivery_config import DeliveryConfig
+from .delivery_execution_config import load_execution_config
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _prepare, _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
@@ -280,9 +280,7 @@ def snapshot(store, run_id, kind=KIND):
             or _git(broker.source, 'remote', 'get-url', 'origin') != spec['origin_url']
             or outside_scope(spec['policy'], broker._changed_paths(), checkout=broker.checkout)):
         raise ValueError('gate retry lost unchanged owned source or exact published PR head')
-    config = DeliveryConfig.load(Path(spec['config_path']))
-    if digest(config.raw) != spec['config_digest']:
-        raise ValueError('gate retry frozen configuration changed')
+    load_execution_config(spec)
     with store._connect() as db:
         binding = work_binding(store, spec, db)
         admitted = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
@@ -574,7 +572,7 @@ def prepare_runtime(spec, root, command_digest, seal_digest):
         if hashlib.sha256(binary.read_bytes()).hexdigest() != spec['policy']['codex_bin_sha256']:
             raise ValueError('continuation cannot change the frozen CLI executable')
         execution['policy']['codex_bin'] = str(binary.resolve())
-        return _prepare(execution, DeliveryConfig.load(Path(spec['config_path'])), intent, path)
+        return _prepare(execution, load_execution_config(spec), intent, path)
 
 
 def effective_repair(store, recovery, *, db=None):

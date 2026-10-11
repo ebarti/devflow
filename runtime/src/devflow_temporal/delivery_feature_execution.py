@@ -64,11 +64,16 @@ def admit(store, db, spec):
     for key, receipt in retry_values.items():
         if (key.startswith("plan-revision:preparation-retry:")
                 and receipt["successor_id"] == spec["run_id"]):
+            from .delivery_execution_registry import preparation_lineage
+
+            public = retry_values.get("plan-revision:request:" + receipt["revision_id"])
+            with shared.connect() as claims:
+                chain = preparation_lineage(claims, public) if public else []
             if (spec.get("feature_plan_revision_preparation_retry")
                     != {"checkpoint_key": key, "sha256": digest(receipt)}
-                    or spec.get("feature_plan_revision_request") != retry_values.get(
-                        "plan-revision:request:" + receipt["revision_id"])
-                    or receipt["predecessor"] != predecessor):
+                    or spec.get("feature_plan_revision_request") != public
+                    or receipt["predecessor"] != predecessor
+                    or not chain or chain[-1] != (key, receipt)):
                 raise OwnershipConflict(
                     "preparation successor lacks its server reservation binding")
     # Existing legacy publication is never silently reclassified as a stack.

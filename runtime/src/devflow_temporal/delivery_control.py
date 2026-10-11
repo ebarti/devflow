@@ -478,6 +478,7 @@ async def worker(
         task_queue=config.queue,
         workflows=[DeliveryWorkflow],
         activities=DELIVERY_ACTIVITIES,
+        workflow_failure_exception_types=[ValueError, KeyError, TypeError],
         identity=identity,
         **({"deployment_config": deployment} if deployment is not None else {}),
     ):

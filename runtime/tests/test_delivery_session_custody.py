@@ -14,6 +14,7 @@ from test_delivery_store import service as service
 from devflow_temporal import delivery_session_custody as custody
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import canonical_json, digest
+from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_resources import private_directory, write_private
 from devflow_temporal.delivery_sandbox import _native_role_home
 from devflow_temporal.supervisor import DeliverySupervisor
@@ -31,7 +32,12 @@ def missing_session(stopped, monkeypatch):
             "execution_backend": "native-macos",
         },
     )
+    base["policy_digest"] = digest(base["policy"])
     spec = {**base, "role_home_generation": "gate-retry-1"}
+    candidate = DeliveryBroker(store, spec).candidate()
+    assert candidate["id"] == state["candidate"]["id"]
+    assert candidate["head"] == state["candidate"]["head"]
+    state["candidate"] = candidate
     previous = {
         "kind": "prepublication_gate_retry",
         "execution_spec": spec,
@@ -166,7 +172,8 @@ def missing_session(stopped, monkeypatch):
                 f"INSERT INTO delivery_attempts ({columns}) VALUES ({marks})",
                 tuple(attempt.values()),
             )
-        db.execute("UPDATE delivery_runs SET iteration=1 WHERE run_id='run-1'")
+        db.execute("UPDATE delivery_runs SET iteration=1,candidate_json=? WHERE run_id='run-1'",
+                   (canonical_json(candidate),))
     monkeypatch.setattr(store, "effective_spec", lambda _: spec)
     monkeypatch.setattr(
         custody,

@@ -307,6 +307,13 @@ async def test_invalid_foreign_row_does_not_block_owned_dispatch(
            "issue_url": "https://github.com/example/fixture/issues/4"}
     owner.store.submit(own)
     before = foreign.store.detail(request["run_id"])
+    if mutation in {"edit", "delete"}:
+        # Without an admitted snapshot, legacy fallback must authenticate the
+        # exact original config; it cannot use an edited or missing live file.
+        spec = foreign.store.effective_spec(request["run_id"])
+        snapshot = foreign.config.state_root / "configuration-snapshots" / (
+            spec["config_digest"] + ".json")
+        snapshot.unlink()
     if mutation == "edit":
         raw = json.loads(foreign.config.path.read_text())
         raw["label"] = "changed after admission"

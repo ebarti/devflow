@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from test_delivery_store import service as service
 
+from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_resources import private_directory
 
@@ -299,6 +300,7 @@ def test_controller_prepares_named_node_dependencies_before_role(service, tmp_pa
         f'from pathlib import Path; Path({str(marker)!r}).write_text("prepared")', '/store']}
     spec['accepted_plan'] = json.dumps({'verification': ['Run API audit.test.ts']})
     spec['policy']['prepublish_checks'] = [dependency]
+    spec['policy_digest'] = digest(spec['policy'])
     broker = DeliveryBroker(store, spec)
     broker.prepare()
     before = broker.candidate()
