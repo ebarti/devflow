@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import hashlib
 import importlib.util
 import json
@@ -47,19 +48,35 @@ def _now() -> str:
 
 
 def _private_directory(path: Path) -> None:
+    """Require an owned private directory; only its mode is ever repaired.
+
+    A backup restore or ``chmod -R`` changes modes without changing ownership;
+    that drift heals in place. Foreign ownership, symlinks and non-directories
+    never do.
+    """
     try:
         path.mkdir(mode=0o700, parents=True)
     except FileExistsError:
         pass
     else:
         os.chmod(path, 0o700)
-    metadata = path.lstat()
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-        or metadata.st_uid != os.getuid()
-    ):
-        raise ValueError("service state root must be an owned private directory (0700)")
+    message = "service state root must be an owned private directory (0700)"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError(message) from exc
+        raise
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise ValueError(message)
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            os.fchmod(descriptor, 0o700)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+                raise ValueError(message)
+    finally:
+        os.close(descriptor)
 
 
 class DeliveryStore:

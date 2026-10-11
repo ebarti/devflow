@@ -368,8 +368,8 @@ def create_app(config_path: Path) -> FastAPI:
             ),
             "runtime_identity": identity,
             "temporal": service.temporal_status,
-            # The lifecycle controller compares these with the live file to reload
-            # only a stale API, or the whole stack after a transport change.
+            # Informational for operators and tests; `restart` decides by the
+            # transport the worker registered, never by what the API advertises.
             "config_digest": digest(service.config.raw),
             "transport_digest": transport_digest(service.config),
             "capacity": {"limit": service.config.raw.get("capacity", 2), "active": active},

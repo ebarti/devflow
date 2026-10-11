@@ -412,3 +412,19 @@ async def test_unusable_live_configuration_is_a_conflict_that_names_restart(serv
         assert info["config_digest"] == digest(store.config.raw)
         assert info["transport_digest"] == transport_digest(store.config)
         assert (await browser.get("/api/runs")).status_code == 200
+
+
+def test_state_root_mode_drift_heals_together_with_its_snapshots(service):
+    store, request = service
+    store.submit(request)
+    spec = store.effective_spec(request["run_id"])
+    path = snapshot(store, spec)
+    # A restore or chmod -R reaches the state root first; it must heal like the rest.
+    path.chmod(0o644)
+    path.parent.chmod(0o755)
+    store.config.state_root.chmod(0o755)
+    healed = DeliveryStore(DeliveryConfig.load(store.config.path))
+    assert healed.owns_execution(spec)
+    assert (store.config.state_root.stat().st_mode & 0o777,
+            path.parent.stat().st_mode & 0o777, path.stat().st_mode & 0o777) == (
+        0o700, 0o700, 0o600)

@@ -20,7 +20,8 @@ async def test_worker_uses_explicit_pinned_deployment_without_changing_config(
     from devflow_temporal.delivery_config import DeliveryConfig
 
     raw = {"temporal_address": "127.0.0.1:1", "temporal_queue": "fixture",
-           "state_root": str(tmp_path), "temporal_namespace": "default"}
+           "state_root": str(tmp_path), "temporal_namespace": "default",
+           "tracking_db": str(tmp_path / "tracking.sqlite3")}
     config = DeliveryConfig(tmp_path / "config.json", raw)
     before = json.dumps(raw, sort_keys=True)
     created = []
@@ -78,7 +79,8 @@ async def test_real_deployment_worker_registers_both_pollers_before_ready(tmp_pa
 
     async with local_temporal() as environment:
         raw = {"temporal_address": environment.client.service_client.config.target_host,
-               "queue": "versioned-readiness", "state_root": str(tmp_path)}
+               "queue": "versioned-readiness", "state_root": str(tmp_path),
+               "tracking_db": str(tmp_path / "tracking.sqlite3")}
         config = DeliveryConfig(tmp_path / "config.json", raw)
         deployment = control._worker_deployment("delivery-readiness", "fixture-v1")
         task = asyncio.create_task(control.worker(config, deployment=deployment))
