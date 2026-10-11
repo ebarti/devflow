@@ -8,7 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -712,3 +712,77 @@ async def test_temporal_stop_reaches_native_monitor_and_frees_slot(
     assert broker.result["timed_out"] is False
     assert_stopped(broker)
     assert owned_checks.maximum() == 1
+
+
+def attempt_info(attempt=1, maximum_attempts=3, budget=timedelta(hours=2),
+                 elapsed=timedelta(0)):
+    """What activity.info() reports for a native gate under the production options."""
+    return SimpleNamespace(
+        attempt=attempt, retry_policy=SimpleNamespace(maximum_attempts=maximum_attempts),
+        schedule_to_close_timeout=budget, scheduled_time=datetime.now(UTC) - elapsed,
+    )
+
+
+@pytest.mark.parametrize("replacement", ["timed_out", "not_found", "worker_shutdown"])
+async def test_replaced_check_attempt_keeps_native_gate_running_for_the_retry(
+    owned_checks, monkeypatch, replacement,
+):
+    # What the SDK reports after a heartbeat timeout, a lost attempt or a
+    # worker shutdown: the attempt is superseded, nobody requested a cancel,
+    # and the activity still has attempts and budget left.
+    monkeypatch.setattr(activities.activity, "cancellation_details", lambda: SimpleNamespace(
+        cancel_requested=False, timed_out=False, not_found=False, worker_shutdown=False,
+        **{replacement: True},
+    ))
+    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info())
+    request = owned_checks.request("one", seconds=2, timeout=60)
+    broker = owned_checks.brokers["one"]
+    folder = Path(request["spec"]["state_dir"]) / "native"
+    journal = folder / "native-process.json"
+    superseded = asyncio.create_task(activities.delivery_checks(request))
+    await wait_until(lambda: observed_native_tree(journal))
+    superseded.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await superseded
+    assert not (folder / "cancel").exists()
+    assert not broker.finished.is_set()
+    # The Temporal retry joins the same durable invocation and scores its real result.
+    assert await activities.delivery_checks(request) == {"state": "passed", "cleanup": "confirmed"}
+    native = broker.result
+    assert native["cancelled"] is False and native["exit_code"] == 0
+    assert native["timed_out"] is False
+    assert not (folder / "cancel").exists()
+    assert read_private(journal)["phase"] == "finished"
+    assert_stopped(broker)
+
+
+@pytest.mark.parametrize("reason", ["cancel_requested", "last_attempt", "budget_exhausted"])
+async def test_final_check_attempt_stop_reaches_native_gate(owned_checks, monkeypatch, reason):
+    details = {"cancel_requested": False, "timed_out": False, "not_found": False,
+               "worker_shutdown": False}
+    info = attempt_info()
+    if reason == "cancel_requested":
+        details["cancel_requested"] = True
+    elif reason == "last_attempt":
+        details["timed_out"] = True
+        info = attempt_info(attempt=3)
+    else:
+        details["timed_out"] = True
+        info = attempt_info(budget=timedelta(seconds=1), elapsed=timedelta(seconds=2))
+    monkeypatch.setattr(activities.activity, "cancellation_details",
+                        lambda: SimpleNamespace(**details))
+    monkeypatch.setattr(activities.activity, "info", lambda: info)
+    request = owned_checks.request("one", seconds=8, timeout=60)
+    broker = owned_checks.brokers["one"]
+    folder = Path(request["spec"]["state_dir"]) / "native"
+    journal = folder / "native-process.json"
+    stopped = asyncio.create_task(activities.delivery_checks(request))
+    await wait_until(lambda: observed_native_tree(journal))
+    stopped.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopped
+    # Nothing would ever reattach: the gate is stopped and its slot is freed.
+    assert (folder / "cancel").exists()
+    assert broker.finished.is_set()
+    assert broker.result["cancelled"] is True and broker.result["exit_code"] != 0
+    assert_stopped(broker)

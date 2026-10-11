@@ -30,7 +30,7 @@ from .delivery_broker import (
 from .delivery_execution_config import load_execution_config
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
-from .supervisor import get_supervisor
+from .supervisor import activity_attempt_replaced, activity_retry_pending, get_supervisor
 
 _CHECK_HEARTBEAT_INTERVAL = 5
 _UNCLEAN_CHECK_SLOTS: list[int] = []
@@ -87,6 +87,8 @@ async def _execute_check(
     cancelled = threading.Event()
     admitted = threading.Event()
     ports_admitted = threading.Event()
+    # Admission and cancellation decide atomically whether the gate launches.
+    gate = threading.Lock()
 
     def run():
         from .delivery_resources import private_directory
@@ -124,9 +126,12 @@ async def _execute_check(
                     descriptor = handle
                     break
                 if descriptor is not None:
-                    if cancelled.is_set() or broker._native_cancelled():
-                        raise CheckCancelledBeforeLaunch("native check cancelled before admission")
-                    admitted.set()
+                    with gate:
+                        if cancelled.is_set() or broker._native_cancelled():
+                            raise CheckCancelledBeforeLaunch(
+                                "native check cancelled before admission"
+                            )
+                        admitted.set()
                     result = execute(broker)
                     if not broker.native_cleanup_confirmed:
                         result = {**result, "state": "unknown", "cleanup": "unknown"}
@@ -165,8 +170,23 @@ async def _execute_check(
                 })
             await asyncio.wait({pending}, timeout=_CHECK_HEARTBEAT_INTERVAL)
         return await asyncio.shield(pending)
-    except BaseException:
-        cancelled.set()
+    except BaseException as exc:
+        with gate:
+            replaced = (isinstance(exc, asyncio.CancelledError) and admitted.is_set()
+                        and request["spec"]["provider"] == "codex"
+                        and activity_attempt_replaced() and activity_retry_pending())
+            if not replaced:
+                cancelled.set()
+        if replaced:
+            # A heartbeat timeout, lost attempt or worker shutdown replaces only
+            # this waiter. The admitted gate keeps running under its durable
+            # monitor, so the retry reattaches to the same invocation instead
+            # of scoring a killed one. A terminal timeout or operator cancel
+            # still stops it and frees its slot.
+            execution.add_done_callback(
+                lambda future: future.exception() if not future.cancelled() else None
+            )
+            raise
         # The task can be cancelled during shutdown without stopping its
         # executor. Join that original future before returning cancellation.
         while not execution.done():

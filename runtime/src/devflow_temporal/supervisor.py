@@ -45,6 +45,31 @@ def activity_attempt_replaced() -> bool:
     ))
 
 
+def activity_retry_pending() -> bool:
+    """Whether Temporal can still start another attempt that would reattach.
+
+    A last attempt or an exhausted schedule-to-close budget ends the activity
+    for good, so nothing it leaves running would ever be joined again.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from temporalio import activity
+
+    if not activity.in_activity():
+        return False
+    try:
+        info = activity.info()
+    except RuntimeError:
+        return False
+    if info.schedule_to_close_timeout is not None and (
+            datetime.now(UTC) - info.scheduled_time + timedelta(seconds=1)
+            >= info.schedule_to_close_timeout):
+        return False
+    policy = info.retry_policy
+    return not (policy is not None and policy.maximum_attempts
+                and info.attempt >= policy.maximum_attempts)
+
+
 def _process_identity(pid: int) -> str | None:
     result = subprocess.run(
         ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False
