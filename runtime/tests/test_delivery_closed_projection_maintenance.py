@@ -98,17 +98,24 @@ async def test_maintenance_persists_backoff_and_settles_closed_executions(servic
     assert len(await reconcile_completed_projections(
         store, client, now=moment + timedelta(seconds=1))) == 1
     assert len(client.describes) == reads + 1
-    # An absent execution is not an error; an unproven verdict backs off up to an hour.
+    # An absent execution is not an error; a changed verdict restarts the backoff.
     client.error = RPCError("Private absent workflow", RPCStatusCode.NOT_FOUND, b"")
     moment = _due_at(store, key)
     assert [item["state"] for item in await reconcile_completed_projections(
         store, client, now=moment)] == ["not_started"]
+    assert _due_at(store, key) - moment == BACKOFF_BASE
+    assert _maintenance_rows(store)[key]["attempts"] == 1
+    # Consecutive unproven verdicts back off from the base again, up to an hour.
     client.error = RuntimeError("Private transport failure")
-    moment = _due_at(store, key)
-    observed = await reconcile_completed_projections(store, client, now=moment)
-    assert [(item["state"], item["error_type"]) for item in observed] == [
-        ("unproven", "RuntimeError")]
-    assert _due_at(store, key) - moment == BACKOFF_CAP
+    delays = []
+    for _attempt in range(8):
+        moment = _due_at(store, key)
+        observed = await reconcile_completed_projections(store, client, now=moment)
+        assert [(item["state"], item["error_type"]) for item in observed] == [
+            ("unproven", "RuntimeError")]
+        delays.append(_due_at(store, key) - moment)
+    assert delays == [min(BACKOFF_CAP, BACKOFF_BASE * 2 ** n) for n in range(8)]
+    assert delays[-1] == BACKOFF_CAP
     assert _maintenance_rows(store)[key]["error"] == "RuntimeError"
     # A closed, not completed execution settles: never described again.
     client.error = None

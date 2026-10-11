@@ -32,6 +32,7 @@ async def closed_tail(store, run_id, client):
     input_recovery = inputs[1] if len(inputs) > 1 else None
     scheduled = {}
     tail = None
+    settled = set()
     for event in history.events:
         if event.HasField('activity_task_scheduled_event_attributes'):
             attributes = event.activity_task_scheduled_event_attributes
@@ -41,8 +42,16 @@ async def closed_tail(store, run_id, client):
         if event.HasField('activity_task_completed_event_attributes'):
             completed = event.activity_task_completed_event_attributes
             request = scheduled.get(completed.scheduled_event_id)
+            settled.add(completed.scheduled_event_id)
             if request is not None:
                 tail = request
+    if (scheduled and max(scheduled) not in settled
+            and description.status == WorkflowExecutionStatus.COMPLETED):
+        from .delivery_closed_projection import failed_terminal_tail
+
+        # The controller's last projection failed inside its boundary; only its
+        # completed result's record binds that exact request as the tail.
+        tail = await failed_terminal_tail(handle, scheduled[max(scheduled)], max(scheduled)) or tail
     if (tail is None and description.status == WorkflowExecutionStatus.TIMED_OUT
             and isinstance(input_recovery, dict)
             and input_recovery.get('kind') == 'terminal_tracker_recovery'):
@@ -197,6 +206,10 @@ def _grant(store, run_id, payload, closed):
     state.update(run_id=run_id, revision=tail['protocol_revision'],
                  candidate_revision=row['candidate_revision'],
                  roles=[json.loads(a['result_json']) for a in attempts if a['result_json']])
+    # The predecessor's failed-projection record names its own history events;
+    # the successor starts without it so its own terminal pass binds cleanly.
+    state['checks'] = {key: value for key, value in state['checks'].items()
+                       if key != 'terminal_projection_failure'}
     recovery = {
         'kind': 'terminal_tracker_recovery', 'original_recovery': previous,
         'state': state, 'spec_sha256': digest(spec), 'closed': closed,

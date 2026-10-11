@@ -1080,12 +1080,15 @@ class DeliveryWorkflow:
     async def run(
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        # Single program-wide liveness gate, evaluated before any command. Every
-        # fix-program change to this workflow's command sequence checks it:
-        # executions recorded before the marker replay with False and keep their
-        # original behaviour; executions started after the upgrade, including
-        # recovery executions of older runs, get True.
-        self.liveness_v2 = workflow.patched("delivery-liveness-v2")
+        # Marker for this change set's bounded-stop commands only, evaluated before
+        # any command. A patch marker is replay-safe for exactly the change it
+        # shipped with, so every later command change defines its own marker right
+        # below this line. Executions recorded before a marker replay with it
+        # False and keep their recorded behaviour; executions started after the
+        # upgrade, including recovery executions of older runs, get True. Direct
+        # protocol calls outside a workflow have no history: False.
+        self.liveness_v2 = (workflow.patched("delivery-liveness-v2")
+                            if workflow.in_workflow() else False)
         if (spec.get("workflow_failure_boundary_version") != 1
                 or not workflow.patched("delivery-controller-failure-boundary-v1")):
             return await self._run_protocol(spec, recovery)

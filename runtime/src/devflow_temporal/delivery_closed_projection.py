@@ -57,6 +57,37 @@ def _terminal_request(projection):
             and projection.get("phase") == "waiting_tracker")
 
 
+def bound_failed_projection(projection, failure):
+    """The failure record names exactly this scheduled projection request."""
+    return (isinstance(failure, dict) and failure.get("version") == 1
+            and type(failure.get("scheduled_event_id")) is int
+            and digest(projection) == failure.get("projection_sha256")
+            and failure.get("event_type") == projection.get("event_type")
+            and failure.get("protocol_revision") == projection.get("protocol_revision")
+            and projection.get("key") == (
+                f"{projection.get('event_type')}:{projection.get('iteration')}:"
+                f"{projection.get('protocol_revision')}"))
+
+
+async def failed_terminal_tail(handle, request, event_id):
+    """A failed last projection as the closed tail, bound by the completed result's record.
+
+    The result's checks are that request's checks plus the record the controller
+    added after the failure, so the tail equals the reconciled row.
+    """
+    state = await handle.result()
+    checks = state.get("checks") if isinstance(state, dict) else None
+    failure = checks.get("terminal_projection_failure") if isinstance(checks, dict) else None
+    if (failure is None or failure.get("scheduled_event_id") != event_id
+            or not bound_failed_projection(request, failure)
+            or not _terminal_request(request)
+            or checks != {**(request.get("checks") or {}), "terminal_projection_failure": failure}
+            or state.get("cleanup") != (
+                "confirmed" if request.get("cleanup") == "confirmed" else "unknown")):
+        return None
+    return {**request, "checks": deepcopy(checks), "cleanup": state["cleanup"]}
+
+
 def _events(store, run_id):
     with store._connect() as db:
         return [dict(item) for item in db.execute(
@@ -190,16 +221,9 @@ async def _reconcile_terminal(store, row, spec, description, state, history, fai
             failed.add(event.activity_task_timed_out_event_attributes.scheduled_event_id)
     event_id = failure.get("scheduled_event_id")
     projection = scheduled.get(event_id)
-    if (failure.get("version") != 1 or type(event_id) is not int
-            or event_id not in failed or event_id != last_projection or projection is None
-            or digest(projection) != failure.get("projection_sha256")
-            or projection.get("spec") != spec
-            or not _terminal_request(projection)
-            or failure.get("event_type") != projection["event_type"]
-            or failure.get("protocol_revision") != projection.get("protocol_revision")
-            or projection.get("key") != (
-                f"{projection['event_type']}:{projection.get('iteration')}:"
-                f"{projection.get('protocol_revision')}")):
+    if (projection is None or event_id not in failed or event_id != last_projection
+            or not bound_failed_projection(projection, failure)
+            or projection.get("spec") != spec or not _terminal_request(projection)):
         raise ValueError("completed result is not bound to its failed terminal request")
     expected_checks = {**(projection.get("checks") or {}),
                        "terminal_projection_failure": failure, **expected_extra}
@@ -301,16 +325,23 @@ async def reconcile_projection(store, client, row):
     # Authenticate every record before any row write or replayed effect.
     stop_request = (await _bound_feature_stop(history, spec, state, stop_record)
                     if stop_record else None)
-    observed = {"state": "observed"}
+    observed, refused = {"state": "observed"}, None
     if failure:
-        observed = await _reconcile_terminal(
-            store, row, spec, description, state, history, failure,
-            {"feature_stop_failure": stop_record} if stop_record else {})
+        try:
+            observed = await _reconcile_terminal(
+                store, row, spec, description, state, history, failure,
+                {"feature_stop_failure": stop_record} if stop_record else {})
+        except Exception as exc:
+            # The stop request is bound to the result on its own; a row that
+            # refuses its projection must not keep the feature owner active.
+            refused = exc
     if stop_request:
         stopped = await _replay_feature_stop(
             store, run_id, spec, description, state, stop_record, stop_request)
         observed = {**observed, **stopped, "state": "reconciled" if "reconciled" in {
             observed["state"], stopped["state"]} else "observed"}
+    if refused is not None:
+        raise refused
     return {**observed, "workflow_id": workflow_id, "execution_run_id": description.run_id}
 
 
@@ -345,9 +376,11 @@ def _remember(store, row, observed, now):
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         previous = db.execute(
-            "SELECT attempts FROM delivery_closed_projections WHERE run_id=? AND workflow_id=?",
-            (row["run_id"], workflow_id)).fetchone()
-        attempts = 0 if state in SETTLED else (previous[0] if previous else 0) + 1
+            "SELECT attempts,state FROM delivery_closed_projections "
+            "WHERE run_id=? AND workflow_id=?", (row["run_id"], workflow_id)).fetchone()
+        # Backoff counts consecutive identical verdicts; a changed verdict restarts it.
+        attempts = 0 if state in SETTLED else (
+            previous["attempts"] + 1 if previous and previous["state"] == state else 1)
         next_check = None
         if state not in SETTLED:
             cap = (OPEN_EXECUTION_BACKOFF_CAP if state in {"not_completed", "not_started"}

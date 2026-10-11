@@ -208,10 +208,14 @@ per execution identity: settled executions are never re-read (also after a
 service restart), open executions back off up to five minutes, unproven verdicts
 up to one hour, SQLite work runs off the API event loop, and a reconciled row or a
 replayed feature stop is bound to the authentic history bytes before any write.
-Workflow behaviour changes since the boundary are gated on the single
-`delivery-liveness-v2` patch marker evaluated first in `DeliveryWorkflow.run()`:
-histories recorded before it replay on their earlier command path, so workers
-roll forward only.
+The bounded-stop commands above are gated on the `delivery-liveness-v2` patch
+marker, evaluated first in `DeliveryWorkflow.run()`. A patch marker is replay-safe
+only for the exact change it shipped with, so every later workflow command change
+defines its own marker next to it rather than reusing this one. Histories recorded
+before a marker replay on their earlier command path, so workers roll forward only.
+A reconciled expired deadline remains admissible by `terminal_tracker_recovery`:
+the closed tail is the failed last projection bound by the completed result's
+record, and the successor starts without that record.
 
 Run lists return up to 50 observations by default (maximum 100). `/api/runs`, CLI `runs` and MCP `list_runs` accept `limit`, `cursor` and `archived`; CLI uses `--limit`, `--cursor` and `--archived`. Follow a returned `next_cursor` explicitly to read older history, keeping the same archive filter. Ordering uses last-update time and run ID. These are live observations, so concurrent updates can move rows between pages; cursors do not freeze history. The dashboard polls only the recent page every five seconds. **Load older tasks** retrieves one older page on demand and retains its rows without polling that page; toggling the archive collection resets older observations. Direct run URLs remain available, and statistics still include complete stored history.
 
