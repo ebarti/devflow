@@ -950,3 +950,76 @@ async def test_queued_replacement_while_admission_transaction_waits(
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def _poll_until(predicate):
+    deadline = time.monotonic() + 10
+    while not predicate():
+        assert time.monotonic() < deadline, 'fixture did not reach its controlled boundary'
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_busy_store_defers_admission_without_failing_the_waiting_role(
+        native_role, monkeypatch):
+    case = native_role
+    polls = []
+    original = case.owner._enter_capacity
+    tracking_db = str(case.store.config.tracking_db)
+    sqlite_connect = sqlite3.connect
+
+    def enter(job_key, **options):
+        try:
+            result = original(job_key, **options)
+        except Exception as exc:
+            polls.append(exc)
+            raise
+        polls.append(result)
+        return result
+
+    def impatient(path, *args, **options):
+        # The state helper opens every connection with a 30s busy timeout.
+        if str(path) == tracking_db:
+            options['timeout'] = 0.1
+        return sqlite_connect(path, *args, **options)
+
+    def observed_row():
+        with sqlite_connect(f'file:{tracking_db}?mode=ro', uri=True) as db:
+            db.row_factory = sqlite3.Row
+            rows = [dict(row) for row in db.execute('SELECT * FROM delivery_attempts')]
+            occupied = db.execute("SELECT COUNT(*) FROM delivery_attempts WHERE state IN "
+                                  "('starting','running','unknown')").fetchone()[0]
+        assert len(rows) == 1
+        return rows[0], occupied
+
+    monkeypatch.setattr(case.owner, '_enter_capacity', enter)
+    settings = json.loads(case.store.config.path.read_text())
+    settings['capacity'] = 0
+    case.store.config.path.write_text(json.dumps(settings))
+    blocker = sqlite_connect(tracking_db, timeout=5)
+    task = asyncio.create_task(delivery_role(case.request))
+    try:
+        await _poll_until(lambda: len(polls) >= 1)
+        # Another writer holds the store exactly when capacity becomes available.
+        monkeypatch.setattr(sqlite3, 'connect', impatient)
+        blocker.execute('BEGIN IMMEDIATE')
+        settings['capacity'] = 1
+        case.store.config.path.write_text(json.dumps(settings))
+        case.owner.capacity = 1
+        seen = len(polls)
+        await _poll_until(lambda: len(polls) >= seen + 1)
+        await asyncio.wait({task}, timeout=2.5)
+        # A busy store defers admission; it is never charged to the queued role.
+        assert not task.done()
+        assert len(polls) >= seen + 2 and polls[seen:] == [None] * len(polls[seen:])
+        row, occupied = observed_row()
+        assert row['state'] == 'queued' and occupied == 0
+        blocker.rollback()
+        monkeypatch.setattr(sqlite3, 'connect', sqlite_connect)
+        result = await asyncio.wait_for(task, 20)
+    finally:
+        blocker.close()
+        await asyncio.gather(task, return_exceptions=True)
+    assert result['finish_reason'] == 'fixture'
+    row, occupied = _attempt(case)
+    assert row['state'] == 'finished' and occupied == 0

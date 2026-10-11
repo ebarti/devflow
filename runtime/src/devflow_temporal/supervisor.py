@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -129,9 +130,23 @@ class DeliverySupervisor:
                 continue
 
     def _enter_capacity(self, job_key: str, *, cancelled=None, stop_requested=None) -> str | None:
-        if cancelled is not None and cancelled():
-            raise ValueError("native role cancelled before capacity admission")
-        self._reconcile_capacity()
+        try:
+            if cancelled is not None and cancelled():
+                raise ValueError("native role cancelled before capacity admission")
+            self._reconcile_capacity()
+            return self._admit(job_key, cancelled=cancelled, stop_requested=stop_requested)
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+            if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise
+            # Another writer holds the store (every state connection opens with
+            # a write transaction): the role is simply not admitted yet and
+            # polls again. A busy store is never a launch failure.
+            _LOG.warning("Native capacity admission deferred for %s: %s", job_key, exc)
+            return None
+
+    def _admit(self, job_key: str, *, cancelled=None, stop_requested=None) -> str | None:
+        """Claim one shared DB slot inside a single admission transaction."""
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if stop_requested is not None and stop_requested():
