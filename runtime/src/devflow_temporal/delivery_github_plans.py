@@ -323,7 +323,29 @@ def _preflight_plan_records(issue, manifest, children, operation_id):
         }
     preview["workstream_plans"] = refs
     _parent_plan_body(preview, issue)
+    _parent_plan_body({**preview, "publication": _largest_publication(issue, preview)}, issue)
     return preview
+
+
+def _largest_publication(issue, manifest):
+    """Every chunk later appends one stacked PR; reserve each member's largest encoding."""
+    from .delivery_github_contract import GITHUB_ID_MAX
+
+    members = []
+    for index, chunk in enumerate(ordered_chunks(manifest["plan"])):
+        child = manifest["workstream_issues"][chunk["workstream_id"]]
+        # Unique full-width PR numbers that cannot coincide with reserved issue numbers.
+        number = GITHUB_ID_MAX // 2 - index
+        members.append({
+            "chunk_id": chunk["id"], "number": number,
+            "url": f"https://github.com/{issue['repository']}/pull/{number}",
+            "branch": "feat/df-" + "f" * 10 + "-" + chunk["id"], "head": "f" * 64,
+            # The manifest contract bounds the trunk name to 128 characters.
+            "base_branch": members[-1]["branch"] if members else "f" * 128,
+            "workstream_id": chunk["workstream_id"], "issue_id": child["id"],
+            "issue_number": child["number"], "issue_url": child["url"],
+        })
+    return {"stack_id": GITHUB_ID_MAX if len(members) > 1 else None, "members": members}
 
 
 def _initial_manifest(issue, plan, bindings, key):

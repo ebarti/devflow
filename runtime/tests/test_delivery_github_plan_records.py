@@ -532,7 +532,6 @@ def test_revision_cannot_drop_final_verification_before_publication(tmp_path, we
     assert adopted["manifest"]["plan_revision"] == 2
 
 
-
 @pytest.mark.parametrize(
     "rejected_record", ["bound_parent_marker", "nullable_parent_marker",
                         "nullable_later_child_marker", "nullable_parent_overflow"],
@@ -653,3 +652,55 @@ def test_closed_staged_operation_releases_custody_for_a_later_revision(tmp_path)
     with pytest.raises(OwnershipConflict, match="retains publication custody"):
         remote.publish_plan_revision(issue, current, revised, registry, token,
                                      operation_id="later")
+
+
+def test_parent_index_preflight_reserves_every_later_stack_member(tmp_path):
+    from devflow_temporal.delivery_github_plans import _parent_plan_body, _preflight_initial_plan
+    from devflow_temporal.delivery_plan_model import ordered_chunks
+
+    remote, issue, registry, token = setup(tmp_path)
+
+    def padded(size):
+        value = v2_plan()
+        # Members grow per chunk while the reserved child identities grow per workstream.
+        stream = value["workstreams"][0]
+        for number in range(32 - len(ordered_chunks(value))):
+            chunk = deepcopy(stream["chunks"][0])
+            chunk.update(id=f"{chunk['id']}-{number}", title=f"{chunk['title']} {number}",
+                         depends_on=[stream["chunks"][-1]["id"]])
+            stream["chunks"].append(chunk)
+        value["acceptance"] = [*value["acceptance"], *(
+            f"Requirement {start} " + "x" * min(4000, size - start)
+            for start in range(0, size, 4000))]
+        return value
+
+    def admitted(size):
+        value = padded(size)
+        try:
+            _preflight_initial_plan(issue, value, "github-plan:" + digest(
+                {"issue": issue["id"], "plan": value}))
+        except ValueError as exc:
+            assert "GitHub comment limit" in str(exc)
+            return False
+        return True
+
+    # The largest plan the creation preflight admits.
+    low, high = 0, 60000
+    while low < high:
+        middle = (low + high + 1) // 2
+        low, high = (middle, high) if admitted(middle) else (low, middle - 1)
+    record = remote.initialize(issue, padded(low), registry, token)
+    manifest = deepcopy(record["manifest"])
+    members = manifest["publication"]["members"]
+    for index, chunk in enumerate(ordered_chunks(manifest["plan"])):
+        child = manifest["workstream_issues"][chunk["workstream_id"]]
+        members.append({
+            "chunk_id": chunk["id"], "number": 9000 + index,
+            "url": f"https://github.com/{issue['repository']}/pull/{9000 + index}",
+            "branch": "feat/df-" + digest(issue["id"])[:10] + "-" + chunk["id"],
+            "head": "a" * 40, "base_branch": members[-1]["branch"] if members else "main",
+            "workstream_id": chunk["workstream_id"], "issue_id": child["id"],
+            "issue_number": child["number"], "issue_url": child["url"]})
+    manifest["publication"]["stack_id"] = 7 if len(members) > 1 else None
+    # Publishing every chunk later must still fit the parent index it admitted.
+    _parent_plan_body(manifest, issue)
