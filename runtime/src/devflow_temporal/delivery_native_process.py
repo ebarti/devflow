@@ -264,6 +264,54 @@ def reconcile_process(path: Path, *, _locks: dict | None = None) -> dict:
     }
 
 
+def prelaunch_journal(journal: dict) -> bool:
+    """A monitor that died before authorizing its child never started a provider."""
+    return (journal.get("phase") == "allocated"
+            or (journal.get("cleanup_reconciliation") or {}).get("previous_phase") == "allocated")
+
+
+def launch_binding(folder: Path, journal: dict) -> dict | None:
+    """launch.json follows the journal; only a prelaunch death can lack it."""
+    path = folder / "launch.json"
+    if not path.exists() and prelaunch_journal(journal):
+        return None
+    return read_private(path)
+
+
+def interrupted_cleanup_proven(journal: dict) -> bool:
+    """A lost monitor's journal whose confirmed-teardown proof still binds its contents."""
+    proof = journal.get("cleanup_reconciliation")
+    result = journal.get("result") or {}
+    return (isinstance(proof, dict) and proof.get("kind") == "interrupted_monitor"
+            and journal.get("phase") == "finished"
+            and result.get("interrupted_monitor") is True
+            and result.get("cleanup") == "observed-native-confirmed"
+            and proof.get("intent_sha256") == digest(journal.get("intent"))
+            and proof.get("owned_sha256") == digest(journal.get("owned")))
+
+
+def reconciled_not_started(folder: Path) -> bool:
+    """The attempt's monitor was lost before GO and its teardown is confirmed again now.
+
+    Such a folder keeps its journal, launch and log files as evidence, so the
+    prelaunch consumers accept it in place of an empty folder.
+    """
+    journal = folder / "native-process.json"
+    if (any(os.path.lexists(folder / name) for name in ("start.json", "result.json", "cancel"))
+            or not os.path.lexists(journal)):
+        return False
+    try:
+        value = read_private(journal)
+        receipt = reconcile_process(journal)
+    except (OSError, ValueError, KeyError):
+        return False
+    result = value.get("result") or {}
+    return (receipt.get("cleanup") == "observed-native-confirmed"
+            and result.get("interrupted_monitor") is True
+            and result.get("provider_outcome") == "not_started"
+            and prelaunch_journal(value))
+
+
 def _cancel_requested(folder: Path) -> bool:
     try:
         info = (folder / "cancel").lstat()

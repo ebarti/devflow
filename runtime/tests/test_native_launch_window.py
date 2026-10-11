@@ -1,22 +1,32 @@
 """Launch-window deaths release their capacity slot instead of leaking it (N-12)."""
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 from test_dead_native_monitor import attempt
 from test_delivery_api import api_fixture as api_fixture
 from test_delivery_prelaunch_capacity import native_role as native_role
+from test_delivery_store import _sealed_prelaunch_retry_fixture
+from test_delivery_store import service as service
 
 from devflow_temporal import delivery_native_process as native
 from devflow_temporal import supervisor
 from devflow_temporal.delivery_activities import delivery_role
 from devflow_temporal.delivery_orphans import _complete_attempt, reconcile_attempt
-from devflow_temporal.delivery_resources import private_directory, read_private
+from devflow_temporal.delivery_resources import (
+    RunResources,
+    observe_completed_resources,
+    observe_finalized_resources,
+    private_directory,
+    read_private,
+)
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.supervisor import DeliverySupervisor
 
@@ -57,7 +67,51 @@ HOOKS = {
         "    return original(path, value)\n"
         "native.write_private = write\n"
     ),
+    # The monitor dies as it reads ready.json: its gated child is alive and
+    # waiting for a GO that never comes; the journal is still "allocated".
+    "ready": (
+        "original_read = native.read_private\n"
+        "def read(path):\n"
+        "    if path.name == 'ready.json':\n"
+        "        die()\n"
+        "    return original_read(path)\n"
+        "native.read_private = read\n"
+    ),
 }
+
+
+def _lose_monitor(monkeypatch, died_at):
+    original_popen = subprocess.Popen
+    script = MONITOR_SCRIPT.format(hook=HOOKS[died_at])
+
+    def popen(argv, *args, **kwargs):
+        if argv[-1] == "devflow_temporal.delivery_native_process":
+            argv = [sys.executable, "-I", "-c", script]
+        return original_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+
+def _assert_not_started_journal(folder, died_at):
+    journal = read_private(folder / "native-process.json")
+    assert journal["phase"] == "finished" and journal["monitoring_complete"] is False
+    assert journal["result"]["provider_outcome"] == "not_started"
+    assert journal["result"]["interrupted_monitor"] is True
+    assert journal["cleanup_reconciliation"]["previous_phase"] == "allocated"
+    assert (folder / "launch.json").exists() == (died_at != "launch")
+    assert not (folder / "start.json").exists() and not (folder / "result.json").exists()
+    observed = native.process_table()
+    assert not any(observed.get(int(pid), {}).get("identity") == entry["identity"]
+                   and not observed[int(pid)]["stat"].startswith("Z")
+                   for pid, entry in journal["owned"].items())
+    if died_at == "ready":
+        ready = read_private(folder / "ready.json")
+        assert str(ready["pid"]) in journal["owned"]
+    assert native.reconcile_process(folder / "native-process.json")["cleanup"] \
+        == "observed-native-confirmed"
+    assert read_private(folder / "native-process.json") == journal
+    assert native.reconciled_not_started(folder)
+    return journal
 
 
 def _occupied(case):
@@ -80,6 +134,8 @@ def _dead_owner(case, state):
 def _assert_launch_absent(case, result):
     row = attempt(case)
     assert row["state"] == "finished" and row["cleanup"] == "confirmed"
+    # The prelaunch contract: no provider process is recorded on the row.
+    assert row["pid"] is None and row["process_identity"] is None and row["session_id"] is None
     assert _occupied(case) == 0
     assert result["status"] == "blocked" and result["finish_reason"] == "prelaunch"
     assert result["cleanup"] == "confirmed" and result["session_id"] is None
@@ -147,20 +203,49 @@ async def test_live_owner_in_its_prelaunch_window_keeps_the_slot(native_role):
 
 
 @pytest.mark.asyncio
+async def test_real_owner_paused_in_launch_window_keeps_its_slot(native_role, monkeypatch):
+    case = native_role
+    entered, release = threading.Event(), threading.Event()
+
+    def paused(request, folder):
+        # The owner is alive between its capacity claim and its first journal write.
+        entered.set()
+        assert release.wait(60)
+        return ("fixture", {"PATH": "/usr/bin:/bin"})
+
+    monkeypatch.setattr(supervisor, "prepare_native_role", paused)
+    task = asyncio.create_task(delivery_role(case.request))
+    assert await asyncio.to_thread(entered.wait, 60)
+    assert attempt(case)["state"] == "starting"
+    assert not (case.folder / "native-process.json").exists()
+    lock_path = DeliverySupervisor._owner_lock_path(case.request["spec"], case.key)
+    probe = os.open(lock_path, os.O_RDWR)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(probe)
+    # Neither a competing admission, the sweep nor the CLI may take the slot.
+    assert not await asyncio.to_thread(_admits, case, "review")
+    with pytest.raises(ValueError, match="not provably absent"):
+        _complete_attempt(case.store, case.request["spec"], attempt(case))
+    outcome = await asyncio.to_thread(reconcile_attempt, case.store, job_key=case.key)
+    assert outcome["changed"] is False and outcome["held_locks"] == ["attempt-owner"]
+    assert attempt(case)["state"] == "starting"
+    release.set()
+    result = await asyncio.wait_for(task, 60)
+    assert result["finish_reason"] == "fixture"
+    assert (case.state / "invocations").read_text().split() == ["one"]
+    assert attempt(case)["state"] == "finished"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("resolution", ["waiter", "sweep"])
-@pytest.mark.parametrize("died_at", ["spawn", "launch"])
+@pytest.mark.parametrize("died_at", ["spawn", "launch", "ready"])
 async def test_monitor_lost_before_authorization_is_launch_absent(
         native_role, monkeypatch, died_at, resolution):
     case = native_role
-    original_popen = subprocess.Popen
-    script = MONITOR_SCRIPT.format(hook=HOOKS[died_at])
-
-    def popen(argv, *args, **kwargs):
-        if argv[-1] == "devflow_temporal.delivery_native_process":
-            argv = [sys.executable, "-I", "-c", script]
-        return original_popen(argv, *args, **kwargs)
-
-    monkeypatch.setattr(subprocess, "Popen", popen)
+    _lose_monitor(monkeypatch, died_at)
     if resolution == "sweep":
         # The waiting worker is lost right after its monitor; a later sweep
         # resolves the unknown row from the journal alone.
@@ -180,22 +265,55 @@ async def test_monitor_lost_before_authorization_is_launch_absent(
     result = await delivery_role(case.request)
     row = _assert_launch_absent(case, result)
     assert len(case.created) == 1
-    journal = read_private(case.folder / "native-process.json")
-    assert journal["phase"] == "finished" and journal["monitoring_complete"] is False
-    assert journal["result"]["provider_outcome"] == "not_started"
-    assert journal["result"]["interrupted_monitor"] is True
-    assert journal["cleanup_reconciliation"]["previous_phase"] == "allocated"
-    assert (case.folder / "launch.json").exists() == (died_at == "spawn")
-    observed = native.process_table()
-    assert not any(observed.get(int(pid), {}).get("identity") == entry["identity"]
-                   and not observed[int(pid)]["stat"].startswith("Z")
-                   for pid, entry in journal["owned"].items())
-    assert native.reconcile_process(case.folder / "native-process.json")["cleanup"] \
-        == "observed-native-confirmed"
-    assert read_private(case.folder / "native-process.json") == journal
+    _assert_not_started_journal(case.folder, died_at)
     assert await delivery_role(case.request) == result
     assert attempt(case) == row
     assert _admits(case, "review")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("died_at", ["spawn", "launch", "ready"])
+async def test_monitor_lost_before_authorization_passes_automatic_retry_observation(
+        native_role, monkeypatch, died_at):
+    case = native_role
+    _lose_monitor(monkeypatch, died_at)
+    result = await delivery_role(case.request)
+    row = _assert_launch_absent(case, result)
+    _assert_not_started_journal(case.folder, died_at)
+    # Automatic retry authenticates the blocked run's attempts against their
+    # registered journals before reusing anything.
+    assert RunResources(case.request["spec"]).finalize("blocked")["outcome"] == "blocked"
+    observed = observe_completed_resources(case.request["spec"], [row])
+    assert observed["journal_sha256"]
+    assert observe_finalized_resources(case.request["spec"])["finalization_sha256"]
+
+
+@pytest.mark.parametrize("died_at", ["spawn", "launch", "ready"])
+def test_monitor_lost_before_authorization_is_retryable_prelaunch(
+        service, monkeypatch, tmp_path, died_at):
+    store, request = service
+    spec, _state, command, folder = _sealed_prelaunch_retry_fixture(store, request, monkeypatch)
+    _lose_monitor(monkeypatch, died_at)
+    # The sealed fixture run is the retry's authority; only the launch itself
+    # needs the native backend the monitor insists on.
+    authority = {**spec, "policy": {**spec["policy"], "execution_backend": "native-macos"}}
+    outcome = native.NativeProcess(
+        authority, folder, argv=[sys.executable, "-c", "pass"], cwd=tmp_path,
+        environment={"PATH": os.environ["PATH"]}, timeout=10, cancelled=lambda: False,
+    ).run()
+    assert outcome["interrupted_monitor"] is True
+    assert outcome["provider_outcome"] == "not_started"
+    _assert_not_started_journal(folder, died_at)
+    assert any(folder.iterdir())
+    # The folder keeps its evidence yet proves no provider ran: retry-prelaunch
+    # and the resumed implementer's readback both accept it.
+    response = store.retry_prelaunch(request["run_id"], command)
+    assert response["phase"] == "repair_prelaunch_retry_queued"
+    assert store.retry_prelaunch(request["run_id"], command) == response
+    with store._connect() as db:
+        run = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                         (request["run_id"],)).fetchone()
+    store.repair_preflight(spec, json.loads(run["recovery_json"]))
 
 
 def test_closed_sweep_finalizes_launch_window_attempt_and_resources(api_fixture):

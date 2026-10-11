@@ -852,7 +852,8 @@ class DeliverySupervisor:
             if outcome["cleanup"] == "unknown":
                 return self._mark_unknown(job_key, "native monitoring/provider outcome ambiguous")
             interrupted = outcome.get("interrupted_monitor") is True
-            if interrupted and outcome.get("provider_outcome") == "not_started":
+            launch_absent = interrupted and outcome.get("provider_outcome") == "not_started"
+            if launch_absent:
                 # The monitor died before authorizing its child: no provider ran,
                 # so the attempt is a retryable prelaunch failure, not a verdict.
                 result = {"status": "blocked",
@@ -928,7 +929,9 @@ class DeliverySupervisor:
                         canonical_json(result),
                         result.get("session_id"),
                         _now(),
-                        next(iter(journal["owned"]), None),
+                        # A prelaunch receipt records no provider process.
+                        None if launch_absent else next(iter(journal["owned"]), None),
+                        None if launch_absent else
                         next(iter(journal["owned"].values()), {}).get("identity"),
                         job_key,
                     ),

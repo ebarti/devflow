@@ -1246,13 +1246,16 @@ def _saved_revision_role(store, spec, context, proposal, candidate, role, *, clo
              "request_sha256": digest(request), "result_sha256": digest(result),
              "session_id": saved["session_id"]}
     if result.get("finish_reason") == "prelaunch":
+        from .delivery_native_process import reconciled_not_started
+
+        # A monitor lost before GO keeps its journal as evidence of that very fact.
         if (result.get("status") != "blocked"
                 or any(saved[k] is not None for k in ("pid", "process_identity", "session_id"))
                 or result.get("session_id") is not None or result.get("usage") is not None
-                or any(os.path.lexists(folder / name) for name in (
+                or (any(os.path.lexists(folder / name) for name in (
                     "native-process.json", "launch.json", "ready.json", "start.json",
                     "result.json", "cancel",
-                ))):
+                )) and not reconciled_not_started(folder))):
             raise ValueError("claimed prelaunch rejection retains independent launch evidence")
         return result, {**proof, "classification": "prelaunch"}
     native = result.get("native_process") or {}

@@ -12,7 +12,17 @@ from types import SimpleNamespace
 from temporalio.client import WorkflowExecutionStatus
 
 from .contracts import digest
-from .delivery_native_process import listeners, process_table, reconcile_process
+from .delivery_native_process import (
+    launch_binding as _launch_binding,
+)
+from .delivery_native_process import (
+    listeners,
+    process_table,
+    reconcile_process,
+)
+from .delivery_native_process import (
+    prelaunch_journal as _prelaunch_journal,
+)
 from .delivery_resources import RunResources, read_private
 from .supervisor import DeliverySupervisor, get_supervisor
 
@@ -28,20 +38,6 @@ def _unchanged(store, original):
     )):
         raise ValueError('closed execution changed during native cleanup')
     return dict(row)
-
-
-def _prelaunch_journal(journal):
-    """A monitor that died before authorizing its child never started a provider."""
-    return (journal.get('phase') == 'allocated'
-            or (journal.get('cleanup_reconciliation') or {}).get('previous_phase') == 'allocated')
-
-
-def _launch_binding(folder, journal):
-    # launch.json follows the journal; only a prelaunch death can lack it.
-    launch_path = folder / 'launch.json'
-    if not launch_path.exists() and _prelaunch_journal(journal):
-        return None
-    return read_private(launch_path)
 
 
 def _complete_attempt(store, spec, row, on_observed=None):

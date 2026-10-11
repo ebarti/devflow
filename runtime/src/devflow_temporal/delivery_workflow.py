@@ -160,6 +160,7 @@ class DeliveryWorkflow:
         self.original_execution = True
         self.controller_failure_boundary = False
         self.controller_spec = None
+        self.launch_window_v1 = False
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
         if self.controller_only_resource_closure and name not in {
@@ -651,14 +652,7 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], reason: str, *, cause: Exception | None = None,
         controller_cause: str | None = None,
     ) -> dict[str, Any]:
-        if any(
-            role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
-            for role in self.state["roles"]
-        ) or any(
-            isinstance(check, dict)
-            and (check.get("cleanup") == "unknown" or check.get("state") == "unknown")
-            for check in self.state["checks"].values()
-        ):
+        if self._cleanup_evidence_unknown():
             self.state["cleanup"] = "unknown"
         if self.cancel_requested:
             self.state["cleanup"] = "unknown"
@@ -676,19 +670,21 @@ class DeliveryWorkflow:
         await self._project(spec, "blocked", reason)
         return self.state
 
-    async def _cancelled(self, spec: dict[str, Any]) -> dict[str, Any]:
-        uncertain = (
-            self.state.get("cleanup") == "unknown"
-            or any(
-                role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
-                for role in self.state["roles"]
-            )
-            or any(
-                isinstance(check, dict)
-                and (check.get("cleanup") == "unknown" or check.get("state") == "unknown")
-                for check in self.state["checks"].values()
-            )
+    def _cleanup_evidence_unknown(self) -> bool:
+        return any(
+            role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
+            for role in self.state["roles"]
+        ) or any(
+            isinstance(check, dict)
+            and (check.get("cleanup") == "unknown" or (
+                check.get("state") == "unknown"
+                # A no-verdict gate with independently confirmed teardown.
+                and not (self.launch_window_v1 and check.get("cleanup") == "confirmed")))
+            for check in self.state["checks"].values()
         )
+
+    async def _cancelled(self, spec: dict[str, Any]) -> dict[str, Any]:
+        uncertain = self.state.get("cleanup") == "unknown" or self._cleanup_evidence_unknown()
         self.state["phase"] = "cancelled"
         self.state["execution_state"] = "terminal"
         self.state["outcome"] = "cancelled"
@@ -1041,6 +1037,10 @@ class DeliveryWorkflow:
     async def run(
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        # A gate whose native monitor was lost twice yields no verdict. Histories
+        # recorded without this marker keep treating that result as a failed gate.
+        self.launch_window_v1 = (workflow.patched("delivery-native-launch-window-v1")
+                                 if workflow.in_workflow() else False)
         if (spec.get("workflow_failure_boundary_version") != 1
                 or not workflow.patched("delivery-controller-failure-boundary-v1")):
             return await self._run_protocol(spec, recovery)
@@ -2159,6 +2159,8 @@ class DeliveryWorkflow:
                     )
                 self.state["checks"]["prepublish"] = prechecked
                 if prechecked.get("state") == "unknown" or prechecked.get("cleanup") == "unknown":
+                    if self.launch_window_v1 and prechecked.get("cleanup") == "confirmed":
+                        return await self._stop(spec, "prepublication gate produced no verdict")
                     return await self._stop(spec, "prepublication process cleanup is unknown")
                 if self.cancel_requested:
                     return await self._cancelled(spec)
@@ -2256,6 +2258,8 @@ class DeliveryWorkflow:
                         )
                     self.state["checks"]["local"] = checked
                     if checked.get("state") == "unknown" or checked.get("cleanup") == "unknown":
+                        if self.launch_window_v1 and checked.get("cleanup") == "confirmed":
+                            return await self._stop(spec, "local check gate produced no verdict")
                         return await self._stop(spec, "local check process cleanup is unknown")
                     if self.cancel_requested:
                         return await self._cancelled(spec)
@@ -2299,6 +2303,9 @@ class DeliveryWorkflow:
                     if browser_qa.get("cleanup") == "unknown":
                         self.state["cleanup"] = "unknown"
                         return await self._stop(spec, "browser QA child cleanup is unknown")
+                    if self.launch_window_v1 and browser_qa.get("state") == "unknown":
+                        # No verdict was produced: never spend a repair turn on it.
+                        return await self._stop(spec, "browser QA gate produced no verdict")
                     if browser_qa.get("state") != "passed":
                         if self._capture_planning_defect(spec, browser_qa):
                             return await self._stop(spec, "browser gate revealed a planning defect")
