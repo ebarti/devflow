@@ -733,7 +733,7 @@ async def test_physical_worker_death_releases_os_slot_before_orphan_cleanup(tmp_
 
 
 @pytest.mark.parametrize("stop", ["cancel", "timeout"])
-async def test_temporal_stop_reaches_native_monitor_and_frees_slot(
+async def test_temporal_cancel_or_monitor_timeout_preserves_native_slot_lifecycle(
     owned_checks, monkeypatch, tmp_path, stop,
 ):
     monkeypatch.setattr(activities.activity, "in_activity", owned_checks.in_activity)
@@ -765,11 +765,22 @@ async def test_temporal_stop_reaches_native_monitor_and_frees_slot(
             )
             if stop == "cancel":
                 await handle.cancel()
-            with pytest.raises(WorkflowFailureError):
-                await asyncio.wait_for(handle.result(), 10)
+                with pytest.raises(WorkflowFailureError):
+                    await asyncio.wait_for(handle.result(), 10)
+            else:
+                # Losing a monitor attempt does not end the durable check or
+                # free its slot while it is still running. Its replacement
+                # reattaches and returns the original check's result.
+                result = await asyncio.wait_for(handle.result(), 15)
+                assert result == {"state": "passed", "cleanup": "confirmed"}
+                history = await handle.fetch_history()
+                started = [event.activity_task_started_event_attributes
+                           for event in history.events
+                           if event.HasField("activity_task_started_event_attributes")]
+                assert started[-1].attempt > 1
             await wait_until(broker.finished.is_set)
             await following
-    assert broker.result["cancelled"] is True
+    assert broker.result["cancelled"] is (stop == "cancel")
     assert broker.result["timed_out"] is False
     assert_stopped(broker)
     assert owned_checks.maximum() == 1
