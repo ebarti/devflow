@@ -1778,7 +1778,10 @@ def _recheck_reconsideration(store, spec, context, *, candidate=None):
 
         if candidate_subject(candidate) != receipt["product_candidate"]:
             raise OwnershipConflict("fresh investigation changed product candidate custody")
-    return receipt
+    # A retry's current proof has already matched every protected receipt field.
+    # Completion must use its exact authenticated runtime, not the old install
+    # stamp; the original receipt and pre-admission budget remain immutable.
+    return proof if retry else receipt
 
 
 def _completed_reconsideration_role(store, spec, context, proposal, role):

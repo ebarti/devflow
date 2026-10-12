@@ -814,34 +814,42 @@ async def delivery_feature_revision_propose(request):
     from .delivery_activities import _run_intake, _with_heartbeat
     from .delivery_feature_revisions import record_proposal
 
-    store, payload = await _revision_role_request(request, "intake")
-    result = await _with_heartbeat(_run_intake(payload), payload, "feature_revision_intake")
-    if result.get("status") != "plan" or result.get("cleanup") != "confirmed":
-        return {**result, "status": "blocked"}
-    receipt = await asyncio.to_thread(
-        record_proposal, store, request["spec"], request["context"]["revision_id"],
-        result["plan"], diagnostic=result.get("diagnostic"),
-    )
-    return {**result, "proposal_receipt": receipt}
+    async def execute():
+        store, payload = await _revision_role_request(request, "intake")
+        result = await _run_intake(payload)
+        if result.get("status") != "plan" or result.get("cleanup") != "confirmed":
+            return {**result, "status": "blocked"}
+        receipt = await asyncio.to_thread(
+            record_proposal, store, request["spec"], request["context"]["revision_id"],
+            result["plan"], diagnostic=result.get("diagnostic"),
+        )
+        return {**result, "proposal_receipt": receipt}
+
+    # Authentication and durable result admission can each outlive a heartbeat
+    # lease, so cover the whole operation rather than only the native role.
+    return await _with_heartbeat(execute(), request, "feature_revision_intake")
 
 
 @activity.defn(name="delivery_feature_revision_review")
 async def delivery_feature_revision_review(request):
     from .delivery_activities import _run_role, _with_heartbeat
 
-    _, payload = await _revision_role_request(request, "review")
-    result = await _with_heartbeat(_run_role(payload), payload, "feature_revision_review")
-    proposal_session = request["proposal_session_id"]
-    if (result.get("cleanup") != "confirmed"
-            or result.get("candidate") != request["candidate"]
-            or request["spec"]["provider"] == "codex" and (
-                not proposal_session or not result.get("session_id")
-                or result["session_id"] == proposal_session)):
-        result = {**result, "status": "blocked", "findings": [
-            "revision review lacks independent session, exact candidate or confirmed cleanup"],
-        }
-    return {**result, "proposal_session_id": proposal_session,
-            "candidate_id": request["candidate"]["id"]}
+    async def execute():
+        _, payload = await _revision_role_request(request, "review")
+        result = await _run_role(payload)
+        proposal_session = request["proposal_session_id"]
+        if (result.get("cleanup") != "confirmed"
+                or result.get("candidate") != request["candidate"]
+                or request["spec"]["provider"] == "codex" and (
+                    not proposal_session or not result.get("session_id")
+                    or result["session_id"] == proposal_session)):
+            result = {**result, "status": "blocked", "findings": [
+                "revision review lacks independent session, exact candidate or confirmed cleanup"],
+            }
+        return {**result, "proposal_session_id": proposal_session,
+                "candidate_id": request["candidate"]["id"]}
+
+    return await _with_heartbeat(execute(), request, "feature_revision_review")
 
 
 @activity.defn(name="delivery_feature_revision_adopt")
