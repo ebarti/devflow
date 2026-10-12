@@ -79,6 +79,7 @@ class DeliveryService(unittest.TestCase):
         data = plistlib.loads(path.read_bytes())
         self.assertEqual(data["ProgramArguments"],
                          [str(self.entry), "--config", str(self.config), "supervise"])
+        self.assertEqual(data["DevflowRuntime"], str(self.runtime))
         self.assertEqual(data["ProcessType"], "Standard")
         self.assertEqual(data["KeepAlive"], {"SuccessfulExit": False})
         self.assertTrue(data["RunAtLoad"])
@@ -186,6 +187,58 @@ class DeliveryService(unittest.TestCase):
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertIn("Uninstall the launchd agent", refused.stderr)
         self.assertIn(f"uninstall --config {self.config}", refused.stderr)
+
+    def test_install_records_the_runtime_behind_a_canonical_launcher(self):
+        # install-delivery-launchers.py links bin/devflow-delivery to a journal
+        # entry that execs the checkout's venv entry: argv[0] never names the checkout.
+        journal = self.root / "launchers/share/devflow/delivery-launchers/cmd-1"
+        (journal / "entries").mkdir(parents=True)
+        (journal / "manifest.json").write_text(json.dumps({"runtime_dir": str(self.runtime)}))
+        wrapper = fake_executable(
+            journal / "entries/devflow-delivery",
+            "#!/bin/sh\n# Canonical delivery entry; devflow aliases devflow-delivery.\n"
+            f"exec '{self.entry}' --config '{self.config}' \"$@\"\n")
+        link = self.root / "launchers/bin/devflow-delivery"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(wrapper)
+        launcher_args = ["install", "--config", self.config, "--devflow-delivery", link,
+                         "--temporal", self.temporal]
+        installed = self.script(*launcher_args)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        staged = Path(json.loads(installed.stdout)["staged"])
+        data = plistlib.loads(staged.read_bytes())
+        self.assertEqual(data["ProgramArguments"][0], str(wrapper))
+        self.assertEqual(data["DevflowRuntime"], str(self.runtime))
+        # Activated (copied, no launchctl), the agent counts against this checkout only.
+        self.agents.mkdir(parents=True)
+        shutil.copyfile(staged, self.agents / (data["Label"] + ".plist"))
+        blocking = self.script("active", "--runtime", self.runtime)
+        self.assertEqual(blocking.returncode, 3, blocking.stderr)
+        self.assertEqual([item["runtime"] for item in json.loads(blocking.stdout)],
+                         [str(self.runtime)])
+        elsewhere = self.root / "elsewhere/runtime"
+        self.assertEqual(self.script("active", "--runtime", elsewhere).stdout.strip(), "[]")
+        # Without the journal, the wrapper's exec target names the checkout; a
+        # wrapper bound to another configuration is refused.
+        (journal / "manifest.json").unlink()
+        again = self.script(*launcher_args)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(plistlib.loads(Path(json.loads(again.stdout)["staged"]).read_bytes())[
+            "DevflowRuntime"], str(self.runtime))
+        other = fake_executable(
+            journal / "entries/other",
+            f"#!/bin/sh\nexec '{self.entry}' --config '{self.root}/other.json' \"$@\"\n")
+        refused = self.script("install", "--config", self.config, "--devflow-delivery", other,
+                              "--temporal", self.temporal)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("bound to another configuration", refused.stderr)
+        # An agent that names no runtime blocks every upgrade.
+        unknown = {key: value for key, value in data.items() if key != "DevflowRuntime"}
+        unknown["Label"] = PREFIX + "unknown00000"
+        (self.agents / (unknown["Label"] + ".plist")).write_bytes(plistlib.dumps(unknown))
+        self.assertEqual([item["label"] for item in
+                          json.loads(self.script("active", "--runtime", elsewhere).stdout)],
+                         [unknown["Label"]])
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -107,9 +108,43 @@ def write_private(path, content):
     staged.replace(path)
 
 
+def supervised_runtime(entry, config, explicit=None):
+    """The runtime checkout the agent's entry point runs.
+
+    The canonical launcher links ``devflow-delivery`` to a wrapper under its
+    journal that execs ``<checkout>/runtime/.venv/bin/devflow-delivery``: the
+    journal names the runtime and the wrapper names its exec target, so argv[0]
+    never does. A bare entry lives in that ``.venv``. ``--runtime`` names the
+    checkout when none of those apply.
+    """
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    journal = entry.parent.parent / "manifest.json"
+    if entry.parent.name == "entries" and journal.is_file():
+        recorded = json.loads(journal.read_text(encoding="utf-8")).get("runtime_dir")
+        if isinstance(recorded, str) and recorded:
+            return Path(recorded).resolve()
+    head = entry.read_bytes()[:4096]
+    if head.startswith(b"#!"):
+        for line in head.decode(errors="replace").splitlines():
+            if not line.startswith("exec "):
+                continue
+            words = shlex.split(line[len("exec "):])
+            if "--config" in words and Path(words[words.index("--config") + 1]).resolve() != config:
+                raise ValueError(f"{entry} is bound to another configuration: "
+                                 f"{words[words.index('--config') + 1]}")
+            target = Path(words[0]) if words else Path()
+            if target.parent.name == "bin" and target.parent.parent.name == ".venv":
+                return target.parents[2].resolve()
+    if entry.parent.name == "bin" and entry.parent.parent.name == ".venv":
+        return entry.parents[2].resolve()
+    raise ValueError(f"supply --runtime: the runtime checkout {entry} runs cannot be derived")
+
+
 def agent(args, name, config, data, state_root):
     entry = executable(args.devflow_delivery or shutil.which("devflow-delivery")
                        or str(ROOT / "runtime/.venv/bin/devflow-delivery"), "devflow-delivery")
+    runtime = supervised_runtime(entry, config, args.runtime)
     temporal = executable(args.temporal or data.get("temporal_bin") or shutil.which("temporal"),
                           "Temporal CLI")
     private_directory(state_root)
@@ -123,6 +158,9 @@ def agent(args, name, config, data, state_root):
     search += [item for item in os.environ.get("PATH", "").split(os.pathsep) if item]
     search += ["/usr/bin", "/bin"]
     return {"Label": name, "DevflowManaged": True, "DevflowConfig": str(config),
+            # The checkout this agent would relaunch a worker from; upgrades of
+            # that checkout refuse while the agent is active.
+            "DevflowRuntime": str(runtime),
             "ProgramArguments": [str(entry), "--config", str(config), "supervise"],
             "EnvironmentVariables": {"PATH": os.pathsep.join(dict.fromkeys(search))},
             "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False},
@@ -194,7 +232,11 @@ def uninstall(args, name, staged, active):
 
 
 def active_agents(launch_agents, runtime):
-    """Activated Devflow delivery agents whose entry point lives under ``runtime``."""
+    """Activated Devflow delivery agents that supervise a stack from ``runtime``.
+
+    An agent that recorded no runtime is reported for every checkout: refusing
+    an upgrade beats relaunching a worker from changed source.
+    """
     runtime = Path(runtime).expanduser().resolve()
     folder = Path(launch_agents).expanduser()
     found = []
@@ -203,10 +245,13 @@ def active_agents(launch_agents, runtime):
             data = owned(path)
         except ValueError:
             continue
-        arguments = data.get("ProgramArguments") or [""]
-        if Path(arguments[0]).parent.resolve().is_relative_to(runtime):
-            found.append({"service": str(path), "label": data.get("Label"),
-                          "config": data.get("DevflowConfig")})
+        recorded = data.get("DevflowRuntime")
+        if isinstance(recorded, str) and recorded:
+            supervised = Path(recorded).resolve()
+            if supervised != runtime and not supervised.is_relative_to(runtime):
+                continue
+        found.append({"service": str(path), "label": data.get("Label"),
+                      "config": data.get("DevflowConfig"), "runtime": recorded})
     return found
 
 
@@ -222,6 +267,8 @@ def main():
     setting.add_argument("--config", required=True, help="absolute delivery service configuration")
     setting.add_argument("--devflow-delivery", help="absolute devflow-delivery executable")
     setting.add_argument("--temporal", help="absolute Temporal CLI executable")
+    setting.add_argument("--runtime", help="runtime checkout the entry runs; derived from the "
+                         "canonical launcher's journal or wrapper, or the entry's .venv, when omitted")
     setting.add_argument("--interval", type=int, default=60,
                          help="seconds between supervised start passes")
     setting.add_argument("--activate", action="store_true",
