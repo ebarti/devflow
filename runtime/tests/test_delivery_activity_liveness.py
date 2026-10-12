@@ -136,9 +136,11 @@ async def test_blocking_intake_preparation_keeps_heartbeating(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('outcome,expected_attempts', [
-    ('transient', 3), ('permanent', 1), ('eventual', 2), ('findings', 1),
+    ('transient', 4), ('permanent', 1), ('eventual', 2), ('findings', 1),
 ])
-async def test_temporal_retries_are_finite_and_preserve_gate_outcomes(outcome, expected_attempts):
+async def test_monitor_retries_outlast_capacity_wait_and_preserve_gate_outcomes(
+    outcome, expected_attempts,
+):
     attempts = []
 
     @activity.defn(name='delivery_role')
@@ -147,8 +149,9 @@ async def test_temporal_retries_are_finite_and_preserve_gate_outcomes(outcome, e
         attempts.append(attempt)
         if outcome == 'permanent':
             raise ValueError('invalid role input')
-        if outcome == 'transient' or outcome == 'eventual' and attempt == 1:
-            raise RuntimeError('temporary transport failure')
+        if ((outcome == 'transient' and attempt <= 3)
+                or (outcome == 'eventual' and attempt == 1)):
+            raise ConnectionError('temporary transport failure')
         return {'status': 'findings' if outcome == 'findings' else 'pass'}
 
     async with await WorkflowEnvironment.start_local(
@@ -162,11 +165,11 @@ async def test_temporal_retries_are_finite_and_preserve_gate_outcomes(outcome, e
                     'request': {'spec': {'policy': {'execution_backend': 'native-macos'}}},
                 }, id='retry-bound', task_queue='activity-retry-bound',
             )
-            if outcome in {'transient', 'permanent'}:
+            if outcome == 'permanent':
                 with pytest.raises(WorkflowFailureError):
-                    await handle.result()
+                    await asyncio.wait_for(handle.result(), 30)
             else:
-                result = await handle.result()
+                result = await asyncio.wait_for(handle.result(), 30)
                 assert result['status'] == ('findings' if outcome == 'findings' else 'pass')
             history = await handle.fetch_history()
             await Replayer(workflows=[ActivityLivenessWorkflow]).replay_workflow(history)
@@ -455,7 +458,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             await _wait_for_fixture_worker_ready(workers[0], tmp_path / 'first-worker.log')
             handle = await environment.client.start_workflow(
                 ActivityLivenessWorkflow.run, {'activity_name': name, 'request': request,
-                    **({'hours': 40/3600} if interruption == 'deadline' else {})},
+                    **({'hours': 12/3600} if interruption == 'deadline' else {})},
                 id='worker-loss', task_queue='activity-worker-loss',
             )
             await _wait_for_fixture_native_start(
@@ -473,9 +476,22 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
                 while not (state / 'stall-started').exists():
                     assert time.monotonic()<deadline
                     await asyncio.sleep(0.05)
-            elif interruption in {'deadline', 'terminate'}:
-                if interruption == 'terminate':
-                    await handle.terminate(reason='Fixture closes without a replacement activity')
+            elif interruption == 'deadline':
+                # An attempt deadline must replace only the monitor. Capacity
+                # waiting has no total deadline and the native command remains
+                # the same durable job, including after the first timeout.
+                deadline = time.monotonic() + 30
+                while True:
+                    description = await handle.describe()
+                    pending = description.raw_description.pending_activities
+                    if pending and pending[0].attempt >= 2:
+                        break
+                    assert time.monotonic() < deadline
+                    await asyncio.sleep(0.1)
+                assert workers[0].poll() is None
+                assert (state / 'invocations').read_text().splitlines() == ['one']
+            elif interruption == 'terminate':
+                await handle.terminate(reason='Fixture closes without a replacement activity')
                 try:
                     early = await asyncio.wait_for(handle.result(), 55)
                 except WorkflowFailureError:
