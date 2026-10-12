@@ -179,10 +179,15 @@ def _interrupted_role(roles: list[dict[str, Any]]) -> str | None:
 def _broker_findings(stage: str, result: dict[str, Any], *, iteration: int) -> list[str]:
     """Give a repair role bounded, candidate-bound broker diagnostics as data."""
 
+    evidence_feedback = not workflow.in_workflow() or workflow.patched(
+        "broker-evidence-failure-feedback-v1"
+    )
+
     def bounded_check(item: dict[str, Any]) -> dict[str, Any]:
         argv = item.get("argv")
         return {
-            key: (value[:1000] if key == "diagnostic" and isinstance(value, str) else value)
+            key: (value[:1000] if key in {"diagnostic", "evidence_failure"}
+                  and isinstance(value, str) else value)
             for key, value in (
                 ("id", item.get("id")),
                 ("argv", [arg[:200] for arg in argv[:10]] if isinstance(argv, list) else None),
@@ -190,10 +195,12 @@ def _broker_findings(stage: str, result: dict[str, Any], *, iteration: int) -> l
                 ("test_count", item.get("test_count")),
                 ("rejected_output", item.get("rejected_output")),
                 ("rejection_causes", _bounded_causes(item)),
+                ("evidence_failure", item.get("evidence_failure")),
                 ("log", str(item.get("log", ""))[:1000]),
                 ("log_sha256", item.get("log_sha256")),
                 ("diagnostic", item.get("diagnostic")),
             )
+            if key != "evidence_failure" or evidence_feedback and isinstance(value, str)
         }
 
     summary = {
@@ -214,16 +221,19 @@ def _broker_findings(stage: str, result: dict[str, Any], *, iteration: int) -> l
     else:
         summary.update(
             {
-                key: (value[:1000] if key == "diagnostic" and isinstance(value, str) else value)
+                key: (value[:1000] if key in {"diagnostic", "evidence_failure"}
+                      and isinstance(value, str) else value)
                 for key, value in (
                     ("exit_code", result.get("exit_code")),
                     ("test_count", result.get("test_count")),
                     ("rejected_output", result.get("rejected_output")),
                     ("rejection_causes", _bounded_causes(result)),
+                    ("evidence_failure", result.get("evidence_failure")),
                     ("log", str(result.get("log", ""))[:1000]),
                     ("log_sha256", result.get("log_sha256")),
                     ("diagnostic", result.get("diagnostic")),
                 )
+                if key != "evidence_failure" or evidence_feedback and isinstance(value, str)
             }
         )
     return [
