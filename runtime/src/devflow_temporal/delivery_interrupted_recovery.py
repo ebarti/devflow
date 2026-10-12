@@ -14,9 +14,11 @@ from pathlib import Path
 from temporalio.api.common.v1 import WorkflowExecution
 from temporalio.api.enums.v1 import ResetReapplyType, WorkflowTaskFailedCause
 from temporalio.api.workflowservice.v1 import ResetWorkflowExecutionRequest
+from temporalio.common import RetryPolicy, WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
 from .contracts import digest
 from .delivery_closures import closure_facts, history_sha256, seal
+from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_preparation import execution_retired
 from .payload import payload_digest
 
@@ -65,6 +67,11 @@ def _record(store, row, kind, payload):
             ),
             payload,
         )
+        if kind == RESULT:
+            db.execute(
+                "DELETE FROM delivery_closure_observations WHERE workflow_id=?",
+                (payload["workflow_id"],),
+            )
 
 
 def _guard(store, row, spec):
@@ -168,8 +175,23 @@ def _resume_point(history):
             )
         )
     ]
+    # A workflow that expired while queued has never run application code. Only
+    # its start, queue and close events may exist; start those exact inputs again.
     if not points:
-        raise ValueError("interrupted execution has no workflow task to resume")
+        if any(
+            not any(
+                event.HasField(field)
+                for field in (
+                    "workflow_execution_started_event_attributes",
+                    "workflow_task_scheduled_event_attributes",
+                    "workflow_execution_timed_out_event_attributes",
+                    "workflow_execution_terminated_event_attributes",
+                )
+            )
+            for event in history.events
+        ):
+            raise ValueError("interrupted execution has no safe workflow task to resume")
+        return None
     return max(points)
 
 
@@ -188,7 +210,7 @@ async def recover_interrupted(store, client, row, spec, description):
             history = await client.get_workflow_handle(
                 description.id, run_id=description.run_id
             ).fetch_history()
-            if not any(
+            linked = any(
                 event.HasField("workflow_task_failed_event_attributes")
                 and event.workflow_task_failed_event_attributes.cause
                 == WorkflowTaskFailedCause.WORKFLOW_TASK_FAILED_CAUSE_RESET_WORKFLOW
@@ -197,7 +219,14 @@ async def recover_interrupted(store, client, row, spec, description):
                 and event.workflow_task_failed_event_attributes.new_run_id == description.run_id
                 and event.event_id == prior["resume_event_id"]
                 for event in history.events
-            ):
+            )
+            if prior["resume_event_id"] is None:
+                started = history.events[0].workflow_execution_started_event_attributes
+                marker = started.memo.fields.get("interrupted_recovery_key")
+                linked = bool(
+                    marker and (await DELIVERY_DATA_CONVERTER.decode([marker]))[0] == prior["key"]
+                )
+            if not linked:
                 raise ValueError("new execution is not the requested recovery")
             await asyncio.to_thread(
                 _record, store, row, RESULT, {**prior, "recovered_run_id": description.run_id}
@@ -268,20 +297,41 @@ async def recover_interrupted(store, client, row, spec, description):
     if fresh.run_id != description.run_id or fresh.status != description.status:
         raise ValueError("current execution changed before recovery dispatch")
     await asyncio.to_thread(_record, store, row, INTENT, prior)
-    response = await client.workflow_service.reset_workflow_execution(
-        ResetWorkflowExecutionRequest(
-            namespace=client.namespace,
-            workflow_execution=WorkflowExecution(
-                workflow_id=description.id, run_id=description.run_id
+    if prior["resume_event_id"] is None:
+        start = history.events[0].workflow_execution_started_event_attributes
+        memo = {
+            key: (await DELIVERY_DATA_CONVERTER.decode([value]))[0]
+            for key, value in start.memo.fields.items()
+        }
+        restarted = await client.start_workflow(
+            "DevflowDeliveryWorkflow",
+            args=inputs,
+            id=description.id,
+            task_queue=start.task_queue.name,
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+            id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+            execution_timeout=start.workflow_execution_timeout.ToTimedelta() or None,
+            run_timeout=start.workflow_run_timeout.ToTimedelta() or None,
+            memo={**memo, "interrupted_recovery_key": prior["key"]},
+        )
+        recovered_run_id = restarted.result_run_id
+    else:
+        response = await client.workflow_service.reset_workflow_execution(
+            ResetWorkflowExecutionRequest(
+                namespace=client.namespace,
+                workflow_execution=WorkflowExecution(
+                    workflow_id=description.id, run_id=description.run_id
+                ),
+                workflow_task_finish_event_id=prior["resume_event_id"],
+                request_id=prior["key"],
+                reason="Devflow interrupted-controller recovery; existing repair budget retained",
+                reset_reapply_type=ResetReapplyType.RESET_REAPPLY_TYPE_ALL_ELIGIBLE,
             ),
-            workflow_task_finish_event_id=prior["resume_event_id"],
-            request_id=prior["key"],
-            reason="Devflow interrupted-controller recovery; existing repair budget retained",
-            reset_reapply_type=ResetReapplyType.RESET_REAPPLY_TYPE_ALL_ELIGIBLE,
-        ),
-        retry=False,
-    )
+            retry=False,
+        )
+        recovered_run_id = response.run_id
     await asyncio.to_thread(
-        _record, store, row, RESULT, {**prior, "recovered_run_id": response.run_id}
+        _record, store, row, RESULT, {**prior, "recovered_run_id": recovered_run_id}
     )
-    return {"state": "execution_recovered", "execution_run_id": response.run_id}
+    return {"state": "execution_recovered", "execution_run_id": recovered_run_id}

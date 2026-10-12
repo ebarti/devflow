@@ -240,13 +240,31 @@ def _write_sealed(root: Path, data: bytes) -> str:
     return sha256
 
 
-def sealed_record(store, workflow_id: str) -> dict[str, Any] | None:
+def sealed_record(
+    store, workflow_id: str, *, execution_run_id: str | None = None,
+) -> dict[str, Any] | None:
     with store._connect() as db:
+        if execution_run_id is None:
+            intents = [json.loads(row[0]) for row in db.execute(
+                "SELECT payload_json FROM delivery_events WHERE "
+                "type='interrupted_execution_recovery_requested' AND "
+                "json_extract(payload_json,'$.workflow_id')=? ORDER BY sequence", (workflow_id,))]
+            results = [json.loads(row[0]) for row in db.execute(
+                "SELECT payload_json FROM delivery_events WHERE "
+                "type='interrupted_execution_recovered' AND "
+                "json_extract(payload_json,'$.workflow_id')=? ORDER BY sequence", (workflow_id,))]
+            if any(not any(result['key'] == intent['key'] for result in results)
+                   for intent in intents):
+                raise ValueError('controller recovery response is still unconfirmed')
+            if results:
+                execution_run_id = results[-1]['recovered_run_id']
         rows = db.execute(
-            "SELECT * FROM delivery_closures WHERE workflow_id=?", (workflow_id,),
+            "SELECT * FROM delivery_closures WHERE workflow_id=?" +
+            (" AND execution_run_id=?" if execution_run_id else ""),
+            (workflow_id, execution_run_id) if execution_run_id else (workflow_id,),
         ).fetchall()
     if len(rows) > 1:
-        raise ValueError(f"several sealed executions share workflow {workflow_id}")
+        raise ValueError(f"several unselected sealed executions share workflow {workflow_id}")
     return dict(rows[0]) if rows else None
 
 
@@ -276,18 +294,33 @@ def seal(
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         existing = db.execute(
-            "SELECT * FROM delivery_closures WHERE workflow_id=?", (record["workflow_id"],),
+            "SELECT * FROM delivery_closures WHERE workflow_id=? AND execution_run_id=?",
+            (record["workflow_id"], record["execution_run_id"]),
         ).fetchone()
         if existing is not None:
             existing = dict(existing)
-            # Delivery workflow IDs are never reused (REJECT_DUPLICATE), so a workflow
-            # has exactly one closed execution; anything else is refused, not shadowed.
+            # Repeated observation of one execution must preserve its exact bytes.
             if (existing["execution_run_id"] != record["execution_run_id"]
                     or existing["history_sha256"] != sha256 or existing["run_id"] != run_id):
                 raise SealConflict(
                     f"a different history is already sealed for workflow {record['workflow_id']}"
                 )
             return existing
+        predecessors = db.execute("SELECT * FROM delivery_closures WHERE workflow_id=?",
+                                  (record["workflow_id"],)).fetchall()
+        if predecessors:
+            # Only our authenticated recovery receipt permits another execution
+            # under the same workflow ID. Retain every predecessor unchanged.
+            receipts = [json.loads(row[0]) for row in db.execute(
+                "SELECT payload_json FROM delivery_events WHERE run_id=? AND "
+                "type='interrupted_execution_recovered'", (run_id,))]
+            if not any(receipt.get('workflow_id') == record['workflow_id']
+                       and receipt.get('recovered_run_id') == record['execution_run_id']
+                       and any(old['execution_run_id'] == receipt.get('execution_run_id')
+                               and old['history_sha256'] == receipt.get('history_sha256')
+                               and old['run_id'] == run_id for old in predecessors)
+                       for receipt in receipts):
+                raise SealConflict('a different history has no authenticated recovery receipt')
         db.execute(
             f"INSERT INTO delivery_closures ({','.join(record)}) "
             f"VALUES ({','.join('?' for _ in record)})",
@@ -300,9 +333,10 @@ def seal(
     return record
 
 
-async def sealed_closure(store, workflow_id: str) -> dict[str, Any] | None:
+async def sealed_closure(store, workflow_id: str, *,
+                         execution_run_id: str | None = None) -> dict[str, Any] | None:
     """Rebuild the closure a live describe/result would return, from the sealed copy."""
-    record = sealed_record(store, workflow_id)
+    record = sealed_record(store, workflow_id, execution_run_id=execution_run_id)
     if record is None:
         return None
     data = _read_sealed(_private_root(store), record["history_sha256"])
@@ -442,7 +476,13 @@ def _due_candidates(store, limit: int) -> list[dict[str, Any]]:
                FROM delivery_runs r JOIN delivery_outbox o ON o.run_id = r.run_id
                WHERE o.state = 'sent'
                  AND NOT EXISTS (SELECT 1 FROM delivery_closures c
-                     WHERE c.workflow_id = COALESCE(r.workflow_id, 'delivery-' || r.run_id))
+                     WHERE c.workflow_id = COALESCE(r.workflow_id, 'delivery-' || r.run_id)
+                       AND c.execution_run_id = COALESCE((
+                           SELECT json_extract(e.payload_json,'$.recovered_run_id')
+                           FROM delivery_events e WHERE e.run_id=r.run_id
+                             AND e.type='interrupted_execution_recovered'
+                             AND json_extract(e.payload_json,'$.workflow_id')=c.workflow_id
+                           ORDER BY e.sequence DESC LIMIT 1), c.execution_run_id))
                  AND NOT EXISTS (SELECT 1 FROM delivery_closure_observations b
                      WHERE b.workflow_id = COALESCE(r.workflow_id, 'delivery-' || r.run_id)
                        AND (b.state = 'expired' OR b.next_check_at > ?))
