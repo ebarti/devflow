@@ -326,15 +326,35 @@ def _validate(proof: dict, identity: dict, state_root: Path) -> None:
             raise PreparationError("native recursive-command probe lacks a valid PATH control")
 
 
+# Recorded for provenance only in trusted-local mode, whose proof claims no
+# sandbox denials: a macOS update changes the reported version without changing the
+# measured launcher, interpreter, dependencies or Codex binary, so pinning it stopped
+# every in-flight run. native-profile keeps it pinned because its proof measures
+# Seatbelt-enforced denials, for which the OS is an input.
+RECORDED_ONLY = frozenset({"os_version"})
+
+
+def recorded_only(spec: dict) -> frozenset:
+    trusted = spec.get("policy", {}).get("host_sandbox") == "trusted-local"
+    return RECORDED_ONLY if trusted else frozenset()
+
+
+def pinned_identity(identity: dict, spec: dict, *ignored: str) -> dict:
+    skip = recorded_only(spec) | set(ignored)
+    return {key: value for key, value in identity.items() if key not in skip}
+
+
 def verify_native_spec(spec: dict) -> None:
     prepared = spec.get("preparation", {})
     if not isinstance(prepared, dict) or prepared.get("schema") != SCHEMA:
         raise PreparationError("native execution authority has not been frozen or changed")
     identity = native_identity(spec)
     frozen = spec["policy"].get("native_identity", {})
+    if identity != frozen and pinned_identity(identity, spec) == pinned_identity(frozen, spec):
+        identity = frozen
     if identity != frozen and (
-        {k: v for k, v in identity.items() if k != "runtime_payload_sha256"}
-        == {k: v for k, v in frozen.items() if k != "runtime_payload_sha256"}
+        pinned_identity(identity, spec, "runtime_payload_sha256")
+        == pinned_identity(frozen, spec, "runtime_payload_sha256")
     ):
         if spec["policy"].get("host_sandbox") == "trusted-local":
             from .delivery_broker import _git
@@ -345,7 +365,11 @@ def verify_native_spec(spec: dict) -> None:
                 revision = _git(source, "rev-parse", "HEAD")
                 if (
                     Path(_git(source, "rev-parse", "--show-toplevel")).resolve() != source
-                    or _git(source, "status", "--porcelain", "--untracked-files=all")
+                    # runtime/src is the import root (editable install), so an untracked
+                    # module there (e.g. sitecustomize.py) could run; editor or tool
+                    # directories elsewhere in the checkout cannot change the runtime.
+                    or _git(source, "status", "--porcelain", "--untracked-files=all",
+                            "--", str(PACKAGE.parent.relative_to(source)))
                     or _historical_payload(str(source), revision)
                     != identity["runtime_payload_sha256"]
                 ):

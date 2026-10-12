@@ -593,7 +593,13 @@ class DeliveryBroker:
                 from .delivery_preparation import verify_prepared_spec
                 from .delivery_sandbox import native_check_argv, prepare_native_check
 
-                verify_prepared_spec(self.spec)
+                try:
+                    verify_prepared_spec(self.spec)
+                except Exception as exc:
+                    # Nothing launched: report the unverifiable native authority with
+                    # confirmed cleanup instead of an unknown process teardown.
+                    raise CheckPreparationFailure(
+                        "native-execution-authority", exc, results) from exc
                 try:
                     profile, environment = prepare_native_check(
                         self.spec, checkout, evidence_dir, check,
@@ -1032,7 +1038,10 @@ class DeliveryBroker:
         from .delivery_resources import RunResources, private_directory, read_private, write_private
         from .delivery_sandbox import native_check_argv, prepare_native_check
 
-        verify_prepared_spec(self.spec)
+        try:
+            verify_prepared_spec(self.spec)
+        except Exception as exc:
+            raise CheckPreparationFailure("native-execution-authority", exc) from exc
         provenance = {}
         manager, inputs = frozen_pnpm_inputs(self.spec, checkout, provenance=provenance)
         resources = RunResources(self.spec)
