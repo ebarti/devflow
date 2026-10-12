@@ -467,10 +467,18 @@ async def test_closed_projection_refuses_tampering_newer_row_and_unknown_cleanup
 
     original_row = row()
     original_state, original_history = copy.deepcopy(state), copy.deepcopy(history)
+    client.namespace = store.config.raw.get("temporal_namespace", "default")
+    client.service_client = SimpleNamespace(config=SimpleNamespace(
+        target_host=store.config.temporal_address))
     for status in (WorkflowExecutionStatus.FAILED, WorkflowExecutionStatus.TIMED_OUT,
                    WorkflowExecutionStatus.RUNNING):
         description.status = status
-        assert (await reconcile_projection(store, client, row()))["state"] == "not_completed"
+        if status == WorkflowExecutionStatus.RUNNING:
+            assert (await reconcile_projection(store, client, row()))["state"] == "not_completed"
+        else:
+            # A completed-history fixture cannot authorize an interrupted reset.
+            with pytest.raises(ValueError):
+                await reconcile_projection(store, client, row())
         assert row() == original_row
     description.status = WorkflowExecutionStatus.COMPLETED
     for change in ("memo", "input", "result", "request", "failed", "execution", "newer"):

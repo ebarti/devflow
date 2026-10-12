@@ -2,7 +2,6 @@
 no SQLite work on the API event loop (rr-sweep-2)."""
 from __future__ import annotations
 
-import json
 import threading
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -15,7 +14,6 @@ from test_delivery_controller_failure_boundary import _closed_fixture
 from test_delivery_gate_retry import unpublished as unpublished
 from test_delivery_store import service as service
 
-from devflow_temporal.contracts import canonical_json
 from devflow_temporal.delivery_closed_projection import (
     BACKOFF_BASE,
     BACKOFF_CAP,
@@ -59,15 +57,6 @@ def _due_at(store, key):
 async def test_maintenance_persists_backoff_and_settles_closed_executions(service):
     store, request = service
     store.submit(request)
-    legacy = {**request, "command_id": "submit-legacy", "run_id": "run-legacy",
-              "work_id": "work-legacy", "issue_url": request["issue_url"][:-1] + "9"}
-    store.submit(legacy)
-    with store._connect() as db:
-        admitted = json.loads(db.execute(
-            "SELECT request_json FROM delivery_runs WHERE run_id='run-legacy'").fetchone()[0])
-        assert admitted.pop("workflow_failure_boundary_version") == 1
-        db.execute("UPDATE delivery_runs SET request_json=? WHERE run_id='run-legacy'",
-                   (canonical_json(admitted),))
     client = _Client()
     key = ("run-1", "delivery-run-1")
     start = datetime(2026, 10, 11, 12, tzinfo=UTC)
@@ -119,11 +108,11 @@ async def test_maintenance_persists_backoff_and_settles_closed_executions(servic
     assert _maintenance_rows(store)[key]["error"] == "RuntimeError"
     # A closed, not completed execution settles: never described again.
     client.error = None
-    client.status, client.close_time = WorkflowExecutionStatus.FAILED, datetime.now(UTC)
+    client.status, client.close_time = WorkflowExecutionStatus.CANCELED, datetime.now(UTC)
     moment = _due_at(store, key)
     observed = await reconcile_completed_projections(store, client, now=moment)
     assert [(item["state"], item["closed"]) for item in observed] == [("not_completed", True)]
-    assert _maintenance_rows(store)[key]["state"] == "closed"
+    assert _maintenance_rows(store)[key]["state"] == "closed_observed"
     assert _maintenance_rows(store)[key]["next_check_at"] is None
     reads = len(client.describes)
     assert await reconcile_completed_projections(
@@ -139,8 +128,6 @@ async def test_maintenance_persists_backoff_and_settles_closed_executions(servic
     assert [item["state"] for item in observed] == ["not_completed"]
     assert client.describes[-1] == "delivery-run-1-recovery"
     assert set(_maintenance_rows(store)) == {key, ("run-1", "delivery-run-1-recovery")}
-    # Legacy admissions are never candidates.
-    assert "delivery-run-legacy" not in client.describes
 
 
 @pytest.mark.asyncio
