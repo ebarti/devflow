@@ -76,6 +76,16 @@ describe('workflow board and controls', () => {
     expect(select).toHaveBeenCalledWith('newer-run')
   })
 
+  it('keeps a merged issue visibly merged even when its latest attempt stopped earlier', () => {
+    const run = { ...mockRun, outcome: 'blocked', execution_state: 'blocked', feature: {
+      issue: 'https://github.com/o/r/issues/1', run_id: mockRun.id, status: 'Merged', version: 4, pull_requests: [],
+    } }
+    render(<RunBoard runs={[run]} archived={false} onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
+    const lane = screen.getByRole('region', { name: 'Merged column' })
+    expect(lane.querySelector('.task-card__status')?.textContent).toBe('Merged')
+    expect(lane.textContent).toContain('Last attempt: Failed')
+  })
+
   it('keeps terminal failure distinct from waiting for a decision and an unknown blocked phase', () => {
     const feature = { issue: 'https://github.com/o/r/issues/1', run_id: mockRun.id, status: 'In review', version: 1, pull_requests: [] }
     expect(laneFor({ ...mockRun, feature, outcome: 'blocked', execution_state: 'blocked' })).toBe('Failed')
