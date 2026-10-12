@@ -10,7 +10,10 @@ cover the fast paths; a history recorded before the marker replays unchanged.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import re
+import subprocess
 from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
@@ -225,7 +228,8 @@ async def test_lost_wait_observations_are_reissued_with_backoff_and_verdicts_sto
         ApplicationError("feature wait does not own this worker", type="OwnershipConflict",
                          non_retryable=True),
         ApplicationError("gh: HTTP 401: Bad credentials", type="GitHubContractError"),
-        ApplicationError("database is locked", type="OperationalError"),
+        ApplicationError("no such table: delivery_runs", type="OperationalError"),
+        ApplicationError("[Errno 2] No such file or directory: 'gh'", type="OSError"),
     ):
         refused = LivenessController(plan())
         _protocol_stubs(monkeypatch, refused, bounded_wait=True)
@@ -378,7 +382,8 @@ async def test_real_temporal_permanent_github_refusal_stops_without_an_observati
             history = await handle.fetch_history()
         await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
     assert result["outcome"] == "blocked"
-    assert "GitHubContractError: gh: HTTP 401" in result["error"]
+    assert ("feature build worker for chunk model delivery_feature_finish_worker failed: "
+            "GitHubContractError: gh: HTTP 401: Bad credentials") in result["error"]
     assert "feature_observation_retries" not in result["checks"]
     assert "feature_worker_recoveries" not in result["checks"]
     events = [p["event_type"] for n, p in fixtures.calls if n == "delivery_project"]
@@ -907,7 +912,6 @@ def test_a_second_in_generation_resume_admits_its_own_command(service, monkeypat
 async def test_slow_merge_readback_backs_off_and_still_ends_merged(monkeypatch):
     controller = LivenessController(plan())
     _protocol_stubs(monkeypatch, controller)
-    monkeypatch.setattr(protocol, "READBACK_FAST_POLLS", 2)
     merges = iter([{"state": "pending"}] * 4)
     settlements = iter([
         {"state": "pending", "effect_key": "merge:stack-42", "reason": "RPCError: unavailable"},
@@ -944,16 +948,17 @@ async def test_slow_merge_readback_backs_off_and_still_ends_merged(monkeypatch):
     assert sum(1 for name, _ in controller.events if name == "delivery_feature_merge") == 5
     assert controller.sleeps == [
         timedelta(seconds=30), timedelta(minutes=1), timedelta(minutes=2), timedelta(minutes=4),
-        protocol.READBACK_INTERVAL, protocol.READBACK_INTERVAL, protocol.READBACK_SLOW_INTERVAL,
+        timedelta(seconds=30), timedelta(minutes=1), timedelta(minutes=2),
     ]
     merging = [m for e, m in controller.messages if e == "feature_merging"]
     assert len(merging) == 2, "one projection names the pending merge"
     assert "#1, #2, #3" in merging[1] and "readback still pending" in merging[1]
     assert "up to 15 minutes" in merging[1]
     readback = [m for e, m in controller.messages if e == "feature_readback_pending"]
-    assert readback[:2] == ["Reconciling the original GitHub operation"] * 2
-    assert ("merge:stack-42" in readback[2] and "after 3 polls" in readback[2]
-            and "RPCError: unavailable" in readback[2] and "every 10 minutes" in readback[2])
+    assert len(readback) == 3
+    assert all("merge:stack-42" in m and "RPCError: unavailable" in m for m in readback)
+    assert [m.rsplit(" in ", 1)[1] for m in readback] == ["30 s", "60 s", "120 s"]
+    assert "after 3 readbacks" in readback[2]
     assert result["checks"]["feature_readback"] == {"state": "confirmed"}
     assert controller.events[-1][0] == "delivery_feature_stop"
 
@@ -1103,10 +1108,7 @@ async def test_feature_worker_continuation_drops_its_predecessors_failure_record
     assert state["phase"] == "repair_preflight" and state["outcome"] is None
 
 
-@pytest.mark.asyncio
-async def test_worker_result_carries_the_closure_its_own_controller_recorded(service, monkeypatch):
-    """The observation the coordinator decides a resume from comes from the real
-    store row, before finish_worker retires the registry assignment."""
+def _registered_build_worker(service, monkeypatch):
     store, request, _ = feature_service(service, monkeypatch)
     store.submit(request)
     parent = store.effective_spec(request["run_id"])
@@ -1114,6 +1116,14 @@ async def test_worker_result_carries_the_closure_its_own_controller_recorded(ser
     child = worker_spec(parent, chunk, {"url": "https://github.com/example/fixture/issues/10"},
                         kind="build", base_sha=parent["base_sha"], base_branch="main")
     register_worker(store, parent, child)
+    return store, parent, child
+
+
+@pytest.mark.asyncio
+async def test_worker_result_carries_the_closure_its_own_controller_recorded(service, monkeypatch):
+    """The observation the coordinator decides a resume from comes from the real
+    store row, before finish_worker retires the registry assignment."""
+    store, parent, child = _registered_build_worker(service, monkeypatch)
     reference = {"spec": parent, "child_id": child["run_id"]}
     assert await activities.delivery_feature_worker_result(reference) == {"closed": False}
     failure = {"classification": "transient", "cause_type": "role_prelaunch",
@@ -1138,3 +1148,294 @@ async def test_worker_result_carries_the_closure_its_own_controller_recorded(ser
         assigned = db.execute("SELECT 1 FROM delivery_runs WHERE run_id=? AND outcome='blocked'",
                               (child["run_id"],)).fetchone()
     assert assigned, "observing a closure never changes the worker's row"
+
+
+# --- Re-issue paths keep the naming and `_resumable`; allowlist coverage ----------------------
+
+
+@pytest.mark.asyncio
+async def test_transient_admission_then_refusal_names_chunk_worker_error_and_refusal(monkeypatch):
+    """The first post-closure admission fails transiently; the retried admission is
+    refused. The stop names the chunk, the worker's own error and the refusal."""
+    controller = LivenessController(plan())
+    _protocol_stubs(monkeypatch, controller, bounded_wait=True)
+    reserves = []
+
+    async def execute(name, request):
+        if name == "delivery_feature_reserve":
+            reserves.append(request["chunk_id"])
+            if len(reserves) == 1:
+                return {"spec": {"run_id": "build:model"}, "workflow_id": "wf-1",
+                        "completed": False}
+            if len(reserves) == 2:
+                raise _transient_error(name, type="TimeoutExpired", message="gh timed out")
+            raise _activity_error(ApplicationError(REFUSAL, type="ValueError", non_retryable=True))
+        if name == "delivery_feature_wait_worker":
+            return {"closed": True, "outcome": "blocked", "closure": deepcopy(TRANSIENT)}
+        raise AssertionError(name)
+
+    controller._activity = execute
+    spec = {"run_id": "feature", "config_path": "/frozen/config"}
+    with pytest.raises(protocol.FeatureWorkerStopped) as info:
+        await protocol._recovering_worker(controller, spec, "model", "build", {})
+    assert info.value.final and reserves == ["model"] * 3
+    message = str(info.value)
+    assert message.startswith("feature build worker for chunk model stopped (")
+    assert TRANSIENT["error"] in message
+    assert "automatic resume refused: ValueError: " + REFUSAL in message
+    assert not protocol._infrastructure_failure(info.value)
+    assert controller.state["checks"]["feature_worker_recoveries"] == {"model:build": 1}
+    assert [m for e, m in controller.messages if e == "feature_worker_recovering"] == [
+        "Re-issuing the build worker admission for model after TimeoutExpired: gh timed out "
+        "(1 of 2)"]
+    assert controller.sleeps == [protocol.OBSERVATION_PAUSE]
+
+
+@pytest.mark.asyncio
+async def test_lost_finish_of_a_terminal_closure_reobserves_instead_of_reserving(monkeypatch):
+    """A lost finish observation of a worker that closed with a verdict is
+    re-observed with the assignment already held; the closed worker never
+    re-enters reserve(), so the admission cannot bypass `_resumable`."""
+    controller = LivenessController(plan())
+    _protocol_stubs(monkeypatch, controller, bounded_wait=True)
+    calls = {"reserve": 0, "wait": 0, "finish": 0}
+
+    async def execute(name, request):
+        if name == "delivery_feature_reserve":
+            calls["reserve"] += 1
+            return {"spec": {"run_id": "build:model"}, "workflow_id": "wf-1", "completed": False}
+        if name == "delivery_feature_wait_worker":
+            calls["wait"] += 1
+            return {"closed": True, "outcome": "blocked", "closure": deepcopy(TERMINAL)}
+        assert name == "delivery_feature_finish_worker"
+        calls["finish"] += 1
+        if calls["finish"] <= protocol.OBSERVATION_RETRIES + 1:
+            raise _transient_error(name, type="TimeoutExpired", message="observer timed out")
+        return {"outcome": "blocked", "record": deepcopy(controller.record), "budget": {}}
+
+    controller._activity = execute
+    spec = {"run_id": "feature", "config_path": "/frozen/config"}
+    with pytest.raises(protocol.FeatureWorkerStopped) as info:
+        await protocol._recovering_worker(controller, spec, "model", "build", {})
+    assert calls == {"reserve": 1, "wait": 2, "finish": protocol.OBSERVATION_RETRIES + 2}
+    assert str(info.value) == (
+        "feature build worker for chunk model stopped with preserved recovery evidence")
+    assert info.value.closure == TERMINAL and not protocol._resumable(TERMINAL)
+    assert controller.state["checks"]["feature_worker_recoveries"] == {"model:build": 1}
+    recovering = [m for e, m in controller.messages if e == "feature_worker_recovering"]
+    assert len(recovering) == 1
+    assert recovering[0].startswith(
+        "Re-issuing the build worker observation for model after ObservationLost: "
+        "delivery_feature_finish_worker for worker build:model stayed lost")
+
+
+@pytest.mark.asyncio
+async def test_finish_verdict_names_the_chunk_and_the_failing_activity(monkeypatch):
+    controller = LivenessController(plan())
+    _protocol_stubs(monkeypatch, controller, bounded_wait=True)
+
+    async def execute(name, request):
+        if name == "delivery_feature_reserve":
+            return {"spec": {"run_id": "build:model"}, "workflow_id": "wf-1", "completed": False}
+        if name == "delivery_feature_wait_worker":
+            return {"closed": True, "outcome": "delivered",
+                    "closure": {"outcome": "delivered", "cleanup": "confirmed"}}
+        raise _activity_error(ApplicationError("gh: HTTP 401: Bad credentials",
+                                               type="GitHubContractError"), name)
+
+    controller._activity = execute
+    spec = {"run_id": "feature", "config_path": "/frozen/config"}
+    with pytest.raises(protocol.FeatureWorkerStopped) as info:
+        await protocol._recovering_worker(controller, spec, "model", "build", {})
+    assert str(info.value) == ("feature build worker for chunk model delivery_feature_finish_worker"
+                               " failed: GitHubContractError: gh: HTTP 401: Bad credentials")
+    assert info.value.final and controller.messages == [] and controller.sleeps == []
+
+
+@pytest.mark.parametrize("kind, message, transient", [
+    ("ConnectionResetError", "[Errno 54] Connection reset by peer", True),
+    ("ConnectionRefusedError", "[Errno 61] Connection refused", True),
+    ("ConnectionAbortedError", "[Errno 53] Software caused connection abort", True),
+    ("BrokenPipeError", "[Errno 32] Broken pipe", True),
+    ("OSError", f"[Errno {errno.ETIMEDOUT}] Operation timed out", True),
+    ("OSError", f"[Errno {errno.EHOSTUNREACH}] No route to host", True),
+    ("OSError", "[Errno 2] No such file or directory: 'gh'", False),
+    ("OSError", "unexpected", False),
+    ("DatabaseBusy", "database busy: database is locked", True),
+    ("OperationalError", "database is locked", True),
+    ("OperationalError", "database table is locked", True),
+    ("OperationalError", "no such table: delivery_runs", False),
+    ("TemporalUnavailable", "UNAVAILABLE: error trying to connect", True),
+    ("RPCError", "permission denied", False),
+    ("GitHubTransientError", "gh: HTTP 502: Bad Gateway", True),
+    ("GitHubContractError", "gh: HTTP 401: Bad credentials", False),
+    ("GitHubContractError", "gh: HTTP 404: Not Found", False),
+    ("KeyError", "'head'", False),
+    ("ValueError", "stopped checkpoint changed before admission", False),
+    ("ClosureUnavailable", "closure unavailable", False),
+    ("PermissionError", "[Errno 13] Permission denied", False),
+])
+def test_infrastructure_allowlist_matches_on_the_child_and_coordinator_sides(
+    kind, message, transient,
+):
+    from devflow_temporal.delivery_workflow import _failure_classification
+
+    error = _activity_error(ApplicationError(message, type=kind), "delivery_feature_finish_worker")
+    assert (_failure_classification(error, None)["classification"] == "transient") is transient
+    assert protocol._transient_activity_failure(error) is transient
+    # A non-retryable failure of a transient type is a verdict on both sides.
+    final = _activity_error(ApplicationError(message, type=kind, non_retryable=True))
+    assert _failure_classification(final, None)["classification"] == "terminal"
+    assert not protocol._transient_activity_failure(final)
+
+
+@pytest.mark.parametrize("stderr, transient", [
+    ("gh: HTTP 502: Bad Gateway (https://api.github.com/repos/example/fixture)", True),
+    ("gh: HTTP 503: Service Unavailable", True),
+    ("gh: HTTP 429: Too Many Requests", True),
+    ("gh: HTTP 403: API rate limit exceeded for user ID 1", True),
+    ("gh: HTTP 403: You have exceeded a secondary rate limit", True),
+    ("gh: HTTP 403: Resource not accessible by integration", False),
+    ("gh: HTTP 401: Bad credentials", False),
+    ("gh: HTTP 404: Not Found", False),
+    ("gh: HTTP 422: Validation Failed", False),
+    ("error connecting to api.github.com", False),
+])
+def test_github_server_faults_and_rate_limits_are_typed_transient(monkeypatch, stderr, transient):
+    from devflow_temporal import delivery_github_contract as contract
+
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(contract.subprocess, "run", run)
+    with pytest.raises(contract.GitHubContractError) as info:
+        contract.GitHubDelivery().api("repos/example/fixture")
+    assert isinstance(info.value, contract.GitHubTransientError) is transient
+    assert protocol.transient_failure(type(info.value).__name__, str(info.value)) is transient
+    match = re.search(r"HTTP (\d{3})", stderr)
+    assert info.value.status == (int(match[1]) if match else None)
+
+
+@pytest.mark.asyncio
+async def test_worker_result_types_unavailable_temporal_as_infrastructure(service, monkeypatch):
+    from temporalio.service import RPCError, RPCStatusCode
+
+    store, parent, child = _registered_build_worker(service, monkeypatch)
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET phase='blocked',outcome='blocked',"
+                   "execution_state='blocked',cleanup='confirmed' WHERE run_id=?",
+                   (child["run_id"],))
+    reference = {"spec": parent, "child_id": child["run_id"]}
+    for status, expected in (
+        (RPCStatusCode.UNAVAILABLE, activities.TemporalUnavailable),
+        (RPCStatusCode.DEADLINE_EXCEEDED, activities.TemporalUnavailable),
+        (RPCStatusCode.RESOURCE_EXHAUSTED, activities.TemporalUnavailable),
+        (RPCStatusCode.PERMISSION_DENIED, RPCError),
+        (RPCStatusCode.NOT_FOUND, RPCError),
+    ):
+        def failing(self, run_id, _status=status, **kwargs):
+            raise RPCError("error trying to connect: tcp connect error", _status, b"")
+
+        monkeypatch.setattr(DeliveryStore, "_completed_temporal_result", failing)
+        with pytest.raises(expected) as info:
+            await activities.delivery_feature_worker_result(reference)
+        name = type(info.value).__name__
+        assert protocol.transient_failure(name, str(info.value)) is (
+            expected is activities.TemporalUnavailable)
+        if expected is activities.TemporalUnavailable:
+            assert str(info.value).startswith(status.name + ": ")
+
+
+# --- An unsettled readback has a cancel exit and a bound; the effect stays pending -----------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_by", ["cancel", "bound"])
+async def test_unsettled_readback_exits_on_cancel_or_bound_with_the_effect_still_pending(
+    monkeypatch, exit_by,
+):
+    controller = LivenessController(plan())
+    _protocol_stubs(monkeypatch, controller)
+    monkeypatch.setattr(protocol, "READBACK_POLLS", 4)
+    settlements = []
+    original = controller._activity
+
+    async def execute(name, request):
+        if name == "delivery_feature_settle_effects":
+            settlements.append(name)
+            if exit_by == "cancel" and len(settlements) == 3:
+                controller.cancel_requested = True
+            return {"state": "pending", "effect_key": "merge:stack-42",
+                    "reason": "RPCError: unavailable"}
+        return await original(name, request)
+
+    controller._activity = execute
+
+    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                     assignment=None):
+        return _delivered(controller, chunk_id, kind)
+
+    monkeypatch.setattr(protocol, "_worker", worker)
+    result = await protocol.coordinate(
+        controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
+    polls = 3 if exit_by == "cancel" else 4
+    assert len(settlements) == polls
+    assert result["outcome"] == ("cancelled" if exit_by == "cancel" else "blocked")
+    assert result["cleanup"] == "unknown"
+    assert result["error"] == (
+        f"original GitHub operation merge:stack-42 still unconfirmed after {polls} readbacks "
+        "(RPCError: unavailable); the feature owner keeps it pending")
+    # The effect is neither confirmed nor dropped, and the owner is not stopped.
+    assert result["checks"]["feature_readback"]["state"] == "pending"
+    assert result["checks"]["feature_stop"] == {
+        "state": "withheld", "effect_key": "merge:stack-42", "reason": "RPCError: unavailable"}
+    assert not any(name == "delivery_feature_stop" for name, _ in controller.events)
+    assert controller.sleeps == [
+        timedelta(seconds=30), timedelta(minutes=1), timedelta(minutes=2)][:polls - 1]
+    assert controller.messages[-1] == (result["outcome"], result["error"])
+
+
+@pytest.mark.asyncio
+async def test_real_temporal_operator_cancel_leaves_an_unsettled_readback_pending(monkeypatch):
+    fixtures = FeatureActivities()
+    waiting, cancel_sent = asyncio.Event(), asyncio.Event()
+    settlements = []
+
+    @activity.defn(name="delivery_feature_settle_effects")
+    async def settle_effects(payload):
+        settlements.append(payload["spec"]["run_id"])
+        if len(settlements) == 2:
+            waiting.set()
+            await asyncio.wait_for(cancel_sent.wait(), 30)
+        return {"state": "pending", "effect_key": "merge:stack-42",
+                "reason": "RPCError: unavailable"}
+
+    monkeypatch.setattr(protocol, "READBACK_INTERVAL", timedelta(seconds=1))
+    spec = _feature_spec("unsettled-readback-cancel")
+    async with local_temporal() as environment:
+        async with Worker(environment.client, task_queue=spec["run_id"],
+                          workflows=[DeliveryWorkflow],
+                          activities=_handlers(fixtures, settle_effects),
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run, spec, id=spec["run_id"], task_queue=spec["run_id"])
+            await asyncio.wait_for(waiting.wait(), 60)
+            state = await handle.query(DeliveryWorkflow.status)
+            assert state["phase"] == "waiting_feature_readback" and state["outcome"] is None
+            await handle.execute_update(DeliveryWorkflow.cancel, {
+                "command_id": "stop-unsettled-readback", "expected_revision": state["revision"],
+                "reason": "Operator stops the wait",
+            })
+            cancel_sent.set()
+            result = await asyncio.wait_for(handle.result(), 60)
+            history = await handle.fetch_history()
+        await Replayer(workflows=[DeliveryWorkflow],
+                       workflow_runner=UnsandboxedWorkflowRunner()).replay_workflow(history)
+    assert result["outcome"] == "cancelled" and result["cleanup"] == "unknown"
+    assert "merge:stack-42" in result["error"] and "RPCError: unavailable" in result["error"]
+    assert result["checks"]["feature_readback"]["state"] == "pending"
+    assert result["checks"]["feature_stop"]["state"] == "withheld"
+    assert len(settlements) == 2
+    assert not any(n == "delivery_feature_stop" for n, _ in fixtures.calls)
+    assert fixtures.calls[-1][0] == "delivery_project"
+    assert _timers(history)[:1] == [timedelta(seconds=1)]

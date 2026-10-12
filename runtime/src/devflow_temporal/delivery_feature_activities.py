@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from temporalio import activity
+from temporalio.service import RPCError, RPCStatusCode
 
 from .contracts import digest
 from .delivery_broker import BrokerReadbackUnavailable, _git
@@ -550,6 +551,15 @@ async def delivery_feature_stop(request):
     return await asyncio.to_thread(stop_feature, request["spec"], request["checkpoint"])
 
 
+TRANSIENT_RPC_STATUSES = frozenset({
+    RPCStatusCode.UNAVAILABLE, RPCStatusCode.DEADLINE_EXCEEDED, RPCStatusCode.RESOURCE_EXHAUSTED,
+})
+
+
+class TemporalUnavailable(RuntimeError):
+    """The Temporal server could not answer an observation; the closure is unaffected."""
+
+
 @activity.defn(name="delivery_feature_worker_result")
 async def delivery_feature_worker_result(request):
     store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
@@ -580,6 +590,12 @@ async def delivery_feature_worker_result(request):
                     "continuation predecessor Temporal closure is unavailable")):
             raise
         return {"closed": False, "reason": "temporal_closure_pending"}
+    except RPCError as exc:
+        # Only an unreachable, overloaded or slow server is infrastructure the
+        # coordinator may re-issue; every other RPC status is a verdict.
+        if exc.status in TRANSIENT_RPC_STATUSES:
+            raise TemporalUnavailable(f"{exc.status.name}: {exc.message}"[:300]) from exc
+        raise
     return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"]),
             "closure": closure}
 

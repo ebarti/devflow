@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import re
 from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any
@@ -21,9 +23,31 @@ from .delivery_questions import valid_blocking_questions
 # Activity failure types that describe infrastructure rather than a verdict. The
 # feature coordinator re-issues observations only for these same types.
 TRANSIENT_FAILURE_TYPES = frozenset({
-    "ConnectionError", "TimeoutError", "TimeoutExpired", "GitHubTransientError",
-    "BrokerReadbackUnavailable", "ResourceCleanupTransient",
+    "ConnectionError", "ConnectionResetError", "ConnectionRefusedError",
+    "ConnectionAbortedError", "BrokenPipeError", "TimeoutError", "TimeoutExpired",
+    "GitHubTransientError", "BrokerReadbackUnavailable", "ResourceCleanupTransient",
+    "DatabaseBusy", "TemporalUnavailable",
 })
+# A bare OSError carries only its errno; SQLite reports contention in its message.
+TRANSIENT_ERRNOS = frozenset({
+    errno.ECONNRESET, errno.ECONNREFUSED, errno.ECONNABORTED, errno.EPIPE, errno.ETIMEDOUT,
+    errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN, errno.ENETRESET,
+})
+_OSERROR_ERRNO = re.compile(r"^\[Errno (\d+)\]")
+_SQLITE_CONTENTION = re.compile(r"database( table)? is (locked|busy)")
+
+
+def transient_failure(kind: str | None, message: str | None) -> bool:
+    """Allowlist of infrastructure failures: by type identity, by errno for a bare
+    OSError, and by SQLite's busy/locked condition. Everything else is a verdict."""
+    if kind in TRANSIENT_FAILURE_TYPES:
+        return True
+    if kind == "OSError":
+        match = _OSERROR_ERRNO.match(message or "")
+        return bool(match) and int(match[1]) in TRANSIENT_ERRNOS
+    if kind == "OperationalError":
+        return bool(_SQLITE_CONTENTION.search((message or "").casefold()))
+    return False
 
 
 def _failure_classification(cause: Exception | None, controller_cause: str | None) -> dict:
@@ -43,7 +67,7 @@ def _failure_classification(cause: Exception | None, controller_cause: str | Non
         return {"classification": "transient", "cause_type": "ServerError"}
     if isinstance(failure, ApplicationError):
         result["cause_type"] = (failure.type or "ApplicationError")[:128]
-        if not failure.non_retryable and failure.type in TRANSIENT_FAILURE_TYPES:
+        if not failure.non_retryable and transient_failure(failure.type, failure.message):
             result["classification"] = "transient"
     return result
 

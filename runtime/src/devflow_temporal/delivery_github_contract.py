@@ -43,6 +43,17 @@ class GitHubContractError(RuntimeError):
         self.status = status
 
 
+class GitHubTransientError(GitHubContractError):
+    """A GitHub server fault or rate limit: infrastructure, not a verdict on the request."""
+
+
+def github_transient(status: int | None, stderr: str) -> bool:
+    return status is not None and (
+        status >= 500 or status == 429
+        or (status == 403 and re.search(r"rate limit", stderr, re.IGNORECASE) is not None)
+    )
+
+
 def issue_identity(url: str, repository: str) -> tuple[str, int]:
     if not isinstance(url, str) or not isinstance(repository, str):
         raise ValueError("delivery issue requires a GitHub URL and repository")
@@ -278,9 +289,13 @@ class GitHubDelivery:
         )
         if result.returncode:
             match = re.search(r"HTTP (\d{3})", result.stderr)
-            raise GitHubContractError(
-                (result.stderr or result.stdout)[:1000], int(match[1]) if match else None
-            )
+            status = int(match[1]) if match else None
+            message = (result.stderr or result.stdout)[:1000]
+            # Server faults and rate limits may be retried; every other status is
+            # GitHub's verdict about this request and must not be.
+            if github_transient(status, result.stderr):
+                raise GitHubTransientError(message, status)
+            raise GitHubContractError(message, status)
         return json.loads(result.stdout) if result.stdout.strip() else None
 
     def optional(self, endpoint):
