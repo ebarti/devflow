@@ -1826,7 +1826,8 @@ class DeliveryStore:
             or stat.S_IMODE(metadata.st_mode) != 0o700
             or metadata.st_uid != os.getuid()
             # Empty, or a monitor lost before GO whose teardown is confirmed again.
-            or (any(folder.iterdir()) and not reconciled_not_started(folder))
+            or (any(folder.iterdir()) and not reconciled_not_started(
+                    folder, receipt=receipt.get("native_process") if receipt else None))
             or len(attempts) != len(roles)
             or any(
                 item["state"] != "finished" or item["cleanup"] != "confirmed"
@@ -1921,7 +1922,8 @@ class DeliveryStore:
                     item["state"] != "complete" or item["observed_json"] is None
                     for item in effects
                 )
-                or (any(folder.iterdir()) and not reconciled_not_started(folder))
+                or (any(folder.iterdir()) and not reconciled_not_started(
+                    folder, receipt=receipt.get("native_process") if receipt else None))
             ):
                 raise ValueError("prelaunch retry lost its frozen run or ownership")
             revision = current["revision"] + 1
@@ -2396,7 +2398,8 @@ class DeliveryStore:
                 or not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != os.getuid()
                 or stat.S_IMODE(metadata.st_mode) != 0o700
-                or (any(folder.iterdir()) and not reconciled_not_started(folder))
+                or (any(folder.iterdir()) and not reconciled_not_started(
+                    folder, receipt=receipt.get("native_process") if receipt else None))
             ):
                 raise ValueError("failed prelaunch attempt changed before retry")
         published_identity(

@@ -302,7 +302,7 @@ def lost_monitor_without_provider(journal: dict, *, role_attempt: bool) -> bool:
         or (journal.get("result") or {}).get("provider_outcome") == "not_started")
 
 
-def reconciled_not_started(folder: Path) -> bool:
+def reconciled_not_started(folder: Path, *, receipt: dict | None = None) -> bool:
     """The attempt's monitor was lost before GO, as its bound teardown proof records.
 
     Such a folder keeps its journal, launch and log files as evidence, so the
@@ -310,6 +310,23 @@ def reconciled_not_started(folder: Path) -> bool:
     read: callers hold database transactions and must not reconcile here.
     """
     journal = folder / "native-process.json"
+    if not os.path.lexists(journal) and receipt:
+        # The supervisor can prove absence before the monitor creates a journal.
+        # Its finished attempt receipt is server-owned; request.json is input,
+        # not proof that a provider was launched. Preserve it for audit.
+        if (receipt.get("journal") != str(journal)
+                or receipt.get("cleanup") != "observed-native-confirmed"
+                or receipt.get("launch_absent") is not True
+                or receipt.get("observed_pids") != []):
+            return False
+        try:
+            if any(path.name not in {"request.json"} for path in folder.iterdir()):
+                return False
+            if (folder / "request.json").exists():
+                read_private(folder / "request.json")
+            return True
+        except (OSError, ValueError):
+            return False
     if (any(os.path.lexists(folder / name) for name in ("start.json", "result.json", "cancel"))
             or not os.path.lexists(journal)):
         return False

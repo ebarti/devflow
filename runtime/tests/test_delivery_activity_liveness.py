@@ -644,3 +644,27 @@ async def test_real_temporal_lost_feature_wait_attempt_retries_with_a_full_windo
     # The server records an absent schedule_to_close as zero: no overall deadline
     # can cut the retry short any more (it was 6 minutes).
     assert waits[0].schedule_to_close_timeout.ToTimedelta() == timedelta(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [
+    "delivery_intake", "delivery_role", "delivery_checks", "delivery_precheck",
+    "delivery_baseline_checks", "delivery_browser_qa",
+    "delivery_feature_revision_propose", "delivery_feature_revision_review",
+])
+async def test_capacity_wait_has_no_total_activity_deadline(monkeypatch, name):
+    from devflow_temporal import delivery_workflow
+
+    observed = {}
+    async def execute(_name, _request, **options):
+        observed.update(options)
+    monkeypatch.setattr(delivery_workflow.workflow, "execute_activity", execute)
+    monkeypatch.setattr(delivery_workflow.workflow, "patched", lambda _flag: True)
+    await DeliveryWorkflow()._activity(name, {
+        "spec": {"policy": {"execution_backend": "native-macos", "max_repairs": 10}},
+    })
+    assert "schedule_to_close_timeout" not in observed
+    assert observed["start_to_close_timeout"] == timedelta(hours=2)
+    assert observed["retry_policy"].maximum_attempts == 0
+    assert "NativeProcessUnknown" in observed["retry_policy"].non_retryable_error_types
+    assert observed["heartbeat_timeout"] <= timedelta(seconds=30)
