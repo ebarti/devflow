@@ -2109,6 +2109,9 @@ class DeliveryStore:
         }
         if generation:
             attempt_identity["attempt_generation"] = generation
+        admission = (prior_recovery or {}).get("execution_spec", {}).get("implement_admission")
+        if admission:
+            attempt_identity["implement_admission"] = admission
         expected_job_key = hashlib.sha256(canonical_json(attempt_identity).encode()).hexdigest()
         attempt = next((item for item in attempts if item["job_key"] == expected_job_key), None)
         if attempt is None or attempt["session_id"] != last["session_id"]:

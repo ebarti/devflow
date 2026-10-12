@@ -42,7 +42,9 @@ def settle_one(store, spec, entry, gh):
         authority = request["authority"]
         result = merge(store, spec, authority["publication"], authority.get("command"),
                        gh=gh, settlement=True)
-        if result["state"] != "confirmed":
+        # A refused stack merge is settled as absent; its issue closures never began.
+        if result["state"] != "confirmed" and not (
+                kind == "feature_merge" and result["state"] == "absent"):
             raise UnresolvedEffect("original merge readback is pending")
         return
     with shared.mutation(token):

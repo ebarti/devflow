@@ -1904,10 +1904,14 @@ class DeliveryWorkflow:
         if spec.get("feature_worker", {}).get("kind") == "build":
             from .delivery_feature_workflow import run_build
 
+            # Older build histories never carry these fields. An interrupted build
+            # resumes at its sealed iteration and seals a passed implementation as is.
             return await run_build(self, spec,
-                                   start_iteration=recovery['state']['iteration'] + 1,
+                                   start_iteration=recovery.get(
+                                       'resume_iteration', recovery['state']['iteration'] + 1),
                                    session=recovery['session_id'],
-                                   maximum_iteration=recovery['maximum_iteration'])
+                                   maximum_iteration=recovery['maximum_iteration'],
+                                   preserved=recovery.get('resume_stage') == 'checks')
         # This admission flag is absent from older histories. A proven unstarted
         # repair reuses its existing iteration and shared budget debit.
         pending = recovery.get('pending_repair')
@@ -1955,6 +1959,9 @@ class DeliveryWorkflow:
             authorized_max_iteration=recovery['maximum_iteration'],
             allow_first_session=recovery['session_id'] is None,
             resume_prechecks=recovery.get('resume_stage') == 'checks',
+            # Only interrupted-worker admissions record this stage: their published
+            # candidate keeps its publication and reruns its gates.
+            published_checkpoint=recovery.get('resume_stage') == 'published',
         )
 
     async def _resume_repair(

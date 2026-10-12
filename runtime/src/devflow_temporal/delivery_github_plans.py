@@ -323,7 +323,79 @@ def _preflight_plan_records(issue, manifest, children, operation_id):
         }
     preview["workstream_plans"] = refs
     _parent_plan_body(preview, issue)
+    require_publication_capacity(issue, preview)
     return preview
+
+
+# GitHub issue and pull request numbers are 32-bit integers: at most ten digits.
+PR_NUMBER_DIGITS = 10
+
+
+def _chunk_index(manifest):
+    """Chunks in stack order from the recorded index, expanded or as read from GitHub."""
+    from .delivery_github_contract import wire_manifest
+    from .delivery_plan_model import index_chunks
+
+    wire = wire_manifest(manifest)
+    return (index_chunks(wire["plan"]) if wire.get("version") == 2
+            else ordered_chunks(wire["plan"]))
+
+
+def _largest_publication(issue, manifest, *, trunk=None, head_width=None):
+    """Keep recorded members; reserve each unpublished chunk's largest realistic member."""
+    members = deepcopy(manifest["publication"]["members"])
+    chunks = _chunk_index(manifest)
+    # Heads are as wide as the run's commits: the recorded ones, else the contract's 64.
+    width = head_width or max((len(member["head"]) for member in members), default=64)
+    known = [issue["number"], *(member["number"] for member in members),
+             *(child["number"] for child in manifest["workstream_issues"].values())]
+    bound = 10 ** max(PR_NUMBER_DIGITS, *(len(str(number)) for number in known)) - 1
+    for index, chunk in enumerate(chunks[len(members):], start=len(members)):
+        child = manifest["workstream_issues"][chunk["workstream_id"]]
+        number = bound - index
+        members.append({
+            "chunk_id": chunk["id"], "number": number,
+            "url": f"https://github.com/{issue['repository']}/pull/{number}",
+            # Workers publish from this exact branch pattern.
+            "branch": "feat/df-" + "f" * 10 + "-" + chunk["id"], "head": "f" * width,
+            # Only the first layer sits on the trunk, whose name is bounded by the contract.
+            "base_branch": members[-1]["branch"] if members else trunk or "f" * 128,
+            **({"workstream_id": chunk["workstream_id"], "issue_id": child["id"],
+                "issue_number": child["number"], "issue_url": child["url"]}
+               if manifest.get("version") == 2 else {}),
+        })
+    stack_id = manifest["publication"]["stack_id"]
+    return {"stack_id": bound if stack_id is None and len(members) > 1 else stack_id,
+            "members": members}
+
+
+def publication_capacity(issue, manifest, *, trunk=None, head_width=None):
+    """Read-only: the parent index bytes needed once every chunk's pull request exists."""
+    from .delivery_github_contract import PARENT_INDEX_LIMIT, manifest_body
+
+    full = {**manifest, "publication": _largest_publication(
+        issue, manifest, trunk=trunk, head_width=head_width)}
+    size = len(manifest_body(full).encode())
+    return {"size": size, "limit": PARENT_INDEX_LIMIT, "fits": size <= PARENT_INDEX_LIMIT,
+            "current": len(manifest_body(manifest).encode()),
+            "unpublished_chunks": (len(_chunk_index(manifest))
+                                   - len(manifest["publication"]["members"]))}
+
+
+def require_publication_capacity(issue, manifest, *, trunk=None, head_width=None):
+    """Refuse a parent index that could not record every chunk's pull request.
+
+    Deterministic on the record alone, so callers run it before any debit or turn.
+    """
+    capacity = publication_capacity(issue, manifest, trunk=trunk, head_width=head_width)
+    if not capacity["fits"]:
+        raise ValueError(
+            f"parent index cannot record every chunk's pull request: {capacity['size']} of "
+            f"{capacity['limit']} bytes once its {capacity['unpublished_chunks']} unpublished "
+            "chunks publish; no automatic remedy exists because a revision cannot shorten the "
+            "scope, acceptance or chunk list; the owner can merge the published stack by hand "
+            "and deliver the remaining scope as a new feature with a shorter plan")
+    return capacity
 
 
 def _initial_manifest(issue, plan, bindings, key):
