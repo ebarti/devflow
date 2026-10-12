@@ -116,7 +116,18 @@ class CheckCancelledBeforeLaunch(RuntimeError):
     """Cancellation was observed before entering the next native process."""
 
 
+class CheckSuperseded(RuntimeError):
+    """Temporal replaced this attempt; its retry owns every further launch and score."""
+
+
 class DeliveryBroker:
+    # Journals of the native gates a broker ran or joined, so an unknown
+    # teardown can be re-proven against the processes they recorded.
+    native_journals: tuple[Path, ...] = ()
+    # Set by the activity once Temporal replaced its waiter: the body may finish
+    # the native process it supervises but must not launch or score another.
+    check_superseded = staticmethod(lambda: False)
+
     def __init__(self, store: DeliveryStore, spec: dict[str, Any]) -> None:
         from .delivery_preparation import require_native_execution
 
@@ -1011,15 +1022,25 @@ class DeliveryBroker:
     def _run_native_check(self, process) -> dict:
         if self._native_cancelled():
             raise CheckCancelledBeforeLaunch("native check cancelled before launch")
+        if self.check_superseded():
+            raise CheckSuperseded("native check superseded before launch")
         self.native_cleanup_confirmed = False
+        self.native_journals += (process.journal,)
         result = process.run()
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
+        if self.check_superseded():
+            # The retry scores this invocation from its journal; a replaced body
+            # neither post-processes nor launches alongside it.
+            raise CheckSuperseded("native check superseded after its monitor")
         return result
 
     def _reconcile_native_check(self, journal: Path) -> dict:
         from .delivery_native_process import reconcile_process
 
+        if self.check_superseded():
+            raise CheckSuperseded("native check superseded before reconciliation")
         self.native_cleanup_confirmed = False
+        self.native_journals += (journal,)
         result = reconcile_process(journal)
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
         return result

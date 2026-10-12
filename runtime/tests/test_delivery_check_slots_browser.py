@@ -133,8 +133,9 @@ def browser_checks(tmp_path, monkeypatch):
     retained = len(activities._UNCLEAN_CHECK_SLOTS)
     yield SimpleNamespace(request=request, brokers=brokers, hearts=hearts,
                           ports=ports, config=config)
-    for descriptor in activities._UNCLEAN_CHECK_SLOTS[retained:]:
-        os.close(descriptor)
+    for entry in activities._UNCLEAN_CHECK_SLOTS[retained:]:
+        for descriptor in entry["descriptors"]:
+            os.close(descriptor)
     del activities._UNCLEAN_CHECK_SLOTS[retained:]
     for broker in brokers.values():
         resource = RunResources(broker.spec)
@@ -243,7 +244,7 @@ async def test_browser_port_wait_cancels_without_taking_generic_capacity(browser
     following = browser_checks.request("generic")
     launched = []
     assert await activities._execute_check(
-        following, lambda _: (launched.append(True), {"state": "passed"})[1],
+        following, lambda _: (launched.append(True), {"state": "passed"})[1], kind="checks",
     ) == {"state": "passed"}
     assert launched and not first.done()
     queued.cancel()
@@ -308,20 +309,25 @@ async def test_actual_interrupted_browser_retains_ports_and_generic_capacity(
         assert_reservation(root / "slot-0.lock")
         for port in browser_checks.ports:
             assert_reservation(root / f"port-{port}.lock")
+        if failure == "exception":
+            reservation = activities._UNCLEAN_CHECK_SLOTS[-1]
+            assert set(reservation["ports"]) == set(browser_checks.ports)
+            assert any(len(recorded) >= 2 for recorded in reservation["journals"].values())
         following = browser_checks.request("following")
         launched = []
         queued = asyncio.create_task(activities._execute_check(
             following, lambda _: (launched.append(True), {"state": "passed"})[1],
+            kind="checks",
         ))
+        # The next admission re-proves a retained reservation against the
+        # processes and ports it recorded; with all of them gone it is released.
+        assert await asyncio.wait_for(queued, 5) == {"state": "passed"}
+        assert launched
         if failure == "exception":
-            await asyncio.sleep(0.15)
-            queued.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await queued
-            assert not launched
-        else:
-            assert await asyncio.wait_for(queued, 5) == {"state": "passed"}
-            assert launched
+            assert reservation not in activities._UNCLEAN_CHECK_SLOTS
+            assert_unlocked(root / "slot-0.lock")
+            for port in browser_checks.ports:
+                assert_unlocked(root / f"port-{port}.lock")
     finally:
         if worker.poll() is None:
             worker.kill()

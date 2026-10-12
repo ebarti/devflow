@@ -124,6 +124,7 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
 ):
     class Broker:
         native_cleanup_confirmed = True
+        native_journals = ()
 
         def _native_cancelled(self):
             return False
@@ -149,8 +150,9 @@ async def test_native_effect_uncertainty_is_returned_for_durable_projection(
         )
         assert len(_UNCLEAN_CHECK_SLOTS) == retained + 1
     finally:
-        for descriptor in _UNCLEAN_CHECK_SLOTS[retained:]:
-            os.close(descriptor)
+        for entry in _UNCLEAN_CHECK_SLOTS[retained:]:
+            for descriptor in entry["descriptors"]:
+                os.close(descriptor)
         del _UNCLEAN_CHECK_SLOTS[retained:]
     assert result == {
         "state": "unknown",

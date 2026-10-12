@@ -7,12 +7,14 @@ import contextvars
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import stat
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,15 +28,26 @@ from .delivery_broker import (
     BrokerReadbackUnavailable,
     CheckCancelledBeforeLaunch,
     CheckPreparationFailure,
+    CheckSuperseded,
     DeliveryBroker,
 )
 from .delivery_execution_config import load_execution_config
 from .delivery_repair import RepairReadbackPending
 from .delivery_store import DeliveryStore, _now
-from .supervisor import get_supervisor
+from .supervisor import activity_attempt_replaced, activity_retry_pending, get_supervisor
 
+_LOG = logging.getLogger(__name__)
 _CHECK_HEARTBEAT_INTERVAL = 5
-_UNCLEAN_CHECK_SLOTS: list[int] = []
+_UNCLEAN_CHECK_RECHECK_INTERVAL = 5.0
+# Gates with unknown teardown: their lock descriptors plus the processes and
+# ports their journals recorded, retained while any of those is observably live.
+_UNCLEAN_CHECK_SLOTS: list[dict[str, Any]] = []
+_UNCLEAN_CHECK_LOCK = threading.Lock()
+# The newest check body per gate identity in this worker, with its supersession
+# and completion signals. A newer attempt supersedes the registered body itself
+# and waits for it, without relying on Temporal's throttled replacement notice.
+_ACTIVE_CHECKS: dict[tuple[Any, ...], tuple[threading.Event, threading.Event]] = {}
+_ACTIVE_CHECK_LOCK = threading.Lock()
 
 
 def database_contention(exc: BaseException) -> bool:
@@ -79,6 +92,113 @@ def _cancelled_check_result(request: dict[str, Any], broker: DeliveryBroker) -> 
     return result
 
 
+def _recorded_processes(journal: Path) -> dict[int, dict[str, Any]] | None:
+    """Processes a journal records, its monitor included; None when it is unreadable."""
+    from .delivery_resources import read_private
+
+    try:
+        value = read_private(journal)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    owned = value.get("owned")
+    recorded = {
+        int(pid): identity for pid, identity in (owned.items() if isinstance(owned, dict) else ())
+        if isinstance(identity, dict) and identity.get("identity")
+    }
+    monitor = value.get("monitor")
+    if isinstance(monitor, dict) and monitor.get("identity") and "pid" in monitor:
+        recorded[int(monitor["pid"])] = monitor
+    return recorded
+
+
+def _retain_unclean_check(
+    descriptors: list[int], broker: DeliveryBroker, ports: tuple[int, ...],
+) -> None:
+    """Hold a gate's slot and port locks while what it recorded may still be live."""
+    journals = {
+        str(journal): _recorded_processes(journal) or {}
+        for journal in dict.fromkeys(broker.native_journals)
+    }
+    with _UNCLEAN_CHECK_LOCK:
+        _UNCLEAN_CHECK_SLOTS.append({
+            "descriptors": list(descriptors), "ports": sorted(set(ports)), "journals": journals,
+        })
+
+
+def _unclean_check_settled(entry: dict[str, Any]) -> bool:
+    """Proof that every process and port a retained gate recorded is gone."""
+    from .delivery_native_process import listeners, process_table
+
+    recorded: dict[int, dict[str, Any]] = {}
+    for journal, snapshot in entry["journals"].items():
+        # Journals are re-read so a monitor or descendant recorded after the
+        # retention snapshot still counts; an unreadable journal proves nothing.
+        current = _recorded_processes(Path(journal))
+        if current is None:
+            return False
+        recorded.update(snapshot)
+        recorded.update(current)
+    table = process_table()
+    if any(table.get(pid, {}).get("identity") == identity["identity"]
+           and not table[pid]["stat"].startswith("Z")
+           for pid, identity in recorded.items()):
+        return False
+    return not any(listeners(port) for port in entry["ports"])
+
+
+def _gate_identity(request: dict[str, Any], kind: str) -> tuple[Any, ...]:
+    spec = request["spec"]
+    candidate = request.get("candidate") or {}
+    return (kind, spec.get("run_id"), request.get("iteration"),
+            candidate.get("id", spec.get("base_sha")))
+
+
+def _claim_gate(
+    identity: tuple[Any, ...], superseded: threading.Event, finished: threading.Event,
+) -> threading.Event | None:
+    """Register a gate's newest body; supersede the previous one and return its `finished`.
+
+    Temporal never runs two attempts of one activity at once, so within this
+    worker a body that finds another registered under its identity is the
+    newer attempt. Across workers the older body keeps running until the
+    replacement notice reaches it.
+    """
+    with _ACTIVE_CHECK_LOCK:
+        previous = _ACTIVE_CHECKS.get(identity)
+        _ACTIVE_CHECKS[identity] = (superseded, finished)
+    if previous is None:
+        return None
+    previous[0].set()
+    return previous[1]
+
+
+def _release_gate(identity: tuple[Any, ...], finished: threading.Event) -> None:
+    with _ACTIVE_CHECK_LOCK:
+        finished.set()
+        current = _ACTIVE_CHECKS.get(identity)
+        if current is not None and current[1] is finished:
+            del _ACTIVE_CHECKS[identity]
+
+
+def _release_settled_check_slots() -> None:
+    """Release retained gates whose recorded processes and ports are proven gone."""
+    with _UNCLEAN_CHECK_LOCK:
+        for entry in list(_UNCLEAN_CHECK_SLOTS):
+            try:
+                settled = _unclean_check_settled(entry)
+            except Exception as exc:
+                # Unavailable inspection proves nothing; the gate stays retained.
+                _LOG.warning("Retained check slot could not be re-proven for %s: %s",
+                             entry["journals"], exc)
+                continue
+            if settled:
+                _UNCLEAN_CHECK_SLOTS.remove(entry)
+                for descriptor in entry["descriptors"]:
+                    os.close(descriptor)
+
+
 def _bind_planning_repair(request, result):
     if (result.get("planning_defect") and request["spec"].get("feature_worker")
             and result.get("cleanup") == "confirmed"):
@@ -111,19 +231,27 @@ def _try_check_lock(path: Path) -> int | None:
 
 
 async def _execute_check(
-    request: dict[str, Any], execute, *, ports: tuple[int, ...] = (),
+    request: dict[str, Any], execute, *, kind: str, ports: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     """Bound native gates across workers and join their monitor on cancellation."""
     cancelled = threading.Event()
     admitted = threading.Event()
     ports_admitted = threading.Event()
+    # `superseded`: a newer attempt owns this gate, or Temporal replaced this
+    # waiter; the body finishes only the native process it supervises.
+    # `finished`: this body stopped, so the newer attempt may take the gate.
+    superseded = threading.Event()
+    finished = threading.Event()
+    identity = _gate_identity(request, kind)
+    # Admission and cancellation decide atomically whether the gate launches.
+    gate = threading.Lock()
 
     def run():
         from .delivery_resources import private_directory
 
         store, broker = _context(request["spec"])
-        broker.check_cancelled = cancelled.is_set
         if request["spec"]["provider"] != "codex":
+            broker.check_cancelled = cancelled.is_set
             admitted.set()
             return _bind_planning_repair(request, execute(broker))
         root = store.config.state_root / "check-execution"
@@ -131,15 +259,46 @@ async def _execute_check(
         slots = store.config.raw.get("check_concurrency", 2)
         descriptor = None
         port_descriptors = []
+        rechecked = float("-inf")
+
+        def recheck() -> None:
+            # Retained gates are re-proven at admission and while queued behind them.
+            nonlocal rechecked
+            if time.monotonic() - rechecked >= _UNCLEAN_CHECK_RECHECK_INTERVAL:
+                rechecked = time.monotonic()
+                _release_settled_check_slots()
+
         try:
+            # A newer attempt takes over the gate: it supersedes the body this
+            # worker already runs for the same identity and waits for it to
+            # stop, so one check body and one slot serve a gate at a time.
+            predecessor = _claim_gate(identity, superseded, finished)
+            while predecessor is not None and not predecessor.is_set():
+                if superseded.is_set():
+                    raise CheckSuperseded(
+                        "native check superseded while waiting for its predecessor"
+                    )
+                if cancelled.is_set() or broker._native_cancelled():
+                    raise CheckCancelledBeforeLaunch(
+                        "native check cancelled while its replaced attempt finishes"
+                    )
+                predecessor.wait(0.1)
+            # Only now may this body steer the broker: a broker shared with the
+            # replaced attempt keeps that body's signals until it has stopped.
+            broker.check_cancelled = cancelled.is_set
+            broker.check_superseded = superseded.is_set
+            recheck()
             # Frozen port sets may overlap across runs. Acquire them in one
             # consistent order, before consuming generic check capacity.
             for port in sorted(set(ports)):
                 while not cancelled.is_set() and not broker._native_cancelled():
+                    if superseded.is_set():
+                        raise CheckSuperseded("native check superseded while queued for ports")
                     handle = _try_check_lock(root / f"port-{port}.lock")
                     if handle is not None:
                         port_descriptors.append(handle)
                         break
+                    recheck()
                     cancelled.wait(0.1)
                 else:
                     raise CheckCancelledBeforeLaunch(
@@ -147,6 +306,8 @@ async def _execute_check(
                     )
             ports_admitted.set()
             while not cancelled.is_set() and not broker._native_cancelled():
+                if superseded.is_set():
+                    raise CheckSuperseded("native check superseded while queued for a slot")
                 for slot in range(slots):
                     handle = _try_check_lock(root / f"slot-{slot}.lock")
                     if handle is None:
@@ -154,17 +315,27 @@ async def _execute_check(
                     descriptor = handle
                     break
                 if descriptor is not None:
-                    if cancelled.is_set() or broker._native_cancelled():
-                        raise CheckCancelledBeforeLaunch("native check cancelled before admission")
-                    admitted.set()
+                    with gate:
+                        if superseded.is_set():
+                            raise CheckSuperseded("native check superseded before admission")
+                        if cancelled.is_set() or broker._native_cancelled():
+                            raise CheckCancelledBeforeLaunch(
+                                "native check cancelled before admission"
+                            )
+                        admitted.set()
                     result = execute(broker)
                     if not broker.native_cleanup_confirmed:
                         result = {**result, "state": "unknown", "cleanup": "unknown"}
                     return _bind_planning_repair(request, result)
+                recheck()
                 cancelled.wait(0.1)
             raise CheckCancelledBeforeLaunch("native check cancelled while queued for a slot")
         except CheckCancelledBeforeLaunch:
             return _cancelled_check_result(request, broker)
+        except CheckSuperseded as exc:
+            # A newer attempt owns this gate and scores it from the journals;
+            # this attempt's verdict is void and must not be retried as such.
+            raise ApplicationError(str(exc), type="CheckSuperseded", non_retryable=True) from exc
         finally:
             if descriptor is not None:
                 port_descriptors.append(descriptor)
@@ -172,8 +343,10 @@ async def _execute_check(
                 for handle in port_descriptors:
                     os.close(handle)
             else:
-                # Unknown teardown cannot supply ports or capacity to another gate.
-                _UNCLEAN_CHECK_SLOTS.extend(port_descriptors)
+                # Unknown teardown cannot supply ports or capacity to another gate
+                # until the processes and ports it recorded are proven gone.
+                _retain_unclean_check(port_descriptors, broker, ports)
+            _release_gate(identity, finished)
 
     execution = asyncio.get_running_loop().run_in_executor(
         None, contextvars.copy_context().run, run,
@@ -195,8 +368,28 @@ async def _execute_check(
                 })
             await asyncio.wait({pending}, timeout=_CHECK_HEARTBEAT_INTERVAL)
         return await asyncio.shield(pending)
-    except BaseException:
-        cancelled.set()
+    except BaseException as exc:
+        with gate:
+            replaced = (isinstance(exc, asyncio.CancelledError) and admitted.is_set()
+                        and request["spec"]["provider"] == "codex"
+                        and activity_attempt_replaced() and activity_retry_pending())
+            if replaced:
+                superseded.set()
+            else:
+                cancelled.set()
+        if replaced:
+            # A heartbeat timeout, lost attempt or worker shutdown replaces only
+            # this waiter. The admitted gate finishes the native process it
+            # supervises under its durable monitor, launches nothing more, and
+            # hands the gate to the retry, which scores that invocation from
+            # its journal instead of a killed one. A retry on this worker takes
+            # the gate as soon as it arrives; one on another worker only once
+            # this notice has stopped the body. A terminal timeout or an
+            # operator cancel still stops it and frees its slot.
+            execution.add_done_callback(
+                lambda future: future.exception() if not future.cancelled() else None
+            )
+            raise
         # The task can be cancelled during shutdown without stopping its
         # executor. Join that original future before returning cancellation.
         while not execution.done():
@@ -751,7 +944,7 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
                     'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
             if (request["spec"]["provider"] != "codex"
-                    or isinstance(exc, CheckCancelledBeforeLaunch)):
+                    or isinstance(exc, (CheckCancelledBeforeLaunch, CheckSuperseded))):
                 raise
             return {
                 "state": "unknown",
@@ -760,7 +953,9 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
                 "reason": type(exc).__name__,
             }
 
-    return await _with_heartbeat(_execute_check(request, execute), request, 'checks')
+    return await _with_heartbeat(
+        _execute_check(request, execute, kind='checks'), request, 'checks',
+    )
 
 
 @activity.defn(name="delivery_browser_qa")
@@ -770,7 +965,7 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
             return broker.run_browser_qa(request["iteration"], request["candidate"])
         except Exception as exc:
             if (request["spec"]["provider"] != "codex"
-                    or isinstance(exc, CheckCancelledBeforeLaunch)):
+                    or isinstance(exc, (CheckCancelledBeforeLaunch, CheckSuperseded))):
                 raise
             return {
                 "state": "unknown",
@@ -784,7 +979,8 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
     # bounded child is supervised on its own thread.
     qa = request["spec"].get("policy", {}).get("browser_qa") or {}
     return await _with_heartbeat(
-        _execute_check(request, execute, ports=tuple(qa.get("ports", {}).values())),
+        _execute_check(request, execute, kind='browser_qa',
+                       ports=tuple(qa.get("ports", {}).values())),
         request, 'browser_qa',
     )
 
@@ -801,7 +997,7 @@ async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
                     'results': exc.results, 'diagnostic': str(exc)}
         except Exception as exc:
             if (request["spec"]["provider"] != "codex"
-                    or isinstance(exc, CheckCancelledBeforeLaunch)):
+                    or isinstance(exc, (CheckCancelledBeforeLaunch, CheckSuperseded))):
                 raise
             return {
                 "state": "unknown",
@@ -810,7 +1006,9 @@ async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
                 "reason": type(exc).__name__,
             }
 
-    return await _with_heartbeat(_execute_check(request, execute), request, 'precheck')
+    return await _with_heartbeat(
+        _execute_check(request, execute, kind='precheck'), request, 'precheck',
+    )
 
 
 @activity.defn(name="delivery_baseline_checks")
@@ -824,7 +1022,9 @@ async def delivery_baseline_checks(request: dict[str, Any]) -> dict[str, Any]:
             return {"state": "failed", "results": exc.results, "diagnostic": str(exc),
                     "base_sha": request["spec"]["base_sha"]}
 
-    return await _with_heartbeat(_execute_check(request, execute), request, 'baseline_checks')
+    return await _with_heartbeat(
+        _execute_check(request, execute, kind='baseline_checks'), request, 'baseline_checks',
+    )
 
 
 @activity.defn(name="delivery_ci")

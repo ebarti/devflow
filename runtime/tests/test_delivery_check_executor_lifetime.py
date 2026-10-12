@@ -379,7 +379,9 @@ async def test_original_context_reaches_real_executor_operation(native_case):
 
     token = EXECUTION_CONTEXT.set("owned-original-context")
     try:
-        result = await delivery_activities._execute_check(run.request(), execute)
+        result = await delivery_activities._execute_check(
+            run.request(), execute, kind="checks",
+        )
     finally:
         EXECUTION_CONTEXT.reset(token)
     assert observed == ["owned-original-context"]
