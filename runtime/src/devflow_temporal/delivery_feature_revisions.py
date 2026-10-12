@@ -677,19 +677,6 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     if not public:
         return None
     revision_id = public["revision_id"]
-    from .delivery_feature_publication import current_record
-    from .delivery_github_plans import require_publication_capacity
-
-    try:
-        # Nothing is written before this. A stopped feature publishes nothing, so the
-        # pending reservation only proceeds after the owner changes the record.
-        require_publication_capacity(spec["feature_delivery"]["snapshot"]["issue"],
-                                     current_record(spec)["manifest"],
-                                     trunk=spec.get("publication_base_ref"),
-                                     head_width=len(spec["base_sha"]))
-    except ValueError as exc:
-        raise OwnershipConflict(f"{exc}; the reserved revision stays pending, unspent and "
-                                "blocked until the owner acts") from exc
     replay = "; replay continue-feature " + request["command_id"] + " to continue without it"
     if _started_reservation(shared, token, revision_id, values):
         # A begun (or charged) attempt belongs to the generation that began it: no
@@ -705,6 +692,20 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
             "reserved revision " + revision_id
             + " attempt stopped before adoption and is now closed" + replay
         )
+    from .delivery_feature_publication import current_record
+    from .delivery_github_plans import require_publication_capacity
+
+    try:
+        # An unstarted reservation has spent nothing and nothing is written before
+        # this. A stopped feature publishes nothing, so it proceeds only after the
+        # owner changes the record.
+        require_publication_capacity(spec["feature_delivery"]["snapshot"]["issue"],
+                                     current_record(spec)["manifest"],
+                                     trunk=spec.get("publication_base_ref"),
+                                     head_width=len(spec["base_sha"]))
+    except ValueError as exc:
+        raise OwnershipConflict(f"{exc}; the reserved revision stays pending, unspent and "
+                                "blocked until the owner acts") from exc
     chain = _preparation_lineage(shared, public, values)
     initial = {**public["owner"], "run_id": public["successor_id"],
                "generation": public["owner"]["generation"] + 1}
