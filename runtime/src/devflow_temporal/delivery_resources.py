@@ -786,15 +786,12 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
                 request = read_private(path.with_name('request.json'))
                 result = json.loads(attempt['result_json'])
                 metadata = value.get('provider_session', {})
-                identity = {'run_id': spec['run_id'], 'role': request['role'],
-                            'iteration': request['iteration'],
-                            'candidate_id': request['candidate']['id'],
-                            'policy_digest': spec['policy_digest']}
-                if request.get('attempt_generation'):
-                    identity['attempt_generation'] = request['attempt_generation']
+                from .supervisor import DeliverySupervisor
+
                 monitor = value.get('monitor', {})
                 if (attempt['state'] != 'finished' or attempt['cleanup'] != 'confirmed'
-                        or request['spec'] != spec or digest(identity) != attempt['job_key']
+                        or request['spec'] != spec
+                        or DeliverySupervisor._job_key(request) != attempt['job_key']
                         or request['role'] != attempt['role']
                         or request['iteration'] != attempt['iteration']
                         or request['candidate']['id'] != attempt['candidate_id']

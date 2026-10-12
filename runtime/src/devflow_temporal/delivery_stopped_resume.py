@@ -139,11 +139,15 @@ def interrupted_resume(seal):
             'resume_stage': 'published' if published else 'checks', 'gate_evidence': evidence}
 
 
-def gate_admission_consistent(details):
-    """A recorded gate admission must be this admission's; only recoveries that never
-    rerun gates at their sealed iteration, or revision recoveries recorded before the
-    identity existed, may lack one."""
-    recorded = details['execution_spec'].get('gate_admission')
+def admission_identity_consistent(details):
+    """Recorded gate and implement admissions must be this admission's. A gate
+    admission may be missing only where gates never rerun at the sealed iteration or
+    on revision recoveries recorded before it existed; an implement admission may be
+    missing on pending repairs recorded before it existed."""
+    spec = details['execution_spec']
+    if spec.get('implement_admission') not in (None, details['command_digest']):
+        return False
+    recorded = spec.get('gate_admission')
     if recorded is not None:
         return recorded == details['command_digest']
     return not ('resume_iteration' in details and not details.get('feature_plan_revision'))
@@ -216,8 +220,8 @@ def custody(db, recovery):
                 and not (recovery.get('pending_repair') or interrupted
                          or details.get('resume_stage') == 'checks'))):
         raise ValueError('stopped resume changed its unstarted repair authority')
-    if not gate_admission_consistent(details):
-        raise ValueError('stopped resume changed its gate admission identity')
+    if not admission_identity_consistent(details):
+        raise ValueError('stopped resume changed its admission identity')
     if interrupted:
         plan = interrupted_resume(details) or {}
         if (plan.get('additional_iterations') != details['command']['additional_iterations']
@@ -507,10 +511,17 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             execution.pop('role_home_generation')
         if seal.get('session_custody'):
             execution['implementation_role_home_generation'] = seal['session_custody']['generation']
+        # Admission identities belong to one admission; a predecessor's never carry over.
+        for field in ('gate_admission', 'implement_admission'):
+            execution.pop(field, None)
         if interrupted or gate_only:
             # Gates may rerun at the sealed iteration, so their attempts take this
             # admission's identity instead of meeting an earlier execution's receipts.
             execution['gate_admission'] = command_digest
+        if pending or (interrupted and 'resume_stage' not in interrupted):
+            # The implementer reruns at the sealed iteration with the same input, so
+            # its attempt must not be answered from the failed one's durable receipt.
+            execution['implement_admission'] = command_digest
         candidate = {**seal['candidate'], 'policy_digest': execution['policy_digest']}
         retained = {k: v for k, v in seal.items() if k not in {'row', 'closed'}}
         retained['closed'] = {k: v for k, v in seal['closed'].items() if k != 'result'}

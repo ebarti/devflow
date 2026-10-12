@@ -165,9 +165,14 @@ def test_pending_repair_ignores_a_predecessor_that_reran_its_own_iteration():
     ({"execution_spec": {}, "command_digest": "a" * 64, "resume_iteration": 2,
       "feature_plan_revision": {"revision_id": "r"}}, True),
     ({"execution_spec": {}, "command_digest": "a" * 64, "pending_repair": {"iteration": 3}}, True),
-], ids=["own", "foreign", "interrupted-missing", "legacy-revision", "pending-repair"])
-def test_gate_admission_identity_rule(details, consistent):
-    assert resume_mod.gate_admission_consistent(details) is consistent
+    ({"execution_spec": {"implement_admission": "a" * 64}, "command_digest": "a" * 64,
+      "pending_repair": {"iteration": 3}}, True),
+    ({"execution_spec": {"implement_admission": "b" * 64}, "command_digest": "a" * 64,
+      "pending_repair": {"iteration": 3}}, False),
+], ids=["own", "foreign", "interrupted-missing", "legacy-revision", "legacy-pending-repair",
+        "own-implement", "foreign-implement"])
+def test_admission_identity_rule(details, consistent):
+    assert resume_mod.admission_identity_consistent(details) is consistent
 
 
 def _worker(service, monkeypatch, *, used_by_others, kind="build"):
