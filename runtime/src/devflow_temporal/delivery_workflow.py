@@ -173,6 +173,7 @@ class DeliveryWorkflow:
         self.liveness_v2 = False
         self.publication_v1 = False
         self.terminal_closing = False
+        self.feature_revision_v1 = False
         self.controller_spec = None
         self.launch_window_v1 = False
 
@@ -1168,6 +1169,14 @@ class DeliveryWorkflow:
         # recorded without this marker keep treating that result as a failed gate.
         self.launch_window_v1 = (workflow.patched("delivery-native-launch-window-v1")
                                  if workflow.in_workflow() else False)
+        # Marker for this change set's feature-revision commands only, evaluated
+        # before any command. A patch marker is replay-safe for exactly the change
+        # it shipped with, so a later command change defines its own marker next to
+        # this one. Executions recorded without it replay with False and keep their
+        # recorded behaviour; direct protocol calls outside a workflow have no
+        # history: False.
+        self.feature_revision_v1 = (workflow.patched("delivery-feature-revision-wedges-v1")
+                                    if workflow.in_workflow() else False)
         if (spec.get("workflow_failure_boundary_version") != 1
                 or not workflow.patched("delivery-controller-failure-boundary-v1")):
             return await self._run_protocol(spec, recovery)

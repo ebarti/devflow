@@ -35,6 +35,10 @@ from .delivery_preparation import execution_retired
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
 
+# Failures that prove nothing about the run and are safe to replay; the API
+# answers 503 with the reason instead of a bare 500.
+TRANSPORT_FAILURES = (RuntimeError, OSError, subprocess.SubprocessError)
+
 logger = logging.getLogger(__name__)
 
 
@@ -476,6 +480,8 @@ def create_app(config_path: Path) -> FastAPI:
             return await asyncio.to_thread(service.store.submit, await request.json())
         except (ValueError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
+        except TRANSPORT_FAILURES as exc:
+            raise HTTPException(503, str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/revise-feature-plan")
     async def revise_feature_plan(request: Request, run_id: str) -> dict[str, Any]:
@@ -485,8 +491,10 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             return await asyncio.to_thread(
                 revise_execution, service.store, run_id, await request.json())
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+        except TRANSPORT_FAILURES as exc:
+            raise HTTPException(503, str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/continue-feature")
     async def continue_feature(request: Request, run_id: str) -> dict[str, Any]:
@@ -498,6 +506,9 @@ def create_app(config_path: Path) -> FastAPI:
                 continue_execution, service.store, run_id, await request.json())
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+        except TRANSPORT_FAILURES as exc:
+            # Temporal, git or gh were unavailable: the command is safe to replay.
+            raise HTTPException(503, str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/recover-publication")
     async def recover_publication(request: Request, run_id: str) -> dict[str, Any]:

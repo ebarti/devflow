@@ -525,8 +525,11 @@ async def delivery_feature_worker_result(request):
             child_id,
             workflow_id=store.active_workflow_id(child_id),
         )
-    except ValueError as exc:
-        if str(exc) != "continuation predecessor Temporal closure is unproven":
+    except (ValueError, RuntimeError) as exc:
+        # A not-yet-closed child and an unreachable Temporal are both polled again.
+        if (str(exc) != "continuation predecessor Temporal closure is unproven"
+                and not str(exc).startswith(
+                    "continuation predecessor Temporal closure is unavailable")):
             raise
         return {"closed": False, "reason": "temporal_closure_pending"}
     return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"])}
@@ -779,13 +782,13 @@ async def delivery_feature_revision_review(request):
 @activity.defn(name="delivery_feature_revision_adopt")
 async def delivery_feature_revision_adopt(request):
     from .delivery_execution_config import load_execution_config
-    from .delivery_feature_revisions import adopt_revision
+    from .delivery_feature_revisions import settle_adoption
     from .delivery_store import DeliveryStore
 
     config = await asyncio.to_thread(load_execution_config, request["spec"])
     store = DeliveryStore(config)
     return await asyncio.to_thread(
-        adopt_revision, store, request["spec"], request["context"]["revision_id"],
+        settle_adoption, store, request["spec"], request["context"]["revision_id"],
         request["proposed_plan"], request["review"],
     )
 

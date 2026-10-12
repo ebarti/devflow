@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_config import COMMAND_RE
-from .delivery_execution_registry import OwnershipConflict
+from .delivery_execution_registry import OwnershipConflict, UnresolvedEffect
 
 PREFIX = "plan-revision:"
 DIAGNOSTIC_FIELDS = {
@@ -369,6 +369,17 @@ def revise_feature_plan(store, run_id, request):
         record = current_record(spec)
         live_members(spec, record)
         identity = _assert_identity(record, adopted_plan_identity(spec, shared))
+        with shared.connect() as db:
+            reserved = shared._pending_revision(db, token["issue_id"])
+        unstarted = bool(
+            reserved and reserved["revision_id"] != revision_id
+            and PREFIX + "begin:" + reserved["revision_id"] not in _values(spec, shared)
+        )
+        if not unstarted:
+            # GitHub still shows the adopted plan, so this stopped owner's unfinished
+            # attempts can end here before a new correction is reserved.
+            _close_stopped_attempts(shared, token, _values(spec, shared),
+                                    "superseded by revision command " + request["command_id"])
         budget = shared.budget(token["issue_id"])
         if budget["used"] >= budget["maximum"]:
             raise OwnershipConflict("feature product repair limit exhausted")
@@ -412,12 +423,29 @@ def revise_feature_plan(store, run_id, request):
                     raise OwnershipConflict("reconsideration proof changed before reservation")
                 for key, item in values.items():
                     existing = item.get("reconsideration") if isinstance(item, dict) else None
-                    if (key.startswith(PREFIX + "request:") and existing
-                            and existing["context_key"] == proof["context_key"]
-                            and item["request_digest"] != command_digest):
+                    if (not key.startswith(PREFIX + "request:") or not existing
+                            or existing["context_key"] != proof["context_key"]
+                            or item["request_digest"] == command_digest):
+                        continue
+                    holder = item["revision_id"]
+                    if not _terminal(values, holder):
+                        raise OwnershipConflict("review context already reserved by " + holder)
+                    # A closed reservation keeps the context only if it was spent on it.
+                    if _started_reservation(shared, token, holder, values):
                         raise OwnershipConflict(
-                            "review context already reserved by " + item["revision_id"]
+                            "review context already consumed by " + holder
+                            + ", which was closed after it was charged"
                         )
+            if unstarted:
+                raise OwnershipConflict(
+                    "feature has another revision command in custody: revision "
+                    + reserved["revision_id"] + " reserved by command "
+                    + str((reserved.get("request") or {}).get("command_id")) + " for run "
+                    + str(reserved.get("successor_id"))
+                    + "; replay that revise-feature-plan command or continue-feature that"
+                    " run to carry it (abandon_revision would permanently reject the"
+                    " pending revision; that is an owner decision, not a retry)"
+                )
             shared.revision_checkpoint(
                 token, PREFIX + "request:" + revision_id, admission, stopped=True
             )
@@ -497,32 +525,61 @@ def _preparation_retry(store, spec, public, values):
                                  "AND generation=?", (receipt["predecessor"]["issue_id"],
                                                       receipt["predecessor"]["generation"]))
             effected = effects.fetchone()
-        closed, observed = _preparation_observation(store, previous, row, custodian=spec)
         if (attempted or effected or digest(previous) != receipt["predecessor_spec_sha256"]
-                or digest(dict(row)) != receipt["stopped_row_sha256"]
-                or digest(closed["result"]) != receipt["closed_state_sha256"]
+                or digest(dict(row)) != receipt["stopped_row_sha256"]):
+            raise OwnershipConflict("preparation predecessor custody changed after continuation")
+        if name != key:
+            # An ancestor's closure and remote observation were sealed into this
+            # digest-chained receipt when its own continuation was admitted.
+            continue
+        closed, observed = _preparation_observation(store, previous, row, custodian=spec)
+        if (digest(closed["result"]) != receipt["closed_state_sha256"]
                 or {k: v for k, v in closed.items() if k != "result"} != receipt["closure"]
                 or observed != receipt["observation"]):
             raise OwnershipConflict("preparation predecessor custody changed after continuation")
-        if name == key:
-            break
+        break
     return saved
 
 
-def _refresh_preparation_reconsideration(store, original, public, values):
+# The runtime install's identity (its git revision and payload digest). Preparation
+# receipts re-stamp it at every continuation; the normalized review context is what
+# binds a reconsideration, so a routine deployment never changes that binding.
+RUNTIME_PROVENANCE = frozenset({"revision", "runtime_payload_sha256"})
+
+
+def _without_runtime_provenance(receipt):
+    """A preparation receipt (or proof) with the runtime install's provenance removed."""
+    stripped = deepcopy(receipt)
+    selectors = stripped.get("selectors")
+    if isinstance(selectors, dict):
+        for key in ("expected_runtime_revision", "expected_runtime_payload_sha256"):
+            selectors.pop(key, None)
+    for proof in (stripped, stripped.get("reconsideration")):
+        if isinstance(proof, dict) and isinstance(proof.get("current_runtime"), dict):
+            proof["current_runtime"] = {
+                k: v for k, v in proof["current_runtime"].items() if k not in RUNTIME_PROVENANCE
+            }
+    return stripped
+
+
+def _current_runtime_selectors(selectors):
     from .delivery_feature_review_context import current_runtime_context
 
+    current = current_runtime_context()
+    return current, {**selectors,
+                     "expected_runtime_revision": current["revision"],
+                     "expected_runtime_payload_sha256": current["runtime_payload_sha256"]}
+
+
+def _refresh_preparation_reconsideration(store, original, public, values):
     receipt = public.get("reconsideration")
     if not receipt:
         raise OwnershipConflict("pending preparation lacks its authenticated review context")
-    current = current_runtime_context()
-    provenance = {"revision", "runtime_payload_sha256"}
-    if ({k: v for k, v in current.items() if k not in provenance}
-            != {k: v for k, v in receipt["current_runtime"].items() if k not in provenance}):
+    current, selectors = _current_runtime_selectors(public["request"]["reconsideration"])
+    if ({k: v for k, v in current.items() if k not in RUNTIME_PROVENANCE}
+            != {k: v for k, v in receipt["current_runtime"].items()
+                if k not in RUNTIME_PROVENANCE}):
         raise OwnershipConflict("preparation retry changed its normalized review context")
-    selectors = {**public["request"]["reconsideration"],
-                 "expected_runtime_revision": current["revision"],
-                 "expected_runtime_payload_sha256": current["runtime_payload_sha256"]}
     proof, findings = _reconsideration_proof(
         store, original, selectors, public["record"], public["predecessor_closure"], values,
     )
@@ -615,6 +672,21 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     if not public:
         return None
     revision_id = public["revision_id"]
+    replay = "; replay continue-feature " + request["command_id"] + " to continue without it"
+    if _started_reservation(shared, token, revision_id, values):
+        # A begun (or charged) attempt belongs to the generation that began it: no
+        # continuation can transport it and no later begin may resume it, so this
+        # refusal is final. Unstarted reservations are never closed here; their
+        # refusals leave the reservation pending for the next command.
+        _abandon_reservation(
+            store, spec, shared, public, values,
+            "plan revision attempt stopped with generation " + str(token["generation"])
+            + " before adoption; closed by continuation command " + request["command_id"],
+        )
+        raise OwnershipConflict(
+            "reserved revision " + revision_id
+            + " attempt stopped before adoption and is now closed" + replay
+        )
     chain = _preparation_lineage(shared, public, values)
     initial = {**public["owner"], "run_id": public["successor_id"],
                "generation": public["owner"]["generation"] + 1}
@@ -622,7 +694,10 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     saved = values.get(key)
     if saved and (saved["command"] != request or saved["successor_id"] != successor_id
                   or saved["predecessor"] != token):
-        raise OwnershipConflict("reserved revision already has a preparation continuation")
+        raise OwnershipConflict(
+            "reserved revision already has a preparation continuation; replay continue-feature "
+            + saved["command"]["command_id"] + " for run " + saved["successor_id"]
+        )
     # This is a new admission, so match submit's live-versus-loaded config guard
     # before appending a transport receipt. Existing execution stays frozen.
     if digest(DeliveryConfig.load(store.config.path).raw) != digest(store.config.raw):
@@ -631,7 +706,15 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     sequence = next((index + 2 for index, (_, receipt) in enumerate(chain)
                      if receipt == incoming), 1)
     if sequence > PREPARATION_CONTINUATION_LIMIT:
-        raise OwnershipConflict("reserved revision preparation continuation limit reached")
+        _abandon_reservation(
+            store, spec, shared, public, values,
+            "preparation continuation limit reached after " + str(len(chain))
+            + " continuations; closed by continuation command " + request["command_id"],
+        )
+        raise OwnershipConflict(
+            "reserved revision preparation continuation limit reached; revision "
+            + revision_id + " is closed" + replay
+        )
     with shared.connect() as db:
         pending = shared._pending_revision(db, token["issue_id"])
         paid = db.execute("SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
@@ -673,7 +756,12 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
         receipt.update(version=2, sequence=sequence,
                        previous=deepcopy(spec["feature_plan_revision_preparation_retry"]))
     if saved is not None and saved != receipt:
-        raise OwnershipConflict("preparation continuation evidence changed before replay")
+        if _without_runtime_provenance(saved) != _without_runtime_provenance(receipt):
+            raise OwnershipConflict("preparation continuation evidence changed before replay")
+        # Only the runtime install moved (a deployment) since this receipt was written;
+        # its normalized review context is unchanged, so the receipt stands as written
+        # and the replay spends nothing and adds no continuation.
+        receipt = saved
     with shared.serialized(token["issue_id"]):
         if _preparation_lineage(shared, public, _values(spec, shared)) != chain:
             raise OwnershipConflict("preparation continuation lineage changed before admission")
@@ -861,7 +949,7 @@ def planning_defect_repair_binding(spec, worker_run_id, iteration, diagnostic):
     key = f"{worker_run_id}:{iteration}"
     with shared.connect() as db:
         charged = db.execute(
-            "SELECT generation,reason FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+            "SELECT reason FROM execution_repairs WHERE issue_id=? AND repair_key=?",
             (issue_id, key),
         ).fetchone()
         assigned = db.execute(
@@ -870,24 +958,34 @@ def planning_defect_repair_binding(spec, worker_run_id, iteration, diagnostic):
         ).fetchone()
     if (
         not charged
-        or charged["generation"] != token["generation"]
         or charged["reason"] != "Product repair at worker iteration " + str(iteration)
         or not assigned
         or assigned["state"] not in {"reserved", "running"}
         or assigned["generation"] != token["generation"]
     ):
         return None
-    revision_id = (
-        "revision-"
-        + digest(
-            {
-                "owner": token,
-                "diagnostic": diagnostic,
-                "command_id": None,
-            }
-        )[:24]
-    )
-    return {"revision_id": revision_id, "repair_key": key}
+    # The worker's debit and its diagnosed defect identify this charge. No
+    # coordinator generation does, so a continuation before replanning reuses it.
+    return {
+        "revision_id": "revision-" + digest(
+            {"worker_run_id": worker_run_id, "repair_key": key, "diagnostic": diagnostic}
+        )[:24],
+        "repair_key": key,
+        "diagnostic_sha256": digest(diagnostic),
+    }
+
+
+def _legacy_binding_ids(shared, issue_id, diagnostic):
+    """Attempt identities earlier bindings derived from each coordinator generation."""
+    with shared.connect() as db:
+        tokens = [dict(row) for row in db.execute(
+            "SELECT issue_id,run_id,store_path,generation FROM execution_snapshots "
+            "WHERE issue_id=?", (issue_id,),
+        )]
+    return {
+        "revision-" + digest({"owner": owner, "diagnostic": diagnostic, "command_id": None})[:24]
+        for owner in tokens
+    }
 
 
 def begin_revision(store, spec, diagnostic=None, command_id=None):
@@ -945,17 +1043,30 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
         with shared.connect() as db:
             shared.require_settlement(db, token)
             shared._settled(db, token["issue_id"])
-            pending = shared._pending_revision(db, token["issue_id"])
-        if pending and pending["revision_id"] != revision_id:
-            raise OwnershipConflict("feature has a different proposal attempt in custody")
+        current = _values(spec, shared)
         begun = [
             value
-            for key, value in _values(spec, shared).items()
+            for key, value in current.items()
             if key.startswith(PREFIX + "begin:")
-            and not _terminal(_values(spec, shared), value["revision_id"])
+            and not _terminal(current, value["revision_id"])
         ]
-        if any(value["revision_id"] != revision_id for value in begun):
-            raise OwnershipConflict("feature has an active plan investigation")
+        for stale in begun:
+            if stale["revision_id"] == revision_id:
+                continue
+            if stale["owner"]["generation"] >= token["generation"]:
+                raise OwnershipConflict("feature has an active plan investigation")
+            # The earlier coordinator stopped mid-attempt. GitHub still shows the plan
+            # it began from (asserted above), so its attempt ends here, debit kept.
+            _close_stopped_investigation(shared, token, stale, current)
+        with shared.connect() as db:
+            pending = shared._pending_revision(db, token["issue_id"])
+        if pending and pending["revision_id"] != revision_id:
+            raise OwnershipConflict(
+                "feature has a different proposal attempt in custody: revision "
+                + pending["revision_id"] + " reserved by command "
+                + str((pending.get("request") or {}).get("command_id")) + " for run "
+                + str(pending.get("successor_id"))
+            )
         if reconsideration:
             _recheck_reconsideration(
                 store, spec, {"revision_id": revision_id, "owner": token, **reconsideration},
@@ -989,9 +1100,27 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
                 ):
                     pending_charge = json.loads(worker["checks_json"] or "{}").get(
                         "planning_defect_repair"
-                    )
+                    ) or {}
                     expected_key = f"{assignment['run_id']}:{worker['iteration']}"
-                    if pending_charge == {"revision_id": revision_id, "repair_key": expected_key}:
+                    # The binding names the debit and the diagnosed defect; earlier
+                    # bindings named the attempt by the generation that observed it.
+                    bound = pending_charge.get("repair_key") == expected_key and (
+                        pending_charge.get("diagnostic_sha256") == digest(diagnostic)
+                        or (
+                            "diagnostic_sha256" not in pending_charge
+                            and pending_charge.get("revision_id")
+                            in _legacy_binding_ids(shared, token["issue_id"], diagnostic)
+                        )
+                    )
+                    # One worker debit backs at most one attempt: an earlier begin that
+                    # already named it (closed or not) leaves this attempt to pay anew.
+                    spent = any(
+                        name.startswith(PREFIX + "begin:")
+                        and item.get("revision_id") != revision_id
+                        and item.get("repair_key") == expected_key
+                        for name, item in values.items()
+                    )
+                    if bound and not spent:
                         with shared.connect() as db:
                             paid = db.execute(
                                 "SELECT repair_key FROM execution_repairs "
@@ -1596,15 +1725,22 @@ def _recheck_reconsideration(store, spec, context, *, candidate=None):
                                "AND repair_key=?", (context["owner"]["issue_id"],
                                                     begun["repair_key"])).fetchone()
         paid = bool(debit and debit[0] == context["owner"]["generation"])
+    selectors = retry["selectors"] if retry else public["request"]["reconsideration"]
+    if retry:
+        # A preparation receipt stamps the runtime that transported it; a deployment
+        # before this begin re-stamps that provenance while the normalized review
+        # context stays bound. The owner's original admission keeps its exact stamp.
+        _, selectors = _current_runtime_selectors(selectors)
     proof, findings = _reconsideration_proof(
-        store, original, retry["selectors"] if retry else public["request"]["reconsideration"],
-        public["record"],
+        store, original, selectors, public["record"],
         public["predecessor_closure"], values, planning_paid=paid,
     )
     # The normal repair debit is intentionally newer; its budget cannot rewrite
     # the original pre-admission receipt, nor redefine deduplication identity.
     proof["original_repair_budget"] = receipt["original_repair_budget"]
-    if proof != receipt or findings != context["unresolved_prior_findings"]:
+    comparable = (_without_runtime_provenance(proof), _without_runtime_provenance(receipt)) \
+        if retry else (proof, receipt)
+    if comparable[0] != comparable[1] or findings != context["unresolved_prior_findings"]:
         raise OwnershipConflict("reconsideration proof or current derived subject changed")
     if candidate is not None:
         from .delivery_feature_review_context import candidate_subject
@@ -1916,20 +2052,182 @@ def reject_revision(store, spec, revision_id, reason):
         ).fetchone()
     if pending:
         raise OwnershipConflict("revision cannot release custody with unsettled external effects")
-    proposal = values.get(PREFIX + "proposal:" + revision_id, {})
-    receipt = {
-        "revision_id": revision_id,
+    release = _releasable_custody(shared, context["owner"]["issue_id"], revision_id)
+    receipt = _rejection_receipt(shared, context, values, reason)
+    shared.revision_checkpoint(context["owner"], PREFIX + "rejected:" + revision_id, receipt)
+    _release_custody(shared, context["owner"], release)
+    return receipt
+
+
+def _publication_custody(shared, issue_id, revision_id):
+    """The staged publication an attempt may hold: its stage and this operation's effects."""
+    stage_key = "github-plan-stage:" + digest(revision_id)
+    with shared.connect() as db:
+        stage = db.execute(
+            "SELECT content_json FROM execution_checkpoints "
+            "WHERE issue_id=? AND checkpoint_key=?", (issue_id, stage_key),
+        ).fetchone()
+        rows = [dict(row) for row in db.execute(
+            "SELECT effect_key,kind,state,request_json,result_json FROM execution_effects "
+            "WHERE issue_id=? AND kind IN ('github_child_plan','github_plan_revision')",
+            (issue_id,),
+        )]
+    effects = [row for row in rows
+               if json.loads(row["request_json"]).get("operation_id") == revision_id]
+    return (json.loads(stage[0]) if stage else None), stage_key, effects
+
+
+def _releasable_custody(shared, issue_id, revision_id):
+    """Refuse to close an attempt whose publication may have reached the parent record.
+
+    A stage whose parent effect was never intended (and whose child-plan effects
+    are settled) can be released: the parent record provably never changed for it.
+    """
+    stage, stage_key, effects = _publication_custody(shared, issue_id, revision_id)
+    if any(e["kind"] == "github_plan_revision" and e["state"] == "complete" for e in effects):
+        raise OwnershipConflict(
+            "revision attempt already published its plan revision and cannot be closed"
+        )
+    if any(e["state"] == "pending" for e in effects):
+        raise OwnershipConflict(
+            "revision attempt holds an unsettled plan publication; settle its readback first"
+        )
+    if stage is None:
+        return None
+    return {
+        "version": 1,
+        "operation_id": revision_id,
+        "stage_key": stage_key,
+        "target_plan_revision": stage.get("target_plan_revision"),
+        # Child-plan comments already written for this operation. Their bodies carry
+        # this operation's creation key and the parent index never referenced them,
+        # so they stay inert; this ledger keeps them accounted for.
+        "children": [
+            {"effect_key": e["effect_key"], "state": e["state"],
+             "child": json.loads(e["request_json"]).get("child"),
+             "reference": json.loads(e["result_json"] or "null")}
+            for e in effects if e["kind"] == "github_child_plan"
+        ],
+    }
+
+
+def _release_custody(shared, token, release, *, stopped=False):
+    if release is None:
+        return
+    shared.revision_checkpoint(
+        token, PREFIX + "publication-released:" + release["operation_id"],
+        {**release, "released_by": token}, stopped=stopped,
+    )
+
+
+def _rejection_receipt(shared, context, values, reason):
+    proposal = values.get(PREFIX + "proposal:" + context["revision_id"], {})
+    return {
+        "revision_id": context["revision_id"],
         "phase": "rejected",
         "reason": reason,
         "old_identity": context["old_identity"],
         "proposal_digest": proposal.get("proposal_digest"),
-        "repair_key": context["repair_key"],
+        "repair_key": context.get("repair_key"),
         "budget": shared.budget(context["owner"]["issue_id"]),
-        **({"reconsideration_context_key": context["reconsideration"]["context_key"]}
+        **({"reconsideration_context_key": context["reconsideration"].get("context_key")}
            if context.get("reconsideration") else {}),
     }
-    shared.revision_checkpoint(context["owner"], PREFIX + "rejected:" + revision_id, receipt)
+
+
+def _close_attempt(shared, token, context, values, reason, *, stopped=False):
+    """Append the terminal rejection of an attempt no coordinator can finish; debit kept."""
+    revision_id = context["revision_id"]
+    with shared.connect() as db:
+        paid = db.execute(
+            "SELECT repair_key FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+            (token["issue_id"], "plan-revision:" + revision_id),
+        ).fetchone()
+    subject = {**context, "repair_key": context.get("repair_key") or (paid[0] if paid else None)}
+    release = _releasable_custody(shared, token["issue_id"], revision_id)
+    receipt = {**_rejection_receipt(shared, subject, values, reason), "closed_by": token}
+    shared.revision_checkpoint(token, PREFIX + "rejected:" + revision_id, receipt, stopped=stopped)
+    _release_custody(shared, token, release, stopped=stopped)
     return receipt
+
+
+def _close_stopped_investigation(shared, token, context, values):
+    """End a stopped generation's unfinished attempt; its product cycle stays spent."""
+    reason = (
+        "plan revision attempt stopped with generation "
+        + str(context["owner"]["generation"])
+        + " before adoption; closed by generation "
+        + str(token["generation"])
+    )
+    return _close_attempt(shared, token, context, values, reason)
+
+
+def _started_reservation(shared, token, revision_id, values):
+    with shared.connect() as db:
+        paid = db.execute(
+            "SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+            (token["issue_id"], "plan-revision:" + revision_id),
+        ).fetchone()
+    return bool(paid or any(
+        name in values for name in (PREFIX + "begin:" + revision_id,
+                                    PREFIX + "proposal:" + revision_id)))
+
+
+def _abandon_reservation(store, spec, shared, public, values, reason):
+    """Close a stopped generation's reservation or attempt that no command can carry."""
+    from .delivery_feature_publication import current_record, live_members
+
+    token = spec["feature_delivery"]["owner"]
+    revision_id = public["revision_id"]
+    if _terminal(values, revision_id):
+        return None
+    begun = values.get(PREFIX + "begin:" + revision_id)
+    if begun:
+        # Only GitHub proves the stopped attempt never adopted its correction.
+        record = current_record(spec)
+        live_members(spec, record)
+        _assert_identity(record, adopted_plan_identity(spec, shared))
+    return _close_attempt(shared, token, begun or public, values, reason, stopped=True)
+
+
+def _close_stopped_attempts(shared, token, values, reason):
+    """Close every unfinished attempt before the stopped owner reserves anew.
+
+    Only the stopped claim owner reaches here, so each open attempt belongs to a
+    stopped generation and GitHub (asserted by the caller) never adopted it.
+    """
+    for key, context in list(values.items()):
+        if key.startswith(PREFIX + "begin:") and not _terminal(values, context["revision_id"]):
+            _close_attempt(shared, token, context, values, reason, stopped=True)
+
+
+def abandon_reserved_revision(store, spec, revision_id, command_id):
+    """Close the named reservation held by this stopped run; an exact replay is a no-op.
+
+    The reservation may be carried by this run, or it may have been reserved from
+    this run without its successor ever being admitted (an orphaned request).
+    """
+    shared = _registry(spec)
+    token = spec["feature_delivery"]["owner"]
+    values = _values(spec, shared)
+    if _terminal(values, revision_id):
+        return None
+    public = revision_request(spec, shared)
+    if not public or public["revision_id"] != revision_id:
+        with shared.connect() as db:
+            pending = shared._pending_revision(db, token["issue_id"])
+        if (pending and pending["revision_id"] == revision_id
+                and pending.get("predecessor_run_id") == spec["run_id"]):
+            public = pending
+        else:
+            recorded = (public or pending or {}).get("revision_id")
+            raise OwnershipConflict(
+                "feature has no reserved revision " + revision_id
+                + (("; its recorded reservation is " + recorded) if recorded
+                   else " to abandon")
+            )
+    return _abandon_reservation(store, spec, shared, public, values,
+                                "abandoned by continuation command " + command_id)
 
 
 def _review_authorized(store, spec, context, proposal, review):
@@ -2055,24 +2353,13 @@ def _review_authorized(store, spec, context, proposal, review):
             raise ValueError("revision approval is not an authenticated exact proposal decision")
 
 
-def adopt_revision(store, spec, revision_id, proposed_plan, review, gh=None):
-    """Publish exact remote revision first, then append its local adoption receipt."""
-    from .delivery_github_contract import GitHubDelivery
-
+def _adoption_subject(store, spec, revision_id, proposed_plan, review):
+    """Authenticate the sealed proposal and its review before anything reaches GitHub."""
     context, values, terminal = _context(spec, revision_id)
     if terminal:
         if terminal["phase"] != "adopted" or digest(proposed_plan) != digest(terminal["plan"]):
             raise OwnershipConflict("revision attempt already ended with a different result")
-        revised = effective_spec(store, spec)
-        _adoption_event(store, revised, terminal)
-        return {
-            "state": "adopted",
-            "spec": revised,
-            "plan_identity": terminal["identity"],
-            "affected_chunks": terminal["affected_chunks"],
-            "checkpoints": revision_checkpoints(revised, _values(revised)),
-            "budget": _registry(spec).budget(context["owner"]["issue_id"]),
-        }
+        return context, None, terminal
     proposal = values.get(PREFIX + "proposal:" + revision_id)
     if not proposal or proposal["proposal_digest"] != digest(proposed_plan):
         raise OwnershipConflict("adoption differs from its sealed correction proposal")
@@ -2085,7 +2372,118 @@ def adopt_revision(store, spec, revision_id, proposed_plan, review, gh=None):
         _settled_revision(db, shared, token, revision_id)
     if adopted_plan_identity(spec, shared) != context["old_identity"]:
         raise OwnershipConflict("plan adoption is stale")
+    return context, proposal, None
+
+
+def _replayed_adoption(store, spec, context, terminal):
+    revised = effective_spec(store, spec)
+    _adoption_event(store, revised, terminal)
+    return {
+        "state": "adopted",
+        "spec": revised,
+        "plan_identity": terminal["identity"],
+        "affected_chunks": terminal["affected_chunks"],
+        "checkpoints": revision_checkpoints(revised, _values(revised)),
+        "budget": _registry(spec).budget(context["owner"]["issue_id"]),
+    }
+
+
+def adopt_revision(store, spec, revision_id, proposed_plan, review, gh=None):
+    """Publish exact remote revision first, then append its local adoption receipt."""
+    from .delivery_github_contract import GitHubDelivery
+
+    context, proposal, terminal = _adoption_subject(
+        store, spec, revision_id, proposed_plan, review
+    )
+    if terminal:
+        return _replayed_adoption(store, spec, context, terminal)
+    return _publish_adoption(store, spec, context, proposal, gh or GitHubDelivery())
+
+
+def settle_adoption(store, spec, revision_id, proposed_plan, review, gh=None):
+    """Adopt, or close the attempt the way GitHub's record already proves.
+
+    A refusal before publication releases custody with a rejection receipt. A failure
+    during publication is reconciled against the remote record: the expected identity
+    means the adoption completes, the original identity with nothing pending means a
+    rejection, and anything else stays uncertain for the original generation.
+    """
+    from .delivery_github_contract import GitHubDelivery
+
     gh = gh or GitHubDelivery()
+    try:
+        context, proposal, terminal = _adoption_subject(
+            store, spec, revision_id, proposed_plan, review
+        )
+    except ValueError as refusal:
+        return _refused_adoption(store, spec, revision_id, refusal)
+    if terminal:
+        return _replayed_adoption(store, spec, context, terminal)
+    try:
+        return _publish_adoption(store, spec, context, proposal, gh)
+    except UnresolvedEffect:
+        raise
+    except ValueError as refusal:
+        # Deterministic refusals only. Transport failures (GitHubContractError,
+        # OSError, timeouts) propagate so the activity's retry resumes the same
+        # idempotent operation instead of ending the reviewed correction.
+        return _reconcile_adoption(store, spec, context, proposal, review, gh, refusal)
+
+
+def _refused_adoption(store, spec, revision_id, refusal):
+    reason = (str(refusal) or type(refusal).__name__)[:4000]
+    try:
+        receipt = reject_revision(store, spec, revision_id, reason)
+    except Exception as unreleased:
+        raise refusal from unreleased
+    if receipt.get("phase") != "rejected":
+        raise refusal
+    return {
+        "state": "rejected",
+        "plan_revision": receipt,
+        "budget": receipt["budget"],
+        "reason": reason,
+    }
+
+
+def _reconcile_adoption(store, spec, context, proposal, review, gh, failure):
+    """Settle an interrupted publication by what GitHub records, never by assumption."""
+    issue = spec["feature_delivery"]["snapshot"]["issue"]
+    original = context["old_identity"]
+    try:
+        record = gh.load_record(
+            issue, {key: original[key] for key in ("comment_id", "comment_node_id")}
+        )
+    except Exception as unread:
+        raise failure from unread
+    manifest = record["manifest"]
+    observed = {
+        "plan_revision": manifest.get("plan_revision", 1),
+        "plan_digest": digest(manifest["plan"]),
+    }
+    expected = {
+        "plan_revision": original["plan_revision"] + 1,
+        "plan_digest": proposal["proposal_digest"],
+    }
+    if observed == expected:
+        # The remote revision committed; its idempotent readback finishes the adoption.
+        return adopt_revision(
+            store, spec, context["revision_id"], proposal["plan"], review, gh=gh
+        )
+    shared = _registry(spec)
+    stage, _, effects = _publication_custody(
+        shared, context["owner"]["issue_id"], context["revision_id"]
+    )
+    if observed == {key: original[key] for key in observed} and stage is None and not effects:
+        # Refused before any remote write of this operation: nothing to settle.
+        return _refused_adoption(store, spec, context["revision_id"], failure)
+    raise failure
+
+
+def _publish_adoption(store, spec, context, proposal, gh):
+    shared = _registry(spec)
+    token = context["owner"]
+    revision_id = context["revision_id"]
     issue = spec["feature_delivery"]["snapshot"]["issue"]
     # The publisher owns the effect lock and journal; never hold a second flock.
     record = gh.publish_plan_revision(
@@ -2187,25 +2585,64 @@ def authenticate_revision_role(store, request):
     return _role_context(store, spec, context, proposal)
 
 
+def _revised_chunk(alias):
+    """The chunk an execution checkpoint proves and the receipt field that re-qualifies it."""
+    if alias.startswith("verified:"):
+        return alias.removeprefix("verified:"), "affected_chunks"
+    if alias.startswith("build:"):
+        return alias.removeprefix("build:"), "implementation_chunks"
+    if alias.startswith("assignment:"):
+        return alias.split(":")[1], "affected_chunks"
+    return None, None
+
+
+def _superseding_receipt(values, alias):
+    """The highest adopted revision that re-qualified the alias's chunk, with its key."""
+    chunk, field = _revised_chunk(alias)
+    if chunk is None:
+        return None
+    listing = [
+        (key, value)
+        for key, value in values.items()
+        if key.startswith(PREFIX + "adopted:") and chunk in value[field]
+    ]
+    return max(listing, key=lambda item: item[1]["identity"]["plan_revision"]) if listing else None
+
+
 def revision_checkpoints(spec, values):
-    """Expose unaffected proof plus explicitly revised namespaces, keeping source history."""
+    """Expose unaffected proof plus explicitly revised namespaces, keeping source history.
+
+    A chunk's proof belongs to the highest adopted revision that re-qualified it. ``values``
+    arrive in journal order, so a plain key appended after that receipt (an earlier namespacing
+    rule wrote it there) is current evidence rather than superseded history.
+    """
     result = dict(values)
+    journal = {key: index for index, key in enumerate(values)}
     receipts = sorted(
-        (value for key, value in values.items() if key.startswith(PREFIX + "adopted:")),
-        key=lambda value: value["identity"]["plan_revision"],
+        ((key, value) for key, value in values.items() if key.startswith(PREFIX + "adopted:")),
+        key=lambda item: item[1]["identity"]["plan_revision"],
     )
-    for receipt in receipts:
+    current_pass = values.get("integration-pass")
+    pass_prefix = "pass:" + str(current_pass["number"]) + ":" if current_pass else None
+    for receipt_key, receipt in receipts:
         affected = set(receipt["affected_chunks"])
         implementation = set(receipt["implementation_chunks"])
         for key in list(result):
             alias = key.split(":", 2)[-1] if key.startswith("pass:") else key
-            if alias.startswith("verified:") and alias.removeprefix("verified:") in affected:
-                result.pop(key)
-            elif alias.startswith("build:") and alias.removeprefix("build:") in implementation:
+            if not (
+                (alias.startswith("verified:") and alias.removeprefix("verified:") in affected)
+                or (alias.startswith("build:") and alias.removeprefix("build:") in implementation)
+            ):
+                continue
+            # A pass alias is journalled under its pass key, never at the alias position.
+            source = key
+            if pass_prefix and not key.startswith("pass:") and pass_prefix + key in journal:
+                source = pass_prefix + key
+            if key in values and journal.get(source, -1) > journal[receipt_key]:
+                result[key] = values[key]
+            else:
                 result.pop(key)
         prefix = "revision:" + str(receipt["identity"]["plan_revision"]) + ":"
-        current_pass = values.get("integration-pass")
-        pass_prefix = "pass:" + str(current_pass["number"]) + ":" if current_pass else None
         for key, value in values.items():
             if not key.startswith(prefix):
                 continue
@@ -2219,21 +2656,12 @@ def revision_checkpoints(spec, values):
 
 
 def revision_checkpoint_key(spec, key):
-    receipt = _latest(_values(spec))
-    if not receipt:
-        return key
+    """Namespace proof under the highest adopted revision that re-qualified its chunk."""
     alias = key.split(":", 2)[-1] if key.startswith("pass:") else key
-    affected = receipt["affected_chunks"]
-    if (
-        (alias.startswith("verified:") and alias.removeprefix("verified:") in affected)
-        or (
-            alias.startswith("build:")
-            and alias.removeprefix("build:") in receipt["implementation_chunks"]
-        )
-        or (alias.startswith("assignment:") and alias.split(":")[1] in affected)
-    ):
-        return "revision:" + str(receipt["identity"]["plan_revision"]) + ":" + key
-    return key
+    superseding = _superseding_receipt(_values(spec), alias)
+    if not superseding:
+        return key
+    return "revision:" + str(superseding[1]["identity"]["plan_revision"]) + ":" + key
 
 
 def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup=None):

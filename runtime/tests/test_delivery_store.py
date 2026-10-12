@@ -2024,6 +2024,18 @@ def test_continuation_rejects_temporal_projection_before_workflow_close(service,
     assert described == [True]
 
 
+def test_continuation_reports_temporal_transport_failure_as_retryable(service, monkeypatch):
+    store, request = service
+    store.submit(request)
+
+    async def connect(*_args, **_kwargs):
+        raise ConnectionRefusedError("temporal server is down")
+
+    monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", connect)
+    with pytest.raises(RuntimeError, match="unavailable \\(ConnectionRefusedError"):
+        store._completed_temporal_result("run-1")
+
+
 def test_check_network_domains_reject_local_destinations():
     for domain in ("127.0.0.1", "::1", "localhost", "metadata.localhost", "*.example.com"):
         with pytest.raises(ValueError):

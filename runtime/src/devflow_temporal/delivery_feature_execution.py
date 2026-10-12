@@ -415,12 +415,16 @@ def continue_feature(store, run_id, request, *, _revision=None):
     from .delivery_config import COMMAND_RE
     from .delivery_feature_closure import closed_coordinator
 
+    abandon = request.get("abandon_revision") if isinstance(request, dict) else None
     if (
         not isinstance(request, dict)
-        or set(request) != {"command_id", "expected_revision"}
+        or not {"command_id", "expected_revision"} <= set(request)
+        or set(request) - {"command_id", "expected_revision", "abandon_revision"}
         or not isinstance(request["command_id"], str)
         or not COMMAND_RE.fullmatch(request["command_id"])
         or type(request["expected_revision"]) is not int
+        or ("abandon_revision" in request
+            and (not isinstance(abandon, str) or not 1 <= len(abandon) <= 128))
     ):
         raise ValueError(
             "feature continuation requires a command ID and current projection revision"
@@ -450,10 +454,17 @@ def continue_feature(store, run_id, request, *, _revision=None):
     shared = registry(original)
     token = original["feature_delivery"]["owner"]
     if _revision is None:
-        from .delivery_feature_revisions import continue_pending_preparation, revision_request
+        from .delivery_feature_revisions import (
+            abandon_reserved_revision,
+            continue_pending_preparation,
+            revision_request,
+        )
 
         execution = store.effective_spec(run_id)
-        if revision_request(execution, shared):
+        if abandon is not None:
+            # Idempotent: a reservation this command already closed is simply absent.
+            abandon_reserved_revision(store, execution, abandon, request["command_id"])
+        elif revision_request(execution, shared):
             _revision = continue_pending_preparation(store, execution, row, request, successor_id)
     current = shared.current(token["issue_id"])
     replay_claim = bool(_revision and "preparation_retry" in _revision and current
