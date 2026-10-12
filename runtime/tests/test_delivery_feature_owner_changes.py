@@ -183,31 +183,35 @@ def test_open_feature_routes_a_changed_layer_to_its_own_worker(service, monkeypa
             for member in members] == [True, False, False]
 
 
-def test_refused_stack_merge_is_receipted_resubmitted_once_then_stops(service, monkeypatch):
+@pytest.mark.parametrize("merged_prefix", [False, True])
+@pytest.mark.parametrize("stderr", [
+    'Post "https://api.github.com/graphql": EOF',
+    "GraphQL: Pull request #21 is not mergeable\n",
+])
+def test_nonzero_merge_response_stays_pending_until_remote_outcome(
+    service, monkeypatch, merged_prefix, stderr,
+):
     store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
-    calls, stderr = [], "GraphQL: Pull request #21 is not mergeable\n"
+    calls = []
 
-    def refused(argv, **_kwargs):
+    def response_lost(argv, **_kwargs):
         calls.append(argv)
+        if merged_prefix:
+            gh.merged.add(20)
         return SimpleNamespace(returncode=1, stderr=stderr)
 
-    first = merger.merge(store, spec, requested, command, gh=gh, execute=refused)
-    assert (first["state"], first["reason"], first["exit_code"]) == (
-        "pending", "merge_submission_failed", 1)
-    assert first["stderr"] == stderr
-    assert merge_effect(spec) == [{"state": "pending", "result": {"submissions": [
-        {"attempt": 1, "state": "failed", "exit_code": 1, "stderr": stderr}]}}]
-    refusal = "refused 2 times; last exit code 1: GraphQL: Pull request #21 is not mergeable"
-    with pytest.raises(OwnershipConflict, match=refusal):
-        merger.merge(store, spec, requested, command, gh=gh, execute=refused)
-    with pytest.raises(OwnershipConflict, match=refusal):
-        merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
-    assert len(calls) == 2
-    # Settlement records the refused all-or-nothing merge as absent, not pending forever.
-    assert merger.merge(store, spec, requested, command, gh=gh,
-                        settlement=True)["state"] == "absent"
-    assert [effect["state"] for effect in merge_effect(spec)] == ["absent"]
-    assert not gh.closed
+    first = merger.merge(store, spec, requested, command, gh=gh, execute=response_lost)
+    assert first["state"] == "pending" and first["exit_code"] == 1
+    for settlement in (False, True):
+        observed = merger.merge(store, spec, requested, command, gh=gh,
+                                execute=refuse, settlement=settlement)
+        assert observed["state"] == "pending"
+    assert len(calls) == 1 and merge_effect(spec)[0]["state"] == "pending"
+    assert merge_effect(spec)[0]["result"]["submissions"][0]["state"] == "unknown"
+    # Delayed successful readback settles the original submission without another merge.
+    gh.merged.update({20, 21, 22})
+    assert merger.merge(store, spec, requested, command, gh=gh, execute=refuse,
+                        settlement=True)["state"] == "confirmed"
 
 
 @pytest.mark.parametrize("failure", ["timeout", "missing_cli"])
