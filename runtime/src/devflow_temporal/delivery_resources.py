@@ -136,10 +136,14 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 'stopped_delivery_resume',
             }:
                 if recovery.get('kind') == 'stopped_delivery_resume':
+                    from .delivery_feature_revision_recovery import retained_recovery
                     from .delivery_stopped_resume import custody
                     from .delivery_stopped_resume import namespace as resume_namespace
 
                     custody(db, recovery)
+                    # Compact revision transports retain their predecessor chain
+                    # in authenticated custody, not in the workflow envelope.
+                    recovery = retained_recovery(recovery)
                     if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
                         raise ValueError('stopped resume execution authority changed')
                     admitted = resume_namespace(recovery)
