@@ -782,8 +782,16 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
 
             launch = launch_binding(path.parent, value)
             intent = value['intent']
+            # Preparation measured under the submitted policy digest; its journals
+            # bind to the digest the run's preparation record says it measured
+            # with. A reused or legacy record admits no measurement journal.
+            expected_digest = (
+                (spec.get('preparation') or {}).get('measured_policy_digest')
+                if path.is_relative_to(state / 'native-preparation')
+                else spec['policy_digest']
+            )
             if (intent['run_id'] != spec['run_id']
-                    or intent['policy_digest'] != spec['policy_digest']
+                    or intent['policy_digest'] != expected_digest
                     or (launch is not None and (
                         intent['argv'] != launch['argv']
                         or intent['environment_sha256'] != digest(launch['environment'])))

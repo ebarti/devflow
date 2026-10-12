@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import subprocess
@@ -21,6 +22,29 @@ from .delivery_resources import (
     private_directory,
     read_private,
 )
+
+_LOG = logging.getLogger(__name__)
+
+
+def _record_skip(store, row, exc):
+    """Keep a skipped retry visible: a WARNING now and one run event per distinct reason."""
+    reason = f'{type(exc).__name__}: {str(exc)[:300]}'
+    _LOG.warning('automatic retry skipped run %s until a fresh observation succeeds: %s',
+                 row['run_id'], reason)
+    try:
+        with store._connect() as db:
+            last = db.execute(
+                "SELECT payload_json FROM delivery_events WHERE run_id=? "
+                "AND type='automatic_retry_skipped' ORDER BY sequence DESC LIMIT 1",
+                (row['run_id'],)).fetchone()
+            if last is not None and json.loads(last[0]).get('reason') == reason:
+                return
+            store._event(db, row['run_id'], row['revision'], 'automatic_retry_skipped',
+                         'Automatic retry skipped this run until a fresh observation succeeds',
+                         {'reason': reason})
+    except sqlite3.Error as error:
+        _LOG.warning('automatic retry could not record its skip for run %s: %s',
+                     row['run_id'], error)
 
 
 def eligible(row, spec):
@@ -369,7 +393,8 @@ def retry_once(store, *, stopped=lambda: False):
             admitted.append(store.submit(supplied, _automatic={
                 'row': row, 'base_sha': base, 'stopped': stopped}))
         except (ValueError, KeyError, TypeError, OSError, RuntimeError,
-                subprocess.SubprocessError, sqlite3.Error):
+                subprocess.SubprocessError, sqlite3.Error) as exc:
             # Wait for conclusive fresh observations; no absence inferred from errors.
+            _record_skip(store, row, exc)
             continue
     return admitted
