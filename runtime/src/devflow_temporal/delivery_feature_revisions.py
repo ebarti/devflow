@@ -304,6 +304,7 @@ def revise_feature_plan(store, run_id, request):
     from .delivery_feature_closure import closed_coordinator
     from .delivery_feature_execution import continue_feature
     from .delivery_feature_publication import current_record, live_members
+    from .delivery_github_plans import require_publication_capacity
 
     if (
         not isinstance(request, dict)
@@ -369,6 +370,9 @@ def revise_feature_plan(store, run_id, request):
         record = current_record(spec)
         live_members(spec, record)
         identity = _assert_identity(record, adopted_plan_identity(spec, shared))
+        # A revision cannot shrink the index: refuse before the reservation is written.
+        require_publication_capacity(spec["feature_delivery"]["snapshot"]["issue"],
+                                     record["manifest"], trunk=spec.get("publication_base_ref"))
         with shared.connect() as db:
             reserved = shared._pending_revision(db, token["issue_id"])
         unstarted = bool(
@@ -672,6 +676,18 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     if not public:
         return None
     revision_id = public["revision_id"]
+    from .delivery_feature_publication import current_record
+    from .delivery_github_plans import require_publication_capacity
+
+    try:
+        # Nothing is written before this: the reservation stays pending and continues
+        # with the same command once the recorded index can hold its stack.
+        require_publication_capacity(spec["feature_delivery"]["snapshot"]["issue"],
+                                     current_record(spec)["manifest"],
+                                     trunk=spec.get("publication_base_ref"))
+    except ValueError as exc:
+        raise OwnershipConflict(f"{exc}; the reserved revision stays continuable and "
+                                "proceeds once the recorded index fits") from exc
     replay = "; replay continue-feature " + request["command_id"] + " to continue without it"
     if _started_reservation(shared, token, revision_id, values):
         # A begun (or charged) attempt belongs to the generation that began it: no
@@ -1023,7 +1039,7 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
     # A revision only grows the index. Refuse one that could never record its
     # stack before the planning debit and either configured role runs.
     require_publication_capacity(spec["feature_delivery"]["snapshot"]["issue"],
-                                 record["manifest"])
+                                 record["manifest"], trunk=spec.get("publication_base_ref"))
     candidate = _candidate(store, spec)
     if public and (
         identity != public["old_identity"]

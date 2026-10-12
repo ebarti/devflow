@@ -327,44 +327,72 @@ def _preflight_plan_records(issue, manifest, children, operation_id):
     return preview
 
 
-def _largest_publication(issue, manifest):
-    """Every chunk later appends one stacked PR; reserve each member's largest encoding."""
-    from .delivery_github_contract import GITHUB_ID_MAX
+# No GitHub repository has reached seven-digit issue or pull request numbers.
+PR_NUMBER_DIGITS = 7
 
-    members = []
-    for index, chunk in enumerate(ordered_chunks(manifest["plan"])):
+
+def _chunk_index(manifest):
+    """Chunks in stack order from the recorded index, expanded or as read from GitHub."""
+    from .delivery_github_contract import wire_manifest
+    from .delivery_plan_model import index_chunks
+
+    wire = wire_manifest(manifest)
+    return (index_chunks(wire["plan"]) if wire.get("version") == 2
+            else ordered_chunks(wire["plan"]))
+
+
+def _largest_publication(issue, manifest, *, trunk=None):
+    """Keep recorded members; reserve each unpublished chunk's largest realistic member."""
+    members = deepcopy(manifest["publication"]["members"])
+    chunks = _chunk_index(manifest)
+    known = [issue["number"], *(member["number"] for member in members),
+             *(child["number"] for child in manifest["workstream_issues"].values())]
+    bound = 10 ** max(PR_NUMBER_DIGITS, *(len(str(number)) for number in known)) - 1
+    for index, chunk in enumerate(chunks[len(members):], start=len(members)):
         child = manifest["workstream_issues"][chunk["workstream_id"]]
-        # Unique full-width PR numbers that cannot coincide with reserved issue numbers.
-        number = GITHUB_ID_MAX // 2 - index
+        number = bound - index
         members.append({
             "chunk_id": chunk["id"], "number": number,
             "url": f"https://github.com/{issue['repository']}/pull/{number}",
-            "branch": "feat/df-" + "f" * 10 + "-" + chunk["id"], "head": "f" * 64,
-            # The manifest contract bounds the trunk name to 128 characters.
-            "base_branch": members[-1]["branch"] if members else "f" * 128,
+            # Workers publish from this exact branch pattern with a SHA-1 head.
+            "branch": "feat/df-" + "f" * 10 + "-" + chunk["id"], "head": "f" * 40,
+            # Only the first layer sits on the trunk, whose name is bounded by the contract.
+            "base_branch": members[-1]["branch"] if members else trunk or "f" * 128,
             **({"workstream_id": chunk["workstream_id"], "issue_id": child["id"],
                 "issue_number": child["number"], "issue_url": child["url"]}
                if manifest.get("version") == 2 else {}),
         })
-    return {"stack_id": GITHUB_ID_MAX if len(members) > 1 else None, "members": members}
+    stack_id = manifest["publication"]["stack_id"]
+    return {"stack_id": bound if stack_id is None and len(members) > 1 else stack_id,
+            "members": members}
 
 
-def require_publication_capacity(issue, manifest):
+def publication_capacity(issue, manifest, *, trunk=None):
+    """Read-only: the parent index bytes needed once every chunk's pull request exists."""
+    from .delivery_github_contract import PARENT_INDEX_LIMIT, manifest_body
+
+    full = {**manifest, "publication": _largest_publication(issue, manifest, trunk=trunk)}
+    size = len(manifest_body(full).encode())
+    return {"size": size, "limit": PARENT_INDEX_LIMIT, "fits": size <= PARENT_INDEX_LIMIT,
+            "current": len(manifest_body(manifest).encode()),
+            "unpublished_chunks": (len(_chunk_index(manifest))
+                                   - len(manifest["publication"]["members"]))}
+
+
+def require_publication_capacity(issue, manifest, *, trunk=None):
     """Refuse a parent index that could not record every chunk's pull request.
 
     Deterministic on the record alone, so callers run it before any debit or turn.
     """
-    from .delivery_github_contract import PARENT_INDEX_LIMIT, manifest_body
-
-    full = {**manifest, "publication": _largest_publication(issue, manifest)}
-    size = len(manifest_body(full).encode())
-    if size > PARENT_INDEX_LIMIT:
-        unpublished = (len(ordered_chunks(manifest["plan"]))
-                       - len(manifest["publication"]["members"]))
+    capacity = publication_capacity(issue, manifest, trunk=trunk)
+    if not capacity["fits"]:
         raise ValueError(
-            f"parent index cannot record every chunk's pull request: {size} of "
-            f"{PARENT_INDEX_LIMIT} bytes once its {unpublished} unpublished chunks publish; "
-            "shorten the plan or reduce its chunks before revising it")
+            f"parent index cannot record every chunk's pull request: {capacity['size']} of "
+            f"{capacity['limit']} bytes once its {capacity['unpublished_chunks']} unpublished "
+            "chunks publish; no automatic remedy exists because a revision cannot shorten the "
+            "scope, acceptance or chunk list; the owner can merge the published stack by hand "
+            "and deliver the remaining scope as a new feature with a shorter plan")
+    return capacity
 
 
 def _initial_manifest(issue, plan, bindings, key):

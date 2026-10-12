@@ -119,6 +119,40 @@ def test_parent_index_without_room_for_its_stack_refuses_revision_before_any_spe
         assert db.execute("SELECT COUNT(*) FROM execution_repairs").fetchone()[0] == 0
 
 
+def test_public_revision_without_index_room_is_refused_before_its_reservation(
+    service, monkeypatch,
+):
+    store, spec, shared, record, _ = _feature(service, monkeypatch,
+                                              index_bytes=PARENT_INDEX_LIMIT - 200)
+    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
+    candidate = DeliveryBroker(store, spec).candidate()
+    store.project(spec["run_id"], phase="blocked", execution_state="blocked", outcome="blocked",
+                  cleanup="confirmed", event_type="blocked", message="Feature stopped",
+                  candidate=candidate, pull_request=None, checks={}, iteration=0,
+                  protocol_revision=5, error="Feature stopped")
+    monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator",
+                        lambda _store, run: {"workflow_id": "delivery-" + run,
+                                             "execution_run_id": "closed",
+                                             "result": {"cleanup": "confirmed"}})
+    with store._connect() as db:
+        revision = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                              (spec["run_id"],)).fetchone()[0]
+        runs = db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0]
+    before = (shared.checkpoints(issue_id), shared.budget(issue_id), shared.current(issue_id))
+    request = {"command_id": "revise-oversized", "expected_revision": revision,
+               "reason": "Owner asks for a smaller stack"}
+    with pytest.raises(ValueError, match=r"parent index cannot record every chunk's pull "
+                                         r"request: \d+ of 60000 bytes once its 3 unpublished"):
+        revisions.revise_feature_plan(store, spec["run_id"], request)
+    # No reservation, successor, command receipt or debit exists after the refusal.
+    assert (shared.checkpoints(issue_id), shared.budget(issue_id),
+            shared.current(issue_id)) == before
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == runs
+        assert not db.execute("SELECT 1 FROM delivery_commands WHERE command_id=?",
+                              ("revise-oversized",)).fetchone()
+
+
 def proposed(record):
     value = migrate_plan_v1(
         record["manifest"]["plan"],

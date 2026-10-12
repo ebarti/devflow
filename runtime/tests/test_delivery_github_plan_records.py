@@ -705,3 +705,33 @@ def test_parent_index_preflight_reserves_every_later_stack_member(tmp_path):
     manifest["publication"]["stack_id"] = 7 if len(members) > 1 else None
     # Publishing every chunk later must still fit the parent index it admitted.
     _parent_plan_body(manifest, issue)
+
+
+def test_capacity_bound_keeps_recorded_members_and_realistic_maxima(tmp_path):
+    from devflow_temporal.delivery_github_contract import encode_manifest
+    from devflow_temporal.delivery_github_plans import publication_capacity
+    from devflow_temporal.delivery_plan_model import ordered_chunks
+
+    remote, issue, registry, token = setup(tmp_path)
+    manifest = deepcopy(remote.initialize(issue, v2_plan(), registry, token)["manifest"])
+    unknown = publication_capacity(issue, manifest)
+    # A known trunk replaces the contract's 128-character bound for the first layer.
+    assert unknown["size"] - publication_capacity(issue, manifest, trunk="main")["size"] == 124
+    assert unknown["unpublished_chunks"] == 3 and unknown["current"] < unknown["size"]
+    members = manifest["publication"]["members"]
+    sizes = [unknown["size"]]
+    for index, chunk in enumerate(ordered_chunks(manifest["plan"])):
+        child = manifest["workstream_issues"][chunk["workstream_id"]]
+        members.append({
+            "chunk_id": chunk["id"], "number": 9000 + index,
+            "url": f"https://github.com/{issue['repository']}/pull/{9000 + index}",
+            "branch": "feat/df-" + digest(issue["id"])[:10] + "-" + chunk["id"],
+            "head": "a" * 40, "base_branch": members[-1]["branch"] if members else "main",
+            "workstream_id": chunk["workstream_id"], "issue_id": child["id"],
+            "issue_number": child["number"], "issue_url": child["url"]})
+        manifest["publication"]["stack_id"] = 7 if len(members) > 1 else None
+        sizes.append(publication_capacity(issue, manifest)["size"])
+    # Each recorded member replaces its reservation, so the bound only tightens.
+    assert sizes == sorted(sizes, reverse=True)
+    assert sizes[-1] == len(encode_manifest(manifest).encode())
+    assert publication_capacity(issue, manifest)["unpublished_chunks"] == 0
