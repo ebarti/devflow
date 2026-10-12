@@ -716,7 +716,8 @@ def scope_amended_spec(
         verify_prepared_spec(original)
         proof_path = Path(original["preparation"]["environment"]["path"])
         effective = bind_native_spec(
-            effective, original["policy"]["native_identity"], proof_path, reused=True
+            effective, original["policy"]["native_identity"], proof_path, reused=True,
+            measured=original["preparation"].get("measured_policy_digest"),
         )
         verify_prepared_spec(effective)
     return effective
