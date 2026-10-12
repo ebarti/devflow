@@ -5,6 +5,7 @@ import { display, time, timelineTime, titleCase, tokens, tone } from './format'
 import type { ActivityEvent, CheckState, Decision, IntakePlan, PhaseGate, RoleState, RunDetail } from './model'
 import { RunControls } from './RunControls'
 import { FeatureDelivery } from './FeatureDelivery'
+import { runStatus } from './runStatus'
 
 function State({ value }: { value: string | null | undefined }) {
   return <span className={`state state--${tone(value)}`}><span className="state__mark" aria-hidden="true">{tone(value) === 'good' ? <CheckIcon /> : null}</span>{titleCase(value)}</span>
@@ -51,6 +52,7 @@ function Facts({ run }: { run: RunDetail }) {
     {run.feature ? <>
       <div><dt>Feature status</dt><dd>{run.feature.status}</dd></div>
       <div><dt>Project sync</dt><dd>{run.feature.mirror?.state === 'consistent' ? 'Synced' : 'Pending'}{run.feature.mirror?.last_error ? `: ${run.feature.mirror.last_error}` : ''}</dd></div>
+      <div><dt>Attempt status</dt><dd>{runStatus(run)}</dd></div>
       <div><dt>Run phase</dt><dd>{titleCase(run.phase)}</dd></div>
       {run.feature.pull_requests.map(pr => {
         const currentUrl = safeWebUrl(pr.url)
