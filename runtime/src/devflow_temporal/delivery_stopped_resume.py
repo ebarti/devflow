@@ -11,7 +11,7 @@ from .delivery_baseline_contract import repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_config import scope_amended_spec, scope_amendment_config
 from .delivery_execution_config import load_execution_config
-from .delivery_gate_retry import prepare_runtime
+from .delivery_gate_retry import prepare_runtime, transient_stop
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import (
     _remote,
@@ -22,7 +22,7 @@ from .delivery_policy_recovery import (
     work_binding,
 )
 from .delivery_preparation import _lock
-from .delivery_repair import published_identity
+from .delivery_repair import _ci_diagnostics, published_identity
 from .delivery_resources import private_directory, read_private
 
 KIND = 'stopped_delivery_resume'
@@ -84,6 +84,33 @@ def fixed_budget_allows(spec, iteration, iterations, *, pending=False):
             and (iterations in allowed or (iterations == 0 and pending))
             and type(maximum) is int and maximum >= 0
             and iteration + iterations <= maximum)
+
+
+def _recorded_findings(state):
+    """Findings the stopped iteration's gates recorded for the next repair turn."""
+    iteration = state.get('iteration')
+    recorded = state.get('repair_findings') or {}
+    if recorded.get('iteration') == iteration and recorded.get('findings'):
+        return list(recorded['findings'])
+    return [finding for role in state.get('roles', [])
+            if role.get('iteration') == iteration and role.get('role') in {'review', 'verify'}
+            for finding in role.get('findings') or []]
+
+
+def sealed_ci_findings(seal):
+    """Failed required-CI diagnostics for a stop that recorded no other findings.
+
+    A transport or controller stop that kept a failed CI verdict is repaired
+    from the failed jobs' logs, sealed here exactly as the repair grant seals
+    them; when they cannot be sealed the admission refuses, so no repair turn
+    ever starts without findings.
+    """
+    state = seal['state']
+    ci = (state.get('checks') or {}).get('ci')
+    if (not transient_stop(state) or not isinstance(ci, dict) or ci.get('state') != 'failed'
+            or _recorded_findings(state)):
+        return None
+    return _ci_diagnostics(ci, seal['predecessor_spec'], state.get('pull_request'))
 
 
 def pending_repair(seal):
@@ -377,6 +404,7 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
 
         gate_only = gate_only_recovery(store, seal, _revision)
     pending = None if gate_only else pending_repair(seal)
+    ci_findings = None if gate_only else sealed_ci_findings(seal)
     if (command['expected_revision'] != seal['state']['revision']
             or command['expected_iteration'] != seal['state']['iteration']
             or command['expected_candidate_id'] != seal['candidate']['id']
@@ -439,6 +467,7 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                     'predecessor_result_digest': digest(seal['state']),
                     **({'feature_plan_revision': _revision} if _revision is not None else {}),
                     **({'pending_repair': pending} if pending else {}),
+                    **({'ci_findings': ci_findings} if ci_findings else {}),
                     **({'resume_stage': 'checks', 'gate_evidence': gate_only,
                         'resume_iteration': seal['state']['iteration']
                         + int(command['additional_iterations'] > 0)} if gate_only else {})}

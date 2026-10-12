@@ -459,8 +459,12 @@ def published_continuation(store, row, spec):
         # those findings, within the run's own budget.
         from .delivery_stopped_resume import KIND as RESUME_KIND
 
-        if row['iteration'] >= spec['policy']['max_repairs']:
+        remaining = spec['policy']['max_repairs'] - row['iteration']
+        if remaining <= 0:
             return None
+        # Exactly the turns an unmasked run would still have, within one grant's
+        # ceiling; never more than the frozen budget.
+        additional = min(remaining, 100 if spec.get('feature_worker') else 2)
         generation = 1 + sum(1 for r in chain if r.get('kind') == RESUME_KIND)
         return store.continue_repair, generation, {
             'continuation_kind': RESUME_KIND,
@@ -468,7 +472,8 @@ def published_continuation(store, row, spec):
             'expected_revision': row['protocol_revision'],
             'expected_iteration': row['iteration'],
             'expected_candidate_id': candidate['id'],
-            'expected_candidate_head': candidate['head'], 'additional_iterations': 1}
+            'expected_candidate_head': candidate['head'],
+            'additional_iterations': additional}
     # A lost observation at the CI stage is observed again, never re-gated.
     kind = (CI_KIND if failure.get('cause_type') == 'ci_deadline'
             or failure.get('stage') == 'waiting_ci' else KIND)

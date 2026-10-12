@@ -1919,10 +1919,16 @@ class DeliveryWorkflow:
                     published_checkpoint=_candidate_published(
                         stopped, recovery.get('execution_candidate')),
                 )
-            # A recorded gate verdict stands: the repair turn receives its findings.
-            findings = _recorded_findings(stopped, stopped['iteration']
-                                          if _implementation_passed(stopped)
-                                          else stopped['iteration'] - 1)
+            if _implementation_passed(stopped):
+                # A recorded gate verdict stands: the repair turn receives its
+                # findings, or the failed CI diagnostics the admission sealed.
+                # Never a repair turn without findings: the operator decides.
+                findings = (_recorded_findings(stopped, stopped['iteration'])
+                            or list(recovery.get('ci_findings') or []))
+                if not findings:
+                    return await self._stop(spec, 'recorded gate failure has no repair findings')
+            else:
+                findings = _recorded_findings(stopped, stopped['iteration'] - 1)
         else:
             findings = [stopped['error'], *role_findings]
         return await self._run_iterations(
