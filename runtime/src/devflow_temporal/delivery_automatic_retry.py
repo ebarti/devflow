@@ -118,6 +118,9 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
     root = Path(execution['state_dir']) / 'resources'
     original = closed['result']['checks']
     binding = digest(closed['result'])
+    archive = root / 'predecessor-resources'
+    if row['recovery_json'] is not None:
+        archive = archive / binding
     with store._connect() as db:
         records = [json.loads(item[0]) for item in db.execute(
             "SELECT payload_json FROM delivery_events WHERE run_id=? "
@@ -136,15 +139,15 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
                 read_private(root / name)
                 if hashlib.sha256((root / name).read_bytes()).hexdigest() != sha:
                     raise ValueError('original resource bytes changed before archive')
-            private_directory(root / 'predecessor-resources')
+            private_directory(archive)
             for name in expected:
-                _immutable(root / 'predecessor-resources' / name,
+                _immutable(archive / name,
                            read_private(root / name), raw=(root / name).read_bytes())
             saved = expected
     if set(saved) != set(expected):
         raise ValueError('archived original inventory changed')
     for name, sha in saved.items():
-        path = root / 'predecessor-resources' / name
+        path = archive / name
         read_private(path)
         if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
             raise ValueError('archived original resource bytes changed')
@@ -184,7 +187,8 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
     are closed here, so its same-run continuations can be admitted.
     """
     attempts = _current(store, row, spec, stopped, published=published)
-    execution = store.intake_execution_spec(spec['run_id'])
+    execution = (store.effective_spec(spec['run_id']) if row['recovery_json']
+                 else store.intake_execution_spec(spec['run_id']))
     before = observe_completed_resources(execution, attempts)
     if not published:
         unpublished(store, spec)
@@ -536,12 +540,14 @@ def _close_published_cleanup(store, row, spec, stopped):
     checks = json.loads(row['checks_json'] or '{}')
     if (checks.get('failure', {}).get('classification') != 'transient'
             or row['outcome'] != 'blocked' or row['phase'] != 'blocked'
-            or row['execution_state'] != 'blocked' or row['pr_json'] is None):
+            or row['execution_state'] != 'blocked'
+            or row['pr_json'] is None and row['recovery_json'] is None):
         return None
     closed = store._completed_temporal_result(spec['run_id'], workflow_id=row['workflow_id'])
     result = closed['result']
     if (closed['request_digest'] != row['request_digest']
-            or closed['recovery_digest'] is not None
+            or closed['recovery_digest'] != (
+                digest(json.loads(row['recovery_json'])) if row['recovery_json'] else None)
             or not closed['execution_run_id'] or not closed['closed_at']
             or closed['workflow_id'] != (row['workflow_id'] or 'delivery-' + spec['run_id'])
             or result.get('run_id') != spec['run_id']
@@ -552,7 +558,8 @@ def _close_published_cleanup(store, row, spec, stopped):
             or not isinstance(result.get('checks', {}).get('resource_cleanup'), dict)
             or result['checks']['resource_cleanup'] != checks.get('resource_cleanup')):
         return None
-    return _close_cleanup(store, row, spec, closed, stopped, published=True)
+    return _close_cleanup(store, row, spec, closed, stopped,
+                          published=row['pr_json'] is not None)
 
 
 def retry_published_once(store, *, stopped=lambda: False):
@@ -573,10 +580,10 @@ def retry_published_once(store, *, stopped=lambda: False):
         if time.monotonic() < due:
             continue
         try:
-            spec = json.loads(row['request_json'])
+            spec = store.effective_spec(row['run_id'])
             if not store.owns_execution(spec):
                 continue
-            if row['cleanup'] == 'unknown' and row['recovery_json'] is None:
+            if row['cleanup'] == 'unknown':
                 row = _close_published_cleanup(store, row, spec, stopped)
                 if row is None:
                     continue
@@ -593,7 +600,8 @@ def retry_published_once(store, *, stopped=lambda: False):
             waits[row['run_id']] = (min(delay * 2, 300), time.monotonic() + delay)
             admitted.append(admit(spec['run_id'], payload))
         except (ValueError, KeyError, TypeError, OSError, RuntimeError,
-                subprocess.SubprocessError, sqlite3.Error):
+                subprocess.SubprocessError, sqlite3.Error) as exc:
             # The admission re-reads every identity; a refusal authorizes nothing.
+            _record_skip(store, row, exc)
             continue
     return admitted

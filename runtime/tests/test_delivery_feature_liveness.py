@@ -1681,14 +1681,11 @@ def test_continue_settles_a_draining_owner_before_closing_its_open_revision(
                                       shared)["revision_id"] == revision_id
     assert shared.budget(issue_id)["used"] == used
     # GitHub answers: the effect settles first, the owner stops, and only then the
-    # revision closure path closes the begun attempt and refuses once with the replay.
+    # revision closure path closes the begun attempt and continues in the same command.
     comments.append({"id": 601, "node_id": "IC_601", "body": "Delivery plan v2"})
-    with pytest.raises(OwnershipConflict,
-                       match="attempt stopped before adoption and is now closed") as info:
-        continue_feature(store, successor["run_id"], request)
-    assert "replay continue-feature continue-drained-revision" in str(info.value)
+    replayed = continue_feature(store, successor["run_id"], request)
     assert shared.effect(issue_id, key)["state"] != "pending"
-    assert shared.current(issue_id)["state"] == "stopped"
+    assert shared.current(issue_id)["state"] == "active"
     assert shared.budget(issue_id)["used"] == used, "the begun attempt's debit is kept"
     assert revisions.revision_request(store.effective_spec(successor["run_id"]), shared) is None
     replayed = continue_feature(store, successor["run_id"], request)

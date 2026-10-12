@@ -1392,3 +1392,36 @@ def test_verdict_resume_without_any_findings_stops_instead_of_repairing(stopped,
     result = asyncio.run(flow._resume_stopped(spec, recovery))
     assert result['error'] == 'recorded gate failure has no repair findings'
     assert 'role' not in launched
+
+
+@pytest.mark.asyncio
+async def test_retry_execution_cleanup_recovers_again_without_reusing_old_archive(
+    service, monkeypatch,
+):
+    def lose_twice(call):
+        if call <= 2:
+            raise ApplicationError("gate transport lost", type="TimeoutExpired")
+
+    async with RealDelivery(service, monkeypatch, script={"checks": lose_twice}).running() as run:
+        result = await run.start()
+        original_head = result["pull_request"]["head"]
+        for generation in (1, 2):
+            assert result["outcome"] == "blocked" and result["cleanup"] == "unknown"
+            run.age()
+            clear_waits(run.store)
+            admitted = retry.retry_once(run.store)
+            assert len(admitted) == 1, run.store.events("run-1")
+            assert admitted[0]["implementation_authority"] is False
+            result, recovery = await run.continue_run()
+            row = run.row()
+            run.closed = {**run.closed, "workflow_id": row["workflow_id"],
+                          "execution_run_id": "continued-" + str(generation),
+                          "recovery_digest": digest(recovery), "result": result}
+        assert result["outcome"] == "delivered"
+        assert result["pull_request"]["head"] == original_head
+        assert run.seen["roles"].count(("implement", 0)) == 1
+        assert run_count(run.store) == 1
+        from pathlib import Path
+        archive = Path(run.spec["state_dir"]) / "resources" / "predecessor-resources"
+        assert (archive / "finalization.json").is_file()
+        assert len(list(archive.glob("*/finalization.json"))) == 1
