@@ -26,6 +26,7 @@ from temporalio.api.history.v1 import (
     ActivityTaskFailedEventAttributes,
     ActivityTaskScheduledEventAttributes,
     HistoryEvent,
+    WorkflowExecutionCompletedEventAttributes,
     WorkflowExecutionStartedEventAttributes,
 )
 from temporalio.client import (
@@ -454,7 +455,13 @@ def _closed_client(spec, state, history, *, workflow_id="delivery-run-1"):
             return copy.deepcopy(state)
 
         async def fetch_history(self):
-            return history
+            # A COMPLETED execution's history ends with its result, as Temporal records it.
+            closed = HistoryEvent(
+                event_id=history.events[-1].event_id + 1,
+                workflow_execution_completed_event_attributes=(
+                    WorkflowExecutionCompletedEventAttributes(result=Payloads(
+                        payloads=await DELIVERY_DATA_CONVERTER.encode([copy.deepcopy(state)])))))
+            return _History(history.workflow_id, [*history.events, closed])
 
     return Client(), description
 
