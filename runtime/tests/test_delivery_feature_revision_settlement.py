@@ -275,8 +275,7 @@ def test_continuation_closes_a_stopped_investigation_once_and_then_proceeds(
     stale = revisions.begin_revision(store, spec, diagnostic)
     frozen = _stopped_feature(store, spec, shared, monkeypatch)
     request = {"command_id": "continue-1", "expected_revision": frozen["revision"]}
-    with pytest.raises(OwnershipConflict, match="now closed; replay continue-feature continue-1"):
-        execution.continue_feature(store, spec["run_id"], request)
+    response = execution.continue_feature(store, spec["run_id"], request)
     closed = shared.checkpoints(owner["issue_id"])[PREFIX + "rejected:" + stale["revision_id"]]
     assert closed["closed_by"] == owner and closed["repair_key"] == stale["repair_key"]
     assert "closed by continuation command continue-1" in closed["reason"]

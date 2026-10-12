@@ -688,10 +688,10 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
             "plan revision attempt stopped with generation " + str(token["generation"])
             + " before adoption; closed by continuation command " + request["command_id"],
         )
-        raise OwnershipConflict(
-            "reserved revision " + revision_id
-            + " attempt stopped before adoption and is now closed" + replay
-        )
+        # The same authorized continuation can now proceed with the unchanged
+        # accepted plan. Retain the rejection and debit; no second command is
+        # needed merely to observe the closure this command just established.
+        return None
     from .delivery_feature_publication import current_record
     from .delivery_github_plans import require_publication_capacity
 

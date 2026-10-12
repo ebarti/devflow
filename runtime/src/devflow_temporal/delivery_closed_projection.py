@@ -6,6 +6,7 @@ import json
 import logging
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from temporalio.client import WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
@@ -285,12 +286,25 @@ async def reconcile_projection(store, client, row):
             or not await asyncio.to_thread(store.owns_execution, spec)):
         raise ValueError("completed projection has no current service authority")
     workflow_id = row["workflow_id"] or "delivery-" + run_id
+    sealed = None
     try:
         description = await client.get_workflow_handle(workflow_id).describe()
     except RPCError as exc:
         if exc.status != RPCStatusCode.NOT_FOUND:
             raise
-        return {"state": "not_started"}
+        from .delivery_closures import sealed_closure
+
+        sealed = await sealed_closure(store, workflow_id)
+        if sealed is None:
+            return {"state": "not_started"}
+        async def memo_value(key, default=None):
+            return sealed.get(key, default)
+        description = SimpleNamespace(
+            id=sealed["workflow_id"], run_id=sealed["execution_run_id"],
+            status=WorkflowExecutionStatus[sealed["status"]],
+            close_time=datetime.fromisoformat(sealed["closed_at"]),
+            workflow_type="DevflowDeliveryWorkflow", memo_value=memo_value,
+        )
     if description.status != WorkflowExecutionStatus.COMPLETED:
         return {"state": "not_completed", "status": description.status.name,
                 "closed": description.close_time is not None}
@@ -303,13 +317,13 @@ async def reconcile_projection(store, client, row):
             != (digest(recovery) if recovery else None)):
         raise ValueError("completed projection start memo changed")
     handle = client.get_workflow_handle(workflow_id, run_id=description.run_id)
-    state = await handle.result()
+    state = sealed["result"] if sealed else await handle.result()
     checks = state.get("checks", {}) if isinstance(state, dict) else {}
     failure = checks.get("terminal_projection_failure") if isinstance(checks, dict) else None
     stop_record = checks.get("feature_stop_failure") if isinstance(checks, dict) else None
     if not failure and not stop_record:
         return {"state": "no_failed_projection"}
-    history = await handle.fetch_history()
+    history = sealed["history"] if sealed else await handle.fetch_history()
     if not history.events or not history.events[0].HasField(
             "workflow_execution_started_event_attributes"):
         raise ValueError("completed projection start history is missing")

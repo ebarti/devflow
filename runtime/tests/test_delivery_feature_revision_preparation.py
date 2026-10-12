@@ -848,9 +848,9 @@ def test_over_capacity_record_still_closes_a_started_reservation_with_its_debit(
         raise AssertionError("capacity must not be consulted for a started reservation")
 
     monkeypatch.setattr(plans, "require_publication_capacity", never)
-    with pytest.raises(OwnershipConflict, match="reserved revision " + revision_id
-                       + " attempt stopped before adoption and is now closed"):
-        execution.continue_feature(store, spec["run_id"], request)
+    assert revisions.continue_pending_preparation(
+        store, spec, _row(store, spec["run_id"]), request, "unused-successor",
+    ) is None
     closed = shared.checkpoints(issue_id)[revisions.PREFIX + "rejected:" + revision_id]
     assert closed["repair_key"] == "plan-revision:" + revision_id
     assert "closed by continuation command " + request["command_id"] in closed["reason"]
