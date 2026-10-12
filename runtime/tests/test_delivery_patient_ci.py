@@ -178,7 +178,9 @@ async def test_activity_window_follows_only_new_frozen_policy(monkeypatch, confi
     else:
         assert options["start_to_close_timeout"] > timedelta(seconds=configured)
         assert options["schedule_to_close_timeout"] == options["start_to_close_timeout"]
-        assert options["heartbeat_timeout"] == timedelta(seconds=30)
+        # Read-only polling tolerates host sleeps: a lapsed heartbeat restarts it.
+        assert options["heartbeat_timeout"] == timedelta(seconds=60)
+        assert options["retry_policy"].maximum_attempts == 12
 
 
 @pytest.mark.asyncio

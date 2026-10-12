@@ -264,9 +264,10 @@ provenance remain readable; this retirement does not delete their tables or
 rewrite historical failures.
 
 Use the existing run and indexed evidence reads to follow an admitted recovery.
-An original run's supported automatic retry policy is independent of these
-historical grants and does not replace every published, uncertain or manual
-recovery path.
+An original run's supported automatic retry policy, and the bounded automatic
+gate or CI continuations of a published run after a classified transient stop,
+are independent of these historical grants and do not replace every uncertain
+or manual recovery path.
 
 ## Durable synthetic check evidence
 
