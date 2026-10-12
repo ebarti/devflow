@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -36,6 +36,111 @@ from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
 
 logger = logging.getLogger(__name__)
+
+
+def _dispatch_failure_reason(exc: BaseException) -> str:
+    """Name the failing condition stably, so a repeat does not read as a new reason."""
+    if isinstance(exc, RPCError):
+        text = f"RPCError {exc.status.name}: {exc.message}"
+    else:
+        text = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    return text[:240]
+
+
+def _dispatch_backoff_remaining(item: dict, now: float) -> float:
+    """Seconds before a row that failed to start may be tried again.
+
+    The first retry is immediate: a start whose acknowledgement was lost is
+    resolved by reading the remote memo on the next cycle. From the second
+    failure on, each attempt doubles the wait (20 s up to 10 min), so a poison
+    row cannot take every cycle while healthy rows wait behind it. A row
+    re-queued by an admission (its error cleared) is due at once.
+    """
+    attempts = item.get("attempts") or 0
+    if attempts <= 1 or item.get("last_error") is None:
+        return 0.0
+    try:
+        updated = datetime.fromisoformat(item["outbox_updated_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    return max(0.0, updated + min(600.0, 5.0 * 2 ** min(attempts, 8)) - now)
+
+
+async def _dispatch_start(service: Any, client: Client, item: dict, spec: dict) -> None:
+    """Start one queued run of ``service``; its failure never reaches the rows behind it.
+
+    A row whose remote description or start is rejected deterministically
+    would otherwise lead every batch (oldest first) and starve newer runs.
+    A module-level function: callers drive ``dispatch_once`` on stand-in
+    services as well as on ``DeliveryService``.
+    """
+    run_id = spec["run_id"]
+    workflow_id = item["workflow_id"] or "delivery-" + run_id
+    attempted = False
+    try:
+        recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
+        handle = client.get_workflow_handle(workflow_id)
+        try:
+            description = await handle.describe()
+        except RPCError as exc:
+            if exc.status != RPCStatusCode.NOT_FOUND:
+                raise
+            description = None
+        if description is not None:
+            remote_digest = await description.memo_value("request_digest", "unknown")
+            remote_recovery = await description.memo_value("recovery_digest", None)
+            if remote_digest != item["request_digest"] or remote_recovery != (
+                digest(recovery) if recovery else None
+            ):
+                await asyncio.to_thread(
+                    service.store.mark_start_conflict, run_id, workflow_id,
+                    f"Temporal ID conflict: workflow {workflow_id} belongs to a "
+                    "different request",
+                )
+                return
+            await asyncio.to_thread(service.store.mark_start, run_id, accepted=True)
+            return
+        attempted = True
+        try:
+            await client.start_workflow(
+                DeliveryWorkflow.run,
+                args=[spec, recovery],
+                id=workflow_id,
+                task_queue=service.config.queue,
+                id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
+                retry_policy=RetryPolicy(maximum_attempts=1),
+                **({"execution_timeout": timedelta(hours=72),
+                    "run_timeout": timedelta(minutes=14)
+                    if recovery and recovery.get("kind") == "terminal_tracker_recovery"
+                    else timedelta(hours=72)}
+                   if spec.get("terminal_tracker_version") == 1
+                   and not spec.get("feature_delivery")
+                   and (spec.get("workflow_failure_boundary_version") != 1
+                        or (recovery and recovery.get("kind") == "terminal_tracker_recovery"))
+                   else {}),
+                memo={
+                    "request_digest": item["request_digest"],
+                    **({"recovery_digest": digest(recovery)} if recovery else {}),
+                },
+            )
+        except WorkflowAlreadyStartedError:
+            # The next dispatch inspects the durable remote memo before acking.
+            return
+        await asyncio.to_thread(service.store.mark_start, run_id, accepted=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        reason = _dispatch_failure_reason(exc)
+        logger.warning("Run %s dispatch failed: %s", run_id, reason)
+        try:
+            # A start that was sent is unknown until the remote memo is read.
+            await asyncio.to_thread(
+                service.store.record_dispatch_failure, run_id, reason, uncertain=attempted
+            )
+        except Exception as recording:
+            logger.warning("Run %s dispatch failure not recorded (%s)",
+                           run_id, type(recording).__name__)
 
 
 class LocalSession:
@@ -146,56 +251,11 @@ class DeliveryService:
         if pending and not starts:
             return
         client = await self.healthy_client()
+        now = time.time()
         for item, spec in starts:
-            recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
-            workflow_id = item["workflow_id"] or "delivery-" + spec["run_id"]
-            handle = client.get_workflow_handle(workflow_id)
-            try:
-                description = await handle.describe()
-            except RPCError as exc:
-                if exc.status != RPCStatusCode.NOT_FOUND:
-                    raise
-                description = None
-            if description is not None:
-                remote_digest = await description.memo_value("request_digest", "unknown")
-                remote_recovery = await description.memo_value("recovery_digest", None)
-                if remote_digest != item["request_digest"] or remote_recovery != (
-                    digest(recovery) if recovery else None
-                ):
-                    await asyncio.to_thread(
-                        self.store.mark_start,
-                        spec["run_id"], accepted=False, error="Temporal ID conflict",
-                    )
-                    continue
-                await asyncio.to_thread(self.store.mark_start, spec["run_id"], accepted=True)
+            if _dispatch_backoff_remaining(item, now) > 0:
                 continue
-            try:
-                await client.start_workflow(
-                    DeliveryWorkflow.run,
-                    args=[spec, recovery],
-                    id=workflow_id,
-                    task_queue=self.config.queue,
-                    id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
-                    id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                    **({"execution_timeout": timedelta(hours=72),
-                        "run_timeout": timedelta(minutes=14)
-                        if recovery and recovery.get("kind") == "terminal_tracker_recovery"
-                        else timedelta(hours=72)}
-                       if spec.get("terminal_tracker_version") == 1
-                       and not spec.get("feature_delivery")
-                       and (spec.get("workflow_failure_boundary_version") != 1
-                            or (recovery and recovery.get("kind") == "terminal_tracker_recovery"))
-                       else {}),
-                    memo={
-                        "request_digest": item["request_digest"],
-                        **({"recovery_digest": digest(recovery)} if recovery else {}),
-                    },
-                )
-            except WorkflowAlreadyStartedError:
-                # The next dispatch inspects the durable remote memo before acking.
-                continue
-            await asyncio.to_thread(self.store.mark_start, spec["run_id"], accepted=True)
+            await _dispatch_start(self, client, item, spec)
 
     async def dispatch_loop(self) -> None:
         self._retry_stopped = threading.Event()
@@ -215,6 +275,7 @@ class DeliveryService:
                 raise
             except Exception as exc:
                 self.temporal_status = "disconnected"
+                reason = _dispatch_failure_reason(exc)
                 for item in await asyncio.to_thread(self.store.pending_starts):
                     try:
                         spec = await asyncio.to_thread(self.store.effective_spec, item["run_id"])
@@ -222,11 +283,15 @@ class DeliveryService:
                             self.store.owns_execution, spec
                         ):
                             continue
+                        # No row was reached: the reason is surfaced once, the
+                        # rows stay queued and their backoff is untouched.
+                        await asyncio.to_thread(
+                            self.store.record_dispatch_failure, item["run_id"], reason,
+                            counted=False,
+                        )
                     except Exception:
                         # Unknown authority cannot authorize an outbox acknowledgement.
                         continue
-                    await asyncio.to_thread(self.store.mark_start, item["run_id"],
-                                            accepted=False, error=type(exc).__name__)
             try:
                 await self.dispatch_questions_once()
             except asyncio.CancelledError:
