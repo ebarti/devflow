@@ -42,10 +42,11 @@ _UNCLEAN_CHECK_RECHECK_INTERVAL = 5.0
 # ports their journals recorded, retained while any of those is observably live.
 _UNCLEAN_CHECK_SLOTS: list[dict[str, Any]] = []
 _UNCLEAN_CHECK_LOCK = threading.Lock()
-# Replaced check attempts still finishing their native process, by gate
-# identity, so the retry takes over the gate only once that body has stopped.
-_SUPERSEDED_CHECKS: dict[tuple[Any, ...], threading.Event] = {}
-_SUPERSEDED_CHECK_LOCK = threading.Lock()
+# The newest check body per gate identity in this worker, with its supersession
+# and completion signals. A newer attempt supersedes the registered body itself
+# and waits for it, without relying on Temporal's throttled replacement notice.
+_ACTIVE_CHECKS: dict[tuple[Any, ...], tuple[threading.Event, threading.Event]] = {}
+_ACTIVE_CHECK_LOCK = threading.Lock()
 
 
 def _cancelled_check_result(request: dict[str, Any], broker: DeliveryBroker) -> dict[str, Any]:
@@ -124,22 +125,31 @@ def _gate_identity(request: dict[str, Any], kind: str) -> tuple[Any, ...]:
             candidate.get("id", spec.get("base_sha")))
 
 
-def _register_superseded(identity: tuple[Any, ...], finished: threading.Event) -> None:
-    with _SUPERSEDED_CHECK_LOCK:
-        if not finished.is_set():
-            _SUPERSEDED_CHECKS[identity] = finished
+def _claim_gate(
+    identity: tuple[Any, ...], superseded: threading.Event, finished: threading.Event,
+) -> threading.Event | None:
+    """Register a gate's newest body; supersede the previous one and return its `finished`.
+
+    Temporal never runs two attempts of one activity at once, so within this
+    worker a body that finds another registered under its identity is the
+    newer attempt. Across workers the older body keeps running until the
+    replacement notice reaches it.
+    """
+    with _ACTIVE_CHECK_LOCK:
+        previous = _ACTIVE_CHECKS.get(identity)
+        _ACTIVE_CHECKS[identity] = (superseded, finished)
+    if previous is None:
+        return None
+    previous[0].set()
+    return previous[1]
 
 
-def _superseded_predecessor(identity: tuple[Any, ...]) -> threading.Event | None:
-    with _SUPERSEDED_CHECK_LOCK:
-        return _SUPERSEDED_CHECKS.get(identity)
-
-
-def _settle_superseded(identity: tuple[Any, ...], finished: threading.Event) -> None:
-    with _SUPERSEDED_CHECK_LOCK:
+def _release_gate(identity: tuple[Any, ...], finished: threading.Event) -> None:
+    with _ACTIVE_CHECK_LOCK:
         finished.set()
-        if _SUPERSEDED_CHECKS.get(identity) is finished:
-            del _SUPERSEDED_CHECKS[identity]
+        current = _ACTIVE_CHECKS.get(identity)
+        if current is not None and current[1] is finished:
+            del _ACTIVE_CHECKS[identity]
 
 
 def _release_settled_check_slots() -> None:
@@ -197,8 +207,9 @@ async def _execute_check(
     cancelled = threading.Event()
     admitted = threading.Event()
     ports_admitted = threading.Event()
-    # Temporal replaced this waiter: the body finishes only the native process
-    # it supervises, then `finished` lets its retry take over the gate.
+    # `superseded`: a newer attempt owns this gate, or Temporal replaced this
+    # waiter; the body finishes only the native process it supervises.
+    # `finished`: this body stopped, so the newer attempt may take the gate.
     superseded = threading.Event()
     finished = threading.Event()
     identity = _gate_identity(request, kind)
@@ -228,10 +239,15 @@ async def _execute_check(
                 _release_settled_check_slots()
 
         try:
-            # A retry takes over its replaced attempt's gate only once that body
-            # has stopped: one check body and one slot per gate at a time.
-            predecessor = _superseded_predecessor(identity)
+            # A newer attempt takes over the gate: it supersedes the body this
+            # worker already runs for the same identity and waits for it to
+            # stop, so one check body and one slot serve a gate at a time.
+            predecessor = _claim_gate(identity, superseded, finished)
             while predecessor is not None and not predecessor.is_set():
+                if superseded.is_set():
+                    raise CheckSuperseded(
+                        "native check superseded while waiting for its predecessor"
+                    )
                 if cancelled.is_set() or broker._native_cancelled():
                     raise CheckCancelledBeforeLaunch(
                         "native check cancelled while its replaced attempt finishes"
@@ -246,6 +262,8 @@ async def _execute_check(
             # consistent order, before consuming generic check capacity.
             for port in sorted(set(ports)):
                 while not cancelled.is_set() and not broker._native_cancelled():
+                    if superseded.is_set():
+                        raise CheckSuperseded("native check superseded while queued for ports")
                     handle = _try_check_lock(root / f"port-{port}.lock")
                     if handle is not None:
                         port_descriptors.append(handle)
@@ -258,6 +276,8 @@ async def _execute_check(
                     )
             ports_admitted.set()
             while not cancelled.is_set() and not broker._native_cancelled():
+                if superseded.is_set():
+                    raise CheckSuperseded("native check superseded while queued for a slot")
                 for slot in range(slots):
                     handle = _try_check_lock(root / f"slot-{slot}.lock")
                     if handle is None:
@@ -266,6 +286,8 @@ async def _execute_check(
                     break
                 if descriptor is not None:
                     with gate:
+                        if superseded.is_set():
+                            raise CheckSuperseded("native check superseded before admission")
                         if cancelled.is_set() or broker._native_cancelled():
                             raise CheckCancelledBeforeLaunch(
                                 "native check cancelled before admission"
@@ -280,9 +302,10 @@ async def _execute_check(
             raise CheckCancelledBeforeLaunch("native check cancelled while queued for a slot")
         except CheckCancelledBeforeLaunch:
             return _cancelled_check_result(request, broker)
-        except CheckSuperseded:
-            # The retry scores this gate from its journals; nobody reads this.
-            return {"state": "superseded"}
+        except CheckSuperseded as exc:
+            # A newer attempt owns this gate and scores it from the journals;
+            # this attempt's verdict is void and must not be retried as such.
+            raise ApplicationError(str(exc), type="CheckSuperseded", non_retryable=True) from exc
         finally:
             if descriptor is not None:
                 port_descriptors.append(descriptor)
@@ -293,7 +316,7 @@ async def _execute_check(
                 # Unknown teardown cannot supply ports or capacity to another gate
                 # until the processes and ports it recorded are proven gone.
                 _retain_unclean_check(port_descriptors, broker, ports)
-            _settle_superseded(identity, finished)
+            _release_gate(identity, finished)
 
     execution = asyncio.get_running_loop().run_in_executor(
         None, contextvars.copy_context().run, run,
@@ -322,7 +345,6 @@ async def _execute_check(
                         and activity_attempt_replaced() and activity_retry_pending())
             if replaced:
                 superseded.set()
-                _register_superseded(identity, finished)
             else:
                 cancelled.set()
         if replaced:
@@ -330,7 +352,9 @@ async def _execute_check(
             # this waiter. The admitted gate finishes the native process it
             # supervises under its durable monitor, launches nothing more, and
             # hands the gate to the retry, which scores that invocation from
-            # its journal instead of a killed one. A terminal timeout or an
+            # its journal instead of a killed one. A retry on this worker takes
+            # the gate as soon as it arrives; one on another worker only once
+            # this notice has stopped the body. A terminal timeout or an
             # operator cancel still stops it and frees its slot.
             execution.add_done_callback(
                 lambda future: future.exception() if not future.cancelled() else None

@@ -912,3 +912,31 @@ async def test_replaced_attempt_hands_its_gate_to_the_retry(owned_checks, monkey
     assert read_private(journal)["result"]["cancelled"] is False
     assert_stopped(broker)
     assert len(activities._UNCLEAN_CHECK_SLOTS) == owned_checks.retained_slots
+
+
+async def test_retry_dispatched_before_the_replacement_notice_waits_for_its_predecessor(
+    owned_checks, monkeypatch,
+):
+    # Real ordering after a Mac sleep: the server times out attempt 1 and
+    # dispatches attempt 2 after a 1s backoff, while attempt 1 learns of its
+    # replacement only at its next throttled heartbeat RPC (up to 24s later).
+    monkeypatch.setattr(activities.activity, "cancellation_details", lambda: SimpleNamespace(
+        cancel_requested=False, timed_out=False, not_found=True, worker_shutdown=False))
+    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info())
+    request = owned_checks.request("one", seconds=2, timeout=60)
+    broker = owned_checks.brokers["one"]
+    journal = Path(request["spec"]["state_dir"]) / "native" / "native-process.json"
+    first = asyncio.create_task(activities.delivery_checks(request))
+    await wait_until(lambda: observed_native_tree(journal))
+    retry = asyncio.create_task(activities.delivery_checks(request))
+    await asyncio.sleep(0.5)
+    # The retry supersedes the body this worker already runs and waits for it.
+    assert owned_checks.maximum() == 1 and not retry.done()
+    assert broker.check_superseded()
+    first.cancel()  # the replacement notice arrives after the retry started
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert await retry == {"state": "passed", "cleanup": "confirmed"}
+    assert owned_checks.maximum() == 1
+    assert not (journal.parent / "cancel").exists()
+    assert_stopped(broker)
