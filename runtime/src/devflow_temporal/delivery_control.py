@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import fcntl
 import json
 import os
@@ -34,6 +35,7 @@ from .delivery_client import DeliveryClient, ServiceUnavailable, read_only_clien
 from .delivery_client import client as api_client
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
+from .delivery_execution_config import transport_digest
 from .delivery_store import DeliveryStore, _private_directory
 from .delivery_temporal_retention import ensure_namespace_retention
 from .delivery_workflow import DeliveryWorkflow
@@ -159,16 +161,26 @@ def _ensure_namespace_retention(config: DeliveryConfig, deadline: float) -> None
 def _lifecycle_lock(config: DeliveryConfig, deadline: float):
     _private_directory(config.state_root)
     path = config.state_root / "service.lock"
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    message = f"service lock must be an owned private file (0600): {path}"
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(message) from exc
+        raise
     try:
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_uid != os.getuid()
             or metadata.st_nlink != 1
         ):
-            raise ValueError(f"service lock must be an owned private file (0600): {path}")
+            raise ValueError(message)
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            # Owner-owned mode drift (a restore, chmod -R) heals in place.
+            os.fchmod(descriptor, 0o600)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+                raise ValueError(message)
         while True:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -248,6 +260,34 @@ def _launch(config: DeliveryConfig, name: str, argv: list[str]) -> dict:
         raise
 
 
+def _terminate(name: str, process: dict) -> str:
+    """Stop one owned member by its process group, escalating only after a grace period."""
+    if not _owned(process):
+        return "already_stopped_or_changed"
+    try:
+        if os.getpgid(process["pid"]) != process["pid"]:
+            raise ValueError(
+                f"owned {name} is not its process group leader; refusing to stop it"
+            )
+        os.killpg(process["pid"], signal.SIGTERM)
+    except ProcessLookupError:
+        return "already_stopped"
+    for _ in range(30):
+        if not _owned(process):
+            break
+        time.sleep(0.1)
+    if _owned(process):
+        try:
+            os.killpg(process["pid"], signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for _ in range(20):
+            if not _owned(process):
+                break
+            time.sleep(0.05)
+    return "stopped" if not _owned(process) else "termination_pending"
+
+
 def _stop(config: DeliveryConfig, manifest: dict) -> dict:
     recorded = _recorded_deployment(manifest)
     if recorded is None:
@@ -259,32 +299,7 @@ def _stop(config: DeliveryConfig, manifest: dict) -> dict:
         process = manifest.get("processes", {}).get(name)
         if process is None:
             continue
-        if not _owned(process):
-            results[name] = "already_stopped_or_changed"
-            continue
-        try:
-            if os.getpgid(process["pid"]) != process["pid"]:
-                raise ValueError(
-                    f"owned {name} is not its process group leader; refusing to stop it"
-                )
-            os.killpg(process["pid"], signal.SIGTERM)
-        except ProcessLookupError:
-            results[name] = "already_stopped"
-            continue
-        for _ in range(30):
-            if not _owned(process):
-                break
-            time.sleep(0.1)
-        if _owned(process):
-            try:
-                os.killpg(process["pid"], signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            for _ in range(20):
-                if not _owned(process):
-                    break
-                time.sleep(0.05)
-        results[name] = "stopped" if not _owned(process) else "termination_pending"
+        results[name] = _terminate(name, process)
     if all(not _owned(process) for process in manifest.get("processes", {}).values()):
         if recorded is None:
             _manifest(config).unlink(missing_ok=True)
@@ -299,35 +314,161 @@ def service_stop(config: DeliveryConfig) -> dict:
         return _stop(config, _read_manifest(config) or {"processes": {}})
 
 
-def _ready(config: DeliveryConfig, manifest: dict, deadline: float) -> bool:
+def _registered_worker(config: DeliveryConfig, processes: dict) -> dict | None:
+    """The owned worker's readiness marker when it registered this stack's worker."""
+    worker = processes.get("worker")
+    if not isinstance(worker, dict):
+        return None
+    marker = config.state_root / "worker-ready.json"
+    try:
+        registered = json.loads(marker.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return None
+    if not isinstance(registered, dict):
+        return None
+    # The transport the worker polls is recorded for restart decisions; workers
+    # that predate its recording still register.
+    identity = {key: value for key, value in registered.items() if key != "transport_digest"}
+    expected = {
+        "pid": worker.get("pid"),
+        "identity": worker.get("identity"),
+        "config_path": str(config.path),
+        **({"deployment": worker["deployment"]} if "deployment" in worker else {}),
+    }
+    return registered if identity == expected else None
+
+
+def _api_probe(config: DeliveryConfig, api: dict) -> DeliveryConfig:
+    """Reach the running API where it listens, not where an edited file says it should."""
+    recorded = api.get("dashboard_url") if isinstance(api, dict) else None
+    if not isinstance(recorded, str) or recorded == config.dashboard_url:
+        return config
+    return DeliveryConfig(config.path, {**config.raw, "dashboard_url": recorded})
+
+
+def _ready(config: DeliveryConfig, manifest: dict, deadline: float) -> dict | None:
+    """The running API's self-description when the owned stack is ready, else None."""
     processes = manifest.get("processes", {})
     if set(processes) != {"temporal", "worker", "api"} or not all(
         _owned(process) for process in processes.values()
     ):
-        return False
+        return None
     try:
-        caller = DeliveryClient(config)
+        caller = DeliveryClient(_api_probe(config, processes["api"]))
         caller.login(timeout=min(2, _remaining(deadline)))
         info = caller._request("GET", "/api/service", timeout=min(2, _remaining(deadline)))
     except (ServiceUnavailable, FileNotFoundError):
-        return False
+        return None
     # Authentication errors propagate without restarting the owned stack.
-    marker = config.state_root / "worker-ready.json"
-    try:
-        worker_ready = json.loads(marker.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        return False
-    return (
+    ready = (
         info.get("pid") == processes["api"]["pid"]
         and info.get("temporal") == "connected"
-        and worker_ready
-        == {
-            "pid": processes["worker"]["pid"],
-            "identity": processes["worker"]["identity"],
-            "config_path": str(config.path),
-            **({"deployment": processes["worker"]["deployment"]}
-               if "deployment" in processes["worker"] else {}),
-        }
+        and _registered_worker(config, processes) is not None
+    )
+    return info if ready else None
+
+
+def _await_ready(config: DeliveryConfig, manifest: dict, deadline: float) -> dict | None:
+    """Probe readiness while every member stays owned.
+
+    A delayed API/DB read does not authorize interrupting live work: at the
+    deadline this reports the uncertainty and preserves the stack.
+    """
+    while True:
+        info = _ready(config, manifest, deadline)
+        if info:
+            return info
+        processes = manifest.get("processes", {})
+        if set(processes) != {"temporal", "worker", "api"} or not all(
+            _owned(process) for process in processes.values()
+        ):
+            return None
+        time.sleep(min(0.1, _remaining(deadline)))
+
+
+def _api_argv(config: DeliveryConfig) -> list[str]:
+    return [sys.executable, "-m", "devflow_temporal.delivery_control",
+            "--config", str(config.path), "api"]
+
+
+def _held_address(config: DeliveryConfig, api: dict | None) -> tuple | None:
+    """The loopback address an owned API member holds; None when no API is running."""
+    if not _owned(api):
+        return None
+    recorded = api.get("dashboard_url")
+    if isinstance(recorded, str):
+        address = urlsplit(recorded)
+        return address.hostname, address.port
+    host, port, _, _ = _ports(config)
+    return host, port
+
+
+def _validate_api_config(config: DeliveryConfig, held: tuple | None = None) -> None:
+    """Fail the way the API process would, before any running member is touched.
+
+    ``held`` is the address the running API itself occupies; stopping it frees
+    that port. Any other configured port must be free now.
+    """
+    host, port, _, _ = _ports(config)
+    if not _dashboard_bundle().is_file():
+        raise ValueError("dashboard bundle is missing; build runtime/ui before service start")
+    if held != (host, port) and not _free(host, port):
+        raise ValueError(f"configured service port {port} is already occupied")
+    DeliveryStore(config)
+
+
+def _worker_polls(config: DeliveryConfig, processes: dict) -> bool:
+    """Whether the registered worker recorded exactly this configuration's transport."""
+    registered = _registered_worker(config, processes)
+    return (registered is not None
+            and registered.get("transport_digest") == transport_digest(config))
+
+
+def _launch_api(config: DeliveryConfig, manifest: dict, deadline: float) -> dict:
+    """Launch the API member beside an owned Temporal server and registered worker."""
+    processes = {name: process for name, process in manifest["processes"].items()
+                 if name != "api"}
+    host, port, _, _ = _ports(config)
+    grace = time.monotonic() + 2
+    while not _free(host, port):
+        # A listener this lifecycle just stopped releases its port shortly after
+        # exiting; anything still bound after that is a foreign process.
+        if time.monotonic() > grace:
+            raise ValueError(f"configured service port {port} is already occupied")
+        time.sleep(min(0.05, _remaining(deadline)))
+    processes["api"] = {**_launch(config, "api", _api_argv(config)),
+                        "dashboard_url": config.dashboard_url}
+    _write_manifest(config, processes)
+    while not _ready(config, {"processes": processes}, deadline):
+        if not _owned(processes["api"]):
+            raise RuntimeError("api exited during service startup")
+        time.sleep(min(0.1, _remaining(deadline)))
+    return _read_manifest(config)
+
+
+def _restart_api(config: DeliveryConfig, manifest: dict, deadline: float) -> dict:
+    """Reload only the dashboard/API member; worker roles in flight are never signalled.
+
+    The edited configuration is validated before the running API (if any) is
+    stopped, so a configuration the API cannot start on leaves it serving.
+    """
+    processes = dict(manifest["processes"])
+    api = processes.pop("api", None)
+    _validate_api_config(config, _held_address(config, api))
+    if api is not None and _terminate("api", api) == "termination_pending":
+        raise ValueError("owned api termination is pending; inspect service status")
+    _write_manifest(config, processes)
+    return _launch_api(config, {**manifest, "processes": processes}, deadline)
+
+
+def _only_api_missing(config: DeliveryConfig, manifest: dict) -> bool:
+    """An owned Temporal server and registered worker whose API is dead or absent."""
+    processes = manifest.get("processes", {})
+    return (
+        {"temporal", "worker"} <= set(processes)
+        and all(_owned(processes[name]) for name in ("temporal", "worker"))
+        and not _owned(processes.get("api"))
+        and _registered_worker(config, processes) is not None
     )
 
 
@@ -361,22 +502,37 @@ def ensure_service_running(
                         existing = {**existing,
                                     "worker_deployment": _deployment_identity(deployment)}
                         _write_manifest(config, {}, deployment=existing["worker_deployment"])
-                while True:
-                    if _ready(config, existing, deadline):
-                        if (deployment is not None and existing["processes"]["worker"].get(
-                                "deployment") != _deployment_identity(deployment)):
-                            raise ValueError(
-                                "running worker deployment differs; drain it before changing")
-                        _ensure_namespace_retention(config, deadline)
-                        return {"dashboard_url": config.dashboard_url, **existing}
-                    processes = existing["processes"]
-                    if set(processes) != {"temporal", "worker", "api"} or not all(
-                        _owned(process) for process in processes.values()
-                    ):
-                        break
-                    # A delayed API/DB read does not authorize interrupting live work.
-                    # At the deadline, report the uncertainty and preserve this stack.
-                    time.sleep(min(0.1, _remaining(deadline)))
+                info = _await_ready(config, existing, deadline)
+                if info:
+                    # An empty or partial inventory reports readiness only through
+                    # patched probes; members it lacks have nothing to compare.
+                    members = existing.get("processes") or {}
+                    if (deployment is not None and members.get("worker", {}).get(
+                            "deployment") != _deployment_identity(deployment)):
+                        raise ValueError(
+                            "running worker deployment differs; drain it before changing")
+                    _ensure_namespace_retention(config, deadline)
+                    # A stale API keeps answering (its 409s name `restart`); ensuring
+                    # never reloads a member, which could split the API's transport
+                    # from the worker's.
+                    listening = members.get("api", {}).get("dashboard_url")
+                    if isinstance(listening, str) and listening != config.dashboard_url:
+                        raise ValueError(
+                            f"the running API listens at {listening}; run `devflow-delivery "
+                            f"--config {config.path} restart` to move it to "
+                            f"{config.dashboard_url}")
+                    return {"dashboard_url": config.dashboard_url, **existing}
+                if _only_api_missing(config, existing):
+                    # A registered worker is never stopped because its API died or
+                    # failed to relaunch; only the API member is brought back, and
+                    # only onto the transport that worker polls.
+                    if not _worker_polls(config, existing["processes"]):
+                        raise ValueError(
+                            "the registered worker polls a transport other than the one "
+                            f"{config.path} names; run `devflow-delivery --config "
+                            f"{config.path} restart` to move the whole service")
+                    existing = _restart_api(config, existing, deadline)
+                    return {"dashboard_url": config.dashboard_url, **existing}
                 _stop(config, existing)
                 if any(_owned(process) for process in existing["processes"].values()):
                     raise ValueError("owned service termination is pending; inspect service status")
@@ -401,6 +557,32 @@ def service_start(
             else ensure_service_running(config))
 
 
+def service_restart(config: DeliveryConfig) -> dict:
+    """Reload the service after a configuration edit.
+
+    When the stack is ready and the registered worker already polls the edited
+    configuration's transport, only the API reloads, so roles in flight
+    continue. A transport change, a worker that registered no transport, or an
+    incomplete stack takes the ordinary stop, then start.
+    """
+    deadline = _deadline(config)
+    try:
+        with _lifecycle_lock(config, deadline):
+            existing = _read_manifest(config)
+            if existing and (
+                _await_ready(config, existing, deadline)
+                or _only_api_missing(config, existing)
+            ) and _worker_polls(config, existing["processes"]):
+                manifest = _restart_api(config, existing, deadline)
+                return {"dashboard_url": config.dashboard_url, "restarted": ["api"], **manifest}
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"local service restart failed: {exc}; logs: {config.state_root / 'api.log'}"
+        ) from None
+    service_stop(config)
+    return {"restarted": ["temporal", "worker", "api"], **ensure_service_running(config)}
+
+
 def _dashboard_bundle() -> Path:
     return Path(__file__).resolve().parents[2] / "ui" / "dist" / "index.html"
 
@@ -418,7 +600,13 @@ def _start(
     temporal = config.raw.get("temporal_bin") or shutil.which("temporal")
     if not temporal or not Path(temporal).is_file():
         raise ValueError("Temporal CLI executable is unavailable")
-    DeliveryStore(config)
+    store = DeliveryStore(config)
+    try:
+        # Seeding is explicit at start: runs admitted under the live configuration
+        # are covered; runs whose bytes are gone are named with their remedy.
+        snapshots = store.seed_execution_snapshots()
+    except (OSError, ValueError) as exc:
+        snapshots = {"error": str(exc)}
     (config.state_root / "worker-ready.json").unlink(missing_ok=True)
     processes = {}
     try:
@@ -462,18 +650,8 @@ def _start(
         if deployment is not None:
             processes["worker"]["deployment"] = _deployment_identity(deployment)
         _write_manifest(config, processes)
-        processes["api"] = _launch(
-            config,
-            "api",
-            [
-                sys.executable,
-                "-m",
-                "devflow_temporal.delivery_control",
-                "--config",
-                str(config.path),
-                "api",
-            ],
-        )
+        processes["api"] = {**_launch(config, "api", _api_argv(config)),
+                            "dashboard_url": config.dashboard_url}
         _write_manifest(config, processes)
         while not _ready(config, {"processes": processes}, deadline):
             for name, process in processes.items():
@@ -483,7 +661,8 @@ def _start(
     except BaseException:
         _stop(config, {"processes": processes})
         raise
-    return {"dashboard_url": config.dashboard_url, "processes": processes}
+    return {"dashboard_url": config.dashboard_url, "processes": processes,
+            "configuration_snapshots": snapshots}
 
 
 def _deployment_identity(deployment: WorkerDeploymentConfig) -> dict:
@@ -547,6 +726,9 @@ async def worker(
             "pid": os.getpid(),
             "identity": _process_identity(os.getpid()),
             "config_path": str(config.path),
+            # The transport this worker polls; `restart` reloads only the API
+            # while an edited configuration still names the same transport.
+            "transport_digest": transport_digest(config),
         }
         if deployment is not None:
             readiness["deployment"] = _deployment_identity(deployment)
@@ -564,6 +746,7 @@ _COMMANDS = (
     "start",
     "status",
     "stop",
+    "restart",
     "token",
     "worker",
     "api",
@@ -733,6 +916,9 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     if args.command == "start":
         print(json.dumps(service_start(config, deployment=deployment), sort_keys=True))
+        return
+    if args.command == "restart":
+        print(json.dumps(service_restart(config), sort_keys=True))
         return
     manifest = _read_manifest(config)
     if args.command == "status":
