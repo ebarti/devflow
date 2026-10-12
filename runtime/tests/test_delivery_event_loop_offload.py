@@ -169,7 +169,7 @@ async def test_maintenance_passes_read_the_store_off_the_event_loop(api_fixture,
 
     class Handle:
         async def describe(self):
-            return SimpleNamespace(status=WorkflowExecutionStatus.RUNNING)
+            return SimpleNamespace(status=WorkflowExecutionStatus.RUNNING, close_time=None)
 
     class Client:
         namespace = "default"
@@ -180,7 +180,8 @@ async def test_maintenance_passes_read_the_store_off_the_event_loop(api_fixture,
             return Handle()
 
     results = await reconcile_completed_projections(store, Client())
-    assert results == [{"run_id": "run-1", "state": "not_completed"}]
+    assert results == [{"run_id": "run-1", "state": "not_completed", "status": "RUNNING",
+                        "closed": False}]
     assert {"_connect", "effective_spec", "owns_execution"} <= set(observed)
     observed.clear()
     await reconcile_closed_native(store, Client())
