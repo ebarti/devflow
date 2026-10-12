@@ -193,11 +193,17 @@ class DeliveryService(unittest.TestCase):
         # entry that execs the checkout's venv entry: argv[0] never names the checkout.
         journal = self.root / "launchers/share/devflow/delivery-launchers/cmd-1"
         (journal / "entries").mkdir(parents=True)
-        (journal / "manifest.json").write_text(json.dumps({"runtime_dir": str(self.runtime)}))
+        # The journal's manifest is {"request": <request>, "bin_identity": ...}.
+        (journal / "manifest.json").write_text(json.dumps({
+            "request": {"schema_version": 1, "command_id": "cmd-1",
+                        "runtime_dir": str(self.runtime), "config_path": str(self.config)},
+            "bin_identity": {"device": 1, "inode": 2}}))
+        # This wrapper's exec target tells nothing about the checkout; the journal does.
+        opaque = fake_executable(self.root / "tools/devflow-delivery")
         wrapper = fake_executable(
             journal / "entries/devflow-delivery",
             "#!/bin/sh\n# Canonical delivery entry; devflow aliases devflow-delivery.\n"
-            f"exec '{self.entry}' --config '{self.config}' \"$@\"\n")
+            f"exec '{opaque}' --config '{self.config}' \"$@\"\n")
         link = self.root / "launchers/bin/devflow-delivery"
         link.parent.mkdir(parents=True)
         link.symlink_to(wrapper)
@@ -215,16 +221,22 @@ class DeliveryService(unittest.TestCase):
         blocking = self.script("active", "--runtime", self.runtime)
         self.assertEqual(blocking.returncode, 3, blocking.stderr)
         self.assertEqual([item["runtime"] for item in json.loads(blocking.stdout)],
-                         [str(self.runtime)])
+                         [[str(self.runtime)]])
         elsewhere = self.root / "elsewhere/runtime"
         self.assertEqual(self.script("active", "--runtime", elsewhere).stdout.strip(), "[]")
-        # Without the journal, the wrapper's exec target names the checkout; a
-        # wrapper bound to another configuration is refused.
+        # Without the journal, only a wrapper that execs a venv entry names the
+        # checkout; otherwise --runtime must. A wrapper bound to another
+        # configuration is refused.
         (journal / "manifest.json").unlink()
+        underived = self.script(*launcher_args)
+        self.assertEqual(underived.returncode, 1)
+        self.assertIn("supply --runtime", underived.stderr)
+        named = self.script(*launcher_args, "--runtime", self.runtime)
+        self.assertEqual(named.returncode, 0, named.stderr)
+        wrapper.write_text(f"#!/bin/sh\nexec '{self.entry}' --config '{self.config}' \"$@\"\n")
         again = self.script(*launcher_args)
         self.assertEqual(again.returncode, 0, again.stderr)
-        self.assertEqual(plistlib.loads(Path(json.loads(again.stdout)["staged"]).read_bytes())[
-            "DevflowRuntime"], str(self.runtime))
+        self.assertEqual(plistlib.loads(staged.read_bytes())["DevflowRuntime"], str(self.runtime))
         other = fake_executable(
             journal / "entries/other",
             f"#!/bin/sh\nexec '{self.entry}' --config '{self.root}/other.json' \"$@\"\n")
@@ -232,13 +244,44 @@ class DeliveryService(unittest.TestCase):
                               "--temporal", self.temporal)
         self.assertEqual(refused.returncode, 1)
         self.assertIn("bound to another configuration", refused.stderr)
-        # An agent that names no runtime blocks every upgrade.
-        unknown = {key: value for key, value in data.items() if key != "DevflowRuntime"}
-        unknown["Label"] = PREFIX + "unknown00000"
-        (self.agents / (unknown["Label"] + ".plist")).write_bytes(plistlib.dumps(unknown))
+
+    def test_active_rederives_the_runtime_and_reports_ambiguous_agents(self):
+        staged = self.script(*self.install_args())
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+        data = plistlib.loads(Path(json.loads(staged.stdout)["staged"]).read_bytes())
+        self.agents.mkdir(parents=True)
+        elsewhere = self.root / "elsewhere/runtime"
+        # A recorded runtime pointing elsewhere does not hide an entry that execs
+        # this checkout's venv: the entry decides where a worker would launch.
+        repointed = {**data, "DevflowRuntime": str(elsewhere), "Label": PREFIX + "repointed000"}
+        (self.agents / (repointed["Label"] + ".plist")).write_bytes(plistlib.dumps(repointed))
+        here = self.script("active", "--runtime", self.runtime)
+        self.assertEqual(here.returncode, 3, here.stderr)
+        self.assertEqual([item["label"] for item in json.loads(here.stdout)], [repointed["Label"]])
+        self.assertEqual(json.loads(here.stdout)[0]["runtime"],
+                         sorted([str(elsewhere), str(self.runtime)]))
         self.assertEqual([item["label"] for item in
                           json.loads(self.script("active", "--runtime", elsewhere).stdout)],
+                         [repointed["Label"]])
+        # An agent with no runtime and an entry that tells nothing blocks every checkout.
+        opaque = fake_executable(self.root / "tools/opaque")
+        unknown = {key: value for key, value in data.items() if key != "DevflowRuntime"}
+        unknown.update(Label=PREFIX + "unknown00000",
+                       ProgramArguments=[str(opaque), "--config", str(self.config), "supervise"])
+        (self.agents / (unknown["Label"] + ".plist")).write_bytes(plistlib.dumps(unknown))
+        far = self.root / "another/runtime"
+        self.assertEqual([item["label"] for item in
+                          json.loads(self.script("active", "--runtime", far).stdout)],
                          [unknown["Label"]])
+        # A plist under the Devflow label that Devflow does not own is reported, not skipped.
+        foreign = self.agents / (PREFIX + "foreign000000.plist")
+        foreign.write_bytes(plistlib.dumps({"Label": PREFIX + "foreign000000",
+                                            "ProgramArguments": ["/usr/bin/true"]}))
+        reported = self.script("active", "--runtime", far)
+        self.assertEqual(reported.returncode, 3)
+        self.assertEqual([item["service"] for item in json.loads(reported.stdout)
+                          if item.get("error")], [str(foreign)])
+        self.assertIn("not owned by Devflow", reported.stderr)
 
 
 if __name__ == "__main__":
