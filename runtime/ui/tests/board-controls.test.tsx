@@ -94,6 +94,16 @@ describe('workflow board and controls', () => {
     expect(laneFor({ ...mockRun, phase: 'cancelled', outcome: 'cancelled', execution_state: 'cancelled' })).toBe('Needs attention')
   })
 
+  it('shows required revision approval as waiting for a decision', () => {
+    const run = { ...mockRun, phase: 'waiting_plan_revision', execution_state: 'waiting', outcome: null,
+      feature: { issue: 'https://github.com/o/r/issues/1', run_id: mockRun.id, status: 'Planning', version: 2, pull_requests: [] } }
+    render(<RunBoard runs={[run]} archived={false} onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
+    const lane = screen.getByRole('region', { name: 'Needs attention column' })
+    expect(lane.querySelectorAll('.task-card')).toHaveLength(1)
+    expect(lane.textContent).toContain('Waiting for decision')
+    expect(screen.getByRole('region', { name: 'Planning column' }).querySelectorAll('.task-card')).toHaveLength(0)
+  })
+
   it('uses the newest feature version when older paginated rows carry stale owners', () => {
     const feature = { issue: 'https://github.com/o/r/issues/1', run_id: 'new', status: 'In progress', version: 12, pull_requests: [] }
     const current = { ...mockRun, id: 'new', feature }
