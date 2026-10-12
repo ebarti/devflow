@@ -823,8 +823,14 @@ async def coordinate(controller, spec):
                     continue
                 effect = readback.get("effect_key") or "readback"
                 reason = readback.get("reason") or "pending"
-                if controller.cancel_requested or polls >= READBACK_POLLS:
-                    unsettled = (effect, reason)
+                # A contradicted readback is a verdict, not a wait: GitHub shows a
+                # state the recorded operation cannot match, so leave at once.
+                contradicted = readback.get("state") == "contradicted"
+                if contradicted:
+                    reason += "; " + (readback.get("remedy")
+                                      or "restore the recorded GitHub state")
+                if contradicted or controller.cancel_requested or polls >= READBACK_POLLS:
+                    unsettled = (effect, reason, contradicted)
                     break
                 # Nothing but this coordinator settles a pending external operation.
                 # Back off to bound history growth, name what is stuck, and leave on
@@ -840,14 +846,20 @@ async def coordinate(controller, spec):
                 # Never turn an unconfirmed effect into a confirmed or absent one.
                 # registry.stop() refuses a pending effect, so the stop activity is
                 # withheld: the owner keeps the effect and the reason names it.
-                effect, reason = unsettled
+                effect, reason, contradicted = unsettled
                 cancelled = controller.cancel_requested
+                if contradicted:
+                    error = (f"original GitHub operation {effect} no longer matches its "
+                             f"recorded identity ({reason}); it will not settle by waiting; "
+                             "the feature owner keeps it pending")
+                else:
+                    error = (f"original GitHub operation {effect} still unconfirmed after "
+                             f"{polls} readbacks ({reason}); the feature owner keeps it pending")
                 terminal = {
                     "phase": "cancelled" if cancelled else "blocked",
                     "execution_state": "terminal" if cancelled else "blocked",
                     "outcome": "cancelled" if cancelled else "blocked", "cleanup": "unknown",
-                    "error": f"original GitHub operation {effect} still unconfirmed after "
-                             f"{polls} readbacks ({reason}); the feature owner keeps it pending",
+                    "error": error,
                 }
                 settled = terminal["error"]
                 controller.state["checks"]["feature_stop"] = {

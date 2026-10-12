@@ -14,9 +14,11 @@ import errno
 import json
 import re
 import subprocess
+import sys
 from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from temporal_test_server import local_temporal
@@ -28,6 +30,14 @@ from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, Worker
 from test_delivery_feature_execution import Controller, feature_service
 from test_delivery_feature_integration import integration
 from test_delivery_feature_recovered_closure import recovered_worker as recovered_worker
+from test_delivery_feature_revision_preparation import (
+    pending_preparation as pending_preparation,
+)
+from test_delivery_feature_revision_subject import (
+    findings_reconsideration as findings_reconsideration,
+)
+from test_delivery_feature_revision_subject import intake_fixture as intake_fixture
+from test_delivery_feature_revision_subject import native_configuration as native_configuration
 from test_delivery_feature_workflow_temporal import FeatureActivities
 from test_delivery_github_contract import plan
 from test_delivery_store import service as service
@@ -36,7 +46,7 @@ import devflow_temporal.delivery_feature_workflow as protocol
 from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_feature_publication as publications
 from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
-from devflow_temporal.delivery_execution_registry import UnresolvedEffect
+from devflow_temporal.delivery_execution_registry import OwnershipConflict, UnresolvedEffect
 from devflow_temporal.delivery_feature_execution import (
     continue_feature,
     register_worker,
@@ -45,6 +55,7 @@ from devflow_temporal.delivery_feature_execution import (
 )
 from devflow_temporal.delivery_feature_pass import checkpoint_key
 from devflow_temporal.delivery_github_contract import ordered_chunks
+from devflow_temporal.delivery_resources import RunResources
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow, _interrupted_role
 
@@ -1318,6 +1329,9 @@ def test_infrastructure_allowlist_matches_on_the_child_and_coordinator_sides(
      True),
     ("net/http: TLS handshake timeout", True),
     ("read tcp 10.0.0.2:51234->140.82.112.6:443: read: connection reset by peer", True),
+    # A certificate that fails verification is a deterministic misconfiguration.
+    ("Get \"https://api.github.com/\": tls: failed to verify certificate: x509: certificate "
+     "signed by unknown authority", False),
     ("could not determine base repo: no git remotes found", False),
     ("unknown command \"foo\" for \"gh api\"", False),
 ])
@@ -1501,6 +1515,186 @@ def test_continue_settles_a_pending_effect_before_stopping_or_refuses_without_wr
     assert successor["feature_delivery"]["owner"]["generation"] == token["generation"] + 1
     assert shared.current(issue["id"])["state"] == "active"
     assert continue_feature(store, parent["run_id"], command) == result
+
+
+def test_continue_reports_a_contradicted_effect_as_a_verdict_with_its_remedy(
+    recovered_worker, monkeypatch,
+):
+    """A plan label renamed on GitHub can never read back: continuing refuses
+    non-retryably, names what changed and the remedy, writes nothing and never
+    confirms or drops the effect; once the label is restored the authentic
+    readback confirms it and the continuation proceeds."""
+    from devflow_temporal import delivery_feature_readback as readback_module
+    from devflow_temporal import delivery_github_contract as contract
+
+    store, parent, child, shared, token, command, _ = recovered_worker
+    issue = parent["feature_delivery"]["snapshot"]["issue"]
+    key = "github_plan_label:devflow:plan"
+    shared.intent(token, key, "github_plan_label", {"name": "devflow:plan"})
+    label = {"name": "devflow:renamed"}
+
+    def api(self, endpoint, **kwargs):
+        assert "/labels/" in endpoint, endpoint
+        return dict(label)
+
+    monkeypatch.setattr(contract.GitHubDelivery, "api", api)
+    verdict = readback_module.settle(store, parent)
+    assert verdict["state"] == "contradicted" and verdict["effect_key"] == key
+    assert verdict["reason"] == "OwnershipConflict: original plan label identity changed"
+    assert verdict["remedy"] == "restore the plan label 'devflow:plan' on example/fixture"
+    owner = shared.current(issue["id"])["state"]
+    for _ in range(2):
+        with pytest.raises(OwnershipConflict) as info:
+            continue_feature(store, parent["run_id"], command)
+        assert not isinstance(info.value, UnresolvedEffect), "a verdict is not a wait"
+        message = str(info.value)
+        assert key in message and "original plan label identity changed" in message
+        assert "will not settle by waiting" in message
+        assert "restore the plan label 'devflow:plan' on example/fixture" in message
+        assert shared.effect(issue["id"], key)["state"] == "pending"
+        assert shared.current(issue["id"])["state"] == owner == "draining"
+    label["name"] = "devflow:plan"
+    result = continue_feature(store, parent["run_id"], command)
+    assert shared.effect(issue["id"], key)["state"] != "pending"
+    successor = store.effective_spec(result["run_id"])
+    assert successor["feature_delivery"]["owner"]["generation"] == token["generation"] + 1
+
+
+def test_settle_keeps_transport_and_unresolved_readbacks_pending(recovered_worker, monkeypatch):
+    from devflow_temporal import delivery_feature_readback as readback_module
+    from devflow_temporal.delivery_github_contract import GitHubTransientError
+
+    store, parent, child, shared, token, command, _ = recovered_worker
+    shared.intent(token, "github_plan:v1", "github_plan", {"body": "Delivery plan v1"})
+    for failure in (GitHubTransientError("error connecting to api.github.com"),
+                    UnresolvedEffect("original plan creation still needs exact readback"),
+                    RuntimeError("command failed (1): gh api: unexpected EOF")):
+        def failing(store_, spec, entry, gh, _failure=failure):
+            raise _failure
+
+        monkeypatch.setattr(readback_module, "settle_one", failing)
+        readback = readback_module.settle(store, parent)
+        assert readback["state"] == "pending" and readback["effect_key"] == "github_plan:v1"
+        assert readback["reason"].startswith(type(failure).__name__ + ": ")
+        assert "remedy" not in readback
+        with pytest.raises(UnresolvedEffect, match="continue the feature again once it settles"):
+            continue_feature(store, parent["run_id"], command)
+
+
+@pytest.mark.asyncio
+async def test_contradicted_readback_stops_the_coordinator_at_once_naming_the_remedy(monkeypatch):
+    controller = LivenessController(plan())
+    _protocol_stubs(monkeypatch, controller)
+    verdict = {"state": "contradicted", "effect_key": "github_plan_label:devflow:plan",
+               "kind": "github_plan_label",
+               "reason": "OwnershipConflict: original plan label identity changed",
+               "remedy": "restore the plan label 'devflow:plan' on example/fixture"}
+    settlements = []
+    original = controller._activity
+
+    async def execute(name, request):
+        if name == "delivery_feature_settle_effects":
+            settlements.append(name)
+            return dict(verdict)
+        return await original(name, request)
+
+    controller._activity = execute
+
+    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                     assignment=None):
+        return _delivered(controller, chunk_id, kind)
+
+    monkeypatch.setattr(protocol, "_worker", worker)
+    result = await protocol.coordinate(
+        controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
+    assert len(settlements) == 1 and controller.sleeps == [], "a verdict is not polled"
+    assert result["outcome"] == "blocked" and result["cleanup"] == "unknown"
+    assert result["error"] == (
+        "original GitHub operation github_plan_label:devflow:plan no longer matches its "
+        "recorded identity (OwnershipConflict: original plan label identity changed; restore "
+        "the plan label 'devflow:plan' on example/fixture); it will not settle by waiting; "
+        "the feature owner keeps it pending")
+    assert result["checks"]["feature_readback"] == verdict
+    assert result["checks"]["feature_stop"]["state"] == "withheld"
+    assert not any(name == "delivery_feature_stop" for name, _ in controller.events)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
+def test_continue_settles_a_draining_owner_before_closing_its_open_revision(
+    pending_preparation, monkeypatch,
+):
+    """A draining owner with a pending effect and an open `begin:`: continuing reads
+    the effect back first (refused and unchanged while GitHub has not answered),
+    then stops the owner, and only then enters the revision closure path, which
+    closes the begun attempt (debit kept) and refuses once with the replay; the
+    replay continues into the next generation."""
+    from devflow_temporal import delivery_feature_readback as readback_module
+    from devflow_temporal import delivery_feature_revisions as revisions
+    from devflow_temporal.delivery_broker import DeliveryBroker
+    from devflow_temporal.delivery_preparation import prepare_authority
+
+    p = pending_preparation
+    store, shared, spec = (p[k] for k in ("store", "shared", "spec"))
+    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
+    response = continue_feature(store, spec["run_id"], p["request"])
+    successor = prepare_authority(store, store.effective_spec(response["run_id"]))
+    candidate = DeliveryBroker(store, successor).prepare()["candidate"]
+    context = revisions.begin_revision(store, successor)
+    revision_id = context["revision_id"]
+    token = successor["feature_delivery"]["owner"]
+    used = shared.budget(issue_id)["used"]
+    # The successor's coordinator leaves its readback wait on an operator cancel
+    # with a plan-comment write still pending: the owner drains, the begin stays.
+    shared.drain(token)
+    key = "github_plan:v2"
+    shared.intent(token, key, "github_plan", {"body": "Delivery plan v2"})
+    error = (f"original GitHub operation {key} still unconfirmed after 3 readbacks "
+             "(RPCError: unavailable); the feature owner keeps it pending")
+    # Owned native resources were finalized for real before the coordinator closed;
+    # only the external readback stayed pending.
+    receipt = RunResources(successor).finalize("cancelled")
+    assert receipt["state"] == "confirmed", receipt
+    checks = {"feature_readback": {"state": "pending", "effect_key": key},
+              "feature_stop": {"state": "withheld", "effect_key": key,
+                               "reason": "RPCError: unavailable"},
+              "resource_cleanup": receipt}
+    with store._connect() as db:
+        before = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                                 (successor["run_id"],)).fetchone())
+    store.project(successor["run_id"], phase="cancelled", execution_state="terminal",
+                  outcome="cancelled", cleanup="unknown", event_type="cancelled", message=error,
+                  candidate=candidate, pull_request=None, checks=checks, iteration=0,
+                  protocol_revision=(before["protocol_revision"] or 0) + 1, error=error)
+    with store._connect() as db:
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                              (successor["run_id"],)).fetchone())
+    request = {"command_id": "continue-drained-revision", "expected_revision": row["revision"]}
+    comments = []
+    monkeypatch.setattr(readback_module, "GitHubDelivery",
+                        lambda: SimpleNamespace(pages=lambda endpoint: list(comments)))
+    # GitHub has not answered: refused before any write; the begin stays open.
+    with pytest.raises(UnresolvedEffect, match=key):
+        continue_feature(store, successor["run_id"], request)
+    assert shared.current(issue_id)["state"] == "draining"
+    assert shared.effect(issue_id, key)["state"] == "pending"
+    assert revisions.revision_request(store.effective_spec(successor["run_id"]),
+                                      shared)["revision_id"] == revision_id
+    assert shared.budget(issue_id)["used"] == used
+    # GitHub answers: the effect settles first, the owner stops, and only then the
+    # revision closure path closes the begun attempt and refuses once with the replay.
+    comments.append({"id": 601, "node_id": "IC_601", "body": "Delivery plan v2"})
+    with pytest.raises(OwnershipConflict,
+                       match="attempt stopped before adoption and is now closed") as info:
+        continue_feature(store, successor["run_id"], request)
+    assert "replay continue-feature continue-drained-revision" in str(info.value)
+    assert shared.effect(issue_id, key)["state"] != "pending"
+    assert shared.current(issue_id)["state"] == "stopped"
+    assert shared.budget(issue_id)["used"] == used, "the begun attempt's debit is kept"
+    assert revisions.revision_request(store.effective_spec(successor["run_id"]), shared) is None
+    replayed = continue_feature(store, successor["run_id"], request)
+    assert replayed == continue_feature(store, successor["run_id"], request)
+    following = store.effective_spec(replayed["run_id"])
+    assert following["feature_delivery"]["owner"]["generation"] == token["generation"] + 1
 
 
 @pytest.mark.asyncio

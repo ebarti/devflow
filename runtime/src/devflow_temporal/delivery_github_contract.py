@@ -55,13 +55,21 @@ _GH_CONNECTION = re.compile(
     r"|network is unreachable|temporary failure in name resolution|unexpected EOF",
     re.IGNORECASE,
 )
+# A certificate that fails verification is a deterministic misconfiguration, not transport.
+_GH_CERTIFICATE = re.compile(
+    r"failed to verify certificate|certificate (is not trusted|has expired|is expired"
+    r"|signed by unknown authority)|x509:",
+    re.IGNORECASE,
+)
 
 
 def github_transient(status: int | None, stderr: str) -> bool:
     """Server faults, rate limits and transport failures are infrastructure; every
     other HTTP status, and every other gh error, is a verdict on the request."""
     if status is None:
-        return _GH_CONNECTION.search(stderr or "") is not None
+        text = stderr or ""
+        return (_GH_CERTIFICATE.search(text) is None
+                and _GH_CONNECTION.search(text) is not None)
     return status >= 500 or status == 429 or (
         status == 403 and re.search(r"rate limit", stderr, re.IGNORECASE) is not None
     )
