@@ -260,12 +260,13 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
         if not all(item["merged"] for item in live):
             last = submissions[-1] if submissions else {}
             if not intent["fresh"]:
-                if last.get("state") != "failed" or intent["state"] != "pending":
+                if last.get("state") != "not_started" or intent["state"] != "pending":
                     # The original command may still be queued or in flight.
                     return {"state": "pending", "reason": "original_merge_readback",
                             "effect_key": key}
                 if settlement:
-                    # GitHub merges a stack all-or-nothing: a refused command had no effect.
+                    # Only an authenticated local launch failure proves no request was sent.
+                    # A CLI exit code cannot establish the remote outcome.
                     shared.finish_effect(token, key, {"submissions": submissions},
                                          no_effect=True)
                     return {"state": "absent", "reason": "merge_submission_failed",
@@ -318,19 +319,17 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
                 )
             except (FileNotFoundError, PermissionError) as exc:
                 # The command never started, so GitHub received no merge request.
-                submissions[-1] = {**submissions[-1], "state": "failed",
+                submissions[-1] = {**submissions[-1], "state": "not_started",
                                    "error": f"{type(exc).__name__}: {exc}"[-2000:]}
                 shared.note_effect(token, key, {"submissions": submissions})
                 raise
             submissions[-1] = {**submissions[-1],
-                               "state": "failed" if result.returncode else "submitted",
+                               "state": "unknown" if result.returncode else "submitted",
                                "exit_code": result.returncode,
                                "stderr": (getattr(result, "stderr", None) or "")[-2000:]}
             shared.note_effect(token, key, {"submissions": submissions})
             live = live_members(spec, record, gh)
             if not all(item["merged"] for item in live):
-                if result.returncode and len(submissions) >= MERGE_SUBMISSIONS:
-                    raise OwnershipConflict(_refused(submissions))
                 return {
                     "state": "pending",
                     "reason": ("merge_submission_failed" if result.returncode
