@@ -1701,7 +1701,7 @@ class DeliveryWorkflow:
                                  'unresolved_findings'],
                              "controller_attribution_proof": recovery['seal'][
                                  'attribution_observation']}
-                            if 'attribution_observation' in recovery['seal'] else None),
+                            if 'attribution_observation' in recovery.get('seal', {}) else None),
             authorized_max_iteration=self.state["iteration"],
             resume_prechecks=True, published_checkpoint=published,
         )
