@@ -793,7 +793,8 @@ def test_reserved_revision_without_index_room_waits_unwritten_until_the_index_fi
 
     monkeypatch.setattr(publications, "current_record", oversized)
     with pytest.raises(OwnershipConflict, match="parent index cannot record every chunk's pull "
-                                                "request.*the reserved revision stays continuable"):
+                                                "request.*stays pending, unspent and blocked "
+                                                "until the owner acts"):
         execution.continue_feature(store, spec["run_id"], request)
     # The reservation is untouched: no retry receipt, successor, command or debit.
     assert (shared.checkpoints(issue_id), shared.budget(issue_id), shared.current(issue_id),

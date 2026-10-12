@@ -715,8 +715,10 @@ def test_capacity_bound_keeps_recorded_members_and_realistic_maxima(tmp_path):
     remote, issue, registry, token = setup(tmp_path)
     manifest = deepcopy(remote.initialize(issue, v2_plan(), registry, token)["manifest"])
     unknown = publication_capacity(issue, manifest)
-    # A known trunk replaces the contract's 128-character bound for the first layer.
+    # A known trunk replaces the contract's 128-character bound for the first layer, and
+    # a run's SHA-1 width replaces the contract's 64-character head for each layer.
     assert unknown["size"] - publication_capacity(issue, manifest, trunk="main")["size"] == 124
+    assert unknown["size"] - publication_capacity(issue, manifest, head_width=40)["size"] == 72
     assert unknown["unpublished_chunks"] == 3 and unknown["current"] < unknown["size"]
     members = manifest["publication"]["members"]
     sizes = [unknown["size"]]
@@ -731,6 +733,8 @@ def test_capacity_bound_keeps_recorded_members_and_realistic_maxima(tmp_path):
             "issue_number": child["number"], "issue_url": child["url"]})
         manifest["publication"]["stack_id"] = 7 if len(members) > 1 else None
         sizes.append(publication_capacity(issue, manifest)["size"])
+        # Recorded heads set the width for the layers still to come.
+        assert sizes[-1] == publication_capacity(issue, manifest, head_width=40)["size"]
     # Each recorded member replaces its reservation, so the bound only tightens.
     assert sizes == sorted(sizes, reverse=True)
     assert sizes[-1] == len(encode_manifest(manifest).encode())
