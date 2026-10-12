@@ -22,7 +22,7 @@ from .delivery_source_scope import require_authorized, source_path
 
 STAGES = ("checks", "prepublish_checks", "browser_qa")
 _TEST_FILE = re.compile(r"(?:test_[A-Za-z0-9_]+\.py|[A-Za-z0-9_.-]+\.(?:test|spec)\.[cm]?[jt]sx?)$")
-_WRAPPED_VITEST = re.compile(
+_WRAPPED_VITEST = (
     r"\bspawnSync\(\s*(?:'corepack'|\"corepack\")\s*,\s*\[\s*"
     r"(?:'pnpm'|\"pnpm\")\s*,\s*(?:'--filter'|\"--filter\")\s*,\s*"
     r"(?P<quote>['\"])(?P<package>@[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+)"
@@ -546,7 +546,7 @@ def _wrapped_junit_project(recipe: dict, spec: dict | None) -> str | None:
     ):
         return None
     script = argv[3]
-    matches = list(_WRAPPED_VITEST.finditer(script))
+    matches = list(re.finditer(_WRAPPED_VITEST, script))
     if len(matches) != 1 or len(re.findall(r"\bspawnSync\s*\(", script)) != 1:
         return None
     if not any(
