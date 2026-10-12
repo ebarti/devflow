@@ -193,5 +193,10 @@ async def test_scope_rejection_preserves_prior_uncertain_publication(service, mo
     with broker.store._connect() as db:
         retained = dict(db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
                                    ("publish:run-1:0",)).fetchone())
-    assert retained == original and retained['state'] == 'pending'
+    # Entering publish() adopts the retained effect, which re-stamps the row so a
+    # timed-out earlier thread can no longer discard it; its identity is untouched.
+    assert {k: v for k, v in retained.items() if k != 'updated_at'} == {
+        k: v for k, v in original.items() if k != 'updated_at'}
+    assert retained['updated_at'] >= original['updated_at']
+    assert retained['state'] == 'pending'
     assert json.loads(retained['observed_json'])['remote_confirmed'] is True

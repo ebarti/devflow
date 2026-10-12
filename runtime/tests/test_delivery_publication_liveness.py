@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -9,11 +10,11 @@ import sys
 from pathlib import Path
 
 import pytest
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.client import WorkflowHistory
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Replayer, Worker
+from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, Worker
 from test_delivery_store import service as _service_fixture
 
 from devflow_temporal import delivery_broker, delivery_config
@@ -26,7 +27,19 @@ def service(tmp_path):
     return _service_fixture.__wrapped__(tmp_path)
 
 
-async def run_publication_probe(*, versioned=True, failure='lost_initial', history_path=None):
+@contextlib.asynccontextmanager
+async def marker_replayed_false(name):
+    """An execution recorded before ``name`` replays the marker False."""
+    real = workflow.patched
+    workflow.patched = lambda marker: False if marker == name else real(marker)
+    try:
+        yield
+    finally:
+        workflow.patched = real
+
+
+async def run_publication_probe(*, versioned=True, failure='lost_initial', history_path=None,
+                                readback_seconds=30, marker=True):
     calls = {'publish': 0, 'reconcile': 0, 'implement': 0}
     events = []
     pending = asyncio.Event()
@@ -38,9 +51,16 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
     spec = {'run_id': 'publication-probe', 'provider': 'fake',
             'policy': {'max_repairs': 0, 'browser_qa': None}}
     if versioned:
-        spec.update(publication_readback_version=1, publication_readback_seconds=30)
-    if failure in {'deadline', 'cancel', 'semantic', 'pre_mutation'}:
+        spec.update(publication_readback_version=1,
+                    publication_readback_seconds=readback_seconds)
+    # Cleanup is certain when the failure never mutated, or when the readback
+    # window outlasted every publish attempt (the production default does).
+    certain = failure in {'pre_mutation', 'pre_push_exhausted'} or (
+        failure == 'deadline' and readback_seconds >= 180)
+    if failure in {'deadline', 'cancel', 'semantic', 'pre_mutation', 'pre_push_exhausted'}:
         spec.update(resource_cleanup_version=1, terminal_tracker_version=1)
+    if failure in {'deadline', 'pre_push_transient', 'pre_push_exhausted'}:
+        spec.update(automatic_retry_version=1)
 
     @activity.defn(name='delivery_project')
     async def project(payload):
@@ -74,6 +94,11 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
         if failure == 'pre_mutation':
             raise ApplicationError('candidate rejected before remote mutation',
                                    type='PublicationRejected', non_retryable=True)
+        if failure == 'pre_push_exhausted' or (
+                failure == 'pre_push_transient' and calls['publish'] <= 5):
+            # Confirmed before any remote mutation; outlasts one activity's attempts.
+            raise ApplicationError('owned branch PR readback unavailable',
+                                   type='PublicationTransient')
         if failure == 'failed_mutation':
             raise RuntimeError('mutation command failed; its remote outcome is unconfirmed')
         if failure == 'lost_initial':
@@ -109,7 +134,7 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
 
     @activity.defn(name='delivery_finalize_resources')
     async def finalize_resources(payload):
-        if failure == 'pre_mutation':
+        if certain:
             assert payload['uncertain'] is False
             return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
                     'resource_cleanup': 'confirmed'}
@@ -118,14 +143,18 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
 
     @activity.defn(name='delivery_terminal_tracker')
     async def terminal_tracker(payload):
-        assert payload['release'] is (failure == 'pre_mutation')
+        assert payload['release'] is certain
         return {'state': 'consistent'}
 
     activities = [project, prepare, tracker_start, role, precheck, publish,
                   reconcile, checks, ci, tracker, finalize_resources, terminal_tracker]
-    async with await WorkflowEnvironment.start_time_skipping() as environment:
+    async with (await WorkflowEnvironment.start_time_skipping() as environment,
+                marker_replayed_false('delivery-publication-self-heal-v1') if not marker
+                else contextlib.nullcontext()):
         async with Worker(environment.client, task_queue='publication-probe',
-                          workflows=[DeliveryWorkflow], activities=activities):
+                          workflows=[DeliveryWorkflow], activities=activities,
+                          **({} if marker else
+                             {'workflow_runner': UnsandboxedWorkflowRunner()})):
             handle = await environment.client.start_workflow(
                 DeliveryWorkflow.run, spec, id='publication-probe', task_queue='publication-probe')
             if failure == 'cancel':
@@ -148,7 +177,10 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
 async def test_publication_transport_failure_reconciles_original_inside_run(failure):
     result, calls, events = await run_publication_probe(failure=failure)
     assert result['outcome'] == 'delivered'
-    assert calls['publish'] == calls['implement'] == 1
+    assert calls['implement'] == 1
+    # An unconfirmed mutation failure is retried on the bound effect before
+    # read-only reconciliation; a pending readback is not a failure.
+    assert calls['publish'] == (1 if failure == 'read_timeout' else 4)
     assert calls['reconcile'] == (2 if failure == 'read_timeout' else 1)
     assert result['pull_request']['head'] == 'original-head'
     assert 'published' in events
@@ -177,6 +209,90 @@ async def test_publication_wait_is_bounded_cancellable_and_semantic_errors_termi
     assert calls['reconcile'] <= 3
     if failure == 'semantic':
         assert calls['reconcile'] == 1
+    if failure == 'deadline':
+        assert result['error'] == 'publication unresolved: readback deadline exhausted'
+        assert result['checks']['failure']['classification'] == 'transient'
+        assert result['checks']['failure']['cause_type'] == 'publication_deadline'
+
+
+@pytest.mark.asyncio
+async def test_pre_push_transport_failures_retry_the_publication_inside_the_run():
+    result, calls, events = await run_publication_probe(failure='pre_push_transient')
+    assert result['outcome'] == 'delivered'
+    assert calls['implement'] == 1
+    # One activity exhausts its attempts; the workflow waits and invokes again.
+    assert calls['publish'] == 6
+    assert calls['reconcile'] == 1
+    assert 'publication_pending' in events
+    assert result['pull_request']['head'] == 'original-head'
+
+
+@pytest.mark.asyncio
+async def test_pre_marker_execution_stops_a_confirmed_transient_failure_as_rejected():
+    # A run in flight at deploy: the new activity, the recorded command path.
+    result, calls, events = await run_publication_probe(failure='pre_push_exhausted',
+                                                        marker=False)
+    assert result['outcome'] == 'blocked'
+    assert result['error'] == 'publication unresolved: ActivityError'
+    assert result['cleanup'] == 'confirmed'
+    assert result['checks']['resource_cleanup']['state'] == 'confirmed'
+    assert result['checks']['failure']['classification'] == 'transient'
+    assert result['checks']['failure']['cause_type'] == 'PublicationTransient'
+    assert calls == {'publish': 4, 'reconcile': 0, 'implement': 1}
+    assert 'publication_pending' not in events
+
+
+@pytest.mark.asyncio
+async def test_default_window_deadline_confirms_cleanup_and_releases_the_claim():
+    result, calls, _events = await run_publication_probe(failure='deadline',
+                                                         readback_seconds=900)
+    assert result['outcome'] == 'blocked'
+    assert result['error'] == 'publication unresolved: readback deadline exhausted'
+    assert result['cleanup'] == 'confirmed'
+    assert result['checks']['resource_cleanup']['state'] == 'confirmed'
+    assert result['checks']['failure']['cause_type'] == 'publication_deadline'
+    assert result['pull_request'] is None
+    assert calls['publish'] == calls['implement'] == 1
+
+
+BASE146 = sorted((Path(__file__).parent / 'fixtures').glob('publication-base146-*.json'))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path', BASE146, ids=lambda path: path.stem)
+async def test_histories_recorded_at_the_liveness_base_replay_without_this_marker(path):
+    # Recorded by this probe on 9aa75b9 (`delivery-liveness-v2` True, before this
+    # change set); the changed workflow replays them on their recorded path.
+    from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
+
+    history = WorkflowHistory.from_json('publication-probe', path.read_text())
+    markers = []
+    for event in history.events:
+        if not event.HasField('marker_recorded_event_attributes'):
+            continue
+        details = event.marker_recorded_event_attributes.details
+        for key in ('patch-data', 'patch_id'):
+            if key in details:
+                value = (await DELIVERY_DATA_CONVERTER.decode(details[key].payloads))[0]
+                markers.append(value['id'] if isinstance(value, dict) else value)
+    assert 'delivery-liveness-v2' in markers
+    assert 'delivery-publication-self-heal-v1' not in markers
+    await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+
+
+@pytest.mark.asyncio
+async def test_pre_push_exhaustion_stops_transient_with_confirmed_cleanup():
+    result, calls, _events = await run_publication_probe(failure='pre_push_exhausted')
+    assert result['outcome'] == 'blocked'
+    assert result['error'] == 'publication unresolved: remote unavailable before push'
+    assert result['checks']['failure'] == {
+        'classification': 'transient', 'cause_type': 'publication_deadline',
+        'stage': 'publishing_pending', 'reason': result['error'],
+    }
+    assert result['cleanup'] == 'confirmed'
+    assert result['pull_request'] is None
+    assert calls['implement'] == 1 and calls['reconcile'] == 0
+    assert calls['publish'] >= 8 and calls['publish'] % 4 == 0
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from .delivery_gate_retry import prepare_runtime
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
+from .delivery_publication import stopped_at_publication
 from .delivery_resources import read_private
 from .delivery_source_scope import outside_scope
 
@@ -33,13 +34,14 @@ def snapshot(store, run_id):
     implementation = next((r for r in reversed(state.get('roles', []))
                            if r.get('role') == 'implement'), {})
     pending = [e for e in effects if e['state'] != 'complete' or not e['observed_json']]
+    bound = json.loads(pending[0]['observed_json'] or 'null') if len(pending) == 1 else None
     if (previous and previous.get('kind') == KIND
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
             or state.get('phase') != 'blocked'
             or row['error'] != state.get('error')
             or state.get('checks') != json.loads(row['checks_json'] or '{}')
-            or state.get('error') != 'publication unresolved: ActivityError'
+            or not stopped_at_publication(state)
             or state.get('cleanup') != 'confirmed' or state.get('outcome') != 'blocked'
             or state.get('revision') != row['protocol_revision']
             or state.get('iteration') != row['iteration']
@@ -60,7 +62,6 @@ def snapshot(store, run_id):
             or claim is not None or len(pending) != 1
             or pending[0]['effect_key'] != f"publish:{run_id}:{row['iteration']}"
             or pending[0]['kind'] != 'publish' or pending[0]['state'] != 'pending'
-            or pending[0]['observed_json'] is not None
             or json.loads(pending[0]['request_json']) != {
                 'iteration': row['iteration'], 'input_candidate_id': candidate.get('id')}):
         raise ValueError('pending publication lacks its closed passed-check checkpoint')
@@ -79,7 +80,10 @@ def snapshot(store, run_id):
             or _git(broker.checkout, 'branch', '--show-current') != spec['branch']
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') != spec['origin_url']
             or not remote or remote.split()[0] != observed['head']
-            or (pr is not None and pr['headRefOid'] != observed['head'])):
+            or (pr is not None and pr['headRefOid'] != observed['head'])
+            # A bound effect names the pushed head and no earlier PR.
+            or (bound is not None and (bound.get('head') != observed['head']
+                                       or bound.get('number') is not None))):
         raise ValueError('pending publication source, remote head or scope changed')
     load_execution_config(spec)
     with store._connect() as db:

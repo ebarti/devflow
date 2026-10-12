@@ -42,6 +42,7 @@ from .delivery_execution_config import (
     transport_difference,
 )
 from .delivery_preparation import execution_retired
+from .delivery_publication import stopped_at_publication
 
 logger = logging.getLogger(__name__)
 
@@ -996,7 +997,7 @@ class DeliveryStore:
             or state.get("phase") != "blocked"
             or state.get("outcome") != "blocked"
             or state.get("execution_state") != "blocked"
-            or state.get("error") != "publication unresolved: ActivityError"
+            or not stopped_at_publication(state)
             or state.get("cleanup") not in {"none", "pending_publication_readback"}
             or state.get("revision") != supplied["expected_revision"]
             or type(iteration) is not int
