@@ -169,7 +169,8 @@ def _prepare(original, config, intent, intent_path):
         _validate(proof, identity, root)
         if not reused:
             _write(path, proof)
-        prepared = bind_native_spec(effective, identity, path, reused=reused)
+        prepared = bind_native_spec(effective, identity, path, reused=reused,
+                                    measured=None if reused else probe['policy_digest'])
         intent.update(state='prepared', effective_spec=prepared)
         write_private(intent_path, intent)
         return prepared

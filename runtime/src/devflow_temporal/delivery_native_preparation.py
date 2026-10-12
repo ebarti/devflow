@@ -413,7 +413,8 @@ def verify_native_spec(spec: dict) -> None:
     _validate(json.loads(content), identity, root)
 
 
-def bind_native_spec(spec: dict, identity: dict, path: Path, *, reused: bool) -> dict:
+def bind_native_spec(spec: dict, identity: dict, path: Path, *, reused: bool,
+                     measured: str | None = None) -> dict:
     effective = deepcopy(spec)
     effective["policy"].update(
         native_identity=identity,
@@ -428,6 +429,11 @@ def bind_native_spec(spec: dict, identity: dict, path: Path, *, reused: bool) ->
         "environment": _reference(path),
         "security_binding_sha256": run_binding(effective),
         "cache_reused": reused,
+        # A measurement ran under the submitted policy digest, before this
+        # binding changed it; its journals under native-preparation/ keep that
+        # digest, and later custody observation binds them to this record.
+        # Reused proofs and records sealed before this key stay byte-identical.
+        **({"measured_policy_digest": measured} if measured else {}),
     }
     verify_native_spec(effective)
     return effective
@@ -456,5 +462,8 @@ def prepare_native_authority(store, spec: dict) -> dict:
         _validate(proof, identity, root)
         if not reused:
             _write(path, proof)
-        effective = bind_native_spec(spec, identity, path, reused=reused)
+        effective = bind_native_spec(
+            spec, identity, path, reused=reused,
+            measured=None if reused else spec["policy_digest"],
+        )
         return store.freeze_preparation(spec, effective)

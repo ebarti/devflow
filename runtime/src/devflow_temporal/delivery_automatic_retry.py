@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import subprocess
@@ -31,6 +32,33 @@ from .delivery_resources import (
 # The n-th automatic continuation of one run waits this long, doubled per
 # generation, after the stop it answers; the row timestamp persists it.
 CONTINUATION_BACKOFF_SECONDS = 30
+_LOG = logging.getLogger(__name__)
+
+
+_SKIP_EVENT_CAP = 32
+
+
+def _record_skip(store, row, exc):
+    """Keep a skipped retry visible: one run event and WARNING per distinct reason."""
+    reason = f'{type(exc).__name__}: {str(exc)[:300]}'
+    try:
+        with store._connect() as db:
+            recorded = [json.loads(item[0]).get('reason') for item in db.execute(
+                "SELECT payload_json FROM delivery_events WHERE run_id=? "
+                "AND type='automatic_retry_skipped'", (row['run_id'],))]
+            # Alternating or ever-changing reasons must not grow the run's
+            # history or the log on every pass.
+            if reason in recorded or len(recorded) >= _SKIP_EVENT_CAP:
+                return
+            store._event(db, row['run_id'], row['revision'], 'automatic_retry_skipped',
+                         'Automatic retry skipped this run until a fresh observation succeeds',
+                         {'reason': reason})
+    except sqlite3.Error as error:
+        _LOG.warning('automatic retry could not record its skip for run %s: %s',
+                     row['run_id'], error)
+        return
+    _LOG.warning('automatic retry skipped run %s until a fresh observation succeeds: %s',
+                 row['run_id'], reason)
 
 
 def eligible(row, spec):
@@ -392,8 +420,9 @@ def retry_once(store, *, stopped=lambda: False):
             admitted.append(store.submit(supplied, _automatic={
                 'row': row, 'base_sha': base, 'stopped': stopped}))
         except (ValueError, KeyError, TypeError, OSError, RuntimeError,
-                subprocess.SubprocessError, sqlite3.Error):
+                subprocess.SubprocessError, sqlite3.Error) as exc:
             # Wait for conclusive fresh observations; no absence inferred from errors.
+            _record_skip(store, row, exc)
             continue
     return admitted + retry_published_once(store, stopped=stopped)
 
