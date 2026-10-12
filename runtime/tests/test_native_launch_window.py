@@ -160,12 +160,21 @@ def _admits(case, role):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prior_state", ["starting", "unknown"])
-async def test_retry_finalizes_dead_owner_that_never_journaled(native_role, prior_state):
+@pytest.mark.parametrize("retained_request", [False, True])
+async def test_retry_finalizes_dead_owner_that_never_journaled(
+    native_role, prior_state, retained_request,
+):
     case = native_role
     _dead_owner(case, prior_state)
+    if retained_request:
+        from devflow_temporal.delivery_resources import write_private
+        write_private(case.folder / "request.json", {
+            **case.request, "workspace": str(case.broker.checkout), "review_diff": None,
+        })
     result = await delivery_role(case.request)
     _assert_launch_absent(case, result)
     assert case.created == []
+    assert native.reconciled_not_started(case.folder, receipt=result["native_process"])
     assert not (case.folder / "native-process.json").exists()
     assert await delivery_role(case.request) == result
     assert _admits(case, "review")
@@ -413,3 +422,40 @@ async def test_reconcile_attempt_command_finalizes_dead_owner(native_role, monke
     printed = json.loads(capsys.readouterr().out)
     assert printed["state"] == "finished" and printed["changed"] is False
     assert printed["result"] == outcome["result"]
+
+
+@pytest.mark.parametrize("tamper", [None, "no_receipt", "start.json", "native-process.json"])
+def test_pre_monitor_request_is_retryable_only_with_server_absence_receipt(
+    service, monkeypatch, tamper,
+):
+    from devflow_temporal.delivery_resources import write_private
+
+    store, request = service
+    spec, state, command, folder = _sealed_prelaunch_retry_fixture(store, request, monkeypatch)
+    write_private(folder / "request.json", {"spec": spec, "role": "implement"})
+    proof = {"journal": str(folder / "native-process.json"),
+             "cleanup": "observed-native-confirmed", "launch_absent": True,
+             "observed_pids": []}
+    with store._connect() as db:
+        row = db.execute("SELECT * FROM delivery_attempts WHERE job_key=?",
+                         (folder.name,)).fetchone()
+        receipt = json.loads(row["result_json"])
+        if tamper != "no_receipt":
+            receipt["native_process"] = proof
+        db.execute("UPDATE delivery_attempts SET result_json=? WHERE job_key=?",
+                   (json.dumps(receipt), folder.name))
+    if tamper in {"start.json", "native-process.json"}:
+        write_private(folder / tamper, {})
+    if tamper:
+        with pytest.raises(ValueError, match="absence or cleanup"):
+            store.retry_prelaunch(request["run_id"], command)
+        return
+    response = store.retry_prelaunch(request["run_id"], command)
+    assert response["authorized_through_iteration"] == state["iteration"]
+    assert store.retry_prelaunch(request["run_id"], command) == response
+    with store._connect() as db:
+        recovery = json.loads(db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+            (request["run_id"],)).fetchone()[0])
+    store.repair_preflight(spec, recovery)
+    assert (folder / "request.json").exists()

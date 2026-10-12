@@ -485,6 +485,23 @@ class DeliveryWorkflow:
             attempts = options["retry_policy"].maximum_attempts or 1
             options["schedule_to_close_timeout"] = timeout * attempts + timedelta(
                 seconds=60 if attempts > 1 else 0)
+        if (name in {"delivery_intake", "delivery_role", "delivery_checks",
+                     "delivery_precheck", "delivery_baseline_checks", "delivery_browser_qa",
+                     "delivery_feature_revision_propose", "delivery_feature_revision_review"}
+                and request["spec"].get("policy", {}).get("execution_backend") == "native-macos"
+                and workflow.patched("delivery-capacity-wait-v1")):
+            # This deadline bounds a monitor attempt, not time spent waiting for
+            # capacity. Retried monitors reattach the same durable native job;
+            # native process timeouts and repair budgets remain unchanged.
+            options.pop("schedule_to_close_timeout", None)
+            options["retry_policy"] = RetryPolicy(
+                maximum_attempts=0, initial_interval=timedelta(seconds=1),
+                maximum_interval=timedelta(seconds=10),
+                non_retryable_error_types=[
+                    "ValueError", "TypeError", "PermissionError", "OwnershipConflict",
+                    "NativeProcessUnknown",
+                ],
+            )
         return await workflow.execute_activity(
             name,
             request,
