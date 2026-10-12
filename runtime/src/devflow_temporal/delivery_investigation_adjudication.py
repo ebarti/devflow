@@ -206,6 +206,22 @@ def _authority(payload, run_id):
     return value, evidence
 
 
+def _service_member(table, process):
+    """Whether a service manifest member is the live process the table shows.
+
+    The lifecycle records member identities with the locale and zone fixed;
+    the process table prints the host's local form. Either proves the member.
+    """
+    entry = table.get(process.get("pid"))
+    if not entry:
+        return False
+    if entry.get("identity") == process.get("identity"):
+        return True
+    from .supervisor import _process_identity
+
+    return _process_identity(process["pid"], canonical=True) == process.get("identity")
+
+
 def _controller(store, spec, payload):
     """Bind the reviewed installed controller; this does not authorize native execution."""
     value = reference(payload["controller_path"], payload["controller_sha256"])
@@ -262,8 +278,7 @@ def _controller(store, spec, payload):
         or active_policy.get("state_root") != str(store.config.state_root)
         or set(processes.get("processes", {})) != {"api", "worker", "temporal"}
         or any(
-            table.get(p["pid"], {}).get("identity") != p["identity"]
-            or table[p["pid"]]["stat"].startswith("Z")
+            not _service_member(table, p) or table[p["pid"]]["stat"].startswith("Z")
             for p in processes["processes"].values()
         )
     ):

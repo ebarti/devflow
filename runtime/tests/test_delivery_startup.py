@@ -808,3 +808,27 @@ def test_lifecycle_identity_is_zone_independent_and_accepts_legacy_manifests(mon
     finally:
         child.kill()
         child.wait()
+
+
+def test_adjudication_binds_service_members_recorded_in_canonical_form(monkeypatch):
+    """The controller binding reads real lstart output on a non-UTC host."""
+    from devflow_temporal.delivery_investigation_adjudication import _service_member
+    from devflow_temporal.delivery_native_process import process_table
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             start_new_session=True)
+    try:
+        monkeypatch.setenv("TZ", "Europe/Madrid")
+        canonical = control._process_identity(child.pid)
+        table = process_table()
+        # The table prints the host's local form; the manifest holds the canonical one.
+        assert table[child.pid]["identity"] != canonical
+        assert _service_member(table, {"pid": child.pid, "identity": canonical})
+        assert _service_member(table, {"pid": child.pid,
+                                       "identity": table[child.pid]["identity"]})
+        assert not _service_member(table, {"pid": child.pid,
+                                           "identity": "Thu Jan  1 00:00:00 1970"})
+        assert not _service_member(table, {"pid": 2 ** 22 + 7, "identity": canonical})
+    finally:
+        child.kill()
+        child.wait()
