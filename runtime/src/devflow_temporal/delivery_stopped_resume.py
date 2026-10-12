@@ -89,6 +89,9 @@ def pending_repair(seal):
             or seal['predecessor_spec'].get('feature_worker', {}).get('kind') == 'build'):
         return None
     state = previous['state']
+    if previous.get('resume_iteration', state['iteration'] + 1) == state['iteration']:
+        # The predecessor re-ran its own sealed iteration; it requested no repair.
+        return None
     iteration = state['iteration'] + 1
     if (previous['execution_spec'] != seal['predecessor_spec']
             or iteration != seal['state']['iteration'] or iteration <= 0):
@@ -101,21 +104,53 @@ def pending_repair(seal):
             'findings': [finding for finding in findings if finding is not None]}
 
 
-def interrupted_iteration(seal):
-    """A cancelled worker re-runs its interrupted iteration instead of starting a repair."""
-    state = seal['state']
-    if not seal['predecessor_spec'].get('feature_worker') or state.get('phase') != 'cancelled':
-        return False
-    current = [role for role in state.get('roles', [])
-               if role.get('iteration') == state['iteration']]
-    # A completed finding makes the next step a product repair, and a completed gate
-    # or an unchanged implementation input would reuse that role's durable attempt.
-    return (len(current) <= 1
-            and all(role.get('role') == 'implement' and role.get('status') == 'pass'
-                    and role.get('input_candidate_id') != seal['candidate']['id']
-                    for role in current)
-            and not any(isinstance(check, dict) and check.get('state') == 'failed'
-                        for check in state.get('checks', {}).values()))
+def interrupted_resume(seal):
+    """Plan a cancelled worker's continuation that needs no product repair, if any.
+
+    A passed implementation is never run again and a published candidate is never
+    published again. Gates rerun fresh: those that already ran at the sealed
+    iteration hold durable attempt and effect identities, so they take the next one.
+    """
+    from .delivery_feature_revision_recovery import gate_evidence, retained_recovery
+
+    spec, state = seal['predecessor_spec'], seal['state']
+    if (not spec.get('feature_worker') or state.get('phase') != 'cancelled'
+            or any(isinstance(check, dict) and check.get('state') == 'failed'
+                   for check in state.get('checks', {}).values())):
+        return None
+    roles, iteration = state.get('roles', []), state['iteration']
+    if not roles:
+        # The first implementation never started, and iteration zero is never charged.
+        return {'resume_iteration': 0, 'additional_iterations': 0} if iteration == 0 else None
+    last = max((index for index, role in enumerate(roles) if role.get('role') == 'implement'),
+               default=None)
+    evidence = gate_evidence(seal)
+    attempt = next((item for item in seal['attempts'] if evidence
+                    and item['job_key'] == evidence['implementation_job_key']), None)
+    if (last is None or roles[last].get('status') != 'pass' or attempt is None
+            or attempt['iteration'] != roles[last]['iteration']
+            or any(role.get('status') != 'pass' for role in roles[last + 1:])):
+        return None
+    previous = retained_recovery(seal.get('original_recovery')) or {}
+    rerun = (previous.get('kind') == KIND and previous.get('resume_stage') == 'published'
+             and previous.get('resume_iteration') == iteration)
+    if iteration != roles[last]['iteration'] and not rerun:
+        # The iteration only advances past a passed implementation for a repair.
+        return None
+    preserved = {'resume_iteration': iteration, 'additional_iterations': 0,
+                 'resume_stage': 'checks', 'gate_evidence': evidence}
+    if spec['feature_worker'].get('kind') == 'build':
+        return preserved
+    if (state.get('pull_request') or {}).get('head') != seal['candidate']['head']:
+        # Gates follow publication, so none has run for an unpublished candidate.
+        return None if rerun else preserved
+    qa = f"browser_qa:{spec['run_id']}:{iteration}"
+    ran = (any(role.get('role') != 'implement' and role.get('iteration') == iteration
+               for role in roles)
+           or any(item['effect_key'] == qa or item['effect_key'].startswith(qa + ':')
+                  for item in seal['effects']))
+    return {'resume_iteration': iteration + int(ran), 'additional_iterations': int(ran),
+            'resume_stage': 'published', 'gate_evidence': evidence}
 
 
 def observed_native_cleanup(spec, *, read_only=False):
@@ -134,7 +169,9 @@ def custody(db, recovery):
 
     details = retained_recovery(recovery)
     spec = details['execution_spec']
-    interrupted = 'resume_iteration' in details and 'resume_stage' not in details
+    # Revision admissions record their own gate resume; any other resume
+    # position comes from an interrupted worker's re-derivable plan.
+    interrupted = 'resume_iteration' in details and not details.get('feature_plan_revision')
     if (spec.get('retry_budget_version') == 1
             and not fixed_budget_allows(spec, recovery['state']['iteration'],
                                         recovery['command']['additional_iterations'],
@@ -154,14 +191,17 @@ def custody(db, recovery):
         raise ValueError('stopped resume lost its immutable command authority')
     if (('pending_repair' in recovery
              and pending_repair(details) != recovery['pending_repair'])
-            or (interrupted and (details['resume_iteration'] != details['state']['iteration']
-                                 or details['command']['additional_iterations'] != 0
-                                 or not interrupted_iteration(details)))
             or (recovery['command']['additional_iterations'] == 0
                 and not (recovery.get('pending_repair') or interrupted
                          or details.get('resume_stage') == 'checks'))):
         raise ValueError('stopped resume changed its unstarted repair authority')
-    if details.get('resume_stage') == 'checks':
+    if interrupted:
+        plan = interrupted_resume(details) or {}
+        if (plan.get('additional_iterations') != details['command']['additional_iterations']
+                or any(details.get(key) != plan.get(key)
+                       for key in ('resume_iteration', 'resume_stage', 'gate_evidence'))):
+            raise ValueError('stopped resume changed its interrupted iteration authority')
+    elif details.get('resume_stage') == 'checks':
         from .delivery_feature_revision_recovery import gate_evidence
 
         if (not details.get('feature_plan_revision')
@@ -391,10 +431,10 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             or command['expected_candidate_id'] != seal['candidate']['id']
             or command['expected_candidate_head'] != seal['candidate']['head']):
         raise ValueError('stopped resume checkpoint is stale')
-    # Re-running an interrupted iteration needs no repair cycle, so it is the only
-    # zero-additional resume that is not already backed by sealed repair authority.
-    interrupted = (_revision is None and not pending and command['additional_iterations'] == 0
-                   and interrupted_iteration(seal))
+    # Interrupted work needs no repair cycle; only its exact plan is admitted this way.
+    interrupted = None if _revision is not None or pending else interrupted_resume(seal)
+    if interrupted and interrupted['additional_iterations'] != command['additional_iterations']:
+        interrupted = None
     if command['additional_iterations'] == 0 and not (pending or gate_only or interrupted):
         raise ValueError('zero additional iterations require an authenticated pending repair '
                          'or an interrupted iteration')
@@ -453,7 +493,8 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                     'predecessor_result_digest': digest(seal['state']),
                     **({'feature_plan_revision': _revision} if _revision is not None else {}),
                     **({'pending_repair': pending} if pending else {}),
-                    **({'resume_iteration': seal['state']['iteration']} if interrupted else {}),
+                    **({key: value for key, value in interrupted.items()
+                        if key != 'additional_iterations'} if interrupted else {}),
                     **({'resume_stage': 'checks', 'gate_evidence': gate_only,
                         'resume_iteration': seal['state']['iteration']
                         + int(command['additional_iterations'] > 0)} if gate_only else {})}

@@ -43,11 +43,14 @@ def publication(record, *, complete=False):
     }
 
 
-async def run_build(controller, spec, *, start_iteration=0, session=None, maximum_iteration=None):
+async def run_build(controller, spec, *, start_iteration=0, session=None, maximum_iteration=None,
+                    preserved=False):
     try:
         findings = []
         maximum = spec["policy"]["max_repairs"] if maximum_iteration is None else maximum_iteration
-        for iteration in range(start_iteration, maximum + 1):
+        # A preserved build already passed its implementation; it is only sealed.
+        result = {"candidate": controller.state["candidate"]}
+        for iteration in range(start_iteration, start_iteration if preserved else maximum + 1):
             if controller.cancel_requested:
                 return await controller._cancelled(spec)
             controller.state["iteration"] = iteration
@@ -79,7 +82,8 @@ async def run_build(controller, spec, *, start_iteration=0, session=None, maximu
                 return await controller._stop(spec, "workstream execution needs recovery")
             findings = result.get("findings", [])
         else:
-            return await controller._stop(spec, "workstream product repair limit exhausted")
+            if not preserved:
+                return await controller._stop(spec, "workstream product repair limit exhausted")
         if controller.cancel_requested:
             return await controller._cancelled(spec)
         sealed = await controller._activity(
