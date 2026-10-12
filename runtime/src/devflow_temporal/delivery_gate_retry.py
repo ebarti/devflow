@@ -237,13 +237,21 @@ def snapshot(store, run_id, kind=KIND):
     failed = [r for r in roles if r.get('role') in {'review', 'verify'}
               and r.get('status') != 'pass' and r.get('findings')]
     precheck = state.get('checks', {}).get('prepublish', {})
+    browser = state.get('checks', {}).get('browser_qa', {})
+    # Browser setup/test failures happen before the verifier role is launched.
+    # The existing bounded gates-only retry must not require that missing role.
+    failed_browser = (state_checks == row_checks and browser.get('state') == 'failed'
+                      and browser.get('candidate_id') == candidate['id']
+                      and browser.get('source_unchanged') is True
+                      and browser.get('cleanup') == 'confirmed')
     failed_gate = (precheck.get('state') == 'failed'
                    and precheck.get('source_unchanged') is True
                    and precheck.get('candidate_id') == candidate['id']
                    and state_checks == row_checks
                    and not any(e['kind'] == 'publish' for e in effects)
                    and any(r.get('passed') is False and r.get('cleanup') == 'confirmed'
-                           for r in precheck.get('results', []))) if unpublished else bool(failed)
+                           for r in precheck.get('results', []))) if unpublished else bool(
+                               failed or failed_browser)
     prelaunch_observation = None
     browser_observation = None
     report_observation = None
