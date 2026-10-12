@@ -746,7 +746,8 @@ class DeliveryBroker:
                         raise ValueError("required per-selector JUnit report was not retained")
                     selector_receipts = selector_evidence(
                         check, checkout, selected_sources[check["id"]],
-                        junit=retained_junit(check_evidence, candidate["id"], self.state_dir))
+                        junit=retained_junit(check_evidence, candidate["id"], self.state_dir),
+                        spec=self.spec)
                 except (ValueError, OSError) as exc:
                     evidence_failure = str(exc)
             rejected_causes = rejection_causes(

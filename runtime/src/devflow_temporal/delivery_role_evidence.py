@@ -20,6 +20,7 @@ FIELDS = {
     'summary', 'results', 'id',
     'argv', 'cwd', 'exit_code', 'passed', 'test_count', 'junit', 'tests', 'failures',
     'errors', 'skipped', 'rejected_output', 'rejection_causes', 'cleanup', 'diagnostic',
+    'evidence_failure',
     'log', 'log_sha256', 'receipt', 'receipt_sha256', 'artifacts', 'sha256', 'path',
     'count', 'bytes', 'head', 'content_sha256', 'base_sha', 'baseline_candidate',
     'role_artifacts', 'relative_path', 'size', 'source_candidate', 'input_candidate',

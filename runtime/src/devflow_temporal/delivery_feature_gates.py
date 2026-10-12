@@ -22,6 +22,13 @@ from .delivery_source_scope import require_authorized, source_path
 
 STAGES = ("checks", "prepublish_checks", "browser_qa")
 _TEST_FILE = re.compile(r"(?:test_[A-Za-z0-9_]+\.py|[A-Za-z0-9_.-]+\.(?:test|spec)\.[cm]?[jt]sx?)$")
+_WRAPPED_VITEST = re.compile(
+    r"\bspawnSync\(\s*(?:'corepack'|\"corepack\")\s*,\s*\[\s*"
+    r"(?:'pnpm'|\"pnpm\")\s*,\s*(?:'--filter'|\"--filter\")\s*,\s*"
+    r"(?P<quote>['\"])(?P<package>@[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+)"
+    r"(?P=quote)\s*,\s*(?:'exec'|\"exec\")\s*,\s*(?:'vitest'|\"vitest\")\s*,\s*"
+    r"(?:'run'|\"run\")\s*(?:,|\])"
+)
 
 
 class GateAdmissionError(ValueError):
@@ -524,6 +531,42 @@ def _report_source(raw: str, checkout: Path, roots: list[Path], selectors: set[s
     return next(iter(matches), None)
 
 
+def _wrapped_junit_project(recipe: dict, spec: dict | None) -> str | None:
+    """Attribute an admitted literal pnpm/Vitest wrapper through fixed base metadata.
+
+    This reads one known command prefix as data; it never evaluates JavaScript,
+    infers a package from a test basename, or changes the frozen gate command.
+    """
+    argv = recipe.get("argv", [])
+    if (
+        spec is None
+        or len(argv) != 4
+        or PurePosixPath(argv[0]).name != "node"
+        or argv[1:3] != ["--input-type=module", "-e"]
+    ):
+        return None
+    script = argv[3]
+    matches = list(_WRAPPED_VITEST.finditer(script))
+    if len(matches) != 1 or len(re.findall(r"\bspawnSync\s*\(", script)) != 1:
+        return None
+    if not any(
+        frozen.get("argv") == argv and frozen.get("cwd", ".") == recipe.get("cwd", ".")
+        for stage in ("checks", "prepublish_checks")
+        for frozen in spec["policy"].get(stage, [])
+    ):
+        raise ValueError("JUnit package attribution requires its exact frozen wrapper")
+    project = recipe_project(
+        {"argv": ["pnpm", "--filter", matches[0]["package"]],
+         "cwd": recipe.get("cwd", ".")}, spec
+    )
+    if any(
+        not PurePosixPath(selector).is_relative_to(PurePosixPath(project))
+        for selector in recipe.get("required_selectors", [])
+    ):
+        raise ValueError("required selector escaped its frozen JUnit package")
+    return project
+
+
 def selector_evidence(
     recipe: dict,
     checkout: Path,
@@ -531,6 +574,7 @@ def selector_evidence(
     *,
     junit: bytes | None = None,
     playwright: str | None = None,
+    spec: dict | None = None,
 ) -> list[dict]:
     """Require actual passing cases from every selected source, without basename guesses."""
     if not sources:
@@ -542,6 +586,9 @@ def selector_evidence(
     roots = [checkout, project]
     cases = []
     if junit is not None:
+        wrapped_project = _wrapped_junit_project(recipe, spec)
+        if wrapped_project is not None:
+            roots.append(checkout / wrapped_project)
         if (
             len(junit) > 50 * 1024 * 1024
             or b"<!DOCTYPE" in junit.upper()
