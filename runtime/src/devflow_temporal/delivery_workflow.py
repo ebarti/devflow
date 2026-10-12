@@ -44,6 +44,22 @@ def _implementation_passed(state: dict) -> bool:
     return bool(implementation and implementation.get("status") == "pass")
 
 
+def _candidate_published(state: dict, candidate: dict) -> bool:
+    """The PR shows exactly this candidate: the same head and the same checked content."""
+    published = state.get("pull_request") or {}
+    return bool(published) and all(
+        published.get("head") == item.get("head")
+        and (published.get("candidate") or {}).get("id") == item.get("id")
+        for item in (state.get("candidate") or {}, candidate or {}))
+
+
+def _recorded_findings(state: dict, iteration: int) -> list:
+    """Findings the independent roles recorded for one iteration."""
+    return [finding for role in state.get("roles", [])
+            if role.get("iteration") == iteration and role.get("role") in {"review", "verify"}
+            for finding in role.get("findings") or []]
+
+
 def _failure_classification(cause: Exception | None, controller_cause: str | None) -> dict:
     """Classify controller observations, never human or model diagnostic text."""
     result = {"classification": "terminal"}
@@ -1588,8 +1604,10 @@ class DeliveryWorkflow:
                     return await self._stop(spec, 'tracker readback remains pending or conflicting')
         except Exception as exc:
             if self.post_publish_v1:
+                transient = _failure_classification(exc, None)["classification"] == "transient"
                 return await self._stop(spec, 'CI continuation failed: ' + type(exc).__name__,
-                                        cause=exc)
+                                        cause=exc,
+                                        controller_cause='ci_deadline' if transient else None)
             return await self._stop(spec, 'CI continuation failed: ' + type(exc).__name__)
         if self.cancel_requested:
             return await self._cancelled(spec)
@@ -1867,7 +1885,10 @@ class DeliveryWorkflow:
         if self.post_publish_v1 and _controller_stop(stopped):
             # A transport or controller failure is not a defect: the model never
             # receives it as findings. A passed implementation re-runs its gates
-            # on the unchanged candidate; an interrupted one resumes without them.
+            # on the unchanged candidate when the PR already shows that exact
+            # candidate; otherwise it resumes at prechecks and publishes it into
+            # the existing PR first, so no gate or CI runs on another head. An
+            # interrupted turn resumes with the recorded findings it was repairing.
             if _implementation_passed(stopped):
                 return await self._run_iterations(
                     spec, start_iteration=stopped['iteration'],
@@ -1876,9 +1897,10 @@ class DeliveryWorkflow:
                     authorized_max_iteration=recovery['maximum_iteration'],
                     allow_first_session=recovery['session_id'] is None,
                     resume_prechecks=True,
-                    published_checkpoint=bool(stopped.get('pull_request')),
+                    published_checkpoint=_candidate_published(
+                        stopped, recovery.get('execution_candidate')),
                 )
-            findings = role_findings
+            findings = _recorded_findings(stopped, stopped['iteration'] - 1)
         else:
             findings = [stopped['error'], *role_findings]
         return await self._run_iterations(
@@ -2583,6 +2605,14 @@ class DeliveryWorkflow:
                     "delivery_ci", {"spec": spec, "pull_request": published}, hours=1
                 )
             except Exception as exc:
+                if (self.post_publish_v1
+                        and _failure_classification(exc, None)["classification"] == "transient"):
+                    # A lost read-only observation is the deadline's unchanged-head
+                    # condition: observed again, never a model turn.
+                    return await self._stop(
+                        spec, f"CI observation failed: {type(exc).__name__}", cause=exc,
+                        controller_cause="ci_deadline",
+                    )
                 return await self._stop(
                     spec, f"CI observation failed: {type(exc).__name__}", cause=exc,
                 )

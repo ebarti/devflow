@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -9,6 +10,7 @@ import pytest
 from temporalio.exceptions import ActivityError, ApplicationError
 from test_delivery_gate_retry import stopped as stopped
 from test_delivery_metadata_recovery import published as published
+from test_delivery_publication_self_heal import FakeGitHub, remote_head
 from test_delivery_publication_self_heal import pending_v1 as pending_v1
 from test_delivery_store import _git
 from test_delivery_store import service as service
@@ -408,12 +410,14 @@ def test_recorded_stopped_resume_keeps_its_implementation_turn_without_the_marke
     assert launched['findings'] == [TRANSPORT_STOPS[0]]
 
 
-def test_interrupted_implementation_resumes_without_the_transport_error_as_findings(
-    stopped, monkeypatch,
-):
+def test_interrupted_repair_resumes_with_the_findings_it_was_repairing(stopped, monkeypatch):
     store, _, state, _, _ = stopped
     spec = store.spec('run-1')
-    state['roles'] = [r for r in state['roles'] if r.get('iteration') < state['iteration']]
+    # verify(1) recorded findings; the repair turn 2 was lost to transport before it
+    # produced anything. The resume hands over those findings, never the error.
+    assert [r['findings'] for r in state['roles'] if r.get('role') == 'verify'] == [
+        ['Receipt omits source hash semantics']]
+    state['iteration'] = 2
     state['checks'] = {'failure': {'classification': 'transient',
                                    'cause_type': 'ActivityTimeoutError', 'stage': 'repair',
                                    'reason': 'implementer activity failed: ActivityError'}}
@@ -429,7 +433,7 @@ def test_interrupted_implementation_resumes_without_the_transport_error_as_findi
     asyncio.run(flow._resume_stopped(spec, recovery))
     assert launched['role'] == 'implement'
     assert launched['iteration'] == state['iteration'] + 1
-    assert launched['findings'] == []
+    assert launched['findings'] == ['Receipt omits source hash semantics']
 
 
 @pytest.mark.parametrize('outcome', ['pending', 'lost'])
@@ -461,7 +465,9 @@ def test_ci_resume_classifies_its_own_deadline_and_lost_observation(stopped, mon
     assert result['outcome'] == 'blocked'
     failure = result['checks']['failure']
     assert failure['classification'] == 'transient'
-    assert failure['cause_type'] == ('ci_deadline' if outcome == 'pending' else 'TimeoutExpired')
+    # A lost read-only observation keeps the deadline's cause: observed again,
+    # never re-gated.
+    assert failure['cause_type'] == 'ci_deadline'
     assert failure['stage'] == 'waiting_ci'
 
 
@@ -504,7 +510,7 @@ def stalled_repair(service, monkeypatch, stage):
     state.update(iteration=1, candidate=candidate, pull_request=publication, revision=21,
                  error=STALL, cleanup='confirmed')
     state['roles'].append({'role': 'implement', 'iteration': 1, 'status': 'pass',
-                           'session_id': 'repair-session', 'cleanup': 'confirmed',
+                           'session_id': 'original-implementation', 'cleanup': 'confirmed',
                            'candidate': candidate})
     state['checks'] = {
         'prepublish': {'state': 'passed', 'source_unchanged': True,
@@ -658,171 +664,511 @@ def test_pending_publication_resume_publishes_the_unpushed_repair(service, monke
 
 
 @pytest.mark.asyncio
-async def test_stalled_repair_publication_heals_through_the_real_stop(service, monkeypatch):
+async def test_stopped_resume_publishes_an_unpublished_repair_before_its_gates(service,
+                                                                                monkeypatch):
+    """The repair's publication was lost before the push: the PR still shows the
+    reviewed-and-failed head, so the resume publishes first and gates after."""
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.now',
+                        lambda: datetime.now(UTC))
+    store, broker, state, _closed, candidate = stalled_repair(service, monkeypatch,
+                                                             'uncommitted')
+    admitted = store.continue_repair('run-1', {
+        'continuation_kind': RESUME_KIND, 'command_id': 'resume-stalled-repair',
+        'expected_revision': state['revision'], 'expected_iteration': state['iteration'],
+        'expected_candidate_id': candidate['id'], 'expected_candidate_head': candidate['head'],
+        'additional_iterations': 1})
+    assert admitted['authorized_through_iteration'] == state['iteration'] + 1
+    spec = store.effective_spec('run-1')
+    recovery, _, _ = current_recovery(store)
+    assert recovery['execution_candidate']['id'] == candidate['id']
+    flow = DeliveryWorkflow()
+    flow.publication_v1 = flow.post_publish_v1 = True
+    repaired = 'e' * 40
+    published = {'number': 1, 'url': 'https://example.invalid/pull/1', 'state': 'OPEN',
+                 'head': repaired, 'base': spec['base_sha'],
+                 'candidate': {**candidate, 'head': repaired, 'id': 'f' * 64}}
+    calls, ci_heads = [], []
+
+    async def execute(name, body, **_kw):
+        calls.append((name, body.get('role')))
+        if name == 'delivery_repair_preflight':
+            return {'state': 'confirmed'}
+        if name in {'delivery_tracker_start', 'delivery_tracker'}:
+            return {'state': 'consistent'}
+        if name == 'delivery_publish':
+            assert body['iteration'] == 1 and body['candidate']['id'] == candidate['id']
+            return published
+        if name == 'delivery_role':
+            return {'status': 'pass', 'role': body['role'], 'candidate': published['candidate'],
+                    'session_id': 'independent-' + body['role'], 'cleanup': 'confirmed'}
+        if name == 'delivery_ci':
+            ci_heads.append(body['pull_request']['head'])
+            return {'state': 'passed'}
+        return {'state': 'passed', 'cleanup': 'confirmed'}
+
+    async def project(*_args):
+        pass
+
+    monkeypatch.setattr(flow, '_activity', execute)
+    monkeypatch.setattr(flow, '_project', project)
+    result = await flow._resume_stopped(spec, recovery)
+    assert result['outcome'] == 'delivered'
+    assert result['pull_request'] == published
+    assert ci_heads == [repaired]
+    names = [name for name, _ in calls]
+    assert names.index('delivery_precheck') < names.index('delivery_publish') < names.index(
+        'delivery_role')
+    assert ('delivery_role', 'implement') not in calls
+    assert [role for name, role in calls if name == 'delivery_role'] == ['review', 'verify']
+
+
+def test_stopped_resume_admission_requires_the_candidate_on_the_published_head(service,
+                                                                                monkeypatch):
+    store, _broker, state, _closed, candidate = stalled_repair(service, monkeypatch,
+                                                              'uncommitted')
+    foreign = {**candidate, 'head': 'f' * 40}
+    monkeypatch.setattr('devflow_temporal.delivery_stopped_resume._candidate',
+                        lambda *_a, **_kw: (foreign, 'original-implementation'))
+    monkeypatch.setattr('devflow_temporal.delivery_stopped_resume.published_identity',
+                        lambda *_a, **_kw: None)
+    with pytest.raises(ValueError, match='not on the published head'):
+        store.continue_repair('run-1', {
+            'continuation_kind': RESUME_KIND, 'command_id': 'resume-foreign-head',
+            'expected_revision': state['revision'], 'expected_iteration': state['iteration'],
+            'expected_candidate_id': candidate['id'], 'expected_candidate_head': foreign['head'],
+            'additional_iterations': 1})
+
+
+def test_superseded_stop_is_never_revived_by_the_service_loop(service, monkeypatch):
+    store, _broker, _state, _closed, _candidate = stalled_repair(service, monkeypatch,
+                                                                'uncommitted')
+    _store, request = service
+    newer = store.submit({**request, 'run_id': 'run-2', 'command_id': 'command-2',
+                          'branch': 'feat/fixture-2'})
+    assert newer['existing'] is False
+    with store._connect() as db:
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+    assert retry.published_continuation(store, row, json.loads(row['request_json'])) is None
+    clear_waits(store)
+    assert retry.retry_once(store) == []
+
+
+class RemoteFakeGitHub(FakeGitHub):
+    """gh answers whose PR head follows origin, as GitHub's does."""
+
+    def __call__(self, argv, **kwargs):
+        if argv[:3] == ['gh', 'pr', 'list'] and not self.list_failures and self.created:
+            self.commands.append(list(argv))
+            remote = _git(self.broker.source, 'ls-remote', 'origin',
+                          'refs/heads/' + self.broker.spec['branch'])
+            return json.dumps([{
+                'number': 1, 'url': 'https://example.invalid/pull/1', 'state': 'OPEN',
+                'isDraft': False, 'baseRefName': self.broker._publication_base_ref(),
+                'headRefName': self.broker.spec['branch'],
+                'headRefOid': remote.split()[0] if remote else '',
+                'title': 'chore: Change a fixture',
+            }])
+        return super().__call__(argv, **kwargs)
+
+
+class RealDelivery:
+    """A current admission on the time-skipping server with the real publish,
+    reconcile, projection, readback and (optionally) finalization activities;
+    roles, checks and CI are scripted, so every stop is one the real controller
+    produces and every admission reads the state it projected."""
+
+    queue = 'real-delivery'
+
+    def __init__(self, service, monkeypatch, *, script=None):
+        self.script = script or {}
+        self.monkeypatch = monkeypatch
+        self.seen = {'roles': [], 'ci_heads': [], 'uncertain': [], 'release': [],
+                     'checks': 0, 'ci': 0}
+        store, request = service
+        original_admit = type(store.config).admit
+
+        def closing_admit(config, supplied):
+            # The fixture provider is fake; production admissions finalize resources
+            # and reconcile the tracker at every stop.
+            admitted = original_admit(config, supplied)
+            admitted.update(resource_cleanup_version=1, terminal_tracker_version=1)
+            return admitted
+
+        monkeypatch.setattr(type(store.config), 'admit', closing_admit)
+        store.submit(request)
+        self.store, self.spec = store, store.spec('run-1')
+        self.broker = DeliveryBroker(store, self.spec)
+        self.broker.prepare()
+        self.broker.state_dir.mkdir(parents=True, exist_ok=True)
+        _git(self.broker.checkout, 'config', 'user.name', 'Delivery Test')
+        _git(self.broker.checkout, 'config', 'user.email', 'delivery@example.invalid')
+        self.base_candidate = self.broker.candidate()
+        self.gh = RemoteFakeGitHub(self.broker)
+        monkeypatch.setattr(delivery_broker, '_run', self.gh)
+        monkeypatch.setattr(delivery_broker.time, 'sleep', lambda _seconds: None)
+        monkeypatch.setattr(delivery_activities, '_context',
+                            lambda given, **_kw: (store, DeliveryBroker(store, given)))
+        for module in ('delivery_pending_publication', 'delivery_gate_retry'):
+            monkeypatch.setattr(f'devflow_temporal.{module}._stopped_cleanup', lambda _: {})
+        # The closure's tracker helper releases the claim it is asked to release.
+        monkeypatch.setattr(retry, '_tracker_sync', self._tracker)
+        store.mark_start('run-1', accepted=True)
+
+    def _tracker(self, spec, status, *, release, terminal, reason=None):
+        if release:
+            with self.store._connect() as db:
+                self.store.state.release_work(db, spec['work_id'],
+                                              'external:devflow:' + spec['run_id'])
+        return {'state': 'consistent', 'pending': False}
+
+    def activities(self):
+        from temporalio import activity
+
+        from devflow_temporal.delivery_activities import (
+            delivery_finalize_resources,
+            delivery_gates_readback,
+            delivery_project,
+            delivery_publish,
+            delivery_reconcile_publish,
+        )
+
+        seen, script, store, base = self.seen, self.script, self.store, self.base_candidate
+
+        @activity.defn(name='delivery_prepare')
+        async def prepare(_payload):
+            return {'candidate': base}
+
+        @activity.defn(name='delivery_tracker_start')
+        async def tracker_start(_payload):
+            return {'state': 'consistent'}
+
+        @activity.defn(name='delivery_repair_preflight')
+        async def repair_preflight(_payload):
+            return {'state': 'confirmed'}
+
+        @activity.defn(name='delivery_role')
+        async def role(payload):
+            seen['roles'].append((payload['role'], payload['iteration']))
+            working = DeliveryBroker(store, payload['spec'])
+            if payload['role'] == 'implement':
+                (working.checkout / 'README.md').write_text(
+                    f"Owned edit {payload['iteration']}\n")
+                if 'implement' in script:
+                    script['implement'](payload['iteration'], self)
+            # The repair resumes the implementer's session; independent roles are fresh.
+            session = ('implementer' if payload['role'] == 'implement'
+                       else f"{payload['role']}-{payload['iteration']}")
+            result = {'status': 'pass', 'role': payload['role'],
+                      'iteration': payload['iteration'], 'session_id': session,
+                      'cleanup': 'confirmed', 'candidate': working.candidate()}
+            findings = script.get('review', lambda _iteration: None)(payload['iteration']) \
+                if payload['role'] == 'review' else None
+            if findings:
+                result.update(status='findings', findings=findings)
+            return result
+
+        @activity.defn(name='delivery_precheck')
+        async def precheck(payload):
+            return {'state': 'passed', 'source_unchanged': True,
+                    'candidate_id': payload['candidate']['id'],
+                    'results': [{'id': 'packaging', 'passed': True, 'cleanup': 'confirmed',
+                                 'exit_code': 0}]}
+
+        @activity.defn(name='delivery_checks')
+        async def checks(payload):
+            seen['checks'] += 1
+            if 'checks' in script:
+                script['checks'](seen['checks'])
+            return {'state': 'passed', 'candidate_id': payload['candidate']['id'],
+                    'cleanup': 'confirmed'}
+
+        @activity.defn(name='delivery_ci')
+        async def ci(payload):
+            seen['ci'] += 1
+            seen['ci_heads'].append(payload['pull_request']['head'])
+            if 'ci' in script:
+                return script['ci'](seen['ci'])
+            return {'state': 'passed'}
+
+        @activity.defn(name='delivery_tracker')
+        async def tracker(_payload):
+            return {'state': 'consistent'}
+
+        @activity.defn(name='delivery_finalize_resources')
+        async def finalize(payload):
+            # The real finalization, with its uncertainty recorded for the assertions.
+            seen['uncertain'].append(payload['uncertain'])
+            return await delivery_finalize_resources(payload)
+
+        @activity.defn(name='delivery_terminal_tracker')
+        async def terminal_tracker(payload):
+            seen['release'].append(payload['release'])
+            return {'state': 'consistent'}
+
+        return [delivery_project, delivery_publish, delivery_reconcile_publish,
+                delivery_gates_readback, prepare, tracker_start, repair_preflight, role,
+                precheck, checks, ci, tracker, terminal_tracker, finalize]
+
+    @contextlib.asynccontextmanager
+    async def running(self):
+        from temporalio.testing import WorkflowEnvironment
+        from temporalio.worker import Worker
+
+        async with await WorkflowEnvironment.start_time_skipping() as environment:
+            async with Worker(environment.client, task_queue=self.queue,
+                              workflows=[DeliveryWorkflow],
+                              activities=self.activities()):
+                self.client = environment.client
+                yield self
+
+    async def start(self):
+        handle = await self.client.start_workflow(
+            DeliveryWorkflow.run, self.spec, id='delivery-run-1', task_queue=self.queue)
+        result = await handle.result()
+        self.closed = {'workflow_id': 'delivery-run-1', 'execution_run_id': handle.result_run_id,
+                       'closed_at': '2026-10-12T00:00:00Z',
+                       'request_digest': self.spec['request_digest'], 'recovery_digest': None,
+                       'result': result}
+        self.monkeypatch.setattr(self.store, '_completed_temporal_result',
+                                 lambda *_a, **_k: self.closed)
+        return result
+
+    def row(self):
+        with self.store._connect() as db:
+            return dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+
+    def claim(self):
+        with self.store._connect() as db:
+            return self.store.state.claim_for(db, self.spec['work_id'])
+
+    def age(self, *, release=False):
+        with self.store._connect() as db:
+            if release:
+                # The terminal tracker releases the claim for codex providers.
+                self.store.state.release_work(db, self.spec['work_id'],
+                                              'external:devflow:run-1')
+            db.execute("UPDATE delivery_runs SET updated_at=? WHERE run_id='run-1'", (PAST,))
+
+    async def continue_run(self):
+        self.store.mark_start('run-1', accepted=True)
+        recovery, _, workflow_id = current_recovery(self.store)
+        effective = self.store.effective_spec('run-1')
+        result = await self.client.execute_workflow(
+            DeliveryWorkflow.run, args=[effective, recovery], id=workflow_id,
+            task_queue=self.queue)
+        return result, recovery
+
+
+def interrupt_repair_publication(iteration, run):
+    if iteration == 1:
+        # GitHub becomes unreachable right before the repair's publication.
+        run.gh.list_failures = 10 ** 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path', ['automatic', 'stopped_resume'])
+async def test_stalled_repair_publication_heals_through_the_real_stop(service, monkeypatch,
+                                                                       path):
     """Iteration 0 publishes; the repair's publication loses GitHub before its push
-    for longer than the readback window; the service loop completes it on the
-    existing PR without an implementation turn."""
+    for longer than the readback window. The service loop completes it on the
+    existing PR, and an operator's stopped resume publishes it before any gate;
+    neither spends an implementation turn nor runs CI on another head."""
+    script = {'implement': interrupt_repair_publication,
+              'review': lambda iteration: ['Needs a second edit'] if iteration == 0 else None}
+    async with RealDelivery(service, monkeypatch, script=script).running() as run:
+        stopped = await run.start()
+        first_head = stopped['pull_request']['head']
+        assert stopped['outcome'] == 'blocked' and stopped['iteration'] == 1
+        assert stopped['error'] == STALL
+        assert stopped['checks']['failure']['cause_type'] == 'publication_deadline'
+        assert stopped['cleanup'] == 'confirmed'
+        assert run.seen['uncertain'] == [False] and run.seen['release'] == [True]
+        assert stopped['pull_request']['number'] == 1
+        assert remote_head(run.broker) == first_head
+        assert _git(run.broker.checkout, 'rev-parse', 'HEAD') == first_head
+        assert (run.broker.checkout / 'README.md').read_text() == 'Owned edit 1\n'
+        row = run.row()
+        assert (row['phase'], row['cleanup'], row['iteration']) == ('blocked', 'confirmed', 1)
+        with run.store._connect() as db:
+            assert db.execute("SELECT COUNT(*) FROM delivery_effects WHERE kind='publish' "
+                              "AND state='pending'").fetchone()[0] == 0
+        run.age(release=True)
+        run.gh.list_failures = 0
+        if path == 'automatic':
+            clear_waits(run.store)
+            admitted = retry.retry_once(run.store)
+            assert [item['phase'] for item in admitted] == ['publication_recovery_queued']
+            assert admitted[0]['implementation_authority'] is False
+        else:
+            admitted = run.store.continue_repair('run-1', {
+                'continuation_kind': RESUME_KIND, 'command_id': 'resume-the-stalled-repair',
+                'expected_revision': stopped['revision'], 'expected_iteration': 1,
+                'expected_candidate_id': stopped['candidate']['id'],
+                'expected_candidate_head': stopped['candidate']['head'],
+                'additional_iterations': 1})
+            assert admitted['phase'] == 'repair_continuation_queued'
+        assert run_count(run.store) == 1
+        resumed, recovery = await run.continue_run()
+    # Delivery finalizes the checkout away; origin and the shared object store remain.
+    repaired = remote_head(run.broker)
+    assert resumed['outcome'] == 'delivered'
+    assert resumed['pull_request']['number'] == 1
+    assert resumed['pull_request']['head'] == repaired != first_head
+    assert _git(run.broker.source, 'rev-list', '--count',
+                run.spec['base_sha'] + '..' + repaired) == '2'
+    assert len(run.gh.creations()) == 1
+    assert run.seen['roles'] == [('implement', 0), ('review', 0), ('implement', 1),
+                                 ('review', 1), ('verify', 1)]
+    # CI only ever observed the gated candidate, which is the delivered head.
+    assert run.seen['ci_heads'] == [repaired]
+    assert recovery['kind'] == ('pending_publication_retry' if path == 'automatic'
+                                else RESUME_KIND)
+    with run.store._connect() as db:
+        assert db.execute("SELECT state FROM delivery_effects WHERE effect_key=?",
+                          ('publish:run-1:1',)).fetchone()[0] == 'complete'
+
+
+def lose_first_checks(call):
+    if call == 1:
+        raise ApplicationError('local check runner lost', type='TimeoutExpired')
+
+
+def break_first_ci_observation(call):
+    # A malformed observation makes the controller itself fail after publish.
+    return 'passed' if call == 1 else {'state': 'passed'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['checks', 'controller'])
+async def test_published_transport_and_controller_stops_heal_through_observed_cleanup(
+    service, monkeypatch, failure,
+):
+    """A lost checks activity or a controller failure after publish stops with
+    unknown cleanup and a retained claim. The service loop confirms the native
+    cleanup by observation, releases the claim, and re-runs the gates on the
+    unchanged head; no implementation turn, no new branch or PR."""
+    from devflow_temporal.delivery_gate_retry import KIND as GATES_KIND
+
+    # A lost checks activity re-runs the gates; a controller failure while handling
+    # the CI observation keeps CI observation semantics (nothing else changed).
+    expected_kind, expected_phase = ((GATES_KIND, 'gates_retry_queued') if failure == 'checks'
+                                     else (CI_KIND, 'gates_retry_queued'))
+    script = {'checks': lose_first_checks} if failure == 'checks' else {
+        'ci': break_first_ci_observation}
+    async with RealDelivery(service, monkeypatch, script=script).running() as run:
+        stopped = await run.start()
+        assert stopped['outcome'] == 'blocked'
+        assert stopped['error'] == ('checks activity failed: ActivityError' if failure == 'checks'
+                                    else 'controller failed: AttributeError')
+        assert stopped['cleanup'] == 'unknown'
+        assert stopped['checks']['resource_cleanup']['state'] == 'unknown'
+        assert run.seen['release'] == [False]
+        assert stopped['checks']['failure']['classification'] == 'transient'
+        assert stopped['checks']['failure']['cause_type'] == (
+            'TimeoutExpired' if failure == 'checks' else 'controller_failure')
+        if failure == 'controller':
+            assert stopped['checks']['controller_failure']['stage'] == 'waiting_ci'
+        published_head = stopped['pull_request']['head']
+        row = run.row()
+        assert row['cleanup'] == 'unknown' and run.claim() is not None
+        run.age()
+        clear_waits(run.store)
+        # Not conclusive without observation: the loop first finalizes again.
+        admitted = retry.retry_once(run.store)
+        assert [item['phase'] for item in admitted] == [expected_phase]
+        assert admitted[0]['implementation_authority'] is False
+        healed = run.row()
+        # The observed closure released the claim; the admitted continuation holds it.
+        assert healed['cleanup'] == 'confirmed'
+        assert run.claim()['owner'] == 'external:devflow:run-1'
+        with run.store._connect() as db:
+            assert db.execute("SELECT COUNT(*) FROM delivery_events WHERE run_id='run-1' "
+                              "AND type='resource_cleanup_reconciled'").fetchone()[0] >= 1
+        assert run_count(run.store) == 1
+        resumed, recovery = await run.continue_run()
+    assert resumed['outcome'] == 'delivered'
+    assert recovery['kind'] == expected_kind
+    assert recovery['execution_spec']['gate_retry_stage'] == (
+        'transient' if failure == 'checks' else 'ci')
+    assert resumed['pull_request']['head'] == published_head == remote_head(run.broker)
+    assert run.seen['roles'].count(('implement', 0)) == 1
+    assert ('implement', 1) not in run.seen['roles']
+    assert set(run.seen['ci_heads']) == {published_head}
+    assert len(run.gh.creations()) == 1
+
+
+async def run_ci_continuation_probe(*, marker):
+    """A published_ci_retry continuation whose observation ends at the deadline."""
     from temporalio import activity
     from temporalio.testing import WorkflowEnvironment
-    from temporalio.worker import Worker
-    from test_delivery_publication_self_heal import FakeGitHub, remote_head
+    from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, Worker
+    from test_delivery_publication_liveness import marker_replayed_false
 
-    from devflow_temporal.delivery_activities import (
-        delivery_gates_readback,
-        delivery_project,
-        delivery_publish,
-        delivery_reconcile_publish,
-    )
+    spec = {'run_id': 'ci-probe', 'provider': 'fake',
+            'policy': {'max_repairs': 0, 'browser_qa': None, 'ci_wait_seconds': 60},
+            'automatic_retry_version': 1, 'publication_readback_version': 1}
+    candidate = {'id': 'c' * 64, 'head': 'a' * 40}
+    publication = {'number': 1, 'url': 'https://example.invalid/pull/1', 'state': 'OPEN',
+                   'head': 'a' * 40, 'candidate': candidate}
+    state = {'run_id': 'ci-probe', 'revision': 9, 'iteration': 0, 'phase': 'blocked',
+             'execution_state': 'blocked', 'outcome': 'blocked', 'cleanup': 'confirmed',
+             'error': 'required CI did not confirm this PR head', 'candidate': candidate,
+             'pull_request': publication, 'candidate_revision': 1, 'roles': [],
+             'checks': {'ci': {'state': 'pending'}}, 'usage': {}, 'findings': []}
+    recovery = {'kind': CI_KIND, 'execution_spec': spec, 'command': {'additional_iterations': 0},
+                'state': state, 'candidate': candidate, 'publication': publication}
+    events = []
 
-    store, request = service
-    original_admit = type(store.config).admit
+    @activity.defn(name='delivery_project')
+    async def project(payload):
+        events.append(payload['event_type'])
+        return {'revision': len(events)}
 
-    def closing_admit(config, supplied):
-        admitted = original_admit(config, supplied)
-        admitted.update(resource_cleanup_version=1, terminal_tracker_version=1)
-        return admitted
-
-    monkeypatch.setattr(type(store.config), 'admit', closing_admit)
-    store.submit(request)
-    spec = store.spec('run-1')
-    assert spec['automatic_retry_version'] == 1 and spec['publication_readback_seconds'] == 900
-    broker = DeliveryBroker(store, spec)
-    broker.prepare()
-    broker.state_dir.mkdir(parents=True, exist_ok=True)
-    _git(broker.checkout, 'config', 'user.name', 'Delivery Test')
-    _git(broker.checkout, 'config', 'user.email', 'delivery@example.invalid')
-    base_candidate = broker.candidate()
-    gh = FakeGitHub(broker)
-    monkeypatch.setattr(delivery_broker, '_run', gh)
-    monkeypatch.setattr(delivery_broker.time, 'sleep', lambda _seconds: None)
-    monkeypatch.setattr(delivery_activities, '_context',
-                        lambda given, **_kw: (store, DeliveryBroker(store, given)))
-    monkeypatch.setattr('devflow_temporal.delivery_pending_publication._stopped_cleanup',
-                        lambda _: {})
-    monkeypatch.setattr('devflow_temporal.delivery_pending_publication.preserve_resources',
-                        lambda *_args, **_kwargs: None)
-    store.mark_start('run-1', accepted=True)
-    seen = {'roles': [], 'uncertain': [], 'release': []}
-
-    @activity.defn(name='delivery_prepare')
-    async def prepare(_payload):
-        return {'candidate': base_candidate}
+    @activity.defn(name='delivery_gates_readback')
+    async def gates_readback(_payload):
+        return {}
 
     @activity.defn(name='delivery_tracker_start')
     async def tracker_start(_payload):
         return {'state': 'consistent'}
 
-    @activity.defn(name='delivery_role')
-    async def role(payload):
-        seen['roles'].append((payload['role'], payload['iteration']))
-        working = DeliveryBroker(store, payload['spec'])
-        if payload['role'] == 'implement':
-            (working.checkout / 'README.md').write_text(
-                f"Owned edit {payload['iteration']}\n")
-            if payload['iteration'] == 1:
-                # GitHub becomes unreachable right before the repair's publication.
-                gh.list_failures = 10 ** 6
-        # The repair resumes the implementer's session; independent roles are fresh.
-        session = ('implementer' if payload['role'] == 'implement'
-                   else f"{payload['role']}-{payload['iteration']}")
-        result = {'status': 'pass', 'role': payload['role'], 'iteration': payload['iteration'],
-                  'session_id': session, 'cleanup': 'confirmed',
-                  'candidate': working.candidate()}
-        if payload['role'] == 'review' and payload['iteration'] == 0:
-            result.update(status='findings', findings=['Needs a second edit'])
-        return result
-
-    @activity.defn(name='delivery_precheck')
-    async def precheck(payload):
-        return {'state': 'passed', 'source_unchanged': True,
-                'candidate_id': payload['candidate']['id'],
-                'results': [{'id': 'packaging', 'passed': True, 'cleanup': 'confirmed',
-                             'exit_code': 0}]}
-
-    @activity.defn(name='delivery_checks')
-    async def checks(payload):
-        return {'state': 'passed', 'candidate_id': payload['candidate']['id'],
-                'cleanup': 'confirmed'}
-
     @activity.defn(name='delivery_ci')
     async def ci(_payload):
-        return {'state': 'passed'}
+        return {'state': 'pending', 'reason': 'CI deadline reached'}
 
     @activity.defn(name='delivery_tracker')
     async def tracker(_payload):
         return {'state': 'consistent'}
 
-    @activity.defn(name='delivery_finalize_resources')
-    async def finalize_resources(payload):
-        seen['uncertain'].append(payload['uncertain'])
-        if payload['uncertain']:
-            return {'state': 'unknown', 'process_cleanup': 'unknown',
-                    'resource_cleanup': 'unknown'}
-        return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
-                'resource_cleanup': 'confirmed'}
-
-    @activity.defn(name='delivery_terminal_tracker')
-    async def terminal_tracker(payload):
-        seen['release'].append(payload['release'])
-        return {'state': 'consistent'}
-
-    activities = [delivery_project, delivery_publish, delivery_reconcile_publish,
-                  delivery_gates_readback, prepare, tracker_start, role, precheck, checks, ci,
-                  tracker, finalize_resources, terminal_tracker]
-    queue = 'stalled-repair-publication'
-    async with await WorkflowEnvironment.start_time_skipping() as environment:
-        async with Worker(environment.client, task_queue=queue, workflows=[DeliveryWorkflow],
-                          activities=activities):
+    activities = [project, gates_readback, tracker_start, ci, tracker]
+    async with (await WorkflowEnvironment.start_time_skipping() as environment,
+                marker_replayed_false('delivery-post-publish-self-heal-v1') if not marker
+                else contextlib.nullcontext()):
+        async with Worker(environment.client, task_queue='ci-probe', workflows=[DeliveryWorkflow],
+                          activities=activities,
+                          **({} if marker else
+                             {'workflow_runner': UnsandboxedWorkflowRunner()})):
             handle = await environment.client.start_workflow(
-                DeliveryWorkflow.run, spec, id='delivery-run-1', task_queue=queue)
-            stopped = await handle.result()
-            first_head = stopped['pull_request']['head']
-            assert stopped['outcome'] == 'blocked' and stopped['iteration'] == 1
-            assert stopped['error'] == STALL
-            assert stopped['checks']['failure']['cause_type'] == 'publication_deadline'
-            assert stopped['cleanup'] == 'confirmed'
-            assert seen['uncertain'] == [False] and seen['release'] == [True]
-            assert stopped['pull_request']['number'] == 1
-            assert remote_head(broker) == first_head
-            assert _git(broker.checkout, 'rev-parse', 'HEAD') == first_head
-            assert (broker.checkout / 'README.md').read_text() == 'Owned edit 1\n'
-            with store._connect() as db:
-                row = dict(db.execute(
-                    "SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
-                store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
-                db.execute("UPDATE delivery_runs SET updated_at=? WHERE run_id='run-1'",
-                           (PAST,))
-                assert db.execute("SELECT COUNT(*) FROM delivery_effects WHERE kind='publish' "
-                                  "AND state='pending'").fetchone()[0] == 0
-            assert (row['phase'], row['cleanup'], row['iteration']) == ('blocked', 'confirmed', 1)
-            closed = {'workflow_id': 'delivery-run-1', 'execution_run_id': handle.result_run_id,
-                      'closed_at': '2026-10-12T00:00:00Z',
-                      'request_digest': spec['request_digest'], 'recovery_digest': None,
-                      'result': stopped}
-            monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_k: closed)
-            gh.list_failures = 0
-            clear_waits(store)
-            admitted = retry.retry_once(store)
-            assert [item['phase'] for item in admitted] == ['publication_recovery_queued']
-            assert admitted[0]['implementation_authority'] is False
-            assert run_count(store) == 1
-            store.mark_start('run-1', accepted=True)
-            recovery, _, workflow_id = current_recovery(store)
-            assert recovery['command']['command_id'].startswith('automatic-publication-')
-            assert recovery['seal']['pushed'] is False
-            effective = store.effective_spec('run-1')
-            resumed = await environment.client.execute_workflow(
-                DeliveryWorkflow.run, args=[effective, recovery], id=workflow_id,
-                task_queue=queue)
-    repaired = _git(broker.checkout, 'rev-parse', 'HEAD')
-    assert resumed['outcome'] == 'delivered'
-    assert resumed['pull_request']['number'] == 1
-    assert resumed['pull_request']['head'] == repaired != first_head
-    assert remote_head(broker) == repaired
-    assert _git(broker.checkout, 'rev-list', '--count', spec['base_sha'] + '..HEAD') == '2'
-    assert len(gh.creations()) == 1
-    assert seen['roles'] == [('implement', 0), ('review', 0), ('implement', 1),
-                             ('review', 1), ('verify', 1)]
-    with store._connect() as db:
-        assert db.execute("SELECT state FROM delivery_effects WHERE effect_key=?",
-                          ('publish:run-1:1',)).fetchone()[0] == 'complete'
+                DeliveryWorkflow.run, args=[spec, recovery], id='ci-probe',
+                task_queue='ci-probe')
+            result = await handle.result()
+            history = await handle.fetch_history()
+            await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+    return result, events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('marker', [False, True])
+async def test_ci_continuation_replays_on_its_recorded_path_with_and_without_the_marker(marker):
+    result, events = await run_ci_continuation_probe(marker=marker)
+    assert result['outcome'] == 'blocked'
+    assert result['error'] == 'required CI did not confirm this PR head'
+    assert events[-1] == 'blocked'
+    if marker:
+        assert result['checks']['failure'] == {
+            'classification': 'transient', 'cause_type': 'ci_deadline', 'stage': 'waiting_ci',
+            'reason': 'required CI did not confirm this PR head'}
+    else:
+        # Recorded before the marker: the stop is the one the old workflow made.
+        assert 'failure' not in result['checks']

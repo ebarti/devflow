@@ -12,7 +12,14 @@ from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_execution_config import load_execution_config
 from .delivery_metadata_recovery import _immutable, preserve_resources
-from .delivery_policy_recovery import _prepare, _rows, _stopped_cleanup, work_binding
+from .delivery_policy_recovery import (
+    _prepare,
+    _rows,
+    _stopped_cleanup,
+    closed_checks,
+    reconciled_cleanup,
+    work_binding,
+)
 from .delivery_preparation import _lock
 from .delivery_resources import read_private, write_private
 from .delivery_source_scope import outside_scope
@@ -154,7 +161,11 @@ def snapshot(store, run_id, kind=KIND):
     ci_only = kind == CI_KIND
     controller_only = kind == CONTROLLER_KIND
     failure = state.get('checks', {}).get('failure') or {}
+    reconciled = reconciled_cleanup(store, row, state)
+    state_checks, row_checks = closed_checks(row, state, reconciled)
+    # A lost CI observation keeps CI observation semantics, never fresh gates.
     transient_retry = bool(kind == KIND and transient_stop(state)
+                           and failure.get('stage') != 'waiting_ci'
                            and failure.get('cause_type') not in {
                                'tracker_readback', 'publication_deadline', 'ci_deadline'})
     # A lost observation never recorded a CI state; its classified stop at the
@@ -219,7 +230,7 @@ def snapshot(store, run_id, kind=KIND):
     failed_gate = (precheck.get('state') == 'failed'
                    and precheck.get('source_unchanged') is True
                    and precheck.get('candidate_id') == candidate['id']
-                   and state.get('checks') == json.loads(row['checks_json'] or '{}')
+                   and state_checks == row_checks
                    and not any(e['kind'] == 'publish' for e in effects)
                    and any(r.get('passed') is False and r.get('cleanup') == 'confirmed'
                            for r in precheck.get('results', []))) if unpublished else bool(failed)
@@ -258,8 +269,11 @@ def snapshot(store, run_id, kind=KIND):
                   for role in ('review', 'verify')}
         sessions = [implementation.get('session_id') if implementation else None,
                     *(r.get('session_id') for r in latest.values())]
-        if (checks != json.loads(row['checks_json'] or '{}')
-                or (checks.get('ci', {}).get('state') not in {'failed', 'pending'}
+        # A controller failure while handling the observation may have left a
+        # malformed CI record; the continuation observes CI again regardless.
+        recorded_ci = checks.get('ci') if isinstance(checks.get('ci'), dict) else {}
+        if (state_checks != row_checks
+                or (recorded_ci.get('state') not in {'failed', 'pending'}
                     and not transient_ci)
                 or any(checks.get(k, {}).get('state') != 'passed'
                        or checks[k].get('candidate_id') != candidate['id']
@@ -284,7 +298,8 @@ def snapshot(store, run_id, kind=KIND):
             or row['execution_state'] != 'blocked'
             or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
             or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
-            or state.get('cleanup') != ('unknown' if prelaunch else 'confirmed')
+            or (prelaunch and state.get('cleanup') != 'unknown')
+            or (not prelaunch and state.get('cleanup') != 'confirmed' and reconciled is None)
             or row['error'] != state.get('error')
             or (not (transient_retry or transient_ci)
                 and state.get('error') not in ({'repair limit exhausted',

@@ -44,7 +44,7 @@ def eligible(row, spec):
     )
 
 
-def unavailable(store, db, spec, *, own_claim_allowed=False):
+def unavailable(store, db, spec, *, own_claim_allowed=False, published=False):
     """Cheap eligibility repeated inside the ordinary admission transaction."""
     issue = store.state.issue_resource(spec['issue_url'])
     latest = next((row['run_id'] for row in db.execute(
@@ -58,9 +58,12 @@ def unavailable(store, db, spec, *, own_claim_allowed=False):
         or db.execute("SELECT 1 FROM delivery_mutations WHERE run_id=? AND "
                       "(state IN ('pending','unknown') OR (kind='cancel' AND state='complete'))",
                       (spec['run_id'],)).fetchone() is not None
-        or db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND "
-                      "(kind='publish' OR state != 'complete')",
-                      (spec['run_id'],)).fetchone() is not None
+        or db.execute(
+            "SELECT 1 FROM delivery_effects WHERE run_id=? AND state != 'complete'"
+            if published else
+            "SELECT 1 FROM delivery_effects WHERE run_id=? AND "
+            "(kind='publish' OR state != 'complete')",
+            (spec['run_id'],)).fetchone() is not None
         or db.execute("SELECT 1 FROM delivery_attempts WHERE run_id=? AND state != 'finished'",
                       (spec['run_id'],)).fetchone() is not None
         or db.execute("SELECT 1 FROM delivery_outbox WHERE run_id=? AND state != 'sent'",
@@ -68,19 +71,20 @@ def unavailable(store, db, spec, *, own_claim_allowed=False):
     )
 
 
-def _current(store, row, spec, stopped):
+def _current(store, row, spec, stopped, *, published=False):
     with store._connect() as db:
         current = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
                              (spec['run_id'],)).fetchone()
         if (current is None or dict(current) != row or stopped()
                 or not store.owns_execution(spec)
-                or unavailable(store, db, spec, own_claim_allowed=True)):
+                or unavailable(store, db, spec, own_claim_allowed=True, published=published)):
             raise ValueError('closed predecessor changed before cleanup or tracker effect')
         return [dict(item) for item in db.execute(
             'SELECT * FROM delivery_attempts WHERE run_id=?', (spec['run_id'],))]
 
 
-def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped):
+def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped, *,
+                      published=False):
     """Keep the original bytes before replacing canonical latest observations."""
     root = Path(execution['state_dir']) / 'resources'
     original = closed['result']['checks']
@@ -125,7 +129,7 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
         current = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
                              (spec['run_id'],)).fetchone()
         if (dict(current) != row or stopped()
-                or unavailable(store, db, spec, own_claim_allowed=True)
+                or unavailable(store, db, spec, own_claim_allowed=True, published=published)
                 or [dict(item) for item in db.execute(
                     'SELECT * FROM delivery_attempts WHERE run_id=?',
                     (spec['run_id'],))] != attempts):
@@ -144,15 +148,21 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
              'predecessor_resources': saved})
 
 
-def _close_cleanup(store, row, spec, closed, stopped):
-    """Keep historical failure immutable; record separately authenticated later cleanup."""
-    attempts = _current(store, row, spec, stopped)
+def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
+    """Keep historical failure immutable; record separately authenticated later cleanup.
+
+    A published run keeps its branch and PR; only its native cleanup and claim
+    are closed here, so its same-run continuations can be admitted.
+    """
+    attempts = _current(store, row, spec, stopped, published=published)
     execution = store.intake_execution_spec(spec['run_id'])
     before = observe_completed_resources(execution, attempts)
-    unpublished(store, spec)
-    if _current(store, row, spec, stopped) != attempts:
+    if not published:
+        unpublished(store, spec)
+    if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original finished attempts changed before finalization')
-    _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped)
+    _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped,
+                      published=published)
     receipt = RunResources(execution, read_only=True).finalize('blocked')
     observed = observe_finalized_resources(execution)
     if (not (receipt.get('state') == receipt.get('resource_cleanup') == 'confirmed')
@@ -160,10 +170,11 @@ def _close_cleanup(store, row, spec, closed, stopped):
             or observed['finalization_sha256'] != receipt.get('receipt_sha256')
             or before['journal_sha256'] != observed['journal_sha256']):
         raise ValueError('fresh original cleanup remains unconfirmed')
-    if _current(store, row, spec, stopped) != attempts:
+    if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original completed attempts changed before tracker closure')
-    unpublished(store, spec)
-    if _current(store, row, spec, stopped) != attempts:
+    if not published:
+        unpublished(store, spec)
+    if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original attempts changed during publication readback')
     tracker = _tracker_sync(execution, 'blocked', release=True, terminal=True,
                             reason=closed['result'].get('error') or 'Retained transient failure')
@@ -174,7 +185,8 @@ def _close_cleanup(store, row, spec, closed, stopped):
         db.execute('BEGIN IMMEDIATE')
         current = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
                              (spec['run_id'],)).fetchone()
-        if (dict(current) != row or stopped() or unavailable(store, db, spec)
+        if (dict(current) != row or stopped()
+                or unavailable(store, db, spec, published=published)
                 or [dict(item) for item in db.execute(
                     'SELECT * FROM delivery_attempts WHERE run_id=?',
                     (spec['run_id'],))] != attempts):
@@ -414,6 +426,14 @@ def published_continuation(store, row, spec):
             or failure.get('cause_type') == 'tracker_readback'
             or not isinstance(candidate, dict)):
         return None
+    with store._connect() as db:
+        issue = store.state.issue_resource(spec['issue_url'])
+        latest = next((item['run_id'] for item in db.execute(
+            'SELECT run_id,issue_url FROM delivery_runs ORDER BY rowid DESC')
+            if store.state.issue_resource(item['issue_url']) == issue), None)
+    if latest != spec['run_id']:
+        # A newer run owns the issue; a superseded stop is never revived.
+        return None
     identity = digest({'run_id': spec['run_id'],
                        'request_digest': row['request_digest']})[:24]
     chain = _recovery_chain(row)
@@ -431,7 +451,9 @@ def published_continuation(store, row, spec):
             'expected_pr_number': 0}
     if not isinstance(publication, dict):
         return None
-    kind = CI_KIND if failure.get('cause_type') == 'ci_deadline' else KIND
+    # A lost observation at the CI stage is observed again, never re-gated.
+    kind = (CI_KIND if failure.get('cause_type') == 'ci_deadline'
+            or failure.get('stage') == 'waiting_ci' else KIND)
     if kind == CI_KIND:
         bound, label = CI_OBSERVATION_RETRIES, 'ci'
         generation = 1 + sum(1 for r in chain if r.get('kind') == CI_KIND)
@@ -448,6 +470,37 @@ def published_continuation(store, row, spec):
         'expected_revision': row['protocol_revision'], 'expected_iteration': row['iteration'],
         'expected_candidate_id': candidate['id'], 'expected_pr_number': publication['number'],
         'expected_pr_head': candidate['head'], 'additional_iterations': 0}
+
+
+def _close_published_cleanup(store, row, spec, stopped):
+    """Observe and confirm the native cleanup of a published transient stop.
+
+    The stop recorded unknown cleanup because a gate or the controller failed
+    with a process possibly still running. Once every native process is observed
+    gone, the run is finalized again and its claim released, exactly as the
+    unpublished retry does; nothing is assumed. Returns the rewritten row, or
+    None when the observation is not conclusive yet.
+    """
+    checks = json.loads(row['checks_json'] or '{}')
+    if (checks.get('failure', {}).get('classification') != 'transient'
+            or row['outcome'] != 'blocked' or row['phase'] != 'blocked'
+            or row['execution_state'] != 'blocked' or row['pr_json'] is None):
+        return None
+    closed = store._completed_temporal_result(spec['run_id'], workflow_id=row['workflow_id'])
+    result = closed['result']
+    if (closed['request_digest'] != row['request_digest']
+            or closed['recovery_digest'] is not None
+            or not closed['execution_run_id'] or not closed['closed_at']
+            or closed['workflow_id'] != (row['workflow_id'] or 'delivery-' + spec['run_id'])
+            or result.get('run_id') != spec['run_id']
+            or result.get('phase') != 'blocked' or result.get('outcome') != 'blocked'
+            or result.get('execution_state') != 'blocked'
+            or result.get('cleanup') != 'unknown'
+            or result.get('checks', {}).get('failure') != checks.get('failure')
+            or not isinstance(result.get('checks', {}).get('resource_cleanup'), dict)
+            or result['checks']['resource_cleanup'] != checks.get('resource_cleanup')):
+        return None
+    return _close_cleanup(store, row, spec, closed, stopped, published=True)
 
 
 def retry_published_once(store, *, stopped=lambda: False):
@@ -469,8 +522,14 @@ def retry_published_once(store, *, stopped=lambda: False):
             continue
         try:
             spec = json.loads(row['request_json'])
+            if not store.owns_execution(spec):
+                continue
+            if row['cleanup'] == 'unknown' and row['recovery_json'] is None:
+                row = _close_published_cleanup(store, row, spec, stopped)
+                if row is None:
+                    continue
             continuation = published_continuation(store, row, spec)
-            if continuation is None or not store.owns_execution(spec):
+            if continuation is None:
                 continue
             admit, generation, payload = continuation
             stopped_at = datetime.fromisoformat(row['updated_at'])

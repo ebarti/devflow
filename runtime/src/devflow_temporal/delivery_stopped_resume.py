@@ -13,7 +13,14 @@ from .delivery_config import scope_amended_spec, scope_amendment_config
 from .delivery_execution_config import load_execution_config
 from .delivery_gate_retry import prepare_runtime
 from .delivery_metadata_recovery import _immutable, preserve_resources
-from .delivery_policy_recovery import _remote, _rows, _stopped_cleanup, work_binding
+from .delivery_policy_recovery import (
+    _remote,
+    _rows,
+    _stopped_cleanup,
+    closed_checks,
+    reconciled_cleanup,
+    work_binding,
+)
 from .delivery_preparation import _lock
 from .delivery_repair import published_identity
 from .delivery_resources import private_directory, read_private
@@ -254,14 +261,17 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
         validate_revision_recovery(store, spec, _revision)
         stopped.add('delivered')
     expected_execution = 'terminal' if row['outcome'] in {'cancelled', 'delivered'} else 'blocked'
+    reconciled = reconciled_cleanup(store, row, state)
+    state_checks, row_checks = closed_checks(row, state, reconciled)
     if (row['phase'] not in stopped or row['outcome'] != row['phase']
             or row['execution_state'] != expected_execution or row['cleanup'] != 'confirmed'
             or state.get('run_id') != run_id or state.get('phase') != row['phase']
-            or state.get('outcome') != row['outcome'] or state.get('cleanup') != 'confirmed'
+            or state.get('outcome') != row['outcome']
+            or (state.get('cleanup') != 'confirmed' and reconciled is None)
             or state.get('execution_state') != expected_execution
             or closed.get('workflow_id') != predecessor_id
             or state.get('candidate') != json.loads(row['candidate_json'] or 'null')
-            or state.get('checks') != json.loads(row['checks_json'] or '{}')
+            or state_checks != row_checks
             or state.get('pull_request') != json.loads(row['pr_json'] or 'null')
             or state.get('revision') != row['protocol_revision']
             or state.get('iteration') != row['iteration'] or state.get('error') != row['error']
@@ -308,6 +318,8 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     publication = state.get('pull_request')
     if publication:
         published_identity(broker, candidate, publication)
+        if candidate['head'] != publication['head']:
+            raise ValueError('stopped candidate is not on the published head')
     else:
         if any(e['kind'] == 'publish' for e in effects):
             raise ValueError('unpublished resume has an unresolved publication')

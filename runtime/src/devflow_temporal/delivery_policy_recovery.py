@@ -213,3 +213,32 @@ def resume_preflight(store, spec, recovery):
                        for pid, item in journal.get('owned', {}).items())
                 or any(listeners(port) for port in journal.get('ports', []))):
             raise ValueError('policy recovery process identity is not stopped')
+
+
+def reconciled_cleanup(store, row, state):
+    """The maintenance record that later confirmed this closed result's cleanup, if any.
+
+    A stop with unknown cleanup is finalized again by the service loop once its
+    native processes are observed gone; the record binds that observation to the
+    exact closed result and to the receipt and tracker it wrote on the row.
+    """
+    if row['cleanup'] != 'confirmed' or state.get('cleanup') == 'confirmed':
+        return None
+    checks = json.loads(row['checks_json'] or '{}')
+    with store._connect() as db:
+        records = [json.loads(item[0]) for item in db.execute(
+            "SELECT payload_json FROM delivery_events WHERE run_id=? "
+            "AND type='resource_cleanup_reconciled' ORDER BY rowid DESC", (row['run_id'],))]
+    return next((item for item in records
+                 if item.get('original_result_digest') == digest(state)
+                 and item.get('resource_cleanup') == checks.get('resource_cleanup')
+                 and item.get('tracker') == json.loads(row['tracker_json'] or '{}')), None)
+
+
+def closed_checks(row, state, reconciled):
+    """The checks an admission compares; a later cleanup receipt is maintenance, not evidence."""
+    checks = json.loads(row['checks_json'] or '{}')
+    if reconciled is None:
+        return state.get('checks'), checks
+    return ({k: v for k, v in (state.get('checks') or {}).items() if k != 'resource_cleanup'},
+            {k: v for k, v in checks.items() if k != 'resource_cleanup'})
