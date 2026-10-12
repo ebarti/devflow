@@ -149,10 +149,12 @@ async def test_dispatch_failure_does_not_ack_retired_entries(
     with pytest.raises(asyncio.CancelledError):
         await service.dispatch_loop()
     assert _historical_rows(store, request["run_id"]) == before
+    # An outage reaches no row: the live entry stays queued and names the
+    # outage once instead of becoming unknown (dispatch isolation, PR #157).
     with store._connect() as db:
-        assert db.execute(
-            "SELECT state FROM delivery_outbox WHERE run_id='native-next'"
-        ).fetchone()[0] == "unknown"
+        assert tuple(db.execute(
+            "SELECT state,last_error FROM delivery_outbox WHERE run_id='native-next'"
+        ).fetchone()) == ("pending", "ConnectionError: fixture Temporal unavailable")
 
 
 def test_retired_docker_configuration_rejected_before_claim(api_fixture):
