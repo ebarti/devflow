@@ -453,31 +453,33 @@ def continue_feature(store, run_id, request, *, _revision=None):
         raise OwnershipConflict("feature is not at the specified stopped checkpoint")
     shared = registry(original)
     token = original["feature_delivery"]["owner"]
-    if _revision is None:
-        from .delivery_feature_revisions import (
-            abandon_reserved_revision,
-            continue_pending_preparation,
-            revision_request,
-        )
-
-        execution = store.effective_spec(run_id)
-        if abandon is not None:
-            # Idempotent: a reservation this command already closed is simply absent.
-            abandon_reserved_revision(store, execution, abandon, request["command_id"])
-        elif revision_request(execution, shared):
-            _revision = continue_pending_preparation(store, execution, row, request, successor_id)
     current = shared.current(token["issue_id"])
-    replay_claim = bool(_revision and "preparation_retry" in _revision and current
-                       and current["run_id"] == successor_id and current["state"] == "active"
-                       and shared.snapshot(successor_id, str(store.config.tracking_db)))
     if current and shared.token(current) == token and current["state"] == "draining":
         # A worker can complete a separately admitted infrastructure recovery
         # after its coordinator has stopped. Reconcile that closed work through
         # the same settlement boundary before allowing the next generation.
+        from .delivery_execution_registry import UnresolvedEffect
         from .delivery_feature_activities import finish_worker, stop_feature
+        from .delivery_feature_readback import settle
 
-        closed = closed_coordinator(store, run_id)
         execution = store.effective_spec(run_id)
+        # The coordinator may have closed while an external operation still awaited
+        # readback. Read it back here, through the same idempotent settlement the
+        # coordinator used, before anything is written: an effect is never
+        # confirmed or dropped without an authentic readback, and an unresolved one
+        # refuses this continuation until GitHub answers.
+        readback = settle(store, execution)
+        if readback["state"] == "contradicted":
+            # A definitive verdict, not a wait: retrying cannot settle it.
+            raise OwnershipConflict(
+                f"original GitHub operation {readback['effect_key']} no longer matches its "
+                f"recorded identity ({readback['reason']}); it will not settle by waiting: "
+                f"{readback['remedy']}, then continue the feature")
+        if readback["state"] != "confirmed":
+            raise UnresolvedEffect(
+                f"original GitHub operation {readback['effect_key']} is still unconfirmed "
+                f"({readback['reason']}); continue the feature again once it settles")
+        closed = closed_coordinator(store, run_id)
         with shared.connect() as db:
             workers = [dict(worker) for worker in db.execute(
                 "SELECT * FROM execution_workers WHERE issue_id=? AND generation=? "
@@ -497,6 +499,26 @@ def continue_feature(store, run_id, request, *, _revision=None):
                                      key: value for key, value in closed.items() if key != 'result'
                                  }} if closed.get('workflow_status') == 'FAILED' else {})})
         current = shared.current(token['issue_id'])
+    if _revision is None:
+        # Only once a draining owner has settled its effects and stopped: a pending
+        # plan revision presumes a stopped, closed predecessor, and its closure
+        # path needs the stopped checkpoint.
+        from .delivery_feature_revisions import (
+            abandon_reserved_revision,
+            continue_pending_preparation,
+            revision_request,
+        )
+
+        execution = store.effective_spec(run_id)
+        if abandon is not None:
+            # Idempotent: a reservation this command already closed is simply absent.
+            abandon_reserved_revision(store, execution, abandon, request["command_id"])
+        elif revision_request(execution, shared):
+            _revision = continue_pending_preparation(store, execution, row, request, successor_id)
+            current = shared.current(token["issue_id"])
+    replay_claim = bool(_revision and "preparation_retry" in _revision and current
+                       and current["run_id"] == successor_id and current["state"] == "active"
+                       and shared.snapshot(successor_id, str(store.config.tracking_db)))
     if not replay_claim and (
         current is None or shared.token(current) != token or current["state"] != "stopped"
     ):

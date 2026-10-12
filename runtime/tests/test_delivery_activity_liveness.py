@@ -582,3 +582,65 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             if journal.get('monitor'):
                 owned[journal['monitor']['pid']] = journal['monitor']
             assert stop_observed(owned)
+
+
+@pytest.mark.asyncio
+async def test_real_temporal_lost_feature_wait_attempt_retries_with_a_full_window(tmp_path):
+    """A coordinator wait attempt lost mid-window (worker crash, host sleep) is
+    timed out on the 60 s heartbeat budget and retried with a full window of its
+    own; the coordinator keeps waiting and the feature completes. Slow by design."""
+    from test_delivery_feature_workflow_temporal import FeatureActivities
+
+    fixtures = FeatureActivities()
+    first = fixtures.record['manifest']['plan']['workstreams'][0]
+    first['chunks'] = first['chunks'][:1]
+    fixtures.record['manifest']['plan']['workstreams'] = [first]
+    attempts = []
+
+    @activity.defn(name='delivery_feature_reserve')
+    async def reserve(payload):
+        child = payload['kind'] + ':' + payload['chunk_id']
+        return {'spec': {'run_id': child}, 'workflow_id': 'wf-' + child,
+                'completed': payload['kind'] == 'chunk'}
+
+    @activity.defn(name='delivery_feature_wait_worker')
+    async def wait_worker(payload):
+        attempts.append((activity.info().attempt, time.monotonic()))
+        if activity.info().attempt == 1:
+            # The host stalls mid-window: no further heartbeats until teardown.
+            activity.heartbeat({'stage': 'feature_worker_wait'})
+            await asyncio.sleep(600)
+        await asyncio.sleep(10)  # the remainder of this attempt's own poll window
+        return {'closed': True, 'outcome': 'delivered',
+                'closure': {'phase': 'delivered', 'cleanup': 'confirmed'}}
+
+    handlers = [f for f in fixtures.handlers() if activity._Definition.must_from_callable(f).name
+                != 'delivery_feature_reserve']
+    spec = {'run_id': 'lost-wait-attempt', 'provider': 'fake', 'config_path': '/frozen/config',
+            'authorized_endpoint': 'merged', 'feature_delivery': {'version': 1},
+            'policy': {'max_repairs': 10}}
+    async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=shutil.which('temporal'),
+        dev_server_database_filename=str(tmp_path / 'temporal.sqlite3'),
+    ) as environment:
+        async with Worker(environment.client, task_queue=spec['run_id'],
+                          workflows=[DeliveryWorkflow],
+                          activities=[*handlers, reserve, wait_worker]):
+            handle = await environment.client.start_workflow(
+                DeliveryWorkflow.run, spec, id=spec['run_id'], task_queue=spec['run_id'])
+            result = await asyncio.wait_for(handle.result(), 240)
+            history = await handle.fetch_history()
+        await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+    assert result['phase'] == 'merged'
+    assert [attempt for attempt, _ in attempts] == [1, 2]
+    assert attempts[1][1] - attempts[0][1] >= 60, 'the lost attempt was detected by heartbeat'
+    waits = [e.activity_task_scheduled_event_attributes for e in history.events
+             if e.HasField('activity_task_scheduled_event_attributes')
+             and e.activity_task_scheduled_event_attributes.activity_type.name
+             == 'delivery_feature_wait_worker']
+    assert len(waits) == 1, 'Temporal retried the lost attempt inside one scheduled wait'
+    assert waits[0].heartbeat_timeout.ToTimedelta() == timedelta(seconds=60)
+    assert waits[0].start_to_close_timeout.ToTimedelta() >= timedelta(seconds=360)
+    # The server records an absent schedule_to_close as zero: no overall deadline
+    # can cut the retry short any more (it was 6 minutes).
+    assert waits[0].schedule_to_close_timeout.ToTimedelta() == timedelta(0)

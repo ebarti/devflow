@@ -13,9 +13,10 @@ import time
 from pathlib import Path
 
 from temporalio import activity
+from temporalio.service import RPCError, RPCStatusCode
 
 from .contracts import digest
-from .delivery_broker import _git
+from .delivery_broker import BrokerReadbackUnavailable, _git
 from .delivery_execution_registry import OwnershipConflict
 from .delivery_feature_execution import (
     plan_for,
@@ -161,7 +162,13 @@ def reserve(spec, chunk_id, kind):
     )
     # Ensure the exact remote prerequisite object is available locally before
     # admitting a checkout. Never move the configured source working tree.
-    _git(Path(spec["source_path"]), "fetch", "--no-tags", "origin", branch)
+    try:
+        _git(Path(spec["source_path"]), "fetch", "--no-tags", "origin", branch)
+    except RuntimeError as exc:
+        # A failed remote query is infrastructure the coordinator may re-issue,
+        # never a verdict about the assignment.
+        raise BrokerReadbackUnavailable(
+            "stack prerequisite fetch failed: " + str(exc)[:300]) from exc
     if _git(Path(spec["source_path"]), "rev-parse", "FETCH_HEAD") != head:
         raise OwnershipConflict("stack prerequisite moved before worker admission")
     register_worker(store, spec, child)
@@ -544,16 +551,32 @@ async def delivery_feature_stop(request):
     return await asyncio.to_thread(stop_feature, request["spec"], request["checkpoint"])
 
 
+TRANSIENT_RPC_STATUSES = frozenset({
+    RPCStatusCode.UNAVAILABLE, RPCStatusCode.DEADLINE_EXCEEDED, RPCStatusCode.RESOURCE_EXHAUSTED,
+})
+
+
+class TemporalUnavailable(RuntimeError):
+    """The Temporal server could not answer an observation; the closure is unaffected."""
+
+
 @activity.defn(name="delivery_feature_worker_result")
 async def delivery_feature_worker_result(request):
     store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
     child_id = request["child_id"]
     with store._connect() as db:
         row = db.execute(
-            "SELECT outcome,workflow_id FROM delivery_runs WHERE run_id=?", (child_id,)
+            "SELECT outcome,workflow_id,phase,cleanup,error,checks_json FROM delivery_runs "
+            "WHERE run_id=?", (child_id,)
         ).fetchone()
     if not row or row["outcome"] is None:
         return {"closed": False}
+    checks = json.loads(row["checks_json"] or "{}")
+    # The coordinator decides a resume from this closure before finish_worker
+    # retires the registry assignment; a retired assignment cannot continue.
+    closure = {"outcome": row["outcome"], "phase": row["phase"], "cleanup": row["cleanup"],
+               "error": row["error"], "failure": checks.get("failure"),
+               "planning_defect": bool(checks.get("planning_defect"))}
     try:
         result = await asyncio.to_thread(
             store._completed_temporal_result,
@@ -567,7 +590,14 @@ async def delivery_feature_worker_result(request):
                     "continuation predecessor Temporal closure is unavailable")):
             raise
         return {"closed": False, "reason": "temporal_closure_pending"}
-    return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"])}
+    except RPCError as exc:
+        # Only an unreachable, overloaded or slow server is infrastructure the
+        # coordinator may re-issue; every other RPC status is a verdict.
+        if exc.status in TRANSIENT_RPC_STATUSES:
+            raise TemporalUnavailable(f"{exc.status.name}: {exc.message}"[:300]) from exc
+        raise
+    return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"]),
+            "closure": closure}
 
 
 def _worker_wait_spec(request):
