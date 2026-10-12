@@ -147,7 +147,7 @@ def test_stopped_integration_resumes_only_its_frozen_local_and_remote_custody(
     store, parent, child, broker, candidate, member, _ = integration(service, monkeypatch)
     record = {"manifest": {"publication": {"members": [member] if drift != "binding" else []}}}
     monkeypatch.setattr(publications, "current_record", lambda *_: record)
-    monkeypatch.setattr(publications, "live_members", lambda *_: [
+    monkeypatch.setattr(publications, "live_members", lambda *_a, **_k: [
         {"number": member["number"], "state": "closed" if drift == "closed_pr" else "open",
          "merged": False}])
     implementation = {"role": "implement", "iteration": 0, "status": "pass",

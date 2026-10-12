@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_broker import _git
-from .delivery_config import DeliveryConfig
+from .delivery_execution_config import load_execution_config
 from .delivery_native_preparation import (
     SCHEMA,
     _validate_observed,
@@ -26,12 +26,22 @@ from .delivery_resources import read_private, write_private
 REQUEST_FIELDS = {"preparation_authority_path", "preparation_authority_sha256"}
 
 
-def _payload_only(before, after):
+def _payload_only(before, after, spec=None):
+    from .delivery_native_preparation import pinned_identity
+
     if not isinstance(before, dict) or not isinstance(after, dict):
         raise ValueError("native renewal identity is absent or invalid")
-    if (canonical_json({k: v for k, v in before.items() if k != 'runtime_payload_sha256'})
-            != canonical_json({k: v for k, v in after.items() if k != 'runtime_payload_sha256'})):
+    scope = spec or {}
+    if (canonical_json(pinned_identity(before, scope, 'runtime_payload_sha256'))
+            != canonical_json(pinned_identity(after, scope, 'runtime_payload_sha256'))):
         raise ValueError("native renewal changed an installed non-payload identity")
+
+
+def _unchanged(before, after, spec):
+    from .delivery_native_preparation import pinned_identity
+
+    return canonical_json(pinned_identity(before, spec)) == canonical_json(
+        pinned_identity(after, spec))
 
 
 def _same_execution(before, after):
@@ -44,7 +54,8 @@ def _same_execution(before, after):
             value['policy'].pop(key, None)
     if canonical_json(frozen) != canonical_json(effective):
         raise ValueError("native renewal changed frozen execution or feature authority")
-    _payload_only(before['policy']['native_identity'], after['policy']['native_identity'])
+    _payload_only(before['policy']['native_identity'], after['policy']['native_identity'],
+                  before)
 
 
 def _existing_bytes(path, root):
@@ -157,8 +168,8 @@ def readiness(spec, payload):
     authority = _authority(spec, payload) if REQUEST_FIELDS & set(payload) else None
     identity = native_identity(spec)
     before = spec['policy'].get('native_identity')
-    _payload_only(before, identity)
-    if canonical_json(before) == canonical_json(identity):
+    _payload_only(before, identity, spec)
+    if _unchanged(before, identity, spec):
         verify_native_spec(spec)
         return {'required': False}
     authority = authority or _authority(spec, payload)
@@ -167,16 +178,17 @@ def readiness(spec, payload):
             or spec['terminal_tracker_version'] != 1):
         raise ValueError("native renewal requires the admitted trusted installed execution")
     _old_proof(spec)
-    config = DeliveryConfig.load(Path(spec['config_path']))
-    if digest(config.raw) != spec['config_digest']:
-        raise ValueError("native renewal frozen configuration changed")
+    # The sealed admitted snapshot is the authority. Live-file edits made after
+    # admission must not strand the runs renewal exists to rescue.
+    config = load_execution_config(spec)
     source = Path(__file__).resolve().parents[3]
     revision = _git(source, 'rev-parse', 'HEAD')
     if _git(source, 'status', '--porcelain', '--untracked-files=all'):
         raise ValueError("native renewal requires clean installed reviewed source")
+    # Receipts record the sealed snapshot identity (its file name), not live bytes.
     return {'required': True, 'identity': identity, 'before': before,
             'authority': authority, 'source_revision': revision, 'source': source,
-            'config_sha256': hashlib.sha256(config.path.read_bytes()).hexdigest()}
+            'config_sha256': digest(config.raw)}
 
 
 def renew(spec, payload, command_digest, *, technical=None, supplemental=None):
@@ -187,7 +199,7 @@ def renew(spec, payload, command_digest, *, technical=None, supplemental=None):
         return spec, None
     identity, before, authority = (observed[key] for key in ('identity', 'before', 'authority'))
     source, revision = observed['source'], observed['source_revision']
-    config = DeliveryConfig.load(Path(spec['config_path']))
+    config = load_execution_config(spec)
     root = Path(spec['state_dir']) / (
         'resource-closure/native-generation' if supplemental else
         'technical-successor/native-generation' if technical else 'native-preparation-renewal'
@@ -222,11 +234,10 @@ def renew(spec, payload, command_digest, *, technical=None, supplemental=None):
         effective = _prepare(spec, config, intent, path)
         _same_execution(spec, effective)
         verify_native_spec(effective)
+        # The sealed configuration cannot drift between readiness and renewal.
         if (canonical_json(native_identity(effective)) != canonical_json(identity)
                 or _git(source, 'rev-parse', 'HEAD') != revision
-                or _git(source, 'status', '--porcelain', '--untracked-files=all')
-                or hashlib.sha256(config.path.read_bytes()).hexdigest()
-                != binding['config_sha256']):
+                or _git(source, 'status', '--porcelain', '--untracked-files=all')):
             raise ValueError("native renewal installed payload or revision changed")
         proof_path = Path(effective['preparation']['environment']['path'])
         proof_raw = _private_bytes(proof_path, Path(spec['state_dir']).parents[1]
@@ -316,10 +327,10 @@ def verify_generation(original, reference, effective):
     receipt = read_private(path)
     _authority(original, receipt['command'])
     _old_proof(original)
-    if (digest(DeliveryConfig.load(Path(original['config_path'])).raw) != original['config_digest']
-            or hashlib.sha256(Path(original['config_path']).read_bytes()).hexdigest()
-            != receipt['config_sha256']
-            or receipt['installed_source_root'] != str(Path(__file__).resolve().parents[3])
+    # Earlier receipts hashed the live file; the sealed snapshot authenticates the
+    # same admitted content without consulting mutable bytes.
+    load_execution_config(original)
+    if (receipt['installed_source_root'] != str(Path(__file__).resolve().parents[3])
             or receipt['runtime_import_path'] != str(Path(__file__).resolve())
             or _git(Path(__file__).resolve().parents[3], 'rev-parse', 'HEAD')
             != receipt['source_revision']

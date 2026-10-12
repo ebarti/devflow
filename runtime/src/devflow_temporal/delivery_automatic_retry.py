@@ -1,19 +1,26 @@
-"""Finite fresh attempts for closed, unpublished original transient failures."""
+"""Finite unattended continuations after classified transient stops.
+
+Unpublished original failures get a fresh attempt; published runs get bounded
+same-run gate or CI continuations on their unchanged head.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import subprocess
 import time
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .contracts import digest
 from .delivery_activities import _tracker_sync
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_metadata_recovery import _immutable
+from .delivery_policy_recovery import gate_failed
 from .delivery_resources import (
     RunResources,
     observe_completed_resources,
@@ -21,6 +28,37 @@ from .delivery_resources import (
     private_directory,
     read_private,
 )
+
+# The n-th automatic continuation of one run waits this long, doubled per
+# generation, after the stop it answers; the row timestamp persists it.
+CONTINUATION_BACKOFF_SECONDS = 30
+_LOG = logging.getLogger(__name__)
+
+
+_SKIP_EVENT_CAP = 32
+
+
+def _record_skip(store, row, exc):
+    """Keep a skipped retry visible: one run event and WARNING per distinct reason."""
+    reason = f'{type(exc).__name__}: {str(exc)[:300]}'
+    try:
+        with store._connect() as db:
+            recorded = [json.loads(item[0]).get('reason') for item in db.execute(
+                "SELECT payload_json FROM delivery_events WHERE run_id=? "
+                "AND type='automatic_retry_skipped'", (row['run_id'],))]
+            # Alternating or ever-changing reasons must not grow the run's
+            # history or the log on every pass.
+            if reason in recorded or len(recorded) >= _SKIP_EVENT_CAP:
+                return
+            store._event(db, row['run_id'], row['revision'], 'automatic_retry_skipped',
+                         'Automatic retry skipped this run until a fresh observation succeeds',
+                         {'reason': reason})
+    except sqlite3.Error as error:
+        _LOG.warning('automatic retry could not record its skip for run %s: %s',
+                     row['run_id'], error)
+        return
+    _LOG.warning('automatic retry skipped run %s until a fresh observation succeeds: %s',
+                 row['run_id'], reason)
 
 
 def eligible(row, spec):
@@ -35,7 +73,7 @@ def eligible(row, spec):
     )
 
 
-def unavailable(store, db, spec, *, own_claim_allowed=False):
+def unavailable(store, db, spec, *, own_claim_allowed=False, published=False):
     """Cheap eligibility repeated inside the ordinary admission transaction."""
     issue = store.state.issue_resource(spec['issue_url'])
     latest = next((row['run_id'] for row in db.execute(
@@ -49,9 +87,12 @@ def unavailable(store, db, spec, *, own_claim_allowed=False):
         or db.execute("SELECT 1 FROM delivery_mutations WHERE run_id=? AND "
                       "(state IN ('pending','unknown') OR (kind='cancel' AND state='complete'))",
                       (spec['run_id'],)).fetchone() is not None
-        or db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND "
-                      "(kind='publish' OR state != 'complete')",
-                      (spec['run_id'],)).fetchone() is not None
+        or db.execute(
+            "SELECT 1 FROM delivery_effects WHERE run_id=? AND state != 'complete'"
+            if published else
+            "SELECT 1 FROM delivery_effects WHERE run_id=? AND "
+            "(kind='publish' OR state != 'complete')",
+            (spec['run_id'],)).fetchone() is not None
         or db.execute("SELECT 1 FROM delivery_attempts WHERE run_id=? AND state != 'finished'",
                       (spec['run_id'],)).fetchone() is not None
         or db.execute("SELECT 1 FROM delivery_outbox WHERE run_id=? AND state != 'sent'",
@@ -59,19 +100,20 @@ def unavailable(store, db, spec, *, own_claim_allowed=False):
     )
 
 
-def _current(store, row, spec, stopped):
+def _current(store, row, spec, stopped, *, published=False):
     with store._connect() as db:
         current = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
                              (spec['run_id'],)).fetchone()
         if (current is None or dict(current) != row or stopped()
                 or not store.owns_execution(spec)
-                or unavailable(store, db, spec, own_claim_allowed=True)):
+                or unavailable(store, db, spec, own_claim_allowed=True, published=published)):
             raise ValueError('closed predecessor changed before cleanup or tracker effect')
         return [dict(item) for item in db.execute(
             'SELECT * FROM delivery_attempts WHERE run_id=?', (spec['run_id'],))]
 
 
-def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped):
+def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped, *,
+                      published=False):
     """Keep the original bytes before replacing canonical latest observations."""
     root = Path(execution['state_dir']) / 'resources'
     original = closed['result']['checks']
@@ -116,7 +158,7 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
         current = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
                              (spec['run_id'],)).fetchone()
         if (dict(current) != row or stopped()
-                or unavailable(store, db, spec, own_claim_allowed=True)
+                or unavailable(store, db, spec, own_claim_allowed=True, published=published)
                 or [dict(item) for item in db.execute(
                     'SELECT * FROM delivery_attempts WHERE run_id=?',
                     (spec['run_id'],))] != attempts):
@@ -135,15 +177,21 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
              'predecessor_resources': saved})
 
 
-def _close_cleanup(store, row, spec, closed, stopped):
-    """Keep historical failure immutable; record separately authenticated later cleanup."""
-    attempts = _current(store, row, spec, stopped)
+def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
+    """Keep historical failure immutable; record separately authenticated later cleanup.
+
+    A published run keeps its branch and PR; only its native cleanup and claim
+    are closed here, so its same-run continuations can be admitted.
+    """
+    attempts = _current(store, row, spec, stopped, published=published)
     execution = store.intake_execution_spec(spec['run_id'])
     before = observe_completed_resources(execution, attempts)
-    unpublished(store, spec)
-    if _current(store, row, spec, stopped) != attempts:
+    if not published:
+        unpublished(store, spec)
+    if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original finished attempts changed before finalization')
-    _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped)
+    _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped,
+                      published=published)
     receipt = RunResources(execution, read_only=True).finalize('blocked')
     observed = observe_finalized_resources(execution)
     if (not (receipt.get('state') == receipt.get('resource_cleanup') == 'confirmed')
@@ -151,10 +199,11 @@ def _close_cleanup(store, row, spec, closed, stopped):
             or observed['finalization_sha256'] != receipt.get('receipt_sha256')
             or before['journal_sha256'] != observed['journal_sha256']):
         raise ValueError('fresh original cleanup remains unconfirmed')
-    if _current(store, row, spec, stopped) != attempts:
+    if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original completed attempts changed before tracker closure')
-    unpublished(store, spec)
-    if _current(store, row, spec, stopped) != attempts:
+    if not published:
+        unpublished(store, spec)
+    if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original attempts changed during publication readback')
     tracker = _tracker_sync(execution, 'blocked', release=True, terminal=True,
                             reason=closed['result'].get('error') or 'Retained transient failure')
@@ -165,7 +214,8 @@ def _close_cleanup(store, row, spec, closed, stopped):
         db.execute('BEGIN IMMEDIATE')
         current = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
                              (spec['run_id'],)).fetchone()
-        if (dict(current) != row or stopped() or unavailable(store, db, spec)
+        if (dict(current) != row or stopped()
+                or unavailable(store, db, spec, published=published)
                 or [dict(item) for item in db.execute(
                     'SELECT * FROM delivery_attempts WHERE run_id=?',
                     (spec['run_id'],))] != attempts):
@@ -177,7 +227,8 @@ def _close_cleanup(store, row, spec, closed, stopped):
                 key: value for key, value in closed.items()
                 if key != 'result'}, 'original_result_digest': digest(closed['result']),
              'resource_cleanup': receipt, 'tracker': tracker,
-             'original_attempts': attempts, 'native_observation': observed})
+             'original_attempts': attempts, 'native_observation': observed,
+             **({'closure': 'published'} if published else {})})
         db.execute('UPDATE delivery_runs SET checks_json=?,cleanup=?,tracker_json=?,revision=? '
                    'WHERE run_id=?', (json.dumps({**checks, 'resource_cleanup': receipt}),
                     'confirmed', json.dumps(tracker), row['revision'] + 1, spec['run_id']))
@@ -369,7 +420,180 @@ def retry_once(store, *, stopped=lambda: False):
             admitted.append(store.submit(supplied, _automatic={
                 'row': row, 'base_sha': base, 'stopped': stopped}))
         except (ValueError, KeyError, TypeError, OSError, RuntimeError,
-                subprocess.SubprocessError, sqlite3.Error):
+                subprocess.SubprocessError, sqlite3.Error) as exc:
             # Wait for conclusive fresh observations; no absence inferred from errors.
+            _record_skip(store, row, exc)
+            continue
+    return admitted + retry_published_once(store, stopped=stopped)
+
+
+def _recovery_chain(row):
+    recovery = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    chain = []
+    while recovery:
+        chain.append(recovery)
+        recovery = recovery.get('original_recovery')
+    return chain
+
+
+def published_continuation(store, row, spec):
+    """The bounded same-run continuation a classified transient stop qualifies for.
+
+    Returns (admit, generation, payload) or None. Nothing here creates a run,
+    branch or PR; the admission re-reads every identity it relies on.
+    """
+    from .delivery_gate_retry import CI_KIND, CI_OBSERVATION_RETRIES, KIND, TRANSIENT_GATE_RETRIES
+    from .delivery_pending_publication import KIND as PUBLICATION_KIND
+    from .delivery_pending_publication import PUBLICATION_RETRIES
+
+    checks = json.loads(row['checks_json'] or '{}')
+    failure = checks.get('failure') or {}
+    candidate = json.loads(row['candidate_json'] or 'null')
+    publication = json.loads(row['pr_json'] or 'null')
+    if (spec.get('automatic_retry_version') != 1 or spec.get('continuation')
+            or row['outcome'] != 'blocked' or row['phase'] != 'blocked'
+            or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
+            or failure.get('classification') != 'transient'
+            or failure.get('cause_type') == 'tracker_readback'
+            or not isinstance(candidate, dict)):
+        return None
+    with store._connect() as db:
+        issue = store.state.issue_resource(spec['issue_url'])
+        latest = next((item['run_id'] for item in db.execute(
+            'SELECT run_id,issue_url FROM delivery_runs ORDER BY rowid DESC')
+            if store.state.issue_resource(item['issue_url']) == issue), None)
+    if latest != spec['run_id']:
+        # A newer run owns the issue; a superseded stop is never revived.
+        return None
+    identity = digest({'run_id': spec['run_id'],
+                       'request_digest': row['request_digest']})[:24]
+    chain = _recovery_chain(row)
+    if failure.get('cause_type') == 'publication_deadline':
+        # Complete the stopped publication, with or without an earlier PR; the
+        # admission seals the checkout head it finds (committed or not).
+        generation = 1 + sum(1 for r in chain if r.get('kind') == PUBLICATION_KIND)
+        if generation > PUBLICATION_RETRIES:
+            return None
+        return store.recover_publication, generation, {
+            'command_id': f'automatic-publication-{identity}-{generation}',
+            'expected_revision': row['protocol_revision'],
+            'expected_candidate_id': candidate['id'],
+            'expected_head': DeliveryBroker(store, spec).candidate()['head'],
+            'expected_pr_number': 0}
+    if not isinstance(publication, dict):
+        return None
+    if gate_failed(checks):
+        # A recorded gate verdict stands: never a fresh assessment of the same
+        # head. The repair turn the run would have taken next is resumed, with
+        # those findings, within the run's own budget.
+        from .delivery_stopped_resume import KIND as RESUME_KIND
+
+        remaining = spec['policy']['max_repairs'] - row['iteration']
+        if remaining <= 0:
+            return None
+        # Exactly the turns an unmasked run would still have, within one grant's
+        # ceiling; never more than the frozen budget.
+        additional = min(remaining, 100 if spec.get('feature_worker') else 2)
+        generation = 1 + sum(1 for r in chain if r.get('kind') == RESUME_KIND)
+        return store.continue_repair, generation, {
+            'continuation_kind': RESUME_KIND,
+            'command_id': f'automatic-repair-{identity}-{generation}',
+            'expected_revision': row['protocol_revision'],
+            'expected_iteration': row['iteration'],
+            'expected_candidate_id': candidate['id'],
+            'expected_candidate_head': candidate['head'],
+            'additional_iterations': additional}
+    # A lost observation at the CI stage is observed again, never re-gated.
+    kind = (CI_KIND if failure.get('cause_type') == 'ci_deadline'
+            or failure.get('stage') == 'waiting_ci' else KIND)
+    if kind == CI_KIND:
+        bound, label = CI_OBSERVATION_RETRIES, 'ci'
+        generation = 1 + sum(1 for r in chain if r.get('kind') == CI_KIND)
+    else:
+        bound, label = TRANSIENT_GATE_RETRIES, 'gates'
+        generation = 1 + sum(
+            1 for r in chain if r.get('kind') == KIND
+            and r.get('execution_spec', {}).get('gate_retry_stage') == 'transient')
+    if generation > bound:
+        return None
+    return store.continue_repair, generation, {
+        'continuation_kind': kind,
+        'command_id': f'automatic-{label}-{identity}-{generation}',
+        'expected_revision': row['protocol_revision'], 'expected_iteration': row['iteration'],
+        'expected_candidate_id': candidate['id'], 'expected_pr_number': publication['number'],
+        'expected_pr_head': candidate['head'], 'additional_iterations': 0}
+
+
+def _close_published_cleanup(store, row, spec, stopped):
+    """Observe and confirm the native cleanup of a published transient stop.
+
+    The stop recorded unknown cleanup because a gate or the controller failed
+    with a process possibly still running. Once every native process is observed
+    gone, the run is finalized again and its claim released, exactly as the
+    unpublished retry does; nothing is assumed. Returns the rewritten row, or
+    None when the observation is not conclusive yet.
+    """
+    checks = json.loads(row['checks_json'] or '{}')
+    if (checks.get('failure', {}).get('classification') != 'transient'
+            or row['outcome'] != 'blocked' or row['phase'] != 'blocked'
+            or row['execution_state'] != 'blocked' or row['pr_json'] is None):
+        return None
+    closed = store._completed_temporal_result(spec['run_id'], workflow_id=row['workflow_id'])
+    result = closed['result']
+    if (closed['request_digest'] != row['request_digest']
+            or closed['recovery_digest'] is not None
+            or not closed['execution_run_id'] or not closed['closed_at']
+            or closed['workflow_id'] != (row['workflow_id'] or 'delivery-' + spec['run_id'])
+            or result.get('run_id') != spec['run_id']
+            or result.get('phase') != 'blocked' or result.get('outcome') != 'blocked'
+            or result.get('execution_state') != 'blocked'
+            or result.get('cleanup') != 'unknown'
+            or result.get('checks', {}).get('failure') != checks.get('failure')
+            or not isinstance(result.get('checks', {}).get('resource_cleanup'), dict)
+            or result['checks']['resource_cleanup'] != checks.get('resource_cleanup')):
+        return None
+    return _close_cleanup(store, row, spec, closed, stopped, published=True)
+
+
+def retry_published_once(store, *, stopped=lambda: False):
+    """Bounded same-run continuations for classified transient stops; no new branch or PR."""
+    with store._connect() as db:
+        rows = [dict(row) for row in db.execute(
+            "SELECT * FROM delivery_runs WHERE outcome='blocked' "
+            "AND checks_json LIKE '%transient%'")]
+    # Separate from the fresh-attempt waits: that loop marks a row before
+    # deciding it is ineligible, which would silence this one forever.
+    waits = getattr(store, '_automatic_continuation_waits', {})
+    store._automatic_continuation_waits = waits
+    admitted = []
+    for row in rows:
+        if stopped():
+            break
+        delay, due = waits.get(row['run_id'], (5, 0))
+        if time.monotonic() < due:
+            continue
+        try:
+            spec = json.loads(row['request_json'])
+            if not store.owns_execution(spec):
+                continue
+            if row['cleanup'] == 'unknown' and row['recovery_json'] is None:
+                row = _close_published_cleanup(store, row, spec, stopped)
+                if row is None:
+                    continue
+            continuation = published_continuation(store, row, spec)
+            if continuation is None:
+                continue
+            admit, generation, payload = continuation
+            stopped_at = datetime.fromisoformat(row['updated_at'])
+            if stopped_at.tzinfo is None:
+                stopped_at = stopped_at.replace(tzinfo=UTC)
+            backoff = min(CONTINUATION_BACKOFF_SECONDS * 2 ** (generation - 1), 600)
+            if datetime.now(UTC) < stopped_at + timedelta(seconds=backoff):
+                continue
+            waits[row['run_id']] = (min(delay * 2, 300), time.monotonic() + delay)
+            admitted.append(admit(spec['run_id'], payload))
+        except (ValueError, KeyError, TypeError, OSError, RuntimeError,
+                subprocess.SubprocessError, sqlite3.Error):
+            # The admission re-reads every identity; a refusal authorizes nothing.
             continue
     return admitted

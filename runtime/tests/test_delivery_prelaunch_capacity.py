@@ -413,18 +413,20 @@ async def test_live_detached_monitor_exception_retains_capacity_and_never_replac
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('prior_state', ['starting', 'unknown'])
-async def test_prior_attempt_without_journal_keeps_its_capacity(native_role, prior_state):
+async def test_prior_attempt_without_journal_releases_dead_owner_capacity(
+        native_role, prior_state):
     case = native_role
     case.owner._claim(case.request)
     with case.store._connect() as db:
         db.execute('UPDATE delivery_attempts SET state=?,started_at=? WHERE job_key=?',
                    (prior_state, 'prior-owner', case.key))
     result = await delivery_role(case.request)
-    row, occupied = _attempt(case)
-    assert result['cleanup'] == 'unknown'
-    assert row['state'] == 'unknown' and occupied == 1
+    row, _ = _attempt(case)
+    # Nobody holds the owner or monitor lock and no monitor ever journaled, so
+    # the dead owner's claim is a provable prelaunch failure, not a leaked slot.
     assert row['started_at'] == 'prior-owner'
     assert case.created == []
+    _assert_prelaunch(case, result)
 
 
 @pytest.mark.asyncio
@@ -661,11 +663,13 @@ async def test_queued_replacement_preserves_retryable_attempt(
 
     with case.store._connect() as db:
         for index in range(case.owner.capacity):
+            # Observed launch evidence keeps an ambiguous occupant in its slot.
             db.execute(
                 'INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,'
-                "state,result_path,started_at) VALUES (?,?,?,?,?,'unknown',?,?)",
+                "state,result_path,started_at,pid,process_identity) "
+                "VALUES (?,?,?,?,?,'unknown',?,?,?,?)",
                 (f'occupant-{index}', case.request['spec']['run_id'], 'review', 90 + index,
-                 'occupant', f'/nonexistent/{index}', 'occupant'))
+                 'occupant', f'/nonexistent/{index}', 'occupant', 1, 'occupant'))
     monkeypatch.setattr(case.owner, '_enter_capacity', enter)
     monkeypatch.setattr(activity, 'in_activity', lambda: True)
     monkeypatch.setattr(activity, 'heartbeat', lambda *args: None)
@@ -950,3 +954,79 @@ async def test_queued_replacement_while_admission_transaction_waits(
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def _poll_until(predicate):
+    deadline = time.monotonic() + 10
+    while not predicate():
+        assert time.monotonic() < deadline, 'fixture did not reach its controlled boundary'
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_busy_store_defers_admission_without_failing_the_waiting_role(
+        native_role, monkeypatch):
+    case = native_role
+    polls = []
+    original = case.owner._enter_capacity
+    tracking_db = str(case.store.config.tracking_db)
+    sqlite_connect = sqlite3.connect
+
+    def enter(job_key, **options):
+        try:
+            result = original(job_key, **options)
+        except Exception as exc:
+            polls.append(exc)
+            raise
+        polls.append(result)
+        return result
+
+    def impatient(path, *args, **options):
+        # The state helper opens every connection with a 30s busy timeout.
+        if str(path) == tracking_db:
+            options['timeout'] = 0.1
+        return sqlite_connect(path, *args, **options)
+
+    def observed_row():
+        with sqlite_connect(f'file:{tracking_db}?mode=ro', uri=True) as db:
+            db.row_factory = sqlite3.Row
+            rows = [dict(row) for row in db.execute('SELECT * FROM delivery_attempts')]
+            occupied = db.execute("SELECT COUNT(*) FROM delivery_attempts WHERE state IN "
+                                  "('starting','running','unknown')").fetchone()[0]
+        assert len(rows) == 1
+        return rows[0], occupied
+
+    monkeypatch.setattr(case.owner, '_enter_capacity', enter)
+    settings = json.loads(case.store.config.path.read_text())
+    settings['capacity'] = 0
+    case.store.config.path.write_text(json.dumps(settings))
+    blocker = sqlite_connect(tracking_db, timeout=5)
+    task = asyncio.create_task(delivery_role(case.request))
+    try:
+        await _poll_until(lambda: len(polls) >= 1)
+        # Another writer holds the store exactly when capacity becomes available.
+        monkeypatch.setattr(sqlite3, 'connect', impatient)
+        blocker.execute('BEGIN IMMEDIATE')
+        settings['capacity'] = 1
+        case.store.config.path.write_text(json.dumps(settings))
+        case.owner.capacity = 1
+        seen = len(polls)
+        await _poll_until(lambda: len(polls) >= seen + 1)
+        await asyncio.wait({task}, timeout=2.5)
+        # A busy store defers admission; it is never charged to the queued role.
+        assert not task.done()
+        assert len(polls) >= seen + 2 and polls[seen:] == [None] * len(polls[seen:])
+        row, occupied = observed_row()
+        assert row['state'] == 'queued' and occupied == 0
+        # The wait is counted; the busy store itself cannot record it yet.
+        assert case.owner.deferrals[case.key] >= 2
+        blocker.rollback()
+        monkeypatch.setattr(sqlite3, 'connect', sqlite_connect)
+        result = await asyncio.wait_for(task, 20)
+        assert case.key not in case.owner.deferrals
+    finally:
+        blocker.close()
+        await asyncio.gather(task, return_exceptions=True)
+    assert result['finish_reason'] == 'fixture'
+    row, occupied = _attempt(case)
+    assert row['state'] == 'finished' and occupied == 0

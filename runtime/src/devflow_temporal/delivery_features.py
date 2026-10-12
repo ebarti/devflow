@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json
+
+logger = logging.getLogger(__name__)
 
 STATUSES = (
     "Queued", "Planning", "In progress", "In review", "Validating", "Awaiting merge",
@@ -48,6 +52,21 @@ def initialize(db: sqlite3.Connection) -> None:
         checked_at TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_sync_settings (
         key TEXT PRIMARY KEY, value INTEGER NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_feature_projections (
+        run_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, generation TEXT NOT NULL,
+        error TEXT, projected_at TEXT NOT NULL)""")
+    # The newest-run-per-issue lookup in transition() runs on every projection;
+    # without this expression index it scans delivery_runs, which makes a pass
+    # over history quadratic.
+    db.execute("""CREATE INDEX IF NOT EXISTS delivery_runs_issue_newest
+        ON delivery_runs(lower(rtrim(issue_url,'/')), created_at, run_id)""")
+
+
+NEWEST_RUN_SQL = (
+    "SELECT run_id FROM delivery_runs WHERE lower(rtrim(issue_url,'/'))=? "
+    "AND json_extract(request_json,'$.feature_worker') IS NULL "
+    "ORDER BY created_at DESC,run_id DESC LIMIT 1"
+)
 
 
 def issue_key(url: str) -> str:
@@ -130,11 +149,7 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
         actual = registry(spec).current(owner["issue_id"])
         if actual is None or registry(spec).token(actual) != owner:
             return
-    newest = db.execute(
-        "SELECT run_id FROM delivery_runs WHERE lower(rtrim(issue_url,'/'))=? "
-        "AND json_extract(request_json,'$.feature_worker') IS NULL "
-        "ORDER BY created_at DESC,run_id DESC LIMIT 1", (key,),
-    ).fetchone()
+    newest = db.execute(NEWEST_RUN_SQL, (key,)).fetchone()
     if not owner and newest[0] != run_id:
         return
     work = db.execute("SELECT details FROM works WHERE id=?", (row["work_id"],)).fetchone()
@@ -245,6 +260,128 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
         (key, run_id, version, encoded, stamp))
     db.execute("INSERT INTO delivery_feature_events(issue,version,payload_json,created_at) "
                "VALUES (?,?,?,?)", (key, version, encoded, stamp))
+
+
+_generation: str | None = None
+_retried: set[tuple[str, str]] = set()
+PASS_LIMIT = 500
+
+
+def projection_generation() -> str:
+    """Identity of the runtime code that shapes a projection.
+
+    The whole package is digested: a projection reads registry, scope and
+    GitHub contract modules well beyond this file, and any code change then
+    re-projects history once per database. Nothing from a configuration enters,
+    so processes running the same code agree whichever admitted configuration
+    (live file or sealed per-run snapshot) builds their store.
+    """
+    global _generation
+    if _generation is None:
+        source = hashlib.sha256()
+        for module in sorted(Path(__file__).parent.glob("*.py")):
+            source.update(module.name.encode())
+            source.update(module.read_bytes())
+        _generation = source.hexdigest()
+    return _generation
+
+
+def _stale_rows(db: sqlite3.Connection, generation: str, tracking_db: Any,
+                limit: int) -> list[str]:
+    """Runs whose projection predates their revision or this code, oldest first."""
+    rows = db.execute(
+        "SELECT r.run_id, r.revision, p.revision AS projected, p.generation, p.error "
+        "FROM delivery_runs r LEFT JOIN delivery_feature_projections p ON p.run_id=r.run_id "
+        "WHERE p.run_id IS NULL OR p.revision != r.revision OR p.generation != ? "
+        "OR p.error IS NOT NULL ORDER BY r.created_at, r.run_id",
+        (generation,),
+    ).fetchall()
+    selected: list[str] = []
+    for row in rows:
+        stale = row["projected"] != row["revision"] or row["generation"] != generation
+        if not stale and (str(tracking_db), row["run_id"]) in _retried:
+            continue  # a skipped row is retried once per service process, and when it changes
+        selected.append(row["run_id"])
+        if len(selected) == limit:
+            break
+    return selected
+
+
+def _project_row(store: Any, run_id: str, generation: str) -> tuple[str, str | None]:
+    """One short write transaction per row; the marker is re-read under the lock."""
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT r.revision, p.revision AS projected, p.generation, p.error "
+            "FROM delivery_runs r LEFT JOIN delivery_feature_projections p ON p.run_id=r.run_id "
+            "WHERE r.run_id=?", (run_id,),
+        ).fetchone()
+        if row is None or (row["projected"] == row["revision"]
+                           and row["generation"] == generation and row["error"] is None):
+            return "fresh", None  # gone, or refreshed by a writer meanwhile
+        db.execute("SAVEPOINT feature_projection")
+        error = None
+        try:
+            transition(db, store.config, run_id)
+        except Exception as exc:
+            db.execute("ROLLBACK TO feature_projection")
+            error = f"{type(exc).__name__}: {str(exc)[:300]}"
+            logger.warning("Feature projection for run %s skipped: %s", run_id, error)
+        db.execute("RELEASE feature_projection")
+        record_projection(db, store.config, run_id, revision=row["revision"], error=error)
+        return ("skipped" if error else "projected"), error
+
+
+def maintain_projections(store: Any, *, limit: int = PASS_LIMIT) -> dict[str, Any]:
+    """Service maintenance: re-project runs whose revision or projection code changed.
+
+    Store construction never projects history. This pass does, one short write
+    transaction per row, so other writers interleave freely and a row that
+    cannot be projected is recorded (see projection_failures) instead of
+    stopping anything. Only the service's loop runs it: the CLI, activities
+    and other installs never replay history, and a row they leave stale is
+    repaired by the service's next pass. Write paths keep fresh rows fresh.
+    """
+    generation = projection_generation()
+    with store._connect() as db:
+        pending = _stale_rows(db, generation, store.config.tracking_db, limit)
+    projected, skipped = 0, {}
+    for run_id in pending:
+        _retried.add((str(store.config.tracking_db), run_id))
+        state, error = _project_row(store, run_id, generation)
+        if state == "projected":
+            projected += 1
+        elif state == "skipped":
+            skipped[run_id] = error
+    return {"pending": len(pending), "projected": projected, "skipped": skipped}
+
+
+def record_projection(db: sqlite3.Connection, config: Any, run_id: str, *,
+                      revision: int | None = None, error: str | None = None) -> None:
+    """Remember which revision of a run the current projection code has seen."""
+    if revision is None:
+        row = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            return
+        revision = row[0]
+    db.execute(
+        "INSERT INTO delivery_feature_projections VALUES (?,?,?,?,?) "
+        "ON CONFLICT(run_id) DO UPDATE SET revision=excluded.revision,"
+        "generation=excluded.generation,error=excluded.error,projected_at=excluded.projected_at",
+        (run_id, revision, projection_generation(), error, now()),
+    )
+
+
+def projection_failures(db: sqlite3.Connection, run_id: str | None = None,
+                        limit: int = 20) -> list[dict[str, Any]]:
+    """Rows whose last projection was skipped, newest first, for operators."""
+    rows = db.execute(
+        "SELECT run_id,revision,error,projected_at FROM delivery_feature_projections "
+        "WHERE error IS NOT NULL AND (? IS NULL OR run_id=?) "
+        "ORDER BY projected_at DESC, run_id LIMIT ?",
+        (run_id, run_id, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def current(db: sqlite3.Connection, issue: str) -> dict | None:

@@ -7,8 +7,10 @@ import contextvars
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -21,10 +23,68 @@ from .delivery_native_process import NativeProcessUnknown
 from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
 
+_LOG = logging.getLogger(__name__)
+# Admission polls run about once a second; a persistent deferral is recorded
+# on the run after this many consecutive ones and again every so often.
+_DEFERRAL_NOTICE_AFTER = 3
+_DEFERRAL_NOTICE_EVERY = 60
 
-def _process_identity(pid: int) -> str | None:
+
+def activity_attempt_replaced() -> bool:
+    """Whether Temporal superseded this attempt without an operator cancel request.
+
+    A heartbeat timeout, a lost attempt or a worker shutdown replaces only the
+    waiter; the durable native work it joined keeps running for the retry.
+    """
+    from temporalio import activity
+
+    if not activity.in_activity():
+        return False
+    try:
+        details = activity.cancellation_details()
+    except RuntimeError:
+        # Only a real activity context knows why it was cancelled.
+        return False
+    return bool(details and not details.cancel_requested and (
+        details.timed_out or details.not_found or details.worker_shutdown
+    ))
+
+
+def activity_retry_pending() -> bool:
+    """Whether Temporal can still start another attempt that would reattach.
+
+    A last attempt or an exhausted schedule-to-close budget ends the activity
+    for good, so nothing it leaves running would ever be joined again.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from temporalio import activity
+
+    if not activity.in_activity():
+        return False
+    try:
+        info = activity.info()
+    except RuntimeError:
+        return False
+    if info.schedule_to_close_timeout is not None and (
+            datetime.now(UTC) - info.scheduled_time + timedelta(seconds=1)
+            >= info.schedule_to_close_timeout):
+        return False
+    policy = info.retry_policy
+    return not (policy is not None and policy.maximum_attempts
+                and info.attempt >= policy.maximum_attempts)
+
+
+def _process_identity(pid: int, *, canonical: bool = False) -> str | None:
+    """The process start time as ``ps`` prints it.
+
+    ``canonical`` fixes the locale and time zone, so an identity recorded for
+    a long-lived member still matches after either changes on the host.
+    """
+    env = {**os.environ, "LC_ALL": "C", "TZ": "UTC0"} if canonical else None
     result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False
+        ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False,
+        env=env,
     )
     value = result.stdout.strip()
     return value if result.returncode == 0 and value else None
@@ -48,14 +108,24 @@ class DeliverySupervisor:
         self.store = store
         self.capacity = capacity
         self.job_locks: dict[str, asyncio.Lock] = {}
+        # Consecutive admission polls per queued role that a failed sweep or a
+        # busy store deferred; persistent waits are surfaced on the run.
+        self.deferrals: dict[str, int] = {}
 
-    def _reconcile_capacity(self) -> None:
+    def _reconcile_capacity(self) -> int:
+        """Release dead native owners before admission; return failures that only retain slots."""
         from .delivery_orphans import _complete_attempt
 
-        with self.store._connect() as db:
-            attempts = [dict(row) for row in db.execute(
-                "SELECT * FROM delivery_attempts WHERE state IN ('starting','running','unknown')"
-            )]
+        try:
+            with self.store._connect() as db:
+                attempts = [dict(row) for row in db.execute(
+                    "SELECT * FROM delivery_attempts"
+                    " WHERE state IN ('starting','running','unknown')"
+                )]
+        except Exception as exc:
+            _LOG.warning("Capacity sweep could not read native attempts: %s", exc)
+            return 1
+        failures = 0
         for attempt in attempts:
             try:
                 spec = self.store.effective_spec(attempt["run_id"])
@@ -67,11 +137,67 @@ class DeliverySupervisor:
                 # Missing evidence, a live owner or a changed reservation retains
                 # its slot; one unresolved row must not hide another dead owner.
                 continue
+            except Exception as exc:
+                # An unavailable process table, port inspection or store retains
+                # the slot too: the sweep is never charged to a waiting role.
+                failures += 1
+                _LOG.warning("Capacity sweep could not resolve native attempt %s: %s",
+                             attempt["job_key"], exc)
+                continue
+        return failures
 
     def _enter_capacity(self, job_key: str, *, cancelled=None, stop_requested=None) -> str | None:
-        if cancelled is not None and cancelled():
-            raise ValueError("native role cancelled before capacity admission")
-        self._reconcile_capacity()
+        try:
+            if cancelled is not None and cancelled():
+                raise ValueError("native role cancelled before capacity admission")
+            failures = self._reconcile_capacity()
+            admitted = self._admit(job_key, cancelled=cancelled, stop_requested=stop_requested)
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+            if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise
+            # Another writer holds the store (every state connection opens with
+            # a write transaction): the role is simply not admitted yet and
+            # polls again. A busy store is never a launch failure.
+            _LOG.warning("Native capacity admission deferred for %s: %s", job_key, exc)
+            self._defer_admission(job_key, f"store busy: {exc}")
+            return None
+        if failures and not admitted:
+            self._defer_admission(
+                job_key, f"capacity sweep could not resolve {failures} native attempt(s)",
+            )
+        else:
+            self.deferrals.pop(job_key, None)
+        return admitted
+
+    def _defer_admission(self, job_key: str, reason: str) -> None:
+        """Count consecutive deferred polls; a persistent wait is recorded on its run."""
+        count = self.deferrals[job_key] = self.deferrals.get(job_key, 0) + 1
+        if count != _DEFERRAL_NOTICE_AFTER and count % _DEFERRAL_NOTICE_EVERY:
+            return
+        try:
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT run_id, role, iteration FROM delivery_attempts WHERE job_key=?",
+                    (job_key,),
+                ).fetchone()
+                if row is None:
+                    return
+                run = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                                 (row["run_id"],)).fetchone()
+                self.store._event(
+                    db, row["run_id"], run["revision"], "native_capacity_deferred",
+                    f"Native {row['role']} role still waits for capacity: {reason}",
+                    {"job_key": job_key, "role": row["role"], "iteration": row["iteration"],
+                     "consecutive_deferrals": count, "reason": reason},
+                )
+        except Exception as exc:
+            # A store that cannot even record the wait leaves the log as the signal.
+            _LOG.warning("Capacity deferral of %s could not be recorded: %s", job_key, exc)
+
+    def _admit(self, job_key: str, *, cancelled=None, stop_requested=None) -> str | None:
+        """Claim one shared DB slot inside a single admission transaction."""
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if stop_requested is not None and stop_requested():
@@ -129,6 +255,10 @@ class DeliverySupervisor:
         if spec.get("gate_retry_generation") in (1, 2) and request["role"] in {"review", "verify"}:
             identity["gate_retry_generation"] = spec["gate_retry_generation"]
             identity["gate_retry_stage"] = spec.get("gate_retry_stage")
+        if spec.get("gate_admission") and request["role"] in {"review", "verify"}:
+            identity["gate_admission"] = spec["gate_admission"]
+        if spec.get("implement_admission") and request["role"] == "implement":
+            identity["implement_admission"] = spec["implement_admission"]
         if generation:
             identity["attempt_generation"] = generation
         from .delivery_native_guard import revision_role_identity
@@ -443,7 +573,21 @@ class DeliverySupervisor:
             expected = None
             fresh = False
             process = None
+            owner_lock = None
             try:
+                # The owner lock proves this worker is alive for the whole
+                # prelaunch window. Its release by process death, together with
+                # a free monitor lock and no journal, is the only launch-absence
+                # proof a later reconciler may use; a held lock means wait.
+                owner_lock = self._owner_lock(spec, job_key)
+                if owner_lock is None:
+                    with self.store._connect() as db:
+                        current = db.execute(
+                            "SELECT state FROM delivery_attempts WHERE job_key=?", (job_key,),
+                        ).fetchone()
+                    if current is not None and current["state"] == "queued":
+                        # Another live owner is admitting this attempt; join its outcome.
+                        owner_lock = self._owner_lock(spec, job_key, blocking=True)
                 with self.store._connect() as db:
                     expected = dict(db.execute(
                         "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,),
@@ -484,9 +628,19 @@ class DeliverySupervisor:
                             break
                         stopped.wait(1)
                 elif not (folder / "native-process.json").is_file():
-                    return {"cleanup": "unknown"}, self._mark_unknown(
-                        job_key, "native prelaunch identity gap", expected=expected,
-                    )
+                    # A claimed slot without a journal belongs to a dead owner
+                    # when nobody holds the owner or monitor locks; a provider
+                    # child cannot exist before its monitor journals.
+                    result = None
+                    if owner_lock is not None:
+                        result = self._reconcile_launch_window(
+                            spec, job_key, expected, locks={"attempt-owner": owner_lock},
+                        )
+                    if result is None:
+                        result = self._mark_unknown(
+                            job_key, "native prelaunch identity gap", expected=expected,
+                        )
+                    return {"cleanup": result["cleanup"]}, result
                 if cancelled():
                     raise ValueError("native role cancelled before monitor entry")
                 from .delivery_native_guard import validate_revision_role
@@ -533,6 +687,9 @@ class DeliverySupervisor:
                     monitor_entered=entered_monitor.is_set(), preserve_queued=replaced.is_set(),
                 )
                 return {"cleanup": result["cleanup"]}, result
+            finally:
+                if owner_lock is not None:
+                    os.close(owner_lock)
 
         # Submit once, independently of the cancellable asyncio waiter. Runner
         # shutdown can cancel that task without cancelling or hiding its thread.
@@ -548,12 +705,7 @@ class DeliverySupervisor:
             _, result = await asyncio.shield(pending)
             return result
         except asyncio.CancelledError:
-            from temporalio import activity
-
-            details = activity.cancellation_details() if activity.in_activity() else None
-            replacement = details and not details.cancel_requested and (
-                details.timed_out or details.not_found or details.worker_shutdown
-            )
+            replacement = activity_attempt_replaced()
             if entered_monitor.is_set() and replacement:
                 # An already entered durable monitor survives replacement of its
                 # Temporal waiter and still observes cancellation of its run.
@@ -681,6 +833,125 @@ class DeliverySupervisor:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
+    @staticmethod
+    def _owner_lock_path(spec: dict[str, Any], job_key: str) -> Path:
+        # Kept outside the attempt folder: retry-prelaunch requires that folder
+        # to stay empty after a failure that never launched.
+        return Path(spec["state_dir"]) / "attempt-owners" / job_key
+
+    @classmethod
+    def _owner_lock(cls, spec: dict[str, Any], job_key: str, *,
+                    blocking: bool = False) -> int | None:
+        """Hold the attempt's owner lock; None when another live owner holds it."""
+        import stat
+
+        from .delivery_resources import private_directory
+
+        path = cls._owner_lock_path(spec, job_key)
+        private_directory(path.parent)
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                raise ValueError("native owner lock is not a private owned file")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                os.close(descriptor)
+                return None
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _reconcile_launch_window(self, spec, job_key, expected, *, locks=None, on_observed=None):
+        """Finalize a claimed slot whose dead owner never reached a journaled launch.
+
+        A provider child only starts after its monitor journals under the
+        monitor lock, and a live owner holds the owner lock throughout its
+        prelaunch window. Holding both locks with no journal or launch
+        artifacts proves no provider ever received GO. Returns None whenever
+        that proof is unavailable so callers retain the slot.
+        """
+        import stat
+
+        if (expected is None or expected["state"] not in {"starting", "unknown"}
+                or expected["cleanup"] == "confirmed"
+                or any(expected[name] is not None for name in (
+                    "pid", "process_identity", "session_id", "result_json"))):
+            return None
+        folder = Path(spec["state_dir"]) / "attempts" / job_key
+        if not Path(spec["state_dir"]).is_dir():
+            return None
+        descriptors = []
+        try:
+            # Nothing is created inside the attempt folder: its emptiness is the
+            # retry-prelaunch predicate. A missing monitor lock means run() never
+            # started, and the held owner lock excludes a concurrent launch.
+            for name, path in (("attempt-owner", self._owner_lock_path(spec, job_key)),
+                               ("native-monitor.lock", folder / "native-monitor.lock")):
+                descriptor = (locks or {}).get(name)
+                if descriptor is None:
+                    if name == "attempt-owner":
+                        descriptor = self._owner_lock(spec, job_key)
+                        if descriptor is None:
+                            return None
+                    elif os.path.lexists(path):
+                        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+                    else:
+                        continue
+                    descriptors.append(descriptor)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                info = os.fstat(descriptor)
+                named = path.lstat()
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                        or (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)):
+                    raise ValueError("native lock ownership changed")
+            if any(os.path.lexists(folder / name) for name in (
+                    "native-process.json", "launch.json", "ready.json", "start.json",
+                    "result.json", "cancel")):
+                return None
+            receipt = {
+                "journal": str(folder / "native-process.json"),
+                "cleanup": "observed-native-confirmed", "launch_absent": True,
+                "observed_pids": [], "previous_state": expected["state"], "reason": None,
+            }
+            if on_observed is not None:
+                on_observed(receipt)
+            reason = "native owner lost before its monitor journaled a launch"
+            result = {
+                "status": "blocked",
+                "summary": "role launch failed before any provider process started",
+                "findings": [reason], "session_id": None, "cleanup": "confirmed",
+                "usage": None, "finish_reason": "prelaunch", "native_process": receipt,
+            }
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT * FROM delivery_attempts WHERE job_key=?", (job_key,),
+                ).fetchone()
+                if row is None or dict(row) != expected:
+                    return None
+                run = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                                 (row["run_id"],)).fetchone()
+                self.store._event(db, row["run_id"], run["revision"],
+                    "native_attempt_cleanup_reconciled",
+                    "Lost native owner finalized before any provider process started",
+                    {"original_attempts": [expected], "native_observations": [receipt]})
+                db.execute(
+                    """UPDATE delivery_attempts SET state='finished',result_json=?,
+                       cleanup='confirmed',finished_at=? WHERE job_key=?""",
+                    (canonical_json(result), _now(), job_key),
+                )
+            return result
+        except (OSError, ValueError):
+            return None
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
     def _complete_native(self, request, native_request, process, job_key, outcome,
                          *, expected=None):
         from .delivery_resources import read_private, write_private
@@ -706,7 +977,15 @@ class DeliverySupervisor:
             if outcome["cleanup"] == "unknown":
                 return self._mark_unknown(job_key, "native monitoring/provider outcome ambiguous")
             interrupted = outcome.get("interrupted_monitor") is True
-            if interrupted:
+            launch_absent = interrupted and outcome.get("provider_outcome") == "not_started"
+            if launch_absent:
+                # The monitor died before authorizing its child: no provider ran,
+                # so the attempt is a retryable prelaunch failure, not a verdict.
+                result = {"status": "blocked",
+                          "summary": "role launch failed before any provider process started",
+                          "findings": ["native monitor lost before any provider process started"],
+                          "session_id": None, "usage": None, "finish_reason": "prelaunch"}
+            elif interrupted:
                 result = {"status": "recovery_unknown",
                           "summary": "native monitor lost; owned teardown independently confirmed",
                           "findings": ["provider outcome unknown; attempt will not be repeated"],
@@ -775,7 +1054,9 @@ class DeliverySupervisor:
                         canonical_json(result),
                         result.get("session_id"),
                         _now(),
-                        next(iter(journal["owned"]), None),
+                        # A prelaunch receipt records no provider process.
+                        None if launch_absent else next(iter(journal["owned"]), None),
+                        None if launch_absent else
                         next(iter(journal["owned"].values()), {}).get("identity"),
                         job_key,
                     ),

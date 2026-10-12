@@ -141,16 +141,16 @@ def _parent(store, spec, previous, authority, bindings):
 
 def _readiness(store, spec, payload, authority, parent):
     from .delivery_native_preparation import native_identity, verify_native_spec
-    from .delivery_native_renewal import _payload_only
+    from .delivery_native_renewal import _payload_only, _unchanged
 
     identity = native_identity(spec)
     before = spec["policy"]["native_identity"]
-    _payload_only(before, identity)
+    _payload_only(before, identity, spec)
     controller = _controller(store, spec, payload)
-    if identity == before:
+    if _unchanged(before, identity, spec):
         verify_native_spec(spec)
     return {
-        "required": identity != before,
+        "required": not _unchanged(before, identity, spec),
         "identity": identity,
         "before": before,
         "authority": authority,

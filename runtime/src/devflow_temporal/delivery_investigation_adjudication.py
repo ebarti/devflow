@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
+from .delivery_execution_config import load_execution_config
 from .delivery_gates_admission import _assessment_receipt, _native_result_bytes
 from .delivery_policy_recovery import _rows, work_binding
 from .delivery_resources import _ancestors, read_private
@@ -205,6 +206,22 @@ def _authority(payload, run_id):
     return value, evidence
 
 
+def _service_member(table, process):
+    """Whether a service manifest member is the live process the table shows.
+
+    The lifecycle records member identities with the locale and zone fixed;
+    the process table prints the host's local form. Either proves the member.
+    """
+    entry = table.get(process.get("pid"))
+    if not entry:
+        return False
+    if entry.get("identity") == process.get("identity"):
+        return True
+    from .supervisor import _process_identity
+
+    return _process_identity(process["pid"], canonical=True) == process.get("identity")
+
+
 def _controller(store, spec, payload):
     """Bind the reviewed installed controller; this does not authorize native execution."""
     value = reference(payload["controller_path"], payload["controller_sha256"])
@@ -219,7 +236,9 @@ def _controller(store, spec, payload):
         from .delivery_transport_adoption import controller_installation
 
         value, _ = controller_installation(spec, original)
-    config_raw = _bytes(spec["config_path"], value.get("config_sha256"))
+    # The sealed admitted snapshot is the frozen authority; the controller's
+    # live-file hash only ever encoded that file's formatting.
+    frozen_policy = load_execution_config(spec).raw
     processes_path = store.config.state_root / "service-processes.json"
     if adoption:
         # The receipt retains the old instance; current ownership is re-observed below.
@@ -228,7 +247,6 @@ def _controller(store, spec, payload):
         processes = json.loads(_bytes(processes_path, value.get("service_manifest_sha256")))
     active = value.get("active_config", {})
     active_raw = _bytes(Path(active.get("path", "")), active.get("sha256"))
-    frozen_policy = json.loads(config_raw)
     active_policy = json.loads(active_raw)
     # A user-authorized role effort change cannot rewrite a sealed run config.
     # Bind both configurations and require every non-role field to remain exact.
@@ -250,7 +268,7 @@ def _controller(store, spec, payload):
         or value.get("runtime_payload_sha256") != payload_digest(PACKAGE)
         or value.get("config_path") != spec["config_path"]
         or value.get("config_digest") != spec["config_digest"]
-        or digest(json.loads(config_raw)) != spec["config_digest"]
+        or digest(frozen_policy) != spec["config_digest"]
         or value.get("published_tree") != value["source_tree"]
         or _git(source, "rev-parse", value.get("published_head", "") + "^{tree}")
         != value["source_tree"]
@@ -260,8 +278,7 @@ def _controller(store, spec, payload):
         or active_policy.get("state_root") != str(store.config.state_root)
         or set(processes.get("processes", {})) != {"api", "worker", "temporal"}
         or any(
-            table.get(p["pid"], {}).get("identity") != p["identity"]
-            or table[p["pid"]]["stat"].startswith("Z")
+            not _service_member(table, p) or table[p["pid"]]["stat"].startswith("Z")
             for p in processes["processes"].values()
         )
     ):
@@ -285,11 +302,12 @@ def _historical(store, spec, previous, authority):
         raise ValueError("adjudication skipped its immediate consumed technical generation")
     value = native_spec(seal["proposed_spec"], previous, technical=True)
     receipt = read_private(Path(previous["native_preparation_renewal"]["path"]))
+    # The sealed snapshot authenticates the configuration this generation ran
+    # under; a receipt's live-file hash is never re-derived from mutable bytes.
+    load_execution_config(spec)
     if (
         value != spec
         or receipt.get("source_revision") != authority["original_runtime_sha"]
-        or receipt.get("config_sha256")
-        != hashlib.sha256(Path(spec["config_path"]).read_bytes()).hexdigest()
     ):
         raise ValueError("historical native source/payload generation changed")
     return previous["native_preparation_renewal"]

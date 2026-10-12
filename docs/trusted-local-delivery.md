@@ -27,14 +27,29 @@ not claim constrained sandbox denials.
 An owner-controlled update of the installed controller Python source may change
 the current runtime payload hash for a run already frozen as `trusted-local`.
 The replacement must match the committed payload of its clean installed Git tree;
-dirty, untracked, ignored extra Python files and a non-installed copy are refused.
-Every other native identity field must still match, including the interpreter,
-OS/architecture, bundled CLI, locked dependencies, sandbox overrides and tool
-roots. Verification authenticates the original private proof, evidence hashes,
+dirty or untracked files inside the installed runtime package and a non-installed
+copy are refused (editor or tool directories elsewhere in the checkout do not
+affect the payload and are ignored). Every other measured native identity field
+must still match, including the interpreter, architecture, bundled CLI, locked
+dependencies, sandbox overrides and tool roots. Because a `trusted-local` proof
+claims no sandbox denials, its macOS version is recorded with the identity but not
+pinned, so an OS update does not stop in-flight runs; `native-profile` keeps the OS
+version pinned because its proof measures denials under that OS.
+Verification authenticates the original private proof, evidence hashes,
 measurements, fingerprint, policy and run binding against its frozen identity.
 It preserves that specification and proof; the old observations remain historical
 measurements rather than measurements of the replacement source. `native-profile`
 retains its existing strict update checks.
+
+Any failure to verify the native execution authority when a local check list
+starts (a measured identity change, a missing binary) is reported as the
+`native-execution-authority` environment preparation failure with confirmed cleanup
+(nothing launched), not as an unknown process teardown. Role homes keep the newest
+Codex credential: for the same auth mode and account, a token the owner's CLI
+refreshed replaces the private copy and a copy the role refreshed more recently is
+kept; a switched auth mode or account takes the owner's credential, a credential
+caught mid-rewrite never replaces a usable copy, and a changed credential never
+blocks a later implementation iteration.
 
 The native launch journal and process result retain the actual controller revision
 and payload at launch. Reattachment preserves that launch identity; later roles
@@ -264,9 +279,10 @@ provenance remain readable; this retirement does not delete their tables or
 rewrite historical failures.
 
 Use the existing run and indexed evidence reads to follow an admitted recovery.
-An original run's supported automatic retry policy is independent of these
-historical grants and does not replace every published, uncertain or manual
-recovery path.
+An original run's supported automatic retry policy, and the bounded automatic
+gate or CI continuations of a published run after a classified transient stop,
+are independent of these historical grants and do not replace every uncertain
+or manual recovery path.
 
 ## Durable synthetic check evidence
 

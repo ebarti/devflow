@@ -8,14 +8,23 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_execution_config import load_execution_config
-from .delivery_gate_retry import prepare_runtime
+from .delivery_gate_retry import _retained_recovery, _sealed_row, prepare_runtime
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
+from .delivery_publication import stopped_at_publication
 from .delivery_resources import read_private
 from .delivery_source_scope import outside_scope
 
 KIND = 'pending_publication_retry'
+# Same-run completions of one stopped publication while its candidate is unchanged.
+PUBLICATION_RETRIES = 3
+
+
+def _chain(recovery):
+    while recovery:
+        yield recovery
+        recovery = recovery.get('original_recovery')
 
 
 def snapshot(store, run_id):
@@ -29,24 +38,33 @@ def snapshot(store, run_id):
     closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
     state = closed['result']
     candidate = state.get('candidate', {})
+    published = state.get('pull_request')
     precheck = state.get('checks', {}).get('prepublish', {})
     implementation = next((r for r in reversed(state.get('roles', []))
                            if r.get('role') == 'implement'), {})
     pending = [e for e in effects if e['state'] != 'complete' or not e['observed_json']]
-    if (previous and previous.get('kind') == KIND
-            or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
+    # The stopped iteration's publish effect: absent when a confirmed pre-push
+    # failure discarded it, pending once a push or PR creation was attempted.
+    effect = pending[0] if len(pending) == 1 else None
+    bound = json.loads(effect['observed_json'] or 'null') if effect else None
+    if sum(1 for r in _chain(previous) if r.get('kind') == KIND) >= PUBLICATION_RETRIES:
+        raise ValueError('this run already received its bounded publication retries')
+    if (row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
             or state.get('phase') != 'blocked'
             or row['error'] != state.get('error')
             or state.get('checks') != json.loads(row['checks_json'] or '{}')
-            or state.get('error') != 'publication unresolved: ActivityError'
+            or not stopped_at_publication(state)
             or state.get('cleanup') != 'confirmed' or state.get('outcome') != 'blocked'
             or state.get('revision') != row['protocol_revision']
             or state.get('iteration') != row['iteration']
             or closed['request_digest'] != row['request_digest']
             or closed['recovery_digest'] != (digest(previous) if previous else None)
             or candidate != json.loads(row['candidate_json'] or 'null')
-            or state.get('pull_request') is not None or json.loads(row['pr_json'] or 'null')
+            or published != json.loads(row['pr_json'] or 'null')
+            # A repair iteration starts from the head its PR already shows.
+            or (published is not None and (not isinstance(published, dict)
+                                           or published.get('head') != candidate.get('head')))
             or precheck.get('state') != 'passed' or precheck.get('source_unchanged') is not True
             or precheck.get('candidate_id') != candidate.get('id')
             or not precheck.get('results')
@@ -57,37 +75,56 @@ def snapshot(store, run_id):
             or any(implementation.get('candidate', {}).get(k) != candidate.get(k)
                    for k in ('id', 'head', 'base_sha', 'content_sha256', 'environment_digest'))
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
-            or claim is not None or len(pending) != 1
-            or pending[0]['effect_key'] != f"publish:{run_id}:{row['iteration']}"
-            or pending[0]['kind'] != 'publish' or pending[0]['state'] != 'pending'
-            or pending[0]['observed_json'] is not None
-            or json.loads(pending[0]['request_json']) != {
-                'iteration': row['iteration'], 'input_candidate_id': candidate.get('id')}):
+            or claim is not None or len(pending) > 1
+            or (effect is not None and (
+                effect['effect_key'] != f"publish:{run_id}:{row['iteration']}"
+                or effect['kind'] != 'publish' or effect['state'] != 'pending'
+                or json.loads(effect['request_json']) != {
+                    'iteration': row['iteration'], 'input_candidate_id': candidate.get('id')}))):
         raise ValueError('pending publication lacks its closed passed-check checkpoint')
     broker = DeliveryBroker(store, spec)
     observed = broker.candidate()
     broker._validate_publication_commits()
     pr = broker._existing_pr()
     remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])
+    remote_head = remote.split()[0] if remote else None
+    committed = observed['head'] != candidate['head']
+    previous_head = published['head'] if published else None
+    pushed = committed and remote_head == observed['head']
     if (any(observed.get(k) != candidate.get(k) for k in (
             'content_sha256', 'base_sha', 'environment_digest', 'policy_digest'))
-            or observed['head'] == candidate['head']
-            or _git(broker.checkout, 'rev-parse', 'HEAD^') != candidate['head']
-            or broker._changed_paths()
+            # Exactly the checked implementation: still uncommitted, or committed
+            # once on top of the head it was checked at.
+            or (committed and (_git(broker.checkout, 'rev-parse', 'HEAD^') != candidate['head']
+                               or broker._changed_paths()))
+            or (not committed and observed['id'] != candidate['id'])
             or outside_scope(spec['policy'], broker._changed_paths(spec['base_sha']),
                              checkout=broker.checkout)
             or _git(broker.checkout, 'branch', '--show-current') != spec['branch']
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') != spec['origin_url']
-            or not remote or remote.split()[0] != observed['head']
-            or (pr is not None and pr['headRefOid'] != observed['head'])):
+            # origin holds the pushed head, or still the head this iteration started from.
+            or not (pushed or remote_head == previous_head)
+            # A bound effect names the pushed head and the PR it saw, and a push it
+            # confirmed must still be on origin.
+            or (bound is not None and (
+                bound.get('head') != observed['head']
+                or bound.get('number') not in {None, pr['number'] if pr else None}
+                or (bound.get('remote_confirmed') and not pushed)))
+            # The owned PR is the one this run published, at the head it had or the
+            # pushed one; a first publication may have been created by a lost attempt.
+            or (published is None and pr is not None and pr['headRefOid'] != observed['head'])
+            or (published is not None and (
+                pr is None or pr['number'] != published['number']
+                or pr['headRefOid'] not in {previous_head, observed['head']}))):
         raise ValueError('pending publication source, remote head or scope changed')
     load_execution_config(spec)
     with store._connect() as db:
         binding = work_binding(store, spec, db)
-    return {'row': row, 'closed': closed, 'spec': spec, 'previous': previous,
-            'candidate': observed, 'pr': pr, 'work_binding': binding,
+    return {'row': _sealed_row(row), 'closed': closed, 'spec': spec,
+            'previous_digest': digest(previous) if previous else None,
+            'candidate': observed, 'pr': pr, 'published': published, 'pushed': pushed,
+            'remote_head': remote_head, 'work_binding': binding,
             'cleanup': _stopped_cleanup(spec)}
-
 
 def admit(store, run_id, payload):
     fields = {'command_id', 'expected_revision', 'expected_candidate_id',
@@ -110,12 +147,15 @@ def admit(store, run_id, payload):
             raise ValueError('command ID already belongs to different inputs')
         return json.loads(prior['response_json'])
     seal = snapshot(store, run_id)
+    previous = _retained_recovery(store, run_id, seal)
     if (payload['expected_revision'] != seal['row']['protocol_revision']
             or payload['expected_candidate_id'] != seal['closed']['result']['candidate']['id']
             or payload['expected_head'] != seal['candidate']['head']):
         raise ValueError('stale pending publication checkpoint')
     spec = seal['spec']
-    root = Path(spec['state_dir']) / 'publication-retry'
+    generation = 1 + sum(1 for r in _chain(previous) if r.get('kind') == KIND)
+    namespace = 'publication-retry' + (f'-{generation}' if generation > 1 else '')
+    root = Path(spec['state_dir']) / namespace
     with _lock(root / 'controller.lock'):
         with store._connect() as db:
             prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
@@ -128,19 +168,18 @@ def admit(store, run_id, payload):
         if digest(snapshot(store, run_id)) != digest(seal):
             raise ValueError('pending publication changed during runtime preparation')
         recovery = {'kind': KIND, 'command': payload, 'seal': seal,
-                    'original_spec': (seal['previous']['original_spec']
-                                      if seal['previous'] else spec),
-                    'original_recovery': seal['previous'], 'execution_spec': execution,
-                    'state': seal['closed']['result']}
+                    'original_spec': (previous['original_spec'] if previous else spec),
+                    'original_recovery': previous, 'execution_spec': execution,
+                    'state': seal['closed']['result'], 'namespace': namespace}
         _immutable(root / 'admission.json', recovery)
         preserve_resources(root, spec)
-        workflow_id = f'delivery-{run_id}-publication-retry-1'
+        workflow_id = f'delivery-{run_id}-publication-retry-{generation}'
         response = {'run_id': run_id, 'phase': 'publication_recovery_queued',
                     'workflow_id': workflow_id, 'implementation_authority': False}
         with store._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             current = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
-            if (dict(current) != seal['row']
+            if (_sealed_row(dict(current)) != seal['row']
                     or work_binding(store, spec, db) != seal['work_binding']):
                 raise ValueError('pending publication lost its stopped ownership')
             store.state.claim_work(db, spec['work_id'], f'external:devflow:{run_id}',
@@ -172,7 +211,8 @@ def custody(db, recovery):
     spec = recovery['execution_spec']
     saved = db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
                        (spec['run_id'],)).fetchone()
-    path = Path(spec['state_dir']) / 'publication-retry/admission.json'
+    path = (Path(spec['state_dir']) / recovery.get('namespace', 'publication-retry')
+            / 'admission.json')
     if not saved or json.loads(saved[0]) != recovery or read_private(path) != recovery:
         raise ValueError('pending publication admission custody changed')
 
@@ -182,14 +222,18 @@ def readback(store, spec, recovery):
     broker = DeliveryBroker(store, spec)
     observed = broker.candidate()
     remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])
-    if (spec != recovery['execution_spec'] or not remote
-            or remote.split()[0] != observed['head']
+    remote_head = remote.split()[0] if remote else None
+    seal = recovery['seal']
+    # origin is unchanged since admission, or carries the sealed head meanwhile.
+    expected_remote = {observed['head']} | (
+        {seal['remote_head']} if 'remote_head' in seal else set())
+    if (spec != recovery['execution_spec'] or remote_head not in expected_remote
             or _git(broker.checkout, 'branch', '--show-current') != spec['branch']
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') != spec['origin_url']
-            or any(observed[k] != recovery['seal']['candidate'][k] for k in (
+            or any(observed[k] != seal['candidate'][k] for k in (
             'id', 'head', 'base_sha', 'content_sha256', 'environment_digest'))):
         raise ValueError('pending publication source changed after admission')
     if spec['provider'] != 'fake':
         from .delivery_native_preparation import verify_native_spec
         verify_native_spec(spec)
-    return recovery['seal']['candidate']
+    return seal['candidate']

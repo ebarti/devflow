@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -31,7 +32,11 @@ from devflow_temporal.delivery_activities import (
     delivery_tracker_start,
 )
 from devflow_temporal.delivery_api import DeliveryService, create_app
-from devflow_temporal.delivery_broker import BrokerReadbackUnavailable, DeliveryBroker
+from devflow_temporal.delivery_broker import (
+    BrokerReadbackUnavailable,
+    CheckPreparationFailure,
+    DeliveryBroker,
+)
 from devflow_temporal.delivery_broker import _git as broker_git
 from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER, LargePayloadCodec
 from devflow_temporal.delivery_config import DeliveryConfig
@@ -55,6 +60,18 @@ def _git(path: Path, *args: str) -> str:
         ["git", "-C", str(path), *args], check=True, capture_output=True, text=True
     )
     return completed.stdout.strip()
+
+
+def _write_lock_free(store: DeliveryStore) -> None:
+    """External observations must not run while the store holds the write lock."""
+    probe = sqlite3.connect(store.config.tracking_db, timeout=0)
+    try:
+        probe.execute("BEGIN IMMEDIATE")
+        probe.rollback()
+    except sqlite3.OperationalError as exc:
+        raise AssertionError("tracking database write lock held during observation") from exc
+    finally:
+        probe.close()
 
 
 @pytest.fixture
@@ -1767,7 +1784,12 @@ def test_post_role_continuation_carries_sealed_candidate_and_session_without_aut
     }
     store.config.path.write_text(json.dumps(configuration))
     successor = DeliveryStore(DeliveryConfig.load(store.config.path))
-    monkeypatch.setattr(successor, "_ensure_no_remote_pr", lambda *_args: None)
+    # Git, file and GitHub observations must not run under the tracking write lock.
+    monkeypatch.setattr(successor, "_ensure_no_remote_pr",
+                        lambda *_args: _write_lock_free(successor))
+    measured_candidate = delivery_store.candidate_for
+    monkeypatch.setattr(delivery_store, "candidate_for",
+                        lambda path: _write_lock_free(successor) or measured_candidate(path))
     live = {
         "workflow_id": "delivery-run-1",
         "execution_run_id": "closed-temporal-execution",
@@ -2004,6 +2026,18 @@ def test_continuation_rejects_temporal_projection_before_workflow_close(service,
     with pytest.raises(ValueError, match="Temporal closure is unproven"):
         store._completed_temporal_result("run-1")
     assert described == [True]
+
+
+def test_continuation_reports_temporal_transport_failure_as_retryable(service, monkeypatch):
+    store, request = service
+    store.submit(request)
+
+    async def connect(*_args, **_kwargs):
+        raise ConnectionRefusedError("temporal server is down")
+
+    monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", connect)
+    with pytest.raises(RuntimeError, match="unavailable \\(ConnectionRefusedError"):
+        store._completed_temporal_result("run-1")
 
 
 def test_check_network_domains_reject_local_destinations():
@@ -2251,10 +2285,13 @@ def test_real_check_fails_closed_without_prepared_native_authority(service, tmp_
         "argv": ["/usr/bin/python3", "-c", f"open({str(sentinel)!r}, 'w').write('BREACH')"],
         "cwd": ".",
     }
-    with pytest.raises(PreparationError, match="not been frozen"):
+    # Fails closed as a typed preparation failure: nothing was launched.
+    with pytest.raises(CheckPreparationFailure, match="not been frozen") as raised:
         broker._run_check_list(
             broker.checkout, [check], broker.state_dir / "security-check", broker.candidate()
         )
+    assert isinstance(raised.value.__cause__, PreparationError)
+    assert raised.value.results[-1]["launched"] is False
     assert sentinel.read_text() == "SAFE\n"
 
 

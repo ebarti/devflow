@@ -482,7 +482,8 @@ def test_controller_effort_amendment_preserves_frozen_non_role_authority(
     active["roles"]["verify"] = {"model": "gpt-6.1-sol", "effort": "high"}
     if broader_change:
         active["capacity"] = frozen.get("capacity", 2) + 1
-    active_path = str(store.config.state_root / "active-config.json")
+    # Production layout: the attested active configuration is the live file itself.
+    active_path = spec["config_path"]
     processes_path = store.config.state_root / "service-processes.json"
     processes = {"config_path": active_path, "processes": {
         name: {"pid": pid, "identity": name} for pid, name in enumerate(
@@ -503,7 +504,10 @@ def test_controller_effort_amendment_preserves_frozen_non_role_authority(
         "active_config": {"path": active_path, "roles": active["roles"], "sha256": "f" * 64},
     }
     monkeypatch.setattr(adjudication, "reference", lambda *_: controller)
-    blobs = {spec["config_path"]: frozen, active_path: active, str(processes_path): processes}
+    # The live file now carries the role change: the frozen policy must come from
+    # the sealed snapshot, never from these bytes. The controller's hash still
+    # binds them as the active attestation (an open residual for this cohort).
+    blobs = {active_path: active, str(processes_path): processes}
     monkeypatch.setattr(adjudication, "_bytes", lambda p, *_: json.dumps(blobs[str(p)]).encode())
     monkeypatch.setattr(adjudication, "_git", lambda _p, *a:
                         "" if a[0] == "status" else "c" * 40 if a[-1].endswith("^{tree}")
@@ -518,6 +522,7 @@ def test_controller_effort_amendment_preserves_frozen_non_role_authority(
     else:
         assert adjudication._controller(store, spec, command) == controller
         assert store.config.raw == frozen
+        assert digest(active) != spec["config_digest"]
 
 
 def test_browser_checkpoint_accepts_report_projection_and_binds_test_evidence():

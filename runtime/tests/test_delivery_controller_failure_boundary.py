@@ -184,7 +184,8 @@ async def test_dispatch_preserves_legacy_timeout_and_bounds_terminal_tracker(mon
     item = {"run_id": spec["run_id"], "workflow_id": None,
             "request_digest": "fixture", "recovery_json": None}
     store = SimpleNamespace(pending_starts=lambda: [item], effective_spec=lambda _: spec,
-                            owns_execution=lambda _: True, mark_start=lambda *_a, **_k: None)
+                            execution_ownership=lambda _: None,
+                            mark_start=lambda *_a, **_k: None)
 
     async def client():
         return Client()

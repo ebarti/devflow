@@ -20,7 +20,8 @@ async def test_worker_uses_explicit_pinned_deployment_without_changing_config(
     from devflow_temporal.delivery_config import DeliveryConfig
 
     raw = {"temporal_address": "127.0.0.1:1", "temporal_queue": "fixture",
-           "state_root": str(tmp_path), "temporal_namespace": "default"}
+           "state_root": str(tmp_path), "temporal_namespace": "default",
+           "tracking_db": str(tmp_path / "tracking.sqlite3")}
     config = DeliveryConfig(tmp_path / "config.json", raw)
     before = json.dumps(raw, sort_keys=True)
     created = []
@@ -42,6 +43,10 @@ async def test_worker_uses_explicit_pinned_deployment_without_changing_config(
         return SimpleNamespace(namespace="default", workflow_service=SimpleNamespace(
             describe_task_queue=describe))
 
+    async def retained(_client):
+        pass
+
+    monkeypatch.setattr(control, "ensure_namespace_retention", retained)
     monkeypatch.setattr(control, "Worker", Worker)
     monkeypatch.setattr(control.Client, "connect", connect)
     deployment = WorkerDeploymentConfig(
@@ -74,7 +79,8 @@ async def test_real_deployment_worker_registers_both_pollers_before_ready(tmp_pa
 
     async with local_temporal() as environment:
         raw = {"temporal_address": environment.client.service_client.config.target_host,
-               "queue": "versioned-readiness", "state_root": str(tmp_path)}
+               "queue": "versioned-readiness", "state_root": str(tmp_path),
+               "tracking_db": str(tmp_path / "tracking.sqlite3")}
         config = DeliveryConfig(tmp_path / "config.json", raw)
         deployment = control._worker_deployment("delivery-readiness", "fixture-v1")
         task = asyncio.create_task(control.worker(config, deployment=deployment))
@@ -330,7 +336,8 @@ def test_pinned_selection_precedes_temporal_only_partial_start(tmp_path, monkeyp
     monkeypatch.setattr(control, "_dashboard_bundle", lambda: bundle)
     monkeypatch.setattr(control, "_ports", lambda _config: ("127.0.0.1", 1, 2, 3))
     monkeypatch.setattr(control, "_free", lambda *_args: True)
-    monkeypatch.setattr(control, "DeliveryStore", lambda _config: None)
+    monkeypatch.setattr(control, "DeliveryStore",
+                        lambda _config: SimpleNamespace(seed_execution_snapshots=dict))
     monkeypatch.setattr(control, "_launch", lambda *_args: {
         "pid": 99_999_999, "identity": "dead-fixture",
     })
@@ -356,7 +363,7 @@ def test_pinned_selection_precedes_temporal_only_partial_start(tmp_path, monkeyp
 
 @pytest.mark.parametrize("digest", [None, "invalid", "0" * 64])
 @pytest.mark.parametrize("operation", ["start", "stop"])
-def test_stopped_selection_rejects_unknown_source_before_any_effect(
+def test_stopped_selection_rejects_unknown_source_before_start_but_never_blocks_stop(
     tmp_path, monkeypatch, digest, operation,
 ):
     from devflow_temporal.delivery_config import DeliveryConfig
@@ -369,11 +376,18 @@ def test_stopped_selection_rejects_unknown_source_before_any_effect(
     })
     before = control._manifest(config).read_bytes()
     monkeypatch.setattr(control, "_ports", lambda _config: None)
-    monkeypatch.setattr(control, "_ready", lambda *_args: pytest.fail("readiness effect"))
+    # Readiness of an empty inventory is read-only and never found; it precedes
+    # the source check so a running stack is served without one.
+    monkeypatch.setattr(control, "_ready", lambda *_args: None)
     monkeypatch.setattr(control, "_start", lambda *_args, **_kwargs: pytest.fail("launch effect"))
     monkeypatch.setattr(control.os, "killpg", lambda *_args: pytest.fail("signal effect"))
-    with pytest.raises(ValueError, match="recorded worker source payload"):
-        (control.service_stop if operation == "stop" else control.ensure_service_running)(config)
+    if operation == "stop":
+        # Stopping never needs the checkout to match the recorded payload; the
+        # selection is retained for the next start to validate.
+        assert control.service_stop(config) == {}
+    else:
+        with pytest.raises(ValueError, match="recorded worker source payload"):
+            control.ensure_service_running(config)
     assert control._manifest(config).read_bytes() == before
 
 
@@ -394,3 +408,70 @@ def test_explicit_new_selection_requires_empty_stopped_inventory(tmp_path, monke
     control.ensure_service_running(config, deployment=new)
     assert calls == [{"deployment": new}]
     assert control._read_manifest(config)["worker_deployment"] == control._deployment_identity(new)
+
+
+def test_stop_terminates_recorded_deployment_stack_after_source_change(tmp_path):
+    """The checkout moved under a pinned stack: `stop` still stops it (surfaces-4)."""
+    import subprocess
+    import sys
+
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    config = DeliveryConfig(tmp_path / "config.json", {
+        "state_root": str(tmp_path), "service_start_timeout": 1,
+    })
+    drifted = {"name": "delivery", "build_id": "retained", "runtime_payload_sha256": "0" * 64}
+    children = {name: subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                       start_new_session=True)
+                for name in ("temporal", "worker", "api")}
+    try:
+        processes = {name: {"pid": child.pid, "identity": control._process_identity(child.pid)}
+                     for name, child in children.items()}
+        processes["worker"]["deployment"] = drifted
+        control._write_manifest(config, processes, deployment=drifted)
+        (tmp_path / "worker-ready.json").write_text("{}")
+        assert all(control._owned(process) for process in processes.values())
+        result = control.service_stop(config)
+        assert result == {"api": "stopped", "worker": "stopped", "temporal": "stopped"}
+        assert not any(control._owned(process) for process in processes.values())
+    finally:
+        for child in children.values():
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+    retained = control._read_manifest(config)
+    assert retained["processes"] == {}
+    assert retained["worker_deployment"] == drifted
+    assert not (tmp_path / "worker-ready.json").exists()
+
+
+def test_ready_recorded_deployment_stack_is_served_after_source_change(tmp_path, monkeypatch):
+    """Client writes reach a ready pinned stack although the checkout changed (surfaces-4)."""
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    config = DeliveryConfig(tmp_path / "config.json", {
+        "state_root": str(tmp_path), "service_start_timeout": 1,
+    })
+    drifted = {"name": "delivery", "build_id": "retained", "runtime_payload_sha256": "0" * 64}
+    processes = {name: {"pid": 1, "identity": "fixture"} for name in ("temporal", "worker", "api")}
+    processes["worker"]["deployment"] = drifted
+    processes["api"]["dashboard_url"] = config.dashboard_url
+    control._write_manifest(config, processes, deployment=drifted)
+    validated = control._validated_deployment
+    monkeypatch.setattr(control, "_ports", lambda _config: None)
+    monkeypatch.setattr(control, "_owned", lambda _process: True)
+    monkeypatch.setattr(control, "_ready", lambda *_args: {"pid": 1})
+    monkeypatch.setattr(control, "_ensure_namespace_retention", lambda *_args: None)
+    monkeypatch.setattr(control, "_validated_deployment",
+                        lambda *_args, **_kwargs: pytest.fail("payload compared for a ready stack"))
+    monkeypatch.setattr(control, "_stop", lambda *_args: pytest.fail("stopped a ready stack"))
+    monkeypatch.setattr(control, "_start", lambda *_args, **_kwargs: pytest.fail("launched"))
+    info = control.ensure_service_running(config)
+    assert info["dashboard_url"] == config.dashboard_url
+    assert info["processes"] == processes
+    # Once the stack is gone, a launch from the current source is still refused.
+    monkeypatch.setattr(control, "_owned", lambda _process: False)
+    monkeypatch.setattr(control, "_ready", lambda *_args: None)
+    monkeypatch.setattr(control, "_validated_deployment", validated)
+    with pytest.raises(ValueError, match="recorded worker source payload"):
+        control.ensure_service_running(config)

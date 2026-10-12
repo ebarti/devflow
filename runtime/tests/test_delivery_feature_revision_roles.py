@@ -323,7 +323,10 @@ async def test_required_revision_approval_survives_cleared_decision_and_lost_pro
     monkeypatch.setattr(GitHubDelivery, "initialize", lambda *_a: deepcopy(record))
     monkeypatch.setattr(GitHubDelivery, "workstreams", lambda *_a: deepcopy(record))
     for module in ("delivery_feature_activities", "delivery_feature_publication"):
-        monkeypatch.setattr("devflow_temporal." + module + ".live_members", lambda *_a: [])
+        monkeypatch.setattr("devflow_temporal." + module + ".live_members",
+                            lambda *_a, **_k: [])
+    monkeypatch.setattr("devflow_temporal.delivery_feature_activities.observe_members",
+                        lambda *_a, **_k: ([], []))
     monkeypatch.setattr("devflow_temporal.delivery_feature_publication.current_record",
                         lambda *_a: deepcopy(record))
     approval_at_adoption = []

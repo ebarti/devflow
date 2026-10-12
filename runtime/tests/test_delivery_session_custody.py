@@ -367,3 +367,80 @@ def test_pending_repair_can_finish_at_the_shared_ceiling(pending_session, monkey
     assert shared.repair(token, "run-1:1", reason) == before
     with pytest.raises(OwnershipConflict, match="repair limit exhausted"):
         shared.repair(token, "run-1:2", "Product repair at worker iteration 2")
+
+
+def test_pending_repair_reruns_implement_under_its_own_identity(pending_session, monkeypatch):
+    from devflow_temporal import delivery_activities as activities
+    from devflow_temporal.delivery_activities import delivery_role
+    from devflow_temporal.delivery_workflow import DeliveryWorkflow
+    from devflow_temporal.supervisor import NativeProcessUnknown, get_supervisor
+
+    store, state, command, _, findings = pending_session
+    with store._connect() as db:
+        failed = dict(db.execute("SELECT * FROM delivery_attempts WHERE run_id='run-1' "
+                                 "AND role='implement' AND iteration=1").fetchone())
+    store.continue_repair("run-1", command)
+    recovery = saved(store)
+    spec = recovery["execution_spec"]
+    assert recovery["pending_repair"]["iteration"] == 1
+    assert spec["implement_admission"] == recovery["command_digest"]
+    assert resume.readback(store, spec, recovery) == {"state": "confirmed"}
+    broker = DeliveryBroker(store, spec)
+    supervisor = get_supervisor(store)
+    launched = []
+
+    class LaunchingRole:
+        async def run(self, request):
+            # The real supervisor finds no durable attempt for this identity, so it
+            # would launch instead of answering from the failed attempt's receipt.
+            assert supervisor.retained_request(request) is None
+            launched.append(request)
+            (broker.checkout / "README.md").write_text("Repaired on the re-run\n")
+            flow.cancel_requested = True
+            return {"status": "pass", "session_id": request["resume_session"],
+                    "cleanup": "confirmed", "findings": [], "finish_reason": "done"}
+
+    monkeypatch.setattr(activities, "_context", lambda _spec: (store, broker))
+    monkeypatch.setattr(activities, "_role_context",
+                        lambda req, *_a: (req, broker.checkout, None, None))
+    monkeypatch.setattr(activities, "get_supervisor", lambda _: LaunchingRole())
+    monkeypatch.setattr(DeliveryBroker, "run_implementation_preparation",
+                        lambda *_a, **_k: {"state": "passed", "cleanup": "confirmed"})
+    flow = DeliveryWorkflow()
+
+    async def activity(name, body, **_):
+        if name == "delivery_role":
+            return await delivery_role(body)
+        return {"state": "consistent"}
+
+    async def confirmed(*_):
+        return True
+
+    async def nothing(*_):
+        return None
+
+    monkeypatch.setattr(flow, "_activity", activity)
+    monkeypatch.setattr(flow, "_confirm_repair_preflight", confirmed)
+    monkeypatch.setattr(flow, "_project", nothing)
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _id: True)
+    result = asyncio.run(flow._resume_stopped(spec, recovery))
+    assert result["phase"] == "cancelled" and len(launched) == 1
+    request = launched[0]
+    assert (request["iteration"], request["candidate"]["id"], request["findings"]) == (
+        1, failed["candidate_id"], findings)
+    assert DeliverySupervisor._job_key(request) != failed["job_key"]
+    rerun = result["roles"][-1]
+    assert (rerun["iteration"], rerun["status"], rerun["session_id"]) == (
+        1, "pass", "original-implementation")
+    assert rerun != json.loads(failed["result_json"])
+    # Under the previous identity the same request met the failed attempt's receipt.
+    old = {**request, "spec": {k: v for k, v in spec.items() if k != "implement_admission"}}
+    assert DeliverySupervisor._job_key(old) == failed["job_key"]
+    try:
+        replay = supervisor.retained_request(old)
+    except NativeProcessUnknown:
+        replay = "refused"
+    assert replay is not None
+    with store._connect() as db:
+        assert dict(db.execute("SELECT * FROM delivery_attempts WHERE job_key=?",
+                               (failed["job_key"],)).fetchone()) == failed

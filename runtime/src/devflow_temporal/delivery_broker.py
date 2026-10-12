@@ -116,7 +116,18 @@ class CheckCancelledBeforeLaunch(RuntimeError):
     """Cancellation was observed before entering the next native process."""
 
 
+class CheckSuperseded(RuntimeError):
+    """Temporal replaced this attempt; its retry owns every further launch and score."""
+
+
 class DeliveryBroker:
+    # Journals of the native gates a broker ran or joined, so an unknown
+    # teardown can be re-proven against the processes they recorded.
+    native_journals: tuple[Path, ...] = ()
+    # Set by the activity once Temporal replaced its waiter: the body may finish
+    # the native process it supervises but must not launch or score another.
+    check_superseded = staticmethod(lambda: False)
+
     def __init__(self, store: DeliveryStore, spec: dict[str, Any]) -> None:
         from .delivery_preparation import require_native_execution
 
@@ -133,6 +144,8 @@ class DeliveryBroker:
         self.check_cancelled = lambda: False
         self.native_cleanup_confirmed = True
         self.publication_may_have_effect = True
+        # (effect key, insertion stamp) of the row this broker inserted, if any.
+        self.inserted_effect: tuple[str, str] | None = None
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -147,12 +160,14 @@ class DeliveryBroker:
                 if saved[0] != kind or saved[1] != serialized:
                     raise ValueError("effect identity belongs to a different request")
                 return json.loads(saved[3]) if saved[2] == "complete" and saved[3] else None
+            stamp = _now()
             db.execute(
                 """INSERT INTO delivery_effects
                    (effect_key,run_id,kind,request_json,state,updated_at)
                    VALUES (?,?,?,?,'pending',?)""",
-                (key, self.spec["run_id"], kind, serialized, _now()),
+                (key, self.spec["run_id"], kind, serialized, stamp),
             )
+            self.inserted_effect = (key, stamp)
         return None
 
     def _finish_effect(self, key: str, result: dict[str, Any]) -> None:
@@ -587,13 +602,20 @@ class DeliveryBroker:
                     )
                 range_binding = self._diff_range_binding(checkout, candidate)
             native_result = None
+            interrupted = []
             check_evidence = None
             if self.spec["provider"] == "codex":
                 from .delivery_native_process import NativeProcess
                 from .delivery_preparation import verify_prepared_spec
                 from .delivery_sandbox import native_check_argv, prepare_native_check
 
-                verify_prepared_spec(self.spec)
+                try:
+                    verify_prepared_spec(self.spec)
+                except Exception as exc:
+                    # Nothing launched: report the unverifiable native authority with
+                    # confirmed cleanup instead of an unknown process teardown.
+                    raise CheckPreparationFailure(
+                        "native-execution-authority", exc, results) from exc
                 try:
                     profile, environment = prepare_native_check(
                         self.spec, checkout, evidence_dir, check,
@@ -624,15 +646,24 @@ class DeliveryBroker:
                 command = [
                     native_dependencies["store"] if item == "/store" else item for item in argv
                 ]
+
+                options = {
+                    "argv": native_check_argv(self.spec, profile, cwd, command),
+                    "cwd": cwd,
+                    "environment": environment,
+                    "timeout": int(check.get("timeout_seconds", 600)),
+                    "cancelled": self._native_cancelled,
+                }
                 native_result = self._run_native_check(NativeProcess(
-                    self.spec,
-                    evidence_dir / check["id"] / "native",
-                    argv=native_check_argv(self.spec, profile, cwd, command),
-                    cwd=cwd,
-                    environment=environment,
-                    timeout=int(check.get("timeout_seconds", 600)),
-                    cancelled=self._native_cancelled,
+                    self.spec, evidence_dir / check["id"] / "native", **options,
                 ))
+                if native_result.get("interrupted_monitor") is True:
+                    # A lost monitor yields no verdict. One fresh invocation
+                    # re-runs the gate; the interrupted journal stays as evidence.
+                    interrupted.append(native_result)
+                    native_result = self._run_native_check(NativeProcess(
+                        self.spec, evidence_dir / check["id"] / "native-retry", **options,
+                    ))
                 self._record_generated(generated)
                 if native_result["cleanup"] == "unknown":
                     return {
@@ -640,6 +671,19 @@ class DeliveryBroker:
                         "cleanup": "unknown",
                         "candidate_id": candidate["id"],
                         "native_process": native_result,
+                    }
+                if native_result.get("interrupted_monitor") is True:
+                    interrupted.append(native_result)
+                    return {
+                        "state": "unknown",
+                        "cleanup": "confirmed",
+                        "process_cleanup": native_result["cleanup"],
+                        "candidate_id": candidate["id"],
+                        "check_id": check["id"],
+                        "reason": "native check monitor was lost twice; "
+                                  "the gate produced no verdict",
+                        "native_process": native_result,
+                        "interrupted_native_processes": interrupted,
                     }
                 artifact = Path(native_result["log"])
                 output = artifact.read_text(encoding="utf-8", errors="replace")
@@ -746,6 +790,7 @@ class DeliveryBroker:
                         if native_result
                         else {}
                     ),
+                    **({"interrupted_native_processes": interrupted} if interrupted else {}),
                 }
             )
             if not passed:
@@ -977,15 +1022,25 @@ class DeliveryBroker:
     def _run_native_check(self, process) -> dict:
         if self._native_cancelled():
             raise CheckCancelledBeforeLaunch("native check cancelled before launch")
+        if self.check_superseded():
+            raise CheckSuperseded("native check superseded before launch")
         self.native_cleanup_confirmed = False
+        self.native_journals += (process.journal,)
         result = process.run()
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
+        if self.check_superseded():
+            # The retry scores this invocation from its journal; a replaced body
+            # neither post-processes nor launches alongside it.
+            raise CheckSuperseded("native check superseded after its monitor")
         return result
 
     def _reconcile_native_check(self, journal: Path) -> dict:
         from .delivery_native_process import reconcile_process
 
+        if self.check_superseded():
+            raise CheckSuperseded("native check superseded before reconciliation")
         self.native_cleanup_confirmed = False
+        self.native_journals += (journal,)
         result = reconcile_process(journal)
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
         return result
@@ -1032,7 +1087,10 @@ class DeliveryBroker:
         from .delivery_resources import RunResources, private_directory, read_private, write_private
         from .delivery_sandbox import native_check_argv, prepare_native_check
 
-        verify_prepared_spec(self.spec)
+        try:
+            verify_prepared_spec(self.spec)
+        except Exception as exc:
+            raise CheckPreparationFailure("native-execution-authority", exc) from exc
         provenance = {}
         manager, inputs = frozen_pnpm_inputs(self.spec, checkout, provenance=provenance)
         resources = RunResources(self.spec)
@@ -1066,14 +1124,23 @@ class DeliveryBroker:
         environment.update({
             "COREPACK_ENABLE_NETWORK": "0", "npm_config_registry": "https://" + REGISTRY + "/",
         })
-        process = self._run_native_check(NativeProcess(
-            self.spec, folder / "process",
-            argv=native_check_argv(self.spec, profile, staging, [
-                "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
-                "--ignore-pnpmfile", "--store-dir", str(dependencies),
-            ]),
-            cwd=staging, environment=environment, timeout=1800, cancelled=self._native_cancelled,
-        ))
+        def launch(name):
+            return self._run_native_check(NativeProcess(
+                self.spec, folder / name,
+                argv=native_check_argv(self.spec, profile, staging, [
+                    "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
+                    "--ignore-pnpmfile", "--store-dir", str(dependencies),
+                ]),
+                cwd=staging, environment=environment, timeout=1800,
+                cancelled=self._native_cancelled,
+            ))
+
+        process = launch("process")
+        if process.get("interrupted_monitor") is True:
+            # A lost monitor leaves no fetch outcome; one fresh invocation repeats it.
+            process = launch("process-retry")
+            if process.get("interrupted_monitor") is True:
+                raise ValueError("native dependency preparation monitor was lost twice")
         unchanged = hashes == write_frozen_inputs(staging, inputs)
         passed = (
             process["exit_code"] == 0
@@ -1432,6 +1499,14 @@ class DeliveryBroker:
             with self.store._connect() as db:
                 prior = db.execute("SELECT 1 FROM delivery_effects WHERE effect_key=?",
                                    (f"publish:{self.spec['run_id']}:{iteration}",)).fetchone()
+                if prior is not None:
+                    # Adopting a retained row re-stamps it, so the invocation that
+                    # inserted it can no longer discard it from a timed-out thread.
+                    db.execute(
+                        "UPDATE delivery_effects SET updated_at=? "
+                        "WHERE effect_key=? AND state='pending'",
+                        (_now(), f"publish:{self.spec['run_id']}:{iteration}"),
+                    )
             self.publication_may_have_effect = prior is not None
         self.validate_candidate_scope()
         publication_branch = self._publication_base_ref()
@@ -1440,6 +1515,9 @@ class DeliveryBroker:
         before = self.candidate()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
         done = self._effect(key, "publish", request)
+        if (self.spec.get("publication_readback_version") == 1
+                and not self.publication_effect_inserted(iteration)):
+            self.publication_may_have_effect = True
         if done:
             found = self._existing_pr()
             if found is None or found["headRefOid"] != done["head"]:
@@ -1484,7 +1562,12 @@ class DeliveryBroker:
             raise ValueError("no meaningful commit is available for publication")
         if self.spec.get("publication_readback_version") == 1:
             self._bind_pending_publication(key, head, existing["number"] if existing else None)
-        remote = _git(self.source, "ls-remote", "origin", f"refs/heads/{self.spec['branch']}")
+        try:
+            remote = _git(self.source, "ls-remote", "origin",
+                          f"refs/heads/{self.spec['branch']}")
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            raise BrokerReadbackUnavailable(
+                "remote branch readback unavailable before push") from exc
         if _git(self.checkout, "remote", "get-url", "--push", "origin") != self.spec["origin_url"]:
             raise RuntimeError("Git push destination changed from the admitted origin")
         remote_head = remote.split()[0] if remote else None
@@ -1511,38 +1594,8 @@ class DeliveryBroker:
                 key, head, existing["number"] if existing else None, remote_confirmed=True,
             )
         if existing is None:
-            title = publication_title(publication_subject(self.spec))
-            body = self.state_dir / "pull-request.md"
-            body.write_text(
-                self.spec["policy"].get("pr_body")
-                or (
-                    f"{title}\n\n"
-                    f"Addresses {self.spec['issue_url']} under the accepted local plan. "
-                    "This PR is published for review and remains unmerged.\n"
-                ),
-                encoding="utf-8",
-            )
-            os.chmod(body, 0o600)
             self.publication_may_have_effect = True
-            _run(
-                [
-                    "gh",
-                    "pr",
-                    "create",
-                    "--repo",
-                    self.spec["github_repo"],
-                    "--head",
-                    self.spec["branch"],
-                    "--base",
-                    publication_branch,
-                    "--title",
-                    title,
-                    "--body-file",
-                    str(body),
-                ],
-                cwd=self.checkout,
-                timeout=90,
-            )
+            self._create_owned_pr(publication_branch)
         # A successful push can precede GitHub's PR-head projection. The
         # durable effect remains pending until a separate read-only
         # reconciliation proves all three heads equal.
@@ -1565,6 +1618,72 @@ class DeliveryBroker:
         self._finish_effect(key, result)
         return result
 
+    def _create_owned_pr(self, publication_branch: str) -> None:
+        """Open the regular PR for the pushed head; an existing one is read back."""
+        title = publication_title(publication_subject(self.spec))
+        body = self.state_dir / "pull-request.md"
+        body.write_text(
+            self.spec["policy"].get("pr_body")
+            or (
+                f"{title}\n\n"
+                f"Addresses {self.spec['issue_url']} under the accepted local plan. "
+                "This PR is published for review and remains unmerged.\n"
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(body, 0o600)
+        try:
+            _run(
+                [
+                    "gh",
+                    "pr",
+                    "create",
+                    "--repo",
+                    self.spec["github_repo"],
+                    "--head",
+                    self.spec["branch"],
+                    "--base",
+                    publication_branch,
+                    "--title",
+                    title,
+                    "--body-file",
+                    str(body),
+                ],
+                cwd=self.checkout,
+                timeout=90,
+            )
+        except RuntimeError as exc:
+            # GitHub refuses a second open PR for one head and base: the
+            # existing PR is this publication, and the caller reads it back.
+            if "already exists" not in str(exc).casefold():
+                raise
+
+    def publication_effect_inserted(self, iteration: int) -> bool:
+        """Whether this broker inserted the publish effect row of ``iteration``."""
+        return (self.inserted_effect is not None
+                and self.inserted_effect[0] == f"publish:{self.spec['run_id']}:{iteration}")
+
+    def discard_unused_publication(self, iteration: int) -> None:
+        """Forget the pending effect of an invocation confirmed to precede any mutation.
+
+        A retained row would make the next attempt treat the same transport
+        failure as a possible lost mutation. Only the invocation that inserted
+        the row and never reached push or PR creation may remove it, and only
+        while the row still carries its insertion stamp: a later attempt that
+        adopted the row re-stamped it and owns it from then on.
+        """
+        if (self.publication_may_have_effect is not False
+                or not self.publication_effect_inserted(iteration)):
+            raise ValueError("publication effect may have taken effect; it cannot be discarded")
+        key, stamp = self.inserted_effect
+        with self.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "DELETE FROM delivery_effects WHERE effect_key=? AND kind='publish' "
+                "AND state='pending' AND updated_at=?",
+                (key, stamp),
+            )
+
     def reconcile_publish(
         self,
         iteration: int,
@@ -1573,11 +1692,14 @@ class DeliveryBroker:
         expected_head: str | None = None,
         expected_pr_number: int | None = None,
         complete: bool = True,
+        create_missing: bool = False,
     ) -> dict[str, Any]:
-        """Complete only an existing publish effect after external readback.
+        """Complete an existing publish effect after external readback.
 
-        This path cannot commit, push, or create a PR. It is safe after a
-        successful push followed by a stale GitHub PR projection.
+        This path cannot commit or push. It is safe after a successful push
+        followed by a stale GitHub PR projection. With ``create_missing`` it
+        opens the PR for a pushed head that has none, so a publication whose
+        PR creation failed converges instead of waiting for nothing.
         """
         key = f"publish:{self.spec['run_id']}:{iteration}"
         self._validate_publication_commits()
@@ -1605,6 +1727,14 @@ class DeliveryBroker:
             original = json.loads(saved["observed_json"] or "null")
             if not original or not original.get("head"):
                 raise ValueError("original publication head has not been observed")
+            # Reading a pending effect adopts it: the invocation that inserted it
+            # can no longer discard the row this reconciliation depends on.
+            with self.store._connect() as db:
+                db.execute(
+                    "UPDATE delivery_effects SET updated_at=? WHERE effect_key=? "
+                    "AND state='pending'",
+                    (_now(), key),
+                )
             if expected_head is not None and expected_head != original["head"]:
                 raise ValueError("publication expected head differs from original effect")
             if (expected_pr_number is not None and original.get("number") is not None
@@ -1646,6 +1776,17 @@ class DeliveryBroker:
         if saved["state"] == "pending" and self.spec.get("publication_readback_version") == 1:
             self._bind_pending_publication(key, head, expected_pr_number, remote_confirmed=True)
         found = self._existing_pr()
+        if (found is None and create_missing and saved["state"] == "pending"
+                and self.spec.get("publication_readback_version") == 1
+                and expected_pr_number is None):
+            # The push is confirmed at this exact head and no PR uses the
+            # branch; finish the original mutation instead of waiting for it.
+            try:
+                self._create_owned_pr(self._publication_base_ref())
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+                raise BrokerReadbackUnavailable(
+                    "owned PR creation is unconfirmed; remote readback required") from exc
+            found = self._existing_pr()
         if found is not None:
             if (self.spec.get("publication_readback_version") == 1
                     and expected_pr_number is not None and found["number"] != expected_pr_number):

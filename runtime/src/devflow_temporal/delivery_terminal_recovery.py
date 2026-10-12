@@ -3,35 +3,83 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 from copy import deepcopy
 from pathlib import Path
 
-from temporalio.client import WorkflowExecutionStatus
-
 from .contracts import canonical_json, digest
 from .delivery_broker import BrokerReadbackUnavailable, DeliveryBroker, _git
+from .delivery_closures import history_sha256
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_resources import RunResources, read_private
 
+logger = logging.getLogger(__name__)
+
+
+async def _closed_execution(store, workflow_id, client, run_id):
+    """Describe the closed execution from Temporal, or from its sealed original."""
+    from .delivery_closures import not_found, sealed_closure
+
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        description = await handle.describe()
+    except Exception as exc:
+        if not not_found(exc):
+            raise
+        sealed = await sealed_closure(store, workflow_id)
+        if sealed is None:
+            raise ValueError('terminal predecessor history is no longer retained and was '
+                             'never sealed') from exc
+        return {'workflow_id': workflow_id, 'execution_run_id': sealed['execution_run_id'],
+                'status': sealed['status'], 'closed_at': sealed['closed_at'],
+                'workflow_type': 'DevflowDeliveryWorkflow',
+                'request_digest': sealed['request_digest'],
+                'recovery_digest': sealed['recovery_digest']}, sealed['history']
+    status = description.status.name if description.status else None
+    closed = {'workflow_id': description.id, 'execution_run_id': description.run_id,
+              'status': status, 'workflow_type': description.workflow_type,
+              'closed_at': (description.close_time.isoformat()
+                            if description.close_time else None),
+              'request_digest': await description.memo_value('request_digest', None),
+              'recovery_digest': await description.memo_value('recovery_digest', None)}
+    if status not in {'COMPLETED', 'TIMED_OUT'} or not description.close_time:
+        return closed, None
+    history = await client.get_workflow_handle(
+        description.id, run_id=description.run_id).fetch_history()
+    await _preserve(store, history, run_id)
+    return closed, history
+
+
+async def _preserve(store, history, run_id):
+    """Seal the history this recovery authenticates; preservation never fails the read."""
+    from .delivery_closures import SealConflict, closure_facts, seal
+
+    try:
+        facts = await closure_facts(history)
+        await asyncio.to_thread(seal, store, history, facts, run_id=run_id, source='temporal')
+    except SealConflict:
+        raise
+    except Exception as exc:
+        logger.warning('Run %s: terminal predecessor was not sealed (%s: %s)',
+                       run_id, type(exc).__name__, exc)
+
 
 async def closed_tail(store, run_id, client):
-    handle = client.get_workflow_handle(store.active_workflow_id(run_id))
-    description = await handle.describe()
-    if (description.status not in {WorkflowExecutionStatus.COMPLETED,
-                                   WorkflowExecutionStatus.TIMED_OUT}
-            or not description.close_time
-            or description.workflow_type != 'DevflowDeliveryWorkflow'):
+    closed, history = await _closed_execution(
+        store, store.active_workflow_id(run_id), client, run_id)
+    if (closed['status'] not in {'COMPLETED', 'TIMED_OUT'}
+            or not closed['closed_at'] or history is None
+            or closed['workflow_type'] != 'DevflowDeliveryWorkflow'):
         raise ValueError('terminal predecessor is not an authentic completed/timed-out delivery')
-    handle = client.get_workflow_handle(description.id, run_id=description.run_id)
-    history = await handle.fetch_history()
     started = history.events[0].workflow_execution_started_event_attributes
     inputs = await DELIVERY_DATA_CONVERTER.decode(started.input.payloads)
     input_spec = inputs[0] if inputs else None
     input_recovery = inputs[1] if len(inputs) > 1 else None
     scheduled = {}
     tail = None
+    settled = set()
     for event in history.events:
         if event.HasField('activity_task_scheduled_event_attributes'):
             attributes = event.activity_task_scheduled_event_attributes
@@ -41,9 +89,20 @@ async def closed_tail(store, run_id, client):
         if event.HasField('activity_task_completed_event_attributes'):
             completed = event.activity_task_completed_event_attributes
             request = scheduled.get(completed.scheduled_event_id)
+            settled.add(completed.scheduled_event_id)
             if request is not None:
                 tail = request
-    if (tail is None and description.status == WorkflowExecutionStatus.TIMED_OUT
+    if scheduled and max(scheduled) not in settled and closed['status'] == 'COMPLETED':
+        from .delivery_closed_projection import failed_terminal_tail
+
+        # The controller's last projection failed inside its boundary; only its
+        # completed result's record binds that exact request as the tail. The
+        # result comes from the authenticated (live or sealed) history.
+        completed = history.events[-1].workflow_execution_completed_event_attributes
+        values = await DELIVERY_DATA_CONVERTER.decode(completed.result.payloads)
+        tail = failed_terminal_tail(values[0] if values else None,
+                                    scheduled[max(scheduled)], max(scheduled)) or tail
+    if (tail is None and closed['status'] == 'TIMED_OUT'
             and isinstance(input_recovery, dict)
             and input_recovery.get('kind') == 'terminal_tracker_recovery'):
         # A queued successor can time out with no worker or before preflight's
@@ -53,11 +112,11 @@ async def closed_tail(store, run_id, client):
     if not isinstance(tail, dict) or tail.get('phase') != 'waiting_tracker':
         raise ValueError('closed Temporal tail has no confirmed pending terminal projection')
     return {
-        'workflow_id': description.id, 'execution_run_id': description.run_id,
-        'status': description.status.name, 'closed_at': description.close_time.isoformat(),
-        'request_digest': await description.memo_value('request_digest', None),
-        'recovery_digest': await description.memo_value('recovery_digest', None),
-        'history_sha256': digest(history.to_json()), 'projection': tail,
+        'workflow_id': closed['workflow_id'], 'execution_run_id': closed['execution_run_id'],
+        'status': closed['status'], 'closed_at': closed['closed_at'],
+        'request_digest': closed['request_digest'],
+        'recovery_digest': closed['recovery_digest'],
+        'history_sha256': history_sha256(history), 'projection': tail,
         'input_spec': input_spec,
         'input_recovery_sha256': digest(input_recovery) if input_recovery else None,
     }
@@ -197,6 +256,10 @@ def _grant(store, run_id, payload, closed):
     state.update(run_id=run_id, revision=tail['protocol_revision'],
                  candidate_revision=row['candidate_revision'],
                  roles=[json.loads(a['result_json']) for a in attempts if a['result_json']])
+    # The predecessor's failed-projection record names its own history events;
+    # the successor starts without it so its own terminal pass binds cleanly.
+    state['checks'] = {key: value for key, value in state['checks'].items()
+                       if key != 'terminal_projection_failure'}
     recovery = {
         'kind': 'terminal_tracker_recovery', 'original_recovery': previous,
         'state': state, 'spec_sha256': digest(spec), 'closed': closed,

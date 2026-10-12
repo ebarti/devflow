@@ -8,7 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,10 +21,10 @@ from test_delivery_resources import spec
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_activities as activities
-from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_broker import CheckSuperseded, DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_process import NativeProcess, process_table, reconcile_process
-from devflow_temporal.delivery_resources import RunResources, read_private
+from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -81,12 +81,14 @@ def owned_checks(tmp_path, monkeypatch):
                     f"time.sleep({self.spec['sleep']})"
                 )
                 self.native_cleanup_confirmed = False
-                self.result = NativeProcess(
+                process = NativeProcess(
                     self.spec, Path(self.spec["state_dir"]) / "native",
                     argv=[sys.executable, "-c", code], cwd=tmp_path,
                     environment={"PATH": os.environ["PATH"]},
                     timeout=self.spec["timeout"], cancelled=self._native_cancelled,
-                ).run()
+                )
+                self.native_journals += (process.journal,)
+                self.result = process.run()
                 self.native_cleanup_confirmed = (
                     self.result["cleanup"] == "observed-native-confirmed"
                 )
@@ -120,8 +122,9 @@ def owned_checks(tmp_path, monkeypatch):
         in_activity=in_activity, heartbeat=heartbeat,
         retained_slots=retained,
     )
-    for descriptor in activities._UNCLEAN_CHECK_SLOTS[retained:]:
-        os.close(descriptor)
+    for entry in activities._UNCLEAN_CHECK_SLOTS[retained:]:
+        for descriptor in entry["descriptors"]:
+            os.close(descriptor)
     del activities._UNCLEAN_CHECK_SLOTS[retained:]
 
 
@@ -527,14 +530,18 @@ async def test_slot_is_held_until_real_monitor_confirms_cleanup(owned_checks, mo
     assert_stopped(owned_checks.brokers["first"])
 
 
-async def test_unknown_cleanup_does_not_release_occupied_slot(owned_checks, monkeypatch):
+async def test_unknown_cleanup_retains_slot_until_recorded_processes_are_gone(
+    owned_checks, monkeypatch,
+):
     owned_checks.config.raw["check_concurrency"] = 1
+    monkeypatch.setattr(activities, "_UNCLEAN_CHECK_RECHECK_INTERVAL", 0.05, raising=False)
     original = NativeProcess.run
     retained = len(activities._UNCLEAN_CHECK_SLOTS)
+    stray = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
 
     def unknown(process):
         result = original(process)
-        result["cleanup"] = "unknown"  # Simulate uncertain evidence after real teardown.
+        result["cleanup"] = "unknown"  # Uncertain evidence after a real teardown.
         return result
 
     monkeypatch.setattr(NativeProcess, "run", unknown)
@@ -542,15 +549,69 @@ async def test_unknown_cleanup_does_not_release_occupied_slot(owned_checks, monk
         result = await activities.delivery_checks(owned_checks.request("uncertain"))
         assert result == {"state": "unknown", "cleanup": "unknown"}
         assert len(activities._UNCLEAN_CHECK_SLOTS) == retained + 1
+        entry = activities._UNCLEAN_CHECK_SLOTS[-1]
+        monkeypatch.setattr(NativeProcess, "run", original)
+        # Only after the retention snapshot does the journal record a monitor
+        # whose exit nobody observed: every proof re-reads the journal.
+        journal = Path(owned_checks.brokers["uncertain"].result["journal"])
+        value = read_private(journal)
+        value["monitor"] = {"pid": stray.pid, **process_table()[stray.pid]}
+        write_private(journal, value)
         task = asyncio.create_task(activities.delivery_checks(owned_checks.request("queued")))
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.3)
+        # A live recorded process keeps the slot retained across admissions.
         assert not owned_checks.brokers["queued"].started.is_set()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained + 1
+        stray.kill()
+        stray.wait()
+        # Once every recorded process is proven gone, the queued gate is admitted.
+        assert await asyncio.wait_for(task, 10) == {"state": "passed", "cleanup": "confirmed"}
+        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained
+        assert_stopped(owned_checks.brokers["queued"])
+        assert list(entry["journals"]) == [str(journal)] and entry["ports"] == []
+        assert len(entry["journals"][str(journal)]) >= 3  # owned tree plus its monitor
     finally:
-        for descriptor in activities._UNCLEAN_CHECK_SLOTS[retained:]:
-            os.close(descriptor)
+        stray.kill()
+        stray.wait()
+        for entry in activities._UNCLEAN_CHECK_SLOTS[retained:]:
+            for descriptor in entry["descriptors"]:
+                os.close(descriptor)
+        del activities._UNCLEAN_CHECK_SLOTS[retained:]
+
+
+async def test_unreadable_journal_keeps_unclean_slot_retained(owned_checks, monkeypatch):
+    owned_checks.config.raw["check_concurrency"] = 1
+    monkeypatch.setattr(activities, "_UNCLEAN_CHECK_RECHECK_INTERVAL", 0.05, raising=False)
+    original = NativeProcess.run
+    retained = len(activities._UNCLEAN_CHECK_SLOTS)
+
+    def unknown(process):
+        result = original(process)
+        result["cleanup"] = "unknown"
+        return result
+
+    monkeypatch.setattr(NativeProcess, "run", unknown)
+    journal = recorded = None
+    try:
+        await activities.delivery_checks(owned_checks.request("uncertain"))
+        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained + 1
+        monkeypatch.setattr(NativeProcess, "run", original)
+        journal = Path(owned_checks.brokers["uncertain"].result["journal"])
+        recorded = journal.read_bytes()
+        journal.write_bytes(b"not a journal")  # Unreadable evidence proves nothing.
+        task = asyncio.create_task(activities.delivery_checks(owned_checks.request("queued")))
+        await asyncio.sleep(0.3)
+        assert not owned_checks.brokers["queued"].started.is_set()
+        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained + 1
+        journal.write_bytes(recorded)
+        assert await asyncio.wait_for(task, 10) == {"state": "passed", "cleanup": "confirmed"}
+        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained
+    finally:
+        if journal is not None and recorded is not None:
+            journal.write_bytes(recorded)
+        for entry in activities._UNCLEAN_CHECK_SLOTS[retained:]:
+            for descriptor in entry["descriptors"]:
+                os.close(descriptor)
         del activities._UNCLEAN_CHECK_SLOTS[retained:]
 
 
@@ -712,3 +773,170 @@ async def test_temporal_stop_reaches_native_monitor_and_frees_slot(
     assert broker.result["timed_out"] is False
     assert_stopped(broker)
     assert owned_checks.maximum() == 1
+
+
+def attempt_info(attempt=1, maximum_attempts=3, budget=timedelta(hours=2),
+                 elapsed=timedelta(0)):
+    """What activity.info() reports for a native gate under the production options."""
+    return SimpleNamespace(
+        attempt=attempt, retry_policy=SimpleNamespace(maximum_attempts=maximum_attempts),
+        schedule_to_close_timeout=budget, scheduled_time=datetime.now(UTC) - elapsed,
+    )
+
+
+@pytest.mark.parametrize("replacement", ["timed_out", "not_found", "worker_shutdown"])
+async def test_replaced_check_attempt_keeps_native_gate_running_for_the_retry(
+    owned_checks, monkeypatch, replacement,
+):
+    # What the SDK reports after a heartbeat timeout, a lost attempt or a
+    # worker shutdown: the attempt is superseded, nobody requested a cancel,
+    # and the activity still has attempts and budget left.
+    monkeypatch.setattr(activities.activity, "cancellation_details", lambda: SimpleNamespace(
+        cancel_requested=False, timed_out=False, not_found=False, worker_shutdown=False,
+        **{replacement: True},
+    ))
+    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info())
+    request = owned_checks.request("one", seconds=2, timeout=60)
+    broker = owned_checks.brokers["one"]
+    folder = Path(request["spec"]["state_dir"]) / "native"
+    journal = folder / "native-process.json"
+    superseded = asyncio.create_task(activities.delivery_checks(request))
+    await wait_until(lambda: observed_native_tree(journal))
+    superseded.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await superseded
+    assert not (folder / "cancel").exists()
+    assert not broker.finished.is_set()
+    # The Temporal retry joins the same durable invocation and scores its real result.
+    assert await activities.delivery_checks(request) == {"state": "passed", "cleanup": "confirmed"}
+    native = broker.result
+    assert native["cancelled"] is False and native["exit_code"] == 0
+    assert native["timed_out"] is False
+    assert not (folder / "cancel").exists()
+    assert read_private(journal)["phase"] == "finished"
+    assert_stopped(broker)
+
+
+@pytest.mark.parametrize("reason", ["cancel_requested", "last_attempt", "budget_exhausted"])
+async def test_final_check_attempt_stop_reaches_native_gate(owned_checks, monkeypatch, reason):
+    details = {"cancel_requested": False, "timed_out": False, "not_found": False,
+               "worker_shutdown": False}
+    info = attempt_info()
+    if reason == "cancel_requested":
+        details["cancel_requested"] = True
+    elif reason == "last_attempt":
+        details["timed_out"] = True
+        info = attempt_info(attempt=3)
+    else:
+        details["timed_out"] = True
+        info = attempt_info(budget=timedelta(seconds=1), elapsed=timedelta(seconds=2))
+    monkeypatch.setattr(activities.activity, "cancellation_details",
+                        lambda: SimpleNamespace(**details))
+    monkeypatch.setattr(activities.activity, "info", lambda: info)
+    request = owned_checks.request("one", seconds=8, timeout=60)
+    broker = owned_checks.brokers["one"]
+    folder = Path(request["spec"]["state_dir"]) / "native"
+    journal = folder / "native-process.json"
+    stopped = asyncio.create_task(activities.delivery_checks(request))
+    await wait_until(lambda: observed_native_tree(journal))
+    stopped.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopped
+    # Nothing would ever reattach: the gate is stopped and its slot is freed.
+    assert (folder / "cancel").exists()
+    assert broker.finished.is_set()
+    assert broker.result["cancelled"] is True and broker.result["exit_code"] != 0
+    assert_stopped(broker)
+
+
+async def test_replaced_attempt_hands_its_gate_to_the_retry(owned_checks, monkeypatch, tmp_path):
+    monkeypatch.setattr(activities.activity, "cancellation_details", lambda: SimpleNamespace(
+        cancel_requested=False, timed_out=False, not_found=True, worker_shutdown=False))
+    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info())
+    request = owned_checks.request("one", seconds=2, timeout=60)
+    broker = owned_checks.brokers["one"]
+    state = Path(request["spec"]["state_dir"])
+    lock, active, peak = threading.Lock(), [0], [0]
+    bodies, launches, superseded = [], [], []
+
+    def native(name, seconds):
+        process = NativeProcess(
+            request["spec"], state / name,
+            argv=[sys.executable, "-c",
+                  "import subprocess,sys,time; "
+                  "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
+                  f"time.sleep({seconds})"],
+            cwd=tmp_path, environment={"PATH": os.environ["PATH"]}, timeout=60,
+            cancelled=broker._native_cancelled,
+        )
+        fresh = not process.journal.exists()
+        try:
+            return broker._run_native_check(process)
+        finally:
+            if fresh and process.journal.exists():
+                launches.append(name)
+
+    def run_checks(iteration, candidate):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        bodies.append(threading.get_ident())
+        try:
+            first = native("native", 2)  # in flight when Temporal replaces the attempt
+            second = native("second", 0.2)  # only the retry may ever launch this one
+            broker.result = first
+            passed = first["exit_code"] == 0 and second["exit_code"] == 0
+            return {"state": "passed" if passed else "failed", "cleanup": "confirmed"}
+        except CheckSuperseded as exc:
+            superseded.append(str(exc))
+            raise
+        finally:
+            with lock:
+                active[0] -= 1
+            broker.finished.set()
+
+    monkeypatch.setattr(broker, "run_checks", run_checks)
+    journal = state / "native" / "native-process.json"
+    replaced = asyncio.create_task(activities.delivery_checks(request))
+    await wait_until(lambda: observed_native_tree(journal))
+    replaced.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await replaced
+    assert await activities.delivery_checks(request) == {"state": "passed", "cleanup": "confirmed"}
+    # One body at a time and one launch per check: the replaced body finished
+    # only the monitor it supervised, then handed the gate to the retry.
+    assert peak[0] == 1 and len(bodies) == 2
+    assert launches == ["native", "second"]
+    assert superseded == ["native check superseded after its monitor"]
+    assert not (state / "native" / "cancel").exists()
+    assert read_private(journal)["result"]["cancelled"] is False
+    assert_stopped(broker)
+    assert len(activities._UNCLEAN_CHECK_SLOTS) == owned_checks.retained_slots
+
+
+async def test_retry_dispatched_before_the_replacement_notice_waits_for_its_predecessor(
+    owned_checks, monkeypatch,
+):
+    # Real ordering after a Mac sleep: the server times out attempt 1 and
+    # dispatches attempt 2 after a 1s backoff, while attempt 1 learns of its
+    # replacement only at its next throttled heartbeat RPC (up to 24s later).
+    monkeypatch.setattr(activities.activity, "cancellation_details", lambda: SimpleNamespace(
+        cancel_requested=False, timed_out=False, not_found=True, worker_shutdown=False))
+    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info())
+    request = owned_checks.request("one", seconds=2, timeout=60)
+    broker = owned_checks.brokers["one"]
+    journal = Path(request["spec"]["state_dir"]) / "native" / "native-process.json"
+    first = asyncio.create_task(activities.delivery_checks(request))
+    await wait_until(lambda: observed_native_tree(journal))
+    retry = asyncio.create_task(activities.delivery_checks(request))
+    await asyncio.sleep(0.5)
+    # The retry supersedes the body this worker already runs and waits for it.
+    assert owned_checks.maximum() == 1 and not retry.done()
+    assert broker.check_superseded()
+    first.cancel()  # the replacement notice arrives after the retry started
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert await retry == {"state": "passed", "cleanup": "confirmed"}
+    assert owned_checks.maximum() == 1
+    assert not (journal.parent / "cancel").exists()
+    assert_stopped(broker)

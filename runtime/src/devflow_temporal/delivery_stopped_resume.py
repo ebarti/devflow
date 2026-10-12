@@ -11,11 +11,18 @@ from .delivery_baseline_contract import repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_config import scope_amended_spec, scope_amendment_config
 from .delivery_execution_config import load_execution_config
-from .delivery_gate_retry import prepare_runtime
+from .delivery_gate_retry import prepare_runtime, transient_stop
 from .delivery_metadata_recovery import _immutable, preserve_resources
-from .delivery_policy_recovery import _remote, _rows, _stopped_cleanup, work_binding
+from .delivery_policy_recovery import (
+    _remote,
+    _rows,
+    _stopped_cleanup,
+    closed_checks,
+    reconciled_cleanup,
+    work_binding,
+)
 from .delivery_preparation import _lock
-from .delivery_repair import published_identity
+from .delivery_repair import _ci_diagnostics, published_identity
 from .delivery_resources import private_directory, read_private
 
 KIND = 'stopped_delivery_resume'
@@ -79,6 +86,33 @@ def fixed_budget_allows(spec, iteration, iterations, *, pending=False):
             and iteration + iterations <= maximum)
 
 
+def _recorded_findings(state):
+    """Findings the stopped iteration's gates recorded for the next repair turn."""
+    iteration = state.get('iteration')
+    recorded = state.get('repair_findings') or {}
+    if recorded.get('iteration') == iteration and recorded.get('findings'):
+        return list(recorded['findings'])
+    return [finding for role in state.get('roles', [])
+            if role.get('iteration') == iteration and role.get('role') in {'review', 'verify'}
+            for finding in role.get('findings') or []]
+
+
+def sealed_ci_findings(seal):
+    """Failed required-CI diagnostics for a stop that recorded no other findings.
+
+    A transport or controller stop that kept a failed CI verdict is repaired
+    from the failed jobs' logs, sealed here exactly as the repair grant seals
+    them; when they cannot be sealed the admission refuses, so no repair turn
+    ever starts without findings.
+    """
+    state = seal['state']
+    ci = (state.get('checks') or {}).get('ci')
+    if (not transient_stop(state) or not isinstance(ci, dict) or ci.get('state') != 'failed'
+            or _recorded_findings(state)):
+        return None
+    return _ci_diagnostics(ci, seal['predecessor_spec'], state.get('pull_request'))
+
+
 def pending_repair(seal):
     """Recover unexecuted work from the sealed admission that requested it."""
     from .delivery_feature_revision_recovery import retained_recovery
@@ -89,6 +123,9 @@ def pending_repair(seal):
             or seal['predecessor_spec'].get('feature_worker', {}).get('kind') == 'build'):
         return None
     state = previous['state']
+    if previous.get('resume_iteration', state['iteration'] + 1) == state['iteration']:
+        # The predecessor re-ran its own sealed iteration; it requested no repair.
+        return None
     iteration = state['iteration'] + 1
     if (previous['execution_spec'] != seal['predecessor_spec']
             or iteration != seal['state']['iteration'] or iteration <= 0):
@@ -99,6 +136,80 @@ def pending_repair(seal):
         for finding in role.get('findings', [])]]
     return {'iteration': iteration,
             'findings': [finding for finding in findings if finding is not None]}
+
+
+def interrupted_resume(seal):
+    """Plan a cancelled worker's continuation that needs no product repair, if any.
+
+    It stays at the sealed iteration. A passed implementation is never run again, a
+    published candidate is never published again, and gates rerun fresh under the
+    admission's own identity.
+    """
+    from .delivery_feature_revision_recovery import gate_evidence
+
+    spec, state = seal['predecessor_spec'], seal['state']
+    if (not spec.get('feature_worker') or state.get('phase') != 'cancelled'
+            or any(isinstance(check, dict) and check.get('state') == 'failed'
+                   for check in state.get('checks', {}).values())):
+        return None
+    roles, iteration = state.get('roles', []), state['iteration']
+    if not roles:
+        # The first implementation never started, and iteration zero is never charged.
+        return {'resume_iteration': 0, 'additional_iterations': 0} if iteration == 0 else None
+    last = max((index for index, role in enumerate(roles) if role.get('role') == 'implement'),
+               default=None)
+    evidence = gate_evidence(seal)
+    attempt = next((item for item in seal['attempts'] if evidence
+                    and item['job_key'] == evidence['implementation_job_key']), None)
+    if (last is None or roles[last].get('status') != 'pass' or attempt is None
+            or attempt['iteration'] != roles[last]['iteration']
+            # The iteration only advances past a passed implementation for a repair.
+            or roles[last]['iteration'] != iteration
+            or any(role.get('status') != 'pass' for role in roles[last + 1:])):
+        return None
+    published = (spec['feature_worker'].get('kind') != 'build'
+                 and (state.get('pull_request') or {}).get('head') == seal['candidate']['head'])
+    return {'resume_iteration': iteration, 'additional_iterations': 0,
+            'resume_stage': 'published' if published else 'checks', 'gate_evidence': evidence}
+
+
+def admission_identity_consistent(details):
+    """Recorded gate and implement admissions must be this admission's. A gate
+    admission may be missing only where gates never rerun at the sealed iteration or
+    on revision recoveries recorded before it existed; an implement admission may be
+    missing on pending repairs recorded before it existed."""
+    spec = details['execution_spec']
+    if spec.get('implement_admission') not in (None, details['command_digest']):
+        return False
+    recorded = spec.get('gate_admission')
+    if recorded is not None:
+        return recorded == details['command_digest']
+    return not ('resume_iteration' in details and not details.get('feature_plan_revision'))
+
+
+def executed_specs(store, spec):
+    """Yield the specs this run executed under, newest first.
+
+    Each resume link is validated only when the walk reaches it, so a stale older
+    link cannot block an implementation that ran under a newer spec.
+    """
+    from .delivery_feature_revision_recovery import retained_recovery
+
+    yield spec
+    with store._connect() as db:
+        row = db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
+                         (spec['run_id'],)).fetchone()
+    recovery = json.loads(row[0]) if row and row[0] else None
+    previous = spec
+    while recovery and recovery.get('kind') == KIND:
+        # Each admission sealed the spec its predecessor execution ran under.
+        with store._connect() as db:
+            if custody(db, recovery) != previous:
+                raise ValueError('resume chain lost its sealed execution authority')
+        details = retained_recovery(recovery)
+        previous = details['predecessor_spec']
+        yield previous
+        recovery = details.get('original_recovery')
 
 
 def observed_native_cleanup(spec, *, read_only=False):
@@ -117,10 +228,13 @@ def custody(db, recovery):
 
     details = retained_recovery(recovery)
     spec = details['execution_spec']
+    # Revision admissions record their own gate resume; any other resume
+    # position comes from an interrupted worker's re-derivable plan.
+    interrupted = 'resume_iteration' in details and not details.get('feature_plan_revision')
     if (spec.get('retry_budget_version') == 1
             and not fixed_budget_allows(spec, recovery['state']['iteration'],
                                         recovery['command']['additional_iterations'],
-                                        pending=bool(recovery.get('pending_repair')
+                                        pending=bool(recovery.get('pending_repair') or interrupted
                                                      or details.get('resume_stage') == 'checks'))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
     path = Path(spec['state_dir']) / namespace(recovery) / 'admission.json'
@@ -137,10 +251,18 @@ def custody(db, recovery):
     if (('pending_repair' in recovery
              and pending_repair(details) != recovery['pending_repair'])
             or (recovery['command']['additional_iterations'] == 0
-                and not (recovery.get('pending_repair')
+                and not (recovery.get('pending_repair') or interrupted
                          or details.get('resume_stage') == 'checks'))):
         raise ValueError('stopped resume changed its unstarted repair authority')
-    if details.get('resume_stage') == 'checks':
+    if not admission_identity_consistent(details):
+        raise ValueError('stopped resume changed its admission identity')
+    if interrupted:
+        plan = interrupted_resume(details) or {}
+        if (plan.get('additional_iterations') != details['command']['additional_iterations']
+                or any(details.get(key) != plan.get(key)
+                       for key in ('resume_iteration', 'resume_stage', 'gate_evidence'))):
+            raise ValueError('stopped resume changed its interrupted iteration authority')
+    elif details.get('resume_stage') == 'checks':
         from .delivery_feature_revision_recovery import gate_evidence
 
         if (not details.get('feature_plan_revision')
@@ -254,14 +376,17 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
         validate_revision_recovery(store, spec, _revision)
         stopped.add('delivered')
     expected_execution = 'terminal' if row['outcome'] in {'cancelled', 'delivered'} else 'blocked'
+    reconciled = reconciled_cleanup(store, row, state)
+    state_checks, row_checks = closed_checks(row, state, reconciled)
     if (row['phase'] not in stopped or row['outcome'] != row['phase']
             or row['execution_state'] != expected_execution or row['cleanup'] != 'confirmed'
             or state.get('run_id') != run_id or state.get('phase') != row['phase']
-            or state.get('outcome') != row['outcome'] or state.get('cleanup') != 'confirmed'
+            or state.get('outcome') != row['outcome']
+            or (state.get('cleanup') != 'confirmed' and reconciled is None)
             or state.get('execution_state') != expected_execution
             or closed.get('workflow_id') != predecessor_id
             or state.get('candidate') != json.loads(row['candidate_json'] or 'null')
-            or state.get('checks') != json.loads(row['checks_json'] or '{}')
+            or state_checks != row_checks
             or state.get('pull_request') != json.loads(row['pr_json'] or 'null')
             or state.get('revision') != row['protocol_revision']
             or state.get('iteration') != row['iteration'] or state.get('error') != row['error']
@@ -308,6 +433,8 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     publication = state.get('pull_request')
     if publication:
         published_identity(broker, candidate, publication)
+        if candidate['head'] != publication['head']:
+            raise ValueError('stopped candidate is not on the published head')
     else:
         if any(e['kind'] == 'publish' for e in effects):
             raise ValueError('unpublished resume has an unresolved publication')
@@ -365,18 +492,24 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
 
         gate_only = gate_only_recovery(store, seal, _revision)
     pending = None if gate_only else pending_repair(seal)
+    ci_findings = None if gate_only else sealed_ci_findings(seal)
     if (command['expected_revision'] != seal['state']['revision']
             or command['expected_iteration'] != seal['state']['iteration']
             or command['expected_candidate_id'] != seal['candidate']['id']
             or command['expected_candidate_head'] != seal['candidate']['head']):
         raise ValueError('stopped resume checkpoint is stale')
-    if command['additional_iterations'] == 0 and not (pending or gate_only):
-        raise ValueError('zero additional iterations require an authenticated pending repair')
+    # Interrupted work needs no repair cycle; only its exact plan is admitted this way.
+    interrupted = None if _revision is not None or pending else interrupted_resume(seal)
+    if interrupted and interrupted['additional_iterations'] != command['additional_iterations']:
+        interrupted = None
+    if command['additional_iterations'] == 0 and not (pending or gate_only or interrupted):
+        raise ValueError('zero additional iterations require an authenticated pending repair '
+                         'or an interrupted iteration')
     maximum = seal['state']['iteration'] + command['additional_iterations']
     if (original.get('retry_budget_version') == 1
             and not fixed_budget_allows(original, seal['state']['iteration'],
                                         command['additional_iterations'],
-                                        pending=bool(pending or gate_only))):
+                                        pending=bool(pending or gate_only or interrupted))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
     amended = scope_spec(store, seal, command)
     if _revision is not None:
@@ -418,6 +551,17 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             execution.pop('role_home_generation')
         if seal.get('session_custody'):
             execution['implementation_role_home_generation'] = seal['session_custody']['generation']
+        # Admission identities belong to one admission; a predecessor's never carry over.
+        for field in ('gate_admission', 'implement_admission'):
+            execution.pop(field, None)
+        if interrupted or gate_only:
+            # Gates may rerun at the sealed iteration, so their attempts take this
+            # admission's identity instead of meeting an earlier execution's receipts.
+            execution['gate_admission'] = command_digest
+        if pending or (interrupted and 'resume_stage' not in interrupted):
+            # The implementer reruns at the sealed iteration with the same input, so
+            # its attempt must not be answered from the failed one's durable receipt.
+            execution['implement_admission'] = command_digest
         candidate = {**seal['candidate'], 'policy_digest': execution['policy_digest']}
         retained = {k: v for k, v in seal.items() if k not in {'row', 'closed'}}
         retained['closed'] = {k: v for k, v in seal['closed'].items() if k != 'result'}
@@ -427,6 +571,9 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                     'predecessor_result_digest': digest(seal['state']),
                     **({'feature_plan_revision': _revision} if _revision is not None else {}),
                     **({'pending_repair': pending} if pending else {}),
+                    **({'ci_findings': ci_findings} if ci_findings else {}),
+                    **({key: value for key, value in interrupted.items()
+                        if key != 'additional_iterations'} if interrupted else {}),
                     **({'resume_stage': 'checks', 'gate_evidence': gate_only,
                         'resume_iteration': seal['state']['iteration']
                         + int(command['additional_iterations'] > 0)} if gate_only else {})}

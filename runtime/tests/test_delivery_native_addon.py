@@ -259,6 +259,7 @@ def test_target_prerequisite_runs_after_successful_original_install_before_tests
     class Process:
         def __init__(self, spec, folder, **options):
             self.folder, self.command = folder, options["argv"]
+            self.journal = folder / "native-process.json"
 
         def run(self):
             sequence.append("install" if "install" in self.command else "test")

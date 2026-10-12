@@ -284,7 +284,17 @@ class ExecutionRegistry:
                 pending = self._pending_revision(db, issue["id"])
                 if (pending and pending.get("successor_id") != run_id
                         and not self._preparation_successor(db, pending, predecessor, run_id)):
-                    raise OwnershipConflict("feature has a recorded plan revision in custody")
+                    raise OwnershipConflict(
+                        "feature has a recorded plan revision in custody: revision "
+                        + str(pending.get("revision_id")) + " reserved by command "
+                        + str((pending.get("request") or {}).get("command_id"))
+                        + " on run " + str(pending.get("predecessor_run_id"))
+                        + " for successor " + str(pending.get("successor_id"))
+                        + "; replay that revise-feature-plan command to admit the successor,"
+                        " or continue-feature the successor if it exists"
+                        " (abandon_revision would permanently reject the pending revision;"
+                        " that is an owner decision, not a retry)"
+                    )
                 generation = old["generation"] + 1
             elif predecessor is not None:
                 raise OwnershipConflict("continuation predecessor is missing")
@@ -727,6 +737,23 @@ class ExecutionRegistry:
                 (state, canonical_json(result), now(), token["issue_id"], key),
             )
 
+    def note_effect(self, token: dict, key: str, result: dict) -> None:
+        """Retain submission diagnostics on a pending effect without settling it."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.require_settlement(db, token)
+            row = db.execute(
+                "SELECT state,generation FROM execution_effects WHERE issue_id=? AND effect_key=?",
+                (token["issue_id"], key),
+            ).fetchone()
+            if not row or row["state"] != "pending" or row["generation"] != token["generation"]:
+                raise OwnershipConflict("external operation has no matching pending intent")
+            db.execute(
+                "UPDATE execution_effects SET result_json=?,updated_at=? "
+                "WHERE issue_id=? AND effect_key=?",
+                (canonical_json(result), now(), token["issue_id"], key),
+            )
+
     def effect(self, issue_id: str, key: str) -> dict | None:
         with self.connect() as db:
             row = db.execute(
@@ -769,10 +796,13 @@ class ExecutionRegistry:
                     "SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
                     (token["issue_id"], bound["repair_key"]),
                 ).fetchone()
+                # The alias is proven by its bound debit and reason; the generation
+                # that wrote it is provenance, so a continuation keeps the same charge.
                 if (
                     not debit
                     or bound.get("reason") != reason
-                    or bound.get("generation") != token["generation"]
+                    or type(bound.get("generation")) is not int
+                    or bound["generation"] > token["generation"]
                 ):
                     raise OwnershipConflict("revision repair alias lost its exact cumulative debit")
                 return {
@@ -813,12 +843,13 @@ class ExecutionRegistry:
             return json.loads(row[0]) if row else None
 
     def checkpoints(self, issue_id: str) -> dict:
+        """Immutable checkpoints in journal order; readers rely on that order as history."""
         with self.connect() as db:
             return {
                 row["checkpoint_key"]: json.loads(row["content_json"])
                 for row in db.execute(
                     "SELECT checkpoint_key,content_json FROM execution_checkpoints "
-                    "WHERE issue_id=?",
+                    "WHERE issue_id=? ORDER BY rowid",
                     (issue_id,),
                 )
             }

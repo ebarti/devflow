@@ -16,6 +16,7 @@ from .delivery_feature_workflow import publication
 from .delivery_github_contract import GitHubDelivery, ordered_chunks
 from .delivery_merge import MergeBroker, native_implementation_output, require_merge_gates
 from .delivery_resources import observe_finalized_resources
+from .delivery_stopped_resume import executed_specs
 
 
 def authorize(store, spec, requested, command, *, settlement=False):
@@ -95,8 +96,9 @@ def evidence(store, parent, record, live, gh):
         implementations = [item for item in attempts if item["role"] == "implement"]
         if not implementations:
             raise OwnershipConflict("chunk lacks native implementation evidence")
+        # A resumed chunk keeps the implementation an earlier sealed execution ran.
         implementations[-1]["controller_output_candidate"] = native_implementation_output(
-            spec, implementations[-1]
+            spec, implementations[-1], executed=executed_specs(store, spec)
         )
         # Endpoint authority is established separately above. All the existing
         # source, independent-session, cleanup and gate requirements still apply.
@@ -166,6 +168,47 @@ def hierarchy(spec, record, gh):
                 raise OwnershipConflict("workstream hierarchy changed before merge or closure")
 
 
+MERGE_SUBMISSIONS = 2
+
+
+def _drafts(members, live):
+    """GitHub refuses to merge a draft layer; the owner's draft is a wait, not a refusal."""
+    waiting = [member["number"] for member, raw in zip(members, live, strict=True)
+               if raw["draft"] and not raw["merged"]]
+    return ({"state": "pending", "reason": "draft_pull_request", "pull_requests": waiting}
+            if waiting else None)
+
+
+def _moved_target(store, spec, members, live, gh):
+    """Return the moved trunk when the lowest unmerged layer's verified base is stale."""
+    opened = next((index for index, raw in enumerate(live) if not raw["merged"]), None)
+    proof = (current_checkpoints(spec).get("verified:" + members[opened]["chunk_id"])
+             if opened is not None else None)
+    if not proof:
+        return None
+    base = store.effective_spec(proof["run_id"])["base_sha"]
+    if not opened:
+        return live[0]["base"]["sha"] if live[0]["base"]["sha"] != base else None
+    # The owner merged the lower layers by hand. The rest merges onto the trunk,
+    # which must hold exactly the tree this layer was verified on.
+    trunk = members[0]["base_branch"]
+    repo = f"repos/{spec['github_repo']}"
+    head = gh.api(f"{repo}/git/ref/heads/{trunk}")["object"]["sha"]
+    if head == base or (gh.api(f"{repo}/git/commits/{head}")["tree"]["sha"]
+                        == gh.api(f"{repo}/git/commits/{base}")["tree"]["sha"]):
+        return None
+    merged = ", ".join("#" + str(member["number"]) for member in members[:opened])
+    raise OwnershipConflict(f"feature PRs {merged} were merged by hand and {trunk} has moved "
+                            "since; the remaining stack needs re-integration before it can merge")
+
+
+def _refused(submissions):
+    last = submissions[-1]
+    detail = (last.get("stderr") or last.get("error") or "").strip() or "no diagnostic output"
+    return (f"feature stack merge was refused {len(submissions)} times; last exit code "
+            f"{last.get('exit_code')}: {detail[-500:]}")
+
+
 def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancelled=None,
           settlement=False):
     gh = gh or GitHubDelivery()
@@ -181,34 +224,61 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
         raise OwnershipConflict("settlement cannot originate a new merge")
     with shared.mutation(token):
         hierarchy(spec, record, gh)
+        # Closed, moved, retargeted or out-of-order merged layers stop here by name.
         live = live_members(spec, record, gh)
-        if any(item["state"] == "closed" and not item["merged"] for item in live):
-            raise OwnershipConflict("a feature PR was closed without merging")
+        members = record["manifest"]["publication"]["members"]
         prior = shared.effect(token["issue_id"], key)
         if prior:
             if prior["kind"] != "feature_merge" or prior["request"]["authority"] != authority:
                 raise OwnershipConflict("original merge authority changed")
             trees = prior["request"]["trees"]
             intent = {"fresh": False, "state": prior["state"]}
+            submissions = (prior["result"] or {}).get("submissions", [])
         else:
-            if any(item["merged"] for item in live) and not all(item["merged"] for item in live):
-                raise OwnershipConflict("partial remote merge requires reconciliation")
-            first = record["manifest"]["publication"]["members"][0]
-            proof = current_checkpoints(spec).get("verified:" + first["chunk_id"])
-            if proof and not live[0]["merged"]:
-                verified = store.effective_spec(proof["run_id"])
-                if live[0]["base"]["sha"] != verified["base_sha"]:
-                    return {"state": "needs_integration", "target": live[0]["base"]["sha"]}
+            layers = [item["merged"] for item in live]
+            if layers != sorted(layers, reverse=True):
+                late = next(member for member, done in zip(
+                    members[layers.index(False):], layers[layers.index(False):],
+                    strict=True) if done)
+                raise OwnershipConflict(
+                    f"feature PR #{late['number']} for chunk {late['chunk_id']} was merged "
+                    "before the stack layers below it")
+            if not all(layers):
+                waiting = _drafts(members, live)
+                if waiting:
+                    return waiting
+                target = _moved_target(store, spec, members, live, gh)
+                if target:
+                    return {"state": "needs_integration", "target": target}
             trees = evidence(store, spec, record, live, gh)
             if cancelled and cancelled.is_set():
                 raise OwnershipConflict("merge cancelled before submission")
             intent = shared.intent(
                 token, key, "feature_merge", {"authority": authority, "trees": trees}
             )
-        members = record["manifest"]["publication"]["members"]
+            submissions = []
         if not all(item["merged"] for item in live):
+            last = submissions[-1] if submissions else {}
             if not intent["fresh"]:
-                return {"state": "pending", "reason": "original_merge_readback", "effect_key": key}
+                if last.get("state") != "failed" or intent["state"] != "pending":
+                    # The original command may still be queued or in flight.
+                    return {"state": "pending", "reason": "original_merge_readback",
+                            "effect_key": key}
+                if settlement:
+                    # GitHub merges a stack all-or-nothing: a refused command had no effect.
+                    shared.finish_effect(token, key, {"submissions": submissions},
+                                         no_effect=True)
+                    return {"state": "absent", "reason": "merge_submission_failed",
+                            "effect_key": key}
+                if len(submissions) >= MERGE_SUBMISSIONS:
+                    raise OwnershipConflict(_refused(submissions))
+                waiting = _drafts(members, live)
+                if waiting:
+                    return waiting
+                if _moved_target(store, spec, members, live, gh):
+                    raise OwnershipConflict(
+                        _refused(submissions) + "; the trunk has moved since, so the stack "
+                        "needs re-integration")
             if record["manifest"]["publication"]["stack_id"]:
                 argv = ["gh", "stack", "merge", str(requested["stack_id"]), "--yes", "--squash"]
             else:
@@ -226,24 +296,48 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
             execute = execute or subprocess.run
             if cancelled and cancelled.is_set():
                 shared.finish_effect(
-                    token, key, {"cancelled_before_submission": True}, no_effect=True
+                    token, key, {"cancelled_before_submission": True,
+                                 **({"submissions": submissions} if submissions else {})},
+                    no_effect=True,
                 )
                 raise OwnershipConflict("merge cancelled before submission")
-            result = execute(
-                argv,
-                cwd=spec["source_path"],
-                env={**os.environ, "GH_REPO": spec["github_repo"], "GH_PROMPT_DISABLED": "1"},
-                capture_output=True,
-                text=True,
-                timeout=540,
-                check=False,
-            )
+            # Record the attempt before running it: an attempt without an outcome
+            # may have reached GitHub and is only ever read back, never repeated.
+            submissions = [*submissions, {"attempt": len(submissions) + 1, "state": "started"}]
+            shared.note_effect(token, key, {"submissions": submissions})
+            try:
+                result = execute(
+                    argv,
+                    cwd=spec["source_path"],
+                    env={**os.environ, "GH_REPO": spec["github_repo"],
+                         "GH_PROMPT_DISABLED": "1"},
+                    capture_output=True,
+                    text=True,
+                    timeout=540,
+                    check=False,
+                )
+            except (FileNotFoundError, PermissionError) as exc:
+                # The command never started, so GitHub received no merge request.
+                submissions[-1] = {**submissions[-1], "state": "failed",
+                                   "error": f"{type(exc).__name__}: {exc}"[-2000:]}
+                shared.note_effect(token, key, {"submissions": submissions})
+                raise
+            submissions[-1] = {**submissions[-1],
+                               "state": "failed" if result.returncode else "submitted",
+                               "exit_code": result.returncode,
+                               "stderr": (getattr(result, "stderr", None) or "")[-2000:]}
+            shared.note_effect(token, key, {"submissions": submissions})
             live = live_members(spec, record, gh)
             if not all(item["merged"] for item in live):
+                if result.returncode and len(submissions) >= MERGE_SUBMISSIONS:
+                    raise OwnershipConflict(_refused(submissions))
                 return {
                     "state": "pending",
-                    "reason": "queued_or_unconfirmed_merge",
+                    "reason": ("merge_submission_failed" if result.returncode
+                               else "queued_or_unconfirmed_merge"),
                     "exit_code": result.returncode,
+                    **({"stderr": submissions[-1]["stderr"][-500:]} if result.returncode
+                       else {}),
                     "effect_key": key,
                 }
         merged = []

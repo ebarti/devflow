@@ -28,6 +28,51 @@ async def test_recorded_delivery_history_replays_on_designated_artifact(path, tm
     await replay_designated_history(path, tmp_path)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker,flag", [
+    ("delivery-liveness-v2", "liveness_v2"),
+    ("delivery-publication-self-heal-v1", "publication_v1"),
+    ("delivery-post-publish-self-heal-v1", "post_publish_v1"),
+])
+async def test_history_recorded_before_a_marker_replays_with_its_flag_false(
+    monkeypatch, marker, flag,
+):
+    """Each fix-program command change is gated on its own marker; an in-flight
+    execution recorded before it replays on the recorded command path."""
+    from temporalio import workflow
+    from temporalio.worker import UnsandboxedWorkflowRunner
+
+    from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
+
+    content = (FIXTURES / "intake-required-history.json").read_text()
+    history = WorkflowHistory.from_json("prior-intake", content)
+    markers = []
+    for event in history.events:
+        if not event.HasField("marker_recorded_event_attributes"):
+            continue
+        details = event.marker_recorded_event_attributes.details
+        for key in ("patch-data", "patch_id"):
+            if key in details:
+                value = (await DELIVERY_DATA_CONVERTER.decode(details[key].payloads))[0]
+                markers.append(value["id"] if isinstance(value, dict) else value)
+    assert marker not in markers
+    observed = []
+    original = workflow.patched
+
+    def patched(name):
+        result = original(name)
+        if name == marker:
+            observed.append((workflow.instance(), result))
+        return result
+
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", patched)
+    await Replayer(workflows=[DeliveryWorkflow],
+                   workflow_runner=UnsandboxedWorkflowRunner()).replay_workflow(history)
+    (instance, result), = observed
+    assert result is False and getattr(instance, flag) is False
+    assert instance.terminal_closing is False
+
+
 def test_original_counterexample_history_bytes_remain_unchanged():
     provenance = json.loads((FIXTURES / "order/provenance.json").read_text())
     for name, expected in provenance["history_sha256"].items():

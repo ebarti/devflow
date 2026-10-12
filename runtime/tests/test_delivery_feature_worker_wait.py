@@ -110,7 +110,9 @@ async def test_long_worker_wait_has_bounded_history_and_remains_cancellable(
                 'command_id': 'stop-existing-worker', 'expected_revision': state['revision'],
                 'reason': 'Preserve the same feature and worker',
             })
-            result = await asyncio.wait_for(handle.result(), 15)
+            # WAIT_CANCELLATION_COMPLETED learns of the cancel on the activity's
+            # next heartbeat, which the SDK throttles to 0.8 x the 60 s budget.
+            result = await asyncio.wait_for(handle.result(), 75 if cancel else 15)
             history = await handle.fetch_history()
     assert result['outcome'] == 'cancelled'
     assert observations >= 100

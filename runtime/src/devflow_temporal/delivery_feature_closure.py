@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 
 from temporalio.client import Client, WorkflowExecutionStatus
 
+from .delivery_closures import history_sha256
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 
 SETTLEMENT = {'delivery_feature_settle_workers'}
@@ -95,7 +95,7 @@ async def failed_checkpoint(history, spec, row, closed):
     state.update(run_id=spec['run_id'], revision=projected['protocol_revision'])
     return {**closed, 'workflow_status': 'FAILED', 'result': state,
             'terminal_projection_event_id': acknowledged,
-            'history_sha256': hashlib.sha256(history.to_json().encode()).hexdigest()}
+            'history_sha256': history_sha256(history)}
 
 
 def closed_coordinator(store, run_id):
@@ -112,12 +112,25 @@ def closed_coordinator(store, run_id):
         row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone())
 
     async def read():
+        from .delivery_closures import not_found, sealed_closure
+
         client = await Client.connect(store.config.temporal_address,
             namespace=store.config.raw.get('temporal_namespace', 'default'),
             data_converter=DELIVERY_DATA_CONVERTER)
         handle = client.get_workflow_handle(closed['workflow_id'],
                                            run_id=closed['execution_run_id'])
-        description = await handle.describe()
+        try:
+            description = await handle.describe()
+        except Exception as exc:
+            if not not_found(exc):
+                raise
+            # Retention deleted the history; only its sealed original can stand in.
+            sealed = await sealed_closure(store, closed['workflow_id'])
+            if (sealed is None or sealed['status'] != 'FAILED'
+                    or sealed['execution_run_id'] != closed['execution_run_id']
+                    or sealed['closed_at'] != closed['closed_at']):
+                raise ValueError('failed feature Temporal closure changed') from exc
+            return await failed_checkpoint(sealed['history'], spec, row, closed)
         if (description.status != WorkflowExecutionStatus.FAILED
                 or not description.close_time or description.run_id != closed['execution_run_id']
                 or description.close_time.isoformat() != closed['closed_at']):

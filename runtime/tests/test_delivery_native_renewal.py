@@ -142,6 +142,10 @@ def test_native_generation_rejects_every_non_payload_or_unapproved_change(
     elif change == 'mode':
         spec['policy']['host_sandbox'] = 'native-profile'
     elif change == 'config':
+        # The sealed snapshot is the authority: only its loss or tampering rejects.
+        snapshot = (Path(spec['state_dir']).parents[1] / 'configuration-snapshots'
+                    / (spec['config_digest'] + '.json'))
+        snapshot.unlink()
         Path(spec['config_path']).write_text('{}')
     else:
         payload['preparation_authority_sha256'] = '0' * 64
@@ -218,3 +222,25 @@ def test_readonly_readiness_does_not_recreate_missing_old_measurement(payload_up
     assert not original.exists()
     assert not (Path(spec['state_dir']) / 'native-preparation-renewal').exists()
     assert Path(spec['preparation']['environment']['path']).read_bytes() == old
+
+
+def test_live_configuration_edits_after_admission_never_block_renewal_or_readback(payload_update):
+    _store, before, payload, _old, _package = payload_update
+    config_path = Path(before['config_path'])
+    original = json.loads(config_path.read_text())
+    # A reformat plus an operational edit after admission: the sealed snapshot,
+    # not the live file, is the authority renewal reads and records.
+    config_path.write_text(json.dumps({**original, 'capacity': 7}, indent=2))
+    observed = renewal.readiness(before, payload)
+    assert observed['required'] is True
+    assert observed['config_sha256'] == before['config_digest']
+    after, reference = renewal.renew(before, payload, digest(payload))
+    assert read_private(Path(reference['path']))['config_sha256'] == before['config_digest']
+    assert renewal.verify_generation(before, reference, after) == after
+    # Later edits, and even the file's absence, leave the generation verifiable
+    # and the renewal replayable.
+    config_path.write_text('{}')
+    assert renewal.verify_generation(before, reference, after) == after
+    config_path.unlink()
+    assert renewal.verify_generation(before, reference, after) == after
+    assert renewal.renew(before, payload, digest(payload)) == (after, reference)

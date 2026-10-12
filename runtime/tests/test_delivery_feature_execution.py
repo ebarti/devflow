@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from copy import deepcopy
 
 import pytest
@@ -70,6 +71,48 @@ def test_admission_claims_remote_identity_and_never_creates_business_features(se
             db.execute("SELECT input_json FROM execution_snapshots").fetchone()[0]
         )
     assert snapshot["issue"]["body"] == "Human scope"
+
+
+def test_admission_reads_github_before_holding_the_tracking_write_lock(service, monkeypatch):
+    store, request, snapshot = feature_service(service, monkeypatch)
+    observed = []
+
+    def github_snapshot(*_args):
+        probe = sqlite3.connect(store.config.tracking_db, timeout=0)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+            probe.rollback()
+        except sqlite3.OperationalError as exc:
+            raise AssertionError("GitHub read while the tracking write lock was held") from exc
+        finally:
+            probe.close()
+        observed.append(True)
+        return deepcopy(snapshot)
+
+    monkeypatch.setattr(GitHubDelivery, "snapshot", github_snapshot)
+    assert not store.submit(request)["existing"]
+    assert observed == [True]
+    spec = store.effective_spec(request["run_id"])
+    assert spec["feature_delivery"]["snapshot"]["issue"]["id"] == "I_feature"
+    assert spec["feature_delivery"]["owner"]["run_id"] == request["run_id"]
+
+
+def test_refused_admission_never_reads_github(service, monkeypatch):
+    from devflow_temporal.delivery_settings import save_repository_access
+
+    legacy, legacy_request = service
+    legacy.submit(legacy_request)  # legacy custody of issue 3 predates the feature run
+    store, request, _ = feature_service(service, monkeypatch)
+    monkeypatch.setattr(GitHubDelivery, "snapshot",
+                        lambda *_args: pytest.fail("GitHub read for a refused admission"))
+    with pytest.raises(OwnershipConflict, match="legacy execution/publication custody"):
+        store.submit({**request, "run_id": "run-2", "command_id": "command-2",
+                      "work_id": "work-2"})
+    save_repository_access(store, {"expected_revision": 0, "allowed_repositories": []})
+    with pytest.raises(ValueError, match="disabled in Settings"):
+        store.submit({**request, "run_id": "run-3", "command_id": "command-3",
+                      "work_id": "work-3",
+                      "issue_url": "https://github.com/example/fixture/issues/5"})
 
 
 
