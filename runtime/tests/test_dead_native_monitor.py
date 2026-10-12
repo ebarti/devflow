@@ -337,6 +337,15 @@ async def test_failed_capacity_sweep_never_finalizes_role_waiting_for_capacity(
         assert attempt(case, waiting_key)["state"] == "queued"
         assert attempt(case)["state"] == "unknown"
         assert len(sweeps) >= 2
+        # A persistent deferral becomes visible on the run, not only in the log.
+        run_id = case.request["spec"]["run_id"]
+        await until(lambda: any(event["type"] == "native_capacity_deferred"
+                                for event in case.store.events(run_id)))
+        deferred = [event for event in case.store.events(run_id)
+                    if event["type"] == "native_capacity_deferred"][0]
+        assert deferred["payload"]["job_key"] == waiting_key
+        assert deferred["payload"]["consecutive_deferrals"] == 3
+        assert "capacity sweep could not resolve 1 native attempt" in deferred["message"]
         monkeypatch.setattr(delivery_orphans, "process_table", native.process_table)
         await until(lambda: attempt(case, waiting_key)["state"] != "queued")
         (case.state / "release-provider").touch()

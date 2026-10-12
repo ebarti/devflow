@@ -24,6 +24,10 @@ from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
 
 _LOG = logging.getLogger(__name__)
+# Admission polls run about once a second; a persistent deferral is recorded
+# on the run after this many consecutive ones and again every so often.
+_DEFERRAL_NOTICE_AFTER = 3
+_DEFERRAL_NOTICE_EVERY = 60
 
 
 def activity_attempt_replaced() -> bool:
@@ -97,9 +101,12 @@ class DeliverySupervisor:
         self.store = store
         self.capacity = capacity
         self.job_locks: dict[str, asyncio.Lock] = {}
+        # Consecutive admission polls per queued role that a failed sweep or a
+        # busy store deferred; persistent waits are surfaced on the run.
+        self.deferrals: dict[str, int] = {}
 
-    def _reconcile_capacity(self) -> None:
-        """Release dead native owners before admission; a failed sweep only retains slots."""
+    def _reconcile_capacity(self) -> int:
+        """Release dead native owners before admission; return failures that only retain slots."""
         from .delivery_orphans import _complete_attempt
 
         try:
@@ -110,7 +117,8 @@ class DeliverySupervisor:
                 )]
         except Exception as exc:
             _LOG.warning("Capacity sweep could not read native attempts: %s", exc)
-            return
+            return 1
+        failures = 0
         for attempt in attempts:
             try:
                 spec = self.store.effective_spec(attempt["run_id"])
@@ -125,16 +133,18 @@ class DeliverySupervisor:
             except Exception as exc:
                 # An unavailable process table, port inspection or store retains
                 # the slot too: the sweep is never charged to a waiting role.
+                failures += 1
                 _LOG.warning("Capacity sweep could not resolve native attempt %s: %s",
                              attempt["job_key"], exc)
                 continue
+        return failures
 
     def _enter_capacity(self, job_key: str, *, cancelled=None, stop_requested=None) -> str | None:
         try:
             if cancelled is not None and cancelled():
                 raise ValueError("native role cancelled before capacity admission")
-            self._reconcile_capacity()
-            return self._admit(job_key, cancelled=cancelled, stop_requested=stop_requested)
+            failures = self._reconcile_capacity()
+            admitted = self._admit(job_key, cancelled=cancelled, stop_requested=stop_requested)
         except sqlite3.OperationalError as exc:
             code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
             if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
@@ -143,7 +153,41 @@ class DeliverySupervisor:
             # a write transaction): the role is simply not admitted yet and
             # polls again. A busy store is never a launch failure.
             _LOG.warning("Native capacity admission deferred for %s: %s", job_key, exc)
+            self._defer_admission(job_key, f"store busy: {exc}")
             return None
+        if failures and not admitted:
+            self._defer_admission(
+                job_key, f"capacity sweep could not resolve {failures} native attempt(s)",
+            )
+        else:
+            self.deferrals.pop(job_key, None)
+        return admitted
+
+    def _defer_admission(self, job_key: str, reason: str) -> None:
+        """Count consecutive deferred polls; a persistent wait is recorded on its run."""
+        count = self.deferrals[job_key] = self.deferrals.get(job_key, 0) + 1
+        if count != _DEFERRAL_NOTICE_AFTER and count % _DEFERRAL_NOTICE_EVERY:
+            return
+        try:
+            with self.store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT run_id, role, iteration FROM delivery_attempts WHERE job_key=?",
+                    (job_key,),
+                ).fetchone()
+                if row is None:
+                    return
+                run = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                                 (row["run_id"],)).fetchone()
+                self.store._event(
+                    db, row["run_id"], run["revision"], "native_capacity_deferred",
+                    f"Native {row['role']} role still waits for capacity: {reason}",
+                    {"job_key": job_key, "role": row["role"], "iteration": row["iteration"],
+                     "consecutive_deferrals": count, "reason": reason},
+                )
+        except Exception as exc:
+            # A store that cannot even record the wait leaves the log as the signal.
+            _LOG.warning("Capacity deferral of %s could not be recorded: %s", job_key, exc)
 
     def _admit(self, job_key: str, *, cancelled=None, stop_requested=None) -> str | None:
         """Claim one shared DB slot inside a single admission transaction."""

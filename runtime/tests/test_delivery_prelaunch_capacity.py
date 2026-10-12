@@ -1014,9 +1014,12 @@ async def test_busy_store_defers_admission_without_failing_the_waiting_role(
         assert len(polls) >= seen + 2 and polls[seen:] == [None] * len(polls[seen:])
         row, occupied = observed_row()
         assert row['state'] == 'queued' and occupied == 0
+        # The wait is counted; the busy store itself cannot record it yet.
+        assert case.owner.deferrals[case.key] >= 2
         blocker.rollback()
         monkeypatch.setattr(sqlite3, 'connect', sqlite_connect)
         result = await asyncio.wait_for(task, 20)
+        assert case.key not in case.owner.deferrals
     finally:
         blocker.close()
         await asyncio.gather(task, return_exceptions=True)
