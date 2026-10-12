@@ -112,13 +112,50 @@ def settle(store, spec, *, gh=None):
             (token["issue_id"],),
         )]
     for entry in pending:
-        if shared.effect(token["issue_id"], entry["effect_key"])["state"] != "pending":
+        key = entry["effect_key"]
+        if shared.effect(token["issue_id"], key)["state"] != "pending":
             continue
         try:
             settle_one(store, spec, entry, gh or GitHubDelivery())
+        except UnresolvedEffect as exc:
+            # GitHub has not shown the operation yet. The durable coordinator waits
+            # here with its original generation; no new product attempt or blind
+            # remote write is authorized.
+            return {"state": "pending", "effect_key": key, "kind": entry["kind"],
+                    "reason": f"{type(exc).__name__}: {str(exc)[:300]}"}
+        except OwnershipConflict as exc:
+            # A definitive verdict: what GitHub shows contradicts the recorded
+            # operation, so waiting cannot settle it. It is still neither confirmed
+            # nor dropped here; only a restored remote state can settle it.
+            return {"state": "contradicted", "effect_key": key, "kind": entry["kind"],
+                    "reason": f"{type(exc).__name__}: {str(exc)[:300]}",
+                    "remedy": remedy(spec, entry)}
         except Exception as exc:
-            # The durable coordinator waits here with its original generation.
-            # No new product attempt or blind remote write is authorized.
-            return {"state": "pending", "effect_key": entry["effect_key"],
+            # Transport and other transient readback failures: read back again later.
+            return {"state": "pending", "effect_key": key, "kind": entry["kind"],
                     "reason": f"{type(exc).__name__}: {str(exc)[:300]}"}
     return {"state": "confirmed"}
+
+
+def remedy(spec, entry):
+    """Name the recorded remote state an operator must restore for this operation
+    to read back; the effect itself is never confirmed or dropped without that."""
+    issue = spec["feature_delivery"]["snapshot"]["issue"]
+    kind, request = entry["kind"], json.loads(entry["request_json"])
+    where = issue["repository"]
+    if kind == "github_plan_label":
+        return f"restore the plan label {request['name']!r} on {where}"
+    if kind == "github_record":
+        return (f"restore delivery comment {request['comment_id']} on {where}#{issue['number']} "
+                "to its recorded content")
+    if kind == "feature_merge":
+        numbers = ", ".join(
+            "#" + str(item["number"])
+            for item in request["authority"]["publication"]["pull_requests"])
+        return (f"restore stack PRs {numbers} on {where} to their recorded state "
+                "(reopen, retarget or restore the merged head)")
+    if kind == "close_merged_issue":
+        return "restore the original stack merge this issue closure belongs to"
+    if kind == "publish_chunk":
+        return f"restore the publication of worker {request['run_id']} to this feature"
+    return "restore the recorded GitHub state this operation expects"
