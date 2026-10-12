@@ -770,6 +770,7 @@ def test_replayed_continuation_survives_a_deployment_without_spending(
     assert shared.budget(issue_id)["used"] == 7
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
 def test_reserved_revision_without_index_room_waits_unwritten_until_the_index_fits(
     pending_preparation, monkeypatch,
 ):
@@ -809,3 +810,50 @@ def test_reserved_revision_without_index_room_waits_unwritten_until_the_index_fi
     assert response["run_id"] == shared.current(issue_id)["run_id"]
     retry = revisions._preparation_retry_key(p["admitted"]["revision_id"])
     assert shared.checkpoints(issue_id)[retry]["command"] == request
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
+def test_over_capacity_record_still_closes_a_started_reservation_with_its_debit(
+    pending_preparation, monkeypatch,
+):
+    from datetime import UTC, datetime
+
+    from devflow_temporal import delivery_feature_publication as publications
+    from devflow_temporal import delivery_github_plans as plans
+
+    p = pending_preparation
+    store, shared, spec, request = (p[k] for k in ("store", "shared", "spec", "request"))
+    token = spec["feature_delivery"]["owner"]
+    issue_id = token["issue_id"]
+    revision_id = p["admitted"]["revision_id"]
+    served = publications.current_record
+
+    def oversized(*args, **kwargs):
+        record = deepcopy(served(*args, **kwargs))
+        record["manifest"]["plan"]["acceptance"].extend(
+            f"Requirement {index} " + "x" * 4000 for index in range(16))
+        return record
+
+    monkeypatch.setattr(publications, "current_record", oversized)
+    issue = spec["feature_delivery"]["snapshot"]["issue"]
+    assert plans.publication_capacity(issue, oversized(spec)["manifest"])["fits"] is False
+    # The reservation was charged by its generation, so no command can carry it.
+    with shared.connect() as db:
+        db.execute("INSERT INTO execution_repairs VALUES (?,?,?,?,?)",
+                   (issue_id, "plan-revision:" + revision_id, token["generation"],
+                    "Planning correction " + revision_id, datetime.now(UTC).isoformat()))
+    budget = shared.budget(issue_id)
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("capacity must not be consulted for a started reservation")
+
+    monkeypatch.setattr(plans, "require_publication_capacity", never)
+    with pytest.raises(OwnershipConflict, match="reserved revision " + revision_id
+                       + " attempt stopped before adoption and is now closed"):
+        execution.continue_feature(store, spec["run_id"], request)
+    closed = shared.checkpoints(issue_id)[revisions.PREFIX + "rejected:" + revision_id]
+    assert closed["repair_key"] == "plan-revision:" + revision_id
+    assert "closed by continuation command " + request["command_id"] in closed["reason"]
+    # The debit is kept and the feature continues without the revision.
+    assert shared.budget(issue_id) == budget
+    assert revisions.revision_request(spec, shared) is None
