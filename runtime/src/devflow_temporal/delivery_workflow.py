@@ -796,7 +796,8 @@ class DeliveryWorkflow:
         if self.cancel_requested:
             self.state["cleanup"] = "unknown"
             return await self._cancelled(spec)
-        if ((self.original_execution or self.post_publish_v1)
+        # Duck-typed controllers run this stop unbound and carry no marker flag.
+        if ((self.original_execution or getattr(self, "post_publish_v1", False))
                 and spec.get("automatic_retry_version") == 1):
             self.state["checks"]["failure"] = {
                 **_failure_classification(cause, controller_cause),
