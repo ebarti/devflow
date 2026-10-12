@@ -22,9 +22,16 @@ from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
 
 
-def _process_identity(pid: int) -> str | None:
+def _process_identity(pid: int, *, canonical: bool = False) -> str | None:
+    """The process start time as ``ps`` prints it.
+
+    ``canonical`` fixes the locale and time zone, so an identity recorded for
+    a long-lived member still matches after either changes on the host.
+    """
+    env = {**os.environ, "LC_ALL": "C", "TZ": "UTC0"} if canonical else None
     result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False
+        ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False,
+        env=env,
     )
     value = result.stdout.strip()
     return value if result.returncode == 0 and value else None

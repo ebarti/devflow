@@ -3083,7 +3083,9 @@ class DeliveryStore:
         with self._connect() as db:
             rows = db.execute(
                 """SELECT r.run_id,r.request_digest,r.request_json,r.workflow_id,
-                          r.recovery_json FROM delivery_runs r
+                          r.recovery_json,o.state AS outbox_state,o.attempts,
+                          o.last_error,o.updated_at AS outbox_updated_at
+                   FROM delivery_runs r
                    JOIN delivery_outbox o ON o.run_id=r.run_id
                    WHERE o.state IN ('pending','unknown') ORDER BY r.created_at"""
             ).fetchall()
@@ -3166,6 +3168,83 @@ class DeliveryStore:
                 "Temporal accepted the run" if accepted else "Temporal dispatch remains pending",
                 {"error": error} if error else {},
             )
+
+    def record_dispatch_failure(
+        self, run_id: str, reason: str, *, uncertain: bool = False, counted: bool = True,
+    ) -> None:
+        """Record why this cycle did not dispatch the run, once per distinct reason.
+
+        The outbox row carries the failure (``last_error``, ``attempts``); the
+        run's revision and timeline move only when the reason changes, so a
+        poison row or a transport outage polled every few seconds does not
+        churn every dashboard command and bury the timeline. ``uncertain``
+        marks a start whose acknowledgement is unknown; ``counted`` is False
+        for a cycle that reached no row (the per-row backoff stays untouched).
+        """
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT o.state,o.last_error,o.attempts,r.revision FROM delivery_outbox o
+                   JOIN delivery_runs r ON r.run_id=o.run_id
+                   WHERE o.run_id=? AND o.state IN ('pending','unknown')""",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return
+            state = "unknown" if uncertain else row[0]
+            # Accepted starts count attempts too, and admissions re-queue a row
+            # by clearing last_error only: a failure after that starts a fresh
+            # sequence, and an outage that reached no row arms no backoff.
+            fresh = row[1] is None
+            attempts = (1 if fresh else row[2] + 1) if counted else (0 if fresh else row[2])
+            db.execute(
+                """UPDATE delivery_outbox SET state=?,attempts=?,last_error=?,updated_at=?
+                   WHERE run_id=?""",
+                (state, attempts, reason, _now(), run_id),
+            )
+            if row[1] == reason:
+                return
+            revision = row[3] + 1
+            db.execute(
+                "UPDATE delivery_runs SET revision=?,updated_at=? WHERE run_id=?",
+                (revision, _now(), run_id),
+            )
+            self._event(
+                db, run_id, revision, "temporal_pending",
+                "Temporal dispatch remains pending", {"error": reason},
+            )
+
+    def mark_start_conflict(self, run_id: str, workflow_id: str, reason: str) -> None:
+        """Block a run whose workflow ID is held by a different request.
+
+        The remote memo proves the ID belongs to another request, so no retry
+        can acknowledge it. The run is projected blocked like any other stop
+        before roles and its error names the recovery: a new submission of the
+        same work that supersedes it, or in feature mode, where supersede is
+        refused, continuing the feature coordinator. The outbox entry becomes
+        terminal, so the row is told once instead of polled. The projection
+        comes first: a row left pending is retried and the keyed event is not
+        repeated.
+        """
+        spec = self.submitted_spec(run_id)
+        feature = bool(spec.get("feature_delivery")) or (
+            self.config.raw.get("feature_delivery_version") == 1)
+        remedy = ("continue the feature coordinator with continue-feature" if feature
+                  else "submit the work again naming this run in supersedes_run_id")
+        self.project(
+            run_id, phase="blocked", execution_state="blocked", event_type="blocked",
+            message="Temporal workflow ID is held by a different request",
+            outcome="blocked", error=f"{reason}; {remedy}",
+            key=f"temporal-conflict:{workflow_id}",
+        )
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE delivery_outbox SET state='conflict',last_error=?,updated_at=?
+                   WHERE run_id=? AND state IN ('pending','unknown')""",
+                (reason, _now(), run_id),
+            )
+        logger.warning("Run %s is blocked: %s", run_id, reason)
 
     def project(
         self,
