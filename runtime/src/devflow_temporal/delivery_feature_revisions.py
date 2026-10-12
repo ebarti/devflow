@@ -577,13 +577,14 @@ def _current_runtime_selectors(selectors):
 
 
 def _refresh_preparation_reconsideration(store, original, public, values):
+    from .delivery_feature_review_context import compatible_external_guards
+
     receipt = public.get("reconsideration")
     if not receipt:
         raise OwnershipConflict("pending preparation lacks its authenticated review context")
     current, selectors = _current_runtime_selectors(public["request"]["reconsideration"])
-    if ({k: v for k, v in current.items() if k not in RUNTIME_PROVENANCE}
-            != {k: v for k, v in receipt["current_runtime"].items()
-                if k not in RUNTIME_PROVENANCE}):
+    if (current["context_sha256"] != receipt["current_runtime"]["context_sha256"]
+            or not compatible_external_guards(receipt["current_runtime"], current)):
         raise OwnershipConflict("preparation retry changed its normalized review context")
     proof, findings = _reconsideration_proof(
         store, original, selectors, public["record"], public["predecessor_closure"], values,
@@ -1628,7 +1629,12 @@ def _worker_subject(store, parent, previous, proposal, values):
 
 
 def _prove_reconsideration(store, spec, selectors, record, closure, values, *, planning_paid=False):
-    from .delivery_feature_review_context import SCHEMA, candidate_subject, current_runtime_context
+    from .delivery_feature_review_context import (
+        SCHEMA,
+        candidate_subject,
+        compatible_external_guards,
+        current_runtime_context,
+    )
 
     selected_id = selectors["rejected_revision_id"]
     rejected = values.get(PREFIX + "rejected:" + selected_id)
@@ -1649,7 +1655,7 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values, *, p
     if (current["revision"] != selectors["expected_runtime_revision"]
             or current["runtime_payload_sha256"] != selectors["expected_runtime_payload_sha256"]):
         raise OwnershipConflict("reconsideration current runtime expectation is stale")
-    if current["guards"] != historical["runtime"]["guards"]:
+    if not compatible_external_guards(historical["runtime"], current):
         raise ValueError("reconsideration changed an external authority/model binding")
     if current["context_sha256"] == historical["runtime"]["context_sha256"]:
         raise ValueError("reconsideration requires a changed relevant derivation context")
@@ -1667,7 +1673,7 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values, *, p
     ):
         proof = historical if item == rejected else _historical_rejection(store, spec, item, values)
         if proof["classification"] == "genuine":
-            if proof["runtime"]["guards"] != current["guards"]:
+            if not compatible_external_guards(proof["runtime"], current):
                 raise ValueError("prior genuine review has unsupported external bindings")
             if proof["runtime"]["context_sha256"] == current["context_sha256"]:
                 raise ValueError("proposal already received genuine findings in current context")

@@ -1,7 +1,8 @@
 """Data-only, bounded provenance for a fresh review after a controller repair.
 
-Historical Python is parsed, never imported or executed. Version one deliberately
-admits only the two declared derivation roots and unchanged external guards.
+Historical Python is parsed, never imported or executed. Version-one digests
+remain intact; a separate bounded comparison can prove GitHub authority/manifest
+compatibility outside the two declared derivation roots.
 """
 from __future__ import annotations
 
@@ -307,6 +308,155 @@ def normalized_context(sources):
         name: hashlib.sha256(_normalized(ast.parse(sources[name])).encode()).hexdigest()
         for name in GUARDS
     }}
+
+
+def _github_projection(source):
+    """Protect the entire contract except bounded, pure transport classification.
+
+    Literal lifting and a straight-line body extraction are compared after
+    inlining. This is authority/manifest equivalence, not transport equivalence.
+    """
+    tree = _WithoutDocumentation().visit(ast.parse(source))
+    definitions = {}
+    for node in tree.body:
+        names = ([node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else
+                 [t.id for t in node.targets if isinstance(t, ast.Name)]
+                 if isinstance(node, ast.Assign) else
+                 [a.asname or a.name.split(".")[0] for a in node.names]
+                 if isinstance(node, (ast.Import, ast.ImportFrom)) else [])
+        for name in names:
+            if name in definitions:
+                raise ValueError("GitHub compatibility has ambiguous bindings")
+            definitions[name] = node
+    removed = set()
+    limit = definitions.get("PARENT_INDEX_LIMIT")
+    if limit is not None:
+        if (not isinstance(limit, ast.Assign) or len(limit.targets) != 1
+                or not isinstance(limit.value, ast.Constant) or limit.value.value != 60000):
+            raise ValueError("GitHub compatibility changed the manifest size limit")
+        removed.add("PARENT_INDEX_LIMIT")
+    helper = definitions.get("manifest_body")
+    encoder = definitions.get("encode_manifest")
+    if helper is not None:
+        if (not isinstance(helper, ast.FunctionDef) or not isinstance(encoder, ast.FunctionDef)
+                or helper.decorator_list or helper.type_params
+                or helper.args.defaults or helper.args.kw_defaults
+                or _normalized(helper.args) != _normalized(encoder.args)
+                or not helper.body or not encoder.body
+                or not isinstance(helper.body[-1], ast.Return)
+                or sum(isinstance(n, ast.Return) for n in ast.walk(helper)) != 1
+                or _normalized(encoder.body[0]) != _normalized(ast.parse(
+                    "body = manifest_body(manifest)").body[0])
+                or sum(isinstance(n, ast.Name) and n.id == "manifest_body"
+                       for n in ast.walk(tree)) != 1):
+            raise ValueError("GitHub compatibility has unsupported manifest extraction")
+        encoder.body = [*deepcopy(helper.body[:-1]),
+                        ast.Assign(targets=[ast.Name(id="body", ctx=ast.Store())],
+                                   value=deepcopy(helper.body[-1].value)), *encoder.body[1:]]
+        removed.add("manifest_body")
+    classifier = definitions.get("github_transient")
+    if classifier is not None:
+        allowed = (ast.FunctionDef, ast.arguments, ast.arg, ast.Name, ast.Load, ast.Store,
+                   ast.Constant, ast.Return, ast.If, ast.Assign, ast.BoolOp, ast.And, ast.Or,
+                   ast.Compare, ast.Is, ast.IsNot, ast.GtE, ast.Eq, ast.Call, ast.Attribute,
+                   ast.BinOp, ast.BitOr)
+        if (not isinstance(classifier, ast.FunctionDef) or classifier.decorator_list
+                or classifier.type_params
+                or classifier.args.defaults or classifier.args.kw_defaults
+                or classifier.args.vararg or classifier.args.kwarg
+                or classifier.args.posonlyargs or classifier.args.kwonlyargs
+                or any(isinstance(n, ast.Call) for n in ast.walk(classifier.args))
+                or [a.arg for a in classifier.args.args] != ["status", "stderr"]):
+            raise ValueError("GitHub compatibility has an eager or dynamic classifier")
+        for node in ast.walk(classifier):
+            if (not isinstance(node, allowed)
+                    or isinstance(node, ast.FunctionDef) and node is not classifier
+                    or isinstance(node, ast.Assign) and (
+                        len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name)
+                        or node.targets[0].id != "text")
+                    or isinstance(node, ast.Name) and node.id not in {
+                        "status", "stderr", "text", "re", "int", "str", "bool",
+                        "_GH_CONNECTION", "_GH_CERTIFICATE"}
+                    or isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                    and node.id != "text"
+                    or isinstance(node, ast.Call) and (node.keywords
+                        or not isinstance(node.func, ast.Attribute)
+                        or not isinstance(node.func.value, ast.Name)
+                        or (node.func.value.id, node.func.attr) not in {
+                            ("re", "search"), ("_GH_CONNECTION", "search"),
+                            ("_GH_CERTIFICATE", "search")})):
+                raise ValueError("GitHub compatibility classifier is not side-effect-free")
+        transient = definitions.get("GitHubTransientError")
+        if (not isinstance(transient, ast.ClassDef) or transient.decorator_list
+                or transient.keywords or transient.body
+                or [ast.unparse(n) for n in transient.bases] != ["GitHubContractError"]):
+            raise ValueError("GitHub compatibility changed its contract error hierarchy")
+        for name in ("_GH_CONNECTION", "_GH_CERTIFICATE"):
+            pattern = definitions.get(name)
+            if (not isinstance(pattern, ast.Assign) or len(pattern.targets) != 1
+                    or not isinstance(pattern.value, ast.Call) or pattern.value.keywords
+                    or ast.unparse(pattern.value.func) != "re.compile"
+                    or len(pattern.value.args) != 2
+                    or not isinstance(pattern.value.args[0], ast.Constant)
+                    or not isinstance(pattern.value.args[0].value, str)
+                    or ast.unparse(pattern.value.args[1]) != "re.IGNORECASE"):
+                raise ValueError("GitHub compatibility has a dynamic transport pattern")
+        delivery = definitions.get("GitHubDelivery")
+        api = next((n for n in delivery.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "api"), None) if isinstance(delivery, ast.ClassDef) else None
+        failure = next((n for n in api.body if isinstance(n, ast.If)
+                        and ast.unparse(n.test) == "result.returncode"), None) if api else None
+        if failure is None or len(failure.body) != 5:
+            raise ValueError("GitHub compatibility changed transport failure structure")
+        match, status, message, conditional, final = failure.body
+        aliases = {}
+        for node, name in ((status, "status"), (message, "message")):
+            if (not isinstance(node, ast.Assign) or len(node.targets) != 1
+                    or ast.unparse(node.targets[0]) != name):
+                raise ValueError("GitHub compatibility changed failure arguments")
+            aliases[name] = node.value
+        if (not isinstance(conditional, ast.If) or conditional.orelse
+                or ast.unparse(conditional.test) != "github_transient(status, result.stderr)"
+                or len(conditional.body) != 1 or not isinstance(final, ast.Raise)
+                or not isinstance(final.exc, ast.Call)
+                or ast.unparse(final.exc.func) != "GitHubContractError"
+                or final.cause is not None):
+            raise ValueError("GitHub compatibility changed failure classification")
+        expected = deepcopy(final)
+        expected.exc.func = ast.Name(id="GitHubTransientError", ctx=ast.Load())
+        if _normalized(conditional.body[0]) != _normalized(expected):
+            raise ValueError("GitHub compatibility changed transient failure payload")
+        class Expand(ast.NodeTransformer):
+            def visit_Name(self, node):
+                return deepcopy(aliases[node.id]) if node.id in aliases else node
+        failure.body = [match, Expand().visit(final)]
+        removed.update({"github_transient", "GitHubTransientError", "_GH_CONNECTION",
+                        "_GH_CERTIFICATE"})
+    tree.body = [n for n in tree.body if not any(definitions.get(k) is n for k in removed)]
+    class Literal(ast.NodeTransformer):
+        def visit_Name(self, node):
+            if node.id == "PARENT_INDEX_LIMIT" and isinstance(node.ctx, ast.Load) and limit:
+                return ast.Constant(value=60000)
+            return node
+    return _normalized(Literal().visit(tree))
+
+
+def compatible_external_guards(previous, current):
+    """Authenticate both full payloads; permit only the bounded GitHub projection."""
+    if previous["guards"] == current["guards"]:
+        return True
+    if (set(previous["guards"]) != set(GUARDS) or set(current["guards"]) != set(GUARDS)
+            or any(previous["guards"][name] != current["guards"][name]
+                   for name in GUARDS if name != "delivery_github_contract.py")):
+        return False
+    sources = []
+    for receipt in (previous, current):
+        source, payload = _sources(_protected_root(), receipt["revision"])
+        if ({"revision": receipt["revision"], "runtime_payload_sha256": payload,
+             **normalized_context(source)} != receipt):
+            raise ValueError("GitHub compatibility lost its exact authenticated runtime")
+        sources.append(source["delivery_github_contract.py"])
+    return _github_projection(sources[0]) == _github_projection(sources[1])
 
 
 def authenticated_runtime_context(identity):
