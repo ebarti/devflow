@@ -302,9 +302,20 @@ def _stop(config: DeliveryConfig, manifest: dict) -> dict:
     return results
 
 
+def _stopped_marker(config: DeliveryConfig) -> Path:
+    """Where an explicit `stop` records the owner's intent for supervised starts."""
+    return config.state_root / "service-stopped.json"
+
+
 def service_stop(config: DeliveryConfig) -> dict:
     with _lifecycle_lock(config, _deadline(config)):
-        return _stop(config, _read_manifest(config) or {"processes": {}})
+        results = _stop(config, _read_manifest(config) or {"processes": {}})
+        # A supervisor's periodic start must not undo this; the next explicit
+        # start, restart or write-triggered start lifts it.
+        descriptor = os.open(_stopped_marker(config), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump({"command": "stop", "stopped_at": time.time()}, stream)
+        return results
 
 
 def _registered_worker(config: DeliveryConfig, processes: dict) -> dict | None:
@@ -469,11 +480,18 @@ def _only_api_missing(config: DeliveryConfig, manifest: dict) -> bool:
 
 def ensure_service_running(
     config: DeliveryConfig, *, deployment: WorkerDeploymentConfig | None = None,
+    unless_stopped: bool = False,
 ) -> dict:
+    """Have the stack running; ``unless_stopped`` (supervised) honours an owner's stop."""
     deadline = _deadline(config)
     try:
         _ports(config)
         with _lifecycle_lock(config, deadline):
+            marker = _stopped_marker(config)
+            if unless_stopped and marker.exists():
+                return {"dashboard_url": config.dashboard_url, "stopped": str(marker),
+                        **(_read_manifest(config) or {"processes": {}})}
+            marker.unlink(missing_ok=True)
             existing = _read_manifest(config)
             if existing:
                 if existing.get("config_path", str(config.path)) != str(config.path) and any(
@@ -751,6 +769,7 @@ _COMMANDS = (
     "status",
     "stop",
     "restart",
+    "supervise",
     "token",
     "worker",
     "api",
@@ -914,6 +933,10 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     if args.command == "restart":
         print(json.dumps(service_restart(config), sort_keys=True))
+        return
+    if args.command == "supervise":
+        # The launchd agent's periodic start: never undoes the owner's `stop`.
+        print(json.dumps(ensure_service_running(config, unless_stopped=True), sort_keys=True))
         return
     manifest = _read_manifest(config)
     if args.command == "status":
