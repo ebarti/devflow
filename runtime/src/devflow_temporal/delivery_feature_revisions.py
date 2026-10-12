@@ -541,20 +541,45 @@ def _preparation_retry(store, spec, public, values):
     return saved
 
 
-def _refresh_preparation_reconsideration(store, original, public, values):
+# The runtime install's identity (its git revision and payload digest). Preparation
+# receipts re-stamp it at every continuation; the normalized review context is what
+# binds a reconsideration, so a routine deployment never changes that binding.
+RUNTIME_PROVENANCE = frozenset({"revision", "runtime_payload_sha256"})
+
+
+def _without_runtime_provenance(receipt):
+    """A preparation receipt (or proof) with the runtime install's provenance removed."""
+    stripped = deepcopy(receipt)
+    selectors = stripped.get("selectors")
+    if isinstance(selectors, dict):
+        for key in ("expected_runtime_revision", "expected_runtime_payload_sha256"):
+            selectors.pop(key, None)
+    for proof in (stripped, stripped.get("reconsideration")):
+        if isinstance(proof, dict) and isinstance(proof.get("current_runtime"), dict):
+            proof["current_runtime"] = {
+                k: v for k, v in proof["current_runtime"].items() if k not in RUNTIME_PROVENANCE
+            }
+    return stripped
+
+
+def _current_runtime_selectors(selectors):
     from .delivery_feature_review_context import current_runtime_context
 
+    current = current_runtime_context()
+    return current, {**selectors,
+                     "expected_runtime_revision": current["revision"],
+                     "expected_runtime_payload_sha256": current["runtime_payload_sha256"]}
+
+
+def _refresh_preparation_reconsideration(store, original, public, values):
     receipt = public.get("reconsideration")
     if not receipt:
         raise OwnershipConflict("pending preparation lacks its authenticated review context")
-    current = current_runtime_context()
-    provenance = {"revision", "runtime_payload_sha256"}
-    if ({k: v for k, v in current.items() if k not in provenance}
-            != {k: v for k, v in receipt["current_runtime"].items() if k not in provenance}):
+    current, selectors = _current_runtime_selectors(public["request"]["reconsideration"])
+    if ({k: v for k, v in current.items() if k not in RUNTIME_PROVENANCE}
+            != {k: v for k, v in receipt["current_runtime"].items()
+                if k not in RUNTIME_PROVENANCE}):
         raise OwnershipConflict("preparation retry changed its normalized review context")
-    selectors = {**public["request"]["reconsideration"],
-                 "expected_runtime_revision": current["revision"],
-                 "expected_runtime_payload_sha256": current["runtime_payload_sha256"]}
     proof, findings = _reconsideration_proof(
         store, original, selectors, public["record"], public["predecessor_closure"], values,
     )
@@ -731,7 +756,12 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
         receipt.update(version=2, sequence=sequence,
                        previous=deepcopy(spec["feature_plan_revision_preparation_retry"]))
     if saved is not None and saved != receipt:
-        raise OwnershipConflict("preparation continuation evidence changed before replay")
+        if _without_runtime_provenance(saved) != _without_runtime_provenance(receipt):
+            raise OwnershipConflict("preparation continuation evidence changed before replay")
+        # Only the runtime install moved (a deployment) since this receipt was written;
+        # its normalized review context is unchanged, so the receipt stands as written
+        # and the replay spends nothing and adds no continuation.
+        receipt = saved
     with shared.serialized(token["issue_id"]):
         if _preparation_lineage(shared, public, _values(spec, shared)) != chain:
             raise OwnershipConflict("preparation continuation lineage changed before admission")
@@ -1692,15 +1722,22 @@ def _recheck_reconsideration(store, spec, context, *, candidate=None):
                                "AND repair_key=?", (context["owner"]["issue_id"],
                                                     begun["repair_key"])).fetchone()
         paid = bool(debit and debit[0] == context["owner"]["generation"])
+    selectors = retry["selectors"] if retry else public["request"]["reconsideration"]
+    if retry:
+        # A preparation receipt stamps the runtime that transported it; a deployment
+        # before this begin re-stamps that provenance while the normalized review
+        # context stays bound. The owner's original admission keeps its exact stamp.
+        _, selectors = _current_runtime_selectors(selectors)
     proof, findings = _reconsideration_proof(
-        store, original, retry["selectors"] if retry else public["request"]["reconsideration"],
-        public["record"],
+        store, original, selectors, public["record"],
         public["predecessor_closure"], values, planning_paid=paid,
     )
     # The normal repair debit is intentionally newer; its budget cannot rewrite
     # the original pre-admission receipt, nor redefine deduplication identity.
     proof["original_repair_budget"] = receipt["original_repair_budget"]
-    if proof != receipt or findings != context["unresolved_prior_findings"]:
+    comparable = (_without_runtime_provenance(proof), _without_runtime_provenance(receipt)) \
+        if retry else (proof, receipt)
+    if comparable[0] != comparable[1] or findings != context["unresolved_prior_findings"]:
         raise OwnershipConflict("reconsideration proof or current derived subject changed")
     if candidate is not None:
         from .delivery_feature_review_context import candidate_subject

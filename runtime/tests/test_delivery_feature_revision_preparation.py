@@ -690,3 +690,81 @@ def test_abandoned_unspent_reservation_releases_its_review_context(
     assert again["revision_id"] != reserved["revision_id"]
     assert again["reconsideration"]["context_key"] == context_key
     assert shared.budget(issue_id) == budget
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
+def test_replayed_continuation_survives_a_deployment_without_spending(
+    pending_preparation, monkeypatch,
+):
+    """A continuation receipt written just before a failure and replayed after the runtime
+    install was upgraded carries the same reservation: the receipt keeps its identity, no
+    continuation is added and no budget moves. Any other evidence change still refuses."""
+    p = pending_preparation
+    store, shared, spec, request = (p[k] for k in ("store", "shared", "spec", "request"))
+    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
+    revision_id = p["admitted"]["revision_id"]
+    key = revisions._preparation_retry_key(revision_id)
+    closures = p["closures"]
+    armed = {"fail": True}
+
+    def closed_coordinator(s, run):
+        # Fail once after the receipt exists: the transport failure after intake.
+        if armed["fail"] and key in shared.checkpoints(issue_id):
+            armed["fail"] = False
+            raise RuntimeError("continuation predecessor Temporal closure is unavailable (x)")
+        return deepcopy(closures[run]) if run in closures else _closed_revision_fixture(s, run)
+
+    monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator",
+                        closed_coordinator)
+    with store._connect() as db:
+        runs_before = db.execute("SELECT count(*) FROM delivery_runs").fetchone()[0]
+    with pytest.raises(RuntimeError, match="unavailable"):
+        execution.continue_feature(store, spec["run_id"], request)
+    saved = deepcopy(shared.checkpoints(issue_id)[key])
+    with store._connect() as db:
+        assert db.execute("SELECT count(*) FROM delivery_runs").fetchone()[0] == runs_before
+    assert shared.budget(issue_id)["used"] == 6
+    # The owner deploys a fix: the runtime install's revision and payload change while
+    # the normalized review context does not.
+    root = review_context._protected_root()
+    source = root / review_context.PREFIX / "delivery_feature_revisions.py"
+    source.write_text(source.read_text() + "\n# Deployed between the receipt and its replay\n")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "Deploy a fix between the continuation and its replay")
+    upgraded = review_context.current_runtime_context()
+    assert upgraded["revision"] != saved["selectors"]["expected_runtime_revision"]
+    stamped = saved["selectors"]
+    assert upgraded["runtime_payload_sha256"] != stamped["expected_runtime_payload_sha256"]
+    bound = saved["reconsideration"]["current_runtime"]
+    assert upgraded["context_sha256"] == bound["context_sha256"]
+    # A closure or a baseline change still refuses the replay and moves nothing.
+    runs, commands, current, _, _ = _boundary_snapshot(store, shared, issue_id)
+    closed_at = closures[spec["run_id"]]["closed_at"]
+    closures[spec["run_id"]]["closed_at"] = "2099-02-02T00:00:00+00:00"
+    with pytest.raises(OwnershipConflict, match="evidence changed before replay"):
+        execution.continue_feature(store, spec["run_id"], request)
+    closures[spec["run_id"]]["closed_at"] = closed_at
+    baseline = closures[spec["run_id"]]["result"]["checks"]["baseline"]
+    baseline_state = baseline["state"]
+    baseline["state"] = "passed"
+    with pytest.raises(OwnershipConflict):
+        execution.continue_feature(store, spec["run_id"], request)
+    baseline["state"] = baseline_state
+    assert _boundary_snapshot(store, shared, issue_id)[:3] == (runs, commands, current)
+    assert shared.checkpoints(issue_id)[key] == saved
+    # The exact replay proceeds on the saved receipt under the upgraded runtime.
+    response = execution.continue_feature(store, spec["run_id"], request)
+    assert response == execution.continue_feature(store, spec["run_id"], request)
+    values = shared.checkpoints(issue_id)
+    assert values[key] == saved
+    assert [name for name in values if name.startswith(key)] == [key]
+    successor = prepare_authority(store, store.effective_spec(response["run_id"]))
+    assert successor["feature_plan_revision_preparation_retry"] == {
+        "checkpoint_key": key, "sha256": digest(saved)}
+    assert successor["feature_plan_revision_request"] == spec["feature_plan_revision_request"]
+    assert shared.budget(issue_id)["used"] == 6
+    DeliveryBroker(store, successor).prepare()
+    context = revisions.begin_revision(store, successor)
+    assert context["revision_id"] == revision_id and context["budget"]["used"] == 7
+    assert revisions.begin_revision(store, successor) == context
+    assert shared.budget(issue_id)["used"] == 7
