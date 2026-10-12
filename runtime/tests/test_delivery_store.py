@@ -32,7 +32,11 @@ from devflow_temporal.delivery_activities import (
     delivery_tracker_start,
 )
 from devflow_temporal.delivery_api import DeliveryService, create_app
-from devflow_temporal.delivery_broker import BrokerReadbackUnavailable, DeliveryBroker
+from devflow_temporal.delivery_broker import (
+    BrokerReadbackUnavailable,
+    CheckPreparationFailure,
+    DeliveryBroker,
+)
 from devflow_temporal.delivery_broker import _git as broker_git
 from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER, LargePayloadCodec
 from devflow_temporal.delivery_config import DeliveryConfig
@@ -2281,10 +2285,13 @@ def test_real_check_fails_closed_without_prepared_native_authority(service, tmp_
         "argv": ["/usr/bin/python3", "-c", f"open({str(sentinel)!r}, 'w').write('BREACH')"],
         "cwd": ".",
     }
-    with pytest.raises(PreparationError, match="not been frozen"):
+    # Fails closed as a typed preparation failure: nothing was launched.
+    with pytest.raises(CheckPreparationFailure, match="not been frozen") as raised:
         broker._run_check_list(
             broker.checkout, [check], broker.state_dir / "security-check", broker.candidate()
         )
+    assert isinstance(raised.value.__cause__, PreparationError)
+    assert raised.value.results[-1]["launched"] is False
     assert sentinel.read_text() == "SAFE\n"
 
 
