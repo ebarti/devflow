@@ -39,6 +39,7 @@ export interface RunSummary {
   issue_url?: string | null
   phase?: string | null
   execution_state?: string | null
+  outcome?: string | null
   execution_retired?: boolean | null
   updated_at?: string | null
   created_at?: string | null
@@ -157,7 +158,6 @@ export interface RunDetail extends RunSummary {
     controller_source: string
     additional_native_execution: false
   } | null
-  outcome?: string | null
   protocol_revision?: number | null
   projection_revision?: number | null
   iteration?: number | null

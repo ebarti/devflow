@@ -305,7 +305,7 @@ th:nth-child(3), td:nth-child(3) { width: 24%; }
 .board-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 22px; flex-wrap: wrap; }
 .board-toolbar h2 { margin: 0 0 6px; font-size: 24px; }
 .board-toolbar p { margin: 0; }
-.kanban-board { display: grid; grid-template-columns: repeat(8, minmax(225px, 1fr)); gap: 14px; overflow-x: auto; padding: 2px 0 20px; }
+.kanban-board { display: grid; grid-auto-flow: column; grid-auto-columns: 250px; gap: 14px; overflow-x: auto; padding: 2px 0 20px; }
 .kanban-lane { background: #f5f8fc; border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 300px; }
 .kanban-lane h3 { font-size: 14px; display: flex; justify-content: space-between; gap: 12px; margin: 2px 0 14px; }
 .kanban-lane h3 span { background: #e5ecf6; border-radius: 12px; padding: 1px 8px; color: var(--muted); }
@@ -314,6 +314,12 @@ th:nth-child(3), td:nth-child(3) { width: 24%; }
 .task-card:hover { border-color: var(--blue); box-shadow: 0 2px 8px #173f6910; }
 .task-card strong { font-size: 14px; line-height: 1.5; }
 .task-card__repo, .task-card small { font-size: 11px; color: var(--muted); }
+.task-card .task-card__status--failed, .task-history .task-card__status--failed { color: #a32e2e; }
+.task-history { padding: 10px 4px; font-size: 12px; }
+.task-history summary { cursor: pointer; color: var(--blue); }
+.task-history ul { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 10px; }
+.task-history button { text-align: left; line-height: 1.5; overflow-wrap: anywhere; }
+.task-history small { display: block; color: var(--muted); font-size: 10px; }
 .task-card__status { color: #285e9f; font-size: 12px; }
 .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 16px; margin: 28px 0; }
 .metric-grid > div { border: 1px solid var(--line); border-radius: 8px; padding: 18px; display: grid; gap: 10px; }
@@ -341,7 +347,7 @@ th:nth-child(3), td:nth-child(3) { width: 24%; }
   .app-shell--wide { grid-template-columns: minmax(0,1fr); grid-template-rows: auto auto minmax(0,1fr); }
   .app-shell--wide .top-bar { grid-column: 1; grid-row: 2; }
   .app-shell--wide .main-panel { grid-column: 1; grid-row: 3; }
-  .kanban-board { grid-template-columns: repeat(8, 250px); }
+  .kanban-board { grid-auto-columns: 250px; }
   .primary-nav { gap: 0; }
   .nav-link { gap: 5px; font-size: 12px; padding: 0 6px; }
 }

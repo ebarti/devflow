@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { api, ApiError } from '../src/api'
@@ -45,15 +45,62 @@ describe('workflow board and controls', () => {
     expect(laneFor({ ...mockRun, phase })).toBe(lane)
   })
 
-  it('shows current merged feature state while retaining the historical run phase', () => {
-    const run = { ...mockRun, phase: 'blocked', feature: { issue: 'https://github.com/o/r/issues/1',
-      run_id: 'newer-run', status: 'Merged', version: 4, pull_requests: [],
-      mirror: { state: 'pending', last_error: 'GitHub unavailable' } } }
-    expect(laneFor(run)).toBe('Merged')
-    render(<RunBoard runs={[run]} archived={false} onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
+  it('shows one current issue card and opens each failed previous attempt from history', async () => {
+    const feature = { issue: 'https://github.com/o/r/issues/1', run_id: 'current-run', status: 'In review', version: 12, pull_requests: [], mirror: { state: 'consistent' } }
+    const current = { ...mockRun, id: feature.run_id, phase: 'feature_revision_review', feature }
+    const previous = Array.from({ length: 11 }, (_, i) => ({ ...mockRun, id: `old-${i}`, phase: 'blocked', outcome: 'blocked', execution_state: 'blocked', feature }))
+    const select = vi.fn()
+    render(<RunBoard runs={[...previous, current]} archived={false} onSelect={select} onToggle={vi.fn()} onRefresh={vi.fn()} />)
+    const review = screen.getByRole('region', { name: 'Review column' })
+    expect(review.querySelectorAll('.task-card')).toHaveLength(1)
+    expect(review.querySelector('details')?.open).toBe(false)
+    expect(review.textContent).toContain('Project: Synced')
+    await userEvent.setup().click(within(review).getByRole('button', { name: /Fixture workflow/ }))
+    expect(select).toHaveBeenLastCalledWith('current-run')
+    await userEvent.setup().click(screen.getByText('11 previous attempts'))
+    expect(within(review).getAllByRole('button', { name: /Failed/ })).toHaveLength(11)
+    await userEvent.setup().click(within(review).getByRole('button', { name: /old-3$/ }))
+    expect(select).toHaveBeenLastCalledWith('old-3')
+    expect(screen.getByRole('region', { name: 'Failed column' }).querySelectorAll('.task-card')).toHaveLength(0)
+  })
+
+  it('links to the observed owner when its row has not loaded, without borrowing an old failure', async () => {
+    const select = vi.fn()
+    const run = { ...mockRun, phase: 'blocked', outcome: 'blocked', execution_state: 'blocked', feature: { issue: 'https://github.com/o/r/issues/1',
+      run_id: 'newer-run', status: 'Merged', version: 4, pull_requests: [], mirror: { state: 'pending' } } }
+    render(<RunBoard runs={[run]} archived={false} onSelect={select} onToggle={vi.fn()} onRefresh={vi.fn()} />)
     const lane = screen.getByRole('region', { name: 'Merged column' })
-    expect(lane.textContent).toContain('Run: Blocked')
-    expect(lane.textContent).toContain('Project: Sync pending')
+    expect(lane.textContent).toContain('Open current run · details not loaded')
+    expect(within(lane).getByRole('button', { name: /Fixture workflow/ }).textContent).not.toContain('Failed')
+    await userEvent.setup().click(within(lane).getByRole('button', { name: /Fixture workflow/ }))
+    expect(select).toHaveBeenCalledWith('newer-run')
+  })
+
+  it('keeps terminal failure distinct from waiting for a decision and an unknown blocked phase', () => {
+    const feature = { issue: 'https://github.com/o/r/issues/1', run_id: mockRun.id, status: 'In review', version: 1, pull_requests: [] }
+    expect(laneFor({ ...mockRun, feature, outcome: 'blocked', execution_state: 'blocked' })).toBe('Failed')
+    expect(laneFor({ ...mockRun, feature, phase: 'waiting_plan', execution_state: 'waiting_plan' })).toBe('Needs attention')
+    expect(laneFor({ ...mockRun, phase: 'blocked', outcome: null })).toBe('Needs attention')
+    expect(laneFor({ ...mockRun, phase: 'cancelled', outcome: 'cancelled', execution_state: 'cancelled' })).toBe('Needs attention')
+  })
+
+  it('uses the newest feature version when older paginated rows carry stale owners', () => {
+    const feature = { issue: 'https://github.com/o/r/issues/1', run_id: 'new', status: 'In progress', version: 12, pull_requests: [] }
+    const current = { ...mockRun, id: 'new', feature }
+    const old = { ...mockRun, id: 'old', outcome: 'blocked', feature: { ...feature, run_id: 'old', status: 'Blocked', version: 11 } }
+    const view = render(<RunBoard runs={[old, current]} archived={false} onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
+    expect(view.container.querySelectorAll('.task-card')).toHaveLength(1)
+    expect(screen.getByRole('region', { name: 'Implementation column' }).querySelectorAll('.task-card')).toHaveLength(1)
+    view.rerender(<RunBoard runs={[current, old]} archived={false} onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
+    expect(screen.getByRole('region', { name: 'Implementation column' }).querySelectorAll('.task-card')).toHaveLength(1)
+  })
+
+  it('keeps archived attempts individually accessible with their own outcomes', () => {
+    const feature = { issue: 'https://github.com/o/r/issues/1', run_id: 'active-not-archived', status: 'In review', version: 12, pull_requests: [] }
+    render(<RunBoard runs={['one', 'two'].map(id => ({ ...mockRun, id, outcome: 'blocked', feature, archived: true }))} archived onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
+    const failed = screen.getByRole('region', { name: 'Failed column' })
+    expect(within(failed).getAllByRole('button', { name: /Failed attempt/ })).toHaveLength(2)
+    expect(screen.queryByText(/Open current run/)).toBeNull()
   })
 
   it.each([
