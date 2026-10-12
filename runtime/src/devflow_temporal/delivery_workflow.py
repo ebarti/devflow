@@ -45,12 +45,61 @@ def _cleanup_evidence_unknown(state: dict, launch_window_v1: bool) -> bool:
             and not (launch_window_v1 and check.get("cleanup") == "confirmed")))
         for check in state["checks"].values()
     )
+def _controller_stop(state: dict) -> bool:
+    """A stop caused by transport or the controller, never a gate or model outcome."""
+    checks = state.get("checks") or {}
+    failure = checks.get("failure") or {}
+    return (failure.get("classification") == "transient"
+            or isinstance(checks.get("controller_failure"), dict))
+
+
+def _implementation_passed(state: dict) -> bool:
+    implementation = next((role for role in reversed(state.get("roles", []))
+                           if role.get("role") == "implement"
+                           and role.get("iteration") == state.get("iteration")), None)
+    return bool(implementation and implementation.get("status") == "pass")
+
+
+def _candidate_published(state: dict, candidate: dict) -> bool:
+    """The PR shows exactly this candidate: the same head and the same checked content."""
+    published = state.get("pull_request") or {}
+    return bool(published) and all(
+        published.get("head") == item.get("head")
+        and (published.get("candidate") or {}).get("id") == item.get("id")
+        for item in (state.get("candidate") or {}, candidate or {}))
+
+
+_GATE_CHECKS = ("prepublish", "local", "browser_qa", "review", "qa", "ci")
+
+
+def _gate_failed(state: dict) -> bool:
+    """The stopped iteration recorded a failed gate verdict."""
+    checks = state.get("checks") or {}
+    return any(isinstance(checks.get(key), dict) and checks[key].get("state") == "failed"
+               for key in _GATE_CHECKS) or any(
+        role.get("iteration") == state.get("iteration") and role.get("status") != "pass"
+        for role in state.get("roles", []) if role.get("role") in {"review", "verify"})
+
+
+def _recorded_findings(state: dict, iteration: int) -> list:
+    """The findings one iteration's gates recorded for the next repair turn.
+
+    New runs keep the exact batch they handed over (every gate, broker checks
+    included); older states retain only the independent roles' findings.
+    """
+    recorded = state.get("repair_findings") or {}
+    if recorded.get("iteration") == iteration and isinstance(recorded.get("findings"), list):
+        return list(recorded["findings"])
+    return [finding for role in state.get("roles", [])
+            if role.get("iteration") == iteration and role.get("role") in {"review", "verify"}
+            for finding in role.get("findings") or []]
 
 
 def _failure_classification(cause: Exception | None, controller_cause: str | None) -> dict:
     """Classify controller observations, never human or model diagnostic text."""
     result = {"classification": "terminal"}
-    if controller_cause in {"ci_deadline", "tracker_readback", "publication_deadline"}:
+    if controller_cause in {"ci_deadline", "tracker_readback", "publication_deadline",
+                            "controller_failure"}:
         return {"classification": "transient", "cause_type": controller_cause}
     if not isinstance(cause, ActivityError):
         return result
@@ -190,6 +239,7 @@ class DeliveryWorkflow:
         self.controller_failure_boundary = False
         self.liveness_v2 = False
         self.publication_v1 = False
+        self.post_publish_v1 = False
         self.terminal_closing = False
         self.feature_revision_v1 = False
         self.controller_spec = None
@@ -303,9 +353,14 @@ class DeliveryWorkflow:
                 non_retryable_error_types=["ValueError", "TypeError", "OwnershipConflict"],
             )}
         elif patient_ci:
+            # Read-only polling: a lapsed heartbeat (host sleep, worker restart)
+            # restarts the observation instead of ending the run.
             options = {
-                "heartbeat_timeout": timedelta(seconds=30),
-                "retry_policy": RetryPolicy(maximum_attempts=3),
+                "heartbeat_timeout": timedelta(seconds=60),
+                "retry_policy": RetryPolicy(
+                    maximum_attempts=12, initial_interval=timedelta(seconds=5),
+                    maximum_interval=timedelta(seconds=60),
+                ),
             }
         elif (name == "delivery_project"
               and request["spec"].get("projection_retry_version") == 1):
@@ -741,7 +796,8 @@ class DeliveryWorkflow:
         if self.cancel_requested:
             self.state["cleanup"] = "unknown"
             return await self._cancelled(spec)
-        if self.original_execution and spec.get("automatic_retry_version") == 1:
+        if ((self.original_execution or self.post_publish_v1)
+                and spec.get("automatic_retry_version") == 1):
             self.state["checks"]["failure"] = {
                 **_failure_classification(cause, controller_cause),
                 "stage": self.state["phase"], "reason": reason[:600],
@@ -1184,6 +1240,10 @@ class DeliveryWorkflow:
         # history: False.
         self.feature_revision_v1 = (workflow.patched("delivery-feature-revision-wedges-v1")
                                     if workflow.in_workflow() else False)
+        # Post-publish self-heal commands: classification on every execution,
+        # gates-first stopped resumes and classified CI continuations.
+        self.post_publish_v1 = (workflow.patched("delivery-post-publish-self-heal-v1")
+                                if workflow.in_workflow() else False)
         if (spec.get("workflow_failure_boundary_version") != 1
                 or not workflow.patched("delivery-controller-failure-boundary-v1")):
             return await self._run_protocol(spec, recovery)
@@ -1217,6 +1277,7 @@ class DeliveryWorkflow:
             try:
                 return await self._stop(
                     self.controller_spec, "controller failed: " + type(exc).__name__, cause=exc,
+                    controller_cause="controller_failure" if self.post_publish_v1 else None,
                 )
             except workflow.NondeterminismError:
                 raise
@@ -1463,7 +1524,13 @@ class DeliveryWorkflow:
                 return await self._stop(spec, "pending publication tracker readback pending")
             if self.cancel_requested:
                 return await self._stop(spec, "cancelled")
-            if spec.get("publication_readback_version") == 1:
+            if self.post_publish_v1 and spec.get("publication_readback_version") == 1:
+                # Finish the stopped iteration's publication from wherever it
+                # stopped: commit, push and PR creation are idempotent on the
+                # bound effect, so an unpushed candidate is published here too.
+                published = await self._publish_original(
+                    spec, self.state["iteration"], self.state["candidate"])
+            elif spec.get("publication_readback_version") == 1:
                 published = await self._published_result(
                     spec, self.state["iteration"], self.state["candidate"], None,
                     expected_head=recovery["seal"]["candidate"]["head"],
@@ -1540,6 +1607,9 @@ class DeliveryWorkflow:
                           pull_request=recovery['publication'])
         for key in ('terminal_tracker_checkpoint', 'resource_cleanup'):
             self.state['checks'].pop(key, None)
+        if self.post_publish_v1:
+            for key in ('failure', 'controller_failure'):
+                self.state['checks'].pop(key, None)
         try:
             await self._activity('delivery_gates_readback', {'spec': spec, 'recovery': recovery})
             tracker = await self._activity('delivery_tracker_start', {
@@ -1556,6 +1626,9 @@ class DeliveryWorkflow:
             if self.cancel_requested:
                 return await self._cancelled(spec)
             if ci.get('state') != 'passed':
+                if self.post_publish_v1 and ci.get('state') == 'pending':
+                    return await self._stop(spec, 'required CI did not confirm this PR head',
+                                            controller_cause='ci_deadline')
                 return await self._stop(spec, 'required CI did not confirm this PR head')
             if spec.get('terminal_tracker_version') != 1:
                 tracker = await self._activity('delivery_tracker', {
@@ -1564,6 +1637,11 @@ class DeliveryWorkflow:
                 if not _tracking_ready(spec, tracker):
                     return await self._stop(spec, 'tracker readback remains pending or conflicting')
         except Exception as exc:
+            if self.post_publish_v1:
+                transient = _failure_classification(exc, None)["classification"] == "transient"
+                return await self._stop(spec, 'CI continuation failed: ' + type(exc).__name__,
+                                        cause=exc,
+                                        controller_cause='ci_deadline' if transient else None)
             return await self._stop(spec, 'CI continuation failed: ' + type(exc).__name__)
         if self.cancel_requested:
             return await self._cancelled(spec)
@@ -1780,6 +1858,9 @@ class DeliveryWorkflow:
                           error=None, cleanup='none', candidate=recovery['execution_candidate'])
         for key in ('resource_cleanup', 'terminal_tracker_checkpoint'):
             self.state['checks'].pop(key, None)
+        if self.post_publish_v1:
+            for key in ('failure', 'controller_failure'):
+                self.state['checks'].pop(key, None)
         if not await self._confirm_repair_preflight(spec, recovery):
             return self.state
         tracker_pending_projected = False
@@ -1830,14 +1911,46 @@ class DeliveryWorkflow:
         # This admission flag is absent from older histories. A proven unstarted
         # repair reuses its existing iteration and shared budget debit.
         pending = recovery.get('pending_repair')
+        stopped = recovery['state']
+        role_findings = [
+            finding for role in stopped.get('roles', [])
+            if role.get('iteration') == stopped['iteration']
+            for finding in role.get('findings', [])]
+        if self.post_publish_v1 and _controller_stop(stopped):
+            # A transport or controller failure is not a defect: the model never
+            # receives it as findings. A passed implementation re-runs its gates
+            # on the unchanged candidate when the PR already shows that exact
+            # candidate; otherwise it resumes at prechecks and publishes it into
+            # the existing PR first, so no gate or CI runs on another head. An
+            # interrupted turn resumes with the recorded findings it was repairing.
+            if _implementation_passed(stopped) and not _gate_failed(stopped):
+                return await self._run_iterations(
+                    spec, start_iteration=stopped['iteration'],
+                    prior_implementer_session=recovery['session_id'], repair_findings=[],
+                    operator_brief=None, continuation=None, recovery=None,
+                    authorized_max_iteration=recovery['maximum_iteration'],
+                    allow_first_session=recovery['session_id'] is None,
+                    resume_prechecks=True,
+                    published_checkpoint=_candidate_published(
+                        stopped, recovery.get('execution_candidate')),
+                )
+            if _implementation_passed(stopped):
+                # A recorded gate verdict stands: the repair turn receives its
+                # findings, or the failed CI diagnostics the admission sealed.
+                # Never a repair turn without findings: the operator decides.
+                findings = (_recorded_findings(stopped, stopped['iteration'])
+                            or list(recovery.get('ci_findings') or []))
+                if not findings:
+                    return await self._stop(spec, 'recorded gate failure has no repair findings')
+            else:
+                findings = _recorded_findings(stopped, stopped['iteration'] - 1)
+        else:
+            findings = [stopped['error'], *role_findings]
         return await self._run_iterations(
             spec, start_iteration=recovery.get('resume_iteration', (
-                pending['iteration'] if pending else recovery['state']['iteration'] + 1)),
+                pending['iteration'] if pending else stopped['iteration'] + 1)),
             prior_implementer_session=recovery['session_id'],
-            repair_findings=(pending['findings'] if pending else [recovery['state']['error'], *[
-                finding for role in recovery['state'].get('roles', [])
-                if role.get('iteration') == recovery['state']['iteration']
-                for finding in role.get('findings', [])]]),
+            repair_findings=(pending['findings'] if pending else findings),
             operator_brief=None, continuation=None, recovery=None,
             authorized_max_iteration=recovery['maximum_iteration'],
             allow_first_session=recovery['session_id'] is None,
@@ -2332,6 +2445,9 @@ class DeliveryWorkflow:
                         "prepublication", prechecked, iteration=iteration
                     )
                     self.state["findings"].extend(repair_findings)
+                    if self.post_publish_v1:
+                        self.state["repair_findings"] = {
+                            "iteration": iteration, "findings": list(repair_findings)}
                     self.state["revision"] += 1
                     await self._project(spec, "findings", "Prepublication candidate needs repair")
                     if iteration >= max_repairs:
@@ -2529,6 +2645,10 @@ class DeliveryWorkflow:
                     break
             if repair_findings:
                 self.state["findings"].extend(repair_findings)
+                if self.post_publish_v1:
+                    # The exact batch the next turn receives, kept for a resume.
+                    self.state["repair_findings"] = {
+                        "iteration": iteration, "findings": list(repair_findings)}
                 self.state["revision"] += 1
                 await self._project(spec, "findings", "Candidate requires bounded repair")
                 if iteration >= max_repairs:
@@ -2542,6 +2662,14 @@ class DeliveryWorkflow:
                     "delivery_ci", {"spec": spec, "pull_request": published}, hours=1
                 )
             except Exception as exc:
+                if (self.post_publish_v1
+                        and _failure_classification(exc, None)["classification"] == "transient"):
+                    # A lost read-only observation is the deadline's unchanged-head
+                    # condition: observed again, never a model turn.
+                    return await self._stop(
+                        spec, f"CI observation failed: {type(exc).__name__}", cause=exc,
+                        controller_cause="ci_deadline",
+                    )
                 return await self._stop(
                     spec, f"CI observation failed: {type(exc).__name__}", cause=exc,
                 )

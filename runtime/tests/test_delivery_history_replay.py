@@ -32,6 +32,7 @@ async def test_recorded_delivery_history_replays_on_designated_artifact(path, tm
 @pytest.mark.parametrize("marker,flag", [
     ("delivery-liveness-v2", "liveness_v2"),
     ("delivery-publication-self-heal-v1", "publication_v1"),
+    ("delivery-post-publish-self-heal-v1", "post_publish_v1"),
 ])
 async def test_history_recorded_before_a_marker_replays_with_its_flag_false(
     monkeypatch, marker, flag,
