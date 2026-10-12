@@ -13,7 +13,8 @@ from .contracts import digest
 from .delivery_workflow import transient_failure
 
 # Bounds of the coordinator paths gated on `delivery-feature-liveness-v1`.
-AUTOMATIC_RECOVERIES = 2
+AUTOMATIC_RECOVERIES = 2  # admitted resumes per worker
+REISSUES = 4  # transport re-issues of a worker's assignment, admission or observation
 OBSERVATION_RETRIES = 6
 OBSERVATION_PAUSE = timedelta(seconds=30)
 OBSERVATION_PAUSE_CAP = timedelta(minutes=10)
@@ -310,11 +311,11 @@ async def _admit(controller, spec, chunk_id, kind, closure):
                    f"{_describe(refusal)}") from refusal
 
 
-async def _recovery(controller, spec, key, count, message):
-    controller.state["checks"].setdefault("feature_worker_recoveries", {})[key] = count + 1
+async def _recovery(controller, spec, counter, key, count, bound, message):
+    controller.state["checks"].setdefault(counter, {})[key] = count + 1
     controller.state["revision"] += 1
     await controller._project(spec, "feature_worker_recovering",
-                              f"{message} ({count + 1} of {AUTOMATIC_RECOVERIES})")
+                              f"{message} ({count + 1} of {bound})")
 
 
 async def _recovering_worker(controller, spec, chunk_id, kind, active):
@@ -326,25 +327,28 @@ async def _recovering_worker(controller, spec, chunk_id, kind, active):
     stops the feature with the worker's own reason, its chunk and the refusal.
     Infrastructure during an observation or the admission re-issues exactly what
     the coordinator already holds (the assignment it observed, or the closure it
-    offered) after a pause, under the same bound: a worker that was observed is
-    never reserved again, so no closed worker re-enters reserve() without
-    passing `_resumable` and the refusal branch first.
+    offered) after a pause: a worker that was observed is never reserved again,
+    so no closed worker re-enters reserve() without passing `_resumable` and the
+    refusal branch first. Admitted resumes and transport re-issues are counted
+    apart (`feature_worker_recoveries`, `feature_worker_reissues`), each under
+    its own bound, so a transport retry never spends a resume.
     """
     key = chunk_id + ":" + kind
     closure = None  # a resumable closure awaiting the real admission
     assignment = None  # an admitted or already observed assignment to continue with
     while True:
-        count = controller.state["checks"].get("feature_worker_recoveries", {}).get(key, 0)
+        resumed = controller.state["checks"].get("feature_worker_recoveries", {}).get(key, 0)
         try:
             if closure is not None:
                 assignment = await _admit(controller, spec, chunk_id, kind, closure)
                 closure = None
-                await _recovery(controller, spec, key, count,
+                await _recovery(controller, spec, "feature_worker_recoveries", key, resumed,
+                                AUTOMATIC_RECOVERIES,
                                 f"Resumed the {kind} worker for {chunk_id} after an "
                                 "infrastructure failure")
-                count += 1
+                resumed += 1
             return await _worker(controller, spec, chunk_id, kind, active,
-                                 resume_allowed=count < AUTOMATIC_RECOVERIES,
+                                 resume_allowed=resumed < AUTOMATIC_RECOVERIES,
                                  assignment=assignment)
         except PlanningCorrectionRequired:
             raise
@@ -358,22 +362,27 @@ async def _recovering_worker(controller, spec, chunk_id, kind, active):
                         chunk_id, kind, closure=closure, final=True,
                         detail=f"{exc.activity_type} failed: {_describe(exc)}") from exc
                 raise
-            if count >= AUTOMATIC_RECOVERIES:
+            if isinstance(exc, FeatureWorkerStopped):
+                if resumed >= AUTOMATIC_RECOVERIES:
+                    raise FeatureWorkerStopped(
+                        chunk_id, kind, final=True, closure=exc.closure,
+                        detail=f"exhausted {resumed} automatic resumes: {exc}") from exc
+                closure, assignment = exc.closure, None
+                continue
+            reissued = controller.state["checks"].get("feature_worker_reissues", {}).get(key, 0)
+            if reissued >= REISSUES:
                 cause = _describe(exc) if isinstance(exc, ActivityError) else exc
-                detail = f"exhausted {count} automatic recoveries: {cause}"
+                detail = f"exhausted {reissued} re-issues: {cause}"
                 if closure is not None:
                     detail = f"stopped ({closure.get('error') or 'blocked'}); " + detail
                 raise FeatureWorkerStopped(
                     chunk_id, kind, final=True, detail=detail,
                     closure=closure or getattr(exc, "closure", None)) from exc
-            if isinstance(exc, FeatureWorkerStopped):
-                closure, assignment = exc.closure, None
-                continue
             if isinstance(exc, ObservationLost):
                 assignment = exc.assignment
             held = ("admission" if closure is not None
                     else "observation" if assignment is not None else "assignment")
-            await _recovery(controller, spec, key, count,
+            await _recovery(controller, spec, "feature_worker_reissues", key, reissued, REISSUES,
                             f"Re-issuing the {kind} worker {held} for {chunk_id} after "
                             f"{_describe(exc)}")
             await _pause(controller, OBSERVATION_PAUSE)

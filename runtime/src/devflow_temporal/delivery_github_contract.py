@@ -47,10 +47,23 @@ class GitHubTransientError(GitHubContractError):
     """A GitHub server fault or rate limit: infrastructure, not a verdict on the request."""
 
 
+# gh reports transport failures (offline, DNS, TLS, reset connections) without any
+# HTTP status; these are its connection-error messages.
+_GH_CONNECTION = re.compile(
+    r"error connecting to|dial tcp|no such host|connection refused|connection reset"
+    r"|connection timed out|i/o timeout|TLS handshake|\btls: |could not resolve host"
+    r"|network is unreachable|temporary failure in name resolution|unexpected EOF",
+    re.IGNORECASE,
+)
+
+
 def github_transient(status: int | None, stderr: str) -> bool:
-    return status is not None and (
-        status >= 500 or status == 429
-        or (status == 403 and re.search(r"rate limit", stderr, re.IGNORECASE) is not None)
+    """Server faults, rate limits and transport failures are infrastructure; every
+    other HTTP status, and every other gh error, is a verdict on the request."""
+    if status is None:
+        return _GH_CONNECTION.search(stderr or "") is not None
+    return status >= 500 or status == 429 or (
+        status == 403 and re.search(r"rate limit", stderr, re.IGNORECASE) is not None
     )
 
 

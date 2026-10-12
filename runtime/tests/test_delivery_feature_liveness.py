@@ -27,6 +27,7 @@ from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, Worker
 from test_delivery_feature_execution import Controller, feature_service
 from test_delivery_feature_integration import integration
+from test_delivery_feature_recovered_closure import recovered_worker as recovered_worker
 from test_delivery_feature_workflow_temporal import FeatureActivities
 from test_delivery_github_contract import plan
 from test_delivery_store import service as service
@@ -35,7 +36,13 @@ import devflow_temporal.delivery_feature_workflow as protocol
 from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_feature_publication as publications
 from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
-from devflow_temporal.delivery_feature_execution import register_worker, registry, worker_spec
+from devflow_temporal.delivery_execution_registry import UnresolvedEffect
+from devflow_temporal.delivery_feature_execution import (
+    continue_feature,
+    register_worker,
+    registry,
+    worker_spec,
+)
 from devflow_temporal.delivery_feature_pass import checkpoint_key
 from devflow_temporal.delivery_github_contract import ordered_chunks
 from devflow_temporal.delivery_store import DeliveryStore
@@ -290,8 +297,10 @@ async def test_observations_stay_bounded_and_the_stop_names_the_stuck_observatio
     result = await protocol.coordinate(
         coordinator, {"run_id": "run-one", "authorized_endpoint": "merged"})
     assert result["outcome"] == "blocked"
-    assert coordinator.state["checks"]["feature_worker_recoveries"] == {"model:build": 2}
-    assert "exhausted 2 automatic recoveries" in result["error"]
+    assert coordinator.state["checks"]["feature_worker_reissues"] == {
+        "model:build": protocol.REISSUES}
+    assert "feature_worker_recoveries" not in coordinator.state["checks"]
+    assert f"exhausted {protocol.REISSUES} re-issues" in result["error"]
     assert "delivery_feature_finish_worker for worker build:model stayed lost" in result["error"]
     assert "GitHubTransientError" in result["error"] and "model" in result["error"]
     assert coordinator.admissions == [], "a lost observation is re-issued, never re-admitted"
@@ -472,7 +481,7 @@ async def test_infrastructure_closures_resume_through_admission_within_a_durable
         assert result["phase"] == "merged"
     else:
         assert result["outcome"] == "blocked"
-        assert "client" in result["error"] and "exhausted 2 automatic recoveries" in result["error"]
+        assert "client" in result["error"] and "exhausted 2 automatic resumes" in result["error"]
         assert "product repair" not in result["error"]
     assert any(name == "delivery_feature_stop" for name, _ in controller.events)
 
@@ -538,11 +547,12 @@ async def test_transport_failures_before_admission_are_reissued_but_verdicts_sto
         controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
     assert result["phase"] == "merged"
     assert attempts.count(("model", "build")) == 3 and controller.admissions == []
-    assert controller.state["checks"]["feature_worker_recoveries"] == {"model:build": 2}
+    assert controller.state["checks"]["feature_worker_reissues"] == {"model:build": 2}
+    assert "feature_worker_recoveries" not in controller.state["checks"]
     assert controller.sleeps == [protocol.OBSERVATION_PAUSE] * 2
     reissued = [m for e, m in controller.messages if e == "feature_worker_recovering"]
     assert len(reissued) == 2 and "BrokerReadbackUnavailable" in reissued[0]
-    assert "TimeoutError" in reissued[1] and "(2 of 2)" in reissued[1]
+    assert "TimeoutError" in reissued[1] and f"(2 of {protocol.REISSUES})" in reissued[1]
 
     for verdict in (
         ApplicationError("worker's prerequisites have not passed their integrated gates",
@@ -1184,10 +1194,11 @@ async def test_transient_admission_then_refusal_names_chunk_worker_error_and_ref
     assert TRANSIENT["error"] in message
     assert "automatic resume refused: ValueError: " + REFUSAL in message
     assert not protocol._infrastructure_failure(info.value)
-    assert controller.state["checks"]["feature_worker_recoveries"] == {"model:build": 1}
+    assert controller.state["checks"]["feature_worker_reissues"] == {"model:build": 1}
+    assert "feature_worker_recoveries" not in controller.state["checks"]
     assert [m for e, m in controller.messages if e == "feature_worker_recovering"] == [
         "Re-issuing the build worker admission for model after TimeoutExpired: gh timed out "
-        "(1 of 2)"]
+        f"(1 of {protocol.REISSUES})"]
     assert controller.sleeps == [protocol.OBSERVATION_PAUSE]
 
 
@@ -1221,7 +1232,8 @@ async def test_lost_finish_of_a_terminal_closure_reobserves_instead_of_reserving
     assert str(info.value) == (
         "feature build worker for chunk model stopped with preserved recovery evidence")
     assert info.value.closure == TERMINAL and not protocol._resumable(TERMINAL)
-    assert controller.state["checks"]["feature_worker_recoveries"] == {"model:build": 1}
+    assert controller.state["checks"]["feature_worker_reissues"] == {"model:build": 1}
+    assert "feature_worker_recoveries" not in controller.state["checks"]
     recovering = [m for e, m in controller.messages if e == "feature_worker_recovering"]
     assert len(recovering) == 1
     assert recovering[0].startswith(
@@ -1299,7 +1311,15 @@ def test_infrastructure_allowlist_matches_on_the_child_and_coordinator_sides(
     ("gh: HTTP 401: Bad credentials", False),
     ("gh: HTTP 404: Not Found", False),
     ("gh: HTTP 422: Validation Failed", False),
-    ("error connecting to api.github.com", False),
+    # Transport failures carry no HTTP status: offline, DNS, TLS, reset connections.
+    ("error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+     True),
+    ("Post \"https://api.github.com/graphql\": dial tcp: lookup api.github.com: no such host",
+     True),
+    ("net/http: TLS handshake timeout", True),
+    ("read tcp 10.0.0.2:51234->140.82.112.6:443: read: connection reset by peer", True),
+    ("could not determine base repo: no git remotes found", False),
+    ("unknown command \"foo\" for \"gh api\"", False),
 ])
 def test_github_server_faults_and_rate_limits_are_typed_transient(monkeypatch, stderr, transient):
     from devflow_temporal import delivery_github_contract as contract
@@ -1439,3 +1459,86 @@ async def test_real_temporal_operator_cancel_leaves_an_unsettled_readback_pendin
     assert not any(n == "delivery_feature_stop" for n, _ in fixtures.calls)
     assert fixtures.calls[-1][0] == "delivery_project"
     assert _timers(history)[:1] == [timedelta(seconds=1)]
+
+
+def test_continue_settles_a_pending_effect_before_stopping_or_refuses_without_writing(
+    recovered_worker, monkeypatch,
+):
+    """The coordinator left (an operator cancel during the readback wait) with an
+    external operation still awaiting readback. Continuing reads it back through the
+    same settlement first: refused and unchanged while GitHub has not answered,
+    admitted once the exact readback confirms the original operation."""
+    from devflow_temporal import delivery_github_contract as contract
+
+    store, parent, child, shared, token, command, _ = recovered_worker
+    issue = parent["feature_delivery"]["snapshot"]["issue"]
+    key = "github_plan:v1"
+    shared.intent(token, key, "github_plan", {"body": "Delivery plan v1"})
+    comments = []
+    monkeypatch.setattr(contract.GitHubDelivery, "pages", lambda self, endpoint: list(comments))
+
+    def snapshot():
+        with store._connect() as db:
+            runs = db.execute("SELECT count(*) FROM delivery_runs").fetchone()[0]
+        with shared.connect() as db:
+            workers = [tuple(row) for row in db.execute(
+                "SELECT worker_key,state FROM execution_workers WHERE issue_id=? "
+                "ORDER BY worker_key", (issue["id"],))]
+        return (runs, workers, shared.current(issue["id"])["state"],
+                shared.effect(issue["id"], key)["state"], shared.budget(issue["id"]))
+
+    before = snapshot()
+    assert before[2] == "draining" and before[3] == "pending"
+    with pytest.raises(UnresolvedEffect, match="github_plan:v1") as info:
+        continue_feature(store, parent["run_id"], command)
+    assert "original plan creation still needs exact readback" in str(info.value)
+    assert snapshot() == before, "a refused continuation writes nothing"
+    # GitHub answers: exactly one comment with the original body exists.
+    comments.append({"id": 501, "node_id": "IC_501", "body": "Delivery plan v1"})
+    result = continue_feature(store, parent["run_id"], command)
+    assert shared.effect(issue["id"], key)["state"] != "pending"
+    successor = store.effective_spec(result["run_id"])
+    assert successor["feature_delivery"]["owner"]["generation"] == token["generation"] + 1
+    assert shared.current(issue["id"])["state"] == "active"
+    assert continue_feature(store, parent["run_id"], command) == result
+
+
+@pytest.mark.asyncio
+async def test_transient_admission_retries_do_not_spend_a_resume(monkeypatch):
+    controller = LivenessController(plan())
+    _protocol_stubs(monkeypatch, controller)
+    admissions = []
+    admitted = controller._activity
+
+    async def execute(name, request):
+        if name == "delivery_feature_reserve":
+            admissions.append(request["chunk_id"])
+            if len(admissions) == 1:
+                raise _transient_error(name, type="TimeoutExpired", message="gh timed out")
+        return await admitted(name, request)
+
+    controller._activity = execute
+    attempts = []
+
+    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
+                     assignment=None):
+        attempts.append((chunk_id, kind, resume_allowed))
+        if (chunk_id, kind) == ("client", "build"):
+            raise protocol.FeatureWorkerStopped(chunk_id, kind, closure=deepcopy(TRANSIENT))
+        return _delivered(controller, chunk_id, kind)
+
+    monkeypatch.setattr(protocol, "_worker", worker)
+    result = await protocol.coordinate(
+        controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
+    assert result["outcome"] == "blocked" and "exhausted 2 automatic resumes" in result["error"]
+    assert [allowed for c, k, allowed in attempts if (c, k) == ("client", "build")] == [
+        True, True, False]
+    assert admissions == ["client"] * 3, "one transient admission, then two admitted resumes"
+    assert controller.state["checks"]["feature_worker_recoveries"] == {"client:build": 2}
+    assert controller.state["checks"]["feature_worker_reissues"] == {"client:build": 1}
+    assert [m for e, m in controller.messages if e == "feature_worker_recovering"] == [
+        "Re-issuing the build worker admission for client after TimeoutExpired: gh timed out "
+        f"(1 of {protocol.REISSUES})",
+        "Resumed the build worker for client after an infrastructure failure (1 of 2)",
+        "Resumed the build worker for client after an infrastructure failure (2 of 2)",
+    ]

@@ -446,10 +446,22 @@ def continue_feature(store, run_id, request, *, _revision=None):
         # A worker can complete a separately admitted infrastructure recovery
         # after its coordinator has stopped. Reconcile that closed work through
         # the same settlement boundary before allowing the next generation.
+        from .delivery_execution_registry import UnresolvedEffect
         from .delivery_feature_activities import finish_worker, stop_feature
+        from .delivery_feature_readback import settle
 
-        closed = closed_coordinator(store, run_id)
         execution = store.effective_spec(run_id)
+        # The coordinator may have closed while an external operation still awaited
+        # readback. Read it back here, through the same idempotent settlement the
+        # coordinator used, before anything is written: an effect is never
+        # confirmed or dropped without an authentic readback, and an unresolved one
+        # refuses this continuation until GitHub answers.
+        readback = settle(store, execution)
+        if readback["state"] != "confirmed":
+            raise UnresolvedEffect(
+                f"original GitHub operation {readback['effect_key']} is still unconfirmed "
+                f"({readback['reason']}); continue the feature again once it settles")
+        closed = closed_coordinator(store, run_id)
         with shared.connect() as db:
             workers = [dict(worker) for worker in db.execute(
                 "SELECT * FROM execution_workers WHERE issue_id=? AND generation=? "
