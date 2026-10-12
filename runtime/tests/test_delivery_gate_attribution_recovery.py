@@ -314,3 +314,68 @@ def test_terminal_cleanup_requires_independent_attribution_before_existing_recon
     with pytest.raises(ValueError):
         retry._close_published_cleanup(store, row, subject.spec, lambda: False)
     assert order == ['proof'] and closed == original
+
+
+def test_real_modern_local_tracking_closes_cleanup_without_promoting_remote_consistency(
+    service, monkeypatch,
+):
+    from devflow_temporal import delivery_automatic_retry as retry
+    from devflow_temporal import delivery_native_process
+    from devflow_temporal.delivery_config import DeliveryConfig
+    from devflow_temporal.delivery_resources import RunResources
+
+    store, request = service
+    admitted = DeliveryConfig.admit
+
+    def modern(self, supplied, **kwargs):
+        return {**admitted(self, supplied, **kwargs), 'terminal_tracker_version': 1}
+
+    monkeypatch.setattr(DeliveryConfig, 'admit', modern)
+    # Empty private resource inventory: no OS actor observation or teardown.
+    monkeypatch.setattr(delivery_native_process, 'process_table', lambda: {})
+    store.submit(request)
+    store.mark_start(request['run_id'], accepted=True)
+    spec = store.intake_execution_spec(request['run_id'])
+    assert spec['project_sync_version'] == spec['terminal_tracker_version'] == 1
+    original_receipt = RunResources(spec).finalize('blocked')
+    checks = {'failure': {'classification': 'terminal', 'stage': 'repair'},
+              'resource_cleanup': original_receipt}
+    store.project(spec['run_id'], phase='blocked', outcome='blocked', execution_state='blocked',
+                  cleanup='unknown', event_type='blocked', message='Retained original stop',
+                  error='implementer did not establish a pass', checks=checks)
+    with store._connect() as db:
+        row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                              (spec['run_id'],)).fetchone())
+    closed = {'workflow_id': 'original-private-workflow', 'execution_run_id': 'closed',
+              'result': {'run_id': spec['run_id'], 'error': row['error'], 'checks': checks,
+                         'cleanup': 'unknown'}}
+    before = deepcopy(closed)
+    # The enclosing native/publication proof is tested separately. This invokes
+    # the real cleanup transaction, resource receipts and _tracker_sync producer
+    # on a private Store; no consistent-return or cleanup-result seam is used.
+    updated = retry._close_cleanup(store, row, spec, closed, lambda: False, published=True)
+    tracker = json.loads(updated['tracker_json'])
+    assert {k: tracker[k] for k in ('state', 'pending', 'scope', 'project_sync',
+                                   'status', 'claim_released')} == {
+        'state': 'recorded', 'pending': False, 'scope': 'local',
+        'project_sync': 'asynchronous', 'status': 'blocked', 'claim_released': True}
+    assert updated['cleanup'] == 'confirmed'
+    assert updated['error'] == row['error'] and closed == before
+    assert updated['recovery_json'] == row['recovery_json']
+    with store._connect() as db:
+        assert store.state.claim_for(db, spec['work_id']) is None
+        receipts = [json.loads(r[0]) for r in db.execute(
+            "SELECT payload_json FROM delivery_events WHERE type='resource_cleanup_reconciled'")]
+    durable = next(r for r in receipts if r.get('closure') == 'published')
+    assert durable['original_result_digest'] == digest(before['result'])
+    assert durable['original_checks'] == checks and durable['tracker'] == tracker
+    assert retry._reuse_cleanup(store, updated, spec, closed, lambda: False) is True
+    assert retry._tracker_closed({}, tracker) is False
+    assert retry._tracker_closed({}, {'state': 'consistent', 'pending': False}) is True
+    assert retry._tracker_closed({}, {'state': 'consistent', 'pending': True}) is False
+    for change in ({'pending': True}, {'scope': 'remote'}, {'project_sync': 'synchronous'},
+                   {'status': 'done'}, {'claim_released': False}, {'state': 'consistent'}):
+        monkeypatch.setattr(retry, '_tracker_sync', lambda *_a, change=change, **_kw: {
+            **tracker, **change})
+        with pytest.raises(ValueError, match='later tracker closure is unobservable'):
+            retry._reuse_cleanup(store, updated, spec, closed, lambda: False)

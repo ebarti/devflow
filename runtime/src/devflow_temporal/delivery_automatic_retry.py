@@ -180,6 +180,15 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
              'predecessor_resources': saved})
 
 
+def _tracker_closed(spec, tracker):
+    if spec.get('project_sync_version') == 1:
+        return (tracker.get('state') == 'recorded' and tracker.get('pending') is False
+                and tracker.get('scope') == 'local'
+                and tracker.get('project_sync') == 'asynchronous'
+                and tracker.get('status') == 'blocked' and tracker.get('claim_released') is True)
+    return tracker.get('state') == 'consistent' and tracker.get('pending') is False
+
+
 def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
     """Keep historical failure immutable; record separately authenticated later cleanup.
 
@@ -211,7 +220,7 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
         raise ValueError('original attempts changed during publication readback')
     tracker = _tracker_sync(execution, 'blocked', release=True, terminal=True,
                             reason=closed['result'].get('error') or 'Retained transient failure')
-    if tracker.get('state') != 'consistent' or tracker.get('pending') is not False:
+    if not _tracker_closed(execution, tracker):
         raise ValueError('terminal tracker closure remains unacknowledged')
     checks = json.loads(row['checks_json'])
     with store._connect() as db:
@@ -273,7 +282,7 @@ def _reuse_cleanup(store, row, spec, closed, stopped):
             raise ValueError('released original claim changed before tracker readback')
     tracker = _tracker_sync(execution, 'blocked', release=True, terminal=True,
                             reason=closed['result'].get('error') or 'Retained transient failure')
-    if tracker.get('state') != 'consistent' or tracker.get('pending') is not False:
+    if not _tracker_closed(execution, tracker):
         raise ValueError('acknowledged later tracker closure is unobservable')
     _current(store, row, spec, stopped)
     return True
