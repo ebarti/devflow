@@ -215,6 +215,16 @@ def resume_preflight(store, spec, recovery):
             raise ValueError('policy recovery process identity is not stopped')
 
 
+# Gate outcomes a stopped iteration records; a verdict among them stands.
+GATE_CHECKS = ('prepublish', 'local', 'browser_qa', 'review', 'qa', 'ci')
+
+
+def gate_failed(checks):
+    """A recorded failed gate verdict: review or QA findings, a failed broker check or CI."""
+    return any(isinstance(checks.get(key), dict) and checks[key].get('state') == 'failed'
+               for key in GATE_CHECKS)
+
+
 def reconciled_cleanup(store, row, state):
     """The maintenance record that later confirmed this closed result's cleanup, if any.
 
@@ -229,8 +239,11 @@ def reconciled_cleanup(store, row, state):
         records = [json.loads(item[0]) for item in db.execute(
             "SELECT payload_json FROM delivery_events WHERE run_id=? "
             "AND type='resource_cleanup_reconciled' ORDER BY rowid DESC", (row['run_id'],))]
+    # Only the published closure qualifies: the unpublished retry's record
+    # belongs to a run its fresh attempt superseded.
     return next((item for item in records
-                 if item.get('original_result_digest') == digest(state)
+                 if item.get('closure') == 'published'
+                 and item.get('original_result_digest') == digest(state)
                  and item.get('resource_cleanup') == checks.get('resource_cleanup')
                  and item.get('tracker') == json.loads(row['tracker_json'] or '{}')), None)
 

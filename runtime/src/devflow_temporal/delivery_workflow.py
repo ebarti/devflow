@@ -53,8 +53,27 @@ def _candidate_published(state: dict, candidate: dict) -> bool:
         for item in (state.get("candidate") or {}, candidate or {}))
 
 
+_GATE_CHECKS = ("prepublish", "local", "browser_qa", "review", "qa", "ci")
+
+
+def _gate_failed(state: dict) -> bool:
+    """The stopped iteration recorded a failed gate verdict."""
+    checks = state.get("checks") or {}
+    return any(isinstance(checks.get(key), dict) and checks[key].get("state") == "failed"
+               for key in _GATE_CHECKS) or any(
+        role.get("iteration") == state.get("iteration") and role.get("status") != "pass"
+        for role in state.get("roles", []) if role.get("role") in {"review", "verify"})
+
+
 def _recorded_findings(state: dict, iteration: int) -> list:
-    """Findings the independent roles recorded for one iteration."""
+    """The findings one iteration's gates recorded for the next repair turn.
+
+    New runs keep the exact batch they handed over (every gate, broker checks
+    included); older states retain only the independent roles' findings.
+    """
+    recorded = state.get("repair_findings") or {}
+    if recorded.get("iteration") == iteration and isinstance(recorded.get("findings"), list):
+        return list(recorded["findings"])
     return [finding for role in state.get("roles", [])
             if role.get("iteration") == iteration and role.get("role") in {"review", "verify"}
             for finding in role.get("findings") or []]
@@ -1889,7 +1908,7 @@ class DeliveryWorkflow:
             # candidate; otherwise it resumes at prechecks and publishes it into
             # the existing PR first, so no gate or CI runs on another head. An
             # interrupted turn resumes with the recorded findings it was repairing.
-            if _implementation_passed(stopped):
+            if _implementation_passed(stopped) and not _gate_failed(stopped):
                 return await self._run_iterations(
                     spec, start_iteration=stopped['iteration'],
                     prior_implementer_session=recovery['session_id'], repair_findings=[],
@@ -1900,7 +1919,10 @@ class DeliveryWorkflow:
                     published_checkpoint=_candidate_published(
                         stopped, recovery.get('execution_candidate')),
                 )
-            findings = _recorded_findings(stopped, stopped['iteration'] - 1)
+            # A recorded gate verdict stands: the repair turn receives its findings.
+            findings = _recorded_findings(stopped, stopped['iteration']
+                                          if _implementation_passed(stopped)
+                                          else stopped['iteration'] - 1)
         else:
             findings = [stopped['error'], *role_findings]
         return await self._run_iterations(
@@ -2400,6 +2422,9 @@ class DeliveryWorkflow:
                         "prepublication", prechecked, iteration=iteration
                     )
                     self.state["findings"].extend(repair_findings)
+                    if self.post_publish_v1:
+                        self.state["repair_findings"] = {
+                            "iteration": iteration, "findings": list(repair_findings)}
                     self.state["revision"] += 1
                     await self._project(spec, "findings", "Prepublication candidate needs repair")
                     if iteration >= max_repairs:
@@ -2592,6 +2617,10 @@ class DeliveryWorkflow:
                     break
             if repair_findings:
                 self.state["findings"].extend(repair_findings)
+                if self.post_publish_v1:
+                    # The exact batch the next turn receives, kept for a resume.
+                    self.state["repair_findings"] = {
+                        "iteration": iteration, "findings": list(repair_findings)}
                 self.state["revision"] += 1
                 await self._project(spec, "findings", "Candidate requires bounded repair")
                 if iteration >= max_repairs:

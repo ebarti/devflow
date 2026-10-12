@@ -55,11 +55,12 @@ def stop_transiently(store, state, error, *, stage='checks', controller=False,
     state['checks'] = {k: v for k, v in state['checks'].items()
                        if k not in {'failure', 'controller_failure'}}
     if controller:
+        # The boundary records the structured failure and classifies the stop.
         state['checks']['controller_failure'] = {
             'version': 1, 'stage': stage, 'error_type': 'KeyError', 'message': 'missing key'}
-    else:
-        state['checks']['failure'] = {'classification': 'transient', 'cause_type': cause_type,
-                                      'stage': stage, 'reason': error}
+        cause_type = 'controller_failure'
+    state['checks']['failure'] = {'classification': 'transient', 'cause_type': cause_type,
+                                  'stage': stage, 'reason': error}
     with store._connect() as db:
         # The historical fixture predates automatic retry; current admissions carry it.
         submitted = json.loads(db.execute(
@@ -835,6 +836,13 @@ class RealDelivery:
 
         seen, script, store, base = self.seen, self.script, self.store, self.base_candidate
 
+        @activity.defn(name='delivery_project')
+        async def project(payload):
+            # The real projection, with a scripted failure window.
+            if 'project' in script:
+                script['project'](payload)
+            return await delivery_project(payload)
+
         @activity.defn(name='delivery_prepare')
         async def prepare(_payload):
             return {'candidate': base}
@@ -852,6 +860,7 @@ class RealDelivery:
             seen['roles'].append((payload['role'], payload['iteration']))
             working = DeliveryBroker(store, payload['spec'])
             if payload['role'] == 'implement':
+                seen.setdefault('findings', []).append(list(payload.get('findings') or []))
                 (working.checkout / 'README.md').write_text(
                     f"Owned edit {payload['iteration']}\n")
                 if 'implement' in script:
@@ -906,7 +915,7 @@ class RealDelivery:
             seen['release'].append(payload['release'])
             return {'state': 'consistent'}
 
-        return [delivery_project, delivery_publish, delivery_reconcile_publish,
+        return [project, delivery_publish, delivery_reconcile_publish,
                 delivery_gates_readback, prepare, tracker_start, repair_preflight, role,
                 precheck, checks, ci, tracker, terminal_tracker, finalize]
 
@@ -1172,3 +1181,126 @@ async def test_ci_continuation_replays_on_its_recorded_path_with_and_without_the
     else:
         # Recorded before the marker: the stop is the one the old workflow made.
         assert 'failure' not in result['checks']
+
+
+def fail_first_findings_projection(payload):
+    # Every attempt of the first iteration's findings projection fails; the
+    # continuation's projections succeed.
+    if payload['event_type'] == 'findings' and payload['iteration'] == 0:
+        raise RuntimeError('projection store unavailable')
+
+
+@pytest.mark.asyncio
+async def test_masked_gate_failure_routes_to_a_repair_turn_not_a_fresh_assessment(service,
+                                                                                   monkeypatch):
+    """Review records findings, then the findings projection fails and the boundary
+    stops the run with cleanup unknown. The verdict stands: the service loop
+    confirms cleanup, then resumes the repair turn with those findings; no gate
+    or CI runs on the failed head again."""
+    script = {'review': lambda iteration: ['Needs a second edit'] if iteration == 0 else None,
+              'project': fail_first_findings_projection}
+    async with RealDelivery(service, monkeypatch, script=script).running() as run:
+        stopped = await run.start()
+        first_head = stopped['pull_request']['head']
+        assert stopped['outcome'] == 'blocked' and stopped['iteration'] == 0
+        assert stopped['error'] == 'controller failed: ActivityError'
+        assert stopped['checks']['failure']['cause_type'] == 'controller_failure'
+        assert stopped['checks']['review']['state'] == 'failed'
+        assert stopped['repair_findings'] == {'iteration': 0, 'findings': ['Needs a second edit']}
+        assert stopped['cleanup'] == 'unknown' and run.claim() is not None
+        run.age()
+        clear_waits(run.store)
+        admitted = retry.retry_once(run.store)
+        assert [item['phase'] for item in admitted] == ['repair_continuation_queued']
+        assert admitted[0]['authorized_through_iteration'] == 1
+        recovery, _, _ = current_recovery(run.store)
+        assert recovery['kind'] == RESUME_KIND
+        assert recovery['command']['command_id'].startswith('automatic-repair-')
+        with pytest.raises(ValueError):
+            run.store.continue_repair('run-1', {
+                'continuation_kind': KIND, 'command_id': 'fresh-assessment',
+                'expected_revision': stopped['revision'], 'expected_iteration': 0,
+                'expected_candidate_id': stopped['candidate']['id'], 'expected_pr_number': 1,
+                'expected_pr_head': first_head, 'additional_iterations': 0})
+        assert run_count(run.store) == 1
+        resumed, _ = await run.continue_run()
+    repaired = remote_head(run.broker)
+    assert resumed['outcome'] == 'delivered'
+    assert resumed['pull_request']['head'] == repaired != first_head
+    assert run.seen['roles'] == [('implement', 0), ('review', 0), ('implement', 1),
+                                 ('review', 1), ('verify', 1)]
+    assert run.seen['findings'] == [[], ['Needs a second edit']]
+    assert run.seen['ci_heads'] == [repaired]
+    assert len(run.gh.creations()) == 1
+
+
+def test_transient_gate_retries_refuse_a_recorded_gate_verdict(stopped, monkeypatch):
+    store, _, state, _, request = stopped
+    stop_transiently(store, state, 'controller failed: KeyError', controller=True,
+                     keep_roles=True)
+    state['checks']['review'] = {'state': 'failed', 'candidate_id': state['candidate']['id']}
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET checks_json=? WHERE run_id='run-1'",
+                   (canonical_json(state['checks']),))
+    for kind in (KIND, CI_KIND):
+        with pytest.raises(ValueError):
+            store.continue_repair('run-1', {**request, 'continuation_kind': kind,
+                                            'command_id': 'verdict-' + kind})
+    with store._connect() as db:
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+    spec = json.loads(row['request_json'])
+    admit, generation, payload = retry.published_continuation(store, row, spec)
+    assert admit == store.continue_repair and generation == 1
+    assert payload['continuation_kind'] == RESUME_KIND
+    assert payload['additional_iterations'] == 1
+    assert payload['command_id'].startswith('automatic-repair-')
+    exhausted = {**spec, 'policy': {**spec['policy'], 'max_repairs': row['iteration']}}
+    assert retry.published_continuation(store, row, exhausted) is None
+
+
+def test_interrupted_repair_resumes_with_every_recorded_gate_finding(stopped, monkeypatch):
+    store, _, state, _, _ = stopped
+    spec = store.spec('run-1')
+    broker_findings = ['local check packaging failed: exit 1',
+                       'Receipt omits source hash semantics']
+    state['iteration'] = 2
+    state['repair_findings'] = {'iteration': 1, 'findings': broker_findings}
+    state['checks'] = {'failure': {'classification': 'transient',
+                                   'cause_type': 'ActivityTimeoutError', 'stage': 'repair',
+                                   'reason': 'implementer activity failed: ActivityError'}}
+    state['error'] = 'implementer activity failed: ActivityError'
+    recovery = {'execution_spec': spec, 'maximum_iteration': 3, 'state': state,
+                'execution_candidate': state['candidate'], 'session_id': 'original-session',
+                'command': {'additional_iterations': 1}}
+    flow = DeliveryWorkflow()
+    flow.post_publish_v1 = True
+    launched = {}
+    resume_probe(flow, launched, monkeypatch)
+    asyncio.run(flow._resume_stopped(spec, recovery))
+    assert launched['role'] == 'implement' and launched['iteration'] == 3
+    assert launched['findings'] == broker_findings
+
+
+def test_reconciled_cleanup_accepts_only_published_closures(service):
+    from devflow_temporal.delivery_policy_recovery import reconciled_cleanup
+
+    store, request = service
+    store.submit(request)
+    receipt = {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
+               'resource_cleanup': 'confirmed', 'receipt_sha256': 'later'}
+    state = {'run_id': 'run-1', 'cleanup': 'unknown', 'checks': {'resource_cleanup': {
+        'state': 'unknown'}}}
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message='stopped', outcome='blocked', cleanup='confirmed',
+                  checks={'resource_cleanup': receipt}, tracker={'state': 'consistent'})
+    with store._connect() as db:
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+        record = {'original_result_digest': digest(state), 'resource_cleanup': receipt,
+                  'tracker': json.loads(row['tracker_json'] or '{}')}
+        store._event(db, 'run-1', row['revision'], 'resource_cleanup_reconciled',
+                     'unpublished retry closure', record)
+    assert reconciled_cleanup(store, row, state) is None
+    with store._connect() as db:
+        store._event(db, 'run-1', row['revision'] + 1, 'resource_cleanup_reconciled',
+                     'published closure', {**record, 'closure': 'published'})
+    assert reconciled_cleanup(store, row, state)['closure'] == 'published'

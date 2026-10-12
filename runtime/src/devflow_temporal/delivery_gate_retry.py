@@ -17,6 +17,7 @@ from .delivery_policy_recovery import (
     _rows,
     _stopped_cleanup,
     closed_checks,
+    gate_failed,
     reconciled_cleanup,
     work_binding,
 )
@@ -163,15 +164,24 @@ def snapshot(store, run_id, kind=KIND):
     failure = state.get('checks', {}).get('failure') or {}
     reconciled = reconciled_cleanup(store, row, state)
     state_checks, row_checks = closed_checks(row, state, reconciled)
+    # A recorded gate verdict stands: a transport or controller stop after it is
+    # never a fresh assessment of the same head.
+    verdict = gate_failed(state.get('checks') or {})
     # A lost CI observation keeps CI observation semantics, never fresh gates.
-    transient_retry = bool(kind == KIND and transient_stop(state)
+    transient_retry = bool(kind == KIND and transient_stop(state) and not verdict
                            and failure.get('stage') != 'waiting_ci'
                            and failure.get('cause_type') not in {
                                'tracker_readback', 'publication_deadline', 'ci_deadline'})
     # A lost observation never recorded a CI state; its classified stop at the
     # CI stage is the same unchanged-head condition as a recorded deadline.
-    transient_ci = bool(kind == CI_KIND and failure.get('classification') == 'transient'
+    transient_ci = bool(kind == CI_KIND and not verdict
+                        and failure.get('classification') == 'transient'
                         and failure.get('stage') == 'waiting_ci')
+    # A controller stop that masked the run's last repair is the exhausted repair
+    # it would have reported: the same one-time operator reassessment applies.
+    masked_exhaustion = bool(kind == KIND and not unpublished and verdict
+                             and transient_stop(state)
+                             and row['iteration'] >= spec['policy']['max_repairs'])
     if controller_only and previous is not None:
         raise ValueError('controller retry requires its original finalized checkpoint')
     if (controller_only and (row['iteration'] > spec['policy']['max_repairs']
@@ -301,7 +311,7 @@ def snapshot(store, run_id, kind=KIND):
             or (prelaunch and state.get('cleanup') != 'unknown')
             or (not prelaunch and state.get('cleanup') != 'confirmed' and reconciled is None)
             or row['error'] != state.get('error')
-            or (not (transient_retry or transient_ci)
+            or (not (transient_retry or transient_ci or masked_exhaustion)
                 and state.get('error') not in ({'repair limit exhausted',
                                           'required CI did not confirm this PR head'}
                                         if report_retry

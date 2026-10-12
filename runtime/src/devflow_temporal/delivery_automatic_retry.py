@@ -19,6 +19,7 @@ from .contracts import digest
 from .delivery_activities import _tracker_sync
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_metadata_recovery import _immutable
+from .delivery_policy_recovery import gate_failed
 from .delivery_resources import (
     RunResources,
     observe_completed_resources,
@@ -198,7 +199,8 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
                 key: value for key, value in closed.items()
                 if key != 'result'}, 'original_result_digest': digest(closed['result']),
              'resource_cleanup': receipt, 'tracker': tracker,
-             'original_attempts': attempts, 'native_observation': observed})
+             'original_attempts': attempts, 'native_observation': observed,
+             **({'closure': 'published'} if published else {})})
         db.execute('UPDATE delivery_runs SET checks_json=?,cleanup=?,tracker_json=?,revision=? '
                    'WHERE run_id=?', (json.dumps({**checks, 'resource_cleanup': receipt}),
                     'confirmed', json.dumps(tracker), row['revision'] + 1, spec['run_id']))
@@ -451,6 +453,22 @@ def published_continuation(store, row, spec):
             'expected_pr_number': 0}
     if not isinstance(publication, dict):
         return None
+    if gate_failed(checks):
+        # A recorded gate verdict stands: never a fresh assessment of the same
+        # head. The repair turn the run would have taken next is resumed, with
+        # those findings, within the run's own budget.
+        from .delivery_stopped_resume import KIND as RESUME_KIND
+
+        if row['iteration'] >= spec['policy']['max_repairs']:
+            return None
+        generation = 1 + sum(1 for r in chain if r.get('kind') == RESUME_KIND)
+        return store.continue_repair, generation, {
+            'continuation_kind': RESUME_KIND,
+            'command_id': f'automatic-repair-{identity}-{generation}',
+            'expected_revision': row['protocol_revision'],
+            'expected_iteration': row['iteration'],
+            'expected_candidate_id': candidate['id'],
+            'expected_candidate_head': candidate['head'], 'additional_iterations': 1}
     # A lost observation at the CI stage is observed again, never re-gated.
     kind = (CI_KIND if failure.get('cause_type') == 'ci_deadline'
             or failure.get('stage') == 'waiting_ci' else KIND)
