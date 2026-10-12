@@ -776,11 +776,12 @@ async def test_temporal_stop_reaches_native_monitor_and_frees_slot(
 
 
 def attempt_info(attempt=1, maximum_attempts=3, budget=timedelta(hours=2),
-                 elapsed=timedelta(0)):
+                 elapsed=timedelta(0), activity_id="gate", workflow_run_id="run"):
     """What activity.info() reports for a native gate under the production options."""
     return SimpleNamespace(
         attempt=attempt, retry_policy=SimpleNamespace(maximum_attempts=maximum_attempts),
         schedule_to_close_timeout=budget, scheduled_time=datetime.now(UTC) - elapsed,
+        activity_id=activity_id, workflow_run_id=workflow_run_id,
     )
 
 
@@ -852,7 +853,8 @@ async def test_final_check_attempt_stop_reaches_native_gate(owned_checks, monkey
 async def test_replaced_attempt_hands_its_gate_to_the_retry(owned_checks, monkeypatch, tmp_path):
     monkeypatch.setattr(activities.activity, "cancellation_details", lambda: SimpleNamespace(
         cancel_requested=False, timed_out=False, not_found=True, worker_shutdown=False))
-    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info())
+    dispatched = {"attempt": 1}
+    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info(**dispatched))
     request = owned_checks.request("one", seconds=2, timeout=60)
     broker = owned_checks.brokers["one"]
     state = Path(request["spec"]["state_dir"])
@@ -902,6 +904,7 @@ async def test_replaced_attempt_hands_its_gate_to_the_retry(owned_checks, monkey
     replaced.cancel()
     with pytest.raises(asyncio.CancelledError):
         await replaced
+    dispatched["attempt"] = 2  # Temporal dispatches the retry as the next attempt
     assert await activities.delivery_checks(request) == {"state": "passed", "cleanup": "confirmed"}
     # One body at a time and one launch per check: the replaced body finished
     # only the monitor it supervised, then handed the gate to the retry.
@@ -922,12 +925,14 @@ async def test_retry_dispatched_before_the_replacement_notice_waits_for_its_pred
     # replacement only at its next throttled heartbeat RPC (up to 24s later).
     monkeypatch.setattr(activities.activity, "cancellation_details", lambda: SimpleNamespace(
         cancel_requested=False, timed_out=False, not_found=True, worker_shutdown=False))
-    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info())
+    dispatched = {"attempt": 1}
+    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info(**dispatched))
     request = owned_checks.request("one", seconds=2, timeout=60)
     broker = owned_checks.brokers["one"]
     journal = Path(request["spec"]["state_dir"]) / "native" / "native-process.json"
     first = asyncio.create_task(activities.delivery_checks(request))
     await wait_until(lambda: observed_native_tree(journal))
+    dispatched["attempt"] = 2  # Temporal dispatches the retry as the next attempt
     retry = asyncio.create_task(activities.delivery_checks(request))
     await asyncio.sleep(0.5)
     # The retry supersedes the body this worker already runs and waits for it.
@@ -940,3 +945,25 @@ async def test_retry_dispatched_before_the_replacement_notice_waits_for_its_pred
     assert owned_checks.maximum() == 1
     assert not (journal.parent / "cancel").exists()
     assert_stopped(broker)
+
+
+@pytest.mark.parametrize("overlap", ["different_activity", "equal_attempt"])
+async def test_same_gate_identity_without_a_later_attempt_shares_admission(
+    owned_checks, monkeypatch, overlap,
+):
+    # Only a later attempt of the same activity supersedes a body. Another
+    # activity, or the same attempt, that carries the gate identity keeps
+    # today's shared admission.
+    dispatched = {"activity_id": "gate-a"}
+    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info(**dispatched))
+    request = owned_checks.request("shared", seconds=1, timeout=60)
+    broker = owned_checks.brokers["shared"]
+    first = asyncio.create_task(activities.delivery_precheck(request))
+    await wait_until(broker.started.is_set)
+    if overlap == "different_activity":
+        dispatched["activity_id"] = "gate-b"
+    second = asyncio.create_task(activities.delivery_precheck(request))
+    assert await first == {"state": "passed", "cleanup": "confirmed"}
+    assert await second == {"state": "passed", "cleanup": "confirmed"}
+    assert owned_checks.maximum() == 2
+    assert not (Path(request["spec"]["state_dir"]) / "native" / "cancel").exists()

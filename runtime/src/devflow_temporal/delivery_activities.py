@@ -43,10 +43,11 @@ _UNCLEAN_CHECK_RECHECK_INTERVAL = 5.0
 # ports their journals recorded, retained while any of those is observably live.
 _UNCLEAN_CHECK_SLOTS: list[dict[str, Any]] = []
 _UNCLEAN_CHECK_LOCK = threading.Lock()
-# The newest check body per gate identity in this worker, with its supersession
-# and completion signals. A newer attempt supersedes the registered body itself
-# and waits for it, without relying on Temporal's throttled replacement notice.
-_ACTIVE_CHECKS: dict[tuple[Any, ...], tuple[threading.Event, threading.Event]] = {}
+# The registered check body per (gate identity, workflow run, activity id) in
+# this worker: its attempt number, supersession and completion signals. A later
+# attempt of the same activity supersedes the registered body itself and waits
+# for it, without relying on Temporal's throttled replacement notice.
+_ACTIVE_CHECKS: dict[tuple[Any, ...], tuple[int, threading.Event, threading.Event]] = {}
 _ACTIVE_CHECK_LOCK = threading.Lock()
 
 
@@ -155,31 +156,45 @@ def _gate_identity(request: dict[str, Any], kind: str) -> tuple[Any, ...]:
             candidate.get("id", spec.get("base_sha")))
 
 
-def _claim_gate(
-    identity: tuple[Any, ...], superseded: threading.Event, finished: threading.Event,
-) -> threading.Event | None:
-    """Register a gate's newest body; supersede the previous one and return its `finished`.
+def _attempt_identity() -> tuple[str, str, int] | None:
+    """The workflow run, activity id and attempt this body runs for; None outside one."""
+    if not activity.in_activity():
+        return None
+    try:
+        info = activity.info()
+    except RuntimeError:
+        return None
+    return (info.workflow_run_id, info.activity_id, info.attempt)
 
-    Temporal never runs two attempts of one activity at once, so within this
-    worker a body that finds another registered under its identity is the
-    newer attempt. Across workers the older body keeps running until the
+
+def _claim_gate(
+    key: tuple[Any, ...], attempt: int, superseded: threading.Event, finished: threading.Event,
+) -> threading.Event | None:
+    """Register a later attempt of one activity; supersede the earlier body, return its `finished`.
+
+    Only a genuine retry supersedes: the same workflow run and activity id with
+    a higher attempt, which Temporal never runs concurrently. Any other overlap
+    of one gate identity (another activity, or an equal attempt) keeps shared
+    admission. Across workers the earlier body keeps running until the
     replacement notice reaches it.
     """
     with _ACTIVE_CHECK_LOCK:
-        previous = _ACTIVE_CHECKS.get(identity)
-        _ACTIVE_CHECKS[identity] = (superseded, finished)
+        previous = _ACTIVE_CHECKS.get(key)
+        if previous is not None and previous[0] >= attempt:
+            return None
+        _ACTIVE_CHECKS[key] = (attempt, superseded, finished)
     if previous is None:
         return None
-    previous[0].set()
-    return previous[1]
+    previous[1].set()
+    return previous[2]
 
 
-def _release_gate(identity: tuple[Any, ...], finished: threading.Event) -> None:
+def _release_gate(key: tuple[Any, ...], finished: threading.Event) -> None:
     with _ACTIVE_CHECK_LOCK:
         finished.set()
-        current = _ACTIVE_CHECKS.get(identity)
-        if current is not None and current[1] is finished:
-            del _ACTIVE_CHECKS[identity]
+        current = _ACTIVE_CHECKS.get(key)
+        if current is not None and current[2] is finished:
+            del _ACTIVE_CHECKS[key]
 
 
 def _release_settled_check_slots() -> None:
@@ -243,6 +258,8 @@ async def _execute_check(
     superseded = threading.Event()
     finished = threading.Event()
     identity = _gate_identity(request, kind)
+    dispatch = _attempt_identity()
+    gate_key = None if dispatch is None else (identity, *dispatch[:2])
     # Admission and cancellation decide atomically whether the gate launches.
     gate = threading.Lock()
 
@@ -269,10 +286,12 @@ async def _execute_check(
                 _release_settled_check_slots()
 
         try:
-            # A newer attempt takes over the gate: it supersedes the body this
-            # worker already runs for the same identity and waits for it to
-            # stop, so one check body and one slot serve a gate at a time.
-            predecessor = _claim_gate(identity, superseded, finished)
+            # A later attempt of this activity takes over the gate: it
+            # supersedes the body this worker already runs for it and waits
+            # for that body to stop, so one body and one slot serve the gate.
+            predecessor = None
+            if gate_key is not None:
+                predecessor = _claim_gate(gate_key, dispatch[2], superseded, finished)
             while predecessor is not None and not predecessor.is_set():
                 if superseded.is_set():
                     raise CheckSuperseded(
@@ -346,7 +365,8 @@ async def _execute_check(
                 # Unknown teardown cannot supply ports or capacity to another gate
                 # until the processes and ports it recorded are proven gone.
                 _retain_unclean_check(port_descriptors, broker, ports)
-            _release_gate(identity, finished)
+            if gate_key is not None:
+                _release_gate(gate_key, finished)
 
     execution = asyncio.get_running_loop().run_in_executor(
         None, contextvars.copy_context().run, run,
