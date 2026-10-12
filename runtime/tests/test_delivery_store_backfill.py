@@ -1,9 +1,11 @@
-"""Store construction must neither replay nor depend on every historical run."""
+"""Store construction does schema setup only; the service pass maintains projections."""
 from __future__ import annotations
 
 import json
 import logging
 import os
+import sqlite3
+import threading
 
 import httpx
 import pytest
@@ -12,6 +14,7 @@ from test_delivery_store import service as service
 from devflow_temporal import delivery_features
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_config import DeliveryConfig
+from devflow_temporal.delivery_features import NEWEST_RUN_SQL, maintain_projections
 from devflow_temporal.delivery_store import DeliveryStore
 
 
@@ -38,48 +41,108 @@ def _bump_revision(store, run_id):
         db.execute("UPDATE delivery_runs SET revision=revision+1 WHERE run_id=?", (run_id,))
 
 
-def test_construction_projects_each_run_once_per_revision_and_generation(service, monkeypatch):
+def _markers(store):
+    with store._connect() as db:
+        return [tuple(row) for row in db.execute(
+            "SELECT run_id,revision,generation,error FROM delivery_feature_projections "
+            "ORDER BY run_id")]
+
+
+def test_construction_never_projects_and_the_service_pass_reprojects_changed_rows(
+    service, monkeypatch
+):
     store, request = service
     store.submit(request)
     store.submit(_second(request))
     calls = _counting_transition(monkeypatch)
-    DeliveryStore(store.config)
-    assert calls == [], "an unchanged history is not replayed per construction"
     _bump_revision(store, "run-1")
-    DeliveryStore(store.config)
-    assert calls == ["run-1"]
-    calls.clear()
-    DeliveryStore(store.config)
-    assert calls == []
-    # Projection code changed: history is re-projected once.
     monkeypatch.setattr(delivery_features, "projection_generation", lambda: "upgraded")
     DeliveryStore(store.config)
+    assert calls == [], "construction does no projection work, however stale the history"
+    result = maintain_projections(store)
     assert calls == ["run-1", "run-2"]
+    assert (result["pending"], result["projected"], result["skipped"]) == (2, 2, {})
     calls.clear()
-    DeliveryStore(store.config)
-    assert calls == []
+    assert maintain_projections(store)["pending"] == 0 and calls == []
+    _bump_revision(store, "run-2")
+    assert maintain_projections(store)["projected"] == 1 and calls == ["run-2"]
+    assert [marker[1:3] for marker in _markers(store)] == [(2, "upgraded"), (2, "upgraded")]
 
 
-def test_construction_skips_unchanged_rows_whichever_admitted_config_builds_it(
-    service, tmp_path, monkeypatch
-):
-    """Activities build stores from sealed per-run snapshots; the API and CLI
-    use the live file. Alternating between them must not replay history."""
+def test_construction_from_another_install_or_config_does_nothing(service, tmp_path, monkeypatch):
+    """The CLI, MCP and activities (sealed snapshots) may run other package
+    bytes or configurations; only the service re-projects, so they never replay
+    history or touch its markers."""
     store, request = service
     store.submit(request)
     store.submit(_second(request))
+    before = _markers(store)
     edited = json.loads(store.config.path.read_text())
     edited["repositories"]["fixture"]["assignee"] = "octocat"
-    edited["repositories"]["fixture"]["project_url"] = "https://github.com/orgs/example/projects/9"
     sealed_path = tmp_path / "sealed-snapshot.json"
     sealed_path.write_text(json.dumps(edited))
     sealed = DeliveryConfig.load(sealed_path)
-    assert sealed.raw != store.config.raw
     calls = _counting_transition(monkeypatch)
-    for config in (sealed, store.config, sealed, store.config):
+    monkeypatch.setattr(delivery_features, "projection_generation", lambda: "another-install")
+    for config in (store.config, sealed, store.config, sealed):
         DeliveryStore(config)
-    assert calls == [], "a binding edit or a config alternation must not replay history"
-    assert delivery_features.projection_generation() == delivery_features.projection_generation()
+    assert calls == []
+    assert _markers(store) == before
+
+
+def test_service_pass_commits_per_row_and_holds_no_lock_between_rows(service, monkeypatch):
+    store, request = service
+    for number in range(1, 6):
+        store.submit({**request, "run_id": f"run-{number}", "command_id": f"command-{number}",
+                      "work_id": f"work-{number}", "branch": f"feat/fixture-{number}",
+                      "issue_url": f"https://github.com/example/fixture/issues/{number}"})
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM delivery_feature_projections")  # the whole history is stale
+    reached, release = threading.Event(), threading.Event()
+    original = delivery_features._project_row
+    rows = []
+
+    def paused(store_, run_id, generation):
+        rows.append(run_id)
+        if len(rows) == 3:
+            reached.set()
+            assert release.wait(5), "maintenance fixture was not released"
+        return original(store_, run_id, generation)
+
+    monkeypatch.setattr(delivery_features, "_project_row", paused)
+    results = []
+    maintainer = threading.Thread(target=lambda: results.append(maintain_projections(store)))
+    maintainer.start()
+    try:
+        assert reached.wait(5), "the pass never reached its third row"
+        # Two rows are committed and visible; a writer gets the lock at once.
+        probe = sqlite3.connect(store.config.tracking_db, timeout=1)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+            probe.execute("UPDATE delivery_runs SET revision=revision+1 WHERE run_id='run-5'")
+            committed = {row[0] for row in probe.execute(
+                "SELECT run_id FROM delivery_feature_projections")}
+            probe.commit()
+        finally:
+            probe.close()
+        assert committed == {"run-1", "run-2"}
+    finally:
+        release.set()
+        maintainer.join(10)
+    assert results and results[0]["projected"] == 5 and results[0]["skipped"] == {}
+    assert rows == [f"run-{number}" for number in range(1, 6)]
+    # run-5 changed while the pass ran; its row was read under its own lock.
+    assert [marker[:2] for marker in _markers(store)] == [
+        ("run-1", 1), ("run-2", 1), ("run-3", 1), ("run-4", 1), ("run-5", 2)]
+    assert maintain_projections(store)["pending"] == 0
+
+
+def test_newest_run_lookup_uses_the_issue_index(service):
+    store, _request = service
+    with store._connect() as db:
+        plan = db.execute("EXPLAIN QUERY PLAN " + NEWEST_RUN_SQL, ("issue",)).fetchall()
+    assert any("delivery_runs_issue_newest" in row[3] for row in plan), plan
 
 
 @pytest.mark.asyncio
@@ -103,7 +166,7 @@ async def test_skipped_projections_are_visible_in_service_info_and_run_detail(se
         ("run-1", "ValueError: registry unreadable")]
 
 
-def test_construction_survives_an_unreadable_historical_feature_row(
+def test_service_pass_skips_an_unreadable_historical_feature_row(
     service, tmp_path, caplog, monkeypatch
 ):
     store, request = service
@@ -128,9 +191,11 @@ def test_construction_survives_an_unreadable_historical_feature_row(
     with pytest.raises(ValueError, match="private"), store._connect() as db:
         delivery_features.transition(db, store.config, "run-2")
     calls = _counting_transition(monkeypatch)
+    rebuilt = DeliveryStore(store.config)
+    assert calls == [], "construction is independent of the unreadable row"
     with caplog.at_level(logging.WARNING, logger="devflow_temporal.delivery_features"):
-        rebuilt = DeliveryStore(store.config)
-    assert calls == ["run-2"]
+        result = maintain_projections(rebuilt)
+    assert calls == ["run-2"] and list(result["skipped"]) == ["run-2"]
     assert any("run-2" in record.getMessage() and "private" in record.getMessage()
                for record in caplog.records)
     assert {item["run_id"] for item in rebuilt.pending_starts()} == {"run-1", "run-2"}
@@ -139,12 +204,11 @@ def test_construction_survives_an_unreadable_historical_feature_row(
         marker = db.execute("SELECT revision,error FROM delivery_feature_projections "
                             "WHERE run_id='run-2'").fetchone()
         assert marker["revision"] == 2 and "private" in marker["error"]
-        # Operators see the skipped row (service info lists these; see below).
         assert [item["run_id"] for item in delivery_features.projection_failures(db)] == ["run-2"]
         assert delivery_features.current(db, request["issue_url"])["status"] == "Queued"
     calls.clear()
-    DeliveryStore(store.config)
-    assert calls == [], "a recorded skip is not retried on every construction"
+    assert maintain_projections(rebuilt)["pending"] == 0 and calls == [], \
+        "a recorded skip is retried once per service process, not every pass"
     _bump_revision(store, "run-2")
-    DeliveryStore(store.config)
+    maintain_projections(rebuilt)
     assert calls == ["run-2"], "a changed row is tried again"

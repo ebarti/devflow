@@ -100,9 +100,10 @@ class DeliveryStore:
             # need this snapshot; they must not take every read surface down.
             logger.warning("admitted configuration snapshot publication failed: %s", exc)
         with self._connect() as db:
-            # Initialization also backfills feature projections. Reserve the write
-            # transaction before reading executions, so a concurrent writer cannot
-            # deadlock that read cursor while it upgrades to its first write.
+            # Schema setup only: feature projections are maintained by the
+            # service loop (delivery_features.maintain_projections), never by a
+            # construction. Reserve the write transaction so concurrent openers
+            # serialize their migrations instead of upgrading a read cursor.
             db.execute("BEGIN IMMEDIATE")
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_runs (
@@ -420,11 +421,9 @@ class DeliveryStore:
             from .delivery_settings import initialize as initialize_settings
 
             initialize_settings(db)
-            from .delivery_features import backfill
             from .delivery_features import initialize as initialize_features
 
             initialize_features(db)
-            backfill(db, self.config)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

@@ -250,6 +250,13 @@ class DeliveryService:
                 # Only an authenticated completed result can repair its read model.
                 pass
             try:
+                await self.reproject_features_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A stale feature projection waits for the next pass.
+                pass
+            try:
                 from .delivery_automatic_retry import retry_once
 
                 if self._retry_task is None or self._retry_task.done():
@@ -281,6 +288,11 @@ class DeliveryService:
         )
         if observations:
             self._closed_projection_cursor = observations[-1]["run_id"]
+
+    async def reproject_features_once(self) -> None:
+        from .delivery_features import maintain_projections
+
+        await asyncio.to_thread(maintain_projections, self.store)
 
     async def dispatch_questions_once(self) -> None:
         from .delivery_question_sender import pump_blocking_questions

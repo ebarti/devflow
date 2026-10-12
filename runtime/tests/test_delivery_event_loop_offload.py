@@ -185,3 +185,6 @@ async def test_maintenance_passes_read_the_store_off_the_event_loop(api_fixture,
     observed.clear()
     await reconcile_closed_native(store, Client())
     assert {"_connect", "effective_spec"} <= set(observed)
+    observed.clear()
+    await app.state.delivery.reproject_features_once()
+    assert observed and set(observed) == {"_connect"}
