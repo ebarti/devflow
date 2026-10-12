@@ -19,6 +19,24 @@ from .delivery_metadata_contract import evidence_applicability
 from .delivery_questions import valid_blocking_questions
 
 
+def _cleanup_evidence_unknown(state: dict, launch_window_v1: bool) -> bool:
+    """Whether recorded roles or gates leave the run's cleanup unknown.
+
+    Module-level on purpose: duck-typed controllers in tests run `_stop` unbound.
+    """
+    return any(
+        role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
+        for role in state["roles"]
+    ) or any(
+        isinstance(check, dict)
+        and (check.get("cleanup") == "unknown" or (
+            check.get("state") == "unknown"
+            # A no-verdict gate with independently confirmed teardown.
+            and not (launch_window_v1 and check.get("cleanup") == "confirmed")))
+        for check in state["checks"].values()
+    )
+
+
 def _failure_classification(cause: Exception | None, controller_cause: str | None) -> dict:
     """Classify controller observations, never human or model diagnostic text."""
     result = {"classification": "terminal"}
@@ -652,7 +670,8 @@ class DeliveryWorkflow:
         self, spec: dict[str, Any], reason: str, *, cause: Exception | None = None,
         controller_cause: str | None = None,
     ) -> dict[str, Any]:
-        if self._cleanup_evidence_unknown():
+        # Duck-typed controllers in tests call this unbound; keep it attribute-light.
+        if _cleanup_evidence_unknown(self.state, getattr(self, "launch_window_v1", False)):
             self.state["cleanup"] = "unknown"
         if self.cancel_requested:
             self.state["cleanup"] = "unknown"
@@ -670,21 +689,9 @@ class DeliveryWorkflow:
         await self._project(spec, "blocked", reason)
         return self.state
 
-    def _cleanup_evidence_unknown(self) -> bool:
-        return any(
-            role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
-            for role in self.state["roles"]
-        ) or any(
-            isinstance(check, dict)
-            and (check.get("cleanup") == "unknown" or (
-                check.get("state") == "unknown"
-                # A no-verdict gate with independently confirmed teardown.
-                and not (self.launch_window_v1 and check.get("cleanup") == "confirmed")))
-            for check in self.state["checks"].values()
-        )
-
     async def _cancelled(self, spec: dict[str, Any]) -> dict[str, Any]:
-        uncertain = self.state.get("cleanup") == "unknown" or self._cleanup_evidence_unknown()
+        uncertain = self.state.get("cleanup") == "unknown" or _cleanup_evidence_unknown(
+            self.state, getattr(self, "launch_window_v1", False))
         self.state["phase"] = "cancelled"
         self.state["execution_state"] = "terminal"
         self.state["outcome"] = "cancelled"
