@@ -121,7 +121,9 @@ def supervised_runtime(entry, config, explicit=None):
         return Path(explicit).expanduser().resolve()
     journal = entry.parent.parent / "manifest.json"
     if entry.parent.name == "entries" and journal.is_file():
-        recorded = json.loads(journal.read_text(encoding="utf-8")).get("runtime_dir")
+        # install-delivery-launchers.py journals {"request": <request>, "bin_identity": ...}.
+        request = json.loads(journal.read_text(encoding="utf-8")).get("request")
+        recorded = request.get("runtime_dir") if isinstance(request, dict) else None
         if isinstance(recorded, str) and recorded:
             return Path(recorded).resolve()
     head = entry.read_bytes()[:4096]
@@ -130,7 +132,8 @@ def supervised_runtime(entry, config, explicit=None):
             if not line.startswith("exec "):
                 continue
             words = shlex.split(line[len("exec "):])
-            if "--config" in words and Path(words[words.index("--config") + 1]).resolve() != config:
+            if (config is not None and "--config" in words
+                    and Path(words[words.index("--config") + 1]).resolve() != config):
                 raise ValueError(f"{entry} is bound to another configuration: "
                                  f"{words[words.index('--config') + 1]}")
             target = Path(words[0]) if words else Path()
@@ -234,8 +237,11 @@ def uninstall(args, name, staged, active):
 def active_agents(launch_agents, runtime):
     """Activated Devflow delivery agents that supervise a stack from ``runtime``.
 
-    An agent that recorded no runtime is reported for every checkout: refusing
-    an upgrade beats relaunching a worker from changed source.
+    The recorded runtime and the one re-derived from the entry point both count:
+    a wrapper re-pointed since installation launches from where it execs now.
+    An agent whose checkout cannot be told, or a plist under the Devflow label
+    that Devflow does not own, is reported for every checkout: refusing an
+    upgrade beats relaunching a worker from changed source.
     """
     runtime = Path(runtime).expanduser().resolve()
     folder = Path(launch_agents).expanduser()
@@ -243,15 +249,26 @@ def active_agents(launch_agents, runtime):
     for path in sorted(folder.glob(PREFIX + "*.plist")) if folder.is_dir() else []:
         try:
             data = owned(path)
-        except ValueError:
+        except ValueError as exc:
+            found.append({"service": str(path), "label": None, "config": None, "runtime": None,
+                          "error": str(exc)})
             continue
+        supervised = set()
         recorded = data.get("DevflowRuntime")
         if isinstance(recorded, str) and recorded:
-            supervised = Path(recorded).resolve()
-            if supervised != runtime and not supervised.is_relative_to(runtime):
-                continue
+            supervised.add(Path(recorded).resolve())
+        arguments = data.get("ProgramArguments") or []
+        if arguments and isinstance(arguments[0], str):
+            try:
+                supervised.add(supervised_runtime(Path(arguments[0]).resolve(), None))
+            except (OSError, ValueError):
+                pass
+        if supervised and not any(item == runtime or item.is_relative_to(runtime)
+                                  for item in supervised):
+            continue
         found.append({"service": str(path), "label": data.get("Label"),
-                      "config": data.get("DevflowConfig"), "runtime": recorded})
+                      "config": data.get("DevflowConfig"),
+                      "runtime": sorted(str(item) for item in supervised) or None})
     return found
 
 
@@ -287,6 +304,11 @@ def main():
             found = active_agents(args.launch_agents, args.runtime)
             print(json.dumps(found, sort_keys=True))
             for item in found:
+                if item.get("error"):
+                    print(f"launchd agent {item['service']} carries the Devflow label but is not "
+                          f"owned by Devflow ({item['error']}); inspect it before upgrading",
+                          file=sys.stderr)
+                    continue
                 print(f"launchd agent {item['label']} supervises the delivery stack for "
                       f"{item['config']} from this checkout; uninstall it first: "
                       f"python3.12 {Path(__file__).name} uninstall --config {item['config']}",
