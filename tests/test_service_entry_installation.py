@@ -17,6 +17,42 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ServiceEntryInstallation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Installer rollback can legitimately check out an earlier release. Run
+        # the installer only in an owned clone, never in the checkout under test.
+        global ROOT
+        original = ROOT
+        temporary = tempfile.TemporaryDirectory(prefix="devflow-install-source-")
+        cls.addClassCleanup(temporary.cleanup)
+        source = Path(temporary.name).resolve() / "source"
+        subprocess.run(["git", "clone", "--shared", "--no-checkout", str(original),
+                        str(source)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(source), "checkout", "-b", "installer-fixture",
+                        "HEAD"], check=True, capture_output=True)
+        # Exercise the working candidate, including edits not committed yet.
+        paths = subprocess.check_output([
+            "git", "-C", str(original), "ls-files", "--cached", "--others",
+            "--exclude-standard", "-z",
+        ]).decode().split("\0")
+        for name in filter(None, paths):
+            before, after = original / name, source / name
+            if after.is_file() or after.is_symlink():
+                after.unlink()
+            if before.is_symlink():
+                after.parent.mkdir(parents=True, exist_ok=True)
+                after.symlink_to(os.readlink(before))
+            elif before.is_file():
+                after.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(before, after)
+        origin = subprocess.check_output([
+            "git", "-C", str(original), "remote", "get-url", "origin",
+        ], text=True).strip()
+        subprocess.run(["git", "-C", str(source), "remote", "set-url", "origin", origin],
+                       check=True)
+        cls.addClassCleanup(setattr, sys.modules[__name__], "ROOT", original)
+        ROOT = source
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -342,9 +378,9 @@ class ServiceEntryInstallation(unittest.TestCase):
                 ),
             ),
             mock.patch.object(rollback, "exchange", side_effect=exchange),
+            self.assertRaisesRegex(ValueError, "forward installer drift preserved"),
         ):
-            with self.assertRaisesRegex(ValueError, "forward installer drift preserved"):
-                service.install(self.skills, self.home, False, backup)
+            service.install(self.skills, self.home, False, backup)
         with self.assertRaisesRegex(ValueError, "retained backup"):
             rollback.restore(backup)
         self.assertTrue(backup.exists())
