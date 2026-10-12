@@ -29,6 +29,7 @@ from devflow_temporal.delivery_feature_execution import (
 )
 from devflow_temporal.delivery_feature_migration import migrate
 from devflow_temporal.delivery_feature_revision_roles import revision_diff
+from devflow_temporal.delivery_github_contract import PARENT_INDEX_LIMIT, encode_manifest
 from devflow_temporal.delivery_plan_model import migrate_plan_v1, ordered_chunks
 from devflow_temporal.delivery_preparation import prepare_authority
 from devflow_temporal.delivery_resources import read_private, write_private
@@ -38,6 +39,10 @@ from devflow_temporal.supervisor import DeliverySupervisor
 
 @pytest.fixture
 def feature(service, monkeypatch):
+    return _feature(service, monkeypatch)
+
+
+def _feature(service, monkeypatch, *, index_bytes=None):
     store, request, snapshot = feature_service(service, monkeypatch)
     request["plan_approval"] = "automatic"
     plan = json.loads(request["accepted_plan"])
@@ -60,6 +65,12 @@ def feature(service, monkeypatch):
             "publication": {"stack_id": None, "members": []},
         },
     }
+    if index_bytes:
+        # Grow the accepted plan until its parent index comment is this large.
+        # Each item lands in the body twice: as a bullet and inside the embedded JSON.
+        while (short := index_bytes - len(encode_manifest(record["manifest"]).encode())) > 80:
+            plan["acceptance"].append("Requirement " + "x" * max(1, min(4000, short // 2 - 40)))
+        request["accepted_plan"] = json.dumps(plan)
     snapshot["delivery"] = record
     store.submit(request)
     spec = store.effective_spec(request["run_id"])
@@ -87,6 +98,59 @@ def feature(service, monkeypatch):
         "devflow_temporal.delivery_feature_publication.live_members", lambda *_a: []
     )
     return store, spec, registry(spec), record, diagnostic
+
+
+def test_parent_index_without_room_for_its_stack_refuses_revision_before_any_spend(
+    service, monkeypatch,
+):
+    # The recorded index fits GitHub today but not once every chunk's PR is recorded.
+    store, spec, shared, record, diagnostic = _feature(service, monkeypatch,
+                                                      index_bytes=PARENT_INDEX_LIMIT - 200)
+    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
+    before = shared.budget(issue_id)
+    assert len(encode_manifest(record["manifest"]).encode()) <= PARENT_INDEX_LIMIT
+    with pytest.raises(ValueError, match=r"parent index cannot record every chunk's pull "
+                                         r"request: \d+ of 60000 bytes once its 3 unpublished"):
+        revisions.begin_revision(store, spec, diagnostic)
+    # No planning-correction debit, no sealed attempt, so no planner or review turn follows.
+    assert shared.budget(issue_id) == before
+    assert not any(key.startswith("plan-revision:") for key in shared.checkpoints(issue_id))
+    with shared.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM execution_repairs").fetchone()[0] == 0
+
+
+def test_public_revision_without_index_room_is_refused_before_its_reservation(
+    service, monkeypatch,
+):
+    store, spec, shared, record, _ = _feature(service, monkeypatch,
+                                              index_bytes=PARENT_INDEX_LIMIT - 200)
+    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
+    candidate = DeliveryBroker(store, spec).candidate()
+    store.project(spec["run_id"], phase="blocked", execution_state="blocked", outcome="blocked",
+                  cleanup="confirmed", event_type="blocked", message="Feature stopped",
+                  candidate=candidate, pull_request=None, checks={}, iteration=0,
+                  protocol_revision=5, error="Feature stopped")
+    monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator",
+                        lambda _store, run: {"workflow_id": "delivery-" + run,
+                                             "execution_run_id": "closed",
+                                             "result": {"cleanup": "confirmed"}})
+    with store._connect() as db:
+        revision = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                              (spec["run_id"],)).fetchone()[0]
+        runs = db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0]
+    before = (shared.checkpoints(issue_id), shared.budget(issue_id), shared.current(issue_id))
+    request = {"command_id": "revise-oversized", "expected_revision": revision,
+               "reason": "Owner asks for a smaller stack"}
+    with pytest.raises(ValueError, match=r"parent index cannot record every chunk's pull "
+                                         r"request: \d+ of 60000 bytes once its 3 unpublished"):
+        revisions.revise_feature_plan(store, spec["run_id"], request)
+    # No reservation, successor, command receipt or debit exists after the refusal.
+    assert (shared.checkpoints(issue_id), shared.budget(issue_id),
+            shared.current(issue_id)) == before
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == runs
+        assert not db.execute("SELECT 1 FROM delivery_commands WHERE command_id=?",
+                              ("revise-oversized",)).fetchone()
 
 
 def proposed(record):

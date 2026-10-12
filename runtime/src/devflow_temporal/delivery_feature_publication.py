@@ -123,32 +123,62 @@ def publish(store, broker, request, *, reconcile=False, settlement=False):
     return result
 
 
-def live_members(spec, record, gh=None):
+def observe_members(spec, record, gh=None, *, through=None):
+    """Read the recorded stack and name each member's owner-side change, if any."""
     gh = gh or GitHubDelivery()
     publication = record["manifest"]["publication"]
     members = publication["members"]
-    if publication["stack_id"] is not None:
-        stack = gh.api(f"repos/{spec['github_repo']}/stacks/{publication['stack_id']}")
-        if stack["number"] != publication["stack_id"] or [
-            item["number"] for item in stack["pull_requests"]
-        ] != [item["number"] for item in members]:
-            raise OwnershipConflict("recorded stack membership changed")
-    results = []
-    for member in members:
-        raw = gh.api(f"repos/{spec['github_repo']}/pulls/{member['number']}")
+    if through is not None:
+        # A layer depends only on itself and the layers below it.
+        members = members[:1 + next(index for index, member in enumerate(members)
+                                    if member["chunk_id"] == through)]
+    stack = (gh.api(f"repos/{spec['github_repo']}/stacks/{publication['stack_id']}")
+             if publication["stack_id"] is not None else None)
+    live = [gh.api(f"repos/{spec['github_repo']}/pulls/{member['number']}")
+            for member in members]
+    changes, merged = [], 0
+    for index, (member, raw) in enumerate(zip(members, live, strict=True)):
         if (
             raw["number"] != member["number"]
             or raw["html_url"] != member["url"]
-            or raw["head"]["sha"] != member["head"]
-            or raw["head"]["ref"] != member["branch"]
-            or raw["draft"]
             or raw["head"]["repo"]["full_name"].casefold() != spec["github_repo"].casefold()
             or raw["base"]["repo"]["full_name"].casefold() != spec["github_repo"].casefold()
-            or (not raw["merged"] and raw["base"]["ref"] != member["base_branch"])
         ):
             raise OwnershipConflict("recorded PR changed; its candidate requires validation")
-        results.append(raw)
-    return results
+        name = f"feature PR #{member['number']} for chunk {member['chunk_id']}"
+        lower_merged = merged == index
+        change = None
+        if raw["head"]["sha"] != member["head"] or raw["head"]["ref"] != member["branch"]:
+            change = (f"{name} moved from {member['head'][:12]} to {raw['head']['sha'][:12]}; "
+                      "its verified evidence does not cover the new head")
+        elif raw["merged"]:
+            # The merge readback decides whether an out-of-order merge is its own.
+            pass
+        elif raw.get("state") == "closed":
+            change = f"{name} was closed without merging"
+        elif raw["base"]["ref"] != member["base_branch"] and not (
+                lower_merged and raw["base"]["ref"] == members[0]["base_branch"]):
+            # Merging every lower layer by hand retargets this layer to the trunk.
+            change = f"{name} was retargeted from {member['base_branch']} to {raw['base']['ref']}"
+        merged += lower_merged and raw["merged"]
+        changes.append(change)
+    if stack is not None:
+        numbers = [item["number"] for item in publication["members"]]
+        # GitHub may drop layers the owner already merged from the stack.
+        if stack["number"] != publication["stack_id"] or [
+            item["number"] for item in stack["pull_requests"]
+        ] not in [numbers[index:] for index in range(merged + 1)]:
+            raise OwnershipConflict("recorded stack membership changed")
+    return live, changes
+
+
+def live_members(spec, record, gh=None, *, through=None):
+    """Draft layers and an owner-merged lower prefix remain valid; other changes stop."""
+    live, changes = observe_members(spec, record, gh, through=through)
+    for change in changes:
+        if change:
+            raise OwnershipConflict(change)
+    return live
 
 
 def owned_pr_number(spec):
@@ -178,7 +208,8 @@ def verify_retained_publication(broker):
             or _git(broker.checkout, "remote", "get-url", "--push", "origin")
             != spec["origin_url"]):
         raise OwnershipConflict("retained integration publication identity changed")
-    raw = next(item for item in live_members(spec, record) if item["number"] == previous["number"])
+    raw = next(item for item in live_members(spec, record, through=previous["chunk_id"])
+               if item["number"] == previous["number"])
     remote = _git(broker.source, "ls-remote", "origin", "refs/heads/" + previous["branch"])
     if raw["merged"] or raw["state"] != "open" or remote.split() != [
         previous["head"], "refs/heads/" + previous["branch"],
@@ -216,7 +247,7 @@ def record_publication(store, spec, receipt, gh=None, *, settlement=False):
         member.update(binding)
     previous = next((item for item in members if item["chunk_id"] == chunk_id), None)
     if previous == member:
-        live_members(spec, record, gh)
+        live_members(spec, record, gh, through=chunk_id)
         return receipt
     if previous:
         reintegrating = spec.get("feature_worker", {}).get("previous_publication")
@@ -294,5 +325,5 @@ def record_publication(store, spec, receipt, gh=None, *, settlement=False):
             publication["stack_id"] = stack["number"]
     manifest["revision"] += 1
     saved = gh.update(issue, record, manifest, shared, token)
-    live_members(spec, saved, gh)
+    live_members(spec, saved, gh, through=chunk_id)
     return receipt

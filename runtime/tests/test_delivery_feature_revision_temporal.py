@@ -319,7 +319,10 @@ async def test_fresh_v2_intake_normalizes_once_and_derives_chunk_gates_on_tempor
         return deepcopy(record)
     monkeypatch.setattr(GitHubDelivery, "initialize", initialize)
     monkeypatch.setattr(GitHubDelivery, "workstreams", workstreams)
-    monkeypatch.setattr("devflow_temporal.delivery_feature_activities.live_members", lambda *_a: [])
+    monkeypatch.setattr("devflow_temporal.delivery_feature_activities.live_members",
+                        lambda *_a, **_k: [])
+    monkeypatch.setattr("devflow_temporal.delivery_feature_activities.observe_members",
+                        lambda *_a, **_k: ([], []))
     request.pop("accepted_plan")
     request.update(plan_approval="automatic", authorized_endpoint="published_unmerged")
     store.submit(request)

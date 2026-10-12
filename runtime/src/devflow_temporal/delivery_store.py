@@ -792,6 +792,15 @@ class DeliveryStore:
                 raise
             if isinstance(exc, closures.ClosureUnavailable):
                 raise
+            if not isinstance(exc, ValueError):
+                # Transport failures (connection, timeout, RPC) prove nothing about
+                # the closure; callers retry or poll instead of refusing.
+                logger.debug("Run %s: Temporal closure unavailable (%s: %s)",
+                             run_id, type(exc).__name__, exc)
+                raise RuntimeError(
+                    "continuation predecessor Temporal closure is unavailable "
+                    f"({type(exc).__name__}: {str(exc)[:300]})"
+                ) from exc
             # Callers match this exact message (a not-yet-closed worker is polled
             # again); the cause stays chained for diagnosis.
             logger.debug("Run %s: Temporal closure unproven (%s: %s)",
@@ -1996,6 +2005,9 @@ class DeliveryStore:
         }
         if generation:
             attempt_identity["attempt_generation"] = generation
+        admission = (prior_recovery or {}).get("execution_spec", {}).get("implement_admission")
+        if admission:
+            attempt_identity["implement_admission"] = admission
         expected_job_key = hashlib.sha256(canonical_json(attempt_identity).encode()).hexdigest()
         attempt = next((item for item in attempts if item["job_key"] == expected_job_key), None)
         if attempt is None or attempt["session_id"] != last["session_id"]:
@@ -2535,7 +2547,13 @@ class DeliveryStore:
             text=True,
             timeout=30,
         )
-        if remote.returncode or json.loads(remote.stdout) != []:
+        if remote.returncode:
+            # A failed lookup proves nothing about the branch; callers retry it.
+            raise RuntimeError(
+                f"remote pull request lookup failed ({remote.returncode}): "
+                + (remote.stderr or remote.stdout).strip()[:300]
+            )
+        if json.loads(remote.stdout) != []:
             raise ValueError("continuation predecessor has a remote pull request")
 
     def spec(self, run_id: str) -> dict[str, Any]:
