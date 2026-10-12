@@ -323,7 +323,7 @@ def _preflight_plan_records(issue, manifest, children, operation_id):
         }
     preview["workstream_plans"] = refs
     _parent_plan_body(preview, issue)
-    _parent_plan_body({**preview, "publication": _largest_publication(issue, preview)}, issue)
+    require_publication_capacity(issue, preview)
     return preview
 
 
@@ -342,10 +342,29 @@ def _largest_publication(issue, manifest):
             "branch": "feat/df-" + "f" * 10 + "-" + chunk["id"], "head": "f" * 64,
             # The manifest contract bounds the trunk name to 128 characters.
             "base_branch": members[-1]["branch"] if members else "f" * 128,
-            "workstream_id": chunk["workstream_id"], "issue_id": child["id"],
-            "issue_number": child["number"], "issue_url": child["url"],
+            **({"workstream_id": chunk["workstream_id"], "issue_id": child["id"],
+                "issue_number": child["number"], "issue_url": child["url"]}
+               if manifest.get("version") == 2 else {}),
         })
     return {"stack_id": GITHUB_ID_MAX if len(members) > 1 else None, "members": members}
+
+
+def require_publication_capacity(issue, manifest):
+    """Refuse a parent index that could not record every chunk's pull request.
+
+    Deterministic on the record alone, so callers run it before any debit or turn.
+    """
+    from .delivery_github_contract import PARENT_INDEX_LIMIT, manifest_body
+
+    full = {**manifest, "publication": _largest_publication(issue, manifest)}
+    size = len(manifest_body(full).encode())
+    if size > PARENT_INDEX_LIMIT:
+        unpublished = (len(ordered_chunks(manifest["plan"]))
+                       - len(manifest["publication"]["members"]))
+        raise ValueError(
+            f"parent index cannot record every chunk's pull request: {size} of "
+            f"{PARENT_INDEX_LIMIT} bytes once its {unpublished} unpublished chunks publish; "
+            "shorten the plan or reduce its chunks before revising it")
 
 
 def _initial_manifest(issue, plan, bindings, key):

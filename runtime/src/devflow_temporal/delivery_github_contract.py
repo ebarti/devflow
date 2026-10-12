@@ -210,7 +210,11 @@ def validate_manifest(value: dict, issue: dict) -> dict:
     return deepcopy(value)
 
 
-def encode_manifest(manifest: dict) -> str:
+PARENT_INDEX_LIMIT = 60000
+
+
+def manifest_body(manifest: dict) -> str:
+    """The parent index comment body, before the GitHub size limit is applied."""
     value = wire_manifest(manifest)
     plan = value["plan"]
     lines = ["## Delivery plan", "", plan["scope"], "", "Acceptance criteria:"]
@@ -233,14 +237,18 @@ def encode_manifest(manifest: dict) -> str:
         lines.extend(f"- {member['url']}" for member in members)
     marker = MARKER if value["version"] == 1 else MARKER_V2
     lines.extend(["", marker, "```json", canonical_json(value), "```", ""])
-    body = "\n".join(lines)
-    if len(body.encode()) > 60000:
+    return "\n".join(lines)
+
+
+def encode_manifest(manifest: dict) -> str:
+    body = manifest_body(manifest)
+    if len(body.encode()) > PARENT_INDEX_LIMIT:
         raise ValueError("delivery plan exceeds the GitHub comment limit")
     return body
 
 
 def decode_manifest(body: str, issue: dict) -> dict:
-    if not isinstance(body, str) or len(body.encode()) > 60000:
+    if not isinstance(body, str) or len(body.encode()) > PARENT_INDEX_LIMIT:
         raise ValueError("GitHub delivery comment lacks its unique record")
     markers = [marker for marker in (MARKER, MARKER_V2) if marker in body]
     if len(markers) != 1 or body.count(markers[0]) != 1:

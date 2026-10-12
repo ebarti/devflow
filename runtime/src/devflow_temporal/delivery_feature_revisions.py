@@ -991,6 +991,7 @@ def _legacy_binding_ids(shared, issue_id, diagnostic):
 def begin_revision(store, spec, diagnostic=None, command_id=None):
     """Seal and debit one proposal attempt before either configured role runs."""
     from .delivery_feature_publication import current_record, live_members
+    from .delivery_github_plans import require_publication_capacity
 
     shared = _registry(spec)
     token = spec["feature_delivery"]["owner"]
@@ -1019,6 +1020,10 @@ def begin_revision(store, spec, diagnostic=None, command_id=None):
     record = current_record(spec)
     live_members(spec, record)
     identity = _assert_identity(record, adopted_plan_identity(spec, shared))
+    # A revision only grows the index. Refuse one that could never record its
+    # stack before the planning debit and either configured role runs.
+    require_publication_capacity(spec["feature_delivery"]["snapshot"]["issue"],
+                                 record["manifest"])
     candidate = _candidate(store, spec)
     if public and (
         identity != public["old_identity"]

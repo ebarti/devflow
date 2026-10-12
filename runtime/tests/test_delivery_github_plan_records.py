@@ -680,7 +680,8 @@ def test_parent_index_preflight_reserves_every_later_stack_member(tmp_path):
             _preflight_initial_plan(issue, value, "github-plan:" + digest(
                 {"issue": issue["id"], "plan": value}))
         except ValueError as exc:
-            assert "GitHub comment limit" in str(exc)
+            assert ("GitHub comment limit" in str(exc)
+                    or "cannot record every chunk's pull request" in str(exc))
             return False
         return True
 
