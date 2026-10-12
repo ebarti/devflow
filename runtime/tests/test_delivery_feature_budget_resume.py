@@ -24,6 +24,7 @@ from devflow_temporal.delivery_feature_execution import (
 )
 from devflow_temporal.delivery_github_contract import ordered_chunks
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+from devflow_temporal.supervisor import DeliverySupervisor
 
 EXHAUSTED = (r"feature product repair limit exhausted: 10 of 10 feature repair cycles used, "
              r"worker iteration \d+ of \d+; continuing this worker needs a new repair cycle")
@@ -44,7 +45,7 @@ def gate(role, iteration, status="pass"):
 
 
 def plan_seal(spec, roles=(), *, iteration=0, phase="cancelled", pr_head=None, checks=None,
-              effects=(), previous=None, authenticated=True, execution="closed-worker"):
+              authenticated=True, execution="closed-worker"):
     # Each implementation the supervisor ran keeps its durable finished attempt.
     attempts = [{"job_key": f"implement-{role['iteration']}", "role": "implement",
                  "iteration": role["iteration"], "state": "finished", "cleanup": "confirmed",
@@ -54,7 +55,7 @@ def plan_seal(spec, roles=(), *, iteration=0, phase="cancelled", pr_head=None, c
                 for role in roles if role["role"] == "implement" and authenticated]
     return {"predecessor_spec": spec, "candidate": CANDIDATE,
             "session_id": "original-implementation", "attempts": attempts,
-            "effects": [{"effect_key": key} for key in effects], "original_recovery": previous,
+            "effects": [], "original_recovery": None,
             "closed": {"workflow_id": "delivery-" + spec["run_id"], "execution_run_id": execution},
             "state": {"phase": phase, "iteration": iteration, "revision": 3, "roles": list(roles),
                       "checks": checks or {},
@@ -93,33 +94,34 @@ def test_unpublished_chunk_reruns_checks_and_publication_at_its_iteration(pr_hea
                           pr_head=pr_head)) == (2, 0, "checks")
 
 
-@pytest.mark.parametrize(("ran", "effects", "expected"), [
-    ((), (), (2, 0)),
-    (("review",), (), (3, 1)),
-    (("review", "verify"), (), (3, 1)),
-    ((), ("browser_qa:worker:2",), (3, 1)),
-    ((), ("browser_qa:worker:2:gates-admission",), (3, 1)),
-    ((), ("browser_qa:worker:20",), (2, 0)),
-])
-def test_published_chunk_keeps_its_publication_and_reruns_gates_fresh(ran, effects, expected):
+@pytest.mark.parametrize("ran", [(), ("review",), ("review", "verify"),
+                                 ("review", "verify", "review")],
+                         ids=["none", "review", "both", "interrupted-rerun"])
+def test_published_chunk_keeps_its_publication_and_reruns_gates_at_its_iteration(ran):
+    # Gates that already ran there, including an interrupted rerun's, stay behind.
     roles = [implementation(2), *(gate(role, 2) for role in ran)]
-    assert plan(plan_seal(worker("chunk"), roles, iteration=2, pr_head=CANDIDATE["head"],
-                          effects=effects)) == (*expected, "published")
+    assert plan(plan_seal(worker("chunk"), roles, iteration=2,
+                          pr_head=CANDIDATE["head"])) == (2, 0, "published")
 
 
-def test_interrupted_gate_rerun_continues_from_its_own_iteration():
-    previous = {"kind": resume_mod.KIND, "resume_stage": "published", "resume_iteration": 3}
-    started = [implementation(2), gate("review", 2), gate("review", 3)]
-    assert plan(plan_seal(worker("chunk"), started, iteration=3, pr_head=CANDIDATE["head"],
-                          previous=previous)) == (4, 1, "published")
-    unstarted = [implementation(2), gate("review", 2)]
-    assert plan(plan_seal(worker("chunk"), unstarted, iteration=3, pr_head=CANDIDATE["head"],
-                          previous=previous)) == (3, 0, "published")
+def test_gate_attempts_of_an_interrupted_admission_take_its_own_identity():
+    request = {"role": "review", "iteration": 2, "candidate": {"id": CANDIDATE["id"]}}
+    spec = {"run_id": "worker", "policy_digest": "p" * 64}
+    keys = {name: DeliverySupervisor._job_key({**request, "spec": {**spec, **extra}})
+            for name, extra in (("original", {}), ("first", {"gate_admission": "a" * 64}),
+                                ("second", {"gate_admission": "b" * 64}))}
+    assert len(set(keys.values())) == 3
+    # The same admission replays its own attempt; an implementer keeps its identity.
+    assert keys["first"] == DeliverySupervisor._job_key(
+        {**request, "spec": {**spec, "gate_admission": "a" * 64}})
+    implement = {**request, "role": "implement"}
+    assert DeliverySupervisor._job_key({**implement, "spec": spec}) == (
+        DeliverySupervisor._job_key({**implement, "spec": {**spec, "gate_admission": "a" * 64}}))
 
 
 @pytest.mark.parametrize("case", ["gate_findings", "failed_check", "implementation_findings",
                                   "repair_requested", "unauthenticated", "blocked",
-                                  "single_delivery", "unpublished_rerun"])
+                                  "single_delivery"])
 def test_states_needing_a_repair_or_lacking_custody_have_no_interrupted_plan(case):
     spec, roles = worker("chunk"), [implementation(2)]
     options = {"iteration": 2, "pr_head": CANDIDATE["head"]}
@@ -137,11 +139,8 @@ def test_states_needing_a_repair_or_lacking_custody_have_no_interrupted_plan(cas
         options["authenticated"] = False
     elif case == "blocked":
         options["phase"] = "blocked"
-    elif case == "single_delivery":
-        spec = {"run_id": "worker"}
     else:
-        options.update(iteration=3, pr_head=None, previous={
-            "kind": resume_mod.KIND, "resume_stage": "published", "resume_iteration": 3})
+        spec = {"run_id": "worker"}
     assert plan(plan_seal(spec, roles, **options)) is None
 
 
@@ -206,28 +205,26 @@ def test_interrupted_worker_resumes_at_its_iteration_without_spending_a_cycle(
 
 
 @pytest.mark.parametrize("used_by_others", [9, 10])
-def test_rerun_of_started_gates_takes_a_fresh_iteration_without_a_cycle(
-    service, monkeypatch, used_by_others,
-):
+def test_gate_rerun_stays_at_its_iteration_without_a_cycle(service, monkeypatch, used_by_others):
     store, parent, child, shared, token = _worker(service, monkeypatch,
                                                   used_by_others=used_by_others, kind="chunk")
     captured = _admission(monkeypatch, plan_seal(
         child, [implementation(0), gate("review", 0)], pr_head=CANDIDATE["head"]))
     activities.resume_worker(store, parent, child, _row(store, child))
     assert (captured["command"]["expected_iteration"],
-            captured["command"]["additional_iterations"]) == (0, 1)
+            captured["command"]["additional_iterations"]) == (0, 0)
     assert shared.budget(token["issue_id"])["used"] == used_by_others
 
 
-def test_gate_rerun_at_the_last_worker_iteration_is_refused_by_name(service, monkeypatch):
+def test_gate_rerun_at_the_last_worker_iteration_keeps_its_repair_ceiling(service, monkeypatch):
     store, parent, child, *_ = _worker(service, monkeypatch, used_by_others=0, kind="chunk")
     last = child["policy"]["max_repairs"]
     captured = _admission(monkeypatch, plan_seal(
         child, [implementation(last), gate("review", last)], iteration=last,
         pr_head=CANDIDATE["head"]))
-    with pytest.raises(OwnershipConflict, match=f"worker iteration {last} is its last of {last}"):
-        activities.resume_worker(store, parent, child, _row(store, child))
-    assert "command" not in captured
+    activities.resume_worker(store, parent, child, _row(store, child))
+    assert (captured["command"]["expected_iteration"],
+            captured["command"]["additional_iterations"]) == (last, 0)
 
 
 @pytest.mark.parametrize("case", ["findings", "failed_check", "blocked", "repair_requested"])
@@ -443,7 +440,12 @@ def test_published_chunk_resume_never_publishes_or_implements_again(service, mon
     resumed = activities.resume_worker(store, parent, child, _row(store, child))
     recovery = _recovery(store, child)
     assert (recovery["resume_stage"], recovery["resume_iteration"],
-            recovery["command"]["additional_iterations"]) == ("published", int(ran), int(ran))
+            recovery["command"]["additional_iterations"]) == ("published", 0, 0)
+    # Gates rerun at the sealed iteration under this admission's own attempt identity.
+    gate_request = {"role": "review", "iteration": 0, "candidate": published["candidate"]}
+    assert resumed["spec"]["gate_admission"] == recovery["command_digest"]
+    assert DeliverySupervisor._job_key({**gate_request, "spec": resumed["spec"]}) != (
+        DeliverySupervisor._job_key({**gate_request, "spec": child}))
     with store._connect() as db:
         assert resume_mod.custody(db, recovery) == resumed["spec"]
         effects = db.execute("SELECT effect_key,request_json,observed_json FROM delivery_effects "
@@ -465,8 +467,7 @@ def test_published_chunk_resume_never_publishes_or_implements_again(service, mon
     assert result["outcome"] == "delivered", result.get("error")
     assert result["pull_request"] == published and result["candidate"]["id"] == (
         published["candidate"]["id"])
-    assert ("delivery_role", "review", int(ran)) in calls
-    assert ("delivery_role", "verify", int(ran)) in calls
+    assert ("delivery_role", "review", 0) in calls and ("delivery_role", "verify", 0) in calls
     assert not any(name == "delivery_publish" or role == "implement" for name, role, _ in calls)
     # The original publication stays the stack's only publication evidence.
     assert result["checks"]["prepublish"]["candidate_id"] == implemented["candidate"]["id"]

@@ -248,11 +248,6 @@ def resume_worker(store, parent, child, row):
         if plan:
             # Interrupted work needs no repair cycle, whatever the feature budget holds.
             remaining = plan["additional_iterations"]
-            if state["iteration"] + remaining > child["policy"]["max_repairs"]:
-                raise OwnershipConflict(
-                    f"worker iteration {state['iteration']} is its last of "
-                    f"{child['policy']['max_repairs']}; gates interrupted after they started "
-                    "need a fresh iteration to rerun")
         else:
             budget = shared.budget(token["issue_id"])
             remaining = min(budget["maximum"] - budget["used"],

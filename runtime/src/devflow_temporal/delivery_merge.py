@@ -74,8 +74,12 @@ def require_merge_gates(spec, candidate, pr, checks, attempts, publication):
         raise ValueError("merge requires independent implementation, review and QA sessions")
 
 
-def native_implementation_output(spec, attempt):
-    """Read the supervisor's separate output binding, never activity-only enrichment."""
+def native_implementation_output(spec, attempt, executed=None):
+    """Read the supervisor's separate output binding, never activity-only enrichment.
+
+    The attempt is authenticated against the spec it ran under, which must be one
+    of the run's sealed executions (by default only the current one).
+    """
     from .delivery_gates_admission import _native_result_bytes
     from .delivery_resources import _ancestors
     from .supervisor import DeliverySupervisor
@@ -92,15 +96,17 @@ def native_implementation_output(spec, attempt):
     journal = read_private(root / "native-process.json")
     metadata, intent = journal.get("provider_session", {}), journal.get("intent", {})
     output = metadata.get("output_candidate")
-    if (request.get("spec") != spec or request.get("role") != "implement"
+    ran = request.get("spec")
+    if (ran not in ([spec] if executed is None else executed)
+            or request.get("role") != "implement"
             or request.get("iteration") != attempt["iteration"]
             or request.get("candidate", {}).get("id") != attempt["candidate_id"]
-            or request.get("workspace") != spec["checkout"]
+            or request.get("workspace") != ran["checkout"]
             or DeliverySupervisor._job_key(request) != attempt["job_key"]
             or journal.get("phase") != "finished" or not journal.get("owned")
-            or intent.get("run_id") != spec["run_id"]
-            or intent.get("policy_digest") != spec["policy_digest"]
-            or intent.get("cwd") != spec["checkout"]
+            or intent.get("run_id") != ran["run_id"]
+            or intent.get("policy_digest") != ran["policy_digest"]
+            or intent.get("cwd") != ran["checkout"]
             or metadata.get("role") != "implement"
             or metadata.get("iteration") != attempt["iteration"]
             or metadata.get("session_id") != attempt["session_id"]

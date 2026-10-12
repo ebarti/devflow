@@ -16,6 +16,7 @@ from .delivery_feature_workflow import publication
 from .delivery_github_contract import GitHubDelivery, ordered_chunks
 from .delivery_merge import MergeBroker, native_implementation_output, require_merge_gates
 from .delivery_resources import observe_finalized_resources
+from .delivery_stopped_resume import executed_specs
 
 
 def authorize(store, spec, requested, command, *, settlement=False):
@@ -95,8 +96,9 @@ def evidence(store, parent, record, live, gh):
         implementations = [item for item in attempts if item["role"] == "implement"]
         if not implementations:
             raise OwnershipConflict("chunk lacks native implementation evidence")
+        # A resumed chunk keeps the implementation an earlier sealed execution ran.
         implementations[-1]["controller_output_candidate"] = native_implementation_output(
-            spec, implementations[-1]
+            spec, implementations[-1], executed=executed_specs(store, spec)
         )
         # Endpoint authority is established separately above. All the existing
         # source, independent-session, cleanup and gate requirements still apply.
