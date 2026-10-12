@@ -394,6 +394,27 @@ def test_discard_leaves_a_row_adopted_by_a_later_attempt(service, monkeypatch):
     assert DeliveryBroker(store, spec).publish(0, checked)['number'] == 1
 
 
+def test_reconcile_adopts_the_pending_effect_it_depends_on(service, monkeypatch):
+    store, spec, _broker, checked, _gh = prepared(service, monkeypatch)
+    inserter = DeliveryBroker(store, spec)
+    inserter._effect('publish:run-1:0', 'publish', {'iteration': 0,
+                                                    'input_candidate_id': checked['id']})
+    _git(inserter.checkout, 'add', 'README.md')
+    _git(inserter.checkout, 'commit', '--signoff', '-m', 'chore: Checked edit')
+    head = _git(inserter.checkout, 'rev-parse', 'HEAD')
+    inserter._bind_pending_publication('publish:run-1:0', head, None)
+    # Its push never happened and the attempt timed out; the thread lives on.
+    inserter.publication_may_have_effect = False
+    reader = DeliveryBroker(store, spec)
+    assert reader.reconcile_publish(0, checked) == {
+        'state': 'pending', 'reason': 'original_push_readback', 'head': head}
+    inserter.discard_unused_publication(0)
+    state, observed = effect_row(store)
+    assert state == 'pending' and observed['head'] == head
+    assert DeliveryBroker(store, spec).publish(0, checked)['number'] == 1
+    assert effect_row(store)[0] == 'complete'
+
+
 @pytest.mark.asyncio
 async def test_transport_failure_before_the_effect_row_is_transient_without_discard(
     service, monkeypatch,

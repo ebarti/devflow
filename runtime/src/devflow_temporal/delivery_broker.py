@@ -1664,6 +1664,14 @@ class DeliveryBroker:
             original = json.loads(saved["observed_json"] or "null")
             if not original or not original.get("head"):
                 raise ValueError("original publication head has not been observed")
+            # Reading a pending effect adopts it: the invocation that inserted it
+            # can no longer discard the row this reconciliation depends on.
+            with self.store._connect() as db:
+                db.execute(
+                    "UPDATE delivery_effects SET updated_at=? WHERE effect_key=? "
+                    "AND state='pending'",
+                    (_now(), key),
+                )
             if expected_head is not None and expected_head != original["head"]:
                 raise ValueError("publication expected head differs from original effect")
             if (expected_pr_number is not None and original.get("number") is not None
