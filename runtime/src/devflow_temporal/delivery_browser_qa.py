@@ -115,7 +115,9 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
             or any(_hash(Path(item["path"])) != item["sha256"] for item in saved["artifacts"])
         ):
             raise ValueError("pending native browser receipt authority changed")
-        process_receipt = broker._reconcile_native_check(folder / "native" / "native-process.json")
+        process_receipt = broker._reconcile_native_check(Path(
+            (saved.get("native_process") or {}).get("journal")
+            or folder / "native" / "native-process.json"))
         if process_receipt["cleanup"] == "unknown":
             return {
                 "state": "unknown",
@@ -132,17 +134,21 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     scratch = RunResources(spec).browser_scratch()
     profile, environment = prepare_browser_qa(spec, checkout, folder, scratch, qa)
     generated = broker._register_generated(checkout, qa.get("artifact_paths", []))
-    process = broker._run_native_check(NativeProcess(
-        spec,
-        folder / "native",
-        argv=(list(qa["argv"]) if trusted_local(spec)
-              else ["/usr/bin/sandbox-exec", "-f", str(profile), *qa["argv"]]),
-        cwd=cwd,
-        environment=environment,
-        timeout=qa["timeout_seconds"],
-        ports=ports,
-        cancelled=broker._native_cancelled,
-    ))
+    options = {
+        "argv": (list(qa["argv"]) if trusted_local(spec)
+                 else ["/usr/bin/sandbox-exec", "-f", str(profile), *qa["argv"]]),
+        "cwd": cwd, "environment": environment, "timeout": qa["timeout_seconds"],
+        "ports": ports, "cancelled": broker._native_cancelled,
+    }
+    process = broker._run_native_check(NativeProcess(spec, folder / "native", **options))
+    interrupted = []
+    if process.get("interrupted_monitor") is True:
+        # A lost monitor yields no verdict. One fresh invocation re-runs the
+        # gate on the confirmed-clear ports; the interrupted journal stays as evidence.
+        interrupted.append(process)
+        if not (folder / "native-retry" / "native-process.json").exists():
+            _ports_free(ports)
+        process = broker._run_native_check(NativeProcess(spec, folder / "native-retry", **options))
     broker._record_generated(generated)
     if process["cleanup"] == "unknown":
         return {
@@ -150,6 +156,17 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
             "cleanup": "unknown",
             "candidate_id": candidate["id"],
             "native_process": process,
+        }
+    if process.get("interrupted_monitor") is True:
+        interrupted.append(process)
+        return {
+            "state": "unknown",
+            "cleanup": "confirmed",
+            "process_cleanup": process["cleanup"],
+            "candidate_id": candidate["id"],
+            "reason": "native browser QA monitor was lost twice; the gate produced no verdict",
+            "native_process": process,
+            "interrupted_native_processes": interrupted,
         }
     log = folder / "browser-qa.log"
     content = Path(process["log"]).read_bytes()
@@ -213,6 +230,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "cleanup": "confirmed",
         "process_cleanup": process["cleanup"],
         "native_process": process,
+        **({"interrupted_native_processes": interrupted} if interrupted else {}),
         "scratch": str(scratch),
         "diagnostic": output[-2000:] if not passed else None,
     }

@@ -1657,6 +1657,7 @@ class DeliveryStore:
 
     def retry_prelaunch(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
         """Retry one proved no-process repair launch under its existing grant."""
+        from .delivery_native_process import reconciled_not_started
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))
@@ -1815,7 +1816,8 @@ class DeliveryStore:
             or not stat.S_ISDIR(metadata.st_mode)
             or stat.S_IMODE(metadata.st_mode) != 0o700
             or metadata.st_uid != os.getuid()
-            or any(folder.iterdir())
+            # Empty, or a monitor lost before GO whose teardown is confirmed again.
+            or (any(folder.iterdir()) and not reconciled_not_started(folder))
             or len(attempts) != len(roles)
             or any(
                 item["state"] != "finished" or item["cleanup"] != "confirmed"
@@ -1910,7 +1912,7 @@ class DeliveryStore:
                     item["state"] != "complete" or item["observed_json"] is None
                     for item in effects
                 )
-                or any(folder.iterdir())
+                or (any(folder.iterdir()) and not reconciled_not_started(folder))
             ):
                 raise ValueError("prelaunch retry lost its frozen run or ownership")
             revision = current["revision"] + 1
@@ -2275,6 +2277,7 @@ class DeliveryStore:
     def repair_preflight(self, spec: dict[str, Any], recovery: dict[str, Any]) -> None:
         """Recheck the frozen command before a resumed implementer can execute."""
         from .delivery_broker import DeliveryBroker
+        from .delivery_native_process import reconciled_not_started
         from .delivery_repair import confirmed_native_cleanup, published_identity
 
         run_id = spec["run_id"]
@@ -2381,7 +2384,7 @@ class DeliveryStore:
                 or not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != os.getuid()
                 or stat.S_IMODE(metadata.st_mode) != 0o700
-                or any(folder.iterdir())
+                or (any(folder.iterdir()) and not reconciled_not_started(folder))
             ):
                 raise ValueError("failed prelaunch attempt changed before retry")
         published_identity(

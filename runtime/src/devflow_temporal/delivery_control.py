@@ -768,6 +768,7 @@ _COMMANDS = (
     "retry-prelaunch",
     "amend-scope",
     "import-closure",
+    "reconcile-attempt",
 )
 
 
@@ -788,6 +789,9 @@ def main() -> None:
     parser.add_argument("--archived", action="store_true", help="list archived runs")
     parser.add_argument("--workflow-id", help="workflow ID of an archived closure")
     parser.add_argument("--history", type=Path, help="exported Temporal history JSON file")
+    parser.add_argument("--job-key", help="native attempt key for reconcile-attempt")
+    parser.add_argument("--role", help="role of the attempt for reconcile-attempt")
+    parser.add_argument("--iteration", type=int, help="iteration of the attempt")
     args = parser.parse_args()
     try:
         _run(args, parser)
@@ -825,6 +829,22 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             parser.error("import-closure requires --id, --workflow-id and --history")
         print(json.dumps(_import_closure(config, args.id, args.workflow_id, args.history),
                          indent=2, sort_keys=True))
+        return
+    if args.command == "reconcile-attempt":
+        from .delivery_orphans import reconcile_attempt
+
+        if not args.job_key and not (args.id and args.role and args.iteration is not None):
+            parser.error("reconcile-attempt needs --job-key or --id with --role and --iteration")
+        try:
+            outcome = reconcile_attempt(
+                DeliveryStore(config), job_key=args.job_key, run_id=args.id,
+                role=args.role, iteration=args.iteration,
+            )
+        except ValueError as exc:
+            parser.exit(1, f"devflow-delivery: {exc}\n")
+        print(json.dumps(outcome, sort_keys=True, indent=2))
+        if outcome["state"] != "finished":
+            parser.exit(1)
         return
     if args.command in {
         "submit",

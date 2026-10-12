@@ -413,18 +413,20 @@ async def test_live_detached_monitor_exception_retains_capacity_and_never_replac
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('prior_state', ['starting', 'unknown'])
-async def test_prior_attempt_without_journal_keeps_its_capacity(native_role, prior_state):
+async def test_prior_attempt_without_journal_releases_dead_owner_capacity(
+        native_role, prior_state):
     case = native_role
     case.owner._claim(case.request)
     with case.store._connect() as db:
         db.execute('UPDATE delivery_attempts SET state=?,started_at=? WHERE job_key=?',
                    (prior_state, 'prior-owner', case.key))
     result = await delivery_role(case.request)
-    row, occupied = _attempt(case)
-    assert result['cleanup'] == 'unknown'
-    assert row['state'] == 'unknown' and occupied == 1
+    row, _ = _attempt(case)
+    # Nobody holds the owner or monitor lock and no monitor ever journaled, so
+    # the dead owner's claim is a provable prelaunch failure, not a leaked slot.
     assert row['started_at'] == 'prior-owner'
     assert case.created == []
+    _assert_prelaunch(case, result)
 
 
 @pytest.mark.asyncio
@@ -661,11 +663,13 @@ async def test_queued_replacement_preserves_retryable_attempt(
 
     with case.store._connect() as db:
         for index in range(case.owner.capacity):
+            # Observed launch evidence keeps an ambiguous occupant in its slot.
             db.execute(
                 'INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,'
-                "state,result_path,started_at) VALUES (?,?,?,?,?,'unknown',?,?)",
+                "state,result_path,started_at,pid,process_identity) "
+                "VALUES (?,?,?,?,?,'unknown',?,?,?,?)",
                 (f'occupant-{index}', case.request['spec']['run_id'], 'review', 90 + index,
-                 'occupant', f'/nonexistent/{index}', 'occupant'))
+                 'occupant', f'/nonexistent/{index}', 'occupant', 1, 'occupant'))
     monkeypatch.setattr(case.owner, '_enter_capacity', enter)
     monkeypatch.setattr(activity, 'in_activity', lambda: True)
     monkeypatch.setattr(activity, 'heartbeat', lambda *args: None)

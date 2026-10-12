@@ -108,7 +108,27 @@ def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) 
                "reason": "interrupted monitoring has no independently confirmed teardown"}
     monitor = journal.get("monitor")
     ports = journal.get("ports")
-    if (not owned or not isinstance(monitor, dict)
+    # A monitor that died in phase "allocated" never authorized a child, so no
+    # provider received GO: an empty owned set is that journal's expected shape.
+    prelaunch = (journal.get("phase") == "allocated"
+                 or (journal.get("cleanup_reconciliation") or {}).get("previous_phase")
+                 == "allocated")
+    if journal.get("phase") == "allocated":
+        # ready.json names the only child a dying monitor could have spawned. It
+        # exits on its closed GO pipe but is still observed stopped before proof.
+        try:
+            ready = read_private(path.with_name("ready.json"))
+        except FileNotFoundError:
+            ready = None
+        except (OSError, ValueError) as exc:
+            receipt["reason"] = str(exc)[:300]
+            return receipt
+        if ready is not None:
+            if (type(ready.get("pid")) is not int or ready["pid"] <= 1
+                    or not isinstance(ready.get("identity"), str) or not ready["identity"]):
+                return receipt
+            owned = {**owned, ready["pid"]: {"identity": ready["identity"]}}
+    if ((not owned and not prelaunch) or not isinstance(monitor, dict)
             or type(monitor.get("pid")) is not int or monitor["pid"] <= 1
             or not isinstance(monitor.get("identity"), str) or not monitor["identity"]
             or not isinstance(ports, list) or ports != journal.get("intent", {}).get("ports")
@@ -178,7 +198,8 @@ def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) 
                      "observed_at": datetime.now(UTC).isoformat()}
             result = {"state": "finished", "cleanup": "observed-native-confirmed",
                       "exit_code": None, "timed_out": False, "cancelled": False,
-                      "interrupted_monitor": True, "provider_outcome": "unknown",
+                      "interrupted_monitor": True,
+                      "provider_outcome": "not_started" if prelaunch else "unknown",
                       "monitoring_complete": journal.get("monitoring_complete", False),
                       "stdio_drained": False, "observed_owned_pids": sorted(all_owned),
                       "journal": str(path), "cleanup_reconciliation": proof,
@@ -241,6 +262,62 @@ def reconcile_process(path: Path, *, _locks: dict | None = None) -> dict:
         if clean
         else "interrupted or ambiguous monitoring cannot certify native teardown",
     }
+
+
+def prelaunch_journal(journal: dict) -> bool:
+    """A monitor that died before authorizing its child never started a provider."""
+    return (journal.get("phase") == "allocated"
+            or (journal.get("cleanup_reconciliation") or {}).get("previous_phase") == "allocated")
+
+
+def launch_binding(folder: Path, journal: dict) -> dict | None:
+    """launch.json follows the journal; only a prelaunch death can lack it."""
+    path = folder / "launch.json"
+    if not path.exists() and prelaunch_journal(journal):
+        return None
+    return read_private(path)
+
+
+def interrupted_cleanup_proven(journal: dict) -> bool:
+    """A lost monitor's journal whose confirmed-teardown proof still binds its contents."""
+    proof = journal.get("cleanup_reconciliation")
+    result = journal.get("result") or {}
+    return (isinstance(proof, dict) and proof.get("kind") == "interrupted_monitor"
+            and journal.get("phase") == "finished"
+            and result.get("interrupted_monitor") is True
+            and result.get("cleanup") == "observed-native-confirmed"
+            and proof.get("intent_sha256") == digest(journal.get("intent"))
+            and proof.get("owned_sha256") == digest(journal.get("owned")))
+
+
+def lost_monitor_without_provider(journal: dict, *, role_attempt: bool) -> bool:
+    """Whether a lost monitor's journal may stand in for completed monitoring.
+
+    A role attempt whose provider ran keeps its unknown outcome: it is never
+    admitted here. A role monitor lost before GO, or a lost gate monitor (whose
+    child is a check command, not a provider), may be, once its proof binds.
+    """
+    return interrupted_cleanup_proven(journal) and (
+        not role_attempt
+        or (journal.get("result") or {}).get("provider_outcome") == "not_started")
+
+
+def reconciled_not_started(folder: Path) -> bool:
+    """The attempt's monitor was lost before GO, as its bound teardown proof records.
+
+    Such a folder keeps its journal, launch and log files as evidence, so the
+    prelaunch consumers accept it in place of an empty folder. This is a pure
+    read: callers hold database transactions and must not reconcile here.
+    """
+    journal = folder / "native-process.json"
+    if (any(os.path.lexists(folder / name) for name in ("start.json", "result.json", "cancel"))
+            or not os.path.lexists(journal)):
+        return False
+    try:
+        value = read_private(journal)
+    except (OSError, ValueError):
+        return False
+    return prelaunch_journal(value) and lost_monitor_without_provider(value, role_attempt=True)
 
 
 def _cancel_requested(folder: Path) -> bool:
