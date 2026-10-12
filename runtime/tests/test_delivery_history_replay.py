@@ -29,11 +29,16 @@ async def test_recorded_delivery_history_replays_on_designated_artifact(path, tm
 
 
 @pytest.mark.asyncio
-async def test_history_recorded_before_liveness_marker_replays_with_liveness_v2_false(
-    monkeypatch,
+@pytest.mark.parametrize("marker,flag", [
+    ("delivery-liveness-v2", "liveness_v2"),
+    ("delivery-publication-self-heal-v1", "publication_v1"),
+    ("delivery-post-publish-self-heal-v1", "post_publish_v1"),
+])
+async def test_history_recorded_before_a_marker_replays_with_its_flag_false(
+    monkeypatch, marker, flag,
 ):
-    """Every fix-program workflow change is gated on `delivery-liveness-v2`; an
-    in-flight execution recorded before it replays on the old command path."""
+    """Each fix-program command change is gated on its own marker; an in-flight
+    execution recorded before it replays on the recorded command path."""
     from temporalio import workflow
     from temporalio.worker import UnsandboxedWorkflowRunner
 
@@ -50,13 +55,13 @@ async def test_history_recorded_before_liveness_marker_replays_with_liveness_v2_
             if key in details:
                 value = (await DELIVERY_DATA_CONVERTER.decode(details[key].payloads))[0]
                 markers.append(value["id"] if isinstance(value, dict) else value)
-    assert "delivery-liveness-v2" not in markers
+    assert marker not in markers
     observed = []
     original = workflow.patched
 
     def patched(name):
         result = original(name)
-        if name == "delivery-liveness-v2":
+        if name == marker:
             observed.append((workflow.instance(), result))
         return result
 
@@ -64,7 +69,7 @@ async def test_history_recorded_before_liveness_marker_replays_with_liveness_v2_
     await Replayer(workflows=[DeliveryWorkflow],
                    workflow_runner=UnsandboxedWorkflowRunner()).replay_workflow(history)
     (instance, result), = observed
-    assert result is False and instance.liveness_v2 is False
+    assert result is False and getattr(instance, flag) is False
     assert instance.terminal_closing is False
 
 
