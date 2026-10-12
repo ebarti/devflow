@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from temporalio.api.enums.v1 import WorkflowTaskFailedCause
 from temporalio.client import WorkflowExecutionStatus, WorkflowHistory
 from temporalio.service import RPCError, RPCStatusCode
 
@@ -144,9 +145,20 @@ async def closure_facts(history: WorkflowHistory) -> dict[str, Any]:
     if status == "COMPLETED":
         payloads = list(events[-1].workflow_execution_completed_event_attributes.result.payloads)
         result = (await DELIVERY_DATA_CONVERTER.decode(payloads))[0] if payloads else None
+    # A reset preserves the original start event. Its server-written fork event
+    # carries the new execution identity; never seal it under its predecessor.
+    execution_run_id = start.original_execution_run_id
+    for event in events:
+        if event.HasField("workflow_task_failed_event_attributes"):
+            fork = event.workflow_task_failed_event_attributes
+            if fork.new_run_id:
+                if (not fork.base_run_id or fork.cause !=
+                        WorkflowTaskFailedCause.WORKFLOW_TASK_FAILED_CAUSE_RESET_WORKFLOW):
+                    raise ValueError("workflow reset identity has no server fork event")
+                execution_run_id = fork.new_run_id
     return {
         "workflow_id": history.workflow_id,
-        "execution_run_id": start.original_execution_run_id,
+        "execution_run_id": execution_run_id,
         "status": status,
         "closed_at": events[-1].event_time.ToDatetime(tzinfo=UTC).isoformat(),
         "request_digest": memo["request_digest"],

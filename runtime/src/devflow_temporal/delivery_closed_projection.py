@@ -24,7 +24,7 @@ JSON_FIELDS = {"candidate": "candidate_json", "pull_request": "pr_json",
                "decision": "decision_json", "intake": "intake_json"}
 TERMINAL_EVENTS = frozenset({"delivered", "blocked", "cancelled"})
 # Maintenance never re-reads these; a new same-run execution has a new identity.
-SETTLED = frozenset({"observed", "reconciled", "no_failed_projection", "closed"})
+SETTLED = frozenset({"observed", "reconciled", "no_failed_projection", "closed", "closed_observed"})
 PASS_LIMIT = 100
 BACKOFF_BASE = timedelta(seconds=30)
 BACKOFF_CAP = timedelta(hours=1)
@@ -282,7 +282,7 @@ async def reconcile_projection(store, client, row):
     """Only controller-owned history/result bytes may repair this read model."""
     run_id = row["run_id"]
     spec = await asyncio.to_thread(store.effective_spec, run_id)
-    if (spec.get("workflow_failure_boundary_version") != 1 or execution_retired(spec)
+    if (execution_retired(spec)
             or not await asyncio.to_thread(store.owns_execution, spec)):
         raise ValueError("completed projection has no current service authority")
     workflow_id = row["workflow_id"] or "delivery-" + run_id
@@ -305,9 +305,17 @@ async def reconcile_projection(store, client, row):
             close_time=datetime.fromisoformat(sealed["closed_at"]),
             workflow_type="DevflowDeliveryWorkflow", memo_value=memo_value,
         )
+    if sealed is None:
+        from .delivery_interrupted_recovery import recover_interrupted
+
+        recovered = await recover_interrupted(store, client, row, spec, description)
+        if recovered:
+            return recovered
     if description.status != WorkflowExecutionStatus.COMPLETED:
         return {"state": "not_completed", "status": description.status.name,
                 "closed": description.close_time is not None}
+    if spec.get("workflow_failure_boundary_version") != 1:
+        return {"state": "no_failed_projection"}
     if (not description.close_time or description.id != workflow_id
             or description.workflow_type != "DevflowDeliveryWorkflow"):
         raise ValueError("completed projection workflow identity changed")
@@ -371,9 +379,12 @@ def _candidates(store, now, limit):
                 LEFT JOIN delivery_closed_projections p
                   ON p.run_id=r.run_id
                  AND p.workflow_id=COALESCE(r.workflow_id,'delivery-'||r.run_id)
-                WHERE json_extract(r.request_json,'$.workflow_failure_boundary_version')=1
+                WHERE (json_extract(r.request_json,'$.workflow_failure_boundary_version')=1
+                       OR r.outcome IS NULL OR r.outcome='blocked')
                   AND EXISTS (SELECT 1 FROM delivery_outbox o WHERE o.run_id=r.run_id)
-                  AND (p.state IS NULL OR (p.state NOT IN ({placeholders})
+                  AND (p.state IS NULL OR (p.state='closed'
+                       AND (r.outcome IS NULL OR r.outcome='blocked'))
+                       OR (p.state NOT IN ({placeholders})
                        AND (p.next_check_at IS NULL OR p.next_check_at<=?
                             OR p.revision!=r.revision)))
                 ORDER BY COALESCE(p.next_check_at,''), r.run_id LIMIT ?""",
@@ -385,7 +396,7 @@ def _remember(store, row, observed, now):
     workflow_id = row["workflow_id"] or "delivery-" + row["run_id"]
     state = observed["state"]
     if state == "not_completed" and observed.get("closed"):
-        state = "closed"
+        state = "closed_observed"
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         previous = db.execute(
@@ -423,7 +434,11 @@ async def reconcile_completed_projections(store, client, *, now=None, limit=PASS
         except Exception as exc:
             logger.warning("Run %s completed projection remains unproven (%s)",
                            row["run_id"], type(exc).__name__)
-            observed = {"state": "unproven", "error_type": type(exc).__name__}
+            observed = {"state": "unproven", "error_type": type(exc).__name__,
+                        "reason": str(exc)[:300]}
+            from .delivery_automatic_retry import _record_skip
+
+            await asyncio.to_thread(_record_skip, store, row, exc)
         await asyncio.to_thread(_remember, store, row, observed, now)
         results.append({"run_id": row["run_id"], **observed})
     return results
