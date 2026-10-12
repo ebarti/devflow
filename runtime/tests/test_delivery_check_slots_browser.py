@@ -244,7 +244,7 @@ async def test_browser_port_wait_cancels_without_taking_generic_capacity(browser
     following = browser_checks.request("generic")
     launched = []
     assert await activities._execute_check(
-        following, lambda _: (launched.append(True), {"state": "passed"})[1],
+        following, lambda _: (launched.append(True), {"state": "passed"})[1], kind="checks",
     ) == {"state": "passed"}
     assert launched and not first.done()
     queued.cancel()
@@ -312,11 +312,12 @@ async def test_actual_interrupted_browser_retains_ports_and_generic_capacity(
         if failure == "exception":
             reservation = activities._UNCLEAN_CHECK_SLOTS[-1]
             assert set(reservation["ports"]) == set(browser_checks.ports)
-            assert len(reservation["owned"]) >= 2
+            assert any(len(recorded) >= 2 for recorded in reservation["journals"].values())
         following = browser_checks.request("following")
         launched = []
         queued = asyncio.create_task(activities._execute_check(
             following, lambda _: (launched.append(True), {"state": "passed"})[1],
+            kind="checks",
         ))
         # The next admission re-proves a retained reservation against the
         # processes and ports it recorded; with all of them gone it is released.
