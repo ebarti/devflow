@@ -139,23 +139,39 @@ def interrupted_resume(seal):
             'resume_stage': 'published' if published else 'checks', 'gate_evidence': evidence}
 
 
+def gate_admission_consistent(details):
+    """A recorded gate admission must be this admission's; only recoveries that never
+    rerun gates at their sealed iteration, or revision recoveries recorded before the
+    identity existed, may lack one."""
+    recorded = details['execution_spec'].get('gate_admission')
+    if recorded is not None:
+        return recorded == details['command_digest']
+    return not ('resume_iteration' in details and not details.get('feature_plan_revision'))
+
+
 def executed_specs(store, spec):
-    """Every spec this run executed under, bound through its sealed resume chain."""
+    """Yield the specs this run executed under, newest first.
+
+    Each resume link is validated only when the walk reaches it, so a stale older
+    link cannot block an implementation that ran under a newer spec.
+    """
     from .delivery_feature_revision_recovery import retained_recovery
 
-    specs = [spec]
+    yield spec
     with store._connect() as db:
         row = db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
                          (spec['run_id'],)).fetchone()
-        recovery = json.loads(row[0]) if row and row[0] else None
-        while recovery and recovery.get('kind') == KIND:
-            # Each admission sealed the spec its predecessor execution ran under.
-            if custody(db, recovery) != specs[-1]:
+    recovery = json.loads(row[0]) if row and row[0] else None
+    previous = spec
+    while recovery and recovery.get('kind') == KIND:
+        # Each admission sealed the spec its predecessor execution ran under.
+        with store._connect() as db:
+            if custody(db, recovery) != previous:
                 raise ValueError('resume chain lost its sealed execution authority')
-            details = retained_recovery(recovery)
-            specs.append(details['predecessor_spec'])
-            recovery = details.get('original_recovery')
-    return specs
+        details = retained_recovery(recovery)
+        previous = details['predecessor_spec']
+        yield previous
+        recovery = details.get('original_recovery')
 
 
 def observed_native_cleanup(spec, *, read_only=False):
@@ -200,10 +216,11 @@ def custody(db, recovery):
                 and not (recovery.get('pending_repair') or interrupted
                          or details.get('resume_stage') == 'checks'))):
         raise ValueError('stopped resume changed its unstarted repair authority')
+    if not gate_admission_consistent(details):
+        raise ValueError('stopped resume changed its gate admission identity')
     if interrupted:
         plan = interrupted_resume(details) or {}
         if (plan.get('additional_iterations') != details['command']['additional_iterations']
-                or details['execution_spec'].get('gate_admission') != details['command_digest']
                 or any(details.get(key) != plan.get(key)
                        for key in ('resume_iteration', 'resume_stage', 'gate_evidence'))):
             raise ValueError('stopped resume changed its interrupted iteration authority')
@@ -490,8 +507,8 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             execution.pop('role_home_generation')
         if seal.get('session_custody'):
             execution['implementation_role_home_generation'] = seal['session_custody']['generation']
-        if interrupted:
-            # Its gates rerun at the sealed iteration, so their attempts take this
+        if interrupted or gate_only:
+            # Gates may rerun at the sealed iteration, so their attempts take this
             # admission's identity instead of meeting an earlier execution's receipts.
             execution['gate_admission'] = command_digest
         candidate = {**seal['candidate'], 'policy_digest': execution['policy_digest']}

@@ -96,8 +96,8 @@ def native_implementation_output(spec, attempt, executed=None):
     journal = read_private(root / "native-process.json")
     metadata, intent = journal.get("provider_session", {}), journal.get("intent", {})
     output = metadata.get("output_candidate")
-    ran = request.get("spec")
-    if (ran not in ([spec] if executed is None else executed)
+    ran = request.get("spec") or {}
+    if (not any(ran == candidate for candidate in ([spec] if executed is None else executed))
             or request.get("role") != "implement"
             or request.get("iteration") != attempt["iteration"]
             or request.get("candidate", {}).get("id") != attempt["candidate_id"]

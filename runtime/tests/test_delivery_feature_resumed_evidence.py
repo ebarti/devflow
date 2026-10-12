@@ -15,6 +15,7 @@ from test_delivery_store import service as service
 from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_feature_merge as merger
 from devflow_temporal import delivery_feature_revisions as revisions
+from devflow_temporal import delivery_stopped_resume as resume_mod
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_feature_execution import (
@@ -32,9 +33,10 @@ from devflow_temporal.supervisor import DeliverySupervisor
 LOST = "merge implementation lost its controller-bound native output"
 
 
-def codex_receipt(store, spec, *, source, output, session="original-implementation"):
+def codex_receipt(store, spec, *, source, output, session="original-implementation",
+                  iteration=0):
     """The supervisor's durable receipt for a codex implementation run under ``spec``."""
-    request = {"spec": spec, "role": "implement", "iteration": 0,
+    request = {"spec": spec, "role": "implement", "iteration": iteration,
                "candidate": {"id": source["id"]}, "workspace": spec["checkout"]}
     key = DeliverySupervisor._job_key(request)
     root = Path(spec["state_dir"]) / "attempts" / key
@@ -46,7 +48,8 @@ def codex_receipt(store, spec, *, source, output, session="original-implementati
     journal = {"phase": "finished", "owned": {"123": {"identity": "observed"}},
                "intent": {"run_id": spec["run_id"], "policy_digest": spec["policy_digest"],
                           "cwd": spec["checkout"]}, "result": outcome,
-               "provider_session": {"role": "implement", "iteration": 0, "session_id": session,
+               "provider_session": {"role": "implement", "iteration": iteration,
+                                    "session_id": session,
                                     "output_candidate": {key: output[key] for key in
                                                          ("id", "head", "content_sha256")},
                                     "result_digest": digest(saved)}}
@@ -56,31 +59,36 @@ def codex_receipt(store, spec, *, source, output, session="original-implementati
     with store._connect() as db:
         db.execute("INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
                    "state,session_id,result_json,cleanup,result_path) "
-                   "VALUES (?,?,'implement',0,?,'finished',?,?,'confirmed',?)",
-                   (key, spec["run_id"], source["id"], session, canonical_json(saved),
-                    str(root / "result.json")))
-    return {**saved, "role": "implement", "iteration": 0, "candidate": output,
+                   "VALUES (?,?,'implement',?,?,'finished',?,?,'confirmed',?)",
+                   (key, spec["run_id"], iteration, source["id"], session,
+                    canonical_json(saved), str(root / "result.json")))
+    return {**saved, "role": "implement", "iteration": iteration, "candidate": output,
             "input_candidate_id": source["id"], "provider": spec["provider"]}
 
 
-def cancelled(store, monkeypatch, parent, child, role, output):
+def cancelled(store, monkeypatch, parent, child, role, output, *, workflow_id=None,
+              execution="closed", recovery_digest=None, revision=7, finish=True):
     """Close the worker's execution as cancelled after its implementation passed."""
     state = {"run_id": child["run_id"], "phase": "cancelled", "execution_state": "terminal",
-             "outcome": "cancelled", "cleanup": "confirmed", "revision": 7, "iteration": 0,
+             "outcome": "cancelled", "cleanup": "confirmed", "revision": revision,
+             "iteration": role["iteration"],
              "candidate": output, "candidate_revision": 1, "pull_request": None,
              "decision": None, "error": None, "usage": {}, "findings": [], "checks": {},
              "tracker": {}, "roles": [role]}
     store.project(child["run_id"], phase="cancelled", execution_state="terminal",
                   event_type="cancelled", message="Feature coordinator stopped",
-                  candidate=output, checks={}, iteration=0, protocol_revision=7,
-                  outcome="cancelled", cleanup="confirmed", error=None)
+                  candidate=output, checks={}, iteration=role["iteration"],
+                  protocol_revision=revision, outcome="cancelled", cleanup="confirmed",
+                  error=None)
     with store._connect() as db:
         store.state.release_work(db, child["work_id"], "external:devflow:" + child["run_id"])
     token = parent["feature_delivery"]["owner"]
-    registry(parent).finish_worker(token, worker_key(child["run_id"], token),
-                                   {"cleanup": "confirmed"})
-    closed = {"workflow_id": "delivery-" + child["run_id"], "execution_run_id": "closed",
-              "request_digest": child["request_digest"], "recovery_digest": None, "result": state}
+    if finish:
+        registry(parent).finish_worker(token, worker_key(child["run_id"], token),
+                                       {"cleanup": "confirmed"})
+    closed = {"workflow_id": workflow_id or "delivery-" + child["run_id"],
+              "execution_run_id": execution, "request_digest": child["request_digest"],
+              "recovery_digest": recovery_digest, "result": state}
     monkeypatch.setattr(DeliveryStore, "_completed_temporal_result",
                         lambda *_a, **_k: deepcopy(closed))
     monkeypatch.setattr(DeliveryBroker, "_existing_pr", lambda *_a, **_k: None)
@@ -185,13 +193,17 @@ def test_interrupted_chunk_merges_on_the_implementation_its_predecessor_ran(
     assert bound == {key: output[key] for key in ("id", "head", "content_sha256")}
 
 
-def test_revision_gate_only_resume_merges_on_its_original_implementation(feature, monkeypatch):
+@pytest.mark.parametrize("last", [False, True], ids=["first-iteration", "last-iteration"])
+def test_revision_gate_only_resume_merges_on_its_original_implementation(
+    feature, monkeypatch, last,
+):
     store, spec, shared, record, diagnostic = feature
     chunk = next(item for item in ordered_chunks(record["manifest"]["plan"])
                  if item["id"] == "client")
     child, source, output = implemented_chunk(store, spec, chunk,
                                               record["manifest"]["workstream_issues"]["ui"])
-    role = codex_receipt(store, child, source=source, output=output)
+    iteration = child["policy"]["max_repairs"] if last else 0
+    role = codex_receipt(store, child, source=source, output=output, iteration=iteration)
     cancelled(store, monkeypatch, spec, child, role, output)
     context = revisions.begin_revision(store, spec, diagnostic)
     value = proposed(record)
@@ -212,9 +224,54 @@ def test_revision_gate_only_resume_merges_on_its_original_implementation(feature
     with store._connect() as db:
         recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
                                          (child["run_id"],)).fetchone()[0])
-    # A gate-only admission: no implementer runs again under the adopted plan.
+    # A gate-only admission: no implementer runs again under the adopted plan. Its
+    # gates, at the last iteration the same one, take the admission's identity.
     assert recovery["resume_stage"] == "checks" and recovery["feature_plan_revision"]
+    assert recovery["resume_iteration"] == iteration + int(not last)
     assert resumed["feature_plan_revision"] != child.get("feature_plan_revision")
+    assert resumed["gate_admission"] == recovery["command_digest"]
+    gate_request = {"role": "review", "iteration": iteration, "candidate": output}
+    assert DeliverySupervisor._job_key({**gate_request, "spec": resumed}) != (
+        DeliverySupervisor._job_key({**gate_request, "spec": child}))
     trees, bound = merge_evidence(monkeypatch, store, adopted["spec"], child, output)
+    assert trees == ["tree-" + output["head"][:8]]
+    assert bound == {key: output[key] for key in ("id", "head", "content_sha256")}
+
+
+@pytest.mark.parametrize("ran_under", ["current", "middle", "oldest"])
+def test_stale_older_resume_link_blocks_only_implementations_that_ran_under_it(
+    service, monkeypatch, ran_under,
+):
+    store, request, _ = feature_service(service, monkeypatch)
+    store.submit(request)
+    parent = store.effective_spec(request["run_id"])
+    chunk = ordered_chunks(json.loads(request["accepted_plan"]))[0]
+    child, source, output = implemented_chunk(
+        store, parent, chunk, {"url": "https://github.com/example/fixture/issues/10"})
+    role = codex_receipt(store, child, source=source, output=output)
+    cancelled(store, monkeypatch, parent, child, role, output)
+    row = {"error": None, "checks_json": "{}"}
+    first = activities.resume_worker(store, parent, child, row)
+    with store._connect() as db:
+        older = json.loads(db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                                      (child["run_id"],)).fetchone()[0])
+    # The resumed execution is cancelled again; a second admission chains onto the first.
+    cancelled(store, monkeypatch, parent, child, role, output, workflow_id=first["workflow_id"],
+              execution="closed-resume", recovery_digest=digest(older), revision=9, finish=False)
+    second = activities.resume_worker(store, parent, child, row)
+    specs = {"current": second["spec"], "middle": first["spec"], "oldest": child}
+    assert len({digest(value) for value in specs.values()}) == 3
+    if ran_under != "oldest":
+        # A later implementation attempt under that spec, from its own input candidate.
+        codex_receipt(store, specs[ran_under], source={"id": "e" * 64}, output=output,
+                      session="later-implementation")
+    # The older link's sealed admission is no longer intact.
+    stale = Path(child["state_dir"]) / resume_mod.namespace(older) / "admission.json"
+    write_private(stale, {**older, "maximum_iteration": 9})
+    if ran_under == "oldest":
+        with pytest.raises(ValueError, match="immutable command authority"):
+            merge_evidence(monkeypatch, store, parent, child, output)
+        return
+    trees, bound = merge_evidence(monkeypatch, store, parent, child, output)
     assert trees == ["tree-" + output["head"][:8]]
     assert bound == {key: output[key] for key in ("id", "head", "content_sha256")}
