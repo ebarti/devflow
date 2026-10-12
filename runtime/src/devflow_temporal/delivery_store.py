@@ -3113,15 +3113,23 @@ class DeliveryStore:
 
         The remote memo proves the ID belongs to another request, so no retry
         can acknowledge it. The run is projected blocked like any other stop
-        before roles, which a new submission of the same work supersedes, and
-        the outbox entry becomes terminal, so the row is told once instead of
-        polled. The projection comes first: a row left pending is retried and
-        the keyed event is not repeated.
+        before roles and its error names the recovery: a new submission of the
+        same work that supersedes it, or in feature mode, where supersede is
+        refused, continuing the feature coordinator. The outbox entry becomes
+        terminal, so the row is told once instead of polled. The projection
+        comes first: a row left pending is retried and the keyed event is not
+        repeated.
         """
+        spec = self.submitted_spec(run_id)
+        feature = bool(spec.get("feature_delivery")) or (
+            self.config.raw.get("feature_delivery_version") == 1)
+        remedy = ("continue the feature coordinator with continue-feature" if feature
+                  else "submit the work again naming this run in supersedes_run_id")
         self.project(
             run_id, phase="blocked", execution_state="blocked", event_type="blocked",
             message="Temporal workflow ID is held by a different request",
-            outcome="blocked", error=reason, key=f"temporal-conflict:{workflow_id}",
+            outcome="blocked", error=f"{reason}; {remedy}",
+            key=f"temporal-conflict:{workflow_id}",
         )
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")

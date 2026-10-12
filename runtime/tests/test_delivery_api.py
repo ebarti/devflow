@@ -513,6 +513,7 @@ async def test_poison_row_cannot_starve_newer_runs_or_churn_their_timelines(
     assert (blocked["phase"], blocked["outcome"], blocked["execution_state"]) == (
         "blocked", "blocked", "blocked")
     assert "belongs to a different request" in blocked["error"]
+    assert blocked["error"].endswith("submit the work again naming this run in supersedes_run_id")
     assert blocked["dispatch"]["state"] == "conflict"
     assert blocked["events"][-1]["type"] == "blocked"
     assert [row["run_id"] for row in service.store.pending_starts()] == ["run-1"]
@@ -691,6 +692,25 @@ async def test_requeued_row_with_stale_attempts_starts_promptly_after_an_outage(
     await service.dispatch_once()
     assert started == ["delivery-" + run_id]
     assert _dispatch_snapshot(service.store, [run_id])[run_id]["outbox"][0] == "sent"
+
+
+def test_conflict_names_the_coordinator_remedy_in_feature_mode(api_fixture, monkeypatch):
+    path, request = api_fixture
+    service = create_app(path).state.delivery
+    service.store.submit(request)
+    run_id = request["run_id"]
+    projected = {}
+    monkeypatch.setattr(service.store, "project",
+                        lambda projected_run, **kwargs: projected.update(kwargs, run=projected_run))
+    # Feature mode refuses supersede; the blocked reason names the coordinator's recovery.
+    service.store.config.raw["feature_delivery_version"] = 1
+    service.store.mark_start_conflict(
+        run_id, "delivery-" + run_id,
+        f"Temporal ID conflict: workflow delivery-{run_id} belongs to a different request")
+    assert projected["run"] == run_id
+    assert (projected["phase"], projected["outcome"]) == ("blocked", "blocked")
+    assert projected["error"].endswith("continue the feature coordinator with continue-feature")
+    assert service.store.detail(run_id)["dispatch"]["state"] == "conflict"
 
 
 @pytest.mark.asyncio
