@@ -17,6 +17,13 @@ upgrade() {
         printf 'Stop the running delivery stack before upgrading, then start it after `uv sync --frozen`.\n' >&2
         exit 1
     fi
+    # An activated supervisor would relaunch a worker from the changed checkout
+    # right after this one-time check.
+    if ! "${DEVFLOW_PYTHON:-python3.12}" -B "$source_root/scripts/delivery-service.py" active \
+            --runtime "$source_root/runtime" >/dev/null; then
+        printf 'Uninstall the launchd agent that supervises this checkout before upgrading; install and activate it again afterwards.\n' >&2
+        exit 1
+    fi
     git check-ref-format "refs/tags/$release_tag"
     if ! git -C "$source_root" diff --quiet HEAD --; then
         printf 'Preserve or commit tracked changes before upgrading.\n' >&2
