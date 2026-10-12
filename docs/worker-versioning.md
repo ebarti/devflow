@@ -24,8 +24,10 @@ The selection is stored at the top level of the existing process manifest before
 any launch, separately from PIDs, and is also included in worker readiness. A
 stop retains that selection with an empty process inventory. Failed and partial
 starts preserve it; later implicit starts reuse it only when the recorded source
-digest matches the package. Unknown or changed identity rejects startup and stop
-before readiness, signalling or launching. Unversioned historical manifests keep
+digest matches the package. Unknown or changed identity rejects any launch from
+the current source before signalling or launching; a ready stack is served as it
+is, and `stop` always proceeds against owned processes and retains the
+selection. Unversioned historical manifests keep
 their original behavior. An explicit different version can replace a selection
 only after the previous lifecycle has been drained and stopped to an empty
 inventory. Selecting the same version never refreshes its source digest.

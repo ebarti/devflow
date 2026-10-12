@@ -198,20 +198,32 @@ def _reconcile(store, original, spec, closed):
                     'resource_cleanup': receipt}))
 
 
+def _unfinished_rows(store):
+    with store._connect() as db:
+        return [dict(row) for row in db.execute(
+            "SELECT r.* FROM delivery_runs r WHERE EXISTS (SELECT 1 FROM delivery_attempts a "
+            "WHERE a.run_id=r.run_id AND a.state!='finished')")]
+
+
+def _owned_native_spec(store, run_id):
+    spec = store.effective_spec(run_id)
+    if (spec.get('provider') != 'codex'
+            or spec['policy'].get('execution_backend') != 'native-macos'
+            or not store.owns_execution(spec)):
+        return None
+    return spec
+
+
 async def reconcile_closed_native(store, client):
     if (client.service_client.config.target_host != store.config.temporal_address
             or client.namespace != store.config.raw.get('temporal_namespace', 'default')):
         raise ValueError('native maintenance transport differs from frozen owner')
-    with store._connect() as db:
-        rows = [dict(row) for row in db.execute(
-            "SELECT r.* FROM delivery_runs r WHERE EXISTS (SELECT 1 FROM delivery_attempts a "
-            "WHERE a.run_id=r.run_id AND a.state!='finished')")]
+    # Store reads stay off the API loop; the repair itself already runs in a thread.
+    rows = await asyncio.to_thread(_unfinished_rows, store)
     for row in rows:
         try:
-            spec = store.effective_spec(row['run_id'])
-            if (spec.get('provider') != 'codex'
-                    or spec['policy'].get('execution_backend') != 'native-macos'
-                    or not store.owns_execution(spec)):
+            spec = await asyncio.to_thread(_owned_native_spec, store, row['run_id'])
+            if spec is None:
                 continue
             handle = client.get_workflow_handle(row['workflow_id'] or 'delivery-'+row['run_id'])
             description = await asyncio.wait_for(handle.describe(), timeout=15)

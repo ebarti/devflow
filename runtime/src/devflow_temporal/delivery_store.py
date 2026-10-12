@@ -17,6 +17,7 @@ import subprocess
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -99,9 +100,10 @@ class DeliveryStore:
             # need this snapshot; they must not take every read surface down.
             logger.warning("admitted configuration snapshot publication failed: %s", exc)
         with self._connect() as db:
-            # Initialization also backfills feature projections. Reserve the write
-            # transaction before reading executions, so a concurrent writer cannot
-            # deadlock that read cursor while it upgrades to its first write.
+            # Schema setup only: feature projections are maintained by the
+            # service loop (delivery_features.maintain_projections), never by a
+            # construction. Reserve the write transaction so concurrent openers
+            # serialize their migrations instead of upgrading a read cursor.
             db.execute("BEGIN IMMEDIATE")
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_runs (
@@ -420,11 +422,8 @@ class DeliveryStore:
 
             initialize_settings(db)
             from .delivery_features import initialize as initialize_features
-            from .delivery_features import transition
 
             initialize_features(db)
-            for row in db.execute("SELECT run_id FROM delivery_runs ORDER BY created_at,run_id"):
-                transition(db, self.config, row[0])
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -466,9 +465,10 @@ class DeliveryStore:
                VALUES (?, ?, ?, ?, ?, ?)""",
             (run_id, _now(), event_type, message, revision, canonical_json(payload or {})),
         )
-        from .delivery_features import transition
+        from .delivery_features import record_projection, transition
 
         transition(db, self.config, run_id)
+        record_projection(db, self.config, run_id)
         return int(cursor.lastrowid)
 
     def submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None,
@@ -540,7 +540,15 @@ class DeliveryStore:
             from .delivery_feature_revisions import authenticate_revision_submission
 
             authenticate_revision_submission(self, spec, _feature_revision)
+        if _automatic is None:
+            from .delivery_settings import require_repository_access
+
+            # Refused access never reaches a GitHub or git observation below;
+            # the write transaction checks it again.
+            with self._connect() as db:
+                require_repository_access(self, db, spec["github_repo"])
         temporal_result = None
+        observed = None
         superseded = spec.get("supersedes_run_id")
         if superseded and _automatic is None:
             from .delivery_preparation import require_native_execution
@@ -555,6 +563,18 @@ class DeliveryStore:
                 ).fetchone()
             if has_attempt:
                 temporal_result = self._completed_temporal_result(superseded)
+                # Git, file and GitHub observations happen before the write lock
+                # is held; the transaction repeats the same checks against them.
+                observed = {}
+                with self._connect() as db:
+                    self._supersede_continuation(
+                        db, deepcopy(spec), supplied, superseded, temporal_result, observed
+                    )
+                observed["sealed"] = True
+        elif self.config.raw.get("feature_delivery_version") == 1 and _automatic is None:
+            from .delivery_feature_execution import observe_admission
+
+            observed = observe_admission(self, spec)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             command = db.execute(
@@ -611,47 +631,9 @@ class DeliveryStore:
 
                 validate_transaction(self, db, spec, _automatic)
             elif superseded:
-                previous = db.execute(
-                    """SELECT work_id,issue_url,repository_key,phase,outcome,execution_state,
-                              cleanup,error,pr_json,checks_json,request_digest,request_json,
-                              accepted_plan_text
-                       FROM delivery_runs WHERE run_id=?""",
-                    (superseded,),
-                ).fetchone()
-                attempts = db.execute(
-                    "SELECT * FROM delivery_attempts WHERE run_id=?", (superseded,)
-                ).fetchall()
-                if (
-                    previous is None
-                    or (previous["work_id"], previous["issue_url"], previous["repository_key"])
-                    != (spec["work_id"], spec["issue_url"], spec["repository_key"])
-                    or previous["outcome"] != "blocked"
-                    or previous["execution_state"] != "blocked"
-                    or previous["pr_json"] is not None
-                ):
-                    raise ValueError("only a blocked unpublished run may be superseded")
-                prior_spec = self._prepared_original(db, json.loads(previous["request_json"]))
-                if "origin_thread_id" not in supplied and prior_spec.get("origin_thread_id"):
-                    spec["origin_thread_id"] = prior_spec["origin_thread_id"]
-                if spec.get("origin_thread_id") != prior_spec.get("origin_thread_id"):
-                    raise ValueError("continuation changed the originating thread")
-                if previous["accepted_plan_text"] is not None:
-                    prior_spec["accepted_plan"] = previous["accepted_plan_text"]
-                if prior_spec["branch"] == spec["branch"]:
-                    raise ValueError("superseded run retains the owned branch; choose a new branch")
-                if attempts:
-                    if spec.get("intake_required") and (
-                        spec["policy"].get("recovery") or {}
-                    ).get("continuation"):
-                        if previous["accepted_plan_text"] is None:
-                            raise ValueError("continuation predecessor has no accepted plan")
-                        spec["accepted_plan"] = previous["accepted_plan_text"]
-                        spec["intake_required"] = False
-                    spec["continuation"] = self._post_role_continuation(
-                        db, spec, prior_spec, previous, attempts, temporal_result
-                    )
-                elif (spec["policy"].get("recovery") or {}).get("continuation"):
-                    raise ValueError("pre-role supersede cannot import a role session")
+                self._supersede_continuation(
+                    db, spec, supplied, superseded, temporal_result, observed
+                )
                 old_owner = f"external:devflow:{superseded}"
                 claim = self.state.claim_for(db, spec["work_id"])
                 if claim is None or claim["owner"] != old_owner:
@@ -667,7 +649,7 @@ class DeliveryStore:
 
                 if superseded or _automatic is not None:
                     raise ValueError("feature continuations use their explicit execution owner")
-                admit(self, db, spec)
+                admit(self, db, spec, observed)
             timestamp = _now()
             initial_phase = "preparing" if spec.get("preparation_version") == 1 else "accepted"
             db.execute(
@@ -2321,6 +2303,58 @@ class DeliveryStore:
         )
         confirmed_native_cleanup(spec)
 
+    def _supersede_continuation(
+        self,
+        db: sqlite3.Connection,
+        spec: dict[str, Any],
+        supplied: dict[str, Any],
+        superseded: str,
+        temporal_result: dict[str, Any] | None,
+        observed: dict[str, Any] | None,
+    ) -> None:
+        """Validate a supersede against its predecessor; reads only, except `spec`."""
+        previous = db.execute(
+            """SELECT work_id,issue_url,repository_key,phase,outcome,execution_state,
+                      cleanup,error,pr_json,checks_json,request_digest,request_json,
+                      accepted_plan_text
+               FROM delivery_runs WHERE run_id=?""",
+            (superseded,),
+        ).fetchone()
+        attempts = db.execute(
+            "SELECT * FROM delivery_attempts WHERE run_id=?", (superseded,)
+        ).fetchall()
+        if (
+            previous is None
+            or (previous["work_id"], previous["issue_url"], previous["repository_key"])
+            != (spec["work_id"], spec["issue_url"], spec["repository_key"])
+            or previous["outcome"] != "blocked"
+            or previous["execution_state"] != "blocked"
+            or previous["pr_json"] is not None
+        ):
+            raise ValueError("only a blocked unpublished run may be superseded")
+        prior_spec = self._prepared_original(db, json.loads(previous["request_json"]))
+        if "origin_thread_id" not in supplied and prior_spec.get("origin_thread_id"):
+            spec["origin_thread_id"] = prior_spec["origin_thread_id"]
+        if spec.get("origin_thread_id") != prior_spec.get("origin_thread_id"):
+            raise ValueError("continuation changed the originating thread")
+        if previous["accepted_plan_text"] is not None:
+            prior_spec["accepted_plan"] = previous["accepted_plan_text"]
+        if prior_spec["branch"] == spec["branch"]:
+            raise ValueError("superseded run retains the owned branch; choose a new branch")
+        if attempts:
+            if spec.get("intake_required") and (
+                spec["policy"].get("recovery") or {}
+            ).get("continuation"):
+                if previous["accepted_plan_text"] is None:
+                    raise ValueError("continuation predecessor has no accepted plan")
+                spec["accepted_plan"] = previous["accepted_plan_text"]
+                spec["intake_required"] = False
+            spec["continuation"] = self._post_role_continuation(
+                db, spec, prior_spec, previous, attempts, temporal_result, observed
+            )
+        elif (spec["policy"].get("recovery") or {}).get("continuation"):
+            raise ValueError("pre-role supersede cannot import a role session")
+
     def _post_role_continuation(
         self,
         db: sqlite3.Connection,
@@ -2329,8 +2363,24 @@ class DeliveryStore:
         previous: sqlite3.Row,
         attempts: list[sqlite3.Row],
         temporal_result: dict[str, Any] | None,
+        observed: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Freeze one finished post-role result before transferring its claim."""
+
+        def observe(name: str, identity: Any, measure):
+            # Git, file and GitHub observations are taken before the write
+            # transaction, which replays them against the same identities.
+            if observed is None:
+                return measure()
+            if observed.get("sealed"):
+                recorded = observed.get(name)
+                if recorded is None or recorded["identity"] != identity:
+                    raise ValueError(
+                        "continuation predecessor changed during admission; retry the submit"
+                    )
+                return recorded["value"]
+            observed[name] = {"identity": identity, "value": measure()}
+            return observed[name]["value"]
 
         recovery = spec["policy"].get("recovery") or {}
         control = recovery.get("continuation")
@@ -2512,14 +2562,16 @@ class DeliveryStore:
             raise ValueError("continuation history differs from closed Temporal result")
         candidate = role.get("candidate")
         source = Path(prior_spec["checkout"])
+        measured = observe("candidate", str(source), lambda: candidate_for(source))
         if (
             not isinstance(candidate, dict)
             or candidate.get("id") != control["candidate_id"]
             or candidate.get("base_sha") != spec["base_sha"]
-            or any(candidate.get(key) != value for key, value in candidate_for(source).items())
+            or any(candidate.get(key) != value for key, value in measured.items())
         ):
             raise ValueError("continuation source differs from the completed activity candidate")
-        manifest = selected_manifest(source, recovery["paths"])
+        manifest = observe("manifest", (str(source), list(recovery["paths"])),
+                           lambda: selected_manifest(source, recovery["paths"]))
         if digest(manifest) != control["source_manifest_sha256"]:
             raise ValueError("continuation recovered file manifest changed")
         finished_ns = int(datetime.fromisoformat(attempt["finished_at"]).timestamp() * 1e9)
@@ -2529,9 +2581,12 @@ class DeliveryStore:
         ):
             raise ValueError("continuation source was edited after the role finished")
         home = Path(prior_spec["state_dir"]) / "role-homes" / "implement"
-        if session_state_digest(home, control["session_id"]) != control["session_state_sha256"]:
+        session_state = observe("session_state", (str(home), control["session_id"]),
+                                lambda: session_state_digest(home, control["session_id"]))
+        if session_state != control["session_state_sha256"]:
             raise ValueError("continuation provider session state changed")
-        self._ensure_no_remote_pr(spec["github_repo"], prior_spec["branch"])
+        observe("remote_pull_request", (spec["github_repo"], prior_spec["branch"]),
+                lambda: self._ensure_no_remote_pr(spec["github_repo"], prior_spec["branch"]))
         return {
             "from_run_id": old_id,
             "attempt_job_key": attempt["job_key"],
@@ -2922,7 +2977,9 @@ class DeliveryStore:
         with self._connect() as db:
             rows = db.execute(
                 """SELECT r.run_id,r.request_digest,r.request_json,r.workflow_id,
-                          r.recovery_json FROM delivery_runs r
+                          r.recovery_json,o.state AS outbox_state,o.attempts,
+                          o.last_error,o.updated_at AS outbox_updated_at
+                   FROM delivery_runs r
                    JOIN delivery_outbox o ON o.run_id=r.run_id
                    WHERE o.state IN ('pending','unknown') ORDER BY r.created_at"""
             ).fetchall()
@@ -3005,6 +3062,83 @@ class DeliveryStore:
                 "Temporal accepted the run" if accepted else "Temporal dispatch remains pending",
                 {"error": error} if error else {},
             )
+
+    def record_dispatch_failure(
+        self, run_id: str, reason: str, *, uncertain: bool = False, counted: bool = True,
+    ) -> None:
+        """Record why this cycle did not dispatch the run, once per distinct reason.
+
+        The outbox row carries the failure (``last_error``, ``attempts``); the
+        run's revision and timeline move only when the reason changes, so a
+        poison row or a transport outage polled every few seconds does not
+        churn every dashboard command and bury the timeline. ``uncertain``
+        marks a start whose acknowledgement is unknown; ``counted`` is False
+        for a cycle that reached no row (the per-row backoff stays untouched).
+        """
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT o.state,o.last_error,o.attempts,r.revision FROM delivery_outbox o
+                   JOIN delivery_runs r ON r.run_id=o.run_id
+                   WHERE o.run_id=? AND o.state IN ('pending','unknown')""",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return
+            state = "unknown" if uncertain else row[0]
+            # Accepted starts count attempts too, and admissions re-queue a row
+            # by clearing last_error only: a failure after that starts a fresh
+            # sequence, and an outage that reached no row arms no backoff.
+            fresh = row[1] is None
+            attempts = (1 if fresh else row[2] + 1) if counted else (0 if fresh else row[2])
+            db.execute(
+                """UPDATE delivery_outbox SET state=?,attempts=?,last_error=?,updated_at=?
+                   WHERE run_id=?""",
+                (state, attempts, reason, _now(), run_id),
+            )
+            if row[1] == reason:
+                return
+            revision = row[3] + 1
+            db.execute(
+                "UPDATE delivery_runs SET revision=?,updated_at=? WHERE run_id=?",
+                (revision, _now(), run_id),
+            )
+            self._event(
+                db, run_id, revision, "temporal_pending",
+                "Temporal dispatch remains pending", {"error": reason},
+            )
+
+    def mark_start_conflict(self, run_id: str, workflow_id: str, reason: str) -> None:
+        """Block a run whose workflow ID is held by a different request.
+
+        The remote memo proves the ID belongs to another request, so no retry
+        can acknowledge it. The run is projected blocked like any other stop
+        before roles and its error names the recovery: a new submission of the
+        same work that supersedes it, or in feature mode, where supersede is
+        refused, continuing the feature coordinator. The outbox entry becomes
+        terminal, so the row is told once instead of polled. The projection
+        comes first: a row left pending is retried and the keyed event is not
+        repeated.
+        """
+        spec = self.submitted_spec(run_id)
+        feature = bool(spec.get("feature_delivery")) or (
+            self.config.raw.get("feature_delivery_version") == 1)
+        remedy = ("continue the feature coordinator with continue-feature" if feature
+                  else "submit the work again naming this run in supersedes_run_id")
+        self.project(
+            run_id, phase="blocked", execution_state="blocked", event_type="blocked",
+            message="Temporal workflow ID is held by a different request",
+            outcome="blocked", error=f"{reason}; {remedy}",
+            key=f"temporal-conflict:{workflow_id}",
+        )
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE delivery_outbox SET state='conflict',last_error=?,updated_at=?
+                   WHERE run_id=? AND state IN ('pending','unknown')""",
+                (reason, _now(), run_id),
+            )
+        logger.warning("Run %s is blocked: %s", run_id, reason)
 
     def project(
         self,
@@ -3521,11 +3655,14 @@ class DeliveryStore:
         }
 
     def detail(self, run_id: str) -> dict[str, Any]:
+        from .delivery_features import projection_failures
+
         with self._connect() as db:
             saved = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             if saved is None:
                 raise ValueError("run ID not found")
             row = dict(saved)
+            projection_failure = next(iter(projection_failures(db, run_id)), None)
             outbox = db.execute(
                 "SELECT state,attempts,last_error,updated_at FROM delivery_outbox WHERE run_id=?",
                 (run_id,),
@@ -3737,6 +3874,9 @@ class DeliveryStore:
                 "implementation_authority": False,
             } if gates_admission else None,
             "queued": row["execution_state"] == "queued",
+            "feature_projection_error": (
+                projection_failure["error"] if projection_failure else None
+            ),
             "cleanup": "unknown"
             if row["cleanup"] == "unknown" or any(a["cleanup"] == "unknown" for a in attempts)
             else cleanup,

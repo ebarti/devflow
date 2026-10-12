@@ -335,8 +335,11 @@ async def test_uncertain_policy_workflow_start_reads_memo_without_duplicate_star
         return temporal
 
     monkeypatch.setattr(service, 'healthy_client', healthy)
-    with pytest.raises(TimeoutError):
-        await service.dispatch_once()
+    await service.dispatch_once()
+    with store._connect() as db:
+        # The sent start is unknown on its own row; the batch is not aborted.
+        assert tuple(db.execute('SELECT state,last_error FROM delivery_outbox').fetchone()) == (
+            'unknown', 'TimeoutError: remote accepted, acknowledgement unavailable')
     await service.dispatch_once()
     assert temporal.starts == 1
     with store._connect() as db:

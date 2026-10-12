@@ -18,6 +18,7 @@ from typing import Any
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
+from temporalio.worker import ActivityInboundInterceptor, ExecuteActivityInput, Interceptor
 
 from .candidate import candidate_for
 from .contracts import digest
@@ -34,6 +35,35 @@ from .supervisor import get_supervisor
 
 _CHECK_HEARTBEAT_INTERVAL = 5
 _UNCLEAN_CHECK_SLOTS: list[int] = []
+
+
+def database_contention(exc: BaseException) -> bool:
+    """SQLITE_BUSY/LOCKED: another writer holds the database; that clears by itself."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return isinstance(exc, sqlite3.OperationalError) and (
+        (code is not None and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+        or str(exc).startswith(("database is locked", "database table is locked",
+                               "database schema is locked", "database is busy"))
+    )
+
+
+class _DatabaseContentionInbound(ActivityInboundInterceptor):
+    async def execute_activity(self, input: ExecuteActivityInput) -> Any:
+        try:
+            return await super().execute_activity(input)
+        except sqlite3.OperationalError as exc:
+            if not database_contention(exc):
+                raise
+            raise ApplicationError(
+                f"database busy: {str(exc)[:200]}", type="DatabaseBusy", non_retryable=False,
+            ) from exc
+
+
+class DatabaseContentionInterceptor(Interceptor):
+    """Type SQLite contention so the workflow classifies it transient, never terminal."""
+
+    def intercept_activity(self, next: ActivityInboundInterceptor) -> ActivityInboundInterceptor:
+        return _DatabaseContentionInbound(next)
 
 
 def _cancelled_check_result(request: dict[str, Any], broker: DeliveryBroker) -> dict[str, Any]:
@@ -285,14 +315,7 @@ async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
     try:
         return await asyncio.to_thread(execute)
     except Exception as exc:
-        import sqlite3
-
-        code = getattr(exc, "sqlite_errorcode", None)
-        transient = isinstance(exc, sqlite3.OperationalError) and (
-            (code is not None and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
-            or str(exc).startswith(("database is locked", "database table is locked",
-                                   "database schema is locked", "database is busy"))
-        )
+        transient = database_contention(exc)
         raise ApplicationError(
             f"projection failed: {type(exc).__name__}: {str(exc)[:400]}",
             type="ProjectionContention" if transient else "ProjectionRejected",
@@ -383,18 +406,21 @@ async def delivery_finalize_resources(request: dict[str, Any]) -> dict[str, Any]
 
 @activity.defn(name="delivery_accept_plan")
 async def delivery_accept_plan(request: dict[str, Any]) -> dict[str, Any]:
-    spec = request["spec"]
-    config = load_execution_config(spec)
-    store = DeliveryStore(config)
-    saved = store.effective_spec(spec["run_id"])
-    if {key: value for key, value in saved.items() if key != "accepted_plan"} != {
-        key: value for key, value in spec.items() if key != "accepted_plan"
-    }:
-        raise ValueError("intake authority changed before acceptance")
-    return store.accept_intake_plan(
-        request["spec"]["run_id"], request["plan_revision"],
-        request["plan_digest"], request["plan"], authorization=request.get("authorization"),
-    )
+    def execute() -> dict[str, Any]:
+        spec = request["spec"]
+        config = load_execution_config(spec)
+        store = DeliveryStore(config)
+        saved = store.effective_spec(spec["run_id"])
+        if {key: value for key, value in saved.items() if key != "accepted_plan"} != {
+            key: value for key, value in spec.items() if key != "accepted_plan"
+        }:
+            raise ValueError("intake authority changed before acceptance")
+        return store.accept_intake_plan(
+            request["spec"]["run_id"], request["plan_revision"],
+            request["plan_digest"], request["plan"], authorization=request.get("authorization"),
+        )
+
+    return await asyncio.to_thread(execute)
 
 
 @activity.defn(name="delivery_role")
@@ -792,7 +818,7 @@ async def delivery_baseline_checks(request: dict[str, Any]) -> dict[str, Any]:
 
 @activity.defn(name="delivery_ci")
 async def delivery_ci(request: dict[str, Any]) -> dict[str, Any]:
-    _, broker = _context(request["spec"])
+    _, broker = await asyncio.to_thread(_context, request["spec"])
     if "ci_wait_seconds" not in request["spec"].get("policy", {}):
         return await broker.checks(request["pull_request"])
     pending = asyncio.create_task(broker.checks(request["pull_request"]))
@@ -1068,7 +1094,7 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
                 and not feature_parent):
             from .delivery_terminal_recovery import published_readback
 
-            store, _ = _context(request["spec"])
+            store, _ = await asyncio.to_thread(_context, request["spec"])
             await asyncio.to_thread(published_readback, store, request["spec"],
                                     request.get("candidate"), request["pull_request"])
         return await asyncio.to_thread(
@@ -1092,7 +1118,7 @@ async def delivery_merge(request):
 
     from .delivery_merge import merge_verified
 
-    store, _ = _context(request["spec"])
+    store, _ = await asyncio.to_thread(_context, request["spec"])
     cancelled = Event()
     try:
         return await _with_heartbeat(
