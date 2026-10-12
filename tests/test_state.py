@@ -4,6 +4,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -123,28 +125,107 @@ class ReplayTests(StateCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 1)
 
 
+def legacy_schema_two(path):
+    schema = (ROOT / "skills" / "devflow" / "scripts" / "schema.sql").read_text()
+    statements, statement = [], ""
+    for line in schema.splitlines(True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            statements.append(statement)
+            statement = ""
+    legacy = sqlite3.connect(path)
+    for text in statements:
+        if all(name not in text for name in ("claims", "runtime_", "reconcile_")):  # schema 2 predates these
+            legacy.execute(text)
+    legacy.execute(f"PRAGMA application_id={state.APP_ID}")
+    legacy.execute("PRAGMA user_version=2")
+    legacy.execute("INSERT INTO works(id,title,status,created_at,updated_at) VALUES "
+                   "('w1','kept','active','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')")
+    legacy.commit()
+    legacy.close()
+
+
+class ConcurrencyTests(unittest.TestCase):
+    """Opening a migrated database is a read; only a due migration takes the write lock."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "workflow.sqlite3"
+
+    def hold_write_lock(self, held, release):
+        writer = sqlite3.connect(self.path, timeout=30)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("INSERT INTO works(id,title,status,created_at,updated_at) VALUES "
+                           "('w-hold','held','active',?,?)", (state.now(), state.now()))
+            held.set()
+            release.wait(10)
+            writer.commit()
+        finally:
+            writer.close()
+
+    def test_open_leaves_no_transaction_and_uses_write_ahead_logging(self):
+        db = state.connect(self.path)
+        self.addCleanup(db.close)
+        self.assertFalse(db.in_transaction)
+        self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+        self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], state.SCHEMA_VERSION)
+        self.assertEqual(db.execute("PRAGMA application_id").fetchone()[0], state.APP_ID)
+
+    def test_reader_opens_while_a_writer_holds_the_lock(self):
+        state.connect(self.path).close()
+        held, release = threading.Event(), threading.Event()
+        writer = threading.Thread(target=self.hold_write_lock, args=(held, release))
+        writer.start()
+        self.addCleanup(writer.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        started = time.monotonic()
+        db = state.connect(self.path)
+        self.addCleanup(db.close)
+        self.assertEqual(db.execute("SELECT count(*) FROM works").fetchone()[0], 0)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_due_migration_waits_for_the_writer_and_runs_once(self):
+        legacy_schema_two(self.path)
+        held, release = threading.Event(), threading.Event()
+        writer = threading.Thread(target=self.hold_write_lock, args=(held, release))
+        writer.start()
+        self.addCleanup(writer.join)
+        self.assertTrue(held.wait(5))
+        openers, errors = [], []
+
+        def open_database():
+            try:
+                db = state.connect(self.path)
+                openers.append(db.execute("PRAGMA user_version").fetchone()[0])
+                db.close()
+            except Exception as exc:  # surfaced below
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=open_database) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.3)
+        self.assertEqual(openers, [], "migration must wait for the held write lock")
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(errors, [])
+        self.assertEqual(openers, [7, 7, 7])
+        db = state.connect(self.path)
+        self.addCleanup(db.close)
+        self.assertEqual(state.row(db, "works", "w1")["title"], "kept")
+        self.assertEqual(state.row(db, "works", "w-hold")["title"], "held")
+
+
 class MigrationTests(unittest.TestCase):
     def test_schema_two_database_upgrades_to_seven_and_keeps_rows(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / "workflow.sqlite3"
-        schema = (ROOT / "skills" / "devflow" / "scripts" / "schema.sql").read_text()
-        statements, statement = [], ""
-        for line in schema.splitlines(True):
-            statement += line
-            if sqlite3.complete_statement(statement):
-                statements.append(statement)
-                statement = ""
-        legacy = sqlite3.connect(path)
-        for text in statements:
-            if all(name not in text for name in ("claims", "runtime_", "reconcile_")):  # schema 2 predates these
-                legacy.execute(text)
-        legacy.execute(f"PRAGMA application_id={state.APP_ID}")
-        legacy.execute("PRAGMA user_version=2")
-        legacy.execute("INSERT INTO works(id,title,status,created_at,updated_at) VALUES "
-                       "('w1','kept','active','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')")
-        legacy.commit()
-        legacy.close()
+        legacy_schema_two(path)
 
         db = state.connect(path)
         self.addCleanup(db.close)

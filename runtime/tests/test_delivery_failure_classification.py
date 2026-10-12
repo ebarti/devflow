@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from copy import deepcopy
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from historical_replay import replay_designated_history
-from temporalio import activity
+from temporal_test_server import local_temporal
+from temporalio import activity, workflow
 from temporalio.client import Client
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
@@ -17,12 +21,13 @@ from temporalio.exceptions import (
     TimeoutType,
 )
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import ActivityInboundInterceptor, UnsandboxedWorkflowRunner, Worker
 from test_delivery_store import service as service
 
 from devflow_temporal.contracts import digest
+from devflow_temporal.delivery_activities import DatabaseContentionInterceptor
 from devflow_temporal.delivery_config import scope_amended_spec
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
+from devflow_temporal.delivery_workflow import DeliveryWorkflow, _failure_classification
 
 
 def activity_failure(cause):
@@ -77,6 +82,11 @@ def test_scope_amendment_preserves_frozen_marker_presence_and_budget(service, ma
     (activity_failure(TimeoutError('timeout', type=TimeoutType.START_TO_CLOSE,
                                   last_heartbeat_details=[])), 'transient'),
     (activity_failure(ApplicationError('network', type='ConnectionError')), 'transient'),
+    (activity_failure(ApplicationError('database busy', type='DatabaseBusy')), 'transient'),
+    (activity_failure(ApplicationError('projection failed: database is locked',
+                                       type='ProjectionContention')), 'transient'),
+    (activity_failure(ApplicationError('database busy', type='DatabaseBusy',
+                                       non_retryable=True)), 'terminal'),
     (activity_failure(ApplicationError('transient deadline', type='ValueError')), 'terminal'),
     (activity_failure(ApplicationError('timeout', type='TimeoutExpired', non_retryable=True)),
      'terminal'),
@@ -97,6 +107,63 @@ async def test_stop_classifies_typed_cause_without_parsing_text(cause, expected)
     assert result['checks']['failure']['stage'] == 'implement'
     assert projects[-1]['checks']['failure'] == result['checks']['failure']
     assert result['outcome'] == 'blocked'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('message', ['database is locked', 'database table is locked: runs'])
+async def test_worker_interceptor_types_sqlite_contention_as_transient(message):
+    class Failing(ActivityInboundInterceptor):
+        def __init__(self, error):
+            self.error = error
+
+        async def execute_activity(self, input):
+            raise self.error
+
+    inbound = DatabaseContentionInterceptor().intercept_activity(
+        Failing(sqlite3.OperationalError(message)))
+    with pytest.raises(ApplicationError) as failure:
+        await inbound.execute_activity(None)
+    assert failure.value.type == 'DatabaseBusy' and not failure.value.non_retryable
+    assert 'database busy' in str(failure.value)
+    other = DatabaseContentionInterceptor().intercept_activity(
+        Failing(sqlite3.OperationalError('no such table: delivery_runs')))
+    with pytest.raises(sqlite3.OperationalError, match='no such table'):
+        await other.execute_activity(None)
+
+
+@activity.defn(name='locked_store_probe')
+async def _locked_store_probe() -> None:
+    raise sqlite3.OperationalError('database is locked')
+
+
+@workflow.defn
+class _ContentionProbe:
+    @workflow.run
+    async def run(self) -> dict:
+        try:
+            await workflow.execute_activity(
+                _locked_store_probe, start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except ActivityError as exc:
+            return _failure_classification(exc, None)
+        return {'classification': 'none'}
+
+
+@pytest.mark.asyncio
+async def test_single_attempt_activity_hitting_a_locked_database_is_transient():
+    async with local_temporal() as environment:
+        async with Worker(
+            environment.client, task_queue='database-contention',
+            workflows=[_ContentionProbe], activities=[_locked_store_probe],
+            interceptors=[DatabaseContentionInterceptor()],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            result = await environment.client.execute_workflow(
+                _ContentionProbe.run, id='database-contention-probe',
+                task_queue='database-contention',
+            )
+    assert result == {'classification': 'transient', 'cause_type': 'DatabaseBusy'}
 
 
 @pytest.mark.asyncio

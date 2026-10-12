@@ -35,7 +35,8 @@ def _failure_classification(cause: Exception | None, controller_cause: str | Non
         result["cause_type"] = (failure.type or "ApplicationError")[:128]
         if not failure.non_retryable and failure.type in {
             "ConnectionError", "TimeoutError", "TimeoutExpired", "GitHubTransientError",
-            "BrokerReadbackUnavailable", "ResourceCleanupTransient",
+            "BrokerReadbackUnavailable", "ResourceCleanupTransient", "DatabaseBusy",
+            "ProjectionContention",
         }:
             result["classification"] = "transient"
     return result

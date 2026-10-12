@@ -29,6 +29,7 @@ TABLES = {"work": "works", "run": "runs", "result": "results", "finding": "findi
 NUMBERS = {"duration_seconds", "estimated_cost_usd", "estimated_credits"}
 TOKENS = {"input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens", "reasoning_output_tokens"}
 APP_ID = 0x44564632
+SCHEMA_VERSION = 7
 ACTIVE = {"active", "running", "in-progress"}
 FINISHED = {"done", "completed", "canceled", "cancelled"}
 
@@ -60,6 +61,24 @@ def timestamps(values, prior=None):
         values["ended_at"] = now()
 
 
+def _schema_current(db):
+    """Read-only: a migrated database needs no write lock to open."""
+    return (db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+            and db.execute("PRAGMA application_id").fetchone()[0] == APP_ID)
+
+
+def _durable_journal(db):
+    """Write-ahead logging is persistent; readers then never wait behind a writer."""
+    if db.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+        return
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        # The switch needs a moment of exclusive access; an older connection may hold
+        # the rollback journal open. Reads and writes stay correct, a later open retries.
+        pass
+
+
 def connect(path):
     path = Path(path).expanduser()
     # umask is process-wide: even a temporary change races with other state
@@ -81,9 +100,16 @@ def connect(path):
     db.row_factory = sqlite3.Row
     try:
         db.execute("PRAGMA foreign_keys=ON")
+        # Readers must not queue behind writers: inspect the schema without a
+        # transaction and reserve the write lock only when a migration is due.
+        if _schema_current(db):
+            _durable_journal(db)
+            return db
         db.execute("BEGIN IMMEDIATE")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version == 0 and not db.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone():
+        if version == SCHEMA_VERSION and db.execute("PRAGMA application_id").fetchone()[0] == APP_ID:
+            pass  # another connection migrated while this one waited for the lock
+        elif version == 0 and not db.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone():
             # Statements are deliberately split by complete_statement, not executescript,
             # which would commit the transaction before the schema is created.
             statement = ""
@@ -134,6 +160,7 @@ def connect(path):
         if version in {2, 3, 4, 5, 6}:
             db.execute("PRAGMA user_version=7")
         db.commit()
+        _durable_journal(db)
         return db
     except BaseException:
         db.close()
