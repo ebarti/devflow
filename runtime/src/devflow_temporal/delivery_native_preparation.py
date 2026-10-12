@@ -405,10 +405,11 @@ def bind_native_spec(spec: dict, identity: dict, path: Path, *, reused: bool,
         "environment": _reference(path),
         "security_binding_sha256": run_binding(effective),
         "cache_reused": reused,
-        # The measurement ran under the submitted policy digest, before this
+        # A measurement ran under the submitted policy digest, before this
         # binding changed it; its journals under native-preparation/ keep that
         # digest, and later custody observation binds them to this record.
-        "measured_policy_digest": measured,
+        # Reused proofs and records sealed before this key stay byte-identical.
+        **({"measured_policy_digest": measured} if measured else {}),
     }
     verify_native_spec(effective)
     return effective
