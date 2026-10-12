@@ -10,7 +10,7 @@ import sys
 import threading
 
 import pytest
-from test_dead_native_monitor import attempt
+from test_dead_native_monitor import attempt, kill_owned_monitor, until
 from test_delivery_api import api_fixture as api_fixture
 from test_delivery_prelaunch_capacity import native_role as native_role
 from test_delivery_store import _sealed_prelaunch_retry_fixture
@@ -314,6 +314,34 @@ def test_monitor_lost_before_authorization_is_retryable_prelaunch(
         run = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
                          (request["run_id"],)).fetchone()
     store.repair_preflight(spec, json.loads(run["recovery_json"]))
+
+
+@pytest.mark.asyncio
+async def test_interrupted_provider_attempt_keeps_blocking_custody_observation(native_role):
+    case = native_role
+    (case.state / "hold-provider").touch()
+    task = asyncio.create_task(delivery_role(case.request))
+    try:
+        await until(lambda: (case.state / "provider-started").exists())
+        # The provider ran: its outcome stays unknown however clean the teardown.
+        kill_owned_monitor(read_private(case.folder / "native-process.json"))
+        (case.state / "release-provider").touch()
+        result = await asyncio.wait_for(task, 60)
+    finally:
+        (case.state / "release-provider").touch()
+        await asyncio.gather(task, return_exceptions=True)
+    row = attempt(case)
+    journal = read_private(case.folder / "native-process.json")
+    assert result["finish_reason"] == "interrupted_monitor" and row["cleanup"] == "confirmed"
+    assert journal["result"]["provider_outcome"] == "unknown"
+    assert native.interrupted_cleanup_proven(journal)
+    assert not native.reconciled_not_started(case.folder)
+    spec = case.request["spec"]
+    assert RunResources(spec).finalize("blocked")["outcome"] == "blocked"
+    with pytest.raises(ValueError, match="live actor or port"):
+        observe_completed_resources(spec, [row])
+    with pytest.raises(ValueError, match="finalized inventory"):
+        observe_finalized_resources(spec)
 
 
 def test_closed_sweep_finalizes_launch_window_attempt_and_resources(api_fixture):

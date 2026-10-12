@@ -742,7 +742,7 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
         ))
     ):
         raise ValueError("predecessor process/root custody is unconfirmed")
-    from .delivery_native_process import interrupted_cleanup_proven, listeners, process_table
+    from .delivery_native_process import listeners, lost_monitor_without_provider, process_table
 
     table = process_table()
     journals, roots = {}, {}
@@ -763,11 +763,14 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
         _ancestors(path)
         value = read_private(path)
         receipt = receipts[raw]
-        # A lost monitor never completes monitoring; its bound teardown proof,
-        # with the live actor and port checks below, stands in for that flag.
+        # A lost monitor never completes monitoring. Only a role monitor lost
+        # before GO or a lost gate monitor may substitute its bound teardown
+        # proof (with the live actor and port checks below); a role attempt
+        # whose provider ran keeps its unknown outcome.
+        role_attempt = path.parent.parent == state / "attempts"
         if not freshly_completed and (
             (receipt.get("monitoring_complete") is not True
-             and not interrupted_cleanup_proven(value))
+             and not lost_monitor_without_provider(value, role_attempt=role_attempt))
             or receipt.get("owned_ports_clear") is not True
             or sorted(receipt.get("observed_pids", [])) != sorted(map(int, value.get("owned", {})))
         ):
@@ -842,7 +845,7 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
         if (
             value.get("phase") != "finished"
             or (value.get("monitoring_complete") is not True
-                and not interrupted_cleanup_proven(value))
+                and not lost_monitor_without_provider(value, role_attempt=role_attempt))
             or any(
                 table.get(int(pid), {}).get("identity") == actor["identity"]
                 and not table[int(pid)]["stat"].startswith("Z")

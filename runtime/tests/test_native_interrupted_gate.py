@@ -17,9 +17,13 @@ from test_delivery_store import _git
 
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
-from devflow_temporal.delivery_native_process import process_table
+from devflow_temporal.delivery_native_process import lost_monitor_without_provider, process_table
 from devflow_temporal.delivery_preparation import prepare_authority
-from devflow_temporal.delivery_resources import RunResources, read_private
+from devflow_temporal.delivery_resources import (
+    RunResources,
+    observe_finalized_resources,
+    read_private,
+)
 from devflow_temporal.delivery_store import DeliveryStore
 
 # The gate command keeps running long enough for its monitor to be lost while
@@ -168,3 +172,25 @@ async def test_lost_browser_qa_monitor_reruns_the_gate_once(native_gates, losses
     again = await loop.run_in_executor(None, broker.run_browser_qa, 0, candidate)
     assert again["state"] == "unknown" and again["cleanup"] == "confirmed"
     assert _native_folders(folder) == ["native", "native-retry"]
+
+
+@pytest.mark.asyncio
+async def test_single_gate_loss_keeps_custody_observable(native_gates):
+    """One lost gate monitor must not block merge, release or automatic retry later."""
+    broker, candidate = native_gates.broker, native_gates.candidate
+    folder = broker.evidence_dir / "checks" / "0" / "regression"
+    task = asyncio.get_running_loop().run_in_executor(None, broker.run_checks, 0, candidate)
+    await _lose_authorized_monitor(folder / "native" / "native-process.json")
+    result = await asyncio.wait_for(task, 120)
+    assert result["state"] == "passed", result
+    interrupted = read_private(folder / "native" / "native-process.json")
+    assert interrupted["monitoring_complete"] is False
+    assert interrupted["result"]["provider_outcome"] == "unknown"
+    receipt = RunResources(native_gates.spec).finalize("blocked")
+    assert receipt["outcome"] == "blocked"
+    # The interrupted journal is a gate's, outside attempts/: its bound teardown
+    # proof stands in for completed monitoring, while the same journal shape
+    # under attempts/ (a provider that ran) would not be admitted.
+    assert observe_finalized_resources(native_gates.spec)["finalization_sha256"]
+    assert lost_monitor_without_provider(interrupted, role_attempt=False)
+    assert not lost_monitor_without_provider(interrupted, role_attempt=True)

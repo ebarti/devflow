@@ -290,11 +290,24 @@ def interrupted_cleanup_proven(journal: dict) -> bool:
             and proof.get("owned_sha256") == digest(journal.get("owned")))
 
 
+def lost_monitor_without_provider(journal: dict, *, role_attempt: bool) -> bool:
+    """Whether a lost monitor's journal may stand in for completed monitoring.
+
+    A role attempt whose provider ran keeps its unknown outcome: it is never
+    admitted here. A role monitor lost before GO, or a lost gate monitor (whose
+    child is a check command, not a provider), may be, once its proof binds.
+    """
+    return interrupted_cleanup_proven(journal) and (
+        not role_attempt
+        or (journal.get("result") or {}).get("provider_outcome") == "not_started")
+
+
 def reconciled_not_started(folder: Path) -> bool:
-    """The attempt's monitor was lost before GO and its teardown is confirmed again now.
+    """The attempt's monitor was lost before GO, as its bound teardown proof records.
 
     Such a folder keeps its journal, launch and log files as evidence, so the
-    prelaunch consumers accept it in place of an empty folder.
+    prelaunch consumers accept it in place of an empty folder. This is a pure
+    read: callers hold database transactions and must not reconcile here.
     """
     journal = folder / "native-process.json"
     if (any(os.path.lexists(folder / name) for name in ("start.json", "result.json", "cancel"))
@@ -302,14 +315,9 @@ def reconciled_not_started(folder: Path) -> bool:
         return False
     try:
         value = read_private(journal)
-        receipt = reconcile_process(journal)
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError):
         return False
-    result = value.get("result") or {}
-    return (receipt.get("cleanup") == "observed-native-confirmed"
-            and result.get("interrupted_monitor") is True
-            and result.get("provider_outcome") == "not_started"
-            and prelaunch_journal(value))
+    return prelaunch_journal(value) and lost_monitor_without_provider(value, role_attempt=True)
 
 
 def _cancel_requested(folder: Path) -> bool:
