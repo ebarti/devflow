@@ -239,7 +239,8 @@ def test_changed_authority_plan_or_head_cannot_merge(service, monkeypatch, chang
     elif change == "head":
         gh.tampered = True
     else:
-        gh.merged.add(20)
+        # A merged lower prefix is progress; a layer merged above an open one is not.
+        gh.merged.add(21)
     with pytest.raises(OwnershipConflict):
         merger.merge(
             store,

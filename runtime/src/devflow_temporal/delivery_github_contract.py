@@ -43,6 +43,38 @@ class GitHubContractError(RuntimeError):
         self.status = status
 
 
+class GitHubTransientError(GitHubContractError):
+    """A GitHub server fault or rate limit: infrastructure, not a verdict on the request."""
+
+
+# gh reports transport failures (offline, DNS, TLS, reset connections) without any
+# HTTP status; these are its connection-error messages.
+_GH_CONNECTION = re.compile(
+    r"error connecting to|dial tcp|no such host|connection refused|connection reset"
+    r"|connection timed out|i/o timeout|TLS handshake|\btls: |could not resolve host"
+    r"|network is unreachable|temporary failure in name resolution|unexpected EOF",
+    re.IGNORECASE,
+)
+# A certificate that fails verification is a deterministic misconfiguration, not transport.
+_GH_CERTIFICATE = re.compile(
+    r"failed to verify certificate|certificate (is not trusted|has expired|is expired"
+    r"|signed by unknown authority)|x509:",
+    re.IGNORECASE,
+)
+
+
+def github_transient(status: int | None, stderr: str) -> bool:
+    """Server faults, rate limits and transport failures are infrastructure; every
+    other HTTP status, and every other gh error, is a verdict on the request."""
+    if status is None:
+        text = stderr or ""
+        return (_GH_CERTIFICATE.search(text) is None
+                and _GH_CONNECTION.search(text) is not None)
+    return status >= 500 or status == 429 or (
+        status == 403 and re.search(r"rate limit", stderr, re.IGNORECASE) is not None
+    )
+
+
 def issue_identity(url: str, repository: str) -> tuple[str, int]:
     if not isinstance(url, str) or not isinstance(repository, str):
         raise ValueError("delivery issue requires a GitHub URL and repository")
@@ -210,7 +242,11 @@ def validate_manifest(value: dict, issue: dict) -> dict:
     return deepcopy(value)
 
 
-def encode_manifest(manifest: dict) -> str:
+PARENT_INDEX_LIMIT = 60000
+
+
+def manifest_body(manifest: dict) -> str:
+    """The parent index comment body, before the GitHub size limit is applied."""
     value = wire_manifest(manifest)
     plan = value["plan"]
     lines = ["## Delivery plan", "", plan["scope"], "", "Acceptance criteria:"]
@@ -233,14 +269,18 @@ def encode_manifest(manifest: dict) -> str:
         lines.extend(f"- {member['url']}" for member in members)
     marker = MARKER if value["version"] == 1 else MARKER_V2
     lines.extend(["", marker, "```json", canonical_json(value), "```", ""])
-    body = "\n".join(lines)
-    if len(body.encode()) > 60000:
+    return "\n".join(lines)
+
+
+def encode_manifest(manifest: dict) -> str:
+    body = manifest_body(manifest)
+    if len(body.encode()) > PARENT_INDEX_LIMIT:
         raise ValueError("delivery plan exceeds the GitHub comment limit")
     return body
 
 
 def decode_manifest(body: str, issue: dict) -> dict:
-    if not isinstance(body, str) or len(body.encode()) > 60000:
+    if not isinstance(body, str) or len(body.encode()) > PARENT_INDEX_LIMIT:
         raise ValueError("GitHub delivery comment lacks its unique record")
     markers = [marker for marker in (MARKER, MARKER_V2) if marker in body]
     if len(markers) != 1 or body.count(markers[0]) != 1:
@@ -270,9 +310,13 @@ class GitHubDelivery:
         )
         if result.returncode:
             match = re.search(r"HTTP (\d{3})", result.stderr)
-            raise GitHubContractError(
-                (result.stderr or result.stdout)[:1000], int(match[1]) if match else None
-            )
+            status = int(match[1]) if match else None
+            message = (result.stderr or result.stdout)[:1000]
+            # Server faults and rate limits may be retried; every other status is
+            # GitHub's verdict about this request and must not be.
+            if github_transient(status, result.stderr):
+                raise GitHubTransientError(message, status)
+            raise GitHubContractError(message, status)
         return json.loads(result.stdout) if result.stdout.strip() else None
 
     def optional(self, endpoint):

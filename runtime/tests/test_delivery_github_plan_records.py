@@ -532,7 +532,6 @@ def test_revision_cannot_drop_final_verification_before_publication(tmp_path, we
     assert adopted["manifest"]["plan_revision"] == 2
 
 
-
 @pytest.mark.parametrize(
     "rejected_record", ["bound_parent_marker", "nullable_parent_marker",
                         "nullable_later_child_marker", "nullable_parent_overflow"],
@@ -653,3 +652,90 @@ def test_closed_staged_operation_releases_custody_for_a_later_revision(tmp_path)
     with pytest.raises(OwnershipConflict, match="retains publication custody"):
         remote.publish_plan_revision(issue, current, revised, registry, token,
                                      operation_id="later")
+
+
+def test_parent_index_preflight_reserves_every_later_stack_member(tmp_path):
+    from devflow_temporal.delivery_github_plans import _parent_plan_body, _preflight_initial_plan
+    from devflow_temporal.delivery_plan_model import ordered_chunks
+
+    remote, issue, registry, token = setup(tmp_path)
+
+    def padded(size):
+        value = v2_plan()
+        # Members grow per chunk while the reserved child identities grow per workstream.
+        stream = value["workstreams"][0]
+        for number in range(32 - len(ordered_chunks(value))):
+            chunk = deepcopy(stream["chunks"][0])
+            chunk.update(id=f"{chunk['id']}-{number}", title=f"{chunk['title']} {number}",
+                         depends_on=[stream["chunks"][-1]["id"]])
+            stream["chunks"].append(chunk)
+        value["acceptance"] = [*value["acceptance"], *(
+            f"Requirement {start} " + "x" * min(4000, size - start)
+            for start in range(0, size, 4000))]
+        return value
+
+    def admitted(size):
+        value = padded(size)
+        try:
+            _preflight_initial_plan(issue, value, "github-plan:" + digest(
+                {"issue": issue["id"], "plan": value}))
+        except ValueError as exc:
+            assert ("GitHub comment limit" in str(exc)
+                    or "cannot record every chunk's pull request" in str(exc))
+            return False
+        return True
+
+    # The largest plan the creation preflight admits.
+    low, high = 0, 60000
+    while low < high:
+        middle = (low + high + 1) // 2
+        low, high = (middle, high) if admitted(middle) else (low, middle - 1)
+    record = remote.initialize(issue, padded(low), registry, token)
+    manifest = deepcopy(record["manifest"])
+    members = manifest["publication"]["members"]
+    for index, chunk in enumerate(ordered_chunks(manifest["plan"])):
+        child = manifest["workstream_issues"][chunk["workstream_id"]]
+        members.append({
+            "chunk_id": chunk["id"], "number": 9000 + index,
+            "url": f"https://github.com/{issue['repository']}/pull/{9000 + index}",
+            "branch": "feat/df-" + digest(issue["id"])[:10] + "-" + chunk["id"],
+            "head": "a" * 40, "base_branch": members[-1]["branch"] if members else "main",
+            "workstream_id": chunk["workstream_id"], "issue_id": child["id"],
+            "issue_number": child["number"], "issue_url": child["url"]})
+    manifest["publication"]["stack_id"] = 7 if len(members) > 1 else None
+    # Publishing every chunk later must still fit the parent index it admitted.
+    _parent_plan_body(manifest, issue)
+
+
+def test_capacity_bound_keeps_recorded_members_and_realistic_maxima(tmp_path):
+    from devflow_temporal.delivery_github_contract import encode_manifest
+    from devflow_temporal.delivery_github_plans import publication_capacity
+    from devflow_temporal.delivery_plan_model import ordered_chunks
+
+    remote, issue, registry, token = setup(tmp_path)
+    manifest = deepcopy(remote.initialize(issue, v2_plan(), registry, token)["manifest"])
+    unknown = publication_capacity(issue, manifest)
+    # A known trunk replaces the contract's 128-character bound for the first layer, and
+    # a run's SHA-1 width replaces the contract's 64-character head for each layer.
+    assert unknown["size"] - publication_capacity(issue, manifest, trunk="main")["size"] == 124
+    assert unknown["size"] - publication_capacity(issue, manifest, head_width=40)["size"] == 72
+    assert unknown["unpublished_chunks"] == 3 and unknown["current"] < unknown["size"]
+    members = manifest["publication"]["members"]
+    sizes = [unknown["size"]]
+    for index, chunk in enumerate(ordered_chunks(manifest["plan"])):
+        child = manifest["workstream_issues"][chunk["workstream_id"]]
+        members.append({
+            "chunk_id": chunk["id"], "number": 9000 + index,
+            "url": f"https://github.com/{issue['repository']}/pull/{9000 + index}",
+            "branch": "feat/df-" + digest(issue["id"])[:10] + "-" + chunk["id"],
+            "head": "a" * 40, "base_branch": members[-1]["branch"] if members else "main",
+            "workstream_id": chunk["workstream_id"], "issue_id": child["id"],
+            "issue_number": child["number"], "issue_url": child["url"]})
+        manifest["publication"]["stack_id"] = 7 if len(members) > 1 else None
+        sizes.append(publication_capacity(issue, manifest)["size"])
+        # Recorded heads set the width for the layers still to come.
+        assert sizes[-1] == publication_capacity(issue, manifest, head_width=40)["size"]
+    # Each recorded member replaces its reservation, so the bound only tightens.
+    assert sizes == sorted(sizes, reverse=True)
+    assert sizes[-1] == len(encode_manifest(manifest).encode())
+    assert publication_capacity(issue, manifest)["unpublished_chunks"] == 0

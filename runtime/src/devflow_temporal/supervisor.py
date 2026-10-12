@@ -129,6 +129,10 @@ class DeliverySupervisor:
         if spec.get("gate_retry_generation") in (1, 2) and request["role"] in {"review", "verify"}:
             identity["gate_retry_generation"] = spec["gate_retry_generation"]
             identity["gate_retry_stage"] = spec.get("gate_retry_stage")
+        if spec.get("gate_admission") and request["role"] in {"review", "verify"}:
+            identity["gate_admission"] = spec["gate_admission"]
+        if spec.get("implement_admission") and request["role"] == "implement":
+            identity["implement_admission"] = spec["implement_admission"]
         if generation:
             identity["attempt_generation"] = generation
         from .delivery_native_guard import revision_role_identity

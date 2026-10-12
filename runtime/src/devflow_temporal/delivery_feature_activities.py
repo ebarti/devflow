@@ -13,9 +13,10 @@ import time
 from pathlib import Path
 
 from temporalio import activity
+from temporalio.service import RPCError, RPCStatusCode
 
 from .contracts import digest
-from .delivery_broker import _git
+from .delivery_broker import BrokerReadbackUnavailable, _git
 from .delivery_execution_registry import OwnershipConflict
 from .delivery_feature_execution import (
     plan_for,
@@ -26,7 +27,7 @@ from .delivery_feature_execution import (
 )
 from .delivery_feature_pass import checkpoint_key
 from .delivery_feature_pass import checkpoints as current_checkpoints
-from .delivery_feature_publication import current_record, live_members
+from .delivery_feature_publication import current_record, live_members, observe_members
 from .delivery_github_contract import GitHubDelivery, ordered_chunks
 
 
@@ -73,12 +74,19 @@ def open_feature(spec):
             shared.checkpoint(token, "accepted-plan", {
                 "digest": digest(record["manifest"]["plan"]),
             })
-    live_members(spec, record, gh)
+    _, changes = observe_members(spec, record, gh)
     checkpoints = current_checkpoints(spec)
-    for member in record["manifest"]["publication"]["members"]:
+    members = record["manifest"]["publication"]["members"]
+    for member in members:
         proof = checkpoints.get("verified:" + member["chunk_id"])
         if proof and (proof["head"] != member["head"] or proof["number"] != member["number"]):
             raise OwnershipConflict("verified chunk no longer matches its recorded publication")
+    changed = next((index for index, change in enumerate(changes) if change), None)
+    if changed is not None:
+        # An owner-side change stops only its own layer, whose worker reports it;
+        # the layers above wait on it and the layers below stay verified.
+        for member in members[changed:]:
+            checkpoints.pop("verified:" + member["chunk_id"], None)
     return {"record": record, "checkpoints": checkpoints, "budget": shared.budget(issue["id"]),
             **({"spec": spec} if plan.get("version") == 2 else {})}
 
@@ -154,7 +162,13 @@ def reserve(spec, chunk_id, kind):
     )
     # Ensure the exact remote prerequisite object is available locally before
     # admitting a checkout. Never move the configured source working tree.
-    _git(Path(spec["source_path"]), "fetch", "--no-tags", "origin", branch)
+    try:
+        _git(Path(spec["source_path"]), "fetch", "--no-tags", "origin", branch)
+    except RuntimeError as exc:
+        # A failed remote query is infrastructure the coordinator may re-issue,
+        # never a verdict about the assignment.
+        raise BrokerReadbackUnavailable(
+            "stack prerequisite fetch failed: " + str(exc)[:300]) from exc
     if _git(Path(spec["source_path"]), "rev-parse", "FETCH_HEAD") != head:
         raise OwnershipConflict("stack prerequisite moved before worker admission")
     register_worker(store, spec, child)
@@ -198,9 +212,27 @@ async def delivery_feature_begin_integration(request):
     return await asyncio.to_thread(begin_integration, request["spec"], request["target"])
 
 
+def _paid_repair(shared, token, run_id, iteration):
+    """A worker cycle is paid by its own debit or by a revision's bound alias debit."""
+    key, reason = f"{run_id}:{iteration}", "Product repair at worker iteration " + str(iteration)
+    with shared.connect() as db:
+        shared.require(db, token)
+        paid = db.execute("SELECT reason FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+                          (token["issue_id"], key)).fetchone()
+        alias = db.execute(
+            "SELECT content_json FROM execution_checkpoints WHERE issue_id=? AND checkpoint_key=?",
+            (token["issue_id"], "plan-revision:repair-alias:" + key)).fetchone()
+        bound = json.loads(alias[0]) if alias else {}
+        debit = alias and db.execute(
+            "SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?",
+            (token["issue_id"], bound.get("repair_key"))).fetchone()
+    return (bool(paid) and paid["reason"] == reason) or bool(
+        debit and bound.get("reason") == reason and bound.get("generation") == token["generation"])
+
+
 def resume_worker(store, parent, child, row):
     from . import delivery_gate_retry as gates
-    from .delivery_stopped_resume import admit, pending_repair, snapshot
+    from .delivery_stopped_resume import admit, interrupted_resume, pending_repair, snapshot
 
     shared = registry(parent)
     token = parent["feature_delivery"]["owner"]
@@ -219,28 +251,38 @@ def resume_worker(store, parent, child, row):
     else:
         sealed = snapshot(store, child["run_id"])
         state = sealed["state"]
-        budget = shared.budget(token["issue_id"])
-        remaining = min(budget["maximum"] - budget["used"],
-                        child["policy"]["max_repairs"] - state["iteration"])
-        if remaining < 0 or (remaining == 0 and not pending_repair(sealed)):
-            raise OwnershipConflict("feature product repair limit exhausted")
-        if remaining == 0:
+        plan = interrupted_resume(sealed)
+        if plan:
+            # Interrupted work needs no repair cycle, whatever the feature budget holds.
+            remaining = plan["additional_iterations"]
+        else:
+            budget = shared.budget(token["issue_id"])
+            remaining = min(budget["maximum"] - budget["used"],
+                            child["policy"]["max_repairs"] - state["iteration"])
+            pending = pending_repair(sealed) if remaining == 0 else None
+            if remaining < 0 or (remaining == 0 and not pending):
+                raise OwnershipConflict(
+                    f"feature product repair limit exhausted: {budget['used']} of "
+                    f"{budget['maximum']} feature repair cycles used, worker iteration "
+                    f"{state['iteration']} of {child['policy']['max_repairs']}; continuing "
+                    "this worker needs a new repair cycle")
             # A zero-additional admission may only finish a cycle already charged
             # to this worker, including after another workstream used the balance.
-            with shared.connect() as db:
-                shared.require(db, token)
-                paid = db.execute(
-                    "SELECT reason FROM execution_repairs WHERE issue_id=? AND repair_key=?",
-                    (token["issue_id"], f"{child['run_id']}:{state['iteration']}"),
-                ).fetchone()
-            if not paid or paid["reason"] != (
-                    "Product repair at worker iteration " + str(state["iteration"])):
+            if remaining == 0 and not _paid_repair(shared, token, child["run_id"],
+                                                   state["iteration"]):
                 raise OwnershipConflict("pending repair has no matching product allowance debit")
         kind = "stopped_delivery_resume"
     candidate = sealed["candidate"]
+    closed = sealed["closed"]
     command = {
         "continuation_kind": kind,
-        "command_id": "feature-resume-" + digest({"owner": token, "run": child["run_id"]})[:24],
+        # One idempotent command per closed execution: an exact replay reuses it
+        # and a later closure of the same worker admits its own.
+        "command_id": "feature-resume-" + digest({
+            "owner": token, "run": child["run_id"],
+            "closed": {"workflow_id": closed["workflow_id"],
+                       "execution_run_id": closed["execution_run_id"]},
+        })[:24],
         "expected_revision": state["revision"],
         "expected_iteration": state["iteration"],
         "expected_candidate_id": candidate["id"],
@@ -456,7 +498,7 @@ def finish_worker(spec, child_id):
     if row["outcome"] == "delivered" and child["feature_worker"]["kind"] == "chunk":
         pr = json.loads(row["pr_json"])
         record = current_record(spec)
-        live_members(spec, record)
+        live_members(spec, record, through=child["feature_worker"]["chunk_id"])
         member = next(
             item
             for item in record["manifest"]["publication"]["members"]
@@ -509,16 +551,32 @@ async def delivery_feature_stop(request):
     return await asyncio.to_thread(stop_feature, request["spec"], request["checkpoint"])
 
 
+TRANSIENT_RPC_STATUSES = frozenset({
+    RPCStatusCode.UNAVAILABLE, RPCStatusCode.DEADLINE_EXCEEDED, RPCStatusCode.RESOURCE_EXHAUSTED,
+})
+
+
+class TemporalUnavailable(RuntimeError):
+    """The Temporal server could not answer an observation; the closure is unaffected."""
+
+
 @activity.defn(name="delivery_feature_worker_result")
 async def delivery_feature_worker_result(request):
     store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
     child_id = request["child_id"]
     with store._connect() as db:
         row = db.execute(
-            "SELECT outcome,workflow_id FROM delivery_runs WHERE run_id=?", (child_id,)
+            "SELECT outcome,workflow_id,phase,cleanup,error,checks_json FROM delivery_runs "
+            "WHERE run_id=?", (child_id,)
         ).fetchone()
     if not row or row["outcome"] is None:
         return {"closed": False}
+    checks = json.loads(row["checks_json"] or "{}")
+    # The coordinator decides a resume from this closure before finish_worker
+    # retires the registry assignment; a retired assignment cannot continue.
+    closure = {"outcome": row["outcome"], "phase": row["phase"], "cleanup": row["cleanup"],
+               "error": row["error"], "failure": checks.get("failure"),
+               "planning_defect": bool(checks.get("planning_defect"))}
     try:
         result = await asyncio.to_thread(
             store._completed_temporal_result,
@@ -532,7 +590,14 @@ async def delivery_feature_worker_result(request):
                     "continuation predecessor Temporal closure is unavailable")):
             raise
         return {"closed": False, "reason": "temporal_closure_pending"}
-    return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"])}
+    except RPCError as exc:
+        # Only an unreachable, overloaded or slow server is infrastructure the
+        # coordinator may re-issue; every other RPC status is a verdict.
+        if exc.status in TRANSIENT_RPC_STATUSES:
+            raise TemporalUnavailable(f"{exc.status.name}: {exc.message}"[:300]) from exc
+        raise
+    return {"closed": True, "outcome": result.get("result", {}).get("outcome", row["outcome"]),
+            "closure": closure}
 
 
 def _worker_wait_spec(request):
