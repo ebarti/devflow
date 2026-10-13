@@ -238,13 +238,11 @@ def trace_fixture_boundary(name, execute):
         return result
     return observed
 
-def check_profile(spec,checkout,folder,check,**kwargs):
-    return 'fixture',{'PATH':'/usr/bin:/bin'}
 def browser_profile(spec,checkout,folder,scratch,qa):
     profile=folder/'browser-qa.sb'
     profile.write_text('offline socket fixture\\n')
     return profile,{'PATH':'/usr/bin:/bin',**{k:str(v) for k,v in qa['ports'].items()}}
-delivery_sandbox.prepare_native_check=check_profile
+# Keep real preparation custody; only the offline launch transport is replaced.
 delivery_sandbox.native_check_argv=lambda spec,profile,cwd,argv: argv
 import devflow_temporal.delivery_browser_qa as browser
 browser.prepare_browser_qa=trace_fixture_boundary('browser-profile',browser_profile)
