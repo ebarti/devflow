@@ -22,7 +22,7 @@ def run_baseline_checks(broker: DeliveryBroker) -> dict:
     else:
         _git(broker.source, "worktree", "add", "--detach", str(path), spec["base_sha"])
     if resources:
-        resources.created(path)
+        resources.created(path, head=spec['base_sha'])
     candidate = candidate_for(path)
     if (candidate["head"] != spec["base_sha"]
             or _git(path, "status", "--porcelain", "--untracked-files=all")):

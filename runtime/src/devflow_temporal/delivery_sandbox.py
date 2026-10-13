@@ -691,9 +691,22 @@ def prepare_native_check(
         }
     )
     if trusted_local(spec) and check.get("kind") == "test":
-        artifacts = evidence_dir / check["id"] / "pytest-artifacts"
-        _private(artifacts)
-        env["PYTEST_ADDOPTS"] = "--basetemp=" + shlex.quote(str(artifacts))
+        artifacts = RunResources(spec).check_artifacts(
+            evidence_dir / check["id"] / "pytest-artifacts")
+        # pytest replaces its basetemp directory. Its fixture child may change
+        # inode; the registered disposable parent must keep exclusive custody.
+        option = "--basetemp=" + shlex.quote(str(artifacts / 'fixtures'))
+        from .delivery_resources import read_private
+
+        for name in ('native', 'native-retry'):
+            launch = artifacts.parent / name / 'launch.json'
+            if launch.exists():
+                prior = read_private(launch)['environment'].get('PYTEST_ADDOPTS')
+                if prior not in {option, "--basetemp=" + shlex.quote(str(artifacts))}:
+                    raise ValueError('retained check artifact environment changed')
+                option = prior
+                break
+        env["PYTEST_ADDOPTS"] = option
     if toolchain_roots:
         env["npm_config_nodedir"] = str(toolchain_roots[0])
     if cache:

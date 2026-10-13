@@ -427,6 +427,17 @@ class RunResources:
         valid = path == self.state / "transient" or path == short
         if kind == "execution-scratch":
             valid = path == self._execution_scratch_root()
+        if kind == "check-artifacts":
+            valid = False
+            for root in _gate_roots(self.spec)[1]:
+                if not path.is_relative_to(root):
+                    continue
+                relative = path.relative_to(root)
+                valid = (len(relative.parts) >= 3 and relative.parts[-1] == 'pytest-artifacts'
+                         and relative.parts[0] in {'checks', 'prechecks', 'baseline-checks',
+                                                   'implementation-preparation'})
+                if valid:
+                    break
         if kind == "checkout":
             valid = path == Path(self.spec["checkout"])
         elif kind == "gate":
@@ -440,7 +451,10 @@ class RunResources:
                               or (relative.parts == ("0", "baseline")
                                   and self.spec.get("baseline_checks_version") in (1, 2))))
         elif kind == "generated":
+            from .delivery_configured_resources import declared_generated_directories
+
             allowed_names = {
+                *declared_generated_directories(self.spec),
                 "node_modules",
                 *(self.spec["policy"].get("browser_qa") or {}).get("artifact_paths", []),
             }
@@ -454,6 +468,20 @@ class RunResources:
                 if entry["kind"] not in {"checkout", "gate"}:
                     continue
                 names = set(allowed_names)
+                if (path.name == 'node_modules' and path.is_relative_to(root)
+                        and path.parent != root):
+                    from .delivery_configured_resources import workspace_dependency_directories
+
+                    relative = path.relative_to(root).as_posix()
+                    retained = ownership.get(str(path), {})
+                    if root.exists():
+                        authority = workspace_dependency_directories(root).get(relative)
+                        if retained.get('workspace_declaration_sha256', authority) != authority:
+                            raise ValueError('generated workspace declaration changed')
+                    else:
+                        authority = retained.get('workspace_declaration_sha256')
+                    if authority:
+                        names.add(relative)
                 if (path.name == '.venv' and path.is_relative_to(root)
                         and self.spec['policy'].get('host_sandbox') == 'trusted-local'):
                     from .delivery_configured_resources import (
@@ -510,6 +538,16 @@ class RunResources:
                     and _identity(path) != old["identity"]
                 ):
                     raise ValueError("registered resource root was replaced")
+                missing_scratch = (kind == 'execution-scratch' and old.get('identity')
+                                   and not os.path.lexists(path))
+                if missing_scratch and old.get('receipt', {}).get('state') not in {
+                        'removed', 'already_absent'}:
+                    # Temp-file deletion cannot invalidate resumable durable state.
+                    # A new generation is allowed only after the old actors and
+                    # their launch leases are gone, never for candidate/session data.
+                    with self._closed_journals(manifest, manifest['processes']):
+                        old['receipt'] = {'path': str(path), 'kind': kind,
+                                          'state': 'already_absent', 'external_removal': True}
                 if (
                     kind != "checkout"
                     and not os.path.lexists(path)
@@ -519,6 +557,7 @@ class RunResources:
                         identity=None, state="allocated", generation=old.get("generation", 0) + 1
                     )
                     old.pop("receipt", None)
+                    old.pop('head', None)
                     write_private(self.manifest, manifest)
                 return
             if os.path.lexists(path):
@@ -536,15 +575,34 @@ class RunResources:
                            else 'accepted_plan_sha256')
                 manifest['roots'][str(path)][binding] = configured or digest(
                     self.spec['accepted_plan'])
+            if kind == 'generated' and path.name == 'node_modules':
+                from .delivery_configured_resources import workspace_dependency_directories
+
+                for root, entry in manifest['roots'].items():
+                    parent = Path(root)
+                    if (entry['kind'] in {'checkout', 'gate'} and path.is_relative_to(parent)
+                            and path.parent != parent):
+                        manifest['roots'][str(path)]['workspace_declaration_sha256'] = (
+                            workspace_dependency_directories(parent)[path.relative_to(
+                                parent).as_posix()])
+                        break
             write_private(self.manifest, manifest)
 
-    def created(self, path: Path) -> None:
+    def created(self, path: Path, *, head: str | None = None) -> None:
         with self.locked() as manifest:
             entry = manifest["roots"][str(path)]
             identity = _identity(path)
             if entry.get("identity") not in (None, identity):
                 raise ValueError("resource identity changed after allocation")
             entry.update(identity=identity, state="created")
+            if head is not None:
+                observed = subprocess.check_output(
+                    ['git', '-c', 'core.fsmonitor=false', '-C', str(path), 'rev-parse', 'HEAD'],
+                    text=True, timeout=30).strip()
+                if (entry['kind'] != 'gate' or observed != head
+                        or entry.get('head', head) != head):
+                    raise ValueError('gate creation lost its authenticated candidate head')
+                entry['head'] = head
             entry.pop("receipt", None)
             write_private(self.manifest, manifest)
 
@@ -596,6 +654,158 @@ class RunResources:
             self.created(path)
         return path
 
+    @contextmanager
+    def _closed_journals(self, manifest: dict, paths, *, unstarted=()):
+        """Hold the original native leases while observing exact process closure."""
+        from .delivery_native_process import (
+            launch_binding,
+            listeners,
+            lost_monitor_without_provider,
+            process_table,
+        )
+
+        descriptors, receipts = [], []
+        execution_specs = {}
+        _gate_roots(self.spec, execution_specs=execution_specs)
+        try:
+            for folder in unstarted:
+                journal = folder / 'native-process.json'
+                if os.path.lexists(journal):
+                    if str(journal) not in manifest['processes']:
+                        raise ValueError('native check journal has no registered ownership')
+                    continue
+                _ancestors(folder, allow_missing=True)
+                if folder.is_symlink() or os.path.lexists(folder / 'launch.json'):
+                    raise ValueError('unjournaled native launch is unconfirmed')
+                for name in ('native-monitor.lock', 'native-process.lock'):
+                    lock_path = folder / name
+                    if not os.path.lexists(lock_path):
+                        continue
+                    descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+                    descriptors.append(descriptor)
+                    info = os.fstat(descriptor)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                            or info.st_ino != lock_path.lstat().st_ino):
+                        raise ValueError('unjournaled native launch lease changed')
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for raw in paths:
+                path = Path(raw)
+                if (str(path) not in manifest['processes'] or path.resolve(strict=True) != path
+                        or not path.is_relative_to(self.state)):
+                    raise ValueError('disposable output lost its registered native journal')
+                value = read_private(path)
+                execution = execution_specs[max(
+                    (root for root in execution_specs if path.is_relative_to(root)),
+                    key=lambda root: len(root.parts))]
+                expected_digest = ((execution.get('preparation') or {}).get(
+                    'measured_policy_digest')
+                    if path.is_relative_to(self.state / 'native-preparation')
+                    else execution['policy_digest']) or execution['policy_digest']
+                intent = value['intent']
+                launch = launch_binding(path.parent, value)
+                if (intent['run_id'] != self.spec['run_id']
+                        or intent['policy_digest'] != expected_digest
+                        or intent['ports'] != value.get('ports')
+                        or (launch is not None and (
+                            intent['argv'] != launch['argv']
+                            or intent['environment_sha256'] != digest(launch['environment'])))
+                        or value.get('phase') != 'finished'
+                        or (value.get('monitoring_complete') is not True
+                            and not lost_monitor_without_provider(value, role_attempt=(
+                                path.parent.parent == self.state / 'attempts')))):
+                    raise ValueError('registered native process closure is unconfirmed')
+                for name in ('native-monitor.lock', 'native-process.lock'):
+                    lock_path = path.with_name(name)
+                    descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+                    descriptors.append(descriptor)
+                    info = os.fstat(descriptor)
+                    identity = {'device': info.st_dev, 'inode': info.st_ino, 'uid': info.st_uid}
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                            or info.st_ino != lock_path.lstat().st_ino
+                            or (value.get('lifecycle_locks') is not None
+                                and value['lifecycle_locks'].get(name) != identity)):
+                        raise ValueError('native launch lease identity changed')
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if path.parent.parent == self.state / 'attempts':
+                    owner = self.state / 'attempt-owners' / path.parent.name
+                    if owner.exists() or owner.is_symlink():
+                        descriptor = os.open(owner, os.O_RDONLY | os.O_NOFOLLOW)
+                        descriptors.append(descriptor)
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                table = process_table()
+                actors = {int(pid): actor for pid, actor in value.get('owned', {}).items()}
+                monitor = value.get('monitor')
+                if not monitor or not actors:
+                    raise ValueError('registered native process identities are incomplete')
+                actors[monitor['pid']] = monitor
+                if (any(table.get(pid, {}).get('identity') == actor['identity']
+                        and not table[pid]['stat'].startswith('Z') for pid, actor in actors.items())
+                        or any(listeners(port) for port in value.get('ports', []))
+                        or digest(read_private(path)) != digest(value)):
+                    raise ValueError('registered native processes or ports remain active')
+                receipts.append({'journal': str(path),
+                                 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+            yield receipts
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def check_artifacts(self, path: Path) -> Path:
+        self._allowed(path, 'check-artifacts', finalizing=True)
+        # Finished check reattachment must keep the original environment but
+        # never rebuild a removed basetemp or duplicate compact evidence.
+        if not os.path.lexists(path) and (os.path.lexists(path.parent / 'artifacts.json') or any(
+                journal.exists() and read_private(journal).get('phase') == 'finished'
+                for journal in (path.parent / name / 'native-process.json'
+                                for name in ('native', 'native-retry')))):
+            return path
+        private_directory(path.parent)
+        self.register(path, 'check-artifacts')
+        if not path.exists():
+            path.mkdir(mode=0o700)
+        self.created(path)
+        return path
+
+    def _dispose_check_artifacts(self, path, entry, manifest, journals):
+        if set(map(str, journals)) != {raw for raw in manifest['processes'] if Path(raw) in {
+                path.parent / name / 'native-process.json' for name in ('native', 'native-retry')}}:
+            raise ValueError('disposable check output lost an original native journal')
+        with self._closed_journals(manifest, journals, unstarted=[
+                path.parent / name for name in ('native', 'native-retry')]) as observed:
+            if not os.path.lexists(path):
+                return {'path': str(path), 'kind': entry['kind'], 'state': 'already_absent',
+                        'processes': observed}
+            if entry['identity'] is None or _identity(path) != entry['identity']:
+                raise ValueError('disposable check artifact root was replaced')
+            if Path('/usr/sbin/lsof').is_file():
+                users = subprocess.run(['/usr/sbin/lsof', '-nP', '-F', 'p', '+D', str(path)],
+                                       text=True, capture_output=True, timeout=30)
+                if users.returncode not in (0, 1) or any(line.startswith('p')
+                        and line[1:].isdecimal() for line in users.stdout.splitlines()):
+                    raise ValueError('disposable check artifact root has a live holder')
+            entry['state'] = 'removing'
+            write_private(self.manifest, manifest)
+            remove_directory(path, entry['identity'])
+            return {'path': str(path), 'kind': entry['kind'], 'state': 'removed',
+                    'processes': observed}
+
+    def cleanup_check_artifacts(self, path: Path, journals) -> dict:
+        self._allowed(path, 'check-artifacts', finalizing=True)
+        with self.locked() as manifest:
+            entry = manifest['roots'].get(str(path))
+            if entry is None or entry['kind'] != 'check-artifacts':
+                raise ValueError('disposable check artifact root has no ownership')
+            try:
+                receipt = self._dispose_check_artifacts(path, entry, manifest, journals)
+            except (OSError, ValueError) as exc:
+                receipt = {'path': str(path), 'kind': entry['kind'], 'state': 'failed_unknown',
+                           'reason': str(exc)[:300]}
+            entry['receipt'] = receipt
+            write_private(self.manifest, manifest)
+            return receipt
+
     def process(self, journal: Path) -> None:
         if not journal.is_relative_to(self.state) or journal.is_symlink():
             raise ValueError("process journal left its run")
@@ -633,6 +843,11 @@ class RunResources:
                         )
                     elif entry["identity"] is None or _identity(path) != entry["identity"]:
                         raise ValueError("resource creation or replacement has no proven ownership")
+                    elif entry['kind'] == 'check-artifacts':
+                        journals = [raw for raw in manifest['processes'] if Path(raw) in {
+                            path.parent / name / 'native-process.json'
+                            for name in ('native', 'native-retry')}]
+                        receipt = self._dispose_check_artifacts(path, entry, manifest, journals)
                     elif entry["kind"] in {"checkout", "gate"}:
                         reason = self._retain_source(path, entry["kind"], outcome)
                         if reason:
@@ -704,9 +919,6 @@ class RunResources:
             }
 
     def _retain_source(self, path: Path, kind: str, outcome: str) -> str | None:
-        if kind == "gate" and not path.is_relative_to(_gate_evidence_root(self.spec) / "gates"):
-            return "historical gate checkout and candidate evidence are preserved"
-
         def git(*args):
             return subprocess.check_output(
                 ["git", "--no-optional-locks", "-C", str(path), *args], text=True, timeout=30
@@ -735,6 +947,17 @@ class RunResources:
             ):
                 return "a live process still uses the candidate worktree"
         if kind == "gate":
+            recorded = read_private(self.manifest)['roots'][str(path)].get('head')
+            head = git('rev-parse', 'HEAD')
+            if recorded:
+                if head != recorded:
+                    return 'changed committed gate source is preserved'
+            candidate = Path(self.spec['checkout'])
+            if (not candidate.is_dir() or candidate.resolve() != candidate
+                    or subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(candidate),
+                        'merge-base', '--is-ancestor', head, 'HEAD'],
+                        capture_output=True, timeout=30).returncode != 0):
+                return 'gate committed source has no preserved candidate proof'
             return None
         if outcome == "blocked":
             return "blocked-run candidate and recovery source are preserved"

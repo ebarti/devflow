@@ -102,6 +102,12 @@ def test_actual_broker_enforces_delegated_report_and_retains_it_after_cleanup(
     assert report['junit']['tests'] == 1
     assert report['junit']['skipped'] == (1 if outcome == 'skip' else 0)
     assert report['artifacts']['count'] == 1
+    raw = Path(report['artifacts']['path']).parent / 'pytest-artifacts'
+    assert not raw.exists()
+    repeated = broker.run_checks(0, candidate)
+    assert repeated['state'] == result['state']
+    assert repeated['results'][-1]['artifacts'] == report['artifacts']
+    assert not raw.exists()
     if outcome == 'fail':
         assert report['evidence_failure'] == 'required JUnit report records failed test cases'
     store.project(spec['run_id'], phase='blocked', execution_state='blocked', event_type='blocked',
