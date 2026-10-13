@@ -122,6 +122,17 @@ async def completed_parent(service, monkeypatch, request):
                     'resource_cleanup': receipt}))
     child_state = {**state, 'run_id': child['run_id'], 'revision': 1, 'cleanup': 'confirmed',
                    'checks': {}, 'error': None}
+    if drift == 'divergent-counters':
+        # A retained recovery carries its execution's counter. Ordinary row
+        # projections keep their own count across earlier candidate snapshots.
+        candidate = {'id': 'retained-candidate', 'base_sha': child['base_sha'],
+                     'head': child['base_sha'], 'content_sha256': 'a' * 64,
+                     'environment_digest': 'b' * 64, 'policy_digest': child['policy_digest']}
+        for number in range(13):
+            store.project(child['run_id'], phase='preparing', execution_state='running',
+                candidate={**candidate, 'id': str(number) if number < 12 else candidate['id']},
+                event_type='candidate', message='Retained candidate projection')
+        child_state.update(candidate=candidate, candidate_revision=9)
     child_history = await _history(store, child, child_state)
     if drift == 'child-memo':
         child_history.events[0].workflow_execution_started_event_attributes.memo.fields[
@@ -162,12 +173,21 @@ async def completed_parent(service, monkeypatch, request):
     return store, parent, child, shared, token, command, history, closed
 
 
+@pytest.mark.parametrize('completed_parent', [None, 'divergent-counters'], indirect=True)
 async def test_completed_parent_continuation_retains_history_and_exhausted_budget(completed_parent):
     store, parent, child, shared, token, command, history, closed = completed_parent
     budget = shared.budget(token['issue_id'])
     assert budget['used'] == budget['maximum'] == 10
     assert closure.closed_settlement(store, parent['run_id'])['result'] == closed['result']
     assert detail(store, parent)['can_continue']
+    child_closed = closure.closed_worker(store, child['run_id'],
+                                        store.active_workflow_id(child['run_id']))
+    with store._connect() as db:
+        child_row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                                    (child['run_id'],)).fetchone())
+    assert json.loads(child_row['candidate_json'] or 'null') == child_closed['result']['candidate']
+    assert child_closed['result']['candidate_revision'] == (9 if child_row['candidate_json'] else 0)
+    assert child_row['candidate_revision'] == (13 if child_row['candidate_json'] else 0)
     before = store.submitted_spec(child['run_id'])
     result = continue_feature(store, parent['run_id'], command)
     successor = store.effective_spec(result['run_id'])
@@ -192,8 +212,10 @@ async def test_completed_parent_continuation_retains_history_and_exhausted_budge
     assert worker['state'] == 'finished'
     with store._connect() as db:
         assert db.execute('SELECT COUNT(*) FROM delivery_attempts').fetchone()[0] == 0
-        assert db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
-                          (child['run_id'],)).fetchone()[0] is None
+        current_child = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                                        (child['run_id'],)).fetchone())
+        assert current_child == child_row
+        assert current_child['recovery_json'] is None
 
 
 @pytest.mark.parametrize('changed', ['start', 'memo', 'result', 'failure', 'settlement-spec',
@@ -236,8 +258,7 @@ async def test_completed_settlement_refuses_unbound_history(completed_parent, ch
 
 
 @pytest.mark.parametrize('changed', ['child-live', 'cleanup', 'attempt', 'effect', 'assignment',
-                                   'generation', 'workflow', 'plan', 'candidate',
-                                   'candidate-revision', 'maintenance'])
+                                   'generation', 'workflow', 'plan', 'candidate', 'maintenance'])
 async def test_completed_parent_continuation_refuses_changed_custody(
     completed_parent, monkeypatch, changed,
 ):
@@ -282,9 +303,6 @@ async def test_completed_parent_continuation_refuses_changed_custody(
             elif changed == 'workflow':
                 db.execute('UPDATE delivery_runs SET workflow_id=? WHERE run_id=?',
                            ('different-worker-workflow', child['run_id']))
-            elif changed == 'candidate-revision':
-                db.execute('UPDATE delivery_runs SET candidate_revision=candidate_revision+1 '
-                           'WHERE run_id=?', (parent['run_id'],))
             elif changed == 'candidate':
                 db.execute('UPDATE delivery_runs SET candidate_json=? WHERE run_id=?',
                            (json.dumps({'id': 'changed'}), parent['run_id']))
@@ -298,6 +316,30 @@ async def test_completed_parent_continuation_refuses_changed_custody(
     assert shared.current(token['issue_id'])['state'] == 'active'
     assert shared.budget(token['issue_id'])['used'] == 10
     assert 'stopped:' + str(token['generation']) not in shared.checkpoints(token['issue_id'])
+
+
+async def test_completed_worker_refuses_current_counter_drift_during_readback(
+    completed_parent, monkeypatch,
+):
+    store, parent, child, shared, token, command, _, _ = completed_parent
+    original = closure.completed_worker
+
+    async def completed(*args):
+        proof = await original(*args)
+        with store._connect() as db:
+            db.execute('UPDATE delivery_runs SET candidate_revision=candidate_revision+1 '
+                       'WHERE run_id=?', (child['run_id'],))
+        return proof
+
+    monkeypatch.setattr(closure, 'completed_worker', completed)
+    with pytest.raises(ValueError, match='checkpoint changed during closure readback'):
+        continue_feature(store, parent['run_id'], command)
+    assert shared.current(token['issue_id'])['state'] == 'active'
+    assert shared.budget(token['issue_id'])['used'] == 10
+    assert 'stopped:' + str(token['generation']) not in shared.checkpoints(token['issue_id'])
+    with shared.connect() as db:
+        assert db.execute('SELECT state FROM execution_workers WHERE worker_key=?',
+                          (worker_key(child['run_id'], token),)).fetchone()[0] == 'reserved'
 
 
 async def test_completed_settlement_replays_after_worker_receipt_before_stop(

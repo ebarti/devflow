@@ -223,10 +223,10 @@ def namespace(recovery):
     return 'stopped-resumes/' + recovery['command_digest']
 
 
-def custody(db, recovery):
+def custody(db, recovery, *, retained_memo=None):
     from .delivery_feature_revision_recovery import retained_recovery
 
-    details = retained_recovery(recovery)
+    details = retained_recovery(recovery, memo=retained_memo)
     spec = details['execution_spec']
     # Revision admissions record their own gate resume; any other resume
     # position comes from an interrupted worker's re-derivable plan.

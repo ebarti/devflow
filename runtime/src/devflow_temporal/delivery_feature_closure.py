@@ -150,10 +150,11 @@ def _completed_row(store, spec, row, closed, projections):
 
     state = closed['result']
     expected = {**state, 'protocol_revision': state['revision']}
-    if (any(row[key] != spec.get(key) for key in
-            ('run_id', 'request_digest', 'work_id', 'issue_url', 'repository_key'))
-            or row['candidate_revision'] != state.get('candidate_revision')):
-        raise ValueError('closed feature immutable row or candidate revision changed')
+    if any(row[key] != spec.get(key) for key in
+           ('run_id', 'request_digest', 'work_id', 'issue_url', 'repository_key')):
+        raise ValueError('closed feature immutable row changed')
+    # Recovery retains the workflow's candidate counter; the store counts its
+    # own projections. The canonical candidate below binds these two histories.
     if row['cleanup'] != 'confirmed':
         raise ValueError('closed feature cleanup remains unconfirmed')
     if _same_row(row, expected):

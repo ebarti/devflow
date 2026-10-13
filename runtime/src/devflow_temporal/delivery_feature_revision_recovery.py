@@ -336,7 +336,7 @@ def compact_recovery(recovery, root):
     return result
 
 
-def retained_recovery(recovery):
+def retained_recovery(recovery, *, memo=None):
     """Hydrate only for local custody checks; never send the retained history again."""
     if not recovery or recovery.get("custody_version") != 1:
         return recovery
@@ -349,13 +349,15 @@ def retained_recovery(recovery):
     expected = Path(spec["state_dir"]) / namespace(recovery) / "revision-worker-custody.json"
     if path != expected or path.resolve(strict=True) != path:
         raise ValueError("revision worker custody reference escaped its sealed namespace")
-    value = read_private(path)
-    content = path.read_bytes()
-    if (
-        hashlib.sha256(content).hexdigest() != reference.get("sha256")
-        or json.loads(content) != value
-    ):
+    content = read_private(path, raw=True)
+    if (hashlib.sha256(content).hexdigest() != reference.get("sha256")
+            or read_private(path, raw=True) != content):
         raise ValueError("retained revision worker custody bytes changed")
+    if memo is not None and path in memo and memo[path][0] == recovery:
+        # The envelope and freshly authenticated bytes are exact. Give each
+        # caller its own value so mutation cannot change later cached authority.
+        return deepcopy(memo[path][1])
+    value = json.loads(content)
     if (
         any(
             recovery.get(key) != value.get(key)
@@ -376,6 +378,8 @@ def retained_recovery(recovery):
         or compact_recovery_view(value, path) != recovery
     ):
         raise ValueError("revision worker envelope differs from its immutable custody")
+    if memo is not None:
+        memo[path] = (deepcopy(recovery), deepcopy(value))
     return value
 
 
