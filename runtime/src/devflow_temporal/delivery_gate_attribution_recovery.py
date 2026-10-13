@@ -79,6 +79,16 @@ def _gate_ancestor(store, transport):
         saved = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
                            (transport['execution_spec']['run_id'],)).fetchone()
     prior = json.loads(saved[0]) if saved else None
+    if prior and prior.get('execution_spec', {}).get('gate_retry_preflight_generation'):
+        path = Path(prior['execution_spec']['state_dir']) / gate_namespace(
+            prior['execution_spec']['gate_retry_generation'],
+            prior['execution_spec'].get('gate_retry_stage'), preflight_generation=1)
+        if (prior['execution_spec']['gate_retry_preflight_generation'] != 1
+                or read_private(path / 'admission.json') != prior
+                or prior.get('seal', {}).get('preflight_continuation', {}).get('recovery_digest')
+                != digest(prior.get('original_recovery'))):
+            raise ValueError('attribution readback lost its owned preflight continuation')
+        prior = prior['original_recovery']
     if (prior and prior.get('kind') == KIND and prior.get('original_recovery') == transport
             and prior.get('execution_spec', {}).get('gate_retry_stage') == 'published'
             and prior['execution_spec'].get('gate_retry_generation') == 2

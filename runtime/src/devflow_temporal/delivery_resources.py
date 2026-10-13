@@ -160,119 +160,132 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None) -> tuple[Pat
                 bind(state / namespace / 'evidence', recovery['execution_spec'])
                 first = False
                 recovery = recovery.get('original_recovery')
-            while recovery and recovery.get('kind') in {
-                'terminal_tracker_recovery', 'repair_continuation',
-                'investigation_assessment_adjudication', 'stopped_resource_closure',
-                'stopped_delivery_resume',
-            }:
-                if recovery.get('kind') == 'stopped_delivery_resume':
-                    from .delivery_feature_revision_recovery import retained_recovery
-                    from .delivery_stopped_resume import custody
-                    from .delivery_stopped_resume import namespace as resume_namespace
+            while recovery:
+                previous = recovery
+                while recovery and recovery.get('kind') in {
+                    'terminal_tracker_recovery', 'repair_continuation',
+                    'investigation_assessment_adjudication', 'stopped_resource_closure',
+                    'stopped_delivery_resume',
+                }:
+                    if recovery.get('kind') == 'stopped_delivery_resume':
+                        from .delivery_feature_revision_recovery import retained_recovery
+                        from .delivery_stopped_resume import custody
+                        from .delivery_stopped_resume import namespace as resume_namespace
 
-                    custody(db, recovery)
-                    # Compact revision transports retain their predecessor chain
-                    # in authenticated custody, not in the workflow envelope.
-                    recovery = retained_recovery(recovery)
-                    if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
-                        raise ValueError('stopped resume execution authority changed')
-                    admitted = resume_namespace(recovery)
-                    roots.add(state / admitted / 'evidence')
-                    bind(state / admitted / 'evidence', recovery['execution_spec'])
+                        custody(db, recovery)
+                        # Compact revision transports retain their predecessor chain
+                        # in authenticated custody, not in the workflow envelope.
+                        recovery = retained_recovery(recovery)
+                        if (first and canonical_json(recovery['execution_spec'])
+                                != canonical_json(spec)):
+                            raise ValueError('stopped resume execution authority changed')
+                        admitted = resume_namespace(recovery)
+                        roots.add(state / admitted / 'evidence')
+                        bind(state / admitted / 'evidence', recovery['execution_spec'])
+                        if first:
+                            namespace = admitted
+                        first = False
+                    if recovery.get('kind') == 'repair_continuation' and recovery.get(
+                            'finalized_checkpoint'):
+                        from .delivery_gate_retry import effective_repair
+
+                        effective_repair(None, recovery, db=db)
+                        if (first and canonical_json(recovery['execution_spec'])
+                                != canonical_json(spec)):
+                            raise ValueError('finalized repair execution authority changed')
+                        if first:
+                            namespace = 'repair-continuation'
+                        roots.add(state / 'repair-continuation' / 'evidence')
+                        bind(state / 'repair-continuation' / 'evidence', recovery['execution_spec'])
+                        first = False
+                    if recovery.get('kind') == 'stopped_resource_closure':
+                        from .delivery_resource_closure import custody
+
+                        custody(db, recovery)
+                        if (first and canonical_json(recovery['execution_spec'])
+                                != canonical_json(spec)):
+                            raise ValueError('resource closure current execution authority changed')
+                        if first:
+                            namespace = 'resource-closure'
+                        roots.add(state / 'resource-closure' / 'evidence')
+                        bind(state / 'resource-closure' / 'evidence', recovery['execution_spec'])
+                        first = False
+                    if recovery.get('kind') == 'investigation_assessment_adjudication':
+                        from .delivery_investigation_adjudication import custody
+
+                        custody(db, recovery)
+                    recovery = recovery.get('original_recovery')
+                while recovery and recovery.get('kind') in {
+                    'published_metadata_recovery', 'investigation_gates_only',
+                    'accepted_technical_successor', 'published_gate_retry',
+                    'prepublication_gate_retry',
+                    'pending_publication_retry',
+                    'published_check_prelaunch_retry', 'published_ci_retry',
+                    'published_controller_retry',
+                    'repair_continuation',
+                }:
+                    if (first and canonical_json(recovery.get('execution_spec'))
+                            != canonical_json(spec)):
+                        raise ValueError('gate namespace execution authority changed')
+                    if recovery['kind'] == 'repair_continuation':
+                        from .delivery_gate_retry import effective_repair
+
+                        if not recovery.get('finalized_checkpoint'):
+                            raise ValueError('historical repair checkpoint is not finalized')
+                        effective_repair(None, recovery, db=db)
+                        admitted_namespace = 'repair-continuation'
+                    elif recovery['kind'] == 'pending_publication_retry':
+                        admitted_namespace = 'publication-retry'
+                        if (canonical_json(read_private(
+                                state / admitted_namespace / 'admission.json'))
+                                != canonical_json(recovery)):
+                            raise ValueError('historical publication admission changed')
+                    elif recovery['kind'] == 'accepted_technical_successor':
+                        from .delivery_technical_continuation import namespace_custody
+
+                        admitted_namespace = 'technical-successor'
+                        namespace_custody(db, recovery['execution_spec'], recovery)
+                    elif recovery['kind'] == 'published_metadata_recovery':
+                        admitted_namespace = 'metadata-reconciliation'
+                        _ancestors(state / admitted_namespace / 'intent.json')
+                        intent = read_private(state / admitted_namespace / 'intent.json')
+                        admitted = db.execute(
+                            'SELECT grant_json,state FROM delivery_metadata_recoveries '
+                            'WHERE run_id=?',
+                            (spec['run_id'],),
+                        ).fetchone()
+                        if (not admitted or admitted[1] != 'queued'
+                                or canonical_json(json.loads(admitted[0])) != canonical_json(intent)
+                                or digest(intent) != recovery.get('grant_digest')
+                                or any(canonical_json(recovery.get(key)) != canonical_json(value)
+                                       for key, value in intent.items())):
+                            raise ValueError('gate namespace metadata admission changed')
+                    else:
+                        from .delivery_gate_retry import gate_namespace
+
+                        admitted_namespace = gate_namespace(
+                            recovery['execution_spec'].get('gate_retry_generation', 1),
+                            recovery['execution_spec'].get('gate_retry_stage'),
+                            preflight_generation=recovery['execution_spec'].get(
+                                'gate_retry_preflight_generation', 0))
+                        _ancestors(state / admitted_namespace / 'admission.json')
+                        admission = read_private(state / admitted_namespace / 'admission.json')
+                        admitted = db.execute(
+                            'SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
+                            (spec['run_id'],),
+                        ).fetchone()
+                        if (not admitted or canonical_json(admission) != canonical_json(recovery)
+                                or (first and canonical_json(json.loads(admitted[0]))
+                                    != canonical_json(recovery))):
+                            raise ValueError('gate namespace gates-only admission changed')
+                    roots.add(state / admitted_namespace / 'evidence')
+                    bind(state / admitted_namespace / 'evidence', recovery['execution_spec'])
                     if first:
-                        namespace = admitted
+                        namespace = admitted_namespace
                     first = False
-                if recovery.get('kind') == 'repair_continuation' and recovery.get(
-                        'finalized_checkpoint'):
-                    from .delivery_gate_retry import effective_repair
-
-                    effective_repair(None, recovery, db=db)
-                    if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
-                        raise ValueError('finalized repair execution authority changed')
-                    if first:
-                        namespace = 'repair-continuation'
-                    roots.add(state / 'repair-continuation' / 'evidence')
-                    bind(state / 'repair-continuation' / 'evidence', recovery['execution_spec'])
-                    first = False
-                if recovery.get('kind') == 'stopped_resource_closure':
-                    from .delivery_resource_closure import custody
-
-                    custody(db, recovery)
-                    if first and canonical_json(recovery['execution_spec']) != canonical_json(spec):
-                        raise ValueError('resource closure current execution authority changed')
-                    if first:
-                        namespace = 'resource-closure'
-                    roots.add(state / 'resource-closure' / 'evidence')
-                    bind(state / 'resource-closure' / 'evidence', recovery['execution_spec'])
-                    first = False
-                if recovery.get('kind') == 'investigation_assessment_adjudication':
-                    from .delivery_investigation_adjudication import custody
-
-                    custody(db, recovery)
-                recovery = recovery.get('original_recovery')
-            while recovery and recovery.get('kind') in {
-                'published_metadata_recovery', 'investigation_gates_only',
-                'accepted_technical_successor', 'published_gate_retry', 'prepublication_gate_retry',
-                'pending_publication_retry',
-                'published_check_prelaunch_retry', 'published_ci_retry',
-                'published_controller_retry',
-                'repair_continuation',
-            }:
-                if first and canonical_json(recovery.get('execution_spec')) != canonical_json(spec):
-                    raise ValueError('gate namespace execution authority changed')
-                if recovery['kind'] == 'repair_continuation':
-                    from .delivery_gate_retry import effective_repair
-
-                    if not recovery.get('finalized_checkpoint'):
-                        raise ValueError('historical repair checkpoint is not finalized')
-                    effective_repair(None, recovery, db=db)
-                    admitted_namespace = 'repair-continuation'
-                elif recovery['kind'] == 'pending_publication_retry':
-                    admitted_namespace = 'publication-retry'
-                    if canonical_json(read_private(state / admitted_namespace / 'admission.json')) \
-                            != canonical_json(recovery):
-                        raise ValueError('historical publication admission changed')
-                elif recovery['kind'] == 'accepted_technical_successor':
-                    from .delivery_technical_continuation import namespace_custody
-
-                    admitted_namespace = 'technical-successor'
-                    namespace_custody(db, recovery['execution_spec'], recovery)
-                elif recovery['kind'] == 'published_metadata_recovery':
-                    admitted_namespace = 'metadata-reconciliation'
-                    _ancestors(state / admitted_namespace / 'intent.json')
-                    intent = read_private(state / admitted_namespace / 'intent.json')
-                    admitted = db.execute(
-                        'SELECT grant_json,state FROM delivery_metadata_recoveries WHERE run_id=?',
-                        (spec['run_id'],),
-                    ).fetchone()
-                    if (not admitted or admitted[1] != 'queued'
-                            or canonical_json(json.loads(admitted[0])) != canonical_json(intent)
-                            or digest(intent) != recovery.get('grant_digest')
-                            or any(canonical_json(recovery.get(key)) != canonical_json(value)
-                                   for key, value in intent.items())):
-                        raise ValueError('gate namespace metadata admission changed')
-                else:
-                    from .delivery_gate_retry import gate_namespace
-
-                    admitted_namespace = gate_namespace(
-                        recovery['execution_spec'].get('gate_retry_generation', 1),
-                        recovery['execution_spec'].get('gate_retry_stage'))
-                    _ancestors(state / admitted_namespace / 'admission.json')
-                    admission = read_private(state / admitted_namespace / 'admission.json')
-                    admitted = db.execute(
-                        'SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
-                        (spec['run_id'],),
-                    ).fetchone()
-                    if (not admitted or canonical_json(admission) != canonical_json(recovery)
-                            or (first and canonical_json(json.loads(admitted[0]))
-                                != canonical_json(recovery))):
-                        raise ValueError('gate namespace gates-only admission changed')
-                roots.add(state / admitted_namespace / 'evidence')
-                bind(state / admitted_namespace / 'evidence', recovery['execution_spec'])
-                if first:
-                    namespace = admitted_namespace
-                first = False
-                recovery = recovery.get('original_recovery')
+                    recovery = recovery.get('original_recovery')
+                if recovery is previous:
+                    break
     root = state / namespace / 'evidence' if namespace else state
     _ancestors(root, allow_missing=True)
     for path in (state, *((state / namespace, root) if namespace else ())):

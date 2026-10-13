@@ -159,6 +159,11 @@ def snapshot(store, run_id, kind=KIND):
     closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    from .delivery_gate_preflight_continuation import possible
+    from .delivery_gate_preflight_continuation import snapshot as preflight_snapshot
+
+    if kind == KIND and possible(row):
+        return preflight_snapshot(store, spec, row, attempts, effects, closed)
     ci_only = kind == CI_KIND
     controller_only = kind == CONTROLLER_KIND
     from .delivery_gate_attribution_recovery import eligible_stop
@@ -480,7 +485,9 @@ def admit(store, run_id, payload, *, preflight=False):
                 'additional_iterations': 0, 'candidate_id': seal['candidate']['id']}
     spec = seal['original_spec']
     generation = seal['generation']
-    root = Path(spec['state_dir']) / gate_namespace(generation, seal['stage'])
+    preflight_generation = 1 if 'preflight_continuation' in seal else 0
+    root = Path(spec['state_dir']) / gate_namespace(
+        generation, seal['stage'], preflight_generation=preflight_generation)
     with _lock(root / 'controller.lock'):
         with store._connect() as db:
             prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
@@ -505,6 +512,9 @@ def admit(store, run_id, payload, *, preflight=False):
             else f'transient-gate-retry-{generation}' if seal['stage'] == 'transient'
             else f'gate-retry-{generation}')
         execution['gate_retry_generation'] = generation
+        if preflight_generation:
+            execution['gate_retry_preflight_generation'] = preflight_generation
+            execution['role_home_generation'] = f'gate-retry-{generation}-preflight-continuation'
         if seal['stage']:
             execution['gate_retry_stage'] = seal['stage']
         current = snapshot(store, run_id, kind)
@@ -537,6 +547,8 @@ def admit(store, run_id, payload, *, preflight=False):
                        if seal['stage'] == 'transient' else
                        f'delivery-{run_id}-published-gates-retry-{generation}' if seal['stage']
                        else f'delivery-{run_id}-gates-retry-{generation}')
+        if preflight_generation:
+            workflow_id += '-preflight-continuation'
         response = {'run_id': run_id, 'phase': 'gates_retry_queued', 'workflow_id': workflow_id,
                     'candidate_id': after['id'], 'implementation_authority': False,
                     'additional_iterations': 0}
@@ -547,6 +559,10 @@ def admit(store, run_id, payload, *, preflight=False):
                 raise ValueError('gate retry admission lost its stopped projection')
             if work_binding(store, spec, db) != seal['work_binding']:
                 raise ValueError('gate retry admission lost issue ownership')
+            if preflight_generation and spec.get('feature_worker'):
+                from .delivery_feature_execution import require_execution
+
+                require_execution(store, spec)
             if observation := seal.get('browser_prelaunch_observation'):
                 from .delivery_browser_prelaunch import resolved_effect
 
@@ -591,7 +607,12 @@ def admit(store, run_id, payload, *, preflight=False):
         return response
 
 
-def gate_namespace(generation, stage=None):
+def gate_namespace(generation, stage=None, *, preflight_generation=0):
+    if preflight_generation:
+        if type(preflight_generation) is not int or preflight_generation != 1 \
+                or generation != 2 or stage != 'published':
+            raise ValueError('gate preflight continuation exceeds its one unused assessment')
+        return gate_namespace(generation, stage) + '/preflight-continuation'
     if stage is not None:
         if stage == 'report' and generation == 1:
             return 'report-gates-admission'
@@ -610,11 +631,24 @@ def gate_namespace(generation, stage=None):
 def effective_spec(store, original, recovery):
     root = Path(original['state_dir']) / gate_namespace(
         recovery['execution_spec'].get('gate_retry_generation', 1),
-        recovery['execution_spec'].get('gate_retry_stage'))
+        recovery['execution_spec'].get('gate_retry_stage'),
+        preflight_generation=recovery['execution_spec'].get('gate_retry_preflight_generation', 0))
     with store._connect() as db:
         saved = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
                            (original['run_id'],)).fetchone()
-    if (not saved or canonical_json(json.loads(saved[0])) != canonical_json(recovery)
+    current = json.loads(saved[0]) if saved else None
+    if current != recovery:
+        # Historical attribution remains observable only through the exact
+        # immediate server-owned preflight envelope, never a caller override.
+        execution = (current or {}).get('execution_spec') or {}
+        current_root = Path(original['state_dir']) / gate_namespace(
+            execution.get('gate_retry_generation', 1), execution.get('gate_retry_stage'),
+            preflight_generation=execution.get('gate_retry_preflight_generation', 0))
+        if (execution.get('gate_retry_preflight_generation') != 1
+                or current.get('original_recovery') != recovery
+                or read_private(current_root / 'admission.json') != current):
+            raise ValueError('published gate retry historical admission changed')
+    if (not saved
             or canonical_json(read_private(root / 'admission.json')) != canonical_json(recovery)
             or recovery['original_spec'] != original
             or recovery['command']['additional_iterations'] != 0):
@@ -622,12 +656,19 @@ def effective_spec(store, original, recovery):
     return recovery['execution_spec']
 
 
-def readback(store, spec, recovery):
+def readback(store, spec, recovery, *, resource_spec=None):
     effective = effective_spec(store, recovery['original_spec'], recovery)
-    if effective != spec or DeliveryBroker(store, spec).candidate() != recovery['candidate']:
+    from .delivery_feature_revision_subject import ObservationBroker
+
+    broker = (ObservationBroker(store, spec, resource_spec=resource_spec)
+              if resource_spec is not None else DeliveryBroker(store, spec))
+    if effective != spec or broker.candidate() != recovery['candidate']:
         raise ValueError('gate retry source or execution authority changed')
-    broker = DeliveryBroker(store, spec)
-    if expected := recovery['seal'].get('attribution_observation'):
+    if spec.get('gate_retry_preflight_generation'):
+        from .delivery_gate_preflight_continuation import validate
+
+        validate(store, spec, recovery)
+    elif expected := recovery['seal'].get('attribution_observation'):
         from .delivery_feature_revision_subject import ObservationBroker
         from .delivery_gate_attribution_recovery import observe
 
@@ -643,7 +684,8 @@ def readback(store, spec, recovery):
             raise ValueError('attribution retry original Temporal result changed')
         if observe(store, original, recovery['seal']['row'], closed['result'],
                    recovery['seal']['attempts'], closed, recovery['original_recovery'],
-                   ObservationBroker(store, original)) != expected:
+                   ObservationBroker(store, original, resource_spec=resource_spec or spec)) \
+                != expected:
             raise ValueError('attribution retry original cause or source evidence changed')
     if observation := recovery['seal'].get('browser_prelaunch_observation'):
         from .delivery_browser_prelaunch import observe, resolved_effect

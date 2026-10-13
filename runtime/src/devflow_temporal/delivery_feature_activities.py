@@ -233,6 +233,7 @@ def _paid_repair(shared, token, run_id, iteration):
 def resume_worker(store, parent, child, row):
     from . import delivery_gate_retry as gates
     from .delivery_gate_attribution_recovery import possible
+    from .delivery_gate_preflight_continuation import possible as preflight_continuation
     from .delivery_stopped_resume import admit, interrupted_resume, pending_repair, snapshot
 
     shared = registry(parent)
@@ -241,9 +242,9 @@ def resume_worker(store, parent, child, row):
     # preserves the original candidate/PR/session and never creates a new branch.
     preparation_failed = gates.prepublication_preparation_failed(
         {"error": row["error"], "checks": json.loads(row["checks_json"] or "{}")})
-    if possible(store, child, row):
+    if possible(store, child, row) or preflight_continuation(row):
         sealed = gates.snapshot(store, child['run_id'])
-        if 'attribution_observation' not in sealed:
+        if not any(key in sealed for key in ('attribution_observation', 'preflight_continuation')):
             raise OwnershipConflict('worker lacks its exact attribution recovery proof')
         state = sealed['closed']['result']
         remaining, kind, admit = 0, gates.KIND, gates.admit
