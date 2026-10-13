@@ -110,8 +110,42 @@ def test_historical_finished_role_uses_exact_admitted_policy_without_changing_cu
         assert dict(db.execute('SELECT * FROM delivery_attempts').fetchone()) == attempt
 
 
+@pytest.mark.parametrize('legacy', [False, True])
+def test_original_policy_role_keeps_existing_observation(historical_role, legacy):
+    store, current, path, request, journal, result, _table, _ports = historical_role
+    executions = {}
+    _gate_roots(current, execution_specs=executions)
+    original = executions[Path(current['state_dir'])]
+    request['spec'] = original
+    old_job = path.parent.name
+    job = 'legacy-monitor' if legacy else DeliverySupervisor._job_key(request)
+    folder = path.parent.with_name(job)
+    path.parent.rename(folder)
+    path = folder / 'native-process.json'
+    request.update(result_path=str(folder / 'result.json'), start_path=str(folder / 'start.json'))
+    result['native_process']['journal'] = str(path)
+    journal['intent']['policy_digest'] = original['policy_digest']
+    journal['provider_session']['result_digest'] = digest(result)
+    write_private(path, journal)
+    if legacy:
+        path.with_name('request.json').unlink()
+        journal.pop('provider_session')
+        write_private(path, journal)
+        with store._connect() as db:
+            db.execute('DELETE FROM delivery_attempts WHERE job_key=?', (old_job,))
+    else:
+        write_private(path.with_name('request.json'), request)
+        with store._connect() as db:
+            db.execute('UPDATE delivery_attempts SET job_key=?,result_path=?,result_json=? '
+                       'WHERE job_key=?',
+                       (job, request['result_path'], canonical_json(result), old_job))
+    assert orphans._observe_registered_process(current, path)['cleanup'] \
+        == 'observed-native-confirmed'
+
+
 @pytest.mark.parametrize('changed', [
-    'wrong_policy', 'forged_spec', 'wrong_job', 'forged_result', 'session', 'candidate',
+    'wrong_policy', 'original_policy', 'original_request', 'missing_request',
+    'forged_spec', 'wrong_job', 'forged_result', 'session', 'candidate',
     'process_identity', 'row_path', 'request_path', 'native_path', 'runtime', 'missing_runtime',
     'missing_attempt', 'nonfinished', 'unconfirmed', 'launch', 'symlink',
 ])
@@ -120,6 +154,13 @@ def test_historical_policy_override_refuses_changed_custody(historical_role, mon
     updates = {}
     if changed == 'wrong_policy':
         journal['intent']['policy_digest'] = current['policy_digest']
+    elif changed in {'original_policy', 'original_request', 'missing_request'}:
+        executions = {}
+        _gate_roots(current, execution_specs=executions)
+        original = executions[Path(current['state_dir'])]
+        journal['intent']['policy_digest'] = original['policy_digest']
+        if changed == 'original_request':
+            request['spec'] = original
     elif changed == 'forged_spec':
         request['spec']['accepted_plan'] += '\nForged scope.'
     elif changed == 'wrong_job':
@@ -156,13 +197,15 @@ def test_historical_policy_override_refuses_changed_custody(historical_role, mon
             db.execute('DELETE FROM delivery_attempts')
     write_private(path.with_name('request.json'), request)
     write_private(path, journal)
+    if changed == 'missing_request':
+        path.with_name('request.json').unlink()
     if changed == 'symlink':
         link = path.with_name('linked-native.json')
         link.symlink_to(path)
         path = link
     reconciled = []
     monkeypatch.setattr(orphans, 'reconcile_process', lambda p: reconciled.append(p))
-    with pytest.raises(ValueError):
+    with pytest.raises((OSError, ValueError)):
         orphans._observe_registered_process(current, path)
     assert not reconciled
 
@@ -174,6 +217,22 @@ def test_historical_finished_role_still_refuses_live_actors(historical_role, act
     table[pid] = {'identity': identity, 'stat': 'S'}
     with pytest.raises(ValueError, match='processes or ports remain active'):
         orphans._observe_registered_process(current, path)
+
+
+@pytest.mark.parametrize('name', ['native-monitor.lock', 'native-process.lock'])
+def test_original_policy_intent_cannot_skip_historical_original_lease(historical_role, name):
+    _store, current, path, _request, journal, _result, _table, _ports = historical_role
+    executions = {}
+    _gate_roots(current, execution_specs=executions)
+    journal['intent']['policy_digest'] = executions[Path(current['state_dir'])]['policy_digest']
+    write_private(path, journal)
+    descriptor = os.open(path.with_name(name), os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises((OSError, ValueError)):
+            orphans._observe_registered_process(current, path)
+    finally:
+        os.close(descriptor)
 
 
 @pytest.mark.parametrize('name', ['native-monitor.lock', 'native-process.lock'])

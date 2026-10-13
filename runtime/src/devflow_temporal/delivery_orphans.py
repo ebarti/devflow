@@ -119,19 +119,11 @@ def _complete_attempt(store, spec, row, on_observed=None):
 
 
 @contextmanager
-def _completed_role_execution(spec, path, journal, execution_specs):
+def _completed_role_execution(path, journal, execution_specs, request, row):
     """Bind a retained role's original policy to its finished durable attempt."""
-    from .delivery_execution_config import load_execution_config
-
-    request = read_private(path.with_name('request.json'))
     execution = request['spec']
     if execution not in execution_specs.values():
         raise ValueError('registered role request lost its admitted execution policy')
-    config = load_execution_config(spec)
-    with closing(sqlite3.connect(config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
-        db.row_factory = sqlite3.Row
-        row = db.execute('SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',
-                         (path.parent.name, spec['run_id'])).fetchone()
     if row is None or row['state'] != 'finished' or row['cleanup'] != 'confirmed':
         raise ValueError('registered historical role is not durably completed')
     result = json.loads(row['result_json'])
@@ -208,14 +200,31 @@ def _observe_registered_process(spec, path):
     expected_digest = ((execution.get('preparation') or {}).get('measured_policy_digest')
                        if path.is_relative_to(Path(spec['state_dir']) / 'native-preparation')
                        else execution['policy_digest']) or execution['policy_digest']
+    request, row = None, None
+    if (path.name == 'native-process.json'
+            and path.parent.parent == Path(spec['state_dir']) / 'attempts'):
+        if 'config_path' in spec:
+            from .delivery_execution_config import load_execution_config
+
+            config = load_execution_config(spec)
+            with closing(sqlite3.connect(config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
+                db.row_factory = sqlite3.Row
+                row = db.execute('SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',
+                                 (path.parent.name, spec['run_id'])).fetchone()
+        if (row is not None or os.path.lexists(path.with_name('request.json'))
+                or 'provider_session' in journal):
+            if row is None:
+                raise ValueError('registered role has no durable original attempt')
+            request = read_private(path.with_name('request.json'))
+            if (request['spec'] not in execution_specs.values()
+                    or DeliverySupervisor._job_key(request) != row['job_key']):
+                raise ValueError('registered role request lost its admitted execution policy')
     # Role jobs retain their original attempt directory across later admissions.
     # Only exact completed custody can override the directory's original policy.
     with ExitStack() as leases:
-        if (intent['policy_digest'] != expected_digest
-                and path.name == 'native-process.json'
-                and path.parent.parent == Path(spec['state_dir']) / 'attempts'):
+        if request is not None and request['spec'] != execution:
             execution = leases.enter_context(
-                _completed_role_execution(spec, path, journal, execution_specs))
+                _completed_role_execution(path, journal, execution_specs, request, row))
             expected_digest = execution['policy_digest']
             launch = _launch_binding(path.parent, journal)
         if (intent['run_id'] != spec['run_id']
