@@ -1,13 +1,16 @@
-"""Authenticate a failed coordinator's terminal checkpoint without reviving it."""
+"""Authenticate closed feature custody without reviving historical executions."""
 from __future__ import annotations
 
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from types import SimpleNamespace
 
 from temporalio.client import Client, WorkflowExecutionStatus
 
-from .delivery_closures import history_sha256
+from .contracts import digest
+from .delivery_closures import closure_facts, history_sha256, sealed_closure
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 
 SETTLEMENT = {'delivery_feature_settle_workers'}
@@ -136,6 +139,245 @@ def closed_coordinator(store, run_id):
                 or description.close_time.isoformat() != closed['closed_at']):
             raise ValueError('failed feature Temporal closure changed')
         return await failed_checkpoint(await handle.fetch_history(), spec, row, closed)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))).result(35)
+
+
+def _completed_row(store, spec, row, closed, projections):
+    """Bind the closed result, allowing only authenticated later cleanup maintenance."""
+    from .delivery_closed_projection import _cleanup_row, _events, _same_row
+
+    state = closed['result']
+    expected = {**state, 'protocol_revision': state['revision']}
+    if (any(row[key] != spec.get(key) for key in
+            ('run_id', 'request_digest', 'work_id', 'issue_url', 'repository_key'))
+            or row['candidate_revision'] != state.get('candidate_revision')):
+        raise ValueError('closed feature immutable row or candidate revision changed')
+    if row['cleanup'] != 'confirmed':
+        raise ValueError('closed feature cleanup remains unconfirmed')
+    if _same_row(row, expected):
+        return
+    checks = json.loads(row['checks_json'] or '{}')
+    if spec.get('feature_worker'):
+        from .delivery_policy_recovery import reconciled_cleanup
+
+        maintenance = reconciled_cleanup(store, row, state)
+        if maintenance and _same_row(row, {**expected, 'cleanup': 'confirmed',
+                'checks': {**state['checks'], 'resource_cleanup': maintenance['resource_cleanup']},
+                'tracker': maintenance['tracker']}):
+            return
+    original = {**row, 'cleanup': state.get('cleanup'),
+                'checks_json': json.dumps(state.get('checks'))}
+    receipt = checks.get('resource_cleanup')
+    if (not _same_row(original, expected)
+            or {k: v for k, v in checks.items() if k != 'resource_cleanup'}
+            != {k: v for k, v in state.get('checks', {}).items() if k != 'resource_cleanup'}
+            or not isinstance(receipt, dict) or receipt.get('state') != 'confirmed'
+            or receipt.get('resource_cleanup') != 'confirmed'
+            or not isinstance(receipt.get('processes'), list)):
+        raise ValueError('closed feature projection differs from its terminal result')
+    # All remaining delivery fields have already matched; no maintenance row may
+    # compose a newer candidate, gate, tracker or plan result with this closure.
+    events = _events(store, spec['run_id'])
+    closed_at = datetime.fromisoformat(closed['closed_at'])
+    description = SimpleNamespace(id=closed['workflow_id'], run_id=closed['execution_run_id'],
+                                  close_time=closed_at)
+    if _cleanup_row(row, spec, description, projections, events):
+        return
+    # A failed terminal projection can first be restored by the existing completed
+    # projection reconciler. Its authenticated result key is the new baseline;
+    # subsequent row writers must be only the same closure's cleanup maintenance.
+    baseline_key = 'closed-project:' + closed['execution_run_id'] + ':' + digest(state)
+    baseline = next((event for event in reversed(events)
+                     if event['type'] == 'closed_projection_reconciled'
+                     and json.loads(event['payload_json']).get('key') == baseline_key), None)
+    if baseline is None:
+        raise ValueError('closed feature cleanup lacks its terminal projection receipt')
+    closure = {'workflow_id': closed['workflow_id'],
+               'execution_run_id': closed['execution_run_id'],
+               'closed_at': closed['closed_at'], 'status': 'COMPLETED'}
+    maintenance_key = digest({'closed_workflow': closure,
+                             'native_observations': receipt['processes'],
+                             'resource_cleanup': receipt})
+    revision, written_at, last = (baseline['run_revision'],
+                                  datetime.fromisoformat(baseline['timestamp']), baseline)
+    if written_at <= closed_at:
+        raise ValueError('closed feature projection receipt precedes its closure')
+    for event in events:
+        if event['sequence'] <= baseline['sequence'] or event['run_revision'] <= revision:
+            continue
+        payload = json.loads(event['payload_json'])
+        timestamp = datetime.fromisoformat(event['timestamp'])
+        if (event['run_revision'] != revision + 1
+                or event['type'] != 'resource_cleanup_reconciled'
+                or set(payload) != {'key', 'iteration', 'candidate_id'}
+                or payload['iteration'] != row['iteration'] or payload['candidate_id'] is not None
+                or not isinstance(payload['key'], str) or len(payload['key']) != 64
+                or any(char not in '0123456789abcdef' for char in payload['key'])
+                or timestamp <= written_at):
+            raise ValueError('closed feature changed after its terminal projection receipt')
+        revision, written_at, last = event['run_revision'], timestamp, event
+    if (revision != row['revision'] or last['type'] != 'resource_cleanup_reconciled'
+            or json.loads(last['payload_json']).get('key') != maintenance_key
+            or datetime.fromisoformat(row['updated_at']) > written_at):
+        raise ValueError('closed feature cleanup maintenance is not bound to its closure')
+
+
+async def completed_settlement(history, store, spec, row, closed):
+    """Authenticate a completed coordinator's actual failed final worker settlement."""
+    facts = await closure_facts(history)
+    inputs = facts['inputs']
+    if (facts['status'] != 'COMPLETED' or not spec.get('feature_delivery')
+            or spec.get('feature_worker') or row['recovery_json'] is not None
+            or facts['recovery_digest'] is not None
+            or any(facts[key] != closed.get(key) for key in (
+                'workflow_id', 'execution_run_id', 'closed_at', 'request_digest',
+                'recovery_digest', 'result'))
+            or facts['request_digest'] != spec['request_digest']
+            or len(inputs) != 2 or inputs[0] != json.loads(row['request_json'])
+            or inputs[1] is not None
+            or inputs[0].get('feature_delivery') != spec.get('feature_delivery')):
+        raise ValueError('completed settlement lacks its original execution authority')
+    state = closed['result']
+    if (not isinstance(state, dict) or state.get('run_id') != spec['run_id']
+            or state.get('outcome') not in {'blocked', 'cancelled'}
+            or type(state.get('revision')) is not int or state['revision'] < 1
+            or row['protocol_revision'] != state['revision']):
+        raise ValueError('completed settlement lacks its current terminal checkpoint')
+    scheduled, failures, completed, projections = {}, {}, set(), {}
+    for event in history.events:
+        if event.HasField('activity_task_scheduled_event_attributes'):
+            attributes = event.activity_task_scheduled_event_attributes
+            name = attributes.activity_type.name
+            if name == 'delivery_feature_stop':
+                raise ValueError('completed coordinator already scheduled its feature stop')
+            if name in SETTLEMENT or name == 'delivery_project':
+                values = await DELIVERY_DATA_CONVERTER.decode(attributes.input.payloads)
+                if len(values) != 1 or not isinstance(values[0], dict):
+                    raise ValueError('completed settlement request is malformed')
+                if name in SETTLEMENT:
+                    scheduled[event.event_id] = values[0]
+                else:
+                    from .delivery_closed_projection import failed_terminal_tail
+
+                    projections[event.event_id] = (failed_terminal_tail(
+                        state, values[0], event.event_id) or values[0])
+        if event.HasField('activity_task_failed_event_attributes'):
+            attributes = event.activity_task_failed_event_attributes
+            failures[attributes.scheduled_event_id] = event.event_id
+        if event.HasField('activity_task_completed_event_attributes'):
+            completed.add(event.activity_task_completed_event_attributes.scheduled_event_id)
+    event_id = max(scheduled, default=0)
+    request = scheduled.get(event_id)
+    workers = request.get('workers') if request else None
+    if (event_id not in failures or event_id in completed
+            or set(request) != {'spec', 'workers'} or request['spec'] != spec
+            or not isinstance(workers, dict)
+            or any(not isinstance(key, str) or not key or not isinstance(value, str) or not value
+                   for key, value in workers.items())):
+        raise ValueError('completed coordinator did not fail its recorded worker settlement')
+    _completed_row(store, spec, row, closed, projections)
+    return {**closed, 'workflow_status': 'COMPLETED', 'history_sha256': history_sha256(history),
+            'settlement': {'action': 'settle_closed_coordinator_workers',
+                'workflow_id': facts['workflow_id'], 'execution_run_id': facts['execution_run_id'],
+                'closed_at': facts['closed_at'], 'history_sha256': history_sha256(history),
+                'result_sha256': digest(state), 'scheduled_event_id': event_id,
+                'failed_event_id': failures[event_id], 'request_sha256': digest(request),
+                'workers': workers}}
+
+
+async def _closed_history(store, workflow_id, closed):
+    sealed = await sealed_closure(store, workflow_id)
+    if sealed is not None:
+        bound = {key: sealed[key] for key in ('workflow_id', 'execution_run_id', 'closed_at',
+                                            'request_digest', 'recovery_digest', 'result')}
+        if closed is not None and bound != closed:
+            raise ValueError('completed feature Temporal closure changed')
+        return sealed['history'], bound
+    if closed is None or closed['workflow_id'] != workflow_id:
+        raise ValueError('completed feature settlement history is unproven')
+    client = await Client.connect(store.config.temporal_address,
+        namespace=store.config.raw.get('temporal_namespace', 'default'),
+        data_converter=DELIVERY_DATA_CONVERTER)
+    handle = client.get_workflow_handle(workflow_id, run_id=closed['execution_run_id'])
+    return await handle.fetch_history(), closed
+
+
+def closed_settlement(store, run_id, *, sealed_only=False):
+    """Read closure proof for admission; status projection uses only an existing seal."""
+    spec = store.effective_spec(run_id)
+    if not store.owns_execution(spec):
+        raise ValueError('completed settlement belongs to another service transport')
+    with store._connect() as db:
+        row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone())
+    workflow_id = store.active_workflow_id(run_id)
+    closed = None if sealed_only else closed_coordinator(store, run_id)
+
+    async def read():
+        history, bound = await _closed_history(store, workflow_id, closed)
+        return await completed_settlement(history, store, spec, row, bound)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))).result(35)
+
+
+async def completed_worker(history, store, spec, row, closed):
+    """Bind a worker's current closed execution to its admitted input and terminal row."""
+    facts = await closure_facts(history)
+    recovery = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    # Reset histories retain the original start input. These are the same frozen
+    # admitted inputs the interrupted-execution guard authenticates before reset.
+    starts = [store.submitted_spec(spec['run_id']), store.spec(spec['run_id']), spec]
+    inputs, state = facts['inputs'], facts['result']
+    if (facts['status'] != 'COMPLETED' or not spec.get('feature_worker')
+            or any(facts[key] != closed.get(key) for key in (
+                'workflow_id', 'execution_run_id', 'closed_at', 'request_digest',
+                'recovery_digest', 'result'))
+            or facts['request_digest'] != row['request_digest']
+            or facts['recovery_digest'] != (digest(recovery) if recovery else None)
+            or len(inputs) not in (1, 2) or inputs[0] not in starts
+            or (inputs[1] if len(inputs) == 2 else None) != recovery
+            or not isinstance(state, dict) or state.get('run_id') != spec['run_id']
+            or state.get('outcome') not in {'delivered', 'blocked', 'cancelled'}
+            or type(state.get('revision')) is not int or state['revision'] < 1
+            or row['protocol_revision'] != state['revision']):
+        raise ValueError('closed worker history does not authenticate its current checkpoint')
+    from .delivery_closed_projection import failed_terminal_tail
+
+    projections = {}
+    for event in history.events:
+        if event.HasField('activity_task_scheduled_event_attributes'):
+            attributes = event.activity_task_scheduled_event_attributes
+            if attributes.activity_type.name == 'delivery_project':
+                values = await DELIVERY_DATA_CONVERTER.decode(attributes.input.payloads)
+                if len(values) != 1 or not isinstance(values[0], dict):
+                    raise ValueError('closed worker projection request is malformed')
+                projections[event.event_id] = (failed_terminal_tail(
+                    state, values[0], event.event_id) or values[0])
+    _completed_row(store, spec, row, closed, projections)
+    return {**closed, 'history_sha256': history_sha256(history)}
+
+
+def closed_worker(store, run_id, workflow_id, *, sealed_only=False):
+    spec = store.effective_spec(run_id)
+    if not store.owns_execution(spec) or workflow_id != store.active_workflow_id(run_id):
+        raise ValueError('closed worker workflow or service custody changed')
+    with store._connect() as db:
+        row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone())
+    closed = (None if sealed_only else
+              store._completed_temporal_result(run_id, workflow_id=workflow_id))
+
+    async def read():
+        history, bound = await _closed_history(store, workflow_id, closed)
+        proof = await completed_worker(history, store, spec, row, bound)
+        with store._connect() as db:
+            current = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                                      (run_id,)).fetchone())
+        if (current != row or store.effective_spec(run_id) != spec
+                or store.active_workflow_id(run_id) != workflow_id):
+            raise ValueError('closed worker checkpoint changed during closure readback')
+        return proof
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))).result(35)

@@ -449,7 +449,7 @@ def register_worker(store, parent, spec):
 
 def continue_feature(store, run_id, request, *, _revision=None):
     from .delivery_config import COMMAND_RE
-    from .delivery_feature_closure import closed_coordinator
+    from .delivery_feature_closure import closed_coordinator, closed_settlement, closed_worker
 
     abandon = request.get("abandon_revision") if isinstance(request, dict) else None
     if (
@@ -490,7 +490,15 @@ def continue_feature(store, run_id, request, *, _revision=None):
     shared = registry(original)
     token = original["feature_delivery"]["owner"]
     current = shared.current(token["issue_id"])
-    if current and shared.token(current) == token and current["state"] == "draining":
+    closed = None
+    recorded_workers = None
+    if current and shared.token(current) == token and current['state'] == 'active':
+        # A generic infrastructure failure can close the coordinator before its
+        # settlement activity drains custody. Only its actual failed request can
+        # admit the same local settlement after all assigned work really closes.
+        closed = closed_settlement(store, run_id)
+        recorded_workers = _settlement_workers(store, store.effective_spec(run_id), closed)
+    if current and shared.token(current) == token and current['state'] in {'active', 'draining'}:
         # A worker can complete a separately admitted infrastructure recovery
         # after its coordinator has stopped. Reconcile that closed work through
         # the same settlement boundary before allowing the next generation.
@@ -515,22 +523,46 @@ def continue_feature(store, run_id, request, *, _revision=None):
             raise UnresolvedEffect(
                 f"original GitHub operation {readback['effect_key']} is still unconfirmed "
                 f"({readback['reason']}); continue the feature again once it settles")
-        closed = closed_coordinator(store, run_id)
+        if recorded_workers is not None and not _draining_handoff_ready(
+                store, shared, token, worker_ids=closed['settlement']['workers']):
+            raise OwnershipConflict('closed feature workers or cleanup remain unsettled')
+        closed = closed or closed_coordinator(store, run_id)
         with shared.connect() as db:
             workers = [dict(worker) for worker in db.execute(
                 "SELECT * FROM execution_workers WHERE issue_id=? AND generation=? "
                 "AND state!='finished'", (token["issue_id"], token["generation"]))]
+        if recorded_workers is not None:
+            workers = recorded_workers
+        worker_closures = {}
         for worker in workers:
             child_id = worker['worker_key'].split(':generation:')[0]
             child = store.effective_spec(child_id)
             if child.get('feature_delivery', {}).get('owner', {}).get('issue_id') \
                     != token['issue_id'] or not child.get('feature_worker'):
                 raise OwnershipConflict('worker closure belongs to a different feature')
-            store._completed_temporal_result(child_id,
-                                            workflow_id=store.active_workflow_id(child_id))
+            if recorded_workers is not None:
+                child_closed = closed_worker(
+                    store, child_id, closed['settlement']['workers'][child_id])
+                worker_closures[child_id] = {
+                    key: child_closed[key] for key in (
+                        'workflow_id', 'execution_run_id', 'closed_at', 'history_sha256')}
+                worker_closures[child_id]['result_sha256'] = digest(child_closed['result'])
+            else:
+                store._completed_temporal_result(child_id,
+                                                workflow_id=store.active_workflow_id(child_id))
             finish_worker(execution, child_id)
+        if recorded_workers is not None:
+            with store._connect() as db:
+                latest = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                                    (run_id,)).fetchone()
+            if dict(latest) != dict(row) or store.effective_spec(run_id) != execution:
+                raise OwnershipConflict('closed feature checkpoint changed before settlement')
         stop_feature(execution, {'state': closed['result'],
                                  'reconciled_workers': [w['worker_key'] for w in workers],
+                                 **({'completed_coordinator_settlement': {**closed['settlement'],
+                                                                         'worker_closures':
+                                                                         worker_closures}}
+                                    if recorded_workers is not None else {}),
                                  **({'failed_coordinator_closure': {
                                      key: value for key, value in closed.items() if key != 'result'
                                  }} if closed.get('workflow_status') == 'FAILED' else {})})
@@ -587,7 +619,69 @@ def continue_feature(store, run_id, request, *, _revision=None):
             else store.submit(supplied))
 
 
-def _draining_handoff_ready(store, shared, token):
+def _settlement_workers(store, spec, closed):
+    """Retain the failed request's exact current worker assignments and adopted plan."""
+    from .delivery_feature_pass import checkpoints
+    from .delivery_feature_revisions import adopted_plan_identity
+
+    shared, token = registry(spec), spec['feature_delivery']['owner']
+    if token['store_path'] != str(store.config.tracking_db):
+        raise OwnershipConflict('closed settlement belongs to another tracking store')
+    adopted = adopted_plan_identity(spec, shared=shared)
+    identity = {key: adopted[key] for key in ('plan_revision', 'plan_digest')}
+    if (adopted['plan_digest'] != digest(plan_for(spec))
+            or (spec.get('feature_plan_revision') is not None
+                and spec['feature_plan_revision'] != identity)
+            or (spec.get('feature_plan_revision') is None and adopted['plan_revision'] > 1)):
+        raise OwnershipConflict('closed settlement belongs to a superseded feature plan')
+    assignments = checkpoints(spec)
+    workers = closed['settlement']['workers']
+    with shared.connect() as db:
+        shared.require(db, token, active=False)
+        rows = {worker['worker_key']: dict(worker) for worker in db.execute(
+            'SELECT * FROM execution_workers WHERE issue_id=?', (token['issue_id'],))}
+    expected = {worker_key(child_id, token) for child_id in workers}
+    if any(worker['state'] != 'finished' and key not in expected for key, worker in rows.items()):
+        raise OwnershipConflict('failed settlement omits a current worker assignment')
+    bound = []
+    for child_id, workflow_id in sorted(workers.items()):
+        child = store.effective_spec(child_id)
+        worker = rows.get(worker_key(child_id, token))
+        role = child.get('feature_worker') or {}
+        child_owner = child.get('feature_delivery', {}).get('owner', {})
+        assignment = assignments.get(f"assignment:{role.get('chunk_id')}:{role.get('kind')}")
+        if (worker is None or worker['generation'] != token['generation']
+                or worker['workstream_id'] != role.get('workstream_id')
+                or child_owner.get('issue_id') != token['issue_id']
+                or child_owner.get('store_path') != token['store_path']
+                or workflow_id != store.active_workflow_id(child_id)
+                or assignment != {'run_id': child_id, 'store_path': token['store_path'],
+                                  'chunk_id': role.get('chunk_id'), 'kind': role.get('kind')}
+                or (child.get('feature_plan_revision') is not None
+                    and child['feature_plan_revision'] != identity)
+                or (child.get('feature_plan_revision') is None and adopted['plan_revision'] > 1)):
+            raise OwnershipConflict('failed settlement worker assignment changed')
+        bound.append(worker)
+    return bound
+
+
+def _active_handoff_ready(store, shared, token):
+    if not _draining_handoff_ready(store, shared, token):
+        return False
+    from .delivery_feature_closure import closed_settlement, closed_worker
+
+    try:
+        closed = closed_settlement(store, token['run_id'], sealed_only=True)
+        _settlement_workers(store, store.effective_spec(token['run_id']), closed)
+        for child_id, workflow_id in closed['settlement']['workers'].items():
+            closed_worker(store, child_id, workflow_id, sealed_only=True)
+    except (ValueError, OwnershipConflict, OSError):
+        return False
+    return _draining_handoff_ready(store, shared, token,
+                                   worker_ids=closed['settlement']['workers'])
+
+
+def _draining_handoff_ready(store, shared, token, *, worker_ids=()):
     """Project eligibility; the command still authenticates closure and custody."""
     with shared.connect() as db:
         if db.execute("SELECT 1 FROM execution_effects WHERE issue_id=? AND state='pending'",
@@ -598,7 +692,8 @@ def _draining_handoff_ready(store, shared, token):
             "WHERE issue_id=? AND state!='finished'", (token['issue_id'],)))
     if any(worker['generation'] != token['generation'] for worker in workers):
         return False
-    ids = [token['run_id'], *(w['worker_key'].split(':generation:')[0] for w in workers)]
+    ids = [token['run_id'], *(w['worker_key'].split(':generation:')[0] for w in workers),
+           *worker_ids]
     with store._connect() as db:
         for run_id in ids:
             row = db.execute('SELECT outcome,cleanup FROM delivery_runs WHERE run_id=?',
@@ -654,7 +749,8 @@ def detail(store, spec):
         "can_continue": bool(
             current and shared.token(current) == token
             and (current["state"] == "stopped" or (current["state"] == "draining"
-                 and _draining_handoff_ready(store, shared, token)))
+                 and _draining_handoff_ready(store, shared, token))
+                 or (current["state"] == "active" and _active_handoff_ready(store, shared, token)))
         ),
         "github_plan_url": spec["issue_url"] + "#issuecomment-" + str(record["comment_id"])
         if record
