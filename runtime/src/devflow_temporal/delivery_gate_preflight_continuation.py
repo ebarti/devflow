@@ -1,10 +1,12 @@
 """One fresh controller continuation of an admitted, unstarted attribution assessment."""
 from __future__ import annotations
 
+import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
-from .contracts import digest
+from .contracts import canonical_json, digest
 from .delivery_continuation import continuation_authority
 from .delivery_resources import observe_completed_resources
 
@@ -120,12 +122,7 @@ def snapshot(store, spec, row, attempts, effects, closed):
             'preflight_continuation': proof}
 
 
-def validate(store, spec, recovery):
-    """The measured overlay retains the original assessment and implementation authority."""
-    from . import delivery_gate_retry as gates
-    from .delivery_native_preparation import native_identity
-    from .delivery_policy_recovery import _rows
-
+def _authority(spec, recovery):
     previous = recovery.get('original_recovery') or {}
     before = previous.get('execution_spec') or {}
     proof = recovery['seal'].get('preflight_continuation') or {}
@@ -142,10 +139,102 @@ def validate(store, spec, recovery):
                 'run_id', 'work_id', 'state_dir', 'checkout', 'source_path', 'branch', 'base_sha',
                 'accepted_plan', 'feature_worker', 'feature_delivery', 'feature_plan_revision',
                 'config_digest', 'plan_approval', 'authorized_endpoint', 'origin_url', 'base_ref',
-                'publication_base_ref', 'expected_paths', 'implementation_role_home_generation'))
+                'publication_base_ref', 'expected_paths', 'implementation_role_home_generation',
+                'provider'))
             or recovery['command'].get('additional_iterations') != 0
             or recovery['state'] != proof.get('closed', {}).get('result')):
         raise ValueError('gate preflight continuation changed its retained assessment authority')
+    return previous, before, proof
+
+
+def _prepared_envelope(root, seal):
+    """Read the canonical unadmitted producer bytes without revising their runtime."""
+    from .delivery_preparation import _private_bytes
+
+    path = root / 'admission.json'
+    raw = _private_bytes(path, root)
+    prepared = json.loads(raw)
+    if raw != (canonical_json(prepared) + '\n').encode():
+        raise ValueError('prepared gate handoff lost canonical producer bytes')
+    _authority(prepared['execution_spec'], prepared)
+    old, current = deepcopy(prepared['seal']), deepcopy(seal)
+    for value in (old, current):
+        value.pop('prepared_handoff', None)
+        value['preflight_continuation'].pop('runtime', None)
+    command = prepared['command']
+    candidate = {**seal['candidate'], 'policy_digest': prepared['execution_spec']['policy_digest']}
+    expected = {'continuation_kind': 'published_gate_retry', 'additional_iterations': 0,
+                'expected_revision': seal['row']['protocol_revision'],
+                'expected_iteration': seal['row']['iteration'],
+                'expected_candidate_id': seal['candidate']['id'],
+                'expected_pr_head': seal['candidate']['head'],
+                'expected_pr_number': seal['publication']['number']}
+    if (old != current or set(command) != set(expected) | {'command_id'}
+            or any(command[k] != v for k, v in expected.items())
+            or prepared.get('kind') != 'published_gate_retry'
+            or prepared.get('candidate') != candidate
+            or prepared.get('publication') != {**seal['publication'], 'candidate': candidate}
+            or prepared.get('original_spec') != prepared['original_recovery']['original_spec']
+            or prepared['execution_spec'].get('gate_retry_prepared_handoff')):
+        raise ValueError('prepared gate handoff changed its original unstarted checkpoint')
+    spec = prepared['execution_spec']
+    if spec['provider'] != 'fake':
+        from .delivery_native_preparation import verify_native_spec
+        from .delivery_resources import read_private
+        from .delivery_session_custody import implementation_generation
+
+        intent = read_private(root / 'runtime-preparation/intent.json')
+        expected_spec = deepcopy(intent.get('effective_spec'))
+        if not expected_spec:
+            raise ValueError('prepared gate handoff lost its completed native preparation')
+        expected_spec.update(
+            implementation_role_home_generation=implementation_generation(
+                prepared['seal']['original_spec'], prepared['original_recovery']),
+            role_home_generation='gate-retry-2-preflight-continuation',
+            gate_retry_generation=2, gate_retry_preflight_generation=1,
+            gate_retry_stage='published')
+        if (intent['command_digest'] != digest({'run_id': spec['run_id'], **command})
+                or intent['seal_digest'] != digest(prepared['seal'])
+                or expected_spec != spec):
+            raise ValueError('prepared gate handoff lost its exact native intent')
+        verify_native_spec(spec)
+    return prepared, {'sha256': hashlib.sha256(raw).hexdigest(),
+                      'command_digest': digest({'run_id': spec['run_id'], **command})}
+
+
+def prepared_handoff(store, seal, root):
+    """One fixed completion namespace for a prepared but never dispatched admission."""
+    if not (root / 'admission.json').exists():
+        return None
+    prepared, proof = _prepared_envelope(root, seal)
+    with store._connect() as db:
+        command = db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
+                             (prepared['command']['command_id'],)).fetchone()
+        admitted = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
+                              (seal['original_spec']['run_id'],)).fetchone()
+        if (command or not admitted
+                or json.loads(admitted[0]) != prepared['original_recovery']):
+            raise ValueError('prepared gate handoff was already admitted or dispatched')
+    return proof
+
+
+def validate(store, spec, recovery):
+    """The measured overlay retains the original assessment and implementation authority."""
+    from . import delivery_gate_retry as gates
+    from .delivery_native_preparation import native_identity
+    from .delivery_policy_recovery import _rows
+
+    previous, before, proof = _authority(spec, recovery)
+    if spec.get('gate_retry_prepared_handoff'):
+        root = Path(spec['state_dir']) / gates.gate_namespace(2, 'published',
+                                                           preflight_generation=1)
+        if (type(spec['gate_retry_prepared_handoff']) is not int
+                or spec['gate_retry_prepared_handoff'] != 1
+                or _prepared_envelope(root, recovery['seal'])[1]
+                != recovery['seal'].get('prepared_handoff')):
+            raise ValueError('prepared gate handoff lost its original envelope binding')
+    elif recovery['seal'].get('prepared_handoff'):
+        raise ValueError('prepared gate handoff lost its execution namespace')
     _, attempts, effects, _ = _rows(store, spec['run_id'])
     if (attempts != recovery['seal']['attempts'] or effects != recovery['seal']['effects']
             or store._completed_temporal_result(spec['run_id'], workflow_id=proof['closed'][
