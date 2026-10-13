@@ -87,6 +87,24 @@ def test_revision_uses_configured_read_only_roles_and_sealed_evidence(feature):
     assert _task(native).permissions.filesystem == FilesystemAccess.READ_ONLY
 
 
+def test_fresh_v2_intake_schema_does_not_change_historical_plan_contract(feature):
+    store, spec, _, _, _ = feature
+    candidate = DeliveryBroker(store, spec).candidate()
+    old_task = _task(request_for(spec, candidate, "intake"))
+    old_schema = old_task.output_schema["properties"]["plan"]
+    assert "steps" in old_schema["required"] and "verification" in old_schema["required"]
+    old_chunk = old_schema["properties"]["workstreams"]["items"]["properties"]["chunks"]["items"]
+    assert "allowed_paths" in old_chunk["required"]
+    assert "planning_defect" not in old_task.output_schema["properties"]
+    fresh = {**spec, "feature_plan_version": 2}
+    task = _task(request_for(fresh, candidate, "intake"))
+    schema = task.output_schema["properties"]["plan"]
+    chunk = schema["properties"]["workstreams"]["items"]["properties"]["chunks"]["items"]
+    assert {"version", "final_gates"} <= set(schema["required"])
+    assert {"expected_paths", "gates"} <= set(chunk["required"])
+    assert "allowed_paths" not in chunk["properties"]
+
+
 def test_review_binds_exact_proposal_and_rejects_unsupported_diagnostics(feature):
     _, spec, _, record, diagnostic = feature
     value = proposed(record)

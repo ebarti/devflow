@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from agent_runtime_kit import FilesystemAccess
 from temporal_test_server import local_temporal
 from temporalio import activity
 from temporalio.client import WorkflowHistory
@@ -31,6 +32,7 @@ from devflow_temporal.delivery_control import main as delivery_main
 from devflow_temporal.delivery_preparation import run_binding
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
+from devflow_temporal.role_runner import _task
 
 
 def _git(path: Path, *args: str) -> str:
@@ -214,6 +216,28 @@ async def test_public_real_submit_is_durable_without_attestation_or_docker_readb
         assert db.execute("SELECT COUNT(*) FROM delivery_outbox").fetchone()[0] == 1
         assert store.state.row(db, "works", request["work_id"]) is not None
 
+
+
+def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):
+    path, request = intake_fixture
+    store = create_app(path).state.delivery.store
+    store.submit(request)
+    spec = store.spec("run-1")
+    native = {**spec, "policy": {**spec["policy"], "host_sandbox": "native-profile"}}
+    task = _task({
+        "spec": native, "role": "intake", "iteration": 0,
+        "candidate": {"id": "candidate", "head": spec["base_sha"]},
+        "workspace": "/work",
+    })
+    assert task.permissions.filesystem == FilesystemAccess.READ_ONLY
+    question_schema = task.output_schema["properties"]["questions"]["items"]
+    assert "blocker" in question_schema["required"]
+    historical = {key: value for key, value in native.items()
+                  if key != "blocking_questions_version"}
+    old_task = _task({"spec": historical, "role": "intake", "iteration": 0,
+                      "candidate": {"id": "candidate", "head": spec["base_sha"]},
+                      "workspace": "/work"})
+    assert "blocker" not in old_task.output_schema["properties"]["questions"]["items"]["required"]
 
 
 def test_cli_reports_stale_answer_without_traceback(intake_fixture, tmp_path, monkeypatch, capsys):
