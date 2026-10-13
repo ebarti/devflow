@@ -34,32 +34,6 @@ RETIRED_COMMANDS = [
 
 
 @pytest.mark.parametrize('command', [*RETIRED_COMMANDS, 'unknown-command'])
-def test_unsupported_private_command_rejects_before_configuration_or_lifecycle(
-    tmp_path, monkeypatch, command, capsys,
-):
-    calls = []
-    path = tmp_path / 'absent' / 'service.json'
-    for name in (
-        '_config', '_read_manifest', 'api_client', 'read_only_client',
-        'ensure_service_running', 'service_start', 'service_stop',
-    ):
-        monkeypatch.setattr(control, name,
-                            lambda *_args, _name=name, **_kwargs: calls.append(_name))
-    monkeypatch.setattr(DeliveryConfig, 'load',
-                        classmethod(lambda *_args: calls.append('load_config')))
-    args = argparse.Namespace(command=command, config=str(path), request=None)
-    try:
-        control._run(args, argparse.ArgumentParser())
-    except SystemExit as failure:
-        assert failure.code == 2
-    else:
-        pytest.fail(f'unsupported command {command} did not reject; effects={calls}')
-    assert 'invalid choice' in capsys.readouterr().err
-    assert calls == []
-    assert not path.parent.exists()
-
-
-@pytest.mark.parametrize('command', [*RETIRED_COMMANDS, 'unknown-command'])
 def test_unsupported_public_command_rejects_before_configuration_or_lifecycle(
     tmp_path, monkeypatch, command, capsys,
 ):

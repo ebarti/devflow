@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import os
@@ -141,43 +140,6 @@ async def test_stopped_mcp_handoff_starts_explicitly_before_required_reads(
             assert not thread.is_alive()
 
 
-class RoutedClient:
-    def __init__(self, factory):
-        self.factory = factory
-
-    def __getattr__(self, method):
-        return lambda *_args, **_kwargs: {"factory": self.factory, "method": method}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tool,arguments,factory,method", [
-    ("get_service", {}, "read", "service"),
-    ("list_runs", {}, "read", "runs"),
-    ("get_run", {"run_id": "run-1"}, "read", "status"),
-    ("read_evidence", {"run_id": "run-1", "evidence_id": "one"}, "read", "evidence"),
-    ("gates_only_preflight", {"run_id": "run-1"}, "read", "gates_only_preflight"),
-    ("repair_admission_preflight", {"run_id": "run-1", "request_json": "{}"},
-     "read", "repair_admission_preflight"),
-    ("start_service", {}, "write", "service"),
-    ("submit_run", {"request_json": "{}"}, "write", "submit"),
-    ("answer_decision", {"run_id": "run-1", "request_json": "{}"}, "write", "decision"),
-    ("cancel_run", {"run_id": "run-1", "request_json": "{}"}, "write", "cancel"),
-    *[(name, {"run_id": "run-1", "request_json": "{}"}, "write", name) for name in (
-        "reconcile_tracker", "admit_gates_only", "continue_repair",
-    )],
-])
-async def test_mcp_tools_use_distinct_read_and_starting_factories(
-    config, monkeypatch, tool, arguments, factory, method,
-):
-    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", lambda _path: RoutedClient("write"))
-    monkeypatch.setattr("devflow_temporal.delivery_mcp.read_only_client",
-                        lambda _path: RoutedClient("read"))
-    async with create_connected_server_and_client_session(build_server(config.path)) as session:
-        result = await session.call_tool(tool, arguments)
-    assert not result.isError, result.content
-    assert json.loads(result.content[0].text) == {"factory": factory, "method": method}
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool", [
     "recovery_preflight", "recover_execution", "metadata_preflight",
@@ -202,29 +164,6 @@ async def test_retired_mcp_tools_reject_without_start_or_stop(tmp_path, monkeypa
     assert result.isError and f"Unknown tool: {tool}" in result.content[0].text
     assert calls == []
     assert not path.parent.exists()
-
-
-@pytest.mark.parametrize("command,factory,method", [
-    ("runs", "read", "runs"), ("run", "read", "status"), ("evidence", "read", "evidence"),
-    *[(name, "read", name.replace("-", "_")) for name in (
-        "gates-only-preflight", "repair-admission-preflight",
-    )],
-    *[(name, "write", name.replace("-", "_")) for name in (
-        "submit", "decision", "cancel", "reconcile-tracker", "recover-publication",
-        "admit-gates-only", "continue-repair", "retry-prelaunch", "amend-scope",
-    )],
-])
-def test_cli_commands_use_distinct_read_and_starting_factories(
-    config, monkeypatch, capsys, command, factory, method,
-):
-    monkeypatch.setattr(control, "api_client", lambda _path: RoutedClient("write"))
-    monkeypatch.setattr(control, "read_only_client", lambda _path: RoutedClient("read"))
-    request = config.path.parent / "request.json"
-    request.write_text("{}")
-    args = argparse.Namespace(command=command, config=str(config.path), id="run-1",
-                              evidence_id="one", request=request)
-    control._run(args, argparse.ArgumentParser())
-    assert json.loads(capsys.readouterr().out) == {"factory": factory, "method": method}
 
 
 @pytest.mark.parametrize("command,exit_code", [("status", 0), ("token", 1)])

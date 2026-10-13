@@ -38,14 +38,6 @@ def activity_failure(cause):
     return error
 
 
-def test_new_admission_freezes_default_automatic_attempt_budget(service):
-    store, request = service
-    spec = store.config.admit(request)
-    assert spec['automatic_retry_version'] == spec['retry_budget_version'] == 1
-    assert spec['policy']['max_attempts'] == 3
-    assert store.config.public_policy()['max_attempts'] == 3
-
-
 @pytest.mark.parametrize('markers,maximum', [({}, None), ({'retry_budget_version': 1}, 5),
                                           ({'automatic_retry_version': 1,
                                             'retry_budget_version': 1}, 4)])

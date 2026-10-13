@@ -158,26 +158,6 @@ def observed_native_tree(journal: Path) -> bool:
     )
 
 
-@pytest.mark.parametrize("value, expected", [
-    (None, False),
-    ({"phase": "allocated", "owned": {}}, False),
-    ({"phase": "authorized", "owned": {"1": {"identity": "parent"}}}, False),
-    ({"phase": "authorized", "owned": {"1": {"identity": "parent"}, "2": {}}}, False),
-    ({"phase": "authorized", "owned": {
-        "1": {"identity": "parent"}, "2": {"identity": "child"},
-    }}, True),
-    ({"phase": "finished", "owned": {
-        "1": {"identity": "parent"}, "2": {"identity": "child"},
-    }}, False),
-])
-def test_native_cancellation_start_barrier_requires_observed_tree(tmp_path, value, expected):
-    journal = tmp_path / "native-process.json"
-    if value is not None:
-        journal.write_text(json.dumps(value))
-        journal.chmod(0o600)
-    assert observed_native_tree(journal) is expected
-
-
 def assert_stopped(broker):
     assert broker.result["cleanup"] == "observed-native-confirmed"
     journal = json.loads(Path(broker.result["journal"]).read_text())

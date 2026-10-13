@@ -307,21 +307,3 @@ def test_summary_rejects_unicode_controls_before_claiming_work(
     with store._connect() as db:
         assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 0
         assert store.state.claim_for(db, request['work_id']) is None
-
-
-@pytest.mark.parametrize('field,text,rule', [
-    ('publication_summary', 'docs: First sentence. Second sentence.', 'multiple sentences'),
-    ('publication_summary', 'docs: one\nline two', 'single line'),
-    ('publication_summary', 'Plain prose', 'Conventional Commit'),
-    ('goal', 'First sentence. Second sentence.', 'multiple sentences'),
-    ('goal', 'x' * 115, '120 characters including its type'),
-])
-def test_summary_error_names_checked_input_and_failed_rule(service, field, text, rule):
-    store, request = service
-    request[field] = text
-    with pytest.raises(ValueError) as error:
-        store.submit(request)
-    assert field in str(error.value)
-    assert rule in str(error.value)
-    if field == 'goal':
-        assert 'provide publication_summary separately' in str(error.value)

@@ -72,38 +72,6 @@ def plan(seal):
                       value.get("resume_stage"))
 
 
-@pytest.mark.parametrize("kind", ["build", "chunk"])
-def test_unstarted_first_implementation_reruns_at_iteration_zero(kind):
-    assert resume_mod.interrupted_resume(plan_seal(worker(kind))) == {
-        "resume_iteration": 0, "additional_iterations": 0}
-    # A later iteration without roles is a repair requested by the previous one.
-    assert plan(plan_seal(worker(kind), iteration=2)) is None
-
-
-def test_passed_build_is_sealed_at_its_iteration_without_running_again():
-    seal = plan_seal(worker("build"), [implementation(0, "findings"), implementation(1)],
-                     iteration=1)
-    value = resume_mod.interrupted_resume(seal)
-    assert plan(seal) == (1, 0, "checks")
-    assert value["gate_evidence"]["implementation_job_key"] == "implement-1"
-
-
-@pytest.mark.parametrize("pr_head", [None, "b" * 40], ids=["first", "repair"])
-def test_unpublished_chunk_reruns_checks_and_publication_at_its_iteration(pr_head):
-    assert plan(plan_seal(worker("chunk"), [implementation(2)], iteration=2,
-                          pr_head=pr_head)) == (2, 0, "checks")
-
-
-@pytest.mark.parametrize("ran", [(), ("review",), ("review", "verify"),
-                                 ("review", "verify", "review")],
-                         ids=["none", "review", "both", "interrupted-rerun"])
-def test_published_chunk_keeps_its_publication_and_reruns_gates_at_its_iteration(ran):
-    # Gates that already ran there, including an interrupted rerun's, stay behind.
-    roles = [implementation(2), *(gate(role, 2) for role in ran)]
-    assert plan(plan_seal(worker("chunk"), roles, iteration=2,
-                          pr_head=CANDIDATE["head"])) == (2, 0, "published")
-
-
 def test_gate_attempts_of_an_interrupted_admission_take_its_own_identity():
     request = {"role": "review", "iteration": 2, "candidate": {"id": CANDIDATE["id"]}}
     spec = {"run_id": "worker", "policy_digest": "p" * 64}

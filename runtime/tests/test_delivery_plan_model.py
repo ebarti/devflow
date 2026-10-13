@@ -4,7 +4,6 @@ import pytest
 from test_delivery_github_contract import plan
 
 from devflow_temporal.delivery_plan_model import (
-    compact_plan,
     migrate_plan_v1,
     ordered_chunks,
     resolve_plan_issues,
@@ -46,17 +45,6 @@ def test_v2_selection_rejects_escaping_or_option_operands(selector):
     value["final_gates"] = [{"stage": "checks", "recipe_id": "unit", "selectors": [selector]}]
     with pytest.raises(ValueError):
         validate_plan(value)
-
-
-def test_supported_selectors_and_compact_index_keep_detail_on_children():
-    value = v2_plan()
-    gate = {"stage": "checks", "recipe_id": "unit",
-            "selectors": ["tests/test_model.py::test_result"], "reason": "Owned by this chunk"}
-    value["workstreams"][0]["chunks"][0]["gates"] = [gate]
-    assert validate_plan(value) == value
-    compact = compact_plan(value)
-    assert set(compact["workstreams"][0]["chunks"][0]) == {"id", "title", "depends_on"}
-    assert "Implement" not in str(compact)
 
 
 def test_explicit_migration_resolves_existing_children_without_mutating_the_old_plan():

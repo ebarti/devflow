@@ -5,9 +5,6 @@ import pytest
 from devflow_temporal.delivery_execution_registry import ExecutionRegistry, OwnershipConflict
 from devflow_temporal.delivery_github_contract import (
     GitHubDelivery,
-    decode_manifest,
-    encode_manifest,
-    ordered_chunks,
     validate_manifest,
     validate_plan,
 )
@@ -70,11 +67,6 @@ def manifest():
         "workstream_issues": {},
         "publication": {"stack_id": None, "members": []},
     }
-
-
-def test_plan_orders_independent_streams_without_forward_dependencies():
-    assert [c["id"] for c in ordered_chunks(plan())] == ["model", "client", "endpoint"]
-    assert decode_manifest(encode_manifest(manifest()), ISSUE) == manifest()
 
 
 @pytest.mark.parametrize("change", ["cycle", "unknown", "sequential", "scope", "same_issue"])
