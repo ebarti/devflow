@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
 from dataclasses import replace
 from functools import wraps
 from pathlib import Path
@@ -21,6 +22,7 @@ from openai_codex.generated.v2_all import (
     TurnStatus,
 )
 
+from .delivery_provider_capacity import MAX_BACKOFF, CapacityWait, capacity_error
 from .delivery_resources import read_private, write_private
 
 
@@ -75,6 +77,10 @@ class NativeThreadObservation:
         self.max_attempts = policy.get("provider_max_attempts", 1)
         if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 3:
             raise ValueError("invalid frozen provider attempt limit")
+        self.timeout = policy.get("roles", {}).get(request["role"], {}).get(
+            "timeout_seconds", 7200)
+        self.capacity_wait = CapacityWait(
+            folder, request["spec"]["run_id"], os.getpid(), identity["identity"])
         self.data = {
             "schema": "devflow-native-kit-threads-v1",
             "run_id": request["spec"]["run_id"],
@@ -228,6 +234,14 @@ class NativeThreadObservation:
                 return code is None or code in {408, 429} or 500 <= code <= 599
         return False
 
+    @staticmethod
+    def capacity_limited(result):
+        if result.status != TurnStatus.failed or not result.error:
+            return False
+        info = result.error.codex_error_info
+        value = info.model_dump(mode="json", by_alias=True) if info else None
+        return capacity_error(value)
+
     def failure(self) -> dict | None:
         turns = self.data.get("turns", [])
         return _turn_failure(turns[-1]) if turns else None
@@ -275,34 +289,56 @@ class NativeThreadObservation:
                     result = await self.thread.run(*args, **kwargs)
                     await observer.completed(self.codex, result)
                     return result
+                async with asyncio.timeout(observer.timeout) as active_clock:
+                    return await self._run(active_clock, *args, **kwargs)
+
+            async def _run(self, active_clock, *args, **kwargs):
                 results = []
-                for attempt in range(observer.max_attempts):
+                failures = capacity_failures = 0
+                while True:
+                    started = time.monotonic()
                     try:
                         handle = await self.thread.turn(*args, **kwargs)
                     except CodexError as exc:
                         # An explicit RPC rejection has no unknown accepted turn.
                         # Lost transport or missing completion is never replayed.
-                        observer.data["turns"].append({"start_error": {
+                        observer.data["turns"].append({"thread_id": self.id, "start_error": {
                             "type": type(exc).__name__, "code": getattr(exc, "code", None),
                             "message": str(exc), "data": getattr(exc, "data", None)}})
                         write_private(observer.path, observer.data)
                         if not isinstance(exc, ServerBusyError):
                             raise
                         await observer.observe_inventory(self.codex)
-                        if (observer.data["state"] != "confirmed"
-                                or attempt + 1 == observer.max_attempts):
+                        if observer.data["state"] != "confirmed":
                             raise
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    result = await observer.collect(handle)
-                    await observer.completed(self.codex, result)
-                    results.append(result)
-                    if (observer.data["state"] != "confirmed" or not observer.retryable(result)
-                            or attempt + 1 == observer.max_attempts):
-                        break
-                    await asyncio.sleep(2 ** attempt)
+                        capacity = True
+                    else:
+                        result = await observer.collect(handle)
+                        await observer.completed(self.codex, result)
+                        results.append(result)
+                        if observer.data["state"] != "confirmed" or not observer.retryable(result):
+                            break
+                        capacity = observer.capacity_limited(result)
+                    if capacity:
+                        delay = min(2 ** min(capacity_failures, 6), MAX_BACKOFF)
+                        capacity_failures += 1
+                        rejected = time.monotonic() - started
+                        # The SDK wrapper and native monitor use the same credit.
+                        # No new role, repair debit, provider thread or prompt.
+                        observer.capacity_wait.begin(rejected, delay)
+                        active_clock.reschedule(active_clock.when() + rejected + delay)
+                        try:
+                            await asyncio.sleep(delay)
+                        finally:
+                            waited = observer.capacity_wait.finish()
+                        active_clock.reschedule(active_clock.when() - delay + waited)
+                    else:
+                        failures += 1
+                        if failures >= observer.max_attempts:
+                            break
+                        await asyncio.sleep(2 ** (failures - 1))
                 # The kit consumes per-turn `last`, not cumulative thread usage.
-                # Preserve all tool effects and account for every bounded attempt.
+                # Preserve all tool effects and account for every actual attempt.
                 usage = None
                 if all(result.usage is not None for result in results):
                     last = results[-1].usage.last.model_dump()

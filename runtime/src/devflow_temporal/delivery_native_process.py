@@ -607,7 +607,8 @@ class NativeProcess:
                 process.stdin.write(b"GO\n")
                 process.stdin.flush()
                 process.stdin.close()
-                deadline = time.monotonic() + self.timeout
+                started = time.monotonic()
+                deadline = started + self.timeout
                 while process.poll() is None:
                     drain_output()
                     sample(owned)
@@ -626,7 +627,15 @@ class NativeProcess:
                                 conflict = True
                             else:
                                 observed_ports[str(port)] = {"pid": pid, **owned[pid]}
-                    timed_out, cancelled = time.monotonic() >= deadline, self.cancelled()
+                    credit = 0.0
+                    if self.argv[1:4] == ["-I", "-m", "devflow_temporal.role_runner"]:
+                        from .delivery_provider_capacity import clock_credit
+
+                        credit = clock_credit(
+                            self.folder, self.spec["run_id"], process.pid,
+                            owned[process.pid]["identity"], started)
+                    now = time.monotonic()
+                    timed_out, cancelled = now >= deadline + credit, self.cancelled()
                     if timed_out or cancelled or conflict:
                         break
                     time.sleep(0.03)

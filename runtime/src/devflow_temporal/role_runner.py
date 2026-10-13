@@ -9,7 +9,7 @@ import os
 import sys
 import traceback
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -493,6 +493,10 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
         **observed_sdk,
     )
     task = _task(request)
+    if observation is not None and not observation.legacy:
+        # Native supervision and the observed turn retain the active-work limit.
+        # A fixed kit wall deadline would also expire during provider backoff.
+        task = replace(task, deadline=None)
     support = validate_task(runtime, task)
     if not support.supported:
         return {
