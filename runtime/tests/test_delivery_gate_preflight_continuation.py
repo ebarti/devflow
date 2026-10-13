@@ -333,6 +333,11 @@ def test_public_parent_handoff_keeps_exhausted_budget_and_original_worker(
                 asyncio.run(env.run(activities.delivery_feature_reserve, request))
         orphan = (base / 'admission.json').read_bytes()
         old_command = json.loads(orphan)['command']['command_id']
+        unrelated = json.loads(orphan)
+        unrelated['command']['command_id'] = 'unrelated-prepared-command'
+        with pytest.raises(ValueError, match='exact coordinator command'):
+            preflight._prepared_coordinator(store, unrelated)
+        assert not (base / 'prepared-handoff').exists()
         with store._connect() as db:
             assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
                                   (old_command,)).fetchone()
@@ -386,6 +391,7 @@ def test_public_parent_handoff_keeps_exhausted_budget_and_original_worker(
     assert replay['spec'] == resumed['spec'] and replay['workflow_id'] == resumed['workflow_id']
     if prepared_orphan:
         assert resumed['spec']['gate_retry_prepared_handoff'] == 1
+        assert recovery['seal']['prepared_handoff']['coordinator']['owner'] == token2
         assert (base / 'admission.json').read_bytes() == orphan
         assert recovery['command']['command_id'] != old_command
         for name, raw in before_files.items():

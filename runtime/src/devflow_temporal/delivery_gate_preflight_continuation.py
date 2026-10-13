@@ -207,6 +207,7 @@ def prepared_handoff(store, seal, root):
     if not (root / 'admission.json').exists():
         return None
     prepared, proof = _prepared_envelope(root, seal)
+    proof['coordinator'] = _prepared_coordinator(store, prepared)
     with store._connect() as db:
         command = db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
                              (prepared['command']['command_id'],)).fetchone()
@@ -216,6 +217,34 @@ def prepared_handoff(store, seal, root):
                 or json.loads(admitted[0]) != prepared['original_recovery']):
             raise ValueError('prepared gate handoff was already admitted or dispatched')
     return proof
+
+
+def _prepared_coordinator(store, prepared):
+    """The orphan command must be the server-derived command of one admitted owner."""
+    from .delivery_feature_execution import registry
+
+    spec = prepared['execution_spec']
+    if not spec.get('feature_worker'):
+        raise ValueError('prepared gate handoff has no feature coordinator provenance')
+    shared = registry(spec)
+    closed = prepared['seal']['closed']
+    issue_id = spec['feature_delivery']['owner']['issue_id']
+    matches = []
+    with shared.connect() as db:
+        for row in db.execute('SELECT * FROM execution_snapshots WHERE issue_id=? AND store_path=?',
+                              (issue_id, str(store.config.tracking_db))):
+            owner = {key: row[key] for key in ('issue_id', 'run_id', 'store_path', 'generation')}
+            command = 'feature-resume-' + digest({
+                'owner': owner, 'run': spec['run_id'],
+                'closed': {key: closed[key] for key in ('workflow_id', 'execution_run_id')},
+            })[:24]
+            if command == prepared['command']['command_id']:
+                if digest(json.loads(row['input_json'])) != row['input_digest']:
+                    raise ValueError('prepared gate coordinator snapshot changed')
+                matches.append({'owner': owner, 'snapshot_sha256': row['input_digest']})
+    if len(matches) != 1:
+        raise ValueError('prepared gate handoff has no exact coordinator command')
+    return matches[0]
 
 
 def validate(store, spec, recovery):
@@ -228,10 +257,11 @@ def validate(store, spec, recovery):
     if spec.get('gate_retry_prepared_handoff'):
         root = Path(spec['state_dir']) / gates.gate_namespace(2, 'published',
                                                            preflight_generation=1)
+        prepared, binding = _prepared_envelope(root, recovery['seal'])
+        binding['coordinator'] = _prepared_coordinator(store, prepared)
         if (type(spec['gate_retry_prepared_handoff']) is not int
                 or spec['gate_retry_prepared_handoff'] != 1
-                or _prepared_envelope(root, recovery['seal'])[1]
-                != recovery['seal'].get('prepared_handoff')):
+                or binding != recovery['seal'].get('prepared_handoff')):
             raise ValueError('prepared gate handoff lost its original envelope binding')
     elif recovery['seal'].get('prepared_handoff'):
         raise ValueError('prepared gate handoff lost its execution namespace')
