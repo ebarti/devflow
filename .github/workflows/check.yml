@@ -40,8 +40,8 @@ jobs:
   temporal-runtime-tests:
     name: runtime shard ${{ matrix.shard }}
     runs-on: macos-latest
-    # Passing Mac tests reached 90% when the former 15-minute job budget expired.
-    timeout-minutes: 20
+    # Hosted Mac throughput varies; a passing shard reached 99% at the 20-minute limit.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       max-parallel: 4
