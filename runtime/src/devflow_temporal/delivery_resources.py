@@ -94,7 +94,7 @@ def _ancestors(path: Path, *, allow_missing: bool = False) -> None:
             raise ValueError("resource ancestor is absent")
 
 
-def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
+def _gate_roots(spec: dict, *, execution_specs: dict | None = None) -> tuple[Path, set[Path]]:
     """Resolve existing continuation custody read-only, never from a caller path."""
     state = Path(spec['state_dir'])
     if (not state.is_absolute() or state.name != spec['run_id'] or '..' in state.parts
@@ -103,6 +103,20 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
     _ancestors(state, allow_missing=True)
     namespace = None
     roots = {state}
+
+    def bind(root, admitted):
+        if execution_specs is not None:
+            if (any(admitted.get(key) != spec.get(key)
+                    for key in ('run_id', 'state_dir', 'request_digest'))
+                    or digest(admitted['policy']) != admitted['policy_digest']):
+                raise ValueError('resource namespace lost its admitted execution policy')
+            if root in execution_specs and execution_specs[root] != admitted:
+                raise ValueError('resource namespace has conflicting execution authority')
+            execution_specs[root] = admitted
+
+    if 'config_path' not in spec:
+        if execution_specs is not None:
+            execution_specs[state] = spec
     if 'config_path' in spec:
         from .delivery_execution_config import load_execution_config
 
@@ -112,12 +126,27 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                 or state != config.state_root / 'runs' / spec['run_id']):
             raise ValueError('gate namespace frozen configuration changed')
         with closing(sqlite3.connect(config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
-            row = db.execute(
-                'SELECT request_digest,recovery_json FROM delivery_runs WHERE run_id=?',
-                (spec['run_id'],),
-            ).fetchone()
+            columns = 'request_digest,recovery_json'
+            if execution_specs is not None:
+                columns += ',request_json,accepted_plan_text'
+            row = db.execute('SELECT ' + columns + ' FROM delivery_runs WHERE run_id=?',
+                             (spec['run_id'],)).fetchone()
             if row is None or row[0] != spec['request_digest']:
                 raise ValueError('gate namespace has no durable original run')
+            if execution_specs is not None:
+                original = json.loads(row[2])
+                prepared = db.execute(
+                    'SELECT submitted_spec_digest,effective_spec_digest,effective_spec_json '
+                    'FROM delivery_preparations WHERE run_id=?', (spec['run_id'],),
+                ).fetchone()
+                if prepared:
+                    measured = json.loads(prepared[2])
+                    if (prepared[0] != digest(original) or prepared[1] != digest(measured)):
+                        raise ValueError('resource namespace preparation custody changed')
+                    original = measured
+                if row[3] is not None:
+                    original['accepted_plan'] = row[3]
+                bind(state, original)
             recovery = json.loads(row[1]) if row[1] else None
             first = True
             if recovery and recovery.get('kind') == 'pending_publication_retry':
@@ -128,6 +157,7 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                     raise ValueError('pending publication execution authority changed')
                 namespace = 'publication-retry'
                 roots.add(state / namespace / 'evidence')
+                bind(state / namespace / 'evidence', recovery['execution_spec'])
                 first = False
                 recovery = recovery.get('original_recovery')
             while recovery and recovery.get('kind') in {
@@ -148,6 +178,7 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                         raise ValueError('stopped resume execution authority changed')
                     admitted = resume_namespace(recovery)
                     roots.add(state / admitted / 'evidence')
+                    bind(state / admitted / 'evidence', recovery['execution_spec'])
                     if first:
                         namespace = admitted
                     first = False
@@ -161,6 +192,7 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                     if first:
                         namespace = 'repair-continuation'
                     roots.add(state / 'repair-continuation' / 'evidence')
+                    bind(state / 'repair-continuation' / 'evidence', recovery['execution_spec'])
                     first = False
                 if recovery.get('kind') == 'stopped_resource_closure':
                     from .delivery_resource_closure import custody
@@ -171,6 +203,7 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                     if first:
                         namespace = 'resource-closure'
                     roots.add(state / 'resource-closure' / 'evidence')
+                    bind(state / 'resource-closure' / 'evidence', recovery['execution_spec'])
                     first = False
                 if recovery.get('kind') == 'investigation_assessment_adjudication':
                     from .delivery_investigation_adjudication import custody
@@ -235,6 +268,7 @@ def _gate_roots(spec: dict) -> tuple[Path, set[Path]]:
                                 != canonical_json(recovery))):
                         raise ValueError('gate namespace gates-only admission changed')
                 roots.add(state / admitted_namespace / 'evidence')
+                bind(state / admitted_namespace / 'evidence', recovery['execution_spec'])
                 if first:
                     namespace = admitted_namespace
                 first = False
@@ -760,6 +794,9 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
     }
     if freshly_completed and not set(attempt_journals).issubset(manifest['processes']):
         raise ValueError('original completed attempt is not registered')
+    execution_specs = {}
+    if freshly_completed:
+        _gate_roots(spec, execution_specs=execution_specs)
     for raw in manifest["processes"]:
         path = Path(raw)
         if not path.is_relative_to(state) or path.resolve(strict=True) != path:
@@ -784,15 +821,25 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
         if freshly_completed:
             from .delivery_native_process import launch_binding
 
+            attempt = attempt_journals.get(raw)
+            request = read_private(path.with_name('request.json')) if attempt is not None else None
+            if request is not None:
+                execution = request['spec']
+                if execution != spec and execution not in execution_specs.values():
+                    raise ValueError('original provider request lost its admitted execution policy')
+            else:
+                root = max((root for root in execution_specs if path.is_relative_to(root)),
+                           key=lambda root: len(root.parts))
+                execution = execution_specs[root]
             launch = launch_binding(path.parent, value)
             intent = value['intent']
             # Preparation measured under the submitted policy digest; its journals
             # bind to the digest the run's preparation record says it measured
             # with. A reused or legacy record admits no measurement journal.
             expected_digest = (
-                (spec.get('preparation') or {}).get('measured_policy_digest')
+                (execution.get('preparation') or {}).get('measured_policy_digest')
                 if path.is_relative_to(state / 'native-preparation')
-                else spec['policy_digest']
+                else execution['policy_digest']
             )
             if (intent['run_id'] != spec['run_id']
                     or intent['policy_digest'] != expected_digest
@@ -802,16 +849,13 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
                     or intent['ports'] != value.get('ports')
                     or not value.get('owned')):
                 raise ValueError('original native launch binding changed')
-            attempt = attempt_journals.get(raw)
             if attempt is not None:
-                request = read_private(path.with_name('request.json'))
                 result = json.loads(attempt['result_json'])
                 metadata = value.get('provider_session', {})
                 from .supervisor import DeliverySupervisor
 
                 monitor = value.get('monitor', {})
                 if (attempt['state'] != 'finished' or attempt['cleanup'] != 'confirmed'
-                        or request['spec'] != spec
                         or DeliverySupervisor._job_key(request) != attempt['job_key']
                         or request['role'] != attempt['role']
                         or request['iteration'] != attempt['iteration']
@@ -820,7 +864,7 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
                         or request.get('start_path') != str(path.with_name('start.json'))
                         or intent['cwd'] != request['workspace']
                         or type(intent['timeout']) is not int or intent['timeout'] <= 0
-                        or intent['timeout'] > spec['policy']['roles'][request['role']].get(
+                        or intent['timeout'] > execution['policy']['roles'][request['role']].get(
                             'timeout_seconds', 7200)
                         or intent['ports'] != [] or not monitor
                         or metadata.get('result_digest') != digest(result)
