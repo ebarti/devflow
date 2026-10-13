@@ -6,7 +6,10 @@ import fcntl
 import json
 import logging
 import os
+import sqlite3
+import stat
 import time
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -115,6 +118,83 @@ def _complete_attempt(store, spec, row, on_observed=None):
 
 
 
+@contextmanager
+def _completed_role_execution(spec, path, journal, execution_specs):
+    """Bind a retained role's original policy to its finished durable attempt."""
+    from .delivery_execution_config import load_execution_config
+
+    request = read_private(path.with_name('request.json'))
+    execution = request['spec']
+    if execution not in execution_specs.values():
+        raise ValueError('registered role request lost its admitted execution policy')
+    config = load_execution_config(spec)
+    with closing(sqlite3.connect(config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute('SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',
+                         (path.parent.name, spec['run_id'])).fetchone()
+    if row is None or row['state'] != 'finished' or row['cleanup'] != 'confirmed':
+        raise ValueError('registered historical role is not durably completed')
+    result = json.loads(row['result_json'])
+    native = result.get('native_process') or {}
+    metadata = journal.get('provider_session') or {}
+    intent = journal['intent']
+    if (DeliverySupervisor._job_key(request) != row['job_key']
+            or request['role'] != row['role'] or request['iteration'] != row['iteration']
+            or request['candidate']['id'] != row['candidate_id']
+            or row['result_path'] != str(path.with_name('result.json'))
+            or request.get('result_path') != row['result_path']
+            or request.get('start_path') != str(path.with_name('start.json'))
+            or intent['cwd'] != request['workspace']
+            or type(intent['timeout']) is not int or intent['timeout'] <= 0
+            or intent['timeout'] > execution['policy']['roles'][request['role']].get(
+                'timeout_seconds', 7200)
+            or intent['ports'] != []
+            or metadata.get('result_digest') != digest(result)
+            or metadata.get('session_id') != row['session_id']
+            or result.get('session_id') != row['session_id']
+            or metadata.get('resumed_from') != request.get('resume_session')
+            or metadata.get('role') != row['role']
+            or metadata.get('iteration') != row['iteration']
+            or result.get('cleanup') != 'confirmed'
+            or native.get('journal') != str(path)
+            or native.get('cleanup') != 'observed-native-confirmed'
+            or native != journal.get('result')
+            or not native.get('runtime_identity')
+            or native['runtime_identity'] != journal.get('runtime_identity')
+            or str(row['pid']) not in journal.get('owned', {})
+            or journal['owned'][str(row['pid'])]['identity'] != row['process_identity']):
+        raise ValueError('registered completed role binding changed')
+    descriptors = []
+    try:
+        for name in ('native-monitor.lock', 'native-process.lock'):
+            lock_path = path.with_name(name)
+            descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+            descriptors.append(descriptor)
+            info, current = os.fstat(descriptor), lock_path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+                raise ValueError('registered historical role lifecycle lock changed')
+            recorded = journal.get('lifecycle_locks')
+            if recorded is not None and (
+                    not isinstance(recorded, dict)
+                    or set(recorded) != {'native-monitor.lock', 'native-process.lock'}
+                    or recorded.get(name) != {'device': info.st_dev, 'inode': info.st_ino,
+                                             'uid': info.st_uid}):
+                raise ValueError('registered historical role recorded lifecycle lock changed')
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            current = lock_path.lstat()
+            if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+                raise ValueError('registered historical role lifecycle lock changed while acquired')
+        if (read_private(path) != journal
+                or read_private(path.with_name('request.json')) != request):
+            raise ValueError('registered historical role custody changed under its leases')
+        yield execution
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def _observe_registered_process(spec, path):
     if path.resolve() != path or not path.is_relative_to(Path(spec['state_dir'])):
         raise ValueError('registered native process path changed')
@@ -128,27 +208,37 @@ def _observe_registered_process(spec, path):
     expected_digest = ((execution.get('preparation') or {}).get('measured_policy_digest')
                        if path.is_relative_to(Path(spec['state_dir']) / 'native-preparation')
                        else execution['policy_digest']) or execution['policy_digest']
-    if (intent['run_id'] != spec['run_id']
-            or intent['policy_digest'] != expected_digest
-            or (launch is not None and (
-                intent['argv'] != launch['argv']
-                or intent['environment_sha256'] != digest(launch['environment'])))
-            or intent['ports'] != journal.get('ports')
-            or (not journal.get('owned') and not _prelaunch_journal(journal))
-            or not journal.get('monitor')):
-        raise ValueError('registered native monitor is incomplete or changed')
-    observed = process_table()
-    owned = {int(pid): identity for pid, identity in journal['owned'].items()}
-    monitor = journal['monitor']
-    owned[monitor['pid']] = monitor
-    if (any(observed.get(pid, {}).get('identity') == identity['identity']
-            and not observed[pid]['stat'].startswith('Z') for pid, identity in owned.items())
-            or any(listeners(port) for port in journal.get('ports', []))):
-        raise ValueError('registered native processes or ports remain active')
-    receipt = reconcile_process(path)
-    if receipt['cleanup'] != 'observed-native-confirmed':
-        raise ValueError('registered native cleanup remains unknown')
-    return receipt
+    # Role jobs retain their original attempt directory across later admissions.
+    # Only exact completed custody can override the directory's original policy.
+    with ExitStack() as leases:
+        if (intent['policy_digest'] != expected_digest
+                and path.name == 'native-process.json'
+                and path.parent.parent == Path(spec['state_dir']) / 'attempts'):
+            execution = leases.enter_context(
+                _completed_role_execution(spec, path, journal, execution_specs))
+            expected_digest = execution['policy_digest']
+            launch = _launch_binding(path.parent, journal)
+        if (intent['run_id'] != spec['run_id']
+                or intent['policy_digest'] != expected_digest
+                or (launch is not None and (
+                    intent['argv'] != launch['argv']
+                    or intent['environment_sha256'] != digest(launch['environment'])))
+                or intent['ports'] != journal.get('ports')
+                or (not journal.get('owned') and not _prelaunch_journal(journal))
+                or not journal.get('monitor')):
+            raise ValueError('registered native monitor is incomplete or changed')
+        observed = process_table()
+        owned = {int(pid): identity for pid, identity in journal['owned'].items()}
+        monitor = journal['monitor']
+        owned[monitor['pid']] = monitor
+        if (any(observed.get(pid, {}).get('identity') == identity['identity']
+                and not observed[pid]['stat'].startswith('Z') for pid, identity in owned.items())
+                or any(listeners(port) for port in journal.get('ports', []))):
+            raise ValueError('registered native processes or ports remain active')
+        receipt = reconcile_process(path)
+        if receipt['cleanup'] != 'observed-native-confirmed':
+            raise ValueError('registered native cleanup remains unknown')
+        return receipt
 
 def _retain_observation(store, original, attempt, closed, observation):
     # Persist the original row before completion can commit, including when its
