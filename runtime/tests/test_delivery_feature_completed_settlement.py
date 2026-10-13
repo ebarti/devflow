@@ -19,7 +19,10 @@ from temporalio.api.history.v1 import (
 )
 from temporalio.client import WorkflowHistory
 from temporalio.service import RPCError, RPCStatusCode
+from test_delivery_closed_cleanup_projection import _closed, _maintenance
+from test_delivery_controller_boundary_gaps import _row
 from test_delivery_feature_execution import feature_service
+from test_delivery_gate_retry import unpublished as unpublished
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_feature_activities as activities
@@ -379,3 +382,81 @@ async def test_finished_worker_cannot_bypass_later_unknown_native_cleanup(
         continue_feature(store, parent['run_id'], command)
     assert shared.current(token['issue_id'])['state'] == 'active'
     assert shared.budget(token['issue_id'])['used'] == 10
+
+
+@pytest.mark.parametrize('committed', [False, True])
+async def test_completed_row_accepts_cleanup_composed_by_ordinary_terminal_reconciliation(
+    unpublished, committed,
+):
+    from devflow_temporal.delivery_closed_projection import (
+        failed_terminal_tail,
+        reconcile_projection,
+    )
+
+    store, spec, state, client, description = await _closed(unpublished, committed=committed)
+    # The older shared fixture omits the controller's ordinary candidate counter.
+    state['candidate_revision'] = _row(store)['candidate_revision']
+    _maintenance(store, spec, description)
+    _maintenance(store, spec, description, uncertain=False)
+    assert (await reconcile_projection(store, client, _row(store)))['state'] == 'reconciled'
+    row = _row(store)
+    assert store.events('run-1')[-1]['type'] == 'closed_projection_reconciled'
+    history = await client.get_workflow_handle(description.id,
+                                               run_id=description.run_id).fetch_history()
+    projections = {}
+    for event in history.events:
+        if event.HasField('activity_task_scheduled_event_attributes'):
+            attributes = event.activity_task_scheduled_event_attributes
+            if attributes.activity_type.name == 'delivery_project':
+                request = (await DELIVERY_DATA_CONVERTER.decode(attributes.input.payloads))[0]
+                projections[event.event_id] = (failed_terminal_tail(
+                    state, request, event.event_id) or request)
+    closed = {'workflow_id': description.id, 'execution_run_id': description.run_id,
+              'closed_at': description.close_time.isoformat(), 'result': state}
+    closure._completed_row(store, spec, row, closed, projections)
+    assert _row(store) == row
+    assert state['cleanup'] == 'unknown' and row['cleanup'] == 'confirmed'
+
+
+@pytest.mark.parametrize('drift', ['key', 'mixed-writer', 'missing-revision', 'unordered-time'])
+async def test_composed_terminal_baseline_refuses_changed_cleanup_chain(unpublished, drift):
+    from devflow_temporal.delivery_closed_projection import (
+        failed_terminal_tail,
+        reconcile_projection,
+    )
+
+    store, spec, state, client, description = await _closed(unpublished)
+    state['candidate_revision'] = _row(store)['candidate_revision']
+    _maintenance(store, spec, description)
+    first = store.events('run-1')[-1]
+    _maintenance(store, spec, description, uncertain=False)
+    second = store.events('run-1')[-1]
+    await reconcile_projection(store, client, _row(store))
+    row = _row(store)
+    with store._connect() as db:
+        if drift == 'key':
+            db.execute("UPDATE delivery_events SET payload_json='{}' WHERE sequence=?",
+                       (second['sequence'],))
+        elif drift == 'mixed-writer':
+            db.execute("UPDATE delivery_events SET type='dispatch_blocked' WHERE sequence=?",
+                       (first['sequence'],))
+        elif drift == 'missing-revision':
+            db.execute('DELETE FROM delivery_events WHERE sequence=?', (first['sequence'],))
+        else:
+            db.execute('UPDATE delivery_events SET timestamp=? WHERE sequence=?',
+                       (second['timestamp'], first['sequence']))
+    history = await client.get_workflow_handle(description.id,
+                                               run_id=description.run_id).fetch_history()
+    projections = {}
+    for event in history.events:
+        if event.HasField('activity_task_scheduled_event_attributes'):
+            attributes = event.activity_task_scheduled_event_attributes
+            if attributes.activity_type.name == 'delivery_project':
+                request = (await DELIVERY_DATA_CONVERTER.decode(attributes.input.payloads))[0]
+                projections[event.event_id] = (failed_terminal_tail(
+                    state, request, event.event_id) or request)
+    closed = {'workflow_id': description.id, 'execution_run_id': description.run_id,
+              'closed_at': description.close_time.isoformat(), 'result': state}
+    with pytest.raises(ValueError, match='composed cleanup'):
+        closure._completed_row(store, spec, row, closed, projections)
+    assert _row(store) == row

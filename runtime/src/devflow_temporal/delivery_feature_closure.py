@@ -146,7 +146,7 @@ def closed_coordinator(store, run_id):
 
 def _completed_row(store, spec, row, closed, projections):
     """Bind the closed result, allowing only authenticated later cleanup maintenance."""
-    from .delivery_closed_projection import _cleanup_row, _events, _same_row
+    from .delivery_closed_projection import FIELDS, JSON_FIELDS, _cleanup_row, _events, _same_row
 
     state = closed['result']
     expected = {**state, 'protocol_revision': state['revision']}
@@ -218,9 +218,32 @@ def _completed_row(store, spec, row, closed, projections):
                 or timestamp <= written_at):
             raise ValueError('closed feature changed after its terminal projection receipt')
         revision, written_at, last = event['run_revision'], timestamp, event
-    if (revision != row['revision'] or last['type'] != 'resource_cleanup_reconciled'
-            or json.loads(last['payload_json']).get('key') != maintenance_key
-            or datetime.fromisoformat(row['updated_at']) > written_at):
+    if revision != row['revision'] or datetime.fromisoformat(row['updated_at']) > written_at:
+        raise ValueError('closed feature cleanup maintenance is not bound to its closure')
+    if last is baseline:
+        # The ordinary pump can finalize native cleanup before restoring the
+        # failed terminal projection. Authenticate that composed baseline by
+        # replaying the existing cleanup proof over its exact scheduled prior
+        # projection and recorded writers; no later cleanup write is required.
+        before = [event for event in events if event['sequence'] < baseline['sequence']]
+        previous = next((event for event in reversed(before)
+                         if event['run_revision'] == baseline['run_revision'] - 1
+                         and event['type'] == 'resource_cleanup_reconciled'
+                         and json.loads(event['payload_json']).get('key') == maintenance_key), None)
+        if previous is not None:
+            for projection in projections.values():
+                prior = {**row, **{key: projection.get(key) for key in FIELDS},
+                         'protocol_revision': projection.get('protocol_revision'),
+                         'revision': previous['run_revision'], 'updated_at': previous['timestamp'],
+                         **{column: json.dumps(projection.get(key))
+                            for key, column in JSON_FIELDS.items()},
+                         'cleanup': row['cleanup'], 'checks_json': json.dumps({
+                             **(projection.get('checks') or {}), 'resource_cleanup': receipt})}
+                if _cleanup_row(prior, spec, description, projections, before):
+                    return
+        raise ValueError('closed feature composed cleanup lacks its original maintenance proof')
+    if (last['type'] != 'resource_cleanup_reconciled'
+            or json.loads(last['payload_json']).get('key') != maintenance_key):
         raise ValueError('closed feature cleanup maintenance is not bound to its closure')
 
 
