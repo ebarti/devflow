@@ -31,11 +31,11 @@ from devflow_temporal.delivery_resources import (
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
-@pytest.fixture
-def failed(stopped, monkeypatch):
-    store, broker, old_state, old_closed, command = stopped
+def failed_assessment(seed, monkeypatch):
+    store, broker, old_state, old_closed, command = seed
+    run_id = old_state["run_id"]
     original_snapshot = gates.snapshot
-    seal = original_snapshot(store, 'run-1')
+    seal = original_snapshot(store, run_id)
     proof = {'cause': 'wrapped_junit_source_attribution', 'unresolved_findings': ['Unpassed work']}
     seal.update(generation=2, stage='published', attribution_observation=proof)
     seal['cleanup']['journal_sha256'] = {}
@@ -43,11 +43,11 @@ def failed(stopped, monkeypatch):
     # proof. Actual compact/full native history is exercised by the archive replay.
     monkeypatch.setattr(gates, 'snapshot', lambda *_a, **_kw: deepcopy(seal))
     command = {**command, 'command_id': 'original-admitted-assessment'}
-    response = store.continue_repair('run-1', command)
-    store.mark_start('run-1', accepted=True)
+    response = store.continue_repair(run_id, command)
+    store.mark_start(run_id, accepted=True)
     monkeypatch.setattr(gates, 'snapshot', original_snapshot)
     monkeypatch.setattr(attribution, 'observe', lambda *_a, **_kw: deepcopy(proof))
-    spec = store.effective_spec('run-1')
+    spec = store.effective_spec(run_id)
     root = Path(spec['state_dir'])
     admission = root / 'published-gates-admission-2/admission.json'
     original_bytes = admission.read_bytes()
@@ -72,7 +72,7 @@ def failed(stopped, monkeypatch):
     receipt['receipt_sha256'] = hashlib.sha256(
         (root / 'resources/finalization.json').read_bytes()).hexdigest()
     state = deepcopy(recovery['state'])
-    state.update(run_id='run-1', phase='blocked', execution_state='blocked', outcome='blocked',
+    state.update(run_id=run_id, phase='blocked', execution_state='blocked', outcome='blocked',
                  cleanup='unknown', candidate=recovery['candidate'],
                  pull_request=recovery['publication'], revision=old_state['revision'] + 1,
                  error='gate retry preflight failed: ActivityError')
@@ -82,7 +82,7 @@ def failed(stopped, monkeypatch):
               'closed_at': '2026-10-13T00:00:00+00:00',
               'request_digest': spec['request_digest'], 'recovery_digest': digest(recovery),
               'result': state}
-    store.project('run-1', phase='blocked', execution_state='blocked', outcome='blocked',
+    store.project(run_id, phase='blocked', execution_state='blocked', outcome='blocked',
                   cleanup='unknown', error=state['error'], checks=state['checks'],
                   candidate=state['candidate'], pull_request=state['pull_request'],
                   iteration=state['iteration'], protocol_revision=state['revision'],
@@ -97,13 +97,18 @@ def failed(stopped, monkeypatch):
 
             return record_tracking(store, _spec, _status, _kw['release'])
         with store._connect() as db:
-            store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
+            store.state.release_work(db, spec['work_id'], 'external:devflow:' + run_id)
         return {'state': 'consistent', 'pending': False}
     monkeypatch.setattr(retry, '_tracker_sync', track)
-    row, *_ = _rows(store, 'run-1')
+    row, *_ = _rows(store, run_id)
     return SimpleNamespace(store=store, spec=spec, row=row, closed=closed, recovery=recovery,
                            original_bytes=original_bytes, admission=admission, old_command=command,
                            old_response=response, broker=broker)
+
+
+@pytest.fixture
+def failed(stopped, monkeypatch):
+    return failed_assessment(stopped, monkeypatch)
 
 
 def close_and_request(fixture):
@@ -211,3 +216,92 @@ def test_resume_rechecks_generation_runtime_and_original_closure(failed, monkeyp
                         lambda *_a, **_kw: (_ for _ in ()).throw(ValueError('closure unavailable')))
     with pytest.raises(ValueError, match='closure unavailable'):
         gates.readback(failed.store, spec, recovery)
+
+
+def test_public_parent_handoff_keeps_exhausted_budget_and_original_worker(service, monkeypatch):
+    from test_delivery_feature_budget_resume import _attempt
+    from test_delivery_feature_integration import integration, role_result
+
+    from devflow_temporal import delivery_feature_activities as activities
+    from devflow_temporal.delivery_broker import DeliveryBroker
+    from devflow_temporal.delivery_config import DeliveryConfig
+    from devflow_temporal.delivery_feature_execution import continue_feature, registry, worker_key
+    from devflow_temporal.delivery_store import DeliveryStore
+
+    # Admit the fixture's advancing integration trunk without a pinned base.
+    original, supplied = service
+    raw = deepcopy(original.config.raw)
+    for repository in raw['repositories'].values():
+        repository.pop('expected_base_sha', None)
+    original.config.path.write_text(json.dumps(raw))
+    service = DeliveryStore(DeliveryConfig.load(original.config.path)), supplied
+    store, parent, child, broker, candidate, member, _ = integration(service, monkeypatch)
+    implemented = role_result(child, broker, candidate)
+    def owned(*_a, **_kw):
+        head = _git(broker.source, 'ls-remote', 'origin',
+                    'refs/heads/' + child['branch']).split()[0]
+        return {'number': 20, 'url': member['url'], 'state': 'OPEN', 'headRefOid': head,
+                'isDraft': False, 'baseRefName': 'main', 'title': 'feat: original chunk'}
+    monkeypatch.setattr(DeliveryBroker, '_existing_pr', owned)
+    publication = broker.publish(0, implemented['candidate'])
+    _git(broker.checkout, 'checkout', '-B', child['branch'])
+    roles = [{'role': 'implement', 'iteration': 0, 'status': 'pass', 'cleanup': 'confirmed',
+              'session_id': 'original-implementation', 'candidate': publication['candidate']},
+             {'role': 'review', 'iteration': 0, 'status': 'findings', 'cleanup': 'confirmed',
+              'session_id': 'historical-review', 'findings': ['Unpassed work']}]
+    for role in roles:
+        _attempt(store, child, role, publication['candidate']['id'])
+    state = {'run_id': child['run_id'], 'revision': 13, 'iteration': 0, 'phase': 'blocked',
+             'execution_state': 'blocked', 'outcome': 'blocked', 'cleanup': 'confirmed',
+             'candidate': publication['candidate'], 'pull_request': publication, 'roles': roles,
+             'checks': {}, 'error': 'repair limit exhausted', 'usage': {}, 'findings': []}
+    store.project(child['run_id'], phase='blocked', execution_state='blocked', outcome='blocked',
+                  cleanup='confirmed', error=state['error'], candidate=state['candidate'],
+                  pull_request=publication, iteration=0, protocol_revision=13,
+                  event_type='blocked', message=state['error'])
+    workflow_id = store.active_workflow_id(child['run_id'])
+    old_closed = {'workflow_id': workflow_id, 'execution_run_id': 'historical-worker',
+                  'request_digest': child['request_digest'], 'recovery_digest': None,
+                  'result': state}
+    with store._connect() as db:
+        store.state.release_work(db, child['work_id'], 'external:devflow:' + child['run_id'])
+    monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_kw: old_closed)
+    monkeypatch.setattr(gates, '_stopped_cleanup', lambda _: {})
+    command = {'continuation_kind': gates.KIND, 'command_id': 'seed-original-assessment',
+               'expected_revision': 13, 'expected_iteration': 0,
+               'expected_candidate_id': state['candidate']['id'], 'expected_pr_number': 20,
+               'expected_pr_head': state['candidate']['head'], 'additional_iterations': 0}
+    fixture = failed_assessment((store, broker, state, old_closed, command), monkeypatch)
+    close_and_request(fixture)
+    shared, token = registry(parent), parent['feature_delivery']['owner']
+    for cycle in range(10):
+        shared.repair(token, 'prior-product-cycle:' + str(cycle), 'Original product repair')
+    shared.finish_worker(token, worker_key(child['run_id'], token), {'cleanup': 'confirmed'})
+    shared.stop(token, 'stopped', {})
+    with store._connect() as db:
+        store.state.release_work(db, parent['work_id'], 'external:devflow:' + parent['run_id'])
+    store.project(parent['run_id'], phase='blocked', execution_state='blocked', outcome='blocked',
+                  cleanup='confirmed', event_type='blocked', message='Worker retained')
+    parent_revision = _rows(store, parent['run_id'])[0]['revision']
+    parent_command = {'command_id': 'continue-existing-parent',
+                      'expected_revision': parent_revision}
+    # Parent and child Temporal transport is modeled, never cancelled or reset.
+    child_closed = deepcopy(fixture.closed)
+    monkeypatch.setattr(store, '_completed_temporal_result', lambda run_id, **kw:
+                        child_closed if run_id == child['run_id'] and kw.get('workflow_id') ==
+                        child_closed['workflow_id'] else old_closed if run_id == child['run_id']
+                        else {'result': {}})
+    accepted = continue_feature(store, parent['run_id'], parent_command)
+    assert continue_feature(store, parent['run_id'], parent_command) == accepted
+    successor = store.effective_spec(accepted['run_id'])
+    row, *_ = _rows(store, child['run_id'])
+    resumed = activities.resume_worker(store, successor, store.effective_spec(child['run_id']), row)
+    assert resumed['resumed'] and resumed['spec']['run_id'] == child['run_id']
+    assert resumed['spec']['gate_retry_generation'] == 2
+    assert resumed['spec']['gate_retry_preflight_generation'] == 1
+    assert gates.readback(store, resumed['spec'], json.loads(
+        _rows(store, child['run_id'])[0]['recovery_json']))['number'] == 20
+    assert shared.budget(token['issue_id'])['used'] == 10
+    assert fixture.admission.read_bytes() == fixture.original_bytes
+    with store._connect() as db:
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
