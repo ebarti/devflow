@@ -418,7 +418,8 @@ async def test_completed_row_accepts_cleanup_composed_by_ordinary_terminal_recon
     assert state['cleanup'] == 'unknown' and row['cleanup'] == 'confirmed'
 
 
-@pytest.mark.parametrize('drift', ['key', 'mixed-writer', 'missing-revision', 'unordered-time'])
+@pytest.mark.parametrize('drift', ['key', 'mixed-writer', 'missing-revision', 'unordered-time',
+                                 'after-baseline'])
 async def test_composed_terminal_baseline_refuses_changed_cleanup_chain(unpublished, drift):
     from devflow_temporal.delivery_closed_projection import (
         failed_terminal_tail,
@@ -442,6 +443,11 @@ async def test_composed_terminal_baseline_refuses_changed_cleanup_chain(unpublis
                        (first['sequence'],))
         elif drift == 'missing-revision':
             db.execute('DELETE FROM delivery_events WHERE sequence=?', (first['sequence'],))
+        elif drift == 'after-baseline':
+            baseline = store.events('run-1')[-1]
+            later = datetime.fromisoformat(baseline['timestamp']) + timedelta(seconds=1)
+            db.execute('UPDATE delivery_events SET timestamp=? WHERE sequence=?',
+                       (later.isoformat(), second['sequence']))
         else:
             db.execute('UPDATE delivery_events SET timestamp=? WHERE sequence=?',
                        (second['timestamp'], first['sequence']))

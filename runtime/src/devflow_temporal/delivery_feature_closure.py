@@ -230,7 +230,8 @@ def _completed_row(store, spec, row, closed, projections):
                          if event['run_revision'] == baseline['run_revision'] - 1
                          and event['type'] == 'resource_cleanup_reconciled'
                          and json.loads(event['payload_json']).get('key') == maintenance_key), None)
-        if previous is not None:
+        if (previous is not None
+                and datetime.fromisoformat(previous['timestamp']) < written_at):
             for projection in projections.values():
                 prior = {**row, **{key: projection.get(key) for key in FIELDS},
                          'protocol_revision': projection.get('protocol_revision'),
