@@ -444,7 +444,7 @@ class DeliveryBroker:
             path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             _git(self.source, "worktree", "add", "--detach", str(path), candidate["head"])
         if resources:
-            resources.created(path)
+            resources.created(path, head=candidate['head'])
         observed = candidate_for(path)
         if observed["id"] != candidate["id"]:
             raise RuntimeError("gate checkout does not match the published candidate")
@@ -674,6 +674,16 @@ class DeliveryBroker:
                     }
                 if native_result.get("interrupted_monitor") is True:
                     interrupted.append(native_result)
+                    if (self.spec['policy'].get('host_sandbox') == 'trusted-local'
+                            and check.get('kind') == 'test'):
+                        from .delivery_resources import RunResources
+
+                        disposal = RunResources(self.spec).cleanup_check_artifacts(
+                            evidence_dir / check['id'] / 'pytest-artifacts',
+                            [Path(item['journal']) for item in interrupted])
+                        if disposal['state'] == 'failed_unknown':
+                            return {'state': 'unknown', 'cleanup': 'unknown',
+                                    'candidate_id': candidate['id'], 'artifact_cleanup': disposal}
                     return {
                         "state": "unknown",
                         "cleanup": "confirmed",
@@ -714,6 +724,7 @@ class DeliveryBroker:
             if range_binding and self._diff_range_binding(checkout, candidate) != range_binding:
                 raise ValueError('tracked diff range changed during controller execution')
             evidence_failure = None
+            artifact_cleanup = None
             if (self.spec["policy"].get("host_sandbox") == "trusted-local"
                     and check.get("kind") == "test"):
                 from .delivery_check_evidence import retain_artifacts
@@ -722,6 +733,15 @@ class DeliveryBroker:
                     check_evidence = retain_artifacts(evidence_dir / check["id"], candidate)
                 except (ValueError, OSError) as exc:
                     evidence_failure = str(exc)
+                finally:
+                    if self.spec['provider'] == 'codex':
+                        from .delivery_resources import RunResources
+
+                        artifact_cleanup = RunResources(self.spec).cleanup_check_artifacts(
+                            evidence_dir / check['id'] / 'pytest-artifacts',
+                            [Path(item['journal']) for item in [*interrupted, native_result]])
+                        if artifact_cleanup['state'] == 'failed_unknown':
+                            evidence_failure = artifact_cleanup['reason']
             parsed_output = visible_output(output)
             count = None
             if check.get("test_count_regex"):
@@ -780,7 +800,9 @@ class DeliveryBroker:
                        if check.get("plan_provenance") else {}),
                     **({"artifacts": check_evidence} if check_evidence else {}),
                     **({"evidence_failure": evidence_failure} if evidence_failure else {}),
-                    "cleanup": "confirmed",
+                    "cleanup": ('unknown' if artifact_cleanup and artifact_cleanup['state']
+                                == 'failed_unknown' else 'confirmed'),
+                    **({'artifact_cleanup': artifact_cleanup} if artifact_cleanup else {}),
                     **({'range_binding': range_binding} if range_binding else {}),
                     **(
                         {
@@ -1047,9 +1069,16 @@ class DeliveryBroker:
         return result
 
     def _register_generated(self, checkout: Path, names: list[str]) -> list[Path]:
+        from .delivery_configured_resources import (
+            declared_generated_directories,
+            workspace_dependency_directories,
+        )
         from .delivery_resources import RunResources, private_directory
 
         resources = RunResources(self.spec)
+        if 'node_modules' in names:
+            names = list(dict.fromkeys([*names, *workspace_dependency_directories(checkout),
+                                       *sorted(declared_generated_directories(self.spec))]))
         roots = []
         for name in names:
             if (not isinstance(name, str) or not Path(name).parts
@@ -1060,7 +1089,8 @@ class DeliveryBroker:
             root = checkout / name
             if _git(checkout, "ls-files", "--", name):
                 raise ValueError("configured generated directory contains tracked source")
-            if name in (self.spec["policy"].get("browser_qa") or {}).get("artifact_paths", []):
+            if (name in (self.spec["policy"].get("browser_qa") or {}).get("artifact_paths", [])
+                    or name in declared_generated_directories(self.spec)):
                 # Regression checks and implementation probes can invoke the
                 # browser fixture before the dedicated browser gate. Reserve its
                 # configured output before any of those commands can create it.

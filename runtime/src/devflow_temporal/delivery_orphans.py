@@ -6,6 +6,7 @@ import fcntl
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,7 +24,7 @@ from .delivery_native_process import (
 from .delivery_native_process import (
     prelaunch_journal as _prelaunch_journal,
 )
-from .delivery_resources import RunResources, read_private
+from .delivery_resources import RunResources, _gate_roots, read_private
 from .supervisor import DeliverySupervisor, get_supervisor
 
 _LOG = logging.getLogger(__name__)
@@ -120,8 +121,15 @@ def _observe_registered_process(spec, path):
     journal = read_private(path)
     intent = journal['intent']
     launch = _launch_binding(path.parent, journal)
+    execution_specs = {}
+    _gate_roots(spec, execution_specs=execution_specs)
+    execution = execution_specs[max((root for root in execution_specs if path.is_relative_to(root)),
+                                    key=lambda root: len(root.parts))]
+    expected_digest = ((execution.get('preparation') or {}).get('measured_policy_digest')
+                       if path.is_relative_to(Path(spec['state_dir']) / 'native-preparation')
+                       else execution['policy_digest']) or execution['policy_digest']
     if (intent['run_id'] != spec['run_id']
-            or intent['policy_digest'] != spec['policy_digest']
+            or intent['policy_digest'] != expected_digest
             or (launch is not None and (
                 intent['argv'] != launch['argv']
                 or intent['environment_sha256'] != digest(launch['environment'])))
@@ -174,6 +182,7 @@ def _reconcile(store, original, spec, closed):
                 'delivery_effects', 'delivery_mutations'))
     observations = []
     resolved = []
+    cleanup_attempted = False
     try:
         for attempt in attempts:
             if attempt['state'] == 'finished':
@@ -188,8 +197,6 @@ def _reconcile(store, original, spec, closed):
             if completed['state'] == 'finished' and completed['cleanup'] == 'confirmed':
                 resolved.append(attempt)
                 observations.append(observation)
-        if not resolved:
-            return
         if any(item['state'] == 'finished' and item['cleanup'] != 'confirmed'
                for item in attempts):
             raise ValueError('completed original role cleanup remains unknown')
@@ -202,6 +209,9 @@ def _reconcile(store, original, spec, closed):
             raise ValueError('original native resource ownership manifest is missing')
         with resources.locked() as manifest:
             processes = list(manifest['processes'])
+            if not resolved and not _disposable_work(manifest, current):
+                return
+            cleanup_attempted = True
         # Attempts finalized before any launch registered no process on purpose.
         with store._connect() as db:
             launched = [row for row in db.execute(
@@ -211,11 +221,12 @@ def _reconcile(store, original, spec, closed):
         if launched and not processes:
             raise ValueError('original native process ownership is missing')
         observations.extend(_observe_registered_process(spec, Path(path)) for path in processes)
+        _unchanged(store, original)
         receipt = resources.finalize(outcome, uncertain=uncertain)
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         receipt = {'state': 'unknown', 'resource_cleanup': 'unknown',
                    'process_cleanup': 'unknown', 'reason': str(exc)[:300]}
-    if not resolved:
+    if not resolved and not cleanup_attempted:
         return
     current = _unchanged(store, original)
     checks = {**json.loads(current['checks_json'] or '{}'), 'resource_cleanup': receipt}
@@ -228,11 +239,69 @@ def _reconcile(store, original, spec, closed):
                     'resource_cleanup': receipt}))
 
 
+def _disposable_work(manifest, row):
+    finalization = manifest.get('finalization', {})
+    if (finalization.get('state') == 'confirmed'
+            and (row['cleanup'] == 'unknown' or json.loads(row['checks_json'] or '{}').get(
+                'resource_cleanup', {}).get('resource_cleanup') != 'confirmed')):
+        return True  # Finalizer committed, but its projection acknowledgement was lost.
+    return any(entry['kind'] != 'checkout' and os.path.lexists(raw)
+               for raw, entry in manifest.get('roots', {}).items()) or (
+                   manifest.get('finalization', {}).get('state') == 'running')
+
+
 def _unfinished_rows(store):
+    # Provider attempts keep their existing maintenance cadence. Supplemental
+    # check/preparation/finalizer custody is bounded and inspected once per
+    # minute, rather than walking the full historical filesystem every pump.
     with store._connect() as db:
-        return [dict(row) for row in db.execute(
+        rows = [dict(row) for row in db.execute(
             "SELECT r.* FROM delivery_runs r WHERE EXISTS (SELECT 1 FROM delivery_attempts a "
             "WHERE a.run_id=r.run_id AND a.state!='finished')")]
+        now = time.monotonic()
+        if now < getattr(store, '_native_cleanup_scan_after', 0):
+            return rows
+        store._native_cleanup_scan_after = now + 60
+        cursor = getattr(store, '_native_cleanup_scan_cursor', 0)
+        supplemental = [dict(row) for row in db.execute(
+            "SELECT r.rowid AS cleanup_rowid,r.* FROM delivery_runs r WHERE r.rowid>? "
+            "AND NOT EXISTS (SELECT 1 FROM delivery_attempts a "
+            "WHERE a.run_id=r.run_id AND a.state!='finished') ORDER BY r.rowid LIMIT 64",
+            (cursor,))]
+        store._native_cleanup_scan_cursor = (supplemental[-1]['cleanup_rowid']
+                                            if len(supplemental) == 64 else 0)
+    seen = getattr(store, '_native_cleanup_seen', {})
+    store._native_cleanup_seen = seen
+    for row in supplemental:
+        row.pop('cleanup_rowid')
+        try:
+            spec = json.loads(row['request_json'])
+            state = Path(spec['state_dir'])
+            manifest_path = state / 'resources/manifest.json'
+            if (not state.is_absolute() or state.name != row['run_id']
+                    or manifest_path.resolve() != manifest_path or not manifest_path.exists()):
+                continue
+            recovery = json.loads(row['recovery_json']) if row['recovery_json'] else None
+            if recovery and recovery.get('kind') == 'execution_policy_recovery':
+                continue  # Preserve the historical policy recovery receipt contract.
+            info = manifest_path.stat()
+            signature = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size,
+                         row['workflow_id'], row['recovery_json'],
+                         row['cleanup'], row['checks_json'])
+            if seen.get(row['run_id']) == signature:
+                continue
+            manifest = read_private(manifest_path)
+            if manifest.get('run_id') != row['run_id']:
+                continue
+            if manifest.get('finalization', {}).get('state') == 'confirmed':
+                if len(seen) >= 512:
+                    seen.pop(next(iter(seen)))
+                seen[row['run_id']] = signature
+            if _disposable_work(manifest, row):
+                rows.append(row)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # A changed or unreadable manifest supplies no cleanup authority.
+    return rows
 
 
 def _owned_native_spec(store, run_id):
@@ -241,6 +310,16 @@ def _owned_native_spec(store, run_id):
             or spec['policy'].get('execution_backend') != 'native-macos'
             or not store.owns_execution(spec)):
         return None
+    # Ordinary transient-stop cleanup belongs to the existing retry owner.
+    with store._connect() as db:
+        row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
+        unfinished = db.execute("SELECT 1 FROM delivery_attempts WHERE run_id=? "
+                                "AND state!='finished' LIMIT 1", (run_id,)).fetchone()
+    if row is not None and unfinished is None:
+        from .delivery_automatic_retry import eligible
+
+        if eligible(dict(row), spec):
+            return None
     return spec
 
 

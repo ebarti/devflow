@@ -249,6 +249,7 @@ def _launch(config: DeliveryConfig, name: str, argv: list[str]) -> dict:
     with os.fdopen(descriptor, "ab") as stream:
         process = subprocess.Popen(
             argv,
+            cwd=config.state_root,
             stdin=subprocess.DEVNULL,
             stdout=stream,
             stderr=stream,

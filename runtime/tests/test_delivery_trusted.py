@@ -457,7 +457,7 @@ def test_actual_broker_preserves_binary_evidence_after_resource_finalization(nat
     assert manifest['count'] == 2
     assert all(Path(item['path']).exists() for item in manifest['artifacts'])
     indexed = store.evidence_index(spec['run_id'])
-    pdf = next(item for item in indexed if item['label'] == 'trial.pdf')
+    pdf = next(item for item in indexed if item['label'] == 'fixtures/trial.pdf')
     value = store.evidence(spec['run_id'], pdf['id'])
     assert base64.b64decode(value['base64']) == b'%PDF-1.7 Synthetic'
     assert value['sha256'] == hashlib.sha256(b'%PDF-1.7 Synthetic').hexdigest()
