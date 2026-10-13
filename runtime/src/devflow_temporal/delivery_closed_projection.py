@@ -38,6 +38,59 @@ def _same_row(row, projection):
                     for key, column in JSON_FIELDS.items()))
 
 
+def _cleanup_row(row, spec, description, scheduled, events):
+    """Prove one postclosure cleanup write over an exact history-bound projection.
+
+    Native maintenance's keyed projection binds the closure and finalization
+    receipt. Its process observations are retained in that receipt; no newer
+    delivery field, protocol step or unaccounted row revision may be composed.
+    """
+    checks = json.loads(row["checks_json"] or "{}")
+    receipt = checks.get("resource_cleanup")
+    if (not isinstance(receipt, dict) or not isinstance(receipt.get("processes"), list)
+            or row["cleanup"] not in {"confirmed", "unknown"}
+            or receipt.get("state") != row["cleanup"]
+            or receipt.get("resource_cleanup") != row["cleanup"]):
+        return None
+    closed = {"workflow_id": description.id, "execution_run_id": description.run_id,
+              "closed_at": description.close_time.isoformat(), "status": "COMPLETED"}
+    key = digest({"closed_workflow": closed, "native_observations": receipt["processes"],
+                  "resource_cleanup": receipt})
+    maintenance = next((event for event in reversed(events)
+                        if event["type"] == "resource_cleanup_reconciled"
+                        and event["run_revision"] == row["revision"]
+                        and json.loads(event["payload_json"]).get("key") == key), None)
+    if (maintenance is None
+            or datetime.fromisoformat(maintenance["timestamp"]) <= description.close_time
+            or datetime.fromisoformat(row["updated_at"])
+            > datetime.fromisoformat(maintenance["timestamp"])):
+        return None
+    for projection in reversed(list(scheduled.values())):
+        if (projection.get("spec") != spec
+                or projection.get("protocol_revision") != row["protocol_revision"]
+                or projection.get("key") != (
+                    f"{projection.get('event_type')}:{projection.get('iteration')}:"
+                    f"{projection.get('protocol_revision')}")
+                or {k: v for k, v in checks.items() if k != "resource_cleanup"}
+                != {k: v for k, v in (projection.get("checks") or {}).items()
+                    if k != "resource_cleanup"}):
+            continue
+        original = {**row, "cleanup": projection.get("cleanup"),
+                    "checks_json": json.dumps(projection.get("checks"))}
+        if not _same_row(original, projection):
+            continue
+        event = next((event for event in reversed(events)
+                      if event["sequence"] < maintenance["sequence"]
+                      and event["run_revision"] == row["revision"] - 1
+                      and event["type"] == projection["event_type"]
+                      and json.loads(event["payload_json"]).get("key") == projection["key"]), None)
+        if event is not None and datetime.fromisoformat(event["timestamp"]) <= (
+                description.close_time):
+            return {**original, "revision": event["run_revision"],
+                    "updated_at": event["timestamp"]}, event, receipt
+    return None
+
+
 def _terminal_request(projection):
     """A terminal event, or the closed tracker deadline that replaced it, binds a row."""
     event = projection.get("event_type")
@@ -246,11 +299,24 @@ async def _reconcile_terminal(store, row, spec, description, state, history, fai
     if observations:
         # An already reconciled execution cannot overwrite any subsequent row.
         return {"state": "observed", "key": key}
+    current = row
+    maintained = _cleanup_row(row, spec, description, scheduled, events)
+    if maintained:
+        row, last_event, receipt = maintained
+        desired = {**desired, "cleanup": current["cleanup"],
+                   "checks": {**desired["checks"], "resource_cleanup": deepcopy(receipt)}}
+    else:
+        # Observations do not write the row: bind its committing event to a
+        # scheduled request instead of interpreting an arbitrary trailing event.
+        keys = {request["key"] for request in scheduled.values() if request.get("key")}
+        last_event = next((event for event in reversed(events)
+                           if event["run_revision"] == row["revision"]
+                           and json.loads(event["payload_json"]).get("key") in keys), None)
     if row["protocol_revision"] == projection["protocol_revision"]:
         # The activity may have committed before losing its response. Preserve
         # that original event and add only the finished-result observation.
-        last_key = json.loads(events[-1]["payload_json"]).get("key") if events else None
-        if not events or events[-1]["run_revision"] != row["revision"]:
+        last_key = json.loads(last_event["payload_json"]).get("key") if last_event else None
+        if last_event is None:
             raise ValueError("completed projection would overwrite a newer row")
         if last_key == projection["key"]:
             if not _same_row(row, projection):
@@ -273,7 +339,7 @@ async def _reconcile_terminal(store, row, spec, description, state, history, fai
         store.project, run_id,
         **{name: desired.get(name) for name in (*FIELDS, *JSON_FIELDS, "protocol_revision")},
         event_type=EVENT, message="Observed the authentic completed controller terminal result",
-        key=key, expected_revision=row["revision"],
+        key=key, expected_revision=current["revision"], expected_row=current,
     )
     return {"state": "reconciled", "key": key}
 
