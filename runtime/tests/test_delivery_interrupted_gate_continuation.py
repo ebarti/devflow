@@ -324,7 +324,9 @@ def test_reserve_rearms_only_fresh_gates_and_keeps_exhausted_budget(
     assert recovery['candidate']['id'] == f.state['candidate']['id']
     assert recovery['publication']['head'] == f.state['pull_request']['head']
     assert recovery['seal']['attribution_observation'] == f.proof
-    assert not preflight.interrupted({'recovery_json': json.dumps(recovery)})
+    assert not preflight.interrupted({'recovery_json': json.dumps(recovery),
+                                     'checks_json': json.dumps(f.state['checks']),
+                                     'error': f.state['error']})
     assert gates.readback(f.store, spec, recovery)['number'] == 7
     assert f.shared.budget(f.token['issue_id']) == budget
     flow, calls = DeliveryWorkflow(), []
