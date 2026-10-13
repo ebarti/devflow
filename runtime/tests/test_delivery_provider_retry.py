@@ -72,7 +72,7 @@ def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
     real_sleep = asyncio.sleep
 
     async def controlled_backoff(seconds):
-        assert seconds in (1, 2) and type(seconds) is int
+        assert seconds in (1, 2, 4, 8, 16, 32, 60) and type(seconds) is int
         control["backoffs"].append(seconds)
         if hold_backoff:
             await asyncio.Event().wait()
@@ -81,7 +81,7 @@ def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
 
     # Intercept only this module's backoff, preserving the kit/event loop clocks.
     monkeypatch.setattr(delivery_native_threads, "asyncio",
-                        SimpleNamespace(sleep=controlled_backoff))
+                        SimpleNamespace(sleep=controlled_backoff, timeout=asyncio.timeout))
 
     class Handle:
         def __init__(self, sequence, error):
@@ -138,8 +138,7 @@ def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
 
         @wraps(AsyncThread.turn)
         async def turn(self, *args, **kwargs):
-            assert control["backoffs"][self.backoff_start:] == [
-                2 ** attempt for attempt in range(self.attempts)]
+            assert len(control["backoffs"][self.backoff_start:]) == self.attempts
             self.attempts += 1
             error = errors[len(calls)] if len(calls) < len(errors) else None
             calls.append({"thread": self.id, "args": args, "kwargs": kwargs})
@@ -165,8 +164,8 @@ def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
         async def __aexit__(self, *_args):
             control["exited"].append(self)
             if not hold_backoff:
-                assert control["backoffs"][self.backoff_start:] == [
-                    2 ** attempt for attempt in range(len(calls) - self.call_start - 1)]
+                assert len(control["backoffs"][self.backoff_start:]) == (
+                    len(calls) - self.call_start - 1)
 
         @wraps(AsyncCodex.thread_start)
         async def thread_start(self, **_kwargs):
@@ -272,23 +271,23 @@ async def test_typed_rejected_start_retries_with_original_error(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_rpc_and_completed_failures_share_one_attempt_budget(tmp_path, monkeypatch):
+async def test_capacity_does_not_consume_the_transport_attempt_budget(tmp_path, monkeypatch):
     rejected = ServerBusyError(-32000, "Controlled overload")
     runtime, task, observation, calls, *_ = harness(
-        tmp_path, monkeypatch, [rejected, "rateLimitExceeded", "rateLimitExceeded"])
+        tmp_path, monkeypatch, [rejected] + ["internalServerError"] * 3)
     result = await runtime.run(task)
-    assert not result.is_success and len(calls) == 3
-    assert len(read_private(observation.path)["turns"]) == 3
-    assert result.usage.total_tokens == 28
+    assert not result.is_success and len(calls) == 4
+    assert len(read_private(observation.path)["turns"]) == 4
+    assert result.usage.total_tokens == 42
 
 
 @pytest.mark.asyncio
-async def test_rejected_start_exhaustion_never_extends_attempt_budget(tmp_path, monkeypatch):
+async def test_rejected_capacity_start_waits_until_success(tmp_path, monkeypatch):
     rejected = ServerBusyError(-32000, "Controlled overload")
     runtime, task, observation, calls, *_ = harness(tmp_path, monkeypatch, [rejected] * 4)
-    with pytest.raises(ServerBusyError):
-        await runtime.run(task)
-    assert len(calls) == 3 and len(read_private(observation.path)["turns"]) == 3
+    result = await runtime.run(task)
+    assert result.is_success
+    assert len(calls) == 5 and len(read_private(observation.path)["turns"]) == 5
 
 
 @pytest.mark.asyncio

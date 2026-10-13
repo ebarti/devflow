@@ -21,7 +21,26 @@ from .delivery_feature_revision_subject import (
     _time,
     full_candidate,
 )
+from .delivery_provider_capacity import capacity_error
 from .delivery_resources import _ancestors
+
+
+def _successful_turns(records, session):
+    for index, record in enumerate(records):
+        turn = record.get("turn") or {}
+        if record.get("thread_id") != session:
+            return False
+        if turn.get("status") == "completed" and turn.get("error") is None:
+            continue
+        if index == len(records) - 1:
+            return False
+        if (turn.get("status") == "failed"
+                and capacity_error((turn.get("error") or {}).get("codexErrorInfo"))):
+            continue
+        if not turn and (record.get("start_error") or {}).get("type") == "ServerBusyError":
+            continue
+        return False
+    return bool(records)
 
 
 def _bytes(path):
@@ -144,10 +163,7 @@ def _native_pass(spec, row, attempts, candidate):
                 "resumed_from": resumed, "new_child_thread_ids": [], "collaboration_items": [],
             }.items())
             or not observation.get("start_identity") or not observation.get("turns")
-            or any((turn.get("turn") or {}).get("status") != "completed"
-                   or (turn.get("turn") or {}).get("error") is not None
-                   or turn.get("thread_id") != attempt["session_id"]
-                   for turn in observation["turns"])):
+            or not _successful_turns(observation["turns"], attempt["session_id"])):
         raise ValueError("completed build lost its actual native thread observation")
     return {"job_key": attempt["job_key"], "request_sha256": digest(request),
             "result_sha256": digest(result), "native_journal_sha256": digest(journal),
