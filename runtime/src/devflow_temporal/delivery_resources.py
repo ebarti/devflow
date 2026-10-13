@@ -545,7 +545,11 @@ class RunResources:
                     # Temp-file deletion cannot invalidate resumable durable state.
                     # A new generation is allowed only after the old actors and
                     # their launch leases are gone, never for candidate/session data.
-                    with self._closed_journals(manifest, manifest['processes']):
+                    with self._closed_journals(manifest, manifest['processes'], unstarted=(
+                            Path(raw).parent / name
+                            for raw, entry in manifest['roots'].items()
+                            if entry['kind'] == 'check-artifacts'
+                            for name in ('native', 'native-retry'))):
                         old['receipt'] = {'path': str(path), 'kind': kind,
                                           'state': 'already_absent', 'external_removal': True}
                 if (

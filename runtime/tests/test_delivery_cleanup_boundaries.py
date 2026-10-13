@@ -379,3 +379,33 @@ def test_clean_recorded_gate_preserves_unique_commit_after_original_candidate_ro
     assert 'preserved candidate proof' in observation['reason']
     assert gate.exists() and (gate / 'file').read_text() == 'unique committed candidate'
     assert (checkout / 'file').read_text() == 'base'
+
+
+
+def test_missing_execution_scratch_refuses_an_original_unjournaled_check_lease(
+    tmp_path, monkeypatch,
+):
+    import fcntl
+    import os
+
+    owned = spec(tmp_path)
+    resources = RunResources(owned)
+    short = tmp_path / 'short'
+    monkeypatch.setattr(RunResources, '_execution_scratch_root', lambda _: short)
+    scratch = resources.execution_scratch('checks', 'owned')
+    raw = resources.check_artifacts(Path(owned['state_dir']) / 'checks/0/owned/pytest-artifacts')
+    folder = raw.parent / 'native'
+    folder.mkdir(mode=0o700)
+    descriptor = os.open(folder / 'native-monitor.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        shutil.rmtree(short)
+        with pytest.raises(BlockingIOError):
+            resources.execution_scratch('checks', 'owned')
+        assert not short.exists()
+        assert read_private(resources.manifest)['roots'][str(short)].get('generation', 0) == 0
+    finally:
+        os.close(descriptor)
+    assert resources.execution_scratch('checks', 'owned') == scratch
+    assert read_private(resources.manifest)['roots'][str(short)]['generation'] == 1
+    assert resources.finalize('blocked')['resource_cleanup'] == 'confirmed'
