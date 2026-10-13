@@ -10,6 +10,7 @@ import pytest
 
 from devflow_temporal import delivery_feature_revision_recovery as revision
 from devflow_temporal import delivery_orphans as orphans
+from devflow_temporal import delivery_resources as resources
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_feature_revision_recovery import compact_recovery
 from devflow_temporal.delivery_resources import (
@@ -202,3 +203,28 @@ def test_observation_batch_refuses_admission_drift_before_next_reconciliation(ch
     with pytest.raises(ValueError, match='immutable command authority'):
         list(orphans._observe_registered_processes(spec, paths))
     assert reconciled == paths[:1]
+
+
+@pytest.mark.parametrize('chain', [True], indirect=True, ids=['compact'])
+def test_warm_memo_refuses_custody_replaced_after_private_read(chain, monkeypatch):
+    _, _, current, _ = chain
+    memo = {}
+    revision.retained_recovery(current, memo=memo)
+    path = Path(current['custody_ref']['path'])
+    read = resources.read_private
+    changed = False
+
+    def read_then_replace(selected, *, raw=False):
+        nonlocal changed
+        content = read(selected, raw=raw)
+        if selected == path and raw and not changed:
+            changed = True
+            value = json.loads(content)
+            value['state']['phase'] = 'changed-after-private-read'
+            write_private(path, value)
+        return content
+
+    monkeypatch.setattr(resources, 'read_private', read_then_replace)
+    with pytest.raises(ValueError, match='custody bytes changed'):
+        revision.retained_recovery(current, memo=memo)
+    assert changed

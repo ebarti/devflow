@@ -350,7 +350,8 @@ def retained_recovery(recovery, *, memo=None):
     if path != expected or path.resolve(strict=True) != path:
         raise ValueError("revision worker custody reference escaped its sealed namespace")
     content = read_private(path, raw=True)
-    if hashlib.sha256(content).hexdigest() != reference.get("sha256"):
+    if (hashlib.sha256(content).hexdigest() != reference.get("sha256")
+            or read_private(path, raw=True) != content):
         raise ValueError("retained revision worker custody bytes changed")
     if memo is not None and path in memo and memo[path][0] == recovery:
         # The envelope and freshly authenticated bytes are exact. Give each
