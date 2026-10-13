@@ -145,6 +145,30 @@ def admit(store, db, spec, observed=None):
     spec.setdefault("publication_base_ref", snapshot["default_branch"])
 
 
+def _worker_assignment(store, spec):
+    feature = spec["feature_delivery"]
+    shared = registry(spec)
+    current = shared.current(feature["owner"]["issue_id"])
+    if current is None or current["state"] not in {"active", "draining"}:
+        raise OwnershipConflict("worker's feature has no active coordinator")
+    with shared.connect() as db:
+        row = db.execute(
+            "SELECT * FROM execution_workers WHERE issue_id=? AND worker_key=?",
+            (current["issue_id"], worker_key(spec["run_id"], current)),
+        ).fetchone()
+    if not row or row["generation"] != current["generation"] or row["state"] == "finished":
+        raise OwnershipConflict("worker no longer has an active execution assignment")
+    identity = spec.get("feature_plan_revision")
+    from .delivery_feature_revisions import adopted_plan_identity
+
+    adopted = adopted_plan_identity(spec, shared=shared)
+    bound_adopted = {key: adopted[key] for key in ("plan_revision", "plan_digest")}
+    if ((identity is not None and identity != bound_adopted)
+            or (identity is None and adopted["plan_revision"] > 1)):
+        raise OwnershipConflict("worker belongs to a superseded feature plan revision")
+    return shared, current, row
+
+
 def require_execution(store, spec, *, allow_stopped=False):
     feature = spec.get("feature_delivery")
     if not feature:
@@ -156,24 +180,7 @@ def require_execution(store, spec, *, allow_stopped=False):
         # old Temporal execution remains fenced by the exact workflow ID.
         from temporalio import activity
 
-        current = shared.current(feature["owner"]["issue_id"])
-        if current is None or current["state"] not in {"active", "draining"}:
-            raise OwnershipConflict("worker's feature has no active coordinator")
-        with shared.connect() as db:
-            row = db.execute(
-                "SELECT * FROM execution_workers WHERE issue_id=? AND worker_key=?",
-                (current["issue_id"], worker_key(spec["run_id"], current)),
-            ).fetchone()
-        if not row or row["generation"] != current["generation"] or row["state"] == "finished":
-            raise OwnershipConflict("worker no longer has an active execution assignment")
-        identity = spec.get("feature_plan_revision")
-        from .delivery_feature_revisions import adopted_plan_identity
-
-        adopted = adopted_plan_identity(spec, shared=shared)
-        bound_adopted = {key: adopted[key] for key in ("plan_revision", "plan_digest")}
-        if ((identity is not None and identity != bound_adopted)
-                or (identity is None and adopted["plan_revision"] > 1)):
-            raise OwnershipConflict("worker belongs to a superseded feature plan revision")
+        _worker_assignment(store, spec)
         if activity.in_activity() and (
             activity.info().workflow_id != store.active_workflow_id(spec["run_id"])
         ):
@@ -184,6 +191,35 @@ def require_execution(store, spec, *, allow_stopped=False):
             allowed = {"active", "draining", "stopped"} if allow_stopped else {"active", "draining"}
             if current["state"] not in allowed:
                 raise OwnershipConflict("feature coordinator is stopped")
+
+
+def require_worker_handoff(store, spec):
+    """Authorize coordinator reservation without granting worker activity authority."""
+    from temporalio import activity
+
+    from .delivery_feature_pass import checkpoints
+
+    if not spec.get("feature_worker"):
+        raise OwnershipConflict("worker handoff requires its retained assignment")
+    if not activity.in_activity() or (
+        activity.info().workflow_id == store.active_workflow_id(spec["run_id"])
+    ):
+        require_execution(store, spec)
+        return
+    shared, current, assignment = _worker_assignment(store, spec)
+    parent = store.effective_spec(current["run_id"])
+    child = spec["feature_worker"]
+    bound = checkpoints(parent).get(f"assignment:{child['chunk_id']}:{child['kind']}")
+    if (activity.info().activity_type != "delivery_feature_reserve"
+            or activity.info().workflow_id != store.active_workflow_id(current["run_id"])
+            or current["store_path"] != str(store.config.tracking_db)
+            or parent.get("feature_worker")
+            or parent.get("feature_delivery", {}).get("owner") != shared.token(current)
+            or assignment["workstream_id"] != child["workstream_id"]
+            or bound != {"run_id": spec["run_id"], "store_path": current["store_path"],
+                         "chunk_id": child["chunk_id"], "kind": child["kind"]}):
+        raise OwnershipConflict("worker handoff does not belong to its current coordinator")
+    require_execution(store, parent)
 
 
 def worker_key(run_id, token):

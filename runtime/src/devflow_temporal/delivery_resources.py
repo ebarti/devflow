@@ -267,7 +267,9 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None) -> tuple[Pat
                             recovery['execution_spec'].get('gate_retry_generation', 1),
                             recovery['execution_spec'].get('gate_retry_stage'),
                             preflight_generation=recovery['execution_spec'].get(
-                                'gate_retry_preflight_generation', 0))
+                                'gate_retry_preflight_generation', 0),
+                            prepared_handoff=recovery['execution_spec'].get(
+                                'gate_retry_prepared_handoff', 0))
                         _ancestors(state / admitted_namespace / 'admission.json')
                         admission = read_private(state / admitted_namespace / 'admission.json')
                         admitted = db.execute(

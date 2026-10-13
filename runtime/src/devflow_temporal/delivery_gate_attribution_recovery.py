@@ -82,7 +82,8 @@ def _gate_ancestor(store, transport):
     if prior and prior.get('execution_spec', {}).get('gate_retry_preflight_generation'):
         path = Path(prior['execution_spec']['state_dir']) / gate_namespace(
             prior['execution_spec']['gate_retry_generation'],
-            prior['execution_spec'].get('gate_retry_stage'), preflight_generation=1)
+            prior['execution_spec'].get('gate_retry_stage'), preflight_generation=1,
+            prepared_handoff=prior['execution_spec'].get('gate_retry_prepared_handoff', 0))
         if (prior['execution_spec']['gate_retry_preflight_generation'] != 1
                 or read_private(path / 'admission.json') != prior
                 or prior.get('seal', {}).get('preflight_continuation', {}).get('recovery_digest')

@@ -218,14 +218,23 @@ def test_resume_rechecks_generation_runtime_and_original_closure(failed, monkeyp
         gates.readback(failed.store, spec, recovery)
 
 
-def test_public_parent_handoff_keeps_exhausted_budget_and_original_worker(service, monkeypatch):
+@pytest.mark.parametrize('prepared_orphan', [False, True])
+def test_public_parent_handoff_keeps_exhausted_budget_and_original_worker(
+        service, monkeypatch, prepared_orphan):
+    from dataclasses import replace
+
+    from temporalio.testing import ActivityEnvironment
     from test_delivery_feature_budget_resume import _attempt
     from test_delivery_feature_integration import integration, role_result
 
+    from devflow_temporal import delivery_activities
     from devflow_temporal import delivery_feature_activities as activities
+    from devflow_temporal import delivery_feature_execution as execution
     from devflow_temporal.delivery_broker import DeliveryBroker
     from devflow_temporal.delivery_config import DeliveryConfig
+    from devflow_temporal.delivery_execution_registry import OwnershipConflict
     from devflow_temporal.delivery_feature_execution import continue_feature, registry, worker_key
+    from devflow_temporal.delivery_feature_pass import checkpoint_key
     from devflow_temporal.delivery_store import DeliveryStore
 
     # Admit the fixture's advancing integration trunk without a pinned base.
@@ -274,6 +283,10 @@ def test_public_parent_handoff_keeps_exhausted_budget_and_original_worker(servic
     fixture = failed_assessment((store, broker, state, old_closed, command), monkeypatch)
     close_and_request(fixture)
     shared, token = registry(parent), parent['feature_delivery']['owner']
+    shared.checkpoint(token, checkpoint_key(child, 'assignment:' + child['feature_worker'][
+        'chunk_id'] + ':chunk'), {'run_id': child['run_id'],
+                                  'store_path': str(store.config.tracking_db),
+                                  'chunk_id': child['feature_worker']['chunk_id'], 'kind': 'chunk'})
     for cycle in range(10):
         shared.repair(token, 'prior-product-cycle:' + str(cycle), 'Original product repair')
     shared.finish_worker(token, worker_key(child['run_id'], token), {'cleanup': 'confirmed'})
@@ -291,16 +304,98 @@ def test_public_parent_handoff_keeps_exhausted_budget_and_original_worker(servic
                         child_closed if run_id == child['run_id'] and kw.get('workflow_id') ==
                         child_closed['workflow_id'] else old_closed if run_id == child['run_id']
                         else {'result': {}})
+    recorded_closure = store._completed_temporal_result
+    monkeypatch.setattr(DeliveryStore, '_completed_temporal_result',
+                        lambda _self, *args, **kwargs: recorded_closure(*args, **kwargs))
     accepted = continue_feature(store, parent['run_id'], parent_command)
     assert continue_feature(store, parent['run_id'], parent_command) == accepted
     successor = store.effective_spec(accepted['run_id'])
-    row, *_ = _rows(store, child['run_id'])
-    resumed = activities.resume_worker(store, successor, store.effective_spec(child['run_id']), row)
+    # Only GitHub/Temporal transport and original native proof are fixture seams;
+    # reserve, registry assignment, gate admission and worker authorization run.
+    monkeypatch.setattr(activities, 'current_record', lambda s: {
+        'manifest': {'plan': json.loads(s['accepted_plan']), 'publication': {'members': [member]}}})
+    env = ActivityEnvironment()
+    env.info = replace(env.info, activity_type='delivery_feature_reserve',
+                       workflow_id=store.active_workflow_id(successor['run_id']))
+    request = {'spec': successor, 'chunk_id': child['feature_worker']['chunk_id'], 'kind': 'chunk'}
+    base = Path(child['state_dir']) / 'published-gates-admission-2/preflight-continuation'
+    old_worker_workflow = store.active_workflow_id(child['run_id'])
+    if prepared_orphan:
+        with monkeypatch.context() as before:
+            correct_handoff = execution.require_worker_handoff
+            guards = []
+            def legacy_commit_guard(given_store, given_spec):
+                guards.append(True)
+                return (correct_handoff if len(guards) == 1 else execution.require_execution)(
+                    given_store, given_spec)
+            before.setattr(execution, 'require_worker_handoff', legacy_commit_guard)
+            with pytest.raises(OwnershipConflict, match='superseded workflow'):
+                asyncio.run(env.run(activities.delivery_feature_reserve, request))
+        orphan = (base / 'admission.json').read_bytes()
+        old_command = json.loads(orphan)['command']['command_id']
+        unrelated = json.loads(orphan)
+        unrelated['command']['command_id'] = 'unrelated-prepared-command'
+        with pytest.raises(ValueError, match='exact coordinator command'):
+            preflight._prepared_coordinator(store, unrelated)
+        assert not (base / 'prepared-handoff').exists()
+        with store._connect() as db:
+            assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
+                                  (old_command,)).fetchone()
+        assert store.active_workflow_id(child['run_id']) == old_worker_workflow
+        # A later public coordinator has a distinct server command and runtime
+        # preparation namespace; the orphan producer bytes remain historical.
+        token2 = successor['feature_delivery']['owner']
+        shared.finish_worker(token2, worker_key(child['run_id'], token2), {'cleanup': 'confirmed'})
+        shared.stop(token2, 'stopped', {})
+        with store._connect() as db:
+            store.state.release_work(
+                db, successor['work_id'], 'external:devflow:' + successor['run_id'])
+        store.project(successor['run_id'], phase='blocked', execution_state='blocked',
+                      outcome='blocked', cleanup='confirmed', event_type='blocked',
+                      message='Handoff refused')
+        next_parent = continue_feature(store, successor['run_id'], {
+            'command_id': 'continue-after-unadmitted-handoff',
+            'expected_revision': _rows(store, successor['run_id'])[0]['revision']})
+        successor = store.effective_spec(next_parent['run_id'])
+        request['spec'] = successor
+        env.info = replace(env.info, workflow_id=store.active_workflow_id(successor['run_id']))
+    before_files = {str(p): p.read_bytes() for p in base.rglob('*') if p.is_file()}
+    for info in (replace(env.info, workflow_id='unrelated-workflow'),
+                 replace(env.info, activity_type='delivery_local_checks')):
+        wrong = ActivityEnvironment()
+        wrong.info = info
+        with pytest.raises(OwnershipConflict, match='current coordinator'):
+            asyncio.run(wrong.run(activities.delivery_feature_reserve, request))
+        assert not (base / 'prepared-handoff').exists()
+    resumed = asyncio.run(env.run(activities.delivery_feature_reserve, request))
     assert resumed['resumed'] and resumed['spec']['run_id'] == child['run_id']
     assert resumed['spec']['gate_retry_generation'] == 2
     assert resumed['spec']['gate_retry_preflight_generation'] == 1
-    assert gates.readback(store, resumed['spec'], json.loads(
-        _rows(store, child['run_id'])[0]['recovery_json']))['number'] == 20
+    recovery = json.loads(_rows(store, child['run_id'])[0]['recovery_json'])
+    worker_env = ActivityEnvironment()
+    worker_env.info = replace(worker_env.info, activity_type='delivery_gates_readback',
+                              workflow_id=resumed['workflow_id'])
+    observed = asyncio.run(worker_env.run(delivery_activities.delivery_gates_readback,
+                                         {'spec': resumed['spec'], 'recovery': recovery}))
+    assert observed['number'] == 20
+    # Next native role entry uses the same strict active worker workflow fence.
+    _, active_broker = worker_env.run(delivery_activities._context, resumed['spec'])
+    assert active_broker.candidate() == recovery['candidate']
+    with pytest.raises(OwnershipConflict, match='superseded workflow'):
+        env.run(delivery_activities._context, resumed['spec'])
+    stale_worker = ActivityEnvironment()
+    stale_worker.info = replace(worker_env.info, workflow_id=old_worker_workflow)
+    with pytest.raises(OwnershipConflict, match='superseded workflow'):
+        stale_worker.run(delivery_activities._context, resumed['spec'])
+    replay = asyncio.run(env.run(activities.delivery_feature_reserve, request))
+    assert replay['spec'] == resumed['spec'] and replay['workflow_id'] == resumed['workflow_id']
+    if prepared_orphan:
+        assert resumed['spec']['gate_retry_prepared_handoff'] == 1
+        assert recovery['seal']['prepared_handoff']['coordinator']['owner'] == token2
+        assert (base / 'admission.json').read_bytes() == orphan
+        assert recovery['command']['command_id'] != old_command
+        for name, raw in before_files.items():
+            assert Path(name).read_bytes() == raw
     assert shared.budget(token['issue_id'])['used'] == 10
     assert fixture.admission.read_bytes() == fixture.original_bytes
     with store._connect() as db:

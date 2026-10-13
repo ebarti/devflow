@@ -486,6 +486,10 @@ def admit(store, run_id, payload, *, preflight=False):
     spec = seal['original_spec']
     generation = seal['generation']
     preflight_generation = 1 if 'preflight_continuation' in seal else 0
+    if preflight_generation and spec.get('feature_worker'):
+        from .delivery_feature_execution import require_worker_handoff
+
+        require_worker_handoff(store, spec)
     root = Path(spec['state_dir']) / gate_namespace(
         generation, seal['stage'], preflight_generation=preflight_generation)
     with _lock(root / 'controller.lock'):
@@ -496,6 +500,17 @@ def admit(store, run_id, payload, *, preflight=False):
             if prior['request_digest'] != command_digest:
                 raise ValueError('command ID already belongs to different inputs')
             return json.loads(prior['response_json'])
+        prepared = None
+        if preflight_generation:
+            from .delivery_gate_preflight_continuation import prepared_handoff
+
+            prepared = prepared_handoff(store, seal, root)
+            if prepared:
+                from .delivery_resources import private_directory
+
+                seal['prepared_handoff'] = prepared
+                root = root / 'prepared-handoff'
+                private_directory(root)
         if spec['provider'] != 'fake' and _git(
                 Path(__file__).resolve().parents[3], 'status', '--porcelain',
                 '--untracked-files=all'):
@@ -515,9 +530,17 @@ def admit(store, run_id, payload, *, preflight=False):
         if preflight_generation:
             execution['gate_retry_preflight_generation'] = preflight_generation
             execution['role_home_generation'] = f'gate-retry-{generation}-preflight-continuation'
+            if prepared:
+                execution['gate_retry_prepared_handoff'] = 1
+                execution['role_home_generation'] += '-prepared-handoff'
         if seal['stage']:
             execution['gate_retry_stage'] = seal['stage']
         current = snapshot(store, run_id, kind)
+        if prepared:
+            original_root = root.parent
+            if prepared_handoff(store, current, original_root) != prepared:
+                raise ValueError('prepared gate handoff changed during runtime preparation')
+            current['prepared_handoff'] = prepared
         if 'verification_checks' in seal:
             current['verification_checks'] = planned_checks(
                 selected, DeliveryBroker(store, seal['original_spec']).checkout,
@@ -560,9 +583,7 @@ def admit(store, run_id, payload, *, preflight=False):
             if work_binding(store, spec, db) != seal['work_binding']:
                 raise ValueError('gate retry admission lost issue ownership')
             if preflight_generation and spec.get('feature_worker'):
-                from .delivery_feature_execution import require_execution
-
-                require_execution(store, spec)
+                require_worker_handoff(store, spec)
             if observation := seal.get('browser_prelaunch_observation'):
                 from .delivery_browser_prelaunch import resolved_effect
 
@@ -607,7 +628,12 @@ def admit(store, run_id, payload, *, preflight=False):
         return response
 
 
-def gate_namespace(generation, stage=None, *, preflight_generation=0):
+def gate_namespace(generation, stage=None, *, preflight_generation=0, prepared_handoff=0):
+    if prepared_handoff:
+        if (type(prepared_handoff) is not int or prepared_handoff != 1
+                or preflight_generation != 1):
+            raise ValueError('prepared gate handoff exceeds its one completion namespace')
+        return gate_namespace(generation, stage, preflight_generation=1) + '/prepared-handoff'
     if preflight_generation:
         if type(preflight_generation) is not int or preflight_generation != 1 \
                 or generation != 2 or stage != 'published':
@@ -632,7 +658,8 @@ def effective_spec(store, original, recovery):
     root = Path(original['state_dir']) / gate_namespace(
         recovery['execution_spec'].get('gate_retry_generation', 1),
         recovery['execution_spec'].get('gate_retry_stage'),
-        preflight_generation=recovery['execution_spec'].get('gate_retry_preflight_generation', 0))
+        preflight_generation=recovery['execution_spec'].get('gate_retry_preflight_generation', 0),
+        prepared_handoff=recovery['execution_spec'].get('gate_retry_prepared_handoff', 0))
     with store._connect() as db:
         saved = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
                            (original['run_id'],)).fetchone()
@@ -643,7 +670,8 @@ def effective_spec(store, original, recovery):
         execution = (current or {}).get('execution_spec') or {}
         current_root = Path(original['state_dir']) / gate_namespace(
             execution.get('gate_retry_generation', 1), execution.get('gate_retry_stage'),
-            preflight_generation=execution.get('gate_retry_preflight_generation', 0))
+            preflight_generation=execution.get('gate_retry_preflight_generation', 0),
+            prepared_handoff=execution.get('gate_retry_prepared_handoff', 0))
         if (execution.get('gate_retry_preflight_generation') != 1
                 or current.get('original_recovery') != recovery
                 or read_private(current_root / 'admission.json') != current):
