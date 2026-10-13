@@ -3274,6 +3274,7 @@ class DeliveryStore:
         error: str | None = None,
         key: str | None = None,
         expected_revision: int | None = None,
+        expected_row: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -3282,6 +3283,8 @@ class DeliveryStore:
                 raise ValueError("run ID not found")
             if expected_revision is not None and row["revision"] != expected_revision:
                 raise ValueError("projection row revision changed")
+            if expected_row is not None and dict(row) != expected_row:
+                raise ValueError("projection row changed")
             feature_readback_wait = False
             if (event_type == "feature_readback_pending" and phase == "waiting_feature_readback"
                     and execution_state == "waiting" and outcome is None
