@@ -180,6 +180,15 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
              'predecessor_resources': saved})
 
 
+def _tracker_closed(spec, tracker):
+    if spec.get('project_sync_version') == 1:
+        return (tracker.get('state') == 'recorded' and tracker.get('pending') is False
+                and tracker.get('scope') == 'local'
+                and tracker.get('project_sync') == 'asynchronous'
+                and tracker.get('status') == 'blocked' and tracker.get('claim_released') is True)
+    return tracker.get('state') == 'consistent' and tracker.get('pending') is False
+
+
 def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
     """Keep historical failure immutable; record separately authenticated later cleanup.
 
@@ -211,7 +220,7 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
         raise ValueError('original attempts changed during publication readback')
     tracker = _tracker_sync(execution, 'blocked', release=True, terminal=True,
                             reason=closed['result'].get('error') or 'Retained transient failure')
-    if tracker.get('state') != 'consistent' or tracker.get('pending') is not False:
+    if not _tracker_closed(execution, tracker):
         raise ValueError('terminal tracker closure remains unacknowledged')
     checks = json.loads(row['checks_json'])
     with store._connect() as db:
@@ -273,7 +282,7 @@ def _reuse_cleanup(store, row, spec, closed, stopped):
             raise ValueError('released original claim changed before tracker readback')
     tracker = _tracker_sync(execution, 'blocked', release=True, terminal=True,
                             reason=closed['result'].get('error') or 'Retained transient failure')
-    if tracker.get('state') != 'consistent' or tracker.get('pending') is not False:
+    if not _tracker_closed(execution, tracker):
         raise ValueError('acknowledged later tracker closure is unobservable')
     _current(store, row, spec, stopped)
     return True
@@ -538,7 +547,11 @@ def _close_published_cleanup(store, row, spec, stopped):
     None when the observation is not conclusive yet.
     """
     checks = json.loads(row['checks_json'] or '{}')
-    if (checks.get('failure', {}).get('classification') != 'transient'
+    from .delivery_gate_attribution_recovery import possible
+
+    attribution = (checks.get('failure', {}).get('classification') == 'terminal'
+                   and possible(store, spec, row))
+    if (checks.get('failure', {}).get('classification') != 'transient' and not attribution
             or row['outcome'] != 'blocked' or row['phase'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['pr_json'] is None and row['recovery_json'] is None):
@@ -558,6 +571,12 @@ def _close_published_cleanup(store, row, spec, stopped):
             or not isinstance(result.get('checks', {}).get('resource_cleanup'), dict)
             or result['checks']['resource_cleanup'] != checks.get('resource_cleanup')):
         return None
+    if attribution:
+        from .delivery_gate_attribution_recovery import cleanup_observation
+
+        # A terminal result remains terminal. Only independently proved false
+        # attribution permits the existing resource/claim closure maintenance.
+        cleanup_observation(store, row, spec, closed)
     return _close_cleanup(store, row, spec, closed, stopped,
                           published=row['pr_json'] is not None)
 
@@ -567,7 +586,9 @@ def retry_published_once(store, *, stopped=lambda: False):
     with store._connect() as db:
         rows = [dict(row) for row in db.execute(
             "SELECT * FROM delivery_runs WHERE outcome='blocked' "
-            "AND checks_json LIKE '%transient%'")]
+            "AND (checks_json LIKE '%transient%' OR "
+            "(cleanup='unknown' AND error='implementer did not establish a pass' "
+            "AND pr_json IS NOT NULL AND recovery_json IS NOT NULL))")]
     # Separate from the fresh-attempt waits: that loop marks a row before
     # deciding it is ineligible, which would silence this one forever.
     waits = getattr(store, '_automatic_continuation_waits', {})

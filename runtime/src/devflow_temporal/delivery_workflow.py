@@ -1696,6 +1696,12 @@ class DeliveryWorkflow:
             prior_implementer_session=next((role.get("session_id") for role in reversed(
                 self.state["roles"]) if role.get("role") == "implement"), None),
             repair_findings=[], continuation=None, recovery=None,
+            operator_brief=({"historical_assessment_remains_rejected": True,
+                             "unresolved_findings": recovery['seal']['attribution_observation'][
+                                 'unresolved_findings'],
+                             "controller_attribution_proof": recovery['seal'][
+                                 'attribution_observation']}
+                            if 'attribution_observation' in recovery.get('seal', {}) else None),
             authorized_max_iteration=self.state["iteration"],
             resume_prechecks=True, published_checkpoint=published,
         )

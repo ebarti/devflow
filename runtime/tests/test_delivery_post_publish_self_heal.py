@@ -817,6 +817,10 @@ class RealDelivery:
         store.mark_start('run-1', accepted=True)
 
     def _tracker(self, spec, status, *, release, terminal, reason=None):
+        if spec.get('project_sync_version') == 1:
+            from devflow_temporal.delivery_features import record_tracking
+
+            return record_tracking(self.store, spec, status, release)
         if release:
             with self.store._connect() as db:
                 self.store.state.release_work(db, spec['work_id'],

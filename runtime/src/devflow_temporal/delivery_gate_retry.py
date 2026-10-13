@@ -161,6 +161,9 @@ def snapshot(store, run_id, kind=KIND):
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     ci_only = kind == CI_KIND
     controller_only = kind == CONTROLLER_KIND
+    from .delivery_gate_attribution_recovery import eligible_stop
+
+    attribution_retry = kind == KIND and eligible_stop(spec, state)
     failure = state.get('checks', {}).get('failure') or {}
     reconciled = reconciled_cleanup(store, row, state)
     state_checks, row_checks = closed_checks(row, state, reconciled)
@@ -229,7 +232,12 @@ def snapshot(store, run_id, kind=KIND):
         if native_identity(spec)['runtime_payload_sha256'] in _consumed_payloads(
                 spec, state, previous, include_implementation=controller_only):
             raise ValueError('a later gate retry requires a repaired measured runtime')
-    broker = DeliveryBroker(store, spec)
+    if attribution_retry:
+        from .delivery_feature_revision_subject import ObservationBroker
+
+        broker = ObservationBroker(store, spec)
+    else:
+        broker = DeliveryBroker(store, spec)
     candidate = broker.candidate()
     pr = broker._existing_pr()
     roles = [r for r in state.get('roles', []) if r.get('iteration') == row['iteration']]
@@ -256,6 +264,17 @@ def snapshot(store, run_id, kind=KIND):
     browser_observation = None
     report_observation = None
     controller_observation = None
+    attribution_observation = None
+    if attribution_retry:
+        from .delivery_gate_attribution_recovery import observe
+        from .delivery_native_preparation import native_identity
+
+        attribution_observation = observe(
+            store, spec, row, state, attempts, closed, previous, broker)
+        if native_identity(spec)['runtime_payload_sha256'] == attribution_observation[
+                'check_runtime']['runtime_payload_sha256']:
+            raise ValueError('attribution retry requires a repaired measured runtime')
+        failed_gate = True
     if controller_only:
         from .delivery_controller_retry import observe
 
@@ -311,7 +330,7 @@ def snapshot(store, run_id, kind=KIND):
     if ((kind == PRELAUNCH_KIND and not prelaunch)
             or (previous is not None and not (
                 renewed or published_after_recovery or prelaunch
-                or report_retry or ci_only or transient_retry))
+                or report_retry or ci_only or transient_retry or attribution_retry))
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
@@ -329,14 +348,16 @@ def snapshot(store, run_id, kind=KIND):
                                       if browser_prelaunch else
                                       'local check process cleanup is unknown' if prelaunch
                                       else unpublished_error
-                                      if unpublished else state.get('error') if controller_only
+                                      if unpublished else state.get('error')
+                                      if controller_only or attribution_retry
                                       else 'repair limit exhausted'}))
             or row['protocol_revision'] != state.get('revision')
             or row['iteration'] != state.get('iteration')
             or closed['request_digest'] != row['request_digest']
             or closed['recovery_digest'] != (digest(previous) if previous else None)
             or not implementation or (implementation.get('status') != 'pass'
-                                      and not controller_only) or not failed_gate
+                                      and not (controller_only or attribution_retry))
+            or not failed_gate
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
             or any((e['state'] != 'complete' or not e['observed_json'])
                    and e != (browser_observation or {}).get('pending_effect') for e in effects)
@@ -377,8 +398,9 @@ def snapshot(store, run_id, kind=KIND):
                 'pending_publication_retry', 'repair_continuation'}:
             ancestor = ancestor.get('original_recovery')
         if admitted and (not (renewed or published_after_recovery or prelaunch
-                             or report_retry or ci_only or transient_retry)
-                         or prior_gate != ancestor):
+                             or report_retry or ci_only or transient_retry or attribution_retry)
+                         or (digest(prior_gate) != attribution_observation['prior_gate_digest']
+                             if attribution_retry else prior_gate != ancestor)):
             raise ValueError('this run already received its bounded gate assessment retry')
     return {'row': _sealed_row(row), 'closed': closed, 'original_spec': spec,
             'attempts': attempts,
@@ -388,14 +410,17 @@ def snapshot(store, run_id, kind=KIND):
             'prior_gate_digest': digest(prior_gate) if prior_gate else None,
             **({'report_observation': report_observation} if report_observation else {}),
             **({'controller_observation': controller_observation} if controller_only else {}),
+            **({'attribution_observation': attribution_observation} if attribution_retry else {}),
             **({'browser_prelaunch_observation': browser_observation}
                if browser_observation else {}),
             'stage': 'transient' if transient_retry else 'report' if report_retry
                      else 'ci' if ci_only else 'published'
-                     if published_after_recovery or prelaunch or controller_only else None,
+                     if published_after_recovery or prelaunch or controller_only
+                     or attribution_retry else None,
             'generation': (transient_generations + 1 if transient_retry
                            else ci_observations + 1 if ci_only
-                           else 2 if renewed or (prelaunch and not browser_prelaunch)
+                           else 2 if attribution_retry or renewed
+                           or (prelaunch and not browser_prelaunch)
                            or (browser_prelaunch and spec.get('gate_retry_stage') == 'published')
                            else 1)}
 
@@ -602,6 +627,24 @@ def readback(store, spec, recovery):
     if effective != spec or DeliveryBroker(store, spec).candidate() != recovery['candidate']:
         raise ValueError('gate retry source or execution authority changed')
     broker = DeliveryBroker(store, spec)
+    if expected := recovery['seal'].get('attribution_observation'):
+        from .delivery_feature_revision_subject import ObservationBroker
+        from .delivery_gate_attribution_recovery import observe
+
+        original = recovery['seal']['original_spec']
+        _, current_attempts, _, _ = _rows(store, spec['run_id'])
+        current = {attempt['job_key']: attempt for attempt in current_attempts}
+        if any(current.get(attempt['job_key']) != attempt
+               for attempt in recovery['seal']['attempts']):
+            raise ValueError('attribution retry original native attempt changed')
+        closed = store._completed_temporal_result(
+            spec['run_id'], workflow_id=recovery['seal']['closed']['workflow_id'])
+        if closed != recovery['seal']['closed']:
+            raise ValueError('attribution retry original Temporal result changed')
+        if observe(store, original, recovery['seal']['row'], closed['result'],
+                   recovery['seal']['attempts'], closed, recovery['original_recovery'],
+                   ObservationBroker(store, original)) != expected:
+            raise ValueError('attribution retry original cause or source evidence changed')
     if observation := recovery['seal'].get('browser_prelaunch_observation'):
         from .delivery_browser_prelaunch import observe, resolved_effect
 

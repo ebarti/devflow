@@ -90,6 +90,10 @@ def later_cleanup(service, monkeypatch):
         if external.get('lost_ack'):
             external['lost_ack'] = False
             raise RuntimeError('opaque terminal acknowledgement lost after release')
+        # Match the actual producer selected by the admitted tracking mode.
+        if spec.get('project_sync_version') == 1 and external['tracker'] == 'consistent':
+            return {'state': 'recorded', 'pending': False, 'scope': 'local',
+                    'project_sync': 'asynchronous', 'status': status, 'claim_released': release}
         return {'state': external['tracker'], 'pending': external['tracker'] != 'consistent'}
 
     def publication(_store, spec):

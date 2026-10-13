@@ -232,6 +232,7 @@ def _paid_repair(shared, token, run_id, iteration):
 
 def resume_worker(store, parent, child, row):
     from . import delivery_gate_retry as gates
+    from .delivery_gate_attribution_recovery import possible
     from .delivery_stopped_resume import admit, interrupted_resume, pending_repair, snapshot
 
     shared = registry(parent)
@@ -240,7 +241,13 @@ def resume_worker(store, parent, child, row):
     # preserves the original candidate/PR/session and never creates a new branch.
     preparation_failed = gates.prepublication_preparation_failed(
         {"error": row["error"], "checks": json.loads(row["checks_json"] or "{}")})
-    if preparation_failed:
+    if possible(store, child, row):
+        sealed = gates.snapshot(store, child['run_id'])
+        if 'attribution_observation' not in sealed:
+            raise OwnershipConflict('worker lacks its exact attribution recovery proof')
+        state = sealed['closed']['result']
+        remaining, kind, admit = 0, gates.KIND, gates.admit
+    elif preparation_failed:
         # The selector is only a hint. Gate admission authenticates the complete
         # closed result, candidate, failed check, cleanup, and bounded retry history.
         sealed = gates.snapshot(store, child["run_id"], gates.PREPUBLICATION_KIND)
@@ -286,9 +293,13 @@ def resume_worker(store, parent, child, row):
         "expected_revision": state["revision"],
         "expected_iteration": state["iteration"],
         "expected_candidate_id": candidate["id"],
-        "expected_candidate_head": candidate["head"],
         "additional_iterations": remaining,
     }
+    if kind == gates.KIND:
+        command.update(expected_pr_head=candidate['head'],
+                       expected_pr_number=sealed['publication']['number'])
+    else:
+        command['expected_candidate_head'] = candidate['head']
     shared.reserve_worker(
         token, worker_key(child["run_id"], token), child["feature_worker"]["workstream_id"]
     )
