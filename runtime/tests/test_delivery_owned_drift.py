@@ -447,49 +447,45 @@ def test_same_acknowledged_command_rollback_survives_enabled_default_serializati
     }
 
 
-@pytest.mark.parametrize(
-    "change",
-    [
-        "disabled",
-        "public-disabled",
-        "string",
-        "integer",
-        "other-setting",
-    ],
-)
-def test_acknowledged_enabled_default_guard_rejects_semantic_or_type_drift(ambient, change):
+def test_acknowledged_enabled_default_guard_rejects_semantic_or_type_drift(ambient):
     module, drift, fixture, args, manifest, request, root = ambient
     _freeze_current_mcp_enabled(ambient, True)
     _ack(ambient)
     module.upgrade(*args)
     config = fixture["home"] / "config.toml"
-    if change == "public-disabled":
-        registry = json.loads(fixture["registry"].read_text())
-        registry["entries"]["unrelated"]["enabled"] = False
-        _private(fixture["registry"], registry)
-    elif change == "other-setting":
-        config.write_text(
-            config.read_text().replace('foreign_setting="priority"', 'foreign_setting="default"')
+    clean_config, clean_registry = config.read_bytes(), fixture["registry"].read_bytes()
+    # Reuse admission/setup, restoring both mutable inputs before every refusal.
+    for change in ("disabled", "public-disabled", "string", "integer", "other-setting"):
+        config.write_bytes(clean_config)
+        fixture["registry"].write_bytes(clean_registry)
+        if change == "public-disabled":
+            registry = json.loads(fixture["registry"].read_text())
+            registry["entries"]["unrelated"]["enabled"] = False
+            _private(fixture["registry"], registry)
+        elif change == "other-setting":
+            config.write_text(
+                config.read_text().replace(
+                    'foreign_setting="priority"', 'foreign_setting="default"')
+            )
+        else:
+            value = {"disabled": "false", "string": '"true"', "integer": "1"}[change]
+            config.write_text(config.read_text().replace("enabled=true", "enabled=" + value))
+        frozen = (
+            manifest.read_bytes(),
+            fixture["skill"].read_bytes(),
+            fixture["registry"].read_bytes(),
+            config.read_bytes(),
         )
-    else:
-        value = {"disabled": "false", "string": '"true"', "integer": "1"}[change]
-        config.write_text(config.read_text().replace("enabled=true", "enabled=" + value))
-    frozen = (
-        manifest.read_bytes(),
-        fixture["skill"].read_bytes(),
-        fixture["registry"].read_bytes(),
-        config.read_bytes(),
-    )
-    with pytest.raises(ValueError):
-        module.rollback(args[0], fixture["home"], manifest)
-    with pytest.raises(ValueError):
-        module.upgrade(*args)
-    assert frozen == (
-        manifest.read_bytes(),
-        fixture["skill"].read_bytes(),
-        fixture["registry"].read_bytes(),
-        config.read_bytes(),
-    )
+        with pytest.raises(ValueError):
+            module.rollback(args[0], fixture["home"], manifest)
+        with pytest.raises(ValueError):
+            module.upgrade(*args)
+        assert frozen == (
+            manifest.read_bytes(),
+            fixture["skill"].read_bytes(),
+            fixture["registry"].read_bytes(),
+            config.read_bytes(),
+        ), change
 
 
 def _successor(ambient, predecessor, number=2):

@@ -76,10 +76,20 @@ def owned_checks(tmp_path, monkeypatch):
                 # The harmless process creates a real descendant, observed and
                 # stopped by the production PID/start-identity monitor.
                 code = (
-                    "import subprocess,sys,time; "
-                    "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
-                    f"time.sleep({self.spec['sleep']})"
+                    "import subprocess,sys,time\n"
+                    "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])\n"
                 )
+                if self.spec.get("completion_barrier"):
+                    # Cancellation fixtures must remain running until the test
+                    # releases them or the real native monitor stops the tree.
+                    code += (
+                        "from pathlib import Path\n"
+                        f"release = Path({self.spec['completion_barrier']!r})\n"
+                        "while not release.exists():\n"
+                        "    time.sleep(0.02)\n"
+                    )
+                else:
+                    code += f"time.sleep({self.spec['sleep']})"
                 self.native_cleanup_confirmed = False
                 process = NativeProcess(
                     self.spec, Path(self.spec["state_dir"]) / "native",
@@ -740,7 +750,10 @@ async def test_temporal_cancel_or_monitor_timeout_preserves_native_slot_lifecycl
     monkeypatch.setattr(activities.activity, "heartbeat", owned_checks.heartbeat)
     owned_checks.config.raw["check_concurrency"] = 1
     request = owned_checks.request("temporal-stopped", seconds=5, timeout=10)
-    if stop == "timeout":
+    completion_barrier = tmp_path / "release-cancel-fixture"
+    if stop == "cancel":
+        request["spec"]["completion_barrier"] = str(completion_barrier)
+    else:
         request["hours"] = 0.5 / 3600
     broker = owned_checks.brokers["temporal-stopped"]
     async with await WorkflowEnvironment.start_local(
@@ -754,32 +767,40 @@ async def test_temporal_cancel_or_monitor_timeout_preserves_native_slot_lifecycl
             max_heartbeat_throttle_interval=timedelta(seconds=0.1),
             default_heartbeat_throttle_interval=timedelta(seconds=0.1),
         ):
-            handle = await environment.client.start_workflow(
-                CheckSlotCancellationFixture.run, request, id=f"check-slots-{stop}",
-                task_queue="check-slots-cancel",
-            )
-            await wait_until(broker.started.is_set)
-            await asyncio.sleep(0.2)
-            following = asyncio.create_task(
-                activities.delivery_precheck(owned_checks.request("following"))
-            )
-            if stop == "cancel":
-                await handle.cancel()
-                with pytest.raises(WorkflowFailureError):
-                    await asyncio.wait_for(handle.result(), 10)
-            else:
-                # Losing a monitor attempt does not end the durable check or
-                # free its slot while it is still running. Its replacement
-                # reattaches and returns the original check's result.
-                result = await asyncio.wait_for(handle.result(), 15)
-                assert result == {"state": "passed", "cleanup": "confirmed"}
-                history = await handle.fetch_history()
-                started = [event.activity_task_started_event_attributes
-                           for event in history.events
-                           if event.HasField("activity_task_started_event_attributes")]
-                assert started[-1].attempt > 1
-            await wait_until(broker.finished.is_set)
-            await following
+            following = None
+            try:
+                handle = await environment.client.start_workflow(
+                    CheckSlotCancellationFixture.run, request, id=f"check-slots-{stop}",
+                    task_queue="check-slots-cancel",
+                )
+                journal = Path(broker.spec["state_dir"]) / "native/native-process.json"
+                await wait_until(lambda: observed_native_tree(journal))
+                following = asyncio.create_task(
+                    activities.delivery_precheck(owned_checks.request("following"))
+                )
+                if stop == "cancel":
+                    assert not broker.finished.is_set()
+                    await handle.cancel()
+                    with pytest.raises(WorkflowFailureError):
+                        await asyncio.wait_for(handle.result(), 10)
+                else:
+                    # Losing a monitor attempt does not end the durable check or
+                    # free its slot while it is still running. Its replacement
+                    # reattaches and returns the original check's result.
+                    result = await asyncio.wait_for(handle.result(), 15)
+                    assert result == {"state": "passed", "cleanup": "confirmed"}
+                    history = await handle.fetch_history()
+                    started = [event.activity_task_started_event_attributes
+                               for event in history.events
+                               if event.HasField("activity_task_started_event_attributes")]
+                    assert started[-1].attempt > 1
+            finally:
+                if stop == "cancel":
+                    completion_barrier.touch()
+                if broker.started.is_set():
+                    await wait_until(broker.finished.is_set)
+                if following is not None:
+                    await following
     assert broker.result["cancelled"] is (stop == "cancel")
     assert broker.result["timed_out"] is False
     assert_stopped(broker)

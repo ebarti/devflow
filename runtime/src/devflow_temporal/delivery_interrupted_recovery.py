@@ -130,11 +130,14 @@ def _guard(store, row, spec):
         if latest != row["run_id"]:
             raise ValueError("a successor already owns this issue")
     if spec.get("feature_delivery"):
-        from .delivery_feature_execution import registry
+        from .delivery_feature_execution import registry, require_execution
 
-        shared = registry(spec)
-        with shared.connect() as db:
-            shared.require(db, spec["feature_delivery"]["owner"], active=False)
+        if spec.get("feature_worker"):
+            require_execution(store, spec)
+        else:
+            shared = registry(spec)
+            with shared.connect() as db:
+                shared.require(db, spec["feature_delivery"]["owner"], active=False)
     if spec.get("provider") != "fake":
         from .delivery_orphans import _observe_registered_process
         from .delivery_resources import RunResources

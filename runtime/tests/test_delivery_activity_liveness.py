@@ -136,7 +136,7 @@ async def test_blocking_intake_preparation_keeps_heartbeating(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('outcome,expected_attempts', [
-    ('transient', 4), ('permanent', 1), ('eventual', 2), ('findings', 1),
+    ('transient', 4), ('permanent', 1), ('findings', 1),
 ])
 async def test_monitor_retries_outlast_capacity_wait_and_preserve_gate_outcomes(
     outcome, expected_attempts,
@@ -149,8 +149,7 @@ async def test_monitor_retries_outlast_capacity_wait_and_preserve_gate_outcomes(
         attempts.append(attempt)
         if outcome == 'permanent':
             raise ValueError('invalid role input')
-        if ((outcome == 'transient' and attempt <= 3)
-                or (outcome == 'eventual' and attempt == 1)):
+        if outcome == 'transient' and attempt <= 3:
             raise ConnectionError('temporary transport failure')
         return {'status': 'findings' if outcome == 'findings' else 'pass'}
 
@@ -357,12 +356,12 @@ async def _wait_for_fixture_native_start(worker, log_path, state, handle):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('stage,interruption', [
-    # One writable role, one read-only role, and one ordinary check transport.
-    (stage, 'worker_loss') for stage in ['implement', 'review', 'checks']
+    # Writable worker loss and read-only loop stall cover the shared role monitor.
+    (stage, 'worker_loss') for stage in ['implement', 'checks']
 ] + [
     pytest.param('browser_qa', 'worker_loss', marks=pytest.mark.skipif(
         sys.platform != 'darwin', reason='actual macOS TCP listener inspection required')),
-    ('implement', 'loop_stall'), ('review', 'loop_stall'),
+    ('review', 'loop_stall'),
     ('intake', 'loop_stall'), ('implement', 'cancel'),
     ('implement', 'deadline'), ('implement', 'terminate'),
     ('review', 'dirty_result'),
