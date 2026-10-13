@@ -123,6 +123,54 @@ async def test_completed_result_preserves_authenticated_cleanup_and_replay(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_two_cleanup_passes_before_terminal_reconciliation_compose_latest_receipt(
+    unpublished, committed,
+):
+    store, spec, state, client, description = await _closed(unpublished, committed=committed)
+    unknown = _maintenance(store, spec, description)
+    _observation(store)
+    confirmed = _maintenance(store, spec, description, uncertain=False)
+    _observation(store)
+    before, events = _row(store), store.events("run-1")
+    assert unknown["state"] == "unknown" and confirmed["state"] == "confirmed"
+    assert (await reconcile_projection(store, client, before))["state"] == "reconciled"
+    final = _row(store)
+    assert final["cleanup"] == "confirmed" and final["phase"] == "blocked"
+    assert json.loads(final["checks_json"]) == {**state["checks"], "resource_cleanup": confirmed}
+    assert store.events("run-1")[:-1] == events
+    after = store.events("run-1")
+    assert (await reconcile_projection(store, client, final))["state"] == "observed"
+    assert _row(store) == final and store.events("run-1") == after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["mixed-writer", "missing-revision", "unordered-time", "key"])
+async def test_cleanup_chain_refuses_unaccounted_or_foreign_writes(unpublished, drift):
+    store, spec, _, client, description = await _closed(unpublished)
+    _maintenance(store, spec, description)
+    first = store.events("run-1")[-1]
+    _maintenance(store, spec, description, uncertain=False)
+    second = store.events("run-1")[-1]
+    with store._connect() as db:
+        if drift == "mixed-writer":
+            db.execute("UPDATE delivery_events SET type='dispatch_blocked' WHERE sequence=?",
+                       (first["sequence"],))
+        elif drift == "missing-revision":
+            db.execute("DELETE FROM delivery_events WHERE sequence=?", (first["sequence"],))
+        elif drift == "unordered-time":
+            db.execute("UPDATE delivery_events SET timestamp=? WHERE sequence=?",
+                       (second["timestamp"], first["sequence"]))
+        else:
+            db.execute("UPDATE delivery_events SET payload_json='{}' WHERE sequence=?",
+                       (first["sequence"],))
+    before, events = _row(store), store.events("run-1")
+    with pytest.raises(ValueError, match="would overwrite a newer row"):
+        await reconcile_projection(store, client, before)
+    assert _row(store) == before and store.events("run-1") == events
+
+
+@pytest.mark.asyncio
 async def test_committed_terminal_response_loss_allows_a_trailing_observation(unpublished):
     store, _, state, client, _ = await _closed(unpublished, committed=True)
     _observation(store)
@@ -224,7 +272,11 @@ async def test_real_completed_history_reconciles_after_private_cleanup(service):
         assert description.status == WorkflowExecutionStatus.COMPLETED
         assert state["checks"]["terminal_projection_failure"]["event_type"] == "blocked"
         history = await handle.fetch_history()
-        receipt = _maintenance(store, spec, description)
+        # Successive native maintenance passes run before closed projection in
+        # the normal pump: retain both commits and compose the latest receipt.
+        _maintenance(store, spec, description)
+        receipt = _maintenance(store, spec, description, uncertain=False)
+        assert receipt["state"] == "confirmed"
         assert (await reconcile_projection(store, client, _row(store)))["state"] == "reconciled"
         assert store.detail("run-1")["outcome"] == "blocked"
         assert store.detail("run-1")["checks"]["resource_cleanup"] == receipt

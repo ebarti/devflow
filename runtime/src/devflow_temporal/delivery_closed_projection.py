@@ -39,11 +39,11 @@ def _same_row(row, projection):
 
 
 def _cleanup_row(row, spec, description, scheduled, events):
-    """Prove one postclosure cleanup write over an exact history-bound projection.
+    """Prove contiguous cleanup writes over an exact history-bound projection.
 
-    Native maintenance's keyed projection binds the closure and finalization
-    receipt. Its process observations are retained in that receipt; no newer
-    delivery field, protocol step or unaccounted row revision may be composed.
+    The latest maintenance key binds the closure and finalization receipt. Older
+    keys retain no receipt bytes; their ordinary projection events account for
+    the intervening row revisions. No newer delivery field may be composed.
     """
     checks = json.loads(row["checks_json"] or "{}")
     receipt = checks.get("resource_cleanup")
@@ -81,13 +81,34 @@ def _cleanup_row(row, spec, description, scheduled, events):
             continue
         event = next((event for event in reversed(events)
                       if event["sequence"] < maintenance["sequence"]
-                      and event["run_revision"] == row["revision"] - 1
+                      and event["run_revision"] < row["revision"]
                       and event["type"] == projection["event_type"]
                       and json.loads(event["payload_json"]).get("key") == projection["key"]), None)
-        if event is not None and datetime.fromisoformat(event["timestamp"]) <= (
-                description.close_time):
-            return {**original, "revision": event["run_revision"],
-                    "updated_at": event["timestamp"]}, event, receipt
+        if event is None or datetime.fromisoformat(event["timestamp"]) > description.close_time:
+            continue
+        revision, written_at, writer = event["run_revision"], description.close_time, event
+        for later in events:
+            if not event["sequence"] < later["sequence"] <= maintenance["sequence"]:
+                continue
+            if later["run_revision"] <= revision:
+                continue  # An observation does not advance the projected row.
+            payload = json.loads(later["payload_json"])
+            marker = payload.get("key")
+            timestamp = datetime.fromisoformat(later["timestamp"])
+            if (later["run_revision"] != revision + 1
+                    or later["type"] != "resource_cleanup_reconciled"
+                    or set(payload) != {"key", "iteration", "candidate_id"}
+                    or payload["iteration"] != row["iteration"]
+                    or payload["candidate_id"] is not None
+                    or not isinstance(marker, str) or len(marker) != 64
+                    or any(char not in "0123456789abcdef" for char in marker)
+                    or timestamp <= written_at):
+                break
+            revision, written_at, writer = later["run_revision"], timestamp, later
+        else:
+            if revision == row["revision"] and writer is maintenance:
+                return {**original, "revision": event["run_revision"],
+                        "updated_at": event["timestamp"]}, event, receipt
     return None
 
 
