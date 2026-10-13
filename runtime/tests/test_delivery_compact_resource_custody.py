@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from devflow_temporal import delivery_feature_revision_recovery as revision
+from devflow_temporal import delivery_orphans as orphans
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_feature_revision_recovery import compact_recovery
 from devflow_temporal.delivery_resources import (
@@ -29,6 +31,7 @@ def chain(tmp_path, monkeypatch, request):
             'config_path': str(tmp_path / 'config.json'), 'config_digest': digest(raw),
             'request_digest': 'original', 'checkout': str(tmp_path / 'checkout'),
             'policy': {'max_repairs': 10}}
+    spec['policy_digest'] = digest(spec['policy'])
     # Only config loading is a seam; real canonical rows, compact envelopes,
     # custody files and every ancestor command authenticate the ownership chain.
     monkeypatch.setattr('devflow_temporal.delivery_execution_config.load_execution_config',
@@ -50,15 +53,19 @@ def chain(tmp_path, monkeypatch, request):
     private_directory(state / namespace(full))
     current = compact_recovery(full, state / namespace(full)) if request.param else full
     with sqlite3.connect(database) as db:
-        db.execute('CREATE TABLE delivery_runs(run_id,request_digest,recovery_json)')
+        db.execute('CREATE TABLE delivery_runs('
+                   'run_id,request_digest,recovery_json,request_json,accepted_plan_text)')
+        db.execute('CREATE TABLE delivery_preparations('
+                   'run_id,submitted_spec_digest,effective_spec_digest,effective_spec_json)')
         db.execute('CREATE TABLE delivery_commands(command_id,run_id,request_digest,response_json)')
         for recovery in (previous, current):
             write_private(state / namespace(recovery) / 'admission.json', recovery)
             db.execute('INSERT INTO delivery_commands VALUES(?,?,?,?)',
                 (recovery['command']['command_id'], spec['run_id'], recovery['command_digest'],
                  json.dumps({'admission_sha256': digest(recovery)})))
-        db.execute('INSERT INTO delivery_runs VALUES(?,?,?)',
-                   (spec['run_id'], spec['request_digest'], json.dumps(current)))
+        db.execute('INSERT INTO delivery_runs VALUES(?,?,?,?,?)',
+                   (spec['run_id'], spec['request_digest'], json.dumps(current),
+                    json.dumps(spec), None))
     return spec, previous, current, database
 
 
@@ -107,16 +114,91 @@ def test_compact_custody_tampering_cannot_grant_old_roots(chain):
     spec, _, current, database = chain
     if 'custody_ref' not in current:
         return
+    memo = {}
+    _gate_roots(spec, retained_memo=memo)
+    hydrated = revision.retained_recovery(current, memo=memo)
+    hydrated['original_recovery']['execution_spec']['checkout'] = '/foreign'
+    assert revision.retained_recovery(current, memo=memo)['original_recovery'][
+        'execution_spec']['checkout'] == spec['checkout']
     path = Path(current['custody_ref']['path'])
     original = path.read_bytes()
     value = json.loads(original)
     value['original_recovery']['execution_spec']['checkout'] = '/foreign'
     write_private(path, value)
     with pytest.raises(ValueError, match='custody bytes changed'):
-        _gate_roots(spec)
+        _gate_roots(spec, retained_memo=memo)
     path.write_bytes(original)
     current['custody_ref']['path'] = str(path.with_name('foreign.json'))
     with sqlite3.connect(database) as db:
         db.execute('UPDATE delivery_runs SET recovery_json=?', (json.dumps(current),))
     with pytest.raises(ValueError, match='sealed namespace'):
-        _gate_roots(spec)
+        _gate_roots(spec, retained_memo=memo)
+
+
+def _process_paths(spec, root):
+    paths = []
+    launch = {'argv': ['opaque-fixture'], 'environment': {}}
+    for name in ('first', 'second', 'third'):
+        path = root / name / 'native-process.json'
+        write_private(path, {
+            'intent': {'run_id': spec['run_id'], 'policy_digest': spec['policy_digest'],
+                       'argv': launch['argv'], 'environment_sha256': digest({}), 'ports': []},
+            'phase': 'finished', 'ports': [], 'owned': {'17017': {'identity': 'opaque-child'}},
+            'monitor': {'pid': 17019, 'identity': 'opaque-monitor'},
+        })
+        write_private(path.with_name('launch.json'), launch)
+        paths.append(path)
+    return paths
+
+
+def test_observation_batch_materializes_history_once_and_keeps_fresh_checks(chain, monkeypatch):
+    spec, _, current, _ = chain
+    root, _ = _gate_roots(spec)
+    paths = _process_paths(spec, root)
+    materialized, namespaces, observed, reconciled = [], [], [], []
+    compact_view, gate_roots = revision.compact_recovery_view, orphans._gate_roots
+
+    def materialize(value, path):
+        materialized.append(path)
+        return compact_view(value, path)
+
+    def namespace_checks(*args, **kwargs):
+        namespaces.append(True)
+        return gate_roots(*args, **kwargs)
+
+    def process_readback():
+        observed.append(True)
+        return {}
+
+    def reconcile(path):
+        reconciled.append(path)
+        return {'cleanup': 'observed-native-confirmed'}
+
+    monkeypatch.setattr(revision, 'compact_recovery_view', materialize)
+    monkeypatch.setattr(orphans, '_gate_roots', namespace_checks)
+    monkeypatch.setattr(orphans, 'process_table', process_readback)
+    monkeypatch.setattr(orphans, 'reconcile_process', reconcile)
+    for batch in (1, 2):
+        assert len(list(orphans._observe_registered_processes(spec, paths))) == len(paths)
+        assert len(materialized) == (batch if 'custody_ref' in current else 0)
+        assert len(namespaces) == len(observed) == len(reconciled) == batch * len(paths)
+        assert reconciled[-len(paths):] == paths
+
+
+def test_observation_batch_refuses_admission_drift_before_next_reconciliation(chain, monkeypatch):
+    spec, _, current, _ = chain
+    root, _ = _gate_roots(spec)
+    paths = _process_paths(spec, root)
+    reconciled = []
+
+    def reconcile(path):
+        reconciled.append(path)
+        write_private(Path(spec['state_dir']) / namespace(current) / 'admission.json',
+                      {**current, 'session_id': 'changed-after-first-journal'})
+        return {'cleanup': 'observed-native-confirmed'}
+
+    monkeypatch.setattr(orphans, 'process_table', lambda: {})
+    monkeypatch.setattr(orphans, 'reconcile_process', reconcile)
+    with pytest.raises(ValueError, match='immutable command authority'):
+        list(orphans._observe_registered_processes(spec, paths))
+    assert reconciled == paths[:1]

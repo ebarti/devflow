@@ -27,7 +27,7 @@ def private_directory(path: Path) -> None:
         raise ValueError("resource parent is not an owned directory")
 
 
-def read_private(path: Path) -> dict:
+def read_private(path: Path, *, raw: bool = False) -> dict | bytes:
     # Recheck the replacement once when publication unlinks the first inode.
     # A second authenticated descriptor remains a valid snapshot if unlinked too;
     # it need not be the latest pathname value under continuous publication.
@@ -50,7 +50,7 @@ def read_private(path: Path) -> dict:
             if info.st_nlink == 0 and observation == 0:
                 continue
             with os.fdopen(descriptor, "rb", closefd=False) as stream:
-                return json.load(stream)
+                return stream.read() if raw else json.load(stream)
         finally:
             os.close(descriptor)
     raise ValueError("resource evidence is not a private owned file")
@@ -94,7 +94,8 @@ def _ancestors(path: Path, *, allow_missing: bool = False) -> None:
             raise ValueError("resource ancestor is absent")
 
 
-def _gate_roots(spec: dict, *, execution_specs: dict | None = None) -> tuple[Path, set[Path]]:
+def _gate_roots(spec: dict, *, execution_specs: dict | None = None,
+                retained_memo: dict | None = None) -> tuple[Path, set[Path]]:
     """Resolve existing continuation custody read-only, never from a caller path."""
     state = Path(spec['state_dir'])
     if (not state.is_absolute() or state.name != spec['run_id'] or '..' in state.parts
@@ -172,10 +173,10 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None) -> tuple[Pat
                         from .delivery_stopped_resume import custody
                         from .delivery_stopped_resume import namespace as resume_namespace
 
-                        custody(db, recovery)
+                        custody(db, recovery, retained_memo=retained_memo)
                         # Compact revision transports retain their predecessor chain
                         # in authenticated custody, not in the workflow envelope.
-                        recovery = retained_recovery(recovery)
+                        recovery = retained_recovery(recovery, memo=retained_memo)
                         if (first and canonical_json(recovery['execution_spec'])
                                 != canonical_json(spec)):
                             raise ValueError('stopped resume execution authority changed')

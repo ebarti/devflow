@@ -139,15 +139,15 @@ def _guard(store, row, spec):
             with shared.connect() as db:
                 shared.require(db, spec["feature_delivery"]["owner"], active=False)
     if spec.get("provider") != "fake":
-        from .delivery_orphans import _observe_registered_process
+        from .delivery_orphans import _observe_registered_processes
         from .delivery_resources import RunResources
 
         root = Path(spec["state_dir"]) / "resources"
         if root.exists():
             with RunResources(spec, read_only=True).locked() as manifest:
                 paths = list(manifest["processes"])
-            for path in paths:
-                _observe_registered_process(spec, Path(path))
+            for _ in _observe_registered_processes(spec, paths):
+                pass
         elif any(Path(spec["state_dir"]).rglob("native-process.json")):
             raise ValueError("native process has no owning resource manifest")
 

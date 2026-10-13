@@ -363,7 +363,7 @@ def test_uncertain_effect_preserves_cleanup_and_claim(api_fixture, monkeypatch, 
 
     monkeypatch.setattr(delivery_orphans, 'RunResources', Resources)
     monkeypatch.setattr(delivery_orphans, '_observe_registered_process',
-                        lambda spec, path: {'cleanup': 'observed-native-confirmed'})
+                        lambda spec, path, **_kwargs: {'cleanup': 'observed-native-confirmed'})
     delivery_orphans._reconcile(store, original, spec, {'status': 'TERMINATED'})
     assert completed == ['orphan']
     assert observed == [('blocked', True)]
@@ -435,7 +435,7 @@ def test_finished_historical_role_is_not_completed_again(api_fixture, monkeypatc
     monkeypatch.setattr(delivery_orphans, '_complete_attempt', repeat_completion)
     monkeypatch.setattr(delivery_orphans, 'RunResources', Resources)
     monkeypatch.setattr(delivery_orphans, '_observe_registered_process',
-                        lambda spec, path: observed.append(('observe', str(path))))
+                        lambda spec, path, **_kwargs: observed.append(('observe', str(path))))
     delivery_orphans._reconcile(store, original, spec, {'status': 'TERMINATED'})
     assert observed == []
     with store._connect() as db:
@@ -761,7 +761,7 @@ def test_prior_unknown_attempt_survives_second_unresolved_pass(
     monkeypatch.setattr(delivery_orphans, "_complete_attempt", complete)
     monkeypatch.setattr(delivery_orphans, "RunResources", Resources)
     monkeypatch.setattr(
-        delivery_orphans, "_observe_registered_process", lambda s, p: {"journal": str(p)}
+        delivery_orphans, "_observe_registered_process", lambda s, p, **_kwargs: {"journal": str(p)}
     )
     for _ in range(2):  # the run stays selected while cleanup is unknown
         with store._connect() as db:

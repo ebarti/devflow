@@ -187,14 +187,21 @@ def _completed_role_execution(path, journal, execution_specs, request, row):
             os.close(descriptor)
 
 
-def _observe_registered_process(spec, path):
+def _observe_registered_processes(spec, paths):
+    """Share immutable history materialization only within this observation batch."""
+    retained_memo = {}
+    for path in paths:
+        yield _observe_registered_process(spec, Path(path), retained_memo=retained_memo)
+
+
+def _observe_registered_process(spec, path, *, retained_memo=None):
     if path.resolve() != path or not path.is_relative_to(Path(spec['state_dir'])):
         raise ValueError('registered native process path changed')
     journal = read_private(path)
     intent = journal['intent']
     launch = _launch_binding(path.parent, journal)
     execution_specs = {}
-    _gate_roots(spec, execution_specs=execution_specs)
+    _gate_roots(spec, execution_specs=execution_specs, retained_memo=retained_memo)
     execution = execution_specs[max((root for root in execution_specs if path.is_relative_to(root)),
                                     key=lambda root: len(root.parts))]
     expected_digest = ((execution.get('preparation') or {}).get('measured_policy_digest')
@@ -319,7 +326,7 @@ def _reconcile(store, original, spec, closed):
                     'finish_reason') == 'prelaunch')]
         if launched and not processes:
             raise ValueError('original native process ownership is missing')
-        observations.extend(_observe_registered_process(spec, Path(path)) for path in processes)
+        observations.extend(_observe_registered_processes(spec, processes))
         _unchanged(store, original)
         receipt = resources.finalize(outcome, uncertain=uncertain)
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
