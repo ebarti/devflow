@@ -78,8 +78,18 @@ class _ReadOnlyRegistry(ExecutionRegistry):
 
 class ObservationBroker(DeliveryBroker):
     """Preserve broker PR fences without invoking feature reconciliation."""
-    def __init__(self, store, spec, *, revision=None):
-        super().__init__(store, spec)
+    def __init__(self, store, spec, *, revision=None, resource_spec=None):
+        if resource_spec is not None:
+            from .delivery_preparation import require_native_execution
+            from .delivery_resources import _gate_roots
+
+            bindings = {}
+            _gate_roots(resource_spec, execution_specs=bindings)
+            if spec not in bindings.values():
+                raise ValueError("historical observer lost its admitted execution")
+            require_native_execution(spec)
+        super().__init__(store, resource_spec or spec)
+        self.spec = spec
         self.observed_revision = revision
         self.observed_record = None
 

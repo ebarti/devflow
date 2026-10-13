@@ -548,10 +548,13 @@ def _close_published_cleanup(store, row, spec, stopped):
     """
     checks = json.loads(row['checks_json'] or '{}')
     from .delivery_gate_attribution_recovery import possible
+    from .delivery_gate_preflight_continuation import possible as preflight_possible
 
     attribution = (checks.get('failure', {}).get('classification') == 'terminal'
                    and possible(store, spec, row))
-    if (checks.get('failure', {}).get('classification') != 'transient' and not attribution
+    preflight = preflight_possible(row)
+    if (checks.get('failure', {}).get('classification') != 'transient'
+            and not (attribution or preflight)
             or row['outcome'] != 'blocked' or row['phase'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['pr_json'] is None and row['recovery_json'] is None):
@@ -577,6 +580,14 @@ def _close_published_cleanup(store, row, spec, stopped):
         # A terminal result remains terminal. Only independently proved false
         # attribution permits the existing resource/claim closure maintenance.
         cleanup_observation(store, row, spec, closed)
+    if preflight:
+        from .delivery_gate_preflight_continuation import observe
+        from .delivery_policy_recovery import _rows
+
+        current, attempts, effects, _ = _rows(store, spec['run_id'])
+        if current != row:
+            raise ValueError('gate preflight cleanup predecessor changed')
+        observe(store, spec, row, attempts, effects, closed, cleanup=True)
     return _close_cleanup(store, row, spec, closed, stopped,
                           published=row['pr_json'] is not None)
 
@@ -587,7 +598,8 @@ def retry_published_once(store, *, stopped=lambda: False):
         rows = [dict(row) for row in db.execute(
             "SELECT * FROM delivery_runs WHERE outcome='blocked' "
             "AND (checks_json LIKE '%transient%' OR "
-            "(cleanup='unknown' AND error='implementer did not establish a pass' "
+            "(cleanup='unknown' AND error IN ('implementer did not establish a pass',"
+            "'gate retry preflight failed: ActivityError') "
             "AND pr_json IS NOT NULL AND recovery_json IS NOT NULL))")]
     # Separate from the fresh-attempt waits: that loop marks a row before
     # deciding it is ineligible, which would silence this one forever.
