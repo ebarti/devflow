@@ -88,3 +88,43 @@ class NativeListenerSnapshotContract(unittest.TestCase):
         owned = {100: process(1, "original-start")}
         _, inspect = listener_inspector(table, lambda _port: {100})
         self.assertEqual(inspect(owned), (True, {}))
+
+
+def test_verification_fingerprint_uses_authenticated_git_objects(monkeypatch):
+    from tempfile import TemporaryDirectory
+
+    from test_delivery_feature_review_context import git
+
+    from devflow_temporal import delivery_feature_review_context as context
+    from devflow_temporal import delivery_listener_verification as subject
+
+    protected = context._protected_root()
+    fragments = []
+    for revision in ('f652acd5b7e593ab3787d9f6d8dd51d888f30c73',
+                     git(protected, 'rev-parse', 'HEAD')):
+        sources, _ = context._sources(protected, revision)
+        tree = ast.parse(sources['delivery_native_process.py'])
+        loop = next(node for node in ast.walk(tree) if isinstance(node, ast.For)
+                    and isinstance(node.iter, ast.Call)
+                    and isinstance(node.iter.func, ast.Name) and node.iter.func.id == 'listeners')
+        fragments.append(ast.unparse(loop) + '\n')
+    # Only these tiny AST fragments are data; nothing from the fixture is executed.
+    with TemporaryDirectory(prefix='devflow-observer-objects-') as directory:
+        root = Path(directory).resolve()
+        path = root / context.PREFIX / 'delivery_native_process.py'
+        path.parent.mkdir(parents=True)
+        git(root, 'init', '-q')
+        revisions = []
+        for text in fragments:
+            path.write_text(text)
+            git(root, 'add', '.')
+            git(root, 'commit', '-qm', 'Isolated observer source data')
+            revisions.append(git(root, 'rev-parse', 'HEAD'))
+        payload = context._sources(root, revisions[1])[1]
+        git(root, 'replace', revisions[1], revisions[0])
+        assert git(root, 'show', revisions[1] + ':' + context.PREFIX
+                   + 'delivery_native_process.py') == fragments[0].strip()
+        monkeypatch.setattr(context, '_protected_root', lambda: root)
+        identity = {'dirty': False, 'local_digest': None, 'revision': revisions[1],
+                    'runtime_payload_sha256': payload}
+        assert subject._loop(identity) == subject._CORRECTED_LOOP

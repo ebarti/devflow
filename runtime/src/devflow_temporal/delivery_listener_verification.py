@@ -38,17 +38,13 @@ def possible(row):
 
 
 def _loop(identity):
-    from .delivery_broker import _git
-    from .delivery_feature_review_context import _protected_root
+    from .delivery_feature_review_context import _protected_root, _sources
 
     runtime = _runtime(identity)
-    tree = ast.parse(
-        _git(
-            _protected_root(),
-            "show",
-            runtime["revision"] + ":runtime/src/devflow_temporal/delivery_native_process.py",
-        )
-    )
+    sources, payload = _sources(_protected_root(), runtime['revision'])
+    if payload != runtime['runtime_payload_sha256']:
+        raise ValueError('listener verification authenticated runtime payload changed')
+    tree = ast.parse(sources['delivery_native_process.py'])
     loops = [
         node
         for node in ast.walk(tree)
