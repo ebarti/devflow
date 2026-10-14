@@ -131,14 +131,56 @@ async def interrupted_events(history, spec, recovery, state):
             'finalization_failed_event_id': failed[finalizer][0]}
 
 
+def precheck_dependency(spec, journal_path, journal_sha256, history):
+    """Bind one prerequisite launch; its receipt never grants a product-check pass."""
+    from .delivery_native_dependencies import REGISTRY, frozen_pnpm_inputs
+    from .delivery_resources import read_private
+
+    journal_path = Path(journal_path)
+    raw = read_private(journal_path, raw=True)
+    if hashlib.sha256(raw).hexdigest() != journal_sha256:
+        raise ValueError('interrupted gate native launch differs from its actual precheck')
+    journal = json.loads(raw)
+    launch = read_private(journal_path.with_name('launch.json'))
+    ready = read_private(journal_path.with_name('ready.json'))
+    intent, monitor = journal['intent'], journal['monitor']
+    child = journal.get('owned', {}).get(str(ready.get('pid')), {})
+    identity = child.get('identity')
+    staging = Path(spec['state_dir']) / 'transient/dependencies' / spec['policy_digest'] / 'staging'
+    manager, _ = frozen_pnpm_inputs(spec, Path(spec['checkout']))
+    argv = ['corepack', manager, 'fetch', '--frozen-lockfile', '--ignore-scripts',
+            '--ignore-pnpmfile', '--store-dir', str(staging / 'store')]
+    try:
+        born = datetime.strptime(monitor['identity'], '%a %b %d %H:%M:%S %Y').astimezone(UTC)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError('interrupted precheck native birth identity is unreadable') from exc
+    if (intent['run_id'] != spec['run_id']
+            or intent['policy_digest'] != spec['policy_digest']
+            or intent['argv'] != launch.get('argv') or intent['argv'] != argv
+            or intent['timeout'] != 1800
+            or launch.get('environment', {}).get('COREPACK_ENABLE_NETWORK') != '0'
+            or launch.get('environment', {}).get('npm_config_registry')
+            != 'https://' + REGISTRY + '/'
+            or intent['environment_sha256'] != digest(launch.get('environment'))
+            or intent['cwd'] != str(staging)
+            or intent['ports'] != [] or ready.get('identity') != identity
+            or ready.get('pid') == monitor['pid'] or child.get('ppid') != monitor['pid']
+            or child.get('pgid') != ready.get('pid')
+            or journal.get('runtime_identity', {}).get('runtime_payload_sha256')
+            != spec['policy'].get('native_identity', {}).get('runtime_payload_sha256')
+            or not datetime.fromisoformat(history['precheck_started_at']) - timedelta(seconds=1)
+            <= born <= datetime.fromisoformat(history['precheck_completed_at'])):
+        raise ValueError('interrupted gate native launch differs from its actual precheck')
+    return journal
+
+
 def observe_interrupted(store, spec, row, attempts, effects, closed):
     from . import delivery_gate_retry as gates
     from .delivery_closures import sealed_closure
     from .delivery_feature_closure import closed_worker
-    from .delivery_native_dependencies import REGISTRY, frozen_pnpm_inputs
     from .delivery_native_preparation import native_identity
     from .delivery_policy_recovery import work_binding
-    from .delivery_resources import _gate_evidence_root, read_private
+    from .delivery_resources import _gate_evidence_root
 
     recovery, state = json.loads(row['recovery_json']), closed['result']
     if (not interrupted(row) or row['cleanup'] != 'confirmed'
@@ -188,39 +230,7 @@ def observe_interrupted(store, spec, row, attempts, effects, closed):
     # The native observer already proved the actual lost monitor's teardown.
     # Bind this sole new dependency launch to the acknowledged precheck interval;
     # its unknown exit remains unknown and grants no gate pass.
-    journal_path = Path(next(iter(extra)))
-    journal = read_private(journal_path)
-    launch = read_private(journal_path.with_name('launch.json'))
-    ready = read_private(journal_path.with_name('ready.json'))
-    intent, monitor = journal['intent'], journal['monitor']
-    child = journal.get('owned', {}).get(str(ready.get('pid')), {})
-    identity = child.get('identity')
-    staging = Path(spec['state_dir']) / 'transient/dependencies' / spec['policy_digest'] / 'staging'
-    manager, _ = frozen_pnpm_inputs(spec, Path(spec['checkout']))
-    argv = ['corepack', manager, 'fetch', '--frozen-lockfile', '--ignore-scripts',
-            '--ignore-pnpmfile', '--store-dir', str(staging / 'store')]
-    try:
-        born = datetime.strptime(monitor['identity'], '%a %b %d %H:%M:%S %Y').astimezone(UTC)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError('interrupted precheck native birth identity is unreadable') from exc
-    if (hashlib.sha256(journal_path.read_bytes()).hexdigest() != journals[str(journal_path)]
-            or intent['run_id'] != spec['run_id']
-            or intent['policy_digest'] != spec['policy_digest']
-            or intent['argv'] != launch.get('argv') or intent['argv'] != argv
-            or intent['timeout'] != 1800
-            or launch.get('environment', {}).get('COREPACK_ENABLE_NETWORK') != '0'
-            or launch.get('environment', {}).get('npm_config_registry')
-            != 'https://' + REGISTRY + '/'
-            or intent['environment_sha256'] != digest(launch.get('environment'))
-            or intent['cwd'] != str(staging)
-            or intent['ports'] != [] or ready.get('identity') != identity
-            or ready.get('pid') == monitor['pid'] or child.get('ppid') != monitor['pid']
-            or child.get('pgid') != ready.get('pid')
-            or journal.get('runtime_identity', {}).get('runtime_payload_sha256')
-            != spec['policy'].get('native_identity', {}).get('runtime_payload_sha256')
-            or not datetime.fromisoformat(history['precheck_started_at']) - timedelta(seconds=1)
-            <= born <= datetime.fromisoformat(history['precheck_completed_at'])):
-        raise ValueError('interrupted gate native launch differs from its actual precheck')
+    precheck_dependency(spec, next(iter(extra)), journals[next(iter(extra))], history)
     with store._connect() as db:
         binding = work_binding(store, spec, db)
         if (store.state.claim_for(db, spec['work_id']) is not None

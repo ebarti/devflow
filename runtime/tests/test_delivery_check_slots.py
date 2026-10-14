@@ -949,6 +949,34 @@ async def test_replaced_attempt_hands_its_gate_to_the_retry(owned_checks, monkey
     assert len(activities._UNCLEAN_CHECK_SLOTS) == owned_checks.retained_slots
 
 
+@pytest.mark.parametrize('queued_finished', [True, False])
+def test_cancelled_queued_retries_keep_the_live_native_predecessor(queued_finished):
+    key = ('queued-native-custody', object())
+    signals = [(threading.Event(), threading.Event()) for _ in range(4)]
+    first, second, third, fourth = signals
+    try:
+        assert activities._claim_gate(key, 1, *first) is None
+        assert activities._claim_gate(key, 2, *second) is first[1]
+        activities._release_gate(key, second[1])  # Attempt 2 timed out while still queued.
+        assert activities._claim_gate(key, 3, *third) is first[1]
+        assert not first[1].is_set()
+        if queued_finished:
+            activities._release_gate(key, third[1])
+            assert key in activities._ACTIVE_CHECKS
+            activities._release_gate(key, first[1])
+            assert key not in activities._ACTIVE_CHECKS
+        else:
+            activities._release_gate(key, first[1])
+            assert activities._claim_gate(key, 4, *fourth) is third[1]
+            activities._release_gate(key, fourth[1])
+            assert key in activities._ACTIVE_CHECKS
+            activities._release_gate(key, third[1])
+            assert key not in activities._ACTIVE_CHECKS
+    finally:
+        for _, finished in signals:
+            activities._release_gate(key, finished)
+
+
 async def test_retry_dispatched_before_the_replacement_notice_waits_for_its_predecessor(
     owned_checks, monkeypatch,
 ):

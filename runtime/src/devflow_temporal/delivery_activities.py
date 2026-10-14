@@ -47,7 +47,9 @@ _UNCLEAN_CHECK_LOCK = threading.Lock()
 # this worker: its attempt number, supersession and completion signals. A later
 # attempt of the same activity supersedes the registered body itself and waits
 # for it, without relying on Temporal's throttled replacement notice.
-_ACTIVE_CHECKS: dict[tuple[Any, ...], tuple[int, threading.Event, threading.Event]] = {}
+_ACTIVE_CHECKS: dict[
+    tuple[Any, ...], tuple[int, threading.Event, threading.Event, threading.Event | None]
+] = {}
 _ACTIVE_CHECK_LOCK = threading.Lock()
 
 
@@ -182,18 +184,25 @@ def _claim_gate(
         previous = _ACTIVE_CHECKS.get(key)
         if previous is not None and previous[0] >= attempt:
             return None
-        _ACTIVE_CHECKS[key] = (attempt, superseded, finished)
-    if previous is None:
-        return None
-    previous[1].set()
-    return previous[2]
+        predecessor = None
+        if previous is not None:
+            inherited = previous[3]
+            predecessor = (inherited if inherited is not None and not inherited.is_set()
+                           else previous[2])
+        _ACTIVE_CHECKS[key] = (attempt, superseded, finished, predecessor)
+    if previous is not None:
+        previous[1].set()
+    return predecessor
 
 
 def _release_gate(key: tuple[Any, ...], finished: threading.Event) -> None:
     with _ACTIVE_CHECK_LOCK:
         finished.set()
         current = _ACTIVE_CHECKS.get(key)
-        if current is not None and current[2] is finished:
+        # A queued retry finishing does not settle the native body it inherited.
+        # That predecessor's eventual release also retires a finished queued entry.
+        if (current is not None and current[2].is_set()
+                and (current[3] is None or current[3].is_set())):
             del _ACTIVE_CHECKS[key]
 
 

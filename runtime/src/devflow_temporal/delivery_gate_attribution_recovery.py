@@ -81,6 +81,16 @@ def _gate_ancestor(store, transport):
     prior = json.loads(saved[0]) if saved else None
     from .delivery_gate_preflight_continuation import _authority
 
+    if (prior or {}).get('seal', {}).get('preparation_observation'):
+        from .delivery_check_prelaunch import preparation_authority
+
+        execution = prior['execution_spec']
+        path = Path(execution['state_dir']) / gate_namespace(
+            execution['gate_retry_generation'], execution['gate_retry_stage'])
+        if read_private(path / 'admission.json') != prior:
+            raise ValueError('attribution readback lost its preparation predecessor')
+        preparation_authority(execution, prior)
+        prior = prior['original_recovery']
     for _ in range(2):
         if not prior or not prior.get('execution_spec', {}).get('gate_retry_preflight_generation'):
             break
