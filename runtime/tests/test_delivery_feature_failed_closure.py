@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import threading
 from copy import deepcopy
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from temporalio.api.history.v1 import (
 )
 from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError, WorkflowHistory
 from temporalio.exceptions import ApplicationError
-from temporalio.testing import WorkflowEnvironment
+from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from test_delivery_feature_recovered_closure import recovered_worker as recovered_worker
 from test_delivery_feature_workflow_temporal import FeatureActivities
@@ -232,3 +233,124 @@ async def test_pending_settlement_receipt_requires_current_draining_owner(
     monkeypatch.setattr(activities, '_feature_context', unknown)
     with pytest.raises(OwnershipConflict, match='custody is unconfirmed'):
         await activities.delivery_feature_settle_workers({'spec': spec, 'workers': {}})
+
+
+@pytest.mark.parametrize('cancel_at', [None, 'context', 'finish'])
+async def test_worker_settlement_heartbeats_cover_authentication_and_remain_cancellable(
+    recovered_worker, monkeypatch, cancel_at,
+):
+    from devflow_temporal import delivery_activities as roles
+
+    store, spec, child, shared, token, _, _ = recovered_worker
+    request = {'spec': deepcopy(spec), 'workers': {child['run_id']: 'existing-workflow'}}
+    original = deepcopy(request)
+    budget = shared.budget(token['issue_id'])
+    context_entered, context_release, context_done = (threading.Event() for _ in range(3))
+    finish_entered, finish_release, finish_done = (threading.Event() for _ in range(3))
+    remote_entered, remote_release = asyncio.Event(), asyncio.Event()
+    phase = 'initial'
+    beats, settlements = [], []
+    environment = ActivityEnvironment()
+    environment.on_heartbeat = lambda *details: beats.append((phase, deepcopy(details)))
+    original_finish = activities.finish_worker
+
+    def context(input_spec):
+        nonlocal phase
+        assert input_spec == spec
+        phase = 'context'
+        context_entered.set()
+        try:
+            assert context_release.wait(3), 'fixture context was not released'
+            return store, None, shared, token
+        finally:
+            context_done.set()
+
+    async def describe():
+        nonlocal phase
+        phase = 'remote'
+        remote_entered.set()
+        await remote_release.wait()
+        return SimpleNamespace(status=WorkflowExecutionStatus.COMPLETED)
+
+    async def connect(*_args, **_kwargs):
+        return SimpleNamespace(get_workflow_handle=lambda _: SimpleNamespace(describe=describe))
+
+    def finish(input_spec, child_id):
+        nonlocal phase
+        assert input_spec == spec and child_id == child['run_id']
+        phase = 'finish'
+        finish_entered.set()
+        try:
+            assert finish_release.wait(3), 'fixture worker authentication was not released'
+            result = original_finish(input_spec, child_id)
+            settlements.append(child_id)
+            return result
+        finally:
+            finish_done.set()
+
+    # Only accelerate the existing heartbeat cadence and bounded settlement
+    # rescan; retain the real SDK context, wrapper and original finish guards.
+    original_wait, original_sleep = asyncio.wait, asyncio.sleep
+
+    async def accelerated_wait(futures, *, timeout=None, **kwargs):
+        return await original_wait(futures, timeout=.01 if timeout == 5 else timeout, **kwargs)
+
+    async def accelerated_sleep(delay):
+        return await original_sleep(.01 if delay == 5 else delay)
+
+    async def phase_heartbeats(name):
+        async def observed():
+            while sum(phase == name for phase, _ in beats) < 2:
+                await original_sleep(.002)
+        await asyncio.wait_for(observed(), 1)
+
+    monkeypatch.setattr(activities, '_feature_context', context)
+    monkeypatch.setattr(closure.Client, 'connect', connect)
+    monkeypatch.setattr(activities, 'finish_worker', finish)
+    monkeypatch.setattr(roles.asyncio, 'wait', accelerated_wait)
+    monkeypatch.setattr(activities.asyncio, 'sleep', accelerated_sleep)
+    task = asyncio.create_task(environment.run(activities.delivery_feature_settle_workers, request))
+    try:
+        assert await asyncio.to_thread(context_entered.wait, 1)
+        await phase_heartbeats('context')
+        assert not remote_entered.is_set() and settlements == []
+        if cancel_at == 'context':
+            environment.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            context_release.set()
+            await asyncio.wait_for(remote_entered.wait(), 1)
+            await phase_heartbeats('remote')
+            assert not finish_entered.is_set()
+            remote_release.set()
+            assert await asyncio.to_thread(finish_entered.wait, 1)
+            await phase_heartbeats('finish')
+            assert settlements == []
+            if cancel_at == 'finish':
+                environment.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                finish_release.set()
+                assert await asyncio.wait_for(task, 1) == {'state': 'confirmed'}
+    finally:
+        environment.cancel()
+        task.cancel()
+        context_release.set()
+        remote_release.set()
+        finish_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await asyncio.to_thread(context_done.wait, 1)
+        if finish_entered.is_set():
+            assert await asyncio.to_thread(finish_done.wait, 1)
+
+    assert settlements == ([] if cancel_at == 'context' else [child['run_id']])
+    assert request == original and shared.budget(token['issue_id']) == budget
+    assert shared.token(shared.current(token['issue_id'])) == token
+    assert shared.current(token['issue_id'])['state'] == 'draining'
+    for _, details in beats:
+        if details[0].get('stage') == 'settling_feature_workers':
+            assert details == ({'stage': 'settling_feature_workers', 'remaining': 1},)
+        else:
+            assert details == ({'run_id': spec['run_id'], 'stage': 'feature_settle_workers'},)

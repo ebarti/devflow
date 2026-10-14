@@ -675,6 +675,12 @@ async def delivery_feature_wait_worker(request):
 
 @activity.defn(name="delivery_feature_settle_workers")
 async def delivery_feature_settle_workers(request):
+    from .delivery_activities import _with_heartbeat
+
+    return await _with_heartbeat(_settle_workers(request), request, "feature_settle_workers")
+
+
+async def _settle_workers(request):
     from temporalio.client import Client, WorkflowExecutionStatus, WorkflowUpdateFailedError
     from temporalio.service import RPCError, RPCStatusCode
 
