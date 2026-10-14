@@ -630,3 +630,84 @@ def test_public_terminal_cleanup_derives_only_exact_finalization_and_keeps_recor
         "receipt_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
     assert projected_cleanup(owned, checks, "none", terminal=True) == "confirmed"
+
+
+def test_native_prechecks_preserve_unregistered_historical_workspace_modules(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from test_delivery_store import _git
+
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_broker import DeliveryBroker
+
+    monkeypatch.setenv('GIT_CONFIG_NOSYSTEM', '1')
+    monkeypatch.setenv('GIT_CONFIG_GLOBAL', os.devnull)
+    owned = spec(tmp_path)
+    owned.update(provider='codex', resource_cleanup_version=1)
+    recipe = {'id': 'release-privacy', 'argv': ['opaque-fixture']}
+    owned['policy'] = {'execution_backend': 'native-macos', 'host_sandbox': 'trusted-local',
+                       'prepublish_checks': [recipe]}
+    owned['policy_digest'] = digest(owned['policy'])
+    source = Path(owned['source_path'])
+    (source / 'apps/api').mkdir(parents=True)
+    (source / 'package.json').write_text('{"name":"fixture-root","private":true}')
+    (source / 'pnpm-workspace.yaml').write_text('packages:\n  - apps/*\n')
+    (source / 'apps/api/package.json').write_text('{"name":"fixture-api","private":true}')
+    (source / '.gitignore').write_text('node_modules/\n')
+    _git(source, 'init', '-q')
+    _git(source, 'add', '.')
+    _git(source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+         'commit', '-qm', 'Private workspace fixture')
+    owned['base_sha'] = _git(source, 'rev-parse', 'HEAD')
+    checkout = Path(owned['checkout'])
+    checkout.parent.mkdir()
+    resources = RunResources(owned)
+    resources.register(checkout, 'checkout')
+    _git(source, 'worktree', 'add', '--detach', str(checkout), owned['base_sha'])
+    resources.created(checkout)
+    historical = checkout / 'apps/api/node_modules'
+    historical.mkdir()
+    sentinel = historical / 'preserved'
+    sentinel.write_text('historical ignored modules')
+    original_identity = historical.stat().st_ino
+    broker = DeliveryBroker.__new__(DeliveryBroker)
+    broker.spec, broker.source, broker.checkout = owned, source, checkout
+    broker.state_dir = broker.evidence_dir = Path(owned['state_dir'])
+    broker.store = None
+    candidate = broker.candidate()
+    prepared = []
+
+    def run_private_check(process):
+        prepared.append(process.cwd)
+        for relative in ('node_modules', 'apps/api/node_modules'):
+            (process.cwd / relative).mkdir()
+        process.folder.mkdir(parents=True)
+        log = process.folder / 'stdout.log'
+        log.write_text('Private fixture passed')
+        return {'cleanup': 'observed-native-confirmed', 'log': str(log), 'exit_code': 0}
+
+    # Keep the actual check list, workspace expansion and custody recording;
+    # external authority and native launch are private seams, with no provider.
+    monkeypatch.setattr('devflow_temporal.delivery_native_guard.validate_native_turn',
+                        lambda *args: None)
+    monkeypatch.setattr('devflow_temporal.delivery_preparation.verify_prepared_spec',
+                        lambda _spec: None)
+    monkeypatch.setattr('devflow_temporal.delivery_sandbox.prepare_native_check',
+                        lambda *args, **kwargs: ('private-fixture', {}))
+    monkeypatch.setattr('devflow_temporal.delivery_sandbox.native_check_argv',
+                        lambda _spec, _profile, _cwd, argv: argv)
+    monkeypatch.setattr('devflow_temporal.delivery_native_process.NativeProcess',
+                        lambda _spec, folder, **kwargs: SimpleNamespace(folder=folder, **kwargs))
+    monkeypatch.setattr(broker, '_run_native_check', run_private_check)
+    result = broker.run_prechecks(7, candidate)
+    assert result['state'] == 'passed' and result['source_unchanged'] is True
+    verify = broker.state_dir / 'gates/7/verify'
+    assert prepared == [verify]
+    manifest = read_private(resources.manifest)
+    assert manifest['roots'][str(verify / 'apps/api/node_modules')]['identity']
+    assert str(historical) not in manifest['roots']
+    assert sentinel.read_text() == 'historical ignored modules'
+    assert historical.stat().st_ino == original_identity
+    assert broker.candidate() == candidate
+    with pytest.raises(ValueError, match='existing unregistered resource'):
+        broker._register_generated(checkout, ['node_modules'])

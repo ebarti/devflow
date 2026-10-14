@@ -1253,8 +1253,10 @@ class DeliveryBroker:
             validate_native_turn(self.spec, "implement", iteration, self.store)
         if self.candidate() != candidate:
             raise ValueError("prepublication candidate is stale")
+        checkout = (self.gate_checkout("verify", iteration, candidate)
+                    if self.spec["provider"] == "codex" else self.checkout)
         return self._run_check_list(
-            self.checkout,
+            checkout,
             self.spec["policy"].get("prepublish_checks", []),
             self.evidence_dir / "prechecks" / str(iteration),
             candidate,
