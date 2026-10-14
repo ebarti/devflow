@@ -907,7 +907,9 @@ def admit(store, run_id, payload, *, preflight=False):
                 Path(__file__).resolve().parents[3], 'status', '--porcelain',
                 '--untracked-files=all'):
             raise ValueError('gate retry requires clean installed runtime source')
-        execution = prepare_runtime(spec, root, command_digest, digest(seal))
+        execution = prepare_runtime(
+            spec, root, command_digest, digest(seal),
+            **({'handoff': (store, seal, payload)} if verification else {}))
         if 'verification_test_paths' in payload:
             execution['verification_test_paths'] = payload['verification_test_paths']
         from .delivery_session_custody import implementation_generation
@@ -1184,28 +1186,223 @@ def readback(store, spec, recovery, *, resource_spec=None):
     return recovery['publication']
 
 
-def prepare_runtime(spec, root, command_digest, seal_digest):
+def _unused_runtime_preparation(spec, root, raw, handoff, command_digest, seal_digest):
+    """Preserve unused preparation; only the fresh stopped snapshot grants gates."""
+    from .delivery_continuation import continuation_authority
+    from .delivery_feature_closure import closed_coordinator
+    from .delivery_feature_execution import registry, require_worker_handoff, worker_key
+    from .delivery_gate_preflight_continuation import _prepared_coordinator
+    from .delivery_listener_verification import CAUSE
+    from .delivery_native_preparation import native_identity, pinned_identity, verify_native_spec
+
+    store, seal, command = handoff
+    intent = json.loads(raw)
+    prepared = intent.get('effective_spec') or {}
+    preparation = prepared.get('preparation') or {}
+    if (seal.get('verification_observation', {}).get('cause') != CAUSE
+            or seal['original_spec'] != spec or not spec.get('feature_worker')
+            or seal['stage'] != 'transient' or seal['generation'] != 1
+            or root != Path(spec['state_dir']) / gate_namespace(1, 'transient')
+            or command.get('continuation_kind') != KIND
+            or command.get('additional_iterations') != 0
+            or set(intent) != {'command_digest', 'seal_digest', 'preparation_attempts',
+                               'state', 'effective_spec'}
+            or intent.get('state') != 'prepared' or intent.get('preparation_attempts') != []
+            or preparation.get('cache_reused') is not True
+            or 'measured_policy_digest' in preparation
+            or any(not isinstance(intent.get(key), str)
+                   or not re.fullmatch(r'[0-9a-f]{64}', intent[key])
+                   for key in ('command_digest', 'seal_digest'))
+            or (root / 'admission.json').exists() or (root / 'admission.json').is_symlink()
+            or spec['policy'].get('host_sandbox') != 'trusted-local'):
+        raise ValueError('unused runtime preparation has no cache-only listener handoff')
+    config = load_execution_config(spec)
+
+    def frozen_preparation(value):
+        verify_native_spec(value)
+        expected = deepcopy(spec)
+        expected.update(config_path=str(config.path), config_digest=digest(config.raw),
+                        terminal_tracker_version=1)
+        expected['policy']['codex_bin'] = str(Path(distribution(
+            'openai-codex-cli-bin').locate_file('codex_cli_bin/bin/codex')).resolve())
+        value = deepcopy(value)
+        for item in (expected, value):
+            item.pop('preparation', None)
+            item.pop('policy_digest', None)
+            item['policy'] = continuation_authority(item['policy'])
+        if value != expected:
+            raise ValueError('unused runtime preparation changed its frozen source or policy')
+
+    frozen_preparation(prepared)
+    shared = registry(spec)
+    current = shared.current(spec['feature_delivery']['owner']['issue_id'])
+    if not current or current['state'] not in {'active', 'draining'}:
+        raise ValueError('unused runtime preparation has no current coordinator')
+    current_token = shared.token(current)
+    closed = {key: seal['closed'][key] for key in ('workflow_id', 'execution_run_id')}
+
+    def command_for(owner):
+        return {**command, 'command_id': 'feature-resume-' + digest({
+            'owner': owner, 'run': spec['run_id'], 'closed': closed})[:24]}
+
+    if (command_for(current_token) != command
+            or digest({'run_id': spec['run_id'], **command}) != command_digest):
+        raise ValueError('unused runtime preparation requires its current server command')
+
+    def producer(request_digest, *, released):
+        matches = []
+        with shared.connect() as db:
+            for row in db.execute('SELECT * FROM execution_snapshots '
+                                  'WHERE issue_id=? AND store_path=?',
+                                  (current_token['issue_id'], str(store.config.tracking_db))):
+                previous_command = command_for(shared.token(row))
+                if digest({'run_id': spec['run_id'], **previous_command}) == request_digest:
+                    matches.append(previous_command)
+        if len(matches) != 1:
+            raise ValueError('unused runtime preparation lost its original server command')
+        previous_command = matches[0]
+        proof = _prepared_coordinator(store, {
+            'execution_spec': spec, 'seal': seal, 'command': previous_command})
+        owner = proof['owner']
+        with store._connect() as db:
+            if db.execute('SELECT 1 FROM delivery_commands WHERE command_id=? OR request_digest=?',
+                          (previous_command['command_id'], request_digest)).fetchone():
+                raise ValueError('unused runtime preparation command was already consumed')
+        if owner == current_token and not released:
+            return proof
+        with shared.connect() as db:
+            worker = db.execute('SELECT * FROM execution_workers WHERE issue_id=? AND worker_key=?',
+                                (owner['issue_id'], worker_key(spec['run_id'], owner))).fetchone()
+            stopped = db.execute('SELECT * FROM execution_checkpoints WHERE issue_id=? '
+                                 'AND checkpoint_key=?',
+                                 (owner['issue_id'],
+                                  'stopped:' + str(owner['generation']))).fetchone()
+            if (owner['generation'] >= current_token['generation']
+                    or current_token['store_path'] != owner['store_path']
+                    or not worker or worker['state'] != 'finished'
+                    or worker['workstream_id'] != spec['feature_worker']['workstream_id']
+                    or (json.loads(worker['receipt_json'] or 'null') or {}).get('cleanup')
+                    != 'confirmed'
+                    or not stopped or stopped['generation'] != owner['generation']
+                    or stopped['content_digest'] != digest(json.loads(stopped['content_json']))
+                    or db.execute("SELECT 1 FROM execution_workers WHERE issue_id=? "
+                                  "AND generation=? AND state!='finished'",
+                                  (owner['issue_id'], owner['generation'])).fetchone()
+                    or db.execute("SELECT 1 FROM execution_effects WHERE issue_id=? "
+                                  "AND generation=? "
+                                  "AND state='pending'", (owner['issue_id'], owner['generation']))
+                    .fetchone()):
+                raise ValueError('unused runtime preparation still has predecessor custody')
+        with store._connect() as db:
+            previous_parent = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                                         (owner['run_id'],)).fetchone()
+            current_parent = store.effective_spec(current_token['run_id'])
+            if (not previous_parent
+                    or previous_parent['outcome'] not in {'delivered', 'blocked', 'cancelled'}
+                    or previous_parent['work_id'] != current_parent['work_id']):
+                raise ValueError('unused runtime preparation changed its canonical parent work')
+            work_binding(store, current_parent, db)
+        parent_closed = closed_coordinator(store, owner['run_id'])
+        if json.loads(stopped['content_json']).get('state') != parent_closed['result']:
+            raise ValueError('unused runtime preparation lost its stopped coordinator closure')
+        return proof
+
+    original_producer = producer(intent['command_digest'], released=True)
+    require_worker_handoff(store, spec)
+    parent = store.effective_spec(current_token['run_id'])
+    if parent['feature_delivery']['owner'] != current_token:
+        raise ValueError('unused runtime preparation current coordinator changed')
+    with store._connect() as db:
+        work_binding(store, parent, db)
+        if store.state.claim_for(db, parent['work_id']) is None:
+            raise ValueError('unused runtime preparation lost its current parent claim')
+        row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                         (spec['run_id'],)).fetchone()
+        admission = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
+                               (spec['run_id'],)).fetchone()
+        queue = db.execute('SELECT state FROM delivery_outbox WHERE run_id=?',
+                           (spec['run_id'],)).fetchone()
+        if (not row or _sealed_row(row) != seal['row']
+                or row['workflow_id'] != seal['closed']['workflow_id']
+                or not admission or digest(json.loads(admission[0])) != seal['prior_gate_digest']
+                or not queue or queue[0] != 'sent'):
+            raise ValueError('unused runtime preparation was admitted, queued or changed')
+        for table, key, expected in [('delivery_attempts', 'job_key', seal['attempts']),
+                                     ('delivery_effects', 'effect_key', seal['effects'])]:
+            if [dict(item) for item in db.execute(
+                    f'SELECT * FROM {table} WHERE run_id=? ORDER BY {key}', (spec['run_id'],))] \
+                    != expected:
+                raise ValueError('unused runtime preparation lost its full ledger')
+    binding = {'command_digest': command_digest, 'seal_digest': seal_digest,
+               'coordinator': _prepared_coordinator(store, {
+                   'execution_spec': spec, 'seal': seal, 'command': command}),
+               'predecessor': {'intent_sha256': hashlib.sha256(raw).hexdigest(),
+                               'command_digest': intent['command_digest'],
+                               'seal_digest': intent['seal_digest'],
+                               'coordinator': original_producer}}
+    path = root / 'runtime-preparation' / 'successor' / 'intent.json'
+    successor = read_private(path) if path.exists() or path.is_symlink() else {
+        **binding, 'preparation_attempts': []}
+    if successor.get('predecessor') != binding['predecessor']:
+        raise ValueError('unused runtime preparation predecessor changed')
+    if any(successor.get(key) != value for key, value in binding.items()):
+        previous = producer(successor['command_digest'], released=False)
+        if successor.get('coordinator') != previous:
+            raise ValueError('unused runtime preparation successor coordinator changed')
+        for index, attempt in enumerate(successor['preparation_attempts']):
+            if (attempt.get('state') != 'stopped' or attempt.get('error')
+                    or attempt.get('cleanup', {}).get('state') != 'confirmed'
+                    or Path(attempt['spec']['state_dir'])
+                    != path.parent / 'probes' / str(index) / spec['run_id']):
+                raise ValueError('unused runtime preparation still has an unfinished attempt')
+            _stopped_cleanup(attempt['spec'], read_only=True)
+        _immutable(path.parent / ('previous-' + digest(successor) + '.json'), successor)
+        successor = {**successor, **binding}
+    if successor.get('effective_spec'):
+        frozen_preparation(successor['effective_spec'])
+        identity = native_identity(successor['effective_spec'])
+        if pinned_identity(identity, spec) != pinned_identity(
+                successor['effective_spec']['policy']['native_identity'], spec):
+            _immutable(path.parent / ('prepared-' + digest(successor) + '.json'), successor)
+            successor = {key: value for key, value in successor.items()
+                         if key not in {'state', 'effective_spec'}}
+    return path, successor
+
+
+def prepare_runtime(spec, root, command_digest, seal_digest, *, handoff=None):
     """Bind the same locked executable to current source without changing feature authority."""
     if spec['provider'] == 'fake':
         return deepcopy(spec)
     source = Path(__file__).resolve().parents[3]
     if _git(source, 'status', '--porcelain', '--untracked-files=all'):
         raise ValueError('continuation requires clean installed runtime source')
+    binary = Path(distribution('openai-codex-cli-bin').locate_file('codex_cli_bin/bin/codex'))
+    if hashlib.sha256(binary.read_bytes()).hexdigest() != spec['policy']['codex_bin_sha256']:
+        raise ValueError('continuation cannot change the frozen CLI executable')
+    execution = deepcopy(spec)
+    execution['policy']['codex_bin'] = str(binary.resolve())
     with _lock(root / 'runtime-preparation'):
-        path = root / 'runtime-preparation' / 'intent.json'
-        intent = read_private(path) if path.exists() else {
+        original_path = root / 'runtime-preparation' / 'intent.json'
+        raw = read_private(original_path, raw=True) if original_path.exists() else None
+        intent = json.loads(raw) if raw is not None else {
             'command_digest': command_digest, 'seal_digest': seal_digest,
             'preparation_attempts': []}
+        path = original_path
         if intent['command_digest'] != command_digest or intent['seal_digest'] != seal_digest:
-            raise ValueError('pending runtime preparation belongs to changed authority')
+            if handoff is None:
+                raise ValueError('pending runtime preparation belongs to changed authority')
+            path, intent = _unused_runtime_preparation(
+                spec, root, raw, handoff, command_digest, seal_digest)
         write_private(path, intent)
-        execution = deepcopy(spec)
-        binary = Path(distribution('openai-codex-cli-bin').locate_file(
-            'codex_cli_bin/bin/codex'))
-        if hashlib.sha256(binary.read_bytes()).hexdigest() != spec['policy']['codex_bin_sha256']:
-            raise ValueError('continuation cannot change the frozen CLI executable')
-        execution['policy']['codex_bin'] = str(binary.resolve())
-        return _prepare(execution, load_execution_config(spec), intent, path)
+        result = _prepare(execution, load_execution_config(spec), intent, path)
+        if path != original_path:
+            # Native preparation yields to another coordinator. Its current token,
+            # transferred claim, stopped row and full ledger must still be exact.
+            _unused_runtime_preparation(spec, root, raw, handoff, command_digest, seal_digest)
+            if read_private(original_path, raw=True) != raw:
+                raise ValueError('unused runtime preparation predecessor changed '
+                                 'during preparation')
+        return result
 
 
 def effective_repair(store, recovery, *, db=None):
