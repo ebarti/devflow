@@ -25,9 +25,13 @@ jobs:
         with:
           python-version: '3.12'
       - run: sh scripts/check-install.sh
+      - run: python3.12 -B -m unittest discover -s tests -p 'test_reconcile.py' -v
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: '1'
   test:
-    runs-on: macos-latest
-    # The passing Mac source tests took 122.123s before setup and cleanup.
+    runs-on: ubuntu-latest
+    # Installer and reconcile modules already run on Mac; keep one execution per case.
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,7 +40,35 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - run: python3.12 -B -m unittest discover -s tests -v
+      - name: Run the remaining portable source tests
+        run: |
+          python3.12 -B - <<'PY'
+          import sys
+          import unittest
+
+          def cases(suite):
+              for test in suite:
+                  if isinstance(test, unittest.TestSuite):
+                      yield from cases(test)
+                  else:
+                      yield test
+
+          discovered = list(cases(unittest.defaultTestLoader.discover('tests')))
+          mac_modules = {'test_reconcile', 'test_service_entry_installation',
+                         'test_upgrade_installation'}
+          native = [test for test in discovered
+                    if type(test).__module__ in mac_modules
+                    or type(test).__module__.startswith('test_delivery')]
+          native_ids = {test.id() for test in native}
+          portable = [test for test in discovered if test.id() not in native_ids]
+          portable_ids = {test.id() for test in portable}
+          assert not native_ids & portable_ids
+          assert native_ids | portable_ids == {test.id() for test in discovered}
+          assert native_ids and portable_ids
+          print(f'Source coverage: {len(native_ids)} Mac + {len(portable_ids)} portable cases')
+          result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(portable))
+          sys.exit(not result.wasSuccessful())
+          PY
   temporal-runtime-tests:
     name: runtime shard ${{ matrix.shard }}
     needs: [install, test]
@@ -71,12 +103,11 @@ jobs:
       - name: Run every assigned module in three isolated pytest processes
         # Three hosted Mac jobs, each with three module-atomic internal partitions.
         run: |
-          first=$(( ${{ matrix.shard }} * 3 ))
           processes=()
           for lane in 0 1 2; do
-            index=$((first + lane))
-            PYTEST_ADDOPTS="-p no:cacheprovider --basetemp=$RUNNER_TEMP/devflow-pytest-$index" \
-              .venv/bin/python runtime_ci.py --index "$index" --count 9 &
+            index=$(( ${{ matrix.shard }} + lane * 3 ))
+            .venv/bin/python runtime_ci.py --index "$index" --count 9 \
+              --basetemp "$RUNNER_TEMP/devflow-pytest-$index" &
             processes+=("$!")
           done
           result=0

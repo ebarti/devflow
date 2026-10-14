@@ -74,6 +74,7 @@ def main():
     parser.add_argument('--index', type=int)
     parser.add_argument('--verify', type=Path)
     parser.add_argument('--output', type=Path, default=Path('ci-results'))
+    parser.add_argument('--basetemp', type=Path)
     parser.add_argument('--revision', default=os.environ.get('GITHUB_SHA', ''))
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9a-f]{40}', args.revision) or not 1 <= args.count <= 16:
@@ -94,9 +95,12 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     partition = Partition(args.index, args.count, timings, args.revision)
     started = time.monotonic()
-    result = int(pytest.main(['-v', '--tb=short', '-ra', '--durations=20',
-                             '--junitxml=' + str(output / f'shard-{args.index}.xml')],
-                            plugins=[partition]))
+    pytest_args = ['-v', '--tb=short', '-ra', '--durations=20', '-p', 'no:cacheprovider',
+                   '--junitxml=' + str(output / f'shard-{args.index}.xml')]
+    if args.basetemp is not None:
+        # CLI options apply only to this pytest process, never its nested checks.
+        pytest_args.extend(['--basetemp', str(args.basetemp)])
+    result = int(pytest.main(pytest_args, plugins=[partition]))
     if partition.report is not None:
         report = {**partition.report, 'exit_code': result,
                   'finished': sorted(partition.finished),

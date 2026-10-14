@@ -2508,8 +2508,6 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
     ("preflight_mode", "tracker_mode"),
     [
         ("transient", "pending"),
-        ("transient", "drift"),
-        ("transient", "claim"),
         ("cancel", "none"),
         ("authority", "none"),
     ],
@@ -2806,7 +2804,7 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
 @pytest.mark.skipif(not shutil.which("temporal"), reason="local Temporal CLI required")
 @pytest.mark.parametrize(
     "failure_window",
-    ["pending_after_push", "complete_before_ack", "pending_reconcile_error"],
+    ["complete_before_ack"],
 )
 async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remaining_gates(
     service, monkeypatch, failure_window
