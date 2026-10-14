@@ -105,6 +105,7 @@ async def history_for(store, spec, recovery, state, born, *, preparation=False, 
             'controller_attribution_proof': recovery['seal']['attribution_observation']}
         calls[5:5] = [
             ('delivery_role', {**common, 'role': 'review', 'resume_session': None,
+                'planning_defects_version': 1,
                 'qa_evidence': None, 'check_evidence': state['checks']['local'],
                 'evidence_context': {'role_artifacts': []},
                 'findings': ['Operator acceptance criteria (requirements to assess, '
@@ -511,8 +512,15 @@ def test_listener_verification_keeps_failed_report_and_authenticates_added_recor
     # Native transport is modeled; ordinary durable writers create and finish the
     # real review attempt and browser effect instead of filtering the store view.
     workspace = broker.gate_checkout('review', 7, report['candidate'])
+    brief = {'historical_assessment_remains_rejected': True,
+        'unresolved_findings': report['seal']['attribution_observation']['unresolved_findings'],
+        'controller_attribution_proof': report['seal']['attribution_observation']}
     request = {'spec': spec, 'role': 'review', 'iteration': 7, 'candidate': report['candidate'],
-               'workspace': str(workspace), 'resume_session': None, 'native_authorized': True}
+        'resume_session': None, 'qa_evidence': None, 'planning_defects_version': 1,
+        'check_evidence': state['checks']['local'], 'evidence_context': {'role_artifacts': []},
+        'findings': ['Operator acceptance criteria (requirements to assess, '
+                     'not evidence of success): ' + json.dumps(brief, sort_keys=True)],
+        'workspace': str(workspace), 'native_authorized': True}
     supervisor = DeliverySupervisor(f.store, capacity=1)
     job, _ = supervisor._claim(request)
     folder = Path(spec['state_dir']) / 'attempts' / job
@@ -604,6 +612,17 @@ def test_listener_verification_keeps_failed_report_and_authenticates_added_recor
     monkeypatch.setattr(delivery_broker, '_git', lambda root, *args:
         '' if root == _protected_root() and args[0] == 'status' else original_git(root, *args))
     before = deepcopy(state)
+    review_request = Path(spec['state_dir']) / 'attempts' / job / 'request.json'
+    original_request = read_private(review_request)
+    current_row, current_attempts, current_effects, _ = _rows(f.store, spec['run_id'])
+    for key, value in [('findings', []), ('check_evidence', {}), ('evidence_context', {})]:
+        write_private(review_request, {**original_request, key: value})
+        try:
+            with pytest.raises(ValueError, match='review request differs'):
+                subject._report_records(f.store, spec, report, current_row,
+                                        current_attempts, current_effects, closed, spec)
+        finally:
+            write_private(review_request, original_request)
     # The completed predicate, selectors and monitor cannot be replaced with a
     # broader transient failure or a synthetic pass, even at the same candidate.
     for key, value in [('exit_code', 1), ('exit_code', None), ('source_unchanged', False),

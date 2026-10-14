@@ -490,6 +490,7 @@ def _report_records(store, spec, recovery, row, attempts, effects, closed, resou
             raise ValueError("listener verification requires its sealed report history")
         authenticated = await completed_worker(sealed["history"], store, spec, row, closed)
         calls, done, times = {}, {}, {}
+        review_input = None
         names = {
             "delivery_precheck": "prepublish",
             "delivery_checks": "local",
@@ -521,6 +522,7 @@ def _report_records(store, spec, recovery, row, attempts, effects, closed, resou
                     ):
                         raise ValueError("listener verification report activity authority changed")
                     if item.activity_type.name == "delivery_role":
+                        review_input = values[0]
                         brief = {
                             "historical_assessment_remains_rejected": True,
                             "unresolved_findings": recovery["seal"]["attribution_observation"][
@@ -577,10 +579,11 @@ def _report_records(store, spec, recovery, row, attempts, effects, closed, resou
         ):
             raise ValueError("listener verification report history lost its exact gate results")
         review_id = ids[2]
-        return authenticated["history_sha256"], times[review_id], times[done[review_id][0]]
+        return (authenticated["history_sha256"], times[review_id],
+                times[done[review_id][0]], review_input)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        history, lower, upper = pool.submit(lambda: asyncio.run(read())).result(35)
+        history, lower, upper, review_input = pool.submit(lambda: asyncio.run(read())).result(35)
     root, _ = _root(spec, resource_spec)
     broker = ObservationBroker(store, spec, resource_spec=resource_spec)
     _checks(spec, state, broker, root)
@@ -594,6 +597,7 @@ def _report_records(store, spec, recovery, row, attempts, effects, closed, resou
         _time(upper),
         recovery["candidate"],
         resource_spec=resource_spec,
+        scheduled_input=review_input,
     )
     request, browser = _browser(spec, state, broker, root)
     effect = added_effects[0]
