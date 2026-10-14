@@ -619,13 +619,15 @@ class NativeProcess:
                             # A descendant may start between the process and listener snapshots.
                             if pid not in owned:
                                 sample(owned)
+                            # An owned listener can exit after lsof's snapshot.
+                            listener_entry = process_table().get(pid)
                             if (
                                 pid not in owned
-                                or process_table().get(pid, {}).get("identity")
-                                != owned[pid]["identity"]
+                                or (listener_entry is not None
+                                    and listener_entry["identity"] != owned[pid]["identity"])
                             ):
                                 conflict = True
-                            else:
+                            elif listener_entry is not None:
                                 observed_ports[str(port)] = {"pid": pid, **owned[pid]}
                     credit = 0.0
                     if self.argv[1:4] == ["-I", "-m", "devflow_temporal.role_runner"]:

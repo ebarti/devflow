@@ -63,6 +63,21 @@ class NativeListenerSnapshotContract(unittest.TestCase):
         self.assertEqual(inspect(owned), (True, {}))
         self.assertNotIn(200, owned)
 
+    def test_owned_listener_exit_between_snapshots_is_not_a_conflict(self):
+        parent = process(1, "parent-start")
+        child = process(100, "child-start")
+        table = {100: parent, 101: child}
+        owned = {pid: entry.copy() for pid, entry in table.items()}
+
+        def listener(_port):
+            # lsof saw the owned child just before it exited; ps sees it absent.
+            table.pop(101)
+            return {101}
+
+        _, inspect = listener_inspector(table, listener)
+        self.assertEqual(inspect(owned), (False, {}))
+        self.assertEqual(owned[101], child)
+
     def test_absent_listener_remains_a_conflict(self):
         table = {100: process(1, "parent-start")}
         _, inspect = listener_inspector(table, lambda _port: {200})
