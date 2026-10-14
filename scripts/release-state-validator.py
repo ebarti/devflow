@@ -289,13 +289,13 @@ def temporal_rows(table, before, after, phase, startup=None, namespaces=None):
                         "restart shard owner/lease is not one new lease")
                 owner_address(scalar(b, 3, 2))
             qa, qb = shard_queues(a), shard_queues(b)
-            require(qa[1] == qb[1], "transfer queue watermark changed")
-            for category in (2, 4, 7):
+            # Immediate queues can checkpoint a new allocator range after shard startup.
+            for category in (1, 2, 4, 7):
                 require(qb[category] >= qa[category], "shard watermark decreased")
                 require(qb[category][0] == qa[category][0] if category != 2 else
                         qb[category][1] == qa[category][1], "unsupported watermark field change")
                 if phase == "preinstall" and category != 2:
-                    require(qb[category] == qa[category], "preinstall visibility/archival state changed")
+                    require(qb[category] == qa[category], "preinstall immediate queue state changed")
     elif table == "task_queues":
         old_index = {(r["range_hash"], canonical(r["task_queue_id"])): r for r in before}
         new_index = {(r["range_hash"], canonical(r["task_queue_id"])): r for r in after}
@@ -346,12 +346,15 @@ def temporal_rows(table, before, after, phase, startup=None, namespaces=None):
             if old == new:
                 continue
             exact_except(old, new, {"data", "version"}, table)
-            require(new["version"] == old["version"] + 2, "unsupported cluster SQL version change")
+            # Startup endpoint persistence and the optional version check save independently.
+            require(type(old["version"]) is int and type(new["version"]) is int
+                    and 0 < old["version"] < new["version"] < 2**63,
+                    "invalid or nonadvancing cluster SQL version")
             a, b = (message(row, {1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13}) for row in (old, new))
             exact_except(a, b, {4, 5, 13}, "cluster metadata")
             va, vb = (wire(scalar(p, 4, 2), {1, 2, 4, 5}) for p in (a, b))
             exact_except(va, vb, {5}, "cluster VersionInfo")
-            require(proto_time(scalar(vb, 5, 2)) > proto_time(scalar(va, 5, 2)), "cluster version clock did not advance")
+            require(proto_time(scalar(vb, 5, 2)) >= proto_time(scalar(va, 5, 2)), "cluster version clock decreased")
             def attributes(data):
                 return proto_map(wire(data, {1}), 1, 0)
             require(proto_map(a, 5, 2, attributes) == proto_map(b, 5, 2, attributes),
@@ -397,8 +400,10 @@ def scanner_rows(nodes, trees, startup, system_namespace):
         branch_uuid = str(uuid.UUID(bytes=blob(node["branch_id"])))
         require(re.fullmatch(str(process["pid"]) + r"@[^@]+@", attrs.identity) is not None,
                 "scanner startup identity does not match new Temporal PID")
-        require(event.event_time.seconds >= born and node["txn_id"] == -event.task_id - 1
-                and event.task_id > 0, "scanner event clock/task does not match new startup")
+        # Event and transaction IDs are separate allocations; other writers can interleave.
+        require(event.event_time.seconds >= born and type(node["txn_id"]) is int
+                and 0 < event.task_id < -node["txn_id"] < 2**63,
+                "scanner event clock/task does not match new startup")
         expected = History()
         item = expected.events.add()
         item.event_id, item.event_type, item.task_id = 1, 1, event.task_id
@@ -792,8 +797,15 @@ class SavedCustody:
                 lifecycle["processes"][role].update(pid=process["pid"], identity=process["birth"])
             require(after["lifecycle"] == lifecycle, "managed lifecycle descriptor changed outside PID/birth")
             service = json.loads(json.dumps(before["service"]))
+            identity = service["runtime_identity"]
+            old_revision = identity["revision"]
+            require(isinstance(old_revision, str) and re.fullmatch(r"[0-9a-f]{40}", old_revision)
+                    and (identity["release"] is None or isinstance(identity["release"], str))
+                    and service["version"] == (identity["release"] or f"local-{old_revision[:8]}"),
+                    "original public service version differs from runtime identity")
             service["pid"] = identities["processes"]["api"]["pid"]
-            service["runtime_identity"]["revision"] = revision
+            identity["revision"] = revision
+            service["version"] = identity["release"] or f"local-{revision[:8]}"
             require(after["service"] == service and after["service"]["capacity"]["active"] == 0
                     and not after["service"]["runtime_identity"]["dirty"], "public service/policy/readiness changed")
             for name in ("service-processes.json", "worker-ready.json"):
@@ -820,6 +832,7 @@ class SavedCustody:
         expected_sync = json.loads(json.dumps(self.baseline["sync"]))
         expected_sync.update(pid=sync["pid"], birth=sync["birth"])
         arguments = expected_sync["plist"]["ProgramArguments"]
+        require(expected_sync["argv"] == arguments, "original synchronizer argv/plist mismatch")
         source = str(Path(arguments[0]).parents[3])
         config_path = arguments[arguments.index("--config") + 1]
         activation_path = arguments[arguments.index("--activation-file") + 1]
@@ -827,6 +840,7 @@ class SavedCustody:
         token = hashlib.sha256(json.dumps([source, revision, config_path, config_sha]).encode()).hexdigest()
         arguments[arguments.index("--activation-token") + 1] = token
         arguments[arguments.index("--expected-revision") + 1] = revision
+        expected_sync["argv"] = list(arguments)
         require(arguments[arguments.index("--config-sha256") + 1] == config_sha,
                 "synchronizer policy hash changed")
         require(sync == expected_sync and sync["TZ_present"] is False, "synchronizer changed outside exact qualified activation/PID/birth")
