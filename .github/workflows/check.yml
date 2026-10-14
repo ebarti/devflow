@@ -13,30 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  install:
-    runs-on: macos-latest
-    # Mac installer checks passed, but the job exceeded its former two-minute deadline.
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12'
-      - name: Qualify installer and reconcile on Mac
-        run: |
-          sh scripts/check-install.sh &
-          installer=$!
-          python3.12 -B -m unittest discover -s tests -p 'test_reconcile.py' -v &
-          reconcile=$!
-          result=0
-          wait "$installer" || result=1
-          wait "$reconcile" || result=1
-          exit "$result"
-        env:
-          GIT_CONFIG_GLOBAL: /dev/null
-          GIT_CONFIG_NOSYSTEM: '1'
   test:
     runs-on: ubuntu-latest
     # Installer and reconcile modules already run on Mac; keep one execution per case.
@@ -79,18 +55,19 @@ jobs:
           PY
   temporal-runtime-tests:
     name: runtime shard ${{ matrix.shard }}
-    needs: [install, test]
     runs-on: macos-latest
     # Hosted Mac throughput varies; a passing shard reached 99% at the 20-minute limit.
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      # Complete Mac qualification before all three available runtime hosts start together.
+      # All three Mac hosts start together; host 0 also qualifies native source tests.
       max-parallel: 3
       matrix:
         shard: [0, 1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Host 0's installer fixtures require historical Git objects.
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
@@ -108,10 +85,21 @@ jobs:
         working-directory: runtime
       - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
-      - name: Run every assigned module in three isolated pytest processes
+      - name: Run assigned runtime modules and host 0 Mac source qualification
         # Three hosted Mac jobs, each with three module-atomic internal partitions.
         run: |
           processes=()
+          if [ '${{ matrix.shard }}' = 0 ]; then
+            env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              sh ../scripts/check-install.sh &
+            processes+=("$!")
+            (
+              cd ..
+              env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+                python3.12 -B -m unittest discover -s tests -p 'test_reconcile.py' -v
+            ) &
+            processes+=("$!")
+          fi
           for lane in 0 1 2; do
             index=$(( ${{ matrix.shard }} + lane * 3 ))
             .venv/bin/python runtime_ci.py --index "$index" --count 9 \
@@ -133,14 +121,15 @@ jobs:
   temporal-runtime-macos:
     # Preserve the required context and fail closed on missing/failed shards.
     if: ${{ always() }}
-    needs: temporal-runtime-tests
+    needs: [temporal-runtime-tests, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require every runtime shard to pass
         env:
           SHARDS_RESULT: ${{ needs.temporal-runtime-tests.result }}
-        run: test "$SHARDS_RESULT" = success
+          SOURCE_RESULT: ${{ needs.test.result }}
+        run: test "$SHARDS_RESULT" = success && test "$SOURCE_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
