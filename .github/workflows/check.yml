@@ -24,8 +24,16 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - run: sh scripts/check-install.sh
-      - run: python3.12 -B -m unittest discover -s tests -p 'test_reconcile.py' -v
+      - name: Qualify installer and reconcile on Mac
+        run: |
+          sh scripts/check-install.sh &
+          installer=$!
+          python3.12 -B -m unittest discover -s tests -p 'test_reconcile.py' -v &
+          reconcile=$!
+          result=0
+          wait "$installer" || result=1
+          wait "$reconcile" || result=1
+          exit "$result"
         env:
           GIT_CONFIG_GLOBAL: /dev/null
           GIT_CONFIG_NOSYSTEM: '1'
