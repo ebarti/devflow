@@ -741,13 +741,10 @@ def bind_selector_report(recipe: dict, folder: Path) -> dict:
 
 
 def retained_junit(reference: dict, candidate_id: str, state_dir: Path) -> bytes:
-    from .delivery_check_evidence import verify_manifest
+    from .delivery_check_evidence import _retained_junit
 
-    manifest = verify_manifest(reference, candidate_id, state_dir)
-    reports = [item for item in manifest["artifacts"] if item["relative_path"] == "junit.xml"]
-    if len(reports) != 1:
-        raise ValueError("required per-selector JUnit report is missing")
-    return Path(reports[0]["path"]).read_bytes()
+    return _retained_junit(reference, candidate_id, state_dir,
+                           missing_message="required per-selector JUnit report is missing")
 
 
 def retain_admission_failure(

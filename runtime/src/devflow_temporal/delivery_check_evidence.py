@@ -174,13 +174,25 @@ def verify_manifest(reference: dict, candidate_id: str, state_dir: Path) -> dict
     return manifest
 
 
+def _retained_junit(reference: dict, candidate_id: str, state_dir: Path, *,
+                    missing_message: str = 'required owned JUnit report is missing') -> bytes:
+    """Read the unique report from the two exact controller-owned layouts."""
+    manifest = verify_manifest(reference, candidate_id, state_dir)
+    reports = [item for item in manifest['artifacts']
+               if item['relative_path'] in {'junit.xml', 'fixtures/junit.xml'}]
+    if len(reports) != 1:
+        message = missing_message if not reports else 'required owned JUnit report is ambiguous'
+        raise ValueError(message)
+    report = reports[0]
+    content = _owned_bytes(Path(report['path']))
+    if len(content) != report['size'] or hashlib.sha256(content).hexdigest() != report['sha256']:
+        raise ValueError('retained synthetic check artifact changed')
+    return content
+
+
 def junit_counts(reference: dict, candidate_id: str, state_dir: Path) -> dict:
     """Count actual cases in an authenticated retained report, never log summaries."""
-    manifest = verify_manifest(reference, candidate_id, state_dir)
-    reports = [item for item in manifest['artifacts'] if item['relative_path'] == 'junit.xml']
-    if len(reports) != 1:
-        raise ValueError('required owned JUnit report is missing')
-    content = Path(reports[0]['path']).read_bytes()
+    content = _retained_junit(reference, candidate_id, state_dir)
     if (len(content) > 50 * 1024 * 1024 or b'<!DOCTYPE' in content.upper()
             or b'<!ENTITY' in content.upper()):
         raise ValueError('JUnit report contains unsupported declarations or exceeds its bound')

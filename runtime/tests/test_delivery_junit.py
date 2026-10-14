@@ -11,6 +11,7 @@ from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 
 from devflow_temporal.delivery_check_evidence import junit_counts, retain_artifacts
+from devflow_temporal.delivery_feature_gates import retained_junit
 
 
 @pytest.mark.parametrize('outcome', ['pass', 'fail', 'skip'])
@@ -28,7 +29,9 @@ def test_actual_node_case_outcomes_are_not_inferred_from_exit_or_log(tmp_path, o
                              '--test-reporter-destination=' + str(source / 'junit.xml'),
                              str(script)], capture_output=True)
     assert result.returncode == (1 if outcome == 'fail' else 0)
-    counts = junit_counts(retain_artifacts(folder, {'id': 'candidate'}), 'candidate', tmp_path)
+    reference = retain_artifacts(folder, {'id': 'candidate'})
+    counts = junit_counts(reference, 'candidate', tmp_path)
+    assert retained_junit(reference, 'candidate', tmp_path) == (source / 'junit.xml').read_bytes()
     assert counts['tests'] == 1
     assert counts['passed'] == (1 if outcome == 'pass' else 0)
     assert counts['failures'] == (1 if outcome == 'fail' else 0)
@@ -116,3 +119,49 @@ def test_actual_broker_enforces_delegated_report_and_retains_it_after_cleanup(
     assert RunResources(spec).finalize('blocked')['resource_cleanup'] == 'confirmed'
     assert (junit_counts(report['artifacts'], candidate['id'], Path(spec['state_dir']))
             == report['junit'])
+
+
+def test_report_selection_rejects_other_paths_and_coexisting_controller_layouts(tmp_path):
+    report = b'<testsuites><testcase name="measured"/></testsuites>'
+    for name, paths, reason in [
+        ('unrelated', ['other/junit.xml'], 'missing'),
+        ('ambiguous', ['junit.xml', 'fixtures/junit.xml'], 'ambiguous'),
+    ]:
+        folder = tmp_path / name
+        for relative in paths:
+            path = folder / 'pytest-artifacts' / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(report)
+        reference = retain_artifacts(folder, {'id': 'candidate'})
+        for reader in (junit_counts, retained_junit):
+            with pytest.raises(ValueError, match=reason):
+                reader(reference, 'candidate', tmp_path)
+
+
+def test_consumed_nested_report_bytes_remain_bound_after_manifest_validation(tmp_path, monkeypatch):
+    from devflow_temporal import delivery_check_evidence as evidence
+
+    source = tmp_path / 'pytest-artifacts/fixtures/junit.xml'
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b'<testsuites><testcase name="measured"/></testsuites>')
+    reference = retain_artifacts(tmp_path, {'id': 'candidate'})
+    report = tmp_path / 'artifacts/fixtures/junit.xml'
+    original = report.read_bytes()
+    owned_bytes = evidence._owned_bytes
+    for reader in (junit_counts, retained_junit):
+        report.write_bytes(original)
+        reads = 0
+
+        def change_after_validation(path):
+            nonlocal reads
+            value = owned_bytes(path)
+            if path == report:
+                reads += 1
+                if reads == 1:
+                    report.write_bytes(b'<testsuites><testcase name="replacement"/></testsuites>')
+            return value
+
+        monkeypatch.setattr(evidence, '_owned_bytes', change_after_validation)
+        with pytest.raises(ValueError, match='retained synthetic check artifact changed'):
+            reader(reference, 'candidate', tmp_path)
+        assert reads == 2
