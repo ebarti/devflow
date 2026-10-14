@@ -259,8 +259,8 @@ def preparation_validate(store, spec, recovery, *, resource_spec=None):
             store, before, previous, recovery['seal']['closed']))).result(35)
     if observed != {key: proof[key] for key in observed}:
         raise ValueError('published preparation predecessor history changed')
-    _, attempts, effects, _ = gates._rows(store, spec['run_id'])
-    if attempts != recovery['seal']['attempts'] or effects != recovery['seal']['effects']:
-        raise ValueError('published preparation original records changed')
+    from .delivery_listener_verification import historical_records
+
+    historical_records(store, recovery, resource_spec or spec)
     gates.readback(store, before, previous, resource_spec=resource_spec or spec)
     source_readback(store, before, previous, resource_spec=resource_spec or spec)

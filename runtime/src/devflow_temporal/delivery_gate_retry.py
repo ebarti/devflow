@@ -245,8 +245,18 @@ def _report_layout_evidence(spec, state, broker, *, resource_spec=None):
     recipe, native = recipes[0], failed.get('native_process') or {}
     bindings = {}
     _gate_roots(resource_spec or spec, execution_specs=bindings)
+    report_predecessor = None
+    if resource_spec and resource_spec != spec:
+        from .delivery_listener_verification import authority
+
+        root = Path(resource_spec['state_dir']) / gate_namespace(
+            resource_spec['gate_retry_generation'], resource_spec.get('gate_retry_stage'))
+        newest = read_private(root / 'admission.json')
+        if newest.get('seal', {}).get('verification_observation'):
+            report_predecessor = authority(resource_spec, newest)[1]
     if any(admitted.get('gate_retry_stage') == 'report'
-           and admitted != (resource_spec or spec) for admitted in bindings.values()):
+           and admitted not in ((resource_spec or spec), report_predecessor)
+           for admitted in bindings.values()):
         raise ValueError('this run already received its bounded report assessment retry')
     root = Path(spec['state_dir']) / gate_namespace(
         spec['gate_retry_generation'], spec['gate_retry_stage']) / 'evidence'
@@ -260,7 +270,8 @@ def _report_layout_evidence(spec, state, broker, *, resource_spec=None):
     if (local['results'][-1] != failed
             or [r['id'] for r in prefix] != ids[:ids.index(recipe['id']) + 1]
             or any(r.get('argv') != bind_selector_report(configured[r['id']],
-                root / 'checks' / str(state['iteration']) / r['id'])['argv'] for r in prefix)):
+                root / 'checks' / str(state['iteration']) / r['id'], prepare=False)['argv']
+                   for r in prefix)):
         raise ValueError('report layout recovery lost its exact configured check prefix')
     extra = [r for r in local['results'] if r['id'] not in configured]
     if extra:
@@ -413,17 +424,19 @@ def _report_layout_authority(spec, recovery):
 
 
 def _assessment_ancestry(recovery):
-    """One report, one preparation and at most two already admitted preflight links."""
+    """One verification, report, preparation and two admitted preflight links."""
     from .delivery_check_prelaunch import preparation_authority
     from .delivery_gate_preflight_continuation import _authority
+    from .delivery_listener_verification import authority as verification_authority
 
     chain, previous = [], recovery
-    for kind in ('report', 'preparation', 'preflight', 'preflight'):
+    for kind in ('verification', 'report', 'preparation', 'preflight', 'preflight'):
         if not previous:
             break
         spec = previous['execution_spec']
-        matches = (spec.get('gate_retry_stage') == kind if kind != 'preflight'
-                   else bool(spec.get('gate_retry_preflight_generation')))
+        matches = (bool(previous.get('seal', {}).get('verification_observation'))
+                   if kind == 'verification' else spec.get('gate_retry_stage') == kind
+                   if kind != 'preflight' else bool(spec.get('gate_retry_preflight_generation')))
         if not matches:
             continue
         root = Path(spec['state_dir']) / gate_namespace(spec['gate_retry_generation'],
@@ -432,11 +445,14 @@ def _assessment_ancestry(recovery):
             prepared_handoff=spec.get('gate_retry_prepared_handoff', 0))
         if read_private(root / 'admission.json') != previous:
             raise ValueError('gate retry finite predecessor admission changed')
-        authority = (_report_layout_authority if kind == 'report' else preparation_authority
+        authority = (verification_authority if kind == 'verification'
+                     else _report_layout_authority if kind == 'report' else preparation_authority
                      if kind == 'preparation' else _authority)
         chain.append(previous)
         previous = authority(spec, previous)[0]
-    if previous and (previous['execution_spec'].get('gate_retry_stage') in {'report', 'preparation'}
+    if previous and (previous.get('seal', {}).get('verification_observation')
+                     or previous['execution_spec'].get('gate_retry_stage')
+                     in {'report', 'preparation'}
                      or previous['execution_spec'].get('gate_retry_preflight_generation')):
         raise ValueError('gate retry exceeds its finite retained assessment ancestry')
     return [*chain, previous]
@@ -465,12 +481,9 @@ def _report_layout_validate(store, spec, recovery, *, resource_spec=None):
         read_private(root / name)
         if hashlib.sha256(_owned_bytes(root / name)).hexdigest() != proof['resources'][key]:
             raise ValueError('report layout retry lost its original resource custody')
-    _, attempts, effects, _ = _rows(store, spec['run_id'])
-    for key, current, original in [('job_key', attempts, recovery['seal']['attempts']),
-                                    ('effect_key', effects, recovery['seal']['effects'])]:
-        rows = {item[key]: item for item in current}
-        if any(rows.get(item[key]) != item for item in original):
-            raise ValueError('report layout retry original actor or effect changed')
+    from .delivery_listener_verification import historical_records
+
+    historical_records(store, recovery, latest)
 
 def snapshot(store, run_id, kind=KIND):
     unpublished = kind == PREPUBLICATION_KIND
@@ -479,6 +492,9 @@ def snapshot(store, run_id, kind=KIND):
     closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    from .delivery_listener_verification import possible as verification_possible
+
+    verification_retry = kind == KIND and verification_possible(row)
     from .delivery_gate_preflight_continuation import possible
     from .delivery_gate_preflight_continuation import snapshot as preflight_snapshot
 
@@ -581,7 +597,7 @@ def snapshot(store, run_id, kind=KIND):
         if native_identity(spec)['runtime_payload_sha256'] in _consumed_payloads(
                 spec, state, previous, include_implementation=controller_only):
             raise ValueError('a later gate retry requires a repaired measured runtime')
-    if attribution_retry:
+    if attribution_retry or verification_retry:
         from .delivery_feature_revision_subject import ObservationBroker
 
         broker = ObservationBroker(store, spec)
@@ -614,6 +630,7 @@ def snapshot(store, run_id, kind=KIND):
     report_observation = None
     controller_observation = None
     attribution_observation = None
+    verification_observation = None
     if attribution_retry:
         from .delivery_gate_attribution_recovery import observe
         from .delivery_native_preparation import native_identity
@@ -630,6 +647,11 @@ def snapshot(store, run_id, kind=KIND):
         controller_observation = observe(store, spec, state, attempts, broker)
         failed_gate = True
     if transient_retry:
+        failed_gate = True
+    if verification_retry:
+        from .delivery_listener_verification import observe
+
+        verification_observation = observe(store, spec, row, attempts, effects, closed, previous)
         failed_gate = True
     if report_retry:
         current_checks = json.loads(row['checks_json'] or '{}')
@@ -689,7 +711,8 @@ def snapshot(store, run_id, kind=KIND):
     if ((kind == PRELAUNCH_KIND and not prelaunch)
             or (previous is not None and not (
                 renewed or published_after_recovery or prelaunch
-                or report_retry or ci_only or transient_retry or attribution_retry))
+                or report_retry or ci_only or transient_retry or attribution_retry
+                or verification_retry))
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
@@ -716,7 +739,7 @@ def snapshot(store, run_id, kind=KIND):
             or closed['recovery_digest'] != (digest(previous) if previous else None)
             or not implementation or (implementation.get('status') != 'pass'
                                       and not (controller_only or attribution_retry
-                                               or layout_report))
+                                               or layout_report or verification_retry))
             or not failed_gate
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
             or any((e['state'] != 'complete' or not e['observed_json'])
@@ -758,26 +781,32 @@ def snapshot(store, run_id, kind=KIND):
                 'pending_publication_retry', 'repair_continuation'}:
             ancestor = ancestor.get('original_recovery')
         if admitted and (not (renewed or published_after_recovery or prelaunch
-                             or report_retry or ci_only or transient_retry or attribution_retry)
+                             or report_retry or ci_only or transient_retry or attribution_retry
+                             or verification_retry)
                          or (digest(prior_gate) != attribution_observation['prior_gate_digest']
                              if attribution_retry else prior_gate != ancestor)):
             raise ValueError('this run already received its bounded gate assessment retry')
     return {'row': _sealed_row(row), 'closed': closed, 'original_spec': spec,
             'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
-            'cleanup': (report_observation['resources'] if layout_report
+            'cleanup': (verification_observation['resources'] if verification_retry
+                        else report_observation['resources'] if layout_report
                         else prelaunch_observation or _stopped_cleanup(spec)),
             'work_binding': binding,
             'previous_digest': digest(previous) if previous else None,
             'prior_gate_digest': digest(prior_gate) if prior_gate else None,
             **({'report_observation': report_observation} if report_observation else {}),
+            **({'verification_observation': verification_observation}
+               if verification_observation else {}),
             **({'controller_observation': controller_observation} if controller_only else {}),
             **({'attribution_observation': (previous['seal']['attribution_observation']
-                                           if layout_report else attribution_observation)}
-               if attribution_retry or layout_report else {}),
+                                           if layout_report or verification_retry
+                                           else attribution_observation)}
+               if attribution_retry or layout_report or verification_retry else {}),
             **({'browser_prelaunch_observation': browser_observation}
                if browser_observation else {}),
-            'stage': 'transient' if transient_retry else 'report' if report_retry
+            'stage': 'transient' if transient_retry or verification_retry
+                     else 'report' if report_retry
                      else 'ci' if ci_only else 'published'
                      if published_after_recovery or prelaunch or controller_only
                      or attribution_retry else None,
@@ -847,7 +876,8 @@ def admit(store, run_id, payload, *, preflight=False):
     preflight_generation = (seal['preflight_continuation'].get('preflight_generation', 1)
                             if 'preflight_continuation' in seal else 0)
     layout = (seal.get('report_observation') or {}).get('cause') == 'fixture_junit_report_layout'
-    if (preflight_generation or seal.get('preparation_observation') or layout) \
+    verification = bool(seal.get('verification_observation'))
+    if (preflight_generation or seal.get('preparation_observation') or layout or verification) \
             and spec.get('feature_worker'):
         from .delivery_feature_execution import require_worker_handoff
 
@@ -889,7 +919,7 @@ def admit(store, run_id, payload, *, preflight=False):
             else f'transient-gate-retry-{generation}' if seal['stage'] == 'transient'
             else f'gate-retry-{generation}')
         execution['gate_retry_generation'] = generation
-        if layout:
+        if layout or verification:
             execution.pop('gate_retry_preflight_generation', None)
             execution.pop('gate_retry_prepared_handoff', None)
         if seal.get('preparation_observation'):
@@ -956,9 +986,19 @@ def admit(store, run_id, payload, *, preflight=False):
             row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
             if canonical_json(_sealed_row(row)) != canonical_json(seal['row']):
                 raise ValueError('gate retry admission lost its stopped projection')
+            if verification:
+                if store.state.claim_for(db, spec['work_id']) is not None:
+                    raise ValueError('listener verification admission lost its released claim')
+                for table, key, expected in [('delivery_attempts', 'job_key', seal['attempts']),
+                                             ('delivery_effects', 'effect_key', seal['effects'])]:
+                    records = [dict(item) for item in db.execute(
+                        f'SELECT * FROM {table} WHERE run_id=? ORDER BY {key}', (run_id,))]
+                    if records != expected:
+                        raise ValueError('listener verification admission lost its full ledger')
             if work_binding(store, spec, db) != seal['work_binding']:
                 raise ValueError('gate retry admission lost issue ownership')
-            if ((preflight_generation or seal.get('preparation_observation') or layout)
+            if ((preflight_generation or seal.get('preparation_observation')
+                 or layout or verification)
                     and spec.get('feature_worker')):
                 require_worker_handoff(store, spec)
             if observation := seal.get('browser_prelaunch_observation'):
@@ -1063,7 +1103,11 @@ def readback(store, spec, recovery, *, resource_spec=None):
               if resource_spec is not None else DeliveryBroker(store, spec))
     if effective != spec or broker.candidate() != recovery['candidate']:
         raise ValueError('gate retry source or execution authority changed')
-    if (recovery['seal'].get('report_observation') or {}).get(
+    if recovery['seal'].get('verification_observation'):
+        from .delivery_listener_verification import validate
+
+        validate(store, spec, recovery, resource_spec=resource_spec or spec)
+    elif (recovery['seal'].get('report_observation') or {}).get(
             'cause') == 'fixture_junit_report_layout':
         _report_layout_validate(store, spec, recovery, resource_spec=resource_spec or spec)
     elif recovery['seal'].get('preparation_observation'):

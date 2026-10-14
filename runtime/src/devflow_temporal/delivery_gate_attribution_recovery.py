@@ -81,7 +81,8 @@ def _gate_ancestor(store, transport):
     prior = json.loads(saved[0]) if saved else None
     from .delivery_gate_preflight_continuation import _authority
 
-    if (prior or {}).get('execution_spec', {}).get('gate_retry_stage') == 'report':
+    if ((prior or {}).get('execution_spec', {}).get('gate_retry_stage') == 'report'
+            or (prior or {}).get('seal', {}).get('verification_observation')):
         from .delivery_gate_retry import _assessment_ancestry
 
         prior = _assessment_ancestry(prior)[-1]

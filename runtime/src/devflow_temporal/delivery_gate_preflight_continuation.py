@@ -476,7 +476,6 @@ def validate(store, spec, recovery, *, resource_spec=None):
     """The measured overlay retains the original assessment and implementation authority."""
     from . import delivery_gate_retry as gates
     from .delivery_native_preparation import verify_native_spec
-    from .delivery_policy_recovery import _rows
 
     previous, before, proof = _authority(spec, recovery)
     if spec.get('gate_retry_prepared_handoff'):
@@ -490,9 +489,10 @@ def validate(store, spec, recovery, *, resource_spec=None):
             raise ValueError('prepared gate handoff lost its original envelope binding')
     elif recovery['seal'].get('prepared_handoff'):
         raise ValueError('prepared gate handoff lost its execution namespace')
-    _, attempts, effects, _ = _rows(store, spec['run_id'])
-    if (attempts != recovery['seal']['attempts'] or effects != recovery['seal']['effects']
-            or store._completed_temporal_result(spec['run_id'], workflow_id=proof['closed'][
+    from .delivery_listener_verification import historical_records
+
+    historical_records(store, recovery, resource_spec or spec)
+    if (store._completed_temporal_result(spec['run_id'], workflow_id=proof['closed'][
                 'workflow_id']) != proof['closed']):
         raise ValueError('gate preflight continuation original closed work changed')
     if spec['provider'] != 'fake':
