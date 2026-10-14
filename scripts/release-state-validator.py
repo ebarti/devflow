@@ -86,23 +86,35 @@ def pairs(old, new, keys, context):
     return [(before[key], after[key]) for key in before]
 
 
-def clock_rows(old, new, keys, interval, context):
+def clock_rows(old, new, keys, context):
+    projection = context == "delivery_closed_projections"
+    require(projection or context == "delivery_closure_observations", "unknown maintenance clock")
     for before, after in pairs(old, new, keys, context):
         exact_except(before, after, {"attempts", "next_check_at", "updated_at"}, context)
         require(type(before["attempts"]) is int and type(after["attempts"]) is int
-                and after["attempts"] > before["attempts"], f"{context}: attempt did not advance")
+                and 0 < before["attempts"] < after["attempts"], f"{context}: attempt did not advance")
+        require(not projection or before["state"] not in {
+            "observed", "reconciled", "no_failed_projection", "closed", "closed_observed"},
+            f"{context}: settled projection retried")
+        # Exact _remember/_observe schedules; release phase does not choose the backoff.
+        base = 60 if not projection and before["state"] == "running" else 30
+        cap = 300 if projection and before["state"] in {"not_completed", "not_started"} else 3600
+        exponent = 12 if projection else 16
+
+        def delay(attempt):
+            return min(cap, base * 2 ** min(attempt - 1, exponent))
+
         for row in (before, after):
-            delay = (stamp(row["next_check_at"]) - stamp(row["updated_at"])).total_seconds()
-            require(delay in interval, f"{context}: unsupported retry interval")
-        require((stamp(before["next_check_at"]) - stamp(before["updated_at"]))
-                == (stamp(after["next_check_at"]) - stamp(after["updated_at"])),
-                f"{context}: retry interval changed")
+            require((stamp(row["next_check_at"]) - stamp(row["updated_at"])).total_seconds()
+                    == delay(row["attempts"]), f"{context}: unsupported retry interval")
         advance(before, after, "updated_at")
         advance(before, after, "next_check_at")
-        delay = (stamp(before["next_check_at"]) - stamp(before["updated_at"])).total_seconds()
+        # Sum the finite exponential prefix; arbitrary remaining counts use the cap.
+        end = min(after["attempts"], exponent + 1)
+        elapsed = sum(delay(attempt) for attempt in range(min(before["attempts"], end), end))
+        elapsed += (after["attempts"] - max(before["attempts"], end)) * cap
         require((stamp(after["updated_at"]) - stamp(before["updated_at"])).total_seconds()
-                >= (after["attempts"] - before["attempts"]) * delay,
-                f"{context}: retry counter exceeds elapsed authenticated backoff")
+                >= elapsed, f"{context}: retry counter exceeds elapsed authenticated backoff")
 
 
 def pr_payload(before, after, observations, context):
@@ -589,7 +601,7 @@ class SavedCustody:
                 if a != b]
             clock_rows([a for a, _ in changed], [b for _, b in changed],
                        ("run_id", "workflow_id") if table == "delivery_closed_projections" else ("workflow_id",),
-                       {300} if table == "delivery_closed_projections" else {300, 3600}, table)
+                       table)
 
     def temporal(self, owner, reconstructed, phase, startup=None):
         allowed = {"shards", "task_queues"} if phase == "preinstall" else {

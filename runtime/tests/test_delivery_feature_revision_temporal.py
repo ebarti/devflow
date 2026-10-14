@@ -391,6 +391,25 @@ async def test_fresh_v2_intake_normalizes_once_and_derives_chunk_gates_on_tempor
                 if state.get("outcome") == "blocked":
                     raise AssertionError(state)
                 await asyncio.sleep(0.05)
+            else:
+                evidence = {"state": state, "open_attempts": open_attempts,
+                            "calls": [name for name, _ in calls][-12:]}
+                try:
+                    history = await asyncio.wait_for(handle.fetch_history(), 5)
+                    recent_events = []
+                    for event in history.events[-12:]:
+                        attributes = event.WhichOneof("attributes")
+                        details = getattr(event, attributes)
+                        item = {"event_id": event.event_id, "type": attributes}
+                        if hasattr(details, "activity_type"):
+                            item["activity"] = details.activity_type.name
+                        if hasattr(details, "failure"):
+                            item["failure"] = details.failure.message[:400]
+                        recent_events.append(item)
+                    evidence["recent_events"] = recent_events
+                except Exception as exc:
+                    evidence["history_error"] = f"{type(exc).__name__}: {str(exc)[:400]}"
+                pytest.fail("merge decision did not become pending: " + repr(evidence))
             decision = state["decision"]
             await handle.execute_update(DeliveryWorkflow.decision, {
                 "command_id": "authorize-fixture-merge", "expected_revision": state["revision"],
