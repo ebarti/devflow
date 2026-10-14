@@ -1253,8 +1253,12 @@ class DeliveryBroker:
             validate_native_turn(self.spec, "implement", iteration, self.store)
         if self.candidate() != candidate:
             raise ValueError("prepublication candidate is stale")
-        checkout = (self.gate_checkout("verify", iteration, candidate)
-                    if self.spec["provider"] == "codex" else self.checkout)
+        # Prepublication source/index bytes are committed only during publication.
+        # A HEAD-only gate can represent the candidate once Git-visible work is clean.
+        checkout = self.checkout
+        if self.spec["provider"] == "codex" and not _git(
+                self.checkout, "status", "--porcelain=v1", "--untracked-files=all"):
+            checkout = self.gate_checkout("verify", iteration, candidate)
         return self._run_check_list(
             checkout,
             self.spec["policy"].get("prepublish_checks", []),
