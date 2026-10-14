@@ -88,3 +88,55 @@ class NativeListenerSnapshotContract(unittest.TestCase):
         owned = {100: process(1, "original-start")}
         _, inspect = listener_inspector(table, lambda _port: {100})
         self.assertEqual(inspect(owned), (True, {}))
+
+
+def listener_source_fragments():
+    # Historical source is fixed data; CI needs no old repository objects.
+    old = ("for pid in listeners(port):\n"
+           "    if pid not in owned:\n"
+           "        sample(owned)\n"
+           "    if pid not in owned or process_table().get(pid, {}).get('identity') "
+           "!= owned[pid]['identity']:\n"
+           "        conflict = True\n"
+           "    else:\n"
+           "        observed_ports[str(port)] = {'pid': pid, **owned[pid]}\n")
+    path = Path(__file__).parents[1] / 'src/devflow_temporal/delivery_native_process.py'
+    loops = [node for node in ast.walk(ast.parse(path.read_text()))
+             if isinstance(node, ast.For) and isinstance(node.iter, ast.Call)
+             and isinstance(node.iter.func, ast.Name) and node.iter.func.id == 'listeners']
+    assert len(loops) == 1
+    return old, ast.unparse(loops[0]) + '\n'
+
+
+def test_verification_fingerprint_uses_authenticated_git_objects(monkeypatch):
+    from tempfile import TemporaryDirectory
+
+    from test_delivery_feature_review_context import git
+
+    from devflow_temporal import delivery_feature_review_context as context
+    from devflow_temporal import delivery_listener_verification as subject
+
+    fragments = listener_source_fragments()
+    # Only these tiny AST fragments are data; nothing from the fixture is executed.
+    with TemporaryDirectory(prefix='devflow-observer-objects-') as directory:
+        root = Path(directory).resolve()
+        path = root / context.PREFIX / 'delivery_native_process.py'
+        path.parent.mkdir(parents=True)
+        git(root, 'init', '-q')
+        revisions = []
+        for text in fragments:
+            path.write_text(text)
+            git(root, 'add', '.')
+            git(root, 'commit', '-qm', 'Isolated observer source data')
+            revisions.append(git(root, 'rev-parse', 'HEAD'))
+        payload = context._sources(root, revisions[1])[1]
+        monkeypatch.setattr(context, '_protected_root', lambda: root)
+        old_identity = {'dirty': False, 'local_digest': None, 'revision': revisions[0],
+                        'runtime_payload_sha256': context._sources(root, revisions[0])[1]}
+        assert subject._loop(old_identity) == subject._PREVIOUS_LOOP
+        git(root, 'replace', revisions[1], revisions[0])
+        assert git(root, 'show', revisions[1] + ':' + context.PREFIX
+                   + 'delivery_native_process.py') == fragments[0].strip()
+        identity = {'dirty': False, 'local_digest': None, 'revision': revisions[1],
+                    'runtime_payload_sha256': payload}
+        assert subject._loop(identity) == subject._CORRECTED_LOOP

@@ -711,7 +711,7 @@ def admission_diagnostic(
     }
 
 
-def bind_selector_report(recipe: dict, folder: Path) -> dict:
+def bind_selector_report(recipe: dict, folder: Path, *, prepare: bool = True) -> dict:
     """Bind built-in runner reports only to the check's owned artifact folder."""
     if not recipe.get("required_selectors"):
         return recipe
@@ -729,7 +729,8 @@ def bind_selector_report(recipe: dict, folder: Path) -> dict:
     result = deepcopy(recipe)
     from .delivery_resources import private_directory
 
-    private_directory(folder / "pytest-artifacts")
+    if prepare:
+        private_directory(folder / "pytest-artifacts")
     report = folder / "pytest-artifacts" / "junit.xml"
     if runner == "pytest":
         flags = ["--junitxml=" + str(report), "-o", "junit_family=xunit1"]

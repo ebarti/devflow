@@ -243,7 +243,16 @@ def resume_worker(store, parent, child, row):
     # preserves the original candidate/PR/session and never creates a new branch.
     preparation_failed = gates.prepublication_preparation_failed(
         {"error": row["error"], "checks": json.loads(row["checks_json"] or "{}")})
-    if preparation_possible(row):
+    from .delivery_listener_verification import CAUSE
+    from .delivery_listener_verification import possible as verification_possible
+
+    if verification_possible(row):
+        sealed = gates.snapshot(store, child['run_id'])
+        if (sealed.get('verification_observation') or {}).get('cause') != CAUSE:
+            raise OwnershipConflict('worker lacks its exact fresh listener verification proof')
+        state = sealed['closed']['result']
+        remaining, kind, admit = 0, gates.KIND, gates.admit
+    elif preparation_possible(row):
         sealed = gates.snapshot(store, child['run_id'], gates.PRELAUNCH_KIND)
         state = sealed['closed']['result']
         remaining, kind, admit = 0, gates.PRELAUNCH_KIND, gates.admit

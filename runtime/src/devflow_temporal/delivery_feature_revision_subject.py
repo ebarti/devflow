@@ -251,7 +251,8 @@ def _runtime(identity):
     return {"revision": identity["revision"], "runtime_payload_sha256": payload}
 
 
-def _native_role(spec, role, attempt, session, lower, upper, admitted_candidate):
+def _native_role(spec, role, attempt, session, lower, upper, admitted_candidate, *,
+                 resource_spec=None, scheduled_input=None):
     from .delivery_sandbox import _native_role_home
     from .delivery_session_custody import _same_assessment
     from .supervisor import DeliverySupervisor
@@ -262,10 +263,28 @@ def _native_role(spec, role, attempt, session, lower, upper, admitted_candidate)
     folder = Path(spec["state_dir"]) / "attempts" / job
     request_path = folder / "request.json"
     request = _private_receipt(request_path, canonical=True)
+    if scheduled_input is not None:
+        enriched = {'native_authorized', 'planning_context', 'receipt_handoff', 'result_path',
+                    'review_diff', 'role_evidence_key', 'start_path', 'workspace'}
+        if (any(key not in request or request[key] != value
+                for key, value in scheduled_input.items())
+                or set(request) - set(scheduled_input) - enriched):
+            raise ValueError('retained native review request differs from its scheduled input')
     result = json.loads(attempt["result_json"] or "null")
     expected = {key: value for key, value in role.items() if key not in ROLE_FIELDS}
+    root = None
+    if resource_spec is not None and role['role'] != 'implement':
+        from .delivery_resources import _gate_roots
+
+        bindings = {}
+        _gate_roots(resource_spec, execution_specs=bindings)
+        roots = [path for path, admitted in bindings.items() if admitted == spec]
+        if len(roots) != 1:
+            raise ValueError('historical native role lost its exact admitted gate namespace')
+        root = roots[0]
     workspace = (Path(spec["checkout"]) if role["role"] == "implement" else
-                 _gate_evidence_root(spec) / "gates" / str(role["iteration"]) / role["role"])
+                 (root or _gate_evidence_root(spec)) / "gates"
+                 / str(role["iteration"]) / role["role"])
     candidate = full_candidate(request.get("candidate"))
     if (result != expected or role["role"] not in {"implement", "review", "verify"}
             or attempt["state"] != "finished" or attempt["cleanup"] != "confirmed"
@@ -296,6 +315,13 @@ def _native_role(spec, role, attempt, session, lower, upper, admitted_candidate)
     intent, metadata = journal.get("intent") or {}, journal.get("provider_session") or {}
     argv = intent.get("argv") or []
     resumed = session if role["role"] == "implement" else None
+    if root is None:
+        home = _native_role_home(request)
+    else:
+        generation = spec.get('role_home_generation', '')
+        home = Path(spec['state_dir']) / 'role-homes' / (
+            role['role'] + ('-' + generation if generation else '')) / str(role['iteration'])
+        home /= root.relative_to(Path(spec['state_dir'])).parent.name
     output = full_candidate(role.get("candidate"))
     if (not _same_assessment(raw, result) or result.get("finish_reason") != "done"
             or result.get("cleanup") != "confirmed" or not attempt["pid"]
@@ -321,7 +347,7 @@ def _native_role(spec, role, attempt, session, lower, upper, admitted_candidate)
             or argv[1:4] != ["-I", "-m", "devflow_temporal.role_runner"]
             or argv[4] != str(request_path) or not Path(argv[0]).is_absolute()
             or launch.get("environment", {}).get("CODEX_HOME")
-            != str(_native_role_home(request) / "codex")
+            != str(home / "codex")
             or journal.get("owned", {}).get(str(attempt["pid"]), {}).get("identity")
             != attempt["process_identity"]
             or metadata.get("session_id") != attempt["session_id"]
