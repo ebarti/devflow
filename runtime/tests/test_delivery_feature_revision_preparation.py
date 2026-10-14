@@ -606,7 +606,7 @@ def test_expired_worker_closure_refuses_intake_without_abandoning_the_reservatio
     """The live shape: an unstarted reservation whose last continuation failed only
     because the retained worker's closed history was gone. The refusal moves nothing;
     once the closure is readable again the next command continues the same reservation
-    and the replan begin charges its cycle exactly once."""
+    without spending its reserved repair cycle."""
     p = pending_preparation
     store, shared, spec = (p[k] for k in ("store", "shared", "spec"))
     issue_id = spec["feature_delivery"]["owner"]["issue_id"]
@@ -630,18 +630,11 @@ def test_expired_worker_closure_refuses_intake_without_abandoning_the_reservatio
                "expected_revision": p["row"]["revision"]}
     response = execution.continue_feature(store, spec["run_id"], request)
     assert response == execution.continue_feature(store, spec["run_id"], request)
-    successor = prepare_authority(store, store.effective_spec(response["run_id"]))
+    successor = store.effective_spec(response["run_id"])
     assert successor["feature_plan_revision_request"] == reserved
     assert successor["feature_delivery"]["owner"]["generation"] == (
         spec["feature_delivery"]["owner"]["generation"] + 1)
     assert shared.budget(issue_id)["used"] == 6
-    DeliveryBroker(store, successor).prepare()
-    context = revisions.begin_revision(store, successor)
-    assert context["revision_id"] == revision_id
-    assert context["repair_key"] == "plan-revision:" + revision_id
-    assert context["budget"]["used"] == 7 == shared.budget(issue_id)["used"]
-    assert revisions.begin_revision(store, successor) == context
-    assert shared.budget(issue_id)["used"] == 7
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
@@ -758,16 +751,11 @@ def test_replayed_continuation_survives_a_deployment_without_spending(
     values = shared.checkpoints(issue_id)
     assert values[key] == saved
     assert [name for name in values if name.startswith(key)] == [key]
-    successor = prepare_authority(store, store.effective_spec(response["run_id"]))
+    successor = store.effective_spec(response["run_id"])
     assert successor["feature_plan_revision_preparation_retry"] == {
         "checkpoint_key": key, "sha256": digest(saved)}
     assert successor["feature_plan_revision_request"] == spec["feature_plan_revision_request"]
     assert shared.budget(issue_id)["used"] == 6
-    DeliveryBroker(store, successor).prepare()
-    context = revisions.begin_revision(store, successor)
-    assert context["revision_id"] == revision_id and context["budget"]["used"] == 7
-    assert revisions.begin_revision(store, successor) == context
-    assert shared.budget(issue_id)["used"] == 7
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")

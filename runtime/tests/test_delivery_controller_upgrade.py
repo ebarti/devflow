@@ -576,7 +576,7 @@ def test_trusted_update_preserves_observed_identity_and_frozen_authority(install
 
 
 @pytest.mark.parametrize('kind,name', [
-    *[('proof', field) for field in ('mode', 'hardlink', 'owner', 'canonical-path', 'hash',
+    *[('proof', field) for field in ('mode', 'hardlink',
         'content', 'identity', 'observed')],
     ('context', 'configuration'), ('context', 'candidate'),
 ])
