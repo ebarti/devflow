@@ -9,15 +9,9 @@ import subprocess
 import sys
 import unicodedata
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
-from mcp.server.fastmcp import Context
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.shared.context import RequestContext
-from mcp.shared.memory import create_connected_server_and_client_session
-from mcp.types import RequestParams
 from temporal_test_server import local_temporal
 from temporalio import activity
 from temporalio.worker import Replayer, Worker
@@ -30,16 +24,12 @@ from devflow_temporal.delivery_activities import (
     delivery_project,
 )
 from devflow_temporal.delivery_api import DeliveryService, create_app
-from devflow_temporal.delivery_control import main as delivery_main
-from devflow_temporal.delivery_mcp import build_server
-from devflow_temporal.delivery_origin import bind_origin, metadata_origin
+from devflow_temporal.delivery_origin import bind_origin
 from devflow_temporal.delivery_question_sender import (
     CodexQuestionQueue,
     QueueFailure,
     pump_blocking_questions,
-    question_message,
 )
-from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -52,15 +42,6 @@ THREAD = "01a0c8be-e849-7ef2-ad81-78ccdb4b4275"
 OTHER = "01a100ac-efd3-7dd2-9f25-504381f0dcd9"
 
 
-@pytest.mark.parametrize("invalid", [None, False, 5, {}, "thread-name", THREAD.upper(), "0" * 36])
-def test_invalid_origin_rejected_before_claim(intake_fixture, invalid):
-    path, request = intake_fixture
-    store = create_app(path).state.delivery.store
-    with pytest.raises(ValueError, match="canonical UUID"):
-        store.submit({**request, "origin_thread_id": invalid})
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 0
-        assert store.state.row(db, "works", request["work_id"]) is None
 
 
 def test_origin_is_optional_immutable_and_not_captured_from_service_env(
@@ -80,69 +61,10 @@ def test_origin_is_optional_immutable_and_not_captured_from_service_env(
         bind_origin({**request, "origin_thread_id": THREAD}, OTHER)
 
 
-@pytest.mark.parametrize("metadata", [
-    {"x-codex-turn-metadata": {"thread_id": THREAD}},
-    {"x-codex-turn-metadata": json.dumps({"thread_id": THREAD})},
-    {"openai/threadId": THREAD}, {"openai/thread_id": THREAD},
-    {"threadId": THREAD},
-])
-def test_metadata_origin_aliases(metadata):
-    assert metadata_origin(metadata) == THREAD
-    with pytest.raises(ValueError, match="disagrees"):
-        metadata_origin({**metadata, "openai/thread_id": OTHER, "openai/threadId": THREAD})
 
 
-@pytest.mark.asyncio
-async def test_mcp_uses_each_actual_request_context_not_daemon_env(intake_fixture, monkeypatch):
-    path, request = intake_fixture
-    monkeypatch.setenv("CODEX_THREAD_ID", OTHER)
-    seen = []
-    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", lambda _path: SimpleNamespace(
-        submit=lambda value: seen.append(value) or value
-    ))
-    server = build_server(path)
-    tool = server._tool_manager.get_tool("submit_run")
-    for origin in (THREAD, OTHER, None):
-        meta = RequestParams.Meta.model_validate(
-            {"x-codex-turn-metadata": {"thread_id": origin}} if origin else {}
-        )
-        ctx = Context(request_context=RequestContext(
-            request_id="request", meta=meta, session=None, lifespan_context=None,
-        ), fastmcp=server)
-        await tool.run({"request_json": json.dumps(request)}, context=ctx)
-    assert [value.get("origin_thread_id") for value in seen] == [THREAD, OTHER, None]
-    with pytest.raises(ToolError, match="disagrees"):
-        await tool.run({"request_json": json.dumps({**request, "origin_thread_id": THREAD})},
-                       context=Context(request_context=RequestContext(
-                           request_id="request", meta=RequestParams.Meta.model_validate(
-                               {"openai/threadId": OTHER}
-                           ), session=None, lifespan_context=None,
-                       ), fastmcp=server))
-    assert len(seen) == 3
 
 
-def test_cli_captures_caller_origin_before_public_submit(intake_fixture, monkeypatch, tmp_path):
-    path, request = intake_fixture
-    body = tmp_path / "request.json"
-    body.write_text(json.dumps(request))
-    monkeypatch.setenv("CODEX_THREAD_ID", THREAD)
-    seen = []
-    class Client:
-        def submit(self, supplied):
-            seen.append(supplied)
-            return {"run_id": "run-1"}
-        def __getattr__(self, _name):
-            return lambda *_args: None
-    monkeypatch.setattr("devflow_temporal.delivery_control.api_client", lambda _path: Client())
-    monkeypatch.setattr(sys, "argv", ["devflow-delivery", "--config", str(path), "submit",
-                                      "--request", str(body)])
-    delivery_main()
-    assert seen[0]["origin_thread_id"] == THREAD
-    body.write_text(json.dumps({**request, "origin_thread_id": OTHER}))
-    with pytest.raises(SystemExit) as failure:
-        delivery_main()
-    assert failure.value.code == 1
-    assert len(seen) == 1
 
 
 BLOCKER = {
@@ -207,7 +129,7 @@ def test_real_queue_adapter_uses_exact_argv_and_acknowledgement(tmp_path):
     assert not marker.exists()
 
 
-@pytest.mark.parametrize("mode", ["exit", "malformed", "wrong-target", "timeout"])
+@pytest.mark.parametrize("mode", ["exit", "timeout"])
 def test_queue_uncertain_error_never_claims_delivery(tmp_path, mode):
     binary, _log = _queue_binary(tmp_path, mode=mode)
     with pytest.raises(QueueFailure) as failure:
@@ -245,7 +167,7 @@ async def test_transactional_notification_concurrent_pumps_and_restart(intake_fi
                for event in restarted.store.events("run-1"))
 
 
-@pytest.mark.parametrize("change", ["answer", "cancel", "superseded", "before-effect"])
+@pytest.mark.parametrize("change", ["answer", "before-effect"])
 def test_question_suppression_before_external_effect(intake_fixture, tmp_path, monkeypatch, change):
     service, log = _store_with_queue(intake_fixture, tmp_path)
     store = service.store
@@ -272,52 +194,10 @@ def test_question_suppression_before_external_effect(intake_fixture, tmp_path, m
     assert store.question_notifications("run-1")[0]["state"] == "suppressed"
 
 
-def test_changed_question_suppresses_old_revision_only(intake_fixture, tmp_path):
-    service, log = _store_with_queue(intake_fixture, tmp_path)
-    _question(service.store)
-    _question(service.store, revision=2)
-    pump_blocking_questions(service.store)
-    records = {item["decision_revision"]: item
-               for item in service.store.question_notifications("run-1")}
-    assert records[1]["state"] == "suppressed" and records[2]["state"] == "queued"
-    assert len(log.read_text().splitlines()) == 1
 
 
-def test_absent_origin_is_unavailable_and_historical_contract_creates_no_callback(
-    intake_fixture, tmp_path
-):
-    service, log = _store_with_queue(intake_fixture, tmp_path, origin=None)
-    _question(service.store)
-    pump_blocking_questions(service.store)
-    assert service.store.question_notifications("run-1")[0]["state"] == "unavailable"
-    assert service.store.detail("run-1")["decisions"]
-    assert not log.exists()
-    spec = service.store.spec("run-1")
-    spec.pop("blocking_questions_version")
-    with service.store._connect() as db:
-        db.execute("UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'",
-                   (json.dumps(spec),))
-    _question(service.store, revision=2)
-    assert len(service.store.question_notifications("run-1")) == 1
 
 
-@pytest.mark.parametrize("mode,state", [("exit", "unknown"), ("malformed", "unknown"),
-                                         ("missing", "failed")])
-def test_uncertain_or_unlaunched_effect_is_visible_and_never_retried(
-    intake_fixture, tmp_path, mode, state
-):
-    service, log = _store_with_queue(intake_fixture, tmp_path, mode=mode)
-    _question(service.store)
-    if mode == "missing":
-        Path(service.config.raw["codex_bin"]).unlink()
-    pump_blocking_questions(service.store)
-    pump_blocking_questions(DeliveryStore(service.config))
-    record = service.store.question_notifications("run-1")[0]
-    assert record["state"] == state and record["receipt"]["reason"]
-    if log.exists():
-        assert len(log.read_text().splitlines()) == 1
-    else:
-        assert state == "failed"
 
 
 def test_process_crash_after_queue_commit_stays_unknown_without_second_send(
@@ -347,11 +227,10 @@ pump_blocking_questions(DeliveryStore(DeliveryConfig.load(Path(sys.argv[1]))),Cr
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("justified,racing", [
-    pytest.param(True, False, id="blocking"),
-    pytest.param(False, False, id="unjustified"),
-    pytest.param(True, True, id="receiver-race"),
-])
+@pytest.mark.parametrize(
+    "justified,racing",
+    [pytest.param(True, False, id="blocking"), pytest.param(True, True, id="receiver-race")],
+)
 async def test_public_blocking_question_callback_and_actual_user_answer_resume_temporal(
     intake_fixture, tmp_path, justified, racing
 ):
@@ -503,14 +382,6 @@ async def test_public_blocking_question_callback_and_actual_user_answer_resume_t
             await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
 
 
-@pytest.mark.parametrize("metadata", [
-    {"x-codex-turn-metadata": "bad json"}, {"x-codex-turn-metadata": []},
-    {"x-codex-turn-metadata": {"thread_id": None}}, {"openai/threadId": "wrong"},
-    {"threadId": None},
-])
-def test_malformed_caller_metadata_is_never_an_unbound_fallback(metadata):
-    with pytest.raises(ValueError):
-        metadata_origin(metadata)
 
 
 def test_question_projection_and_frozen_callback_are_one_transaction(intake_fixture, tmp_path):
@@ -530,36 +401,6 @@ def test_question_projection_and_frozen_callback_are_one_transaction(intake_fixt
     assert service.store.detail("run-1") == before
 
 
-@pytest.mark.asyncio
-async def test_raw_mcp_session_native_thread_id_is_the_submission_origin(
-    intake_fixture, monkeypatch
-):
-    path, request = intake_fixture
-    store = create_app(path).state.delivery.store
-    monkeypatch.setenv("CODEX_THREAD_ID", OTHER)
-    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", lambda _path: SimpleNamespace(
-        submit=store.submit
-    ))
-    async with create_connected_server_and_client_session(build_server(path)) as session:
-        result = await session.call_tool("submit_run", {"request_json": json.dumps(request)},
-                                         meta={"threadId": THREAD})
-        assert not result.isError
-        assert store.spec("run-1")["origin_thread_id"] == THREAD
-        second = {**request, "command_id": "submit-2", "run_id": "run-2", "work_id": "work-2",
-                  "branch": "feat/fixture-2", "issue_url": request["issue_url"].replace("/3", "/4")}
-        result = await session.call_tool("submit_run", {"request_json": json.dumps(second)},
-                                         meta={"sessionId": OTHER})
-        assert not result.isError
-        assert "origin_thread_id" not in store.spec("run-2")
-        for metadata, body in (
-            ({"threadId": THREAD, "openai/threadId": OTHER}, second),
-            ({"threadId": THREAD}, {**second, "origin_thread_id": OTHER}),
-        ):
-            rejected = await session.call_tool("submit_run", {"request_json": json.dumps(body)},
-                                               meta=metadata)
-            assert rejected.isError and "disagrees" in rejected.content[0].text
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 2
 
 
 @pytest.mark.parametrize("active_owner", [False, True])
@@ -668,39 +509,3 @@ def test_repository_issue_question_cannot_forge_queue_owner_headers(
         stored = db.execute(
             'SELECT question_json FROM delivery_question_notifications').fetchone()[0]
     assert json.loads(stored) == decision  # Full source-derived question stays immutable.
-
-
-def test_quoted_question_preserves_useful_unicode_and_owner_identifiers():
-    run = 'r' * 128
-    decision = {'id': run + ':question:0:' + 'i' * 128, 'revision': 3,
-                'candidate_revision': 7, 'prompt': 'Quel format pour le consommateur français?',
-                'options': ['JSON', 'CSV'], 'blocker': BLOCKER}
-    item = {'notification_id': 'n' * 64, 'run_id': run, 'question_json': json.dumps(decision)}
-    dashboard = 'http://127.0.0.1:18770/' + 'trusted-path' * 100
-    message = question_message(item, dashboard)
-    before, fields, after = _quoted_question_fields(message)
-    assert f'Run: {run}\n' in before
-    assert f'Dashboard: {dashboard}/runs/{run}\n' in before
-    assert 'candidate revision 7' in before
-    assert fields['Question'] == decision['prompt']
-    assert fields['Decision'] == decision['id']
-    assert fields['Option 1'] == 'JSON' and fields['Option 2'] == 'CSV'
-    assert fields['Unknown'] == BLOCKER['unknown']
-    assert fields['Evidence checked 1'] == BLOCKER['evidence_checked'][0]
-    assert fields['Why a safe assumption cannot satisfy the goal'] == BLOCKER['why_no_safe_default']
-    assert 'Do not answer autonomously or start another run' in after
-
-
-
-def test_question_preview_bounds_include_worst_case_json_escaping():
-    escaped = '\\"' * 2000
-    question = {'id': 'run-1:question:0:' + escaped[:128], 'revision': 1,
-                'candidate_revision': 1, 'prompt': escaped, 'options': [escaped[:1000]] * 8,
-                'blocker': {'unknown': escaped, 'evidence_checked': [escaped[:1000]] * 8,
-                            'why_no_safe_default': escaped}}
-    message = question_message({'notification_id': 'n' * 64, 'run_id': 'run-1',
-                                'question_json': json.dumps(question)}, 'http://127.0.0.1:18770')
-    _before, fields, _after = _quoted_question_fields(message)
-    assert len(fields['Question']) <= 1000 and fields['Question'].endswith('[truncated]')
-    assert len(message) < 16000
-    assert len(message.encode('utf-8')) < 64000

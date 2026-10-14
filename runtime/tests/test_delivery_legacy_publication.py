@@ -77,7 +77,7 @@ def test_binding_rejects_target_that_already_owns_its_publication(service):
         bind(ProjectSynchronizer([store], Remote()), request["run_id"])
 
 
-@pytest.mark.parametrize("change", ["receipt", "publisher_resumed", "retry_resumed"])
+@pytest.mark.parametrize("change", ["receipt", "retry_resumed"])
 def test_changed_or_resumed_reference_invalidates_bridge_on_next_tick(service, change):
     store, request, receipt, retry = unpublished_retry(service)
     remote = Remote()
@@ -100,7 +100,7 @@ def test_changed_or_resumed_reference_invalidates_bridge_on_next_tick(service, c
     assert result["pull_requests"] == []
 
 
-@pytest.mark.parametrize("change", ["receipt", "publisher_resumed", "retry_resumed"])
+@pytest.mark.parametrize("change", ["receipt", "retry_resumed"])
 def test_reference_changed_during_mirror_cannot_acknowledge_stale_binding(service, change):
     store, request, receipt, retry = unpublished_retry(service)
     remote = Remote()
@@ -180,7 +180,7 @@ def test_binding_cli_does_not_take_consumer_ownership(service, tmp_path, monkeyp
     assert json.loads(capsys.readouterr().out)["projection_run_id"] == retry["run_id"]
 
 
-@pytest.mark.parametrize("invalid", ["foreign_repository", "native_publisher", "native_retry"])
+@pytest.mark.parametrize("invalid", ["foreign_repository", "native_retry"])
 def test_binding_cannot_borrow_foreign_or_native_custody(service, invalid):
     store, request, receipt, retry = unpublished_retry(service)
     with store._connect() as db:

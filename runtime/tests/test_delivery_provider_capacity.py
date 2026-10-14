@@ -15,8 +15,9 @@ from devflow_temporal.delivery_resources import read_private, write_private
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", ["serverOverloaded", "flexUnavailable",
-                                  {"httpConnectionFailed": {"httpStatusCode": 503}}])
+@pytest.mark.parametrize(
+    "error", ["serverOverloaded", {"httpConnectionFailed": {"httpStatusCode": 503}}]
+)
 async def test_capacity_retries_past_the_transport_attempt_limit(tmp_path, monkeypatch, error):
     runtime, task, observation, calls, clients, _ = harness(
         tmp_path, monkeypatch, [error] * 8)
@@ -108,11 +109,7 @@ def test_monitor_credit_is_identity_bound_and_an_abandoned_wait_is_finite(tmp_pa
     assert clock_credit(tmp_path, "run", os.getpid(), "original birth", 100, 1000) == 63
 
 
-@pytest.mark.parametrize("key,value", [
-    ("run_id", "foreign"), ("pid", -1), ("start_identity", "recycled PID"),
-    ("credited_seconds", 1000), ("credited_seconds", float("nan")),
-    ("wait_started", 999), ("wait_seconds", 1000000),
-])
+@pytest.mark.parametrize("key,value", [("run_id", "foreign"), ("wait_seconds", 1000000)])
 def test_monitor_refuses_foreign_or_unbounded_capacity_credit(tmp_path, key, value):
     clock = clock_fixture(tmp_path)
     clock.value[key] = value

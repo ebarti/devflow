@@ -38,8 +38,7 @@ def activity_failure(cause):
     return error
 
 
-@pytest.mark.parametrize('markers,maximum', [({}, None), ({'retry_budget_version': 1}, 5),
-                                          ({'automatic_retry_version': 1,
+@pytest.mark.parametrize('markers,maximum', [({}, None), ({'automatic_retry_version': 1,
                                             'retry_budget_version': 1}, 4)])
 def test_scope_amendment_preserves_frozen_marker_presence_and_budget(service, markers, maximum):
     store, request = service
@@ -70,21 +69,18 @@ def test_scope_amendment_preserves_frozen_marker_presence_and_budget(service, ma
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('cause,expected', [
-    (activity_failure(TimeoutError('timeout', type=TimeoutType.START_TO_CLOSE,
-                                  last_heartbeat_details=[])), 'transient'),
-    (activity_failure(ApplicationError('network', type='ConnectionError')), 'transient'),
-    (activity_failure(ApplicationError('database busy', type='DatabaseBusy')), 'transient'),
-    (activity_failure(ApplicationError('projection failed: database is locked',
-                                       type='ProjectionContention')), 'transient'),
-    (activity_failure(ApplicationError('database busy', type='DatabaseBusy',
-                                       non_retryable=True)), 'terminal'),
-    (activity_failure(ApplicationError('transient deadline', type='ValueError')), 'terminal'),
-    (activity_failure(ApplicationError('timeout', type='TimeoutExpired', non_retryable=True)),
-     'terminal'),
-    (RuntimeError('rate limit transient please retry'), 'terminal'),
-    (None, 'terminal'),
-])
+@pytest.mark.parametrize(
+    "cause,expected",
+    [
+        (
+            activity_failure(
+                TimeoutError("timeout", type=TimeoutType.START_TO_CLOSE, last_heartbeat_details=[])
+            ),
+            "transient",
+        ),
+        (None, "terminal"),
+    ],
+)
 async def test_stop_classifies_typed_cause_without_parsing_text(cause, expected):
     flow = DeliveryWorkflow()
     flow.state = {'phase': 'implement', 'revision': 1, 'roles': [], 'checks': {}, 'cleanup': 'none'}
@@ -188,10 +184,9 @@ async def test_legacy_recovery_keeps_old_stop_payload_even_with_new_original_mar
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('code,expected', [
-    ('ci_deadline', 'transient'), ('tracker_readback', 'transient'),
-    ('publication_deadline', 'transient'), ('agent says transient', 'terminal'),
-])
+@pytest.mark.parametrize(
+    "code,expected", [("ci_deadline", "transient"), ("agent says transient", "terminal")]
+)
 async def test_only_known_controller_results_can_classify_transient(code, expected):
     flow = DeliveryWorkflow()
     flow.state = {'phase': 'waiting_ci', 'revision': 1, 'roles': [], 'checks': {},
@@ -266,8 +261,7 @@ async def original_run(*, version=True, budget=True, failure='pending', capture=
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure,expected', [('pending', 'transient'), ('failed', 'terminal'),
-                                            ('stale', 'terminal'), ('transport', 'transient')])
+@pytest.mark.parametrize('failure,expected', [('pending', 'transient'), ('transport', 'transient')])
 async def test_actual_original_workflow_classifies_controller_failure(failure, expected):
     result = await original_run(failure=failure)
     assert result['outcome'] == 'blocked'

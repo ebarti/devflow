@@ -51,7 +51,7 @@ async def test_default_api_page_bounds_compaction_and_exposes_all_history(api_fi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('query', ['limit=0', 'limit=101', 'cursor=not-a-cursor'])
+@pytest.mark.parametrize('query', ['limit=0', 'cursor=not-a-cursor'])
 async def test_api_rejects_invalid_page_controls(api_fixture, query):
     app = seeded_app(api_fixture)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app,

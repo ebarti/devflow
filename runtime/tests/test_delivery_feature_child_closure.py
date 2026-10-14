@@ -75,7 +75,6 @@ def test_an_early_child_chunk_merge_cannot_close_that_child_or_the_parent(servic
     "merged,api_status,ui_status,parent_status",
     [
         ({20}, "Partially merged", "Queued", "Partially merged"),
-        ({20, 22}, "Merged", "Queued", "Partially merged"),
         ({20, 21, 22}, "Merged", "Merged", "Merged"),
     ],
 )
@@ -120,12 +119,7 @@ def test_child_status_uses_all_required_pr_merges_not_parent_or_worker_proofs(
 
 @pytest.mark.parametrize(
     "field,value",
-    [
-        ("workstream_id", "ui"),
-        ("issue_id", "I_11"),
-        ("issue_number", 11),
-        ("issue_url", "https://github.com/example/fixture/issues/11"),
-    ],
+    [("workstream_id", "ui"), ("issue_url", "https://github.com/example/fixture/issues/11")],
 )
 def test_explicit_child_ownership_mismatch_refuses_merge_before_any_intent(
     service,

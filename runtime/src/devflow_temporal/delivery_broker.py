@@ -531,6 +531,17 @@ class DeliveryBroker:
     ) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         checkout = checkout.resolve(strict=True)
+
+        def index_description() -> str | None:
+            try:
+                return _git(checkout, "ls-files", "--stage", "-z")
+            except RuntimeError as exc:
+                if (self.spec["provider"] != "fake"
+                        or os.path.lexists(checkout / ".git")
+                        or "not a git repository" not in str(exc)):
+                    raise
+                return None  # Explicit fake fixtures may have no Git repository.
+
         evidence_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         from .delivery_preparation import require_native_execution
 
@@ -575,6 +586,7 @@ class DeliveryBroker:
                     )
             except (ValueError, OSError, KeyError) as exc:
                 raise CheckPreparationFailure('native-addon-authority', exc) from exc
+        initial_index = index_description()
         native_dependencies = (
             self._ensure_native_dependency_store(checkout)
             if self.spec["provider"] == "codex"
@@ -583,6 +595,14 @@ class DeliveryBroker:
         )
         node_toolchain = None
         native_addon = None
+
+        def require_prepared_source(check_id):
+            if (candidate_for(checkout)["id"] != candidate["id"]
+                    or index_description() != initial_index):
+                raise CheckPreparationFailure(
+                    check_id, ValueError("check source or Git index changed during preparation"),
+                    results)
+
         for check in checks:
             argv = check.get("argv")
             relative = check.get("cwd", ".")
@@ -594,6 +614,16 @@ class DeliveryBroker:
                 or checkout not in (cwd, *cwd.parents)
             ):
                 raise ValueError("configured check command or cwd is invalid")
+            independent_test = (check.get("kind") == "test" and "/store" not in argv
+                                and not check.get("native_addon_prerequisite")
+                                and not check["id"].startswith("planned-python-dependencies-")
+                                and argv[:3] != ["corepack", "pnpm", "install"])
+            if results and any(not item["passed"] for item in results):
+                if (not independent_test or candidate_for(checkout)["id"] != candidate["id"]
+                        or index_description() != initial_index):
+                    break
+                if self.spec["provider"] == "codex" and self._native_cancelled():
+                    raise CheckCancelledBeforeLaunch("native check cancelled before launch")
             range_binding = None
             if check.get('plan_provenance', {}).get('recipe') == 'checks.diff':
                 if argv != ['git', 'diff', '--check', 'origin/main...HEAD']:
@@ -654,6 +684,7 @@ class DeliveryBroker:
                     "timeout": int(check.get("timeout_seconds", 600)),
                     "cancelled": self._native_cancelled,
                 }
+                require_prepared_source(check["id"])
                 native_result = self._run_native_check(NativeProcess(
                     self.spec, evidence_dir / check["id"] / "native", **options,
                 ))
@@ -661,6 +692,7 @@ class DeliveryBroker:
                     # A lost monitor yields no verdict. One fresh invocation
                     # re-runs the gate; the interrupted journal stays as evidence.
                     interrupted.append(native_result)
+                    require_prepared_source(check["id"])
                     native_result = self._run_native_check(NativeProcess(
                         self.spec, evidence_dir / check["id"] / "native-retry", **options,
                     ))
@@ -747,6 +779,7 @@ class DeliveryBroker:
             if check.get("test_count_regex"):
                 count = observed_test_count(output, check["test_count_regex"])
             junit = None
+            test_verdict_failure = None
             if check.get("junit_required"):
                 from .delivery_check_evidence import junit_counts
 
@@ -756,7 +789,8 @@ class DeliveryBroker:
                     junit = junit_counts(check_evidence, candidate['id'], self.state_dir)
                     count = junit['passed']
                     if junit['failures'] or junit['errors']:
-                        raise ValueError('required JUnit report records failed test cases')
+                        test_verdict_failure = 'required JUnit report records failed test cases'
+                        raise ValueError(test_verdict_failure)
                 except (ValueError, OSError) as exc:
                     evidence_failure = str(exc)
             selector_receipts = None
@@ -770,6 +804,10 @@ class DeliveryBroker:
                         spec=self.spec)
                 except (ValueError, OSError) as exc:
                     evidence_failure = str(exc)
+                    selector_receipts = getattr(exc, "_failed_selector_receipts", None)
+                    test_verdict_failure = (
+                        evidence_failure if selector_receipts is not None else None
+                    )
             rejected_causes = rejection_causes(
                 parsed_output, [check["reject_regex"]] if check.get("reject_regex") else [],
                 test_results=check.get("kind") == "test",
@@ -816,7 +854,23 @@ class DeliveryBroker:
                     **({"interrupted_native_processes": interrupted} if interrupted else {}),
                 }
             )
-            if not passed:
+            # Every check in a failed batch needs clean custody, even a passing verdict.
+            if any(not item["passed"] for item in results) and (
+                not independent_test or results[-1]["cleanup"] != "confirmed"
+                or (evidence_failure is not None and evidence_failure != test_verdict_failure)
+                or (artifact_cleanup is not None and artifact_cleanup.get("state")
+                    not in {"removed", "already_absent"})
+                or (native_result is not None and (
+                    native_result.get("state") != "finished"
+                    or native_result.get("cleanup") != "observed-native-confirmed"
+                    or native_result.get("monitoring_complete") is not True
+                    or native_result.get("stdio_drained") is not True
+                    or any(native_result.get(flag) is not False
+                           for flag in ("cancelled", "timed_out", "listener_conflict"))
+                    or native_result.get("interrupted_monitor", False) is not False
+                    or interrupted
+                ))
+            ):
                 break
             if (self.spec['provider'] == 'codex' and native_projects and '/store' in argv):
                 if (argv[:3] != ['corepack', 'pnpm', 'install']
@@ -837,7 +891,8 @@ class DeliveryBroker:
                         return {**addon, 'results': results}
                 native_projects = None
         after = candidate_for(checkout)
-        source_unchanged = after["id"] == candidate["id"]
+        source_unchanged = (after["id"] == candidate["id"]
+                            and index_description() == initial_index)
         return {
             "state": "passed"
             if results and all(item["passed"] for item in results) and source_unchanged

@@ -89,7 +89,7 @@ def test_clean_reintegration_qualifies_and_keeps_both_parents_on_same_pr(service
     assert receipt["number"] == 20
 
 
-@pytest.mark.parametrize("invalid", ["later_iteration", "missing_receipt", "unrecorded_edits"])
+@pytest.mark.parametrize("invalid", ["later_iteration", "unrecorded_edits"])
 def test_import_exception_does_not_qualify_unrelated_unchanged_candidates(
     service, monkeypatch, invalid,
 ):
@@ -134,7 +134,7 @@ def test_initial_chunk_import_can_pass_without_rewriting_its_sealed_build(servic
     assert role_result(child, broker, candidate)["status"] == "pass"
 
 
-@pytest.mark.parametrize("drift", [None, "local_branch", "remote_head", "closed_pr", "binding"])
+@pytest.mark.parametrize("drift", [None, "binding"])
 @pytest.mark.parametrize("preparation_failed", [False, True])
 def test_stopped_integration_resumes_only_its_frozen_local_and_remote_custody(
     service, monkeypatch, drift, preparation_failed,

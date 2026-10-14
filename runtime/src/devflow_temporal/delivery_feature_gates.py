@@ -670,13 +670,20 @@ def selector_evidence(
     receipts = []
     for source in sources:
         values = counts[source["selector"]]
-        if not values["passed"] or values["failed"] or values["skipped"]:
+        if not (values["passed"] or values["failed"]) or values["skipped"]:
             raise ValueError(
                 "required selector contributed no complete passing evidence: " + source["selector"]
             )
         if hashlib.sha256(Path(source["path"]).read_bytes()).hexdigest() != source["sha256"]:
             raise ValueError("selected test source changed during verification")
         receipts.append({**source, **values})
+    failed = [item for item in receipts if item["failed"]]
+    if failed:
+        error = ValueError(
+            "required selector contributed no complete passing evidence: " + failed[0]["selector"],
+        )
+        error._failed_selector_receipts = receipts
+        raise error
     return receipts
 
 

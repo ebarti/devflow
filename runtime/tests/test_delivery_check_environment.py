@@ -1,7 +1,9 @@
 """Synthetic execution-prerequisite regressions; never launch native processes."""
 
+import hashlib
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -164,6 +166,50 @@ def test_implementation_prepares_configured_install_and_handoff_without_named_no
         observed == [install]
         and result["node_toolchain"]["node_interpreter"]["absolute_path"] == "/frozen/node"
     )
+    from devflow_temporal import delivery_broker
+    from devflow_temporal.candidate import candidate_for
+
+    # Explicit fake provider: real commands and custody, no native/provider launch.
+    batch = object.__new__(DeliveryBroker)
+    batch.spec = {"provider": "fake", "gate_selections_version": 2,
+                  "policy": {"host_sandbox": "trusted-local", "allowed_paths": []}}
+    batch.state_dir = state
+    (checkout / "README.md").write_text("Original candidate")
+    delivery_broker._git(checkout, "init", "-q")
+    delivery_broker._git(checkout, "add", "README.md")
+    delivery_broker._git(checkout, "-c", "commit.gpgsign=false", "-c", "user.name=Fixture",
+                         "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Fixture")
+    evidence = state / "batch"
+    checks = []
+    for name, failed in [("first", True), ("second", True), ("later", False)]:
+        selector = f"test_{name}.py"
+        (checkout / selector).write_text('assert False, "original failure"' if failed
+                                         else 'assert True')
+        batch.spec["policy"]["allowed_paths"].append(selector)
+        report = evidence / name / "pytest-artifacts" / "junit.xml"
+        code = (f"from pathlib import Path; import runpy, sys; failed=0\n"
+                f"try: runpy.run_path({selector!r})\nexcept AssertionError: failed=1\n"
+                f"p=Path({str(report)!r}); p.parent.mkdir(parents=True, mode=0o700); "
+                f"p.parent.parent.chmod(0o700); "
+                f"p.write_text('<testsuite tests=\"1\"><testcase name=\"fixture\" "
+                f"file=\"{selector}\">'+('<failure message=\"original failure\"/>' if failed "
+                f"else '')+'</testcase></testsuite>'); print({name!r}); sys.exit(failed)")
+        checks.append({"id": name, "kind": "test", "junit_required": True,
+                       "required_selectors": [selector], "selector_evidence_version": 1,
+                       "argv": [sys.executable, "-B", "-c", code]})
+    candidate = candidate_for(checkout)
+    result = batch._run_check_list(checkout, checks, evidence, candidate)
+    assert result["state"] == "failed" and result["source_unchanged"] is True
+    assert [item["id"] for item in result["results"]] == ["first", "second", "later"]
+    assert [item["passed"] for item in result["results"]] == [False, False, True]
+    for item in result["results"]:
+        log = Path(item["log"])
+        assert log.read_text().strip() == item["id"]
+        assert hashlib.sha256(log.read_bytes()).hexdigest() == item["log_sha256"]
+        assert item["cleanup"] == "confirmed" and item["artifacts"]["count"] == 1
+    assert all(item["junit"]["failures"] == 1 and item["selectors"][0]["failed"] == 1
+               and item["evidence_failure"].startswith("required selector contributed")
+               for item in result["results"][:2])
 
 
 @pytest.mark.parametrize("role", [False, True])

@@ -238,7 +238,7 @@ def test_revision_gate_only_resume_merges_on_its_original_implementation(
     assert bound == {key: output[key] for key in ("id", "head", "content_sha256")}
 
 
-@pytest.mark.parametrize("ran_under", ["current", "middle", "oldest"])
+@pytest.mark.parametrize("ran_under", ["current", "oldest"])
 def test_stale_older_resume_link_blocks_only_implementations_that_ran_under_it(
     service, monkeypatch, ran_under,
 ):

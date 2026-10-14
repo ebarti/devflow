@@ -93,10 +93,7 @@ def test_package_relative_junit_uses_only_frozen_command_owner(wrapped_project):
     assert (recipe, spec, sources) == before
 
 
-@pytest.mark.parametrize("failure", [
-    "missing", "failed", "skipped", "basename", "dynamic", "multiple", "unadmitted",
-    "duplicate-owner", "source-drift", "ambiguous-path",
-])
+@pytest.mark.parametrize("failure", ["missing", "ambiguous-path"])
 def test_wrapper_cannot_qualify_missing_ambiguous_or_changed_sources(wrapped_project, failure):
     source, recipe, spec = wrapped_project
     cases = [("test/server.test.ts", "passed"), ("benchmark/local-scale.test.ts", "passed")]

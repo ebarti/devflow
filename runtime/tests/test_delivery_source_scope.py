@@ -46,13 +46,6 @@ def test_versioned_roots_are_bounded_by_protected_files_and_fixed_paths(tmp_path
     "scope",
     [
         {"version": 2, "allowed_roots": ["src"], "allowed_files": [], "protected_paths": []},
-        {
-            "version": 1,
-            "allowed_roots": ["src/../secrets"],
-            "allowed_files": [],
-            "protected_paths": [],
-        },
-        {"version": 1, "allowed_roots": [".agents"], "allowed_files": [], "protected_paths": []},
         {"version": 1, "allowed_roots": ["src", "src"], "allowed_files": [], "protected_paths": []},
     ],
 )

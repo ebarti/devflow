@@ -13,6 +13,8 @@ Delegated verification runs as the `devflow-verifier` [agent](../devflow/referen
 
 2. **Exercise the real path.** For a product-use claim, exercise the actual application entry point in each required mode and inspect the user-visible or persisted result. Include failure and recovery behavior when relevant. Passing checks, healthy services and simulated dependencies do not establish unexercised product behavior.
 
+Map inspected acceptance across the affected entry, handoff, checks, review, publication and resume/settlement path. Within current authority/stage, exercise every required feasible scenario; continue independent checks after failure and hand off all findings together. Mark dependent checks blocked/unverified. The implementation owner repairs the batch on the same candidate/PR before final merge/install; recheck original triggers and later affected boundaries, reusing valid unchanged evidence. Preserve early PR publication and concurrent review/CI where permitted. Cover admitted useful checks, not all tests.
+
 3. **Isolate and clean up.** Use owned isolated resources and preserve unrelated data and processes. Tests sharing a runtime or database must restore their owned state; verify cleanup and affected neighboring scenarios.
 
 4. **Record what happened.** Record the candidate and environment, setup, actions, expected and observed result, and any simulated dependencies.

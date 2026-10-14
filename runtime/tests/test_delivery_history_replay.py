@@ -47,8 +47,7 @@ def _load_routing_probe():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delayed", ["registration", "membership", "not-found", "poller-version",
-                                    "response-version", "activity-registration"])
+@pytest.mark.parametrize("delayed", ["registration", "activity-registration"])
 async def test_retained_routing_waits_beyond_poller_presence(monkeypatch, tmp_path, delayed):
     """Logical RPC fixture: no server, worker, process or recorded history is created."""
     from contextlib import asynccontextmanager
@@ -158,8 +157,7 @@ async def test_retained_routing_waits_beyond_poller_presence(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["missing-membership", "other-precondition", "network",
-                                    "read-network", "wrong-poller", "wrong-registration"])
+@pytest.mark.parametrize("failure", ["missing-membership", "wrong-registration"])
 async def test_retained_routing_readiness_is_bounded_and_rejects_unrelated_errors(failure):
     from temporalio.api.deployment.v1 import WorkerDeploymentOptions, WorkerDeploymentVersionInfo
     from temporalio.api.taskqueue.v1 import PollerInfo

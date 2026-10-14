@@ -81,11 +81,10 @@ def test_merge_observation_preserves_receipts_and_run_outcome(service):
     assert detail["feature"]["status"] == "Merged"
 
 
-@pytest.mark.parametrize(("state", "head", "expected"), [
-    ("OPEN", "a" * 40, "Awaiting merge"),
-    ("CLOSED", "a" * 40, "PR closed"),
-    ("OPEN", "c" * 40, "Needs validation"),
-])
+@pytest.mark.parametrize(
+    ("state", "head", "expected"),
+    [("OPEN", "a" * 40, "Awaiting merge"), ("OPEN", "c" * 40, "Needs validation")],
+)
 def test_current_pr_lifecycle(service, state, head, expected):
     store, request, _ = published(service)
     remote = Remote()

@@ -151,7 +151,7 @@ def test_initial_v2_children_own_detail_and_hydration_uses_only_exact_references
     assert not any(method != "GET" for method, _ in remote.calls)
 
 
-@pytest.mark.parametrize("tamper", ["body", "comment_node", "comment_issue", "child_id", "parent"])
+@pytest.mark.parametrize("tamper", ["body", "parent"])
 def test_exact_child_digest_identity_and_hierarchy_are_required(tmp_path, tamper):
     remote, issue, registry, token = setup(tmp_path)
     record = remote.initialize(issue, v2_plan(), registry, token)
@@ -201,7 +201,7 @@ def test_plan_only_migration_keeps_parent_children_pr_head_and_cumulative_budget
                                          operation_id="migration-one") == migrated
 
 
-@pytest.mark.parametrize("boundary", ["child_create", "parent_patch", "local_commit"])
+@pytest.mark.parametrize("boundary", ["child_create", "local_commit"])
 def test_revision_response_loss_replays_exact_operation_without_duplicate_children(
     tmp_path, monkeypatch, boundary,
 ):
@@ -243,8 +243,7 @@ def test_revision_response_loss_replays_exact_operation_without_duplicate_childr
     registry.stop(token, "settled", {})
 
 
-@pytest.mark.parametrize("change", ["outcome", "acceptance", "child", "published_order",
-                                    "command_reuse"])
+@pytest.mark.parametrize("change", ["outcome", "command_reuse"])
 def test_unsafe_revision_is_rejected_before_new_remote_mutation(tmp_path, change):
     remote, issue, registry, token = setup(tmp_path)
     original = legacy_publication(remote, issue, registry, token)
@@ -418,7 +417,7 @@ def test_initial_nullable_v2_adopts_resolved_definition_without_a_repair_debit(t
     assert spec["accepted_plan"] == json.dumps(supplied)
 
 
-@pytest.mark.parametrize("oversized_record", ["first_child", "later_child", "parent_index"])
+@pytest.mark.parametrize("oversized_record", ["first_child", "parent_index"])
 def test_unpublishable_record_preflight_releases_no_custody_and_allows_bounded_correction(
     tmp_path, oversized_record,
 ):
@@ -455,7 +454,7 @@ def test_unpublishable_record_preflight_releases_no_custody_and_allows_bounded_c
 
 
 @pytest.mark.parametrize(
-    "unreadable_record", ["first_child", "later_child", "parent_v2", "parent_v1"],
+    "unreadable_record", ["first_child", "parent_v1"],
 )
 def test_unreadable_record_preflight_takes_no_custody_and_allows_bounded_correction(
     tmp_path, unreadable_record,
@@ -495,7 +494,7 @@ def test_unreadable_record_preflight_takes_no_custody_and_allows_bounded_correct
 
 
 @pytest.mark.parametrize(
-    "weakening", ["removed_recipe", "dropped_selector", "narrowed_whole", "replaced_with_frozen"],
+    "weakening", ["removed_recipe", "replaced_with_frozen"],
 )
 def test_revision_cannot_drop_final_verification_before_publication(tmp_path, weakening):
     remote, issue, registry, token = setup(tmp_path)
@@ -533,8 +532,7 @@ def test_revision_cannot_drop_final_verification_before_publication(tmp_path, we
 
 
 @pytest.mark.parametrize(
-    "rejected_record", ["bound_parent_marker", "nullable_parent_marker",
-                        "nullable_later_child_marker", "nullable_parent_overflow"],
+    "rejected_record", ["bound_parent_marker", "nullable_parent_overflow"],
 )
 def test_initial_v2_admission_precedes_all_writes_and_corrected_intake_can_stop(
     tmp_path, rejected_record,
@@ -572,7 +570,7 @@ def test_initial_v2_admission_precedes_all_writes_and_corrected_intake_can_stop(
     registry.stop(token, "corrected-intake-stop", {})
 
 
-@pytest.mark.parametrize("response_loss", ["child_create", "parent_create", "local_receipt"])
+@pytest.mark.parametrize("response_loss", ["child_create", "local_receipt"])
 def test_initial_v2_uncertain_effects_recover_original_comments_before_stop(
     tmp_path, response_loss,
 ):

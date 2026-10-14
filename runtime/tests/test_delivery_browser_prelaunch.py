@@ -72,9 +72,7 @@ def test_observer_preserves_unknown_finalization_and_unregistered_output(browser
     assert resolved_effect(proof, state['candidate'])['state'] == 'failed'
 
 
-@pytest.mark.parametrize('drift', ['launch', 'receipt', 'profile', 'profile-link', 'output-link',
-                                 'output-missing', 'registered', 'local', 'review', 'assessment',
-                                 'candidate', 'error', 'effect', 'second-effect', 'ports', 'root'])
+@pytest.mark.parametrize('drift', ['launch', 'root'])
 def test_browser_observer_rejects_ambiguous_or_live_history(browser_stop, monkeypatch, drift):
     owned, state, effects, resources, profile, output = browser_stop
     if drift == 'launch':

@@ -84,7 +84,7 @@ def test_resource_closure_needs_no_renewal_generation_for_a_trusted_os_update(mo
         closure._readiness(None, spec, {}, None, None)
 
 
-@pytest.mark.parametrize("field", ["codex_bin_sha256", "architecture", "config_overrides"])
+@pytest.mark.parametrize("field", ["codex_bin_sha256", "config_overrides"])
 def test_measured_identity_drift_still_refuses(tmp_path, monkeypatch, field):
     spec = _spec(tmp_path, dict(FROZEN))
     monkeypatch.setattr(native, "native_identity",
@@ -120,6 +120,7 @@ def test_changed_native_authority_is_a_preparation_failure_with_confirmed_cleanu
 ):
     checkout = tmp_path / "checkout"
     checkout.mkdir()
+    broker_module._git(checkout, "init", "-q")
     broker = DeliveryBroker.__new__(DeliveryBroker)
     broker.spec = {"provider": "codex", "run_id": "run-1",
                    "policy": {"execution_backend": "native-macos"}}

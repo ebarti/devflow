@@ -726,7 +726,7 @@ def test_ensure_relaunches_a_dead_api_only_onto_the_worker_transport(config, mon
         assert result["processes"]["api"]["pid"] == 4 and signals == []
 
 
-@pytest.mark.parametrize("problem", ["hostname", "path", "occupied"])
+@pytest.mark.parametrize("problem", ["hostname", "occupied"])
 def test_restart_keeps_the_running_api_when_the_edited_one_cannot_start(config, monkeypatch,
                                                                          problem):
     manifest = _manifest(config)

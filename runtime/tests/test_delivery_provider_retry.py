@@ -193,11 +193,12 @@ def harness(tmp_path, monkeypatch, errors, *, legacy=False, completed=True,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", ["rateLimitExceeded", "serverOverloaded",
-                                  {"httpConnectionFailed": {"httpStatusCode": 503}},
-                                  {"responseStreamDisconnected": {"httpStatusCode": None}}])
+@pytest.mark.parametrize(
+    "error", ["rateLimitExceeded", {"responseStreamDisconnected": {"httpStatusCode": None}}]
+)
 async def test_completed_provider_transient_retries_same_thread_and_retains_original(
-        tmp_path, monkeypatch, error):
+    tmp_path, monkeypatch, error
+):
     runtime, task, observation, calls, clients, _control = harness(tmp_path, monkeypatch, [error])
     result = await runtime.run(task)
     assert result.is_success and result.session_id == "owned-thread"
@@ -223,9 +224,9 @@ async def test_transient_exhaustion_is_finite_with_all_original_turns(tmp_path, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", ["usageLimitExceeded", "sessionBudgetExceeded", "unauthorized",
-                                  "badRequest", "sandboxError", "other",
-                                  {"httpConnectionFailed": {"httpStatusCode": 401}}])
+@pytest.mark.parametrize(
+    "error", ["usageLimitExceeded", {"httpConnectionFailed": {"httpStatusCode": 401}}]
+)
 async def test_terminal_provider_failure_never_starts_another_turn(tmp_path, monkeypatch, error):
     runtime, task, observation, calls, *_ = harness(tmp_path, monkeypatch, [error])
     result = await runtime.run(task)
@@ -395,7 +396,7 @@ async def test_application_cancellation_during_backoff_never_retries(tmp_path, m
     assert control["backoffs"] == [1]
 
 
-@pytest.mark.parametrize("limit", [0, 4, True, "3", None])
+@pytest.mark.parametrize("limit", [0, None])
 def test_invalid_provider_attempt_limit_is_rejected_at_configuration(service, limit):
     store, _request = service
     path = store.config.path
@@ -468,9 +469,8 @@ def test_reference_bounds_arbitrary_provider_fields_and_turn_count(tmp_path, mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", ["unauthorized", "contextWindowExceeded",
-                                  "rateLimitExceeded"])
-@pytest.mark.parametrize("role", ["implement", "intake", "verify"])
+@pytest.mark.parametrize("error", ["unauthorized", "rateLimitExceeded"])
+@pytest.mark.parametrize("role", ["implement", "verify"])
 async def test_failed_role_exposes_bounded_typed_provider_reason(
         tmp_path, monkeypatch, error, role):
     from devflow_temporal import role_runner

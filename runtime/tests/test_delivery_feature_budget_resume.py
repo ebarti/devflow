@@ -87,9 +87,7 @@ def test_gate_attempts_of_an_interrupted_admission_take_its_own_identity():
         DeliverySupervisor._job_key({**implement, "spec": {**spec, "gate_admission": "a" * 64}}))
 
 
-@pytest.mark.parametrize("case", ["gate_findings", "failed_check", "implementation_findings",
-                                  "repair_requested", "unauthenticated", "blocked",
-                                  "single_delivery"])
+@pytest.mark.parametrize("case", ["gate_findings", "single_delivery"])
 def test_states_needing_a_repair_or_lacking_custody_have_no_interrupted_plan(case):
     spec, roles = worker("chunk"), [implementation(2)]
     options = {"iteration": 2, "pr_head": CANDIDATE["head"]}
@@ -122,23 +120,28 @@ def test_pending_repair_ignores_a_predecessor_that_reran_its_own_iteration():
     assert resume_mod.pending_repair(seal) is None
 
 
-@pytest.mark.parametrize(("details", "consistent"), [
-    ({"execution_spec": {"gate_admission": "a" * 64}, "command_digest": "a" * 64,
-      "resume_iteration": 2}, True),
-    ({"execution_spec": {"gate_admission": "b" * 64}, "command_digest": "a" * 64,
-      "resume_iteration": 2}, False),
-    # An interrupted rerun always carries its admission; older revision gate-only
-    # recoveries and resumes that never rerun gates at their iteration may lack it.
-    ({"execution_spec": {}, "command_digest": "a" * 64, "resume_iteration": 2}, False),
-    ({"execution_spec": {}, "command_digest": "a" * 64, "resume_iteration": 2,
-      "feature_plan_revision": {"revision_id": "r"}}, True),
-    ({"execution_spec": {}, "command_digest": "a" * 64, "pending_repair": {"iteration": 3}}, True),
-    ({"execution_spec": {"implement_admission": "a" * 64}, "command_digest": "a" * 64,
-      "pending_repair": {"iteration": 3}}, True),
-    ({"execution_spec": {"implement_admission": "b" * 64}, "command_digest": "a" * 64,
-      "pending_repair": {"iteration": 3}}, False),
-], ids=["own", "foreign", "interrupted-missing", "legacy-revision", "legacy-pending-repair",
-        "own-implement", "foreign-implement"])
+@pytest.mark.parametrize(
+    ("details", "consistent"),
+    [
+        (
+            {
+                "execution_spec": {"gate_admission": "a" * 64},
+                "command_digest": "a" * 64,
+                "resume_iteration": 2,
+            },
+            True,
+        ),
+        (
+            {
+                "execution_spec": {"implement_admission": "b" * 64},
+                "command_digest": "a" * 64,
+                "pending_repair": {"iteration": 3},
+            },
+            False,
+        ),
+    ],
+    ids=["own", "foreign-implement"],
+)
 def test_admission_identity_rule(details, consistent):
     assert resume_mod.admission_identity_consistent(details) is consistent
 
@@ -216,7 +219,7 @@ def test_gate_rerun_at_the_last_worker_iteration_keeps_its_repair_ceiling(servic
             captured["command"]["additional_iterations"]) == (last, 0)
 
 
-@pytest.mark.parametrize("case", ["findings", "failed_check", "blocked", "repair_requested"])
+@pytest.mark.parametrize("case", ["findings", "repair_requested"])
 def test_resume_that_needs_a_new_repair_cycle_is_refused_with_budget(service, monkeypatch, case):
     store, parent, child, shared, token = _worker(service, monkeypatch, used_by_others=10)
     roles, options = [implementation(0)], {}

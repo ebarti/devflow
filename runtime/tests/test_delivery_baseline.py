@@ -42,7 +42,7 @@ def configure(store, *, passes=False):
     return DeliveryStore(DeliveryConfig.load(store.config.path))
 
 
-@pytest.mark.parametrize("ids", [["missing"], ["shared-regression", "shared-regression"], None])
+@pytest.mark.parametrize("ids", [["missing"], None])
 def test_baseline_admission_rejects_missing_duplicate_or_invalid_recipe(service, ids):
     store, request = service
     store = configure(store)

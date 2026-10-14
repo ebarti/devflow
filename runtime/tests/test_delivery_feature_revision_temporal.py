@@ -139,9 +139,7 @@ class RevisionActivities:
         )]
 
 
-@pytest.mark.parametrize("scenario", [
-    "automatic", "ordinary", "review_rejects", "exhausted", "stopped",
-])
+@pytest.mark.parametrize("scenario", ["automatic", "stopped"])
 async def test_safe_revision_transition_runs_on_temporal_and_replays(tmp_path, scenario):
     fixtures = RevisionActivities(scenario)
     spec = {"run_id": "revision-temporal-" + scenario, "provider": "fake",

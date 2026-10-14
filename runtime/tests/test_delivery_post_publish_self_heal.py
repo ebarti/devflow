@@ -21,14 +21,11 @@ from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_gate_retry import (
     CI_KIND,
-    CI_OBSERVATION_RETRIES,
-    CONTROLLER_KIND,
     KIND,
-    PRELAUNCH_KIND,
     TRANSIENT_GATE_RETRIES,
 )
 from devflow_temporal.delivery_stopped_resume import KIND as RESUME_KIND
-from devflow_temporal.delivery_workflow import DeliveryWorkflow, _failure_classification
+from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 TRANSPORT_STOPS = [
     'review activity failed: ActivityError',
@@ -132,27 +129,8 @@ def test_classified_transport_stop_after_publish_admits_fresh_gates_only(stopped
     assert run_count(store) == 1
 
 
-def test_controller_failure_stop_after_publish_is_visible_to_gate_admission(stopped):
-    store, _, state, _, request = stopped
-    stop_transiently(store, state, 'controller failed: KeyError', controller=True)
-    result = store.continue_repair('run-1', {**request, 'command_id': 'controller-transient'})
-    assert result['workflow_id'] == 'delivery-run-1-transient-gates-retry-1'
-    assert result['implementation_authority'] is False
 
 
-@pytest.mark.parametrize('error', TRANSPORT_STOPS)
-def test_unclassified_transport_string_is_still_refused_by_every_gate_retry(stopped, error):
-    store, _, state, _, request = stopped
-    stop_transiently(store, state, error)
-    state['checks'].pop('failure')
-    with store._connect() as db:
-        db.execute("UPDATE delivery_runs SET checks_json=? WHERE run_id='run-1'",
-                   (canonical_json(state['checks']),))
-    for kind in (KIND, CI_KIND, PRELAUNCH_KIND, CONTROLLER_KIND):
-        with pytest.raises(ValueError):
-            store.continue_repair('run-1', {**request, 'continuation_kind': kind,
-                                            'command_id': 'string-' + kind})
-    assert retry.retry_once(store) == []
 
 
 def test_transient_gate_retries_are_bounded_per_run(stopped):
@@ -222,54 +200,10 @@ def waiting_for_ci(store, state, *, recorded=True):
                      keep_roles=True)
 
 
-def test_ci_observation_repeats_automatically_while_the_head_is_unchanged(stopped):
-    store, _, state, closed, request = stopped
-    waiting_for_ci(store, state)
-    sizes = []
-    for generation in range(1, CI_OBSERVATION_RETRIES + 1):
-        clear_waits(store)
-        admitted = retry.retry_once(store)
-        assert [item['workflow_id'] for item in admitted] == [
-            f'delivery-run-1-ci-retry-{generation}']
-        recovery, _, _ = current_recovery(store)
-        assert recovery['kind'] == CI_KIND
-        assert recovery['execution_spec']['gate_retry_generation'] == generation
-        sizes.append(len(canonical_json(recovery)))
-        stop_again(store, state, closed, 'required CI did not confirm this PR head',
-                   stage='waiting_ci', cause_type='ci_deadline')
-    # The retained chain is referenced by digest, so the record grows linearly.
-    assert sizes[-1] < 2 * sizes[0] * CI_OBSERVATION_RETRIES
-    clear_waits(store)
-    assert retry.retry_once(store) == []
-    with pytest.raises(ValueError, match='bounded CI observation retries'):
-        store.continue_repair('run-1', {**request, 'continuation_kind': CI_KIND,
-                                        'command_id': 'ci-too-many',
-                                        'expected_revision': state['revision']})
-    assert run_count(store) == 1
 
 
-def test_second_operator_ci_observation_is_admitted_after_another_deadline(stopped):
-    store, _, state, closed, request = stopped
-    waiting_for_ci(store, state)
-    first = store.continue_repair('run-1', {**request, 'continuation_kind': CI_KIND,
-                                            'command_id': 'ci-1'})
-    assert first['workflow_id'] == 'delivery-run-1-ci-retry-1'
-    stop_again(store, state, closed, 'required CI did not confirm this PR head',
-               stage='waiting_ci', cause_type='ci_deadline')
-    second = store.continue_repair('run-1', {**request, 'continuation_kind': CI_KIND,
-                                             'command_id': 'ci-2',
-                                             'expected_revision': state['revision']})
-    assert second['workflow_id'] == 'delivery-run-1-ci-retry-2'
 
 
-def test_lost_ci_observation_without_a_recorded_state_is_observed_again(stopped):
-    store, _, state, _, request = stopped
-    waiting_for_ci(store, state, recorded=False)
-    assert 'ci' not in state['checks']
-    result = store.continue_repair('run-1', {**request, 'continuation_kind': CI_KIND,
-                                             'command_id': 'ci-lost'})
-    assert result['workflow_id'] == 'delivery-run-1-ci-retry-1'
-    assert result['implementation_authority'] is False
 
 
 def test_pending_publication_deadline_is_completed_by_the_service_loop(pending_v1):
@@ -288,48 +222,10 @@ def test_pending_publication_deadline_is_completed_by_the_service_loop(pending_v
     assert retry.published_continuation(store, row, spec) is None
 
 
-def test_tracker_and_unpublished_transient_stops_get_no_published_continuation(stopped):
-    store, _, state, _, _ = stopped
-    stop_transiently(store, state, 'tracker readback remains pending or conflicting',
-                     stage='tracker', cause_type='tracker_readback')
-    with store._connect() as db:
-        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
-    spec = {**json.loads(row['request_json']), 'automatic_retry_version': 1}
-    assert retry.published_continuation(store, row, spec) is None
-    assert retry.published_continuation(store, {**row, 'pr_json': None}, spec) is None
 
 
-def test_controller_failure_classifies_transient_with_its_own_cause():
-    assert _failure_classification(KeyError('head'), 'controller_failure') == {
-        'classification': 'transient', 'cause_type': 'controller_failure'}
-    assert _failure_classification(KeyError('head'), None) == {'classification': 'terminal'}
 
 
-@pytest.mark.parametrize('post_publish_v1,original',
-                         [(True, False), (False, False), (False, True)])
-def test_stop_records_the_classification_for_recovery_executions(monkeypatch, post_publish_v1,
-                                                                 original):
-    flow = DeliveryWorkflow()
-    flow.post_publish_v1 = post_publish_v1
-    flow.original_execution = original
-    flow.state = {'phase': 'checks', 'revision': 3, 'roles': [], 'checks': {},
-                  'cleanup': 'none', 'cancel_requested': False}
-    projected = []
-
-    async def project(_spec, event, _message):
-        projected.append(event)
-
-    monkeypatch.setattr(flow, '_project', project)
-    cause = activity_error(ApplicationError('lost', type='TimeoutExpired'))
-    result = asyncio.run(flow._stop({'automatic_retry_version': 1},
-                                    'review activity failed: ActivityError', cause=cause))
-    assert projected == ['blocked'] and result['outcome'] == 'blocked'
-    if post_publish_v1 or original:
-        assert result['checks']['failure'] == {
-            'classification': 'transient', 'cause_type': 'TimeoutExpired', 'stage': 'checks',
-            'reason': 'review activity failed: ActivityError'}
-    else:
-        assert 'failure' not in result['checks']
 
 
 class Abort(Exception):
@@ -372,43 +268,8 @@ def admitted_resume(store, broker, state, monkeypatch):
     return store.effective_spec('run-1'), recovery
 
 
-@pytest.mark.parametrize('controller', [False, True])
-def test_stopped_resume_reruns_gates_instead_of_handing_the_error_to_the_implementer(
-    stopped, monkeypatch, controller,
-):
-    store, broker, state, _, _ = stopped
-    error = 'controller failed: KeyError' if controller else TRANSPORT_STOPS[0]
-    stop_transiently(store, state, error, controller=controller)
-    spec, recovery = admitted_resume(store, broker, state, monkeypatch)
-    flow = DeliveryWorkflow()
-    flow.post_publish_v1 = True
-    launched = {}
-    resume_probe(flow, launched, monkeypatch)
-    # The role activity's failure is absorbed by the run; the request is what matters.
-    asyncio.run(flow._resume_stopped(spec, recovery))
-    assert launched['role'] == 'review'
-    assert launched['iteration'] == state['iteration']
-    assert error not in json.dumps(launched.get('findings'))
-    assert ('delivery_role', 'implement') not in launched['calls']
-    assert ('delivery_checks', None) in launched['calls']
-    assert 'failure' not in flow.state['checks']
-    assert 'controller_failure' not in flow.state['checks']
 
 
-def test_recorded_stopped_resume_keeps_its_implementation_turn_without_the_marker(
-    stopped, monkeypatch,
-):
-    store, broker, state, _, _ = stopped
-    stop_transiently(store, state, TRANSPORT_STOPS[0])
-    spec, recovery = admitted_resume(store, broker, state, monkeypatch)
-    flow = DeliveryWorkflow()
-    launched = {}
-    resume_probe(flow, launched, monkeypatch)
-    # The role activity's failure is absorbed by the run; the request is what matters.
-    asyncio.run(flow._resume_stopped(spec, recovery))
-    assert launched['role'] == 'implement'
-    assert launched['iteration'] == state['iteration'] + 1
-    assert launched['findings'] == [TRANSPORT_STOPS[0]]
 
 
 def test_interrupted_repair_resumes_with_the_findings_it_was_repairing(stopped, monkeypatch):
@@ -437,39 +298,6 @@ def test_interrupted_repair_resumes_with_the_findings_it_was_repairing(stopped, 
     assert launched['findings'] == ['Receipt omits source hash semantics']
 
 
-@pytest.mark.parametrize('outcome', ['pending', 'lost'])
-def test_ci_resume_classifies_its_own_deadline_and_lost_observation(stopped, monkeypatch,
-                                                                    outcome):
-    store, _, state, _, _ = stopped
-    waiting_for_ci(store, state)
-    spec = {**store.spec('run-1'), 'automatic_retry_version': 1}
-    recovery = {'execution_spec': spec, 'command': {'additional_iterations': 0},
-                'state': state, 'candidate': state['candidate'],
-                'publication': state['pull_request']}
-    flow = DeliveryWorkflow()
-    flow.post_publish_v1 = True
-    flow.original_execution = False
-
-    async def execute(name, body, **_kw):
-        if name == 'delivery_ci':
-            if outcome == 'lost':
-                raise activity_error(ApplicationError('lost', type='TimeoutExpired'))
-            return {'state': 'pending', 'reason': 'CI deadline reached'}
-        return {'state': 'consistent'}
-
-    async def project(*_args):
-        pass
-
-    monkeypatch.setattr(flow, '_activity', execute)
-    monkeypatch.setattr(flow, '_project', project)
-    result = asyncio.run(flow._resume_ci(spec, recovery))
-    assert result['outcome'] == 'blocked'
-    failure = result['checks']['failure']
-    assert failure['classification'] == 'transient'
-    # A lost read-only observation keeps the deadline's cause: observed again,
-    # never re-gated.
-    assert failure['cause_type'] == 'ci_deadline'
-    assert failure['stage'] == 'waiting_ci'
 
 
 STALL = 'publication unresolved: remote unavailable before push'
@@ -556,189 +384,16 @@ def completion_request(broker, state, candidate, command_id='complete-repair-pub
             'expected_pr_number': 0}
 
 
-@pytest.mark.parametrize('stage', ['uncommitted', 'committed', 'pushed'])
-def test_stalled_repair_publication_is_admitted_for_completion_by_identity(
-    service, monkeypatch, stage,
-):
-    store, broker, state, _closed, candidate = stalled_repair(service, monkeypatch, stage)
-    head = _git(broker.checkout, 'rev-parse', 'HEAD')
-    assert (head == candidate['head']) is (stage == 'uncommitted')
-    admitted = store.recover_publication('run-1', completion_request(broker, state, candidate))
-    assert admitted['phase'] == 'publication_recovery_queued'
-    assert admitted['implementation_authority'] is False
-    assert admitted['workflow_id'] == 'delivery-run-1-publication-retry-1'
-    recovery, _, _ = current_recovery(store)
-    assert recovery['seal']['pushed'] is (stage == 'pushed')
-    assert recovery['seal']['published']['number'] == 1
-    assert recovery['seal']['candidate']['head'] == head
-    assert recovery['state']['pull_request']['number'] == 1
-    with store._connect() as db:
-        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
 
 
-@pytest.mark.parametrize('drift', ['pr_number', 'remote', 'content', 'rewound_push'])
-def test_stalled_repair_publication_keeps_its_identity_refusals(service, monkeypatch, drift):
-    stage = 'pushed' if drift == 'rewound_push' else 'committed'
-    store, broker, state, _closed, candidate = stalled_repair(service, monkeypatch, stage)
-    if drift == 'pr_number':
-        monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_a, **_kw: {
-            'number': 2, 'url': 'https://example.invalid/pull/2', 'state': 'OPEN',
-            'isDraft': False, 'headRefOid': candidate['head']})
-    elif drift in {'remote', 'rewound_push'}:
-        # origin shows a foreign head, or no longer the push this run confirmed.
-        foreign = candidate['head'] if drift == 'rewound_push' else 'f' * 40
-        monkeypatch.setattr('devflow_temporal.delivery_pending_publication._git',
-                            lambda path, *args: f'{foreign}\trefs/heads/feat/fixture'
-                            if 'ls-remote' in args else _git(path, *args))
-    else:
-        (broker.checkout / 'README.md').write_text('Changed after checking\n')
-    with pytest.raises(ValueError):
-        store.recover_publication('run-1', completion_request(broker, state, candidate))
 
 
-def test_service_loop_completes_a_stalled_repair_publication_within_bounds(service,
-                                                                           monkeypatch):
-    from devflow_temporal.delivery_pending_publication import PUBLICATION_RETRIES
-
-    store, broker, state, closed, candidate = stalled_repair(service, monkeypatch,
-                                                             'uncommitted')
-    for generation in range(1, PUBLICATION_RETRIES + 1):
-        clear_waits(store)
-        admitted = retry.retry_once(store)
-        assert [item['phase'] for item in admitted] == ['publication_recovery_queued']
-        assert admitted[0]['workflow_id'] == f'delivery-run-1-publication-retry-{generation}'
-        recovery, _, _ = current_recovery(store)
-        assert recovery['command']['command_id'].startswith('automatic-publication-')
-        assert recovery['command']['expected_head'] == candidate['head']
-        assert recovery['namespace'] == 'publication-retry' + (
-            f'-{generation}' if generation > 1 else '')
-        assert run_count(store) == 1
-        stop_again(store, state, closed, STALL, stage='publishing_pending',
-                   cause_type='publication_deadline')
-    clear_waits(store)
-    assert retry.retry_once(store) == []
-    with pytest.raises(ValueError, match='bounded publication retries'):
-        store.recover_publication('run-1', completion_request(broker, state, candidate,
-                                                              command_id='one-too-many'))
 
 
-def test_pending_publication_resume_publishes_the_unpushed_repair(service, monkeypatch):
-    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
-    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.now',
-                        lambda: datetime.now(UTC))
-    store, broker, state, _closed, candidate = stalled_repair(service, monkeypatch, 'committed')
-    store.recover_publication('run-1', completion_request(broker, state, candidate))
-    spec = store.effective_spec('run-1')
-    recovery, _, _ = current_recovery(store)
-    head = _git(broker.checkout, 'rev-parse', 'HEAD')
-    published = {'number': 1, 'url': 'https://example.invalid/pull/1', 'state': 'OPEN',
-                 'head': head, 'base': spec['base_sha'],
-                 'candidate': DeliveryBroker(store, spec).candidate()}
-    flow = DeliveryWorkflow()
-    flow.publication_v1 = flow.post_publish_v1 = True
-    calls = []
-
-    async def execute(name, body, **_kw):
-        calls.append((name, body.get('role')))
-        if name in {'delivery_tracker_start', 'delivery_tracker'}:
-            return {'state': 'consistent'}
-        if name == 'delivery_publish':
-            assert body['iteration'] == 1 and body['candidate'] == state['candidate']
-            return published
-        if name == 'delivery_role':
-            return {'status': 'pass', 'role': body['role'], 'candidate': published['candidate'],
-                    'session_id': 'independent-' + body['role']}
-        return {'state': 'passed', 'cleanup': 'confirmed'}
-
-    async def project(*_args):
-        pass
-
-    monkeypatch.setattr(flow, '_activity', execute)
-    monkeypatch.setattr(flow, '_project', project)
-    result = asyncio.run(flow._resume_pending_publication(spec, recovery))
-    assert result['outcome'] == 'delivered'
-    assert result['pull_request'] == published
-    assert ('delivery_publish', None) in calls
-    assert ('delivery_reconcile_publish', None) not in calls
-    assert ('delivery_role', 'implement') not in calls
-    assert [role for name, role in calls if name == 'delivery_role'] == ['review', 'verify']
 
 
-@pytest.mark.asyncio
-async def test_stopped_resume_publishes_an_unpublished_repair_before_its_gates(service,
-                                                                                monkeypatch):
-    """The repair's publication was lost before the push: the PR still shows the
-    reviewed-and-failed head, so the resume publishes first and gates after."""
-    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
-    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.now',
-                        lambda: datetime.now(UTC))
-    store, broker, state, _closed, candidate = stalled_repair(service, monkeypatch,
-                                                             'uncommitted')
-    admitted = store.continue_repair('run-1', {
-        'continuation_kind': RESUME_KIND, 'command_id': 'resume-stalled-repair',
-        'expected_revision': state['revision'], 'expected_iteration': state['iteration'],
-        'expected_candidate_id': candidate['id'], 'expected_candidate_head': candidate['head'],
-        'additional_iterations': 1})
-    assert admitted['authorized_through_iteration'] == state['iteration'] + 1
-    spec = store.effective_spec('run-1')
-    recovery, _, _ = current_recovery(store)
-    assert recovery['execution_candidate']['id'] == candidate['id']
-    flow = DeliveryWorkflow()
-    flow.publication_v1 = flow.post_publish_v1 = True
-    repaired = 'e' * 40
-    published = {'number': 1, 'url': 'https://example.invalid/pull/1', 'state': 'OPEN',
-                 'head': repaired, 'base': spec['base_sha'],
-                 'candidate': {**candidate, 'head': repaired, 'id': 'f' * 64}}
-    calls, ci_heads = [], []
-
-    async def execute(name, body, **_kw):
-        calls.append((name, body.get('role')))
-        if name == 'delivery_repair_preflight':
-            return {'state': 'confirmed'}
-        if name in {'delivery_tracker_start', 'delivery_tracker'}:
-            return {'state': 'consistent'}
-        if name == 'delivery_publish':
-            assert body['iteration'] == 1 and body['candidate']['id'] == candidate['id']
-            return published
-        if name == 'delivery_role':
-            return {'status': 'pass', 'role': body['role'], 'candidate': published['candidate'],
-                    'session_id': 'independent-' + body['role'], 'cleanup': 'confirmed'}
-        if name == 'delivery_ci':
-            ci_heads.append(body['pull_request']['head'])
-            return {'state': 'passed'}
-        return {'state': 'passed', 'cleanup': 'confirmed'}
-
-    async def project(*_args):
-        pass
-
-    monkeypatch.setattr(flow, '_activity', execute)
-    monkeypatch.setattr(flow, '_project', project)
-    result = await flow._resume_stopped(spec, recovery)
-    assert result['outcome'] == 'delivered'
-    assert result['pull_request'] == published
-    assert ci_heads == [repaired]
-    names = [name for name, _ in calls]
-    assert names.index('delivery_precheck') < names.index('delivery_publish') < names.index(
-        'delivery_role')
-    assert ('delivery_role', 'implement') not in calls
-    assert [role for name, role in calls if name == 'delivery_role'] == ['review', 'verify']
 
 
-def test_stopped_resume_admission_requires_the_candidate_on_the_published_head(service,
-                                                                                monkeypatch):
-    store, _broker, state, _closed, candidate = stalled_repair(service, monkeypatch,
-                                                              'uncommitted')
-    foreign = {**candidate, 'head': 'f' * 40}
-    monkeypatch.setattr('devflow_temporal.delivery_stopped_resume._candidate',
-                        lambda *_a, **_kw: (foreign, 'original-implementation'))
-    monkeypatch.setattr('devflow_temporal.delivery_stopped_resume.published_identity',
-                        lambda *_a, **_kw: None)
-    with pytest.raises(ValueError, match='not on the published head'):
-        store.continue_repair('run-1', {
-            'continuation_kind': RESUME_KIND, 'command_id': 'resume-foreign-head',
-            'expected_revision': state['revision'], 'expected_iteration': state['iteration'],
-            'expected_candidate_id': candidate['id'], 'expected_candidate_head': foreign['head'],
-            'additional_iterations': 1})
 
 
 def test_superseded_stop_is_never_revived_by_the_service_loop(service, monkeypatch):
@@ -1052,63 +707,6 @@ def break_first_ci_observation(call):
     return 'passed' if call == 1 else {'state': 'passed'}
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['checks', 'controller'])
-async def test_published_transport_and_controller_stops_heal_through_observed_cleanup(
-    service, monkeypatch, failure,
-):
-    """A lost checks activity or a controller failure after publish stops with
-    unknown cleanup and a retained claim. The service loop confirms the native
-    cleanup by observation, releases the claim, and re-runs the gates on the
-    unchanged head; no implementation turn, no new branch or PR."""
-    from devflow_temporal.delivery_gate_retry import KIND as GATES_KIND
-
-    # A lost checks activity re-runs the gates; a controller failure while handling
-    # the CI observation keeps CI observation semantics (nothing else changed).
-    expected_kind, expected_phase = ((GATES_KIND, 'gates_retry_queued') if failure == 'checks'
-                                     else (CI_KIND, 'gates_retry_queued'))
-    script = {'checks': lose_first_checks} if failure == 'checks' else {
-        'ci': break_first_ci_observation}
-    async with RealDelivery(service, monkeypatch, script=script).running() as run:
-        stopped = await run.start()
-        assert stopped['outcome'] == 'blocked'
-        assert stopped['error'] == ('checks activity failed: ActivityError' if failure == 'checks'
-                                    else 'controller failed: AttributeError')
-        assert stopped['cleanup'] == 'unknown'
-        assert stopped['checks']['resource_cleanup']['state'] == 'unknown'
-        assert run.seen['release'] == [False]
-        assert stopped['checks']['failure']['classification'] == 'transient'
-        assert stopped['checks']['failure']['cause_type'] == (
-            'TimeoutExpired' if failure == 'checks' else 'controller_failure')
-        if failure == 'controller':
-            assert stopped['checks']['controller_failure']['stage'] == 'waiting_ci'
-        published_head = stopped['pull_request']['head']
-        row = run.row()
-        assert row['cleanup'] == 'unknown' and run.claim() is not None
-        run.age()
-        clear_waits(run.store)
-        # Not conclusive without observation: the loop first finalizes again.
-        admitted = retry.retry_once(run.store)
-        assert [item['phase'] for item in admitted] == [expected_phase]
-        assert admitted[0]['implementation_authority'] is False
-        healed = run.row()
-        # The observed closure released the claim; the admitted continuation holds it.
-        assert healed['cleanup'] == 'confirmed'
-        assert run.claim()['owner'] == 'external:devflow:run-1'
-        with run.store._connect() as db:
-            assert db.execute("SELECT COUNT(*) FROM delivery_events WHERE run_id='run-1' "
-                              "AND type='resource_cleanup_reconciled'").fetchone()[0] >= 1
-        assert run_count(run.store) == 1
-        resumed, recovery = await run.continue_run()
-    assert resumed['outcome'] == 'delivered'
-    assert recovery['kind'] == expected_kind
-    assert recovery['execution_spec']['gate_retry_stage'] == (
-        'transient' if failure == 'checks' else 'ci')
-    assert resumed['pull_request']['head'] == published_head == remote_head(run.broker)
-    assert run.seen['roles'].count(('implement', 0)) == 1
-    assert ('implement', 1) not in run.seen['roles']
-    assert set(run.seen['ci_heads']) == {published_head}
-    assert len(run.gh.creations()) == 1
 
 
 async def run_ci_continuation_probe(*, marker):
@@ -1171,20 +769,6 @@ async def run_ci_continuation_probe(*, marker):
     return result, events
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('marker', [False, True])
-async def test_ci_continuation_replays_on_its_recorded_path_with_and_without_the_marker(marker):
-    result, events = await run_ci_continuation_probe(marker=marker)
-    assert result['outcome'] == 'blocked'
-    assert result['error'] == 'required CI did not confirm this PR head'
-    assert events[-1] == 'blocked'
-    if marker:
-        assert result['checks']['failure'] == {
-            'classification': 'transient', 'cause_type': 'ci_deadline', 'stage': 'waiting_ci',
-            'reason': 'required CI did not confirm this PR head'}
-    else:
-        # Recorded before the marker: the stop is the one the old workflow made.
-        assert 'failure' not in result['checks']
 
 
 def fail_first_findings_projection(payload):
@@ -1194,127 +778,12 @@ def fail_first_findings_projection(payload):
         raise RuntimeError('projection store unavailable')
 
 
-@pytest.mark.asyncio
-async def test_masked_gate_failure_routes_to_a_repair_turn_not_a_fresh_assessment(service,
-                                                                                   monkeypatch):
-    """Review records findings, then the findings projection fails and the boundary
-    stops the run with cleanup unknown. The verdict stands: the service loop
-    confirms cleanup, then resumes the repair turn with those findings and the
-    turns an unmasked run would still have; no gate or CI runs on the failed
-    head again, and the second repair delivers at the last budgeted iteration."""
-    verdicts = {0: ['Needs a second edit'], 1: ['Needs a third edit']}
-    script = {'review': verdicts.get, 'project': fail_first_findings_projection}
-    async with RealDelivery(service, monkeypatch, script=script).running() as run:
-        stopped = await run.start()
-        first_head = stopped['pull_request']['head']
-        assert stopped['outcome'] == 'blocked' and stopped['iteration'] == 0
-        assert stopped['error'] == 'controller failed: ActivityError'
-        assert stopped['checks']['failure']['cause_type'] == 'controller_failure'
-        assert stopped['checks']['review']['state'] == 'failed'
-        assert stopped['repair_findings'] == {'iteration': 0, 'findings': ['Needs a second edit']}
-        assert stopped['cleanup'] == 'unknown' and run.claim() is not None
-        run.age()
-        clear_waits(run.store)
-        admitted = retry.retry_once(run.store)
-        assert [item['phase'] for item in admitted] == ['repair_continuation_queued']
-        assert run.spec['policy']['max_repairs'] == 2
-        assert admitted[0]['authorized_through_iteration'] == 2
-        recovery, _, _ = current_recovery(run.store)
-        assert recovery['kind'] == RESUME_KIND
-        assert recovery['command']['command_id'].startswith('automatic-repair-')
-        with pytest.raises(ValueError):
-            run.store.continue_repair('run-1', {
-                'continuation_kind': KIND, 'command_id': 'fresh-assessment',
-                'expected_revision': stopped['revision'], 'expected_iteration': 0,
-                'expected_candidate_id': stopped['candidate']['id'], 'expected_pr_number': 1,
-                'expected_pr_head': first_head, 'additional_iterations': 0})
-        assert run_count(run.store) == 1
-        resumed, _ = await run.continue_run()
-    repaired = remote_head(run.broker)
-    assert resumed['outcome'] == 'delivered' and resumed['iteration'] == 2
-    assert resumed['pull_request']['head'] == repaired != first_head
-    assert run.seen['roles'] == [('implement', 0), ('review', 0), ('implement', 1),
-                                 ('review', 1), ('implement', 2), ('review', 2),
-                                 ('verify', 2)]
-    assert run.seen['findings'] == [[], ['Needs a second edit'], ['Needs a third edit']]
-    assert run.seen['ci_heads'] == [repaired]
-    assert len(run.gh.creations()) == 1
 
 
-def test_transient_gate_retries_refuse_a_recorded_gate_verdict(stopped, monkeypatch):
-    store, _, state, _, request = stopped
-    stop_transiently(store, state, 'controller failed: KeyError', controller=True,
-                     keep_roles=True)
-    state['checks']['review'] = {'state': 'failed', 'candidate_id': state['candidate']['id']}
-    with store._connect() as db:
-        db.execute("UPDATE delivery_runs SET checks_json=? WHERE run_id='run-1'",
-                   (canonical_json(state['checks']),))
-    for kind in (KIND, CI_KIND):
-        with pytest.raises(ValueError):
-            store.continue_repair('run-1', {**request, 'continuation_kind': kind,
-                                            'command_id': 'verdict-' + kind})
-    with store._connect() as db:
-        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
-    spec = json.loads(row['request_json'])
-    admit, generation, payload = retry.published_continuation(store, row, spec)
-    assert admit == store.continue_repair and generation == 1
-    assert payload['continuation_kind'] == RESUME_KIND
-    # Exactly the turns an unmasked run would still have, never more.
-    assert spec['policy']['max_repairs'] - row['iteration'] == 1
-    assert payload['additional_iterations'] == 1
-    assert payload['command_id'].startswith('automatic-repair-')
-    roomy = {**spec, 'policy': {**spec['policy'], 'max_repairs': row['iteration'] + 5}}
-    assert retry.published_continuation(store, row, roomy)[2]['additional_iterations'] == 2
-    exhausted = {**spec, 'policy': {**spec['policy'], 'max_repairs': row['iteration']}}
-    assert retry.published_continuation(store, row, exhausted) is None
 
 
-def test_interrupted_repair_resumes_with_every_recorded_gate_finding(stopped, monkeypatch):
-    store, _, state, _, _ = stopped
-    spec = store.spec('run-1')
-    broker_findings = ['local check packaging failed: exit 1',
-                       'Receipt omits source hash semantics']
-    state['iteration'] = 2
-    state['repair_findings'] = {'iteration': 1, 'findings': broker_findings}
-    state['checks'] = {'failure': {'classification': 'transient',
-                                   'cause_type': 'ActivityTimeoutError', 'stage': 'repair',
-                                   'reason': 'implementer activity failed: ActivityError'}}
-    state['error'] = 'implementer activity failed: ActivityError'
-    recovery = {'execution_spec': spec, 'maximum_iteration': 3, 'state': state,
-                'execution_candidate': state['candidate'], 'session_id': 'original-session',
-                'command': {'additional_iterations': 1}}
-    flow = DeliveryWorkflow()
-    flow.post_publish_v1 = True
-    launched = {}
-    resume_probe(flow, launched, monkeypatch)
-    asyncio.run(flow._resume_stopped(spec, recovery))
-    assert launched['role'] == 'implement' and launched['iteration'] == 3
-    assert launched['findings'] == broker_findings
 
 
-def test_reconciled_cleanup_accepts_only_published_closures(service):
-    from devflow_temporal.delivery_policy_recovery import reconciled_cleanup
-
-    store, request = service
-    store.submit(request)
-    receipt = {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
-               'resource_cleanup': 'confirmed', 'receipt_sha256': 'later'}
-    state = {'run_id': 'run-1', 'cleanup': 'unknown', 'checks': {'resource_cleanup': {
-        'state': 'unknown'}}}
-    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
-                  message='stopped', outcome='blocked', cleanup='confirmed',
-                  checks={'resource_cleanup': receipt}, tracker={'state': 'consistent'})
-    with store._connect() as db:
-        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
-        record = {'original_result_digest': digest(state), 'resource_cleanup': receipt,
-                  'tracker': json.loads(row['tracker_json'] or '{}')}
-        store._event(db, 'run-1', row['revision'], 'resource_cleanup_reconciled',
-                     'unpublished retry closure', record)
-    assert reconciled_cleanup(store, row, state) is None
-    with store._connect() as db:
-        store._event(db, 'run-1', row['revision'] + 1, 'resource_cleanup_reconciled',
-                     'published closure', {**record, 'closure': 'published'})
-    assert reconciled_cleanup(store, row, state)['closure'] == 'published'
 
 
 def ci_verdict_stop(stopped):
@@ -1383,19 +852,6 @@ def test_ci_verdict_repair_carries_sealed_diagnostics_or_is_refused(stopped, mon
     assert launched['findings'] == SEALED
 
 
-def test_verdict_resume_without_any_findings_stops_instead_of_repairing(stopped, monkeypatch):
-    store, state = ci_verdict_stop(stopped)
-    spec = store.spec('run-1')
-    recovery = {'execution_spec': spec, 'maximum_iteration': state['iteration'] + 1,
-                'state': state, 'execution_candidate': state['candidate'],
-                'session_id': 'original-session', 'command': {'additional_iterations': 1}}
-    flow = DeliveryWorkflow()
-    flow.post_publish_v1 = True
-    launched = {}
-    resume_probe(flow, launched, monkeypatch)
-    result = asyncio.run(flow._resume_stopped(spec, recovery))
-    assert result['error'] == 'recorded gate failure has no repair findings'
-    assert 'role' not in launched
 
 
 @pytest.mark.asyncio

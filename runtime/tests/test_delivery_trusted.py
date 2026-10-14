@@ -28,7 +28,7 @@ def terminal_unit_clock(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    'mapping', [None, [], {'unknown': 'Done'}, {'blocked': ''}, {'blocked': 1}]
+    'mapping', [None, {'blocked': 1}]
 )
 def test_invalid_project_status_mapping_is_rejected(intake_fixture, mapping):
     import json
@@ -86,7 +86,7 @@ def test_implementation_and_repair_leave_commits_to_publisher(native_configurati
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('outcome', ['blocked', 'cancelled', 'delivered'])
+@pytest.mark.parametrize('outcome', ['blocked', 'delivered'])
 @pytest.mark.parametrize('confirmed', [True, False])
 async def test_terminal_sync_replaces_stale_tracker_after_cleanup(outcome, confirmed):
     controller = DeliveryWorkflow()

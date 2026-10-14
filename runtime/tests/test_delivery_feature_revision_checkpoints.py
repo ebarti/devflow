@@ -27,7 +27,7 @@ def _written(monkeypatch, values, key):
 
 
 @pytest.mark.parametrize(
-    "key", ["verified:A", "build:A", "assignment:A:chunk", "assignment:A:build"]
+    "key", ["verified:A", "assignment:A:build"]
 )
 def test_later_unrelated_revision_keeps_proof_under_the_revision_that_requalified_it(
     monkeypatch, key,

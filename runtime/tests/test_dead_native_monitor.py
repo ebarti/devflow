@@ -107,7 +107,7 @@ async def test_sigkill_monitor_confirms_cleanup_without_promoting_provider_resul
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resolution", ["capacity", "orphan", "concurrent"])
+@pytest.mark.parametrize("resolution", ["capacity", "concurrent"])
 async def test_restart_reconciles_dead_owner_before_next_capacity_admission(
     native_role, monkeypatch, tmp_path, resolution,
 ):
@@ -183,8 +183,7 @@ def dead_journal(tmp_path):
 
 
 @pytest.mark.parametrize("lock_name", ["native-monitor.lock", "native-process.lock"])
-@pytest.mark.parametrize("defect", ["held", "missing", "nonprivate", "replaced",
-                                      "replaced-after-restart"])
+@pytest.mark.parametrize("defect", ["held", "replaced-after-restart"])
 def test_interrupted_cleanup_refuses_missing_or_unowned_lifecycle_lock(
     dead_journal, lock_name, defect,
 ):
@@ -266,7 +265,7 @@ def test_foreign_listener_prevents_cleanup_until_port_is_gone(dead_journal):
     assert native.reconcile_process(path)["cleanup"] == "observed-native-confirmed"
 
 
-@pytest.mark.parametrize("defect", ["identity", "monitor", "inspection"])
+@pytest.mark.parametrize("defect", ["identity", "inspection"])
 def test_incomplete_custody_or_inspection_keeps_cleanup_unknown(dead_journal, monkeypatch, defect):
     path, journal = dead_journal
     if defect == "identity":

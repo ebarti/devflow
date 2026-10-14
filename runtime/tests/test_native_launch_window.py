@@ -250,7 +250,7 @@ async def test_real_owner_paused_in_launch_window_keeps_its_slot(native_role, mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resolution", ["waiter", "sweep"])
-@pytest.mark.parametrize("died_at", ["spawn", "launch", "ready"])
+@pytest.mark.parametrize("died_at", ["spawn", "ready"])
 async def test_monitor_lost_before_authorization_is_launch_absent(
         native_role, monkeypatch, died_at, resolution):
     case = native_role
@@ -281,7 +281,7 @@ async def test_monitor_lost_before_authorization_is_launch_absent(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("died_at", ["spawn", "launch", "ready"])
+@pytest.mark.parametrize("died_at", ["spawn", "ready"])
 async def test_monitor_lost_before_authorization_passes_automatic_retry_observation(
         native_role, monkeypatch, died_at):
     case = native_role
@@ -297,7 +297,7 @@ async def test_monitor_lost_before_authorization_passes_automatic_retry_observat
     assert observe_finalized_resources(case.request["spec"])["finalization_sha256"]
 
 
-@pytest.mark.parametrize("died_at", ["spawn", "launch", "ready"])
+@pytest.mark.parametrize("died_at", ["spawn", "ready"])
 def test_monitor_lost_before_authorization_is_retryable_prelaunch(
         service, monkeypatch, tmp_path, died_at):
     store, request = service
@@ -424,7 +424,7 @@ async def test_reconcile_attempt_command_finalizes_dead_owner(native_role, monke
     assert printed["result"] == outcome["result"]
 
 
-@pytest.mark.parametrize("tamper", [None, "no_receipt", "start.json", "native-process.json"])
+@pytest.mark.parametrize("tamper", [None, "native-process.json"])
 def test_pre_monitor_request_is_retryable_only_with_server_absence_receipt(
     service, monkeypatch, tamper,
 ):

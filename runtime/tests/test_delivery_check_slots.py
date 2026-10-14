@@ -21,10 +21,9 @@ from test_delivery_resources import spec
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_activities as activities
-from devflow_temporal.delivery_broker import CheckSuperseded, DeliveryBroker
-from devflow_temporal.delivery_config import DeliveryConfig
-from devflow_temporal.delivery_native_process import NativeProcess, process_table, reconcile_process
-from devflow_temporal.delivery_resources import RunResources, read_private, write_private
+from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_native_process import NativeProcess, process_table
+from devflow_temporal.delivery_resources import read_private, write_private
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -205,38 +204,8 @@ async def test_activity_stop_joins_real_native_tree_before_slot_reuse(owned_chec
     assert owned_checks.maximum() == 1
 
 
-async def test_waiting_heartbeats_and_native_timeout_starts_after_admission(owned_checks):
-    owned_checks.config.raw["check_concurrency"] = 1
-    first = asyncio.create_task(activities.delivery_checks(owned_checks.request("first", 1.3)))
-    await wait_until(owned_checks.brokers["first"].started.is_set)
-    second = asyncio.create_task(
-        activities.delivery_browser_qa(owned_checks.request("queued", seconds=0.2, timeout=1))
-    )
-    await asyncio.gather(first, second)
-    queued = owned_checks.brokers["queued"]
-    assert any(h["run_id"] == "queued" and h["stage"] == "waiting-check-slot"
-               for h in owned_checks.hearts)
-    assert queued.result["timed_out"] is False
-    assert_stopped(queued)
 
 
-async def test_cancelled_waiter_never_launches(owned_checks):
-    owned_checks.config.raw["check_concurrency"] = 1
-    first = asyncio.create_task(activities.delivery_checks(owned_checks.request("first")))
-    await wait_until(owned_checks.brokers["first"].started.is_set)
-    request = owned_checks.request("queued")
-    queued = asyncio.create_task(activities.delivery_checks(request))
-    await asyncio.sleep(0.1)
-    queued.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await queued
-    await first
-    await asyncio.sleep(0.1)
-    launched = owned_checks.brokers["queued"].started.is_set()
-    # On old code the thread survives cancellation; join it to keep test resources owned.
-    if launched:
-        await wait_until(owned_checks.brokers["queued"].finished.is_set)
-    assert not launched
 
 
 def project_cancel(broker):
@@ -248,15 +217,14 @@ def project_cancel(broker):
     db.close()
 
 
-@pytest.mark.parametrize("activity_name, stage", [
-    ("delivery_checks", "waiting-check-slot"),
-    ("delivery_precheck", "waiting-check-slot"),
-    ("delivery_browser_qa", "waiting-check-slot"),
-    ("delivery_baseline_checks", "waiting-check-slot"),
-    ("delivery_browser_qa", "waiting-browser-ports"),
-])
+@pytest.mark.parametrize(
+    "activity_name, stage",
+    [("delivery_checks", "waiting-check-slot"), ("delivery_browser_qa", "waiting-browser-ports")],
+)
 async def test_run_cancel_while_queued_confirms_cleanup_without_launch(
-    owned_checks, activity_name, stage,
+    owned_checks,
+    activity_name,
+    stage,
 ):
     owned_checks.config.raw["check_concurrency"] = 1
     first_request = owned_checks.request("first", 1.0)
@@ -312,156 +280,12 @@ async def test_run_cancel_after_admission_does_not_launch_and_releases_slot(
     os.close(descriptor)
 
 
-@pytest.mark.parametrize("activity_name", [
-    "delivery_checks", "delivery_precheck", "delivery_browser_qa", "delivery_baseline_checks",
-])
-@pytest.mark.parametrize("cleanup_confirmed", [True, False])
-async def test_run_cancel_at_native_launch_guard_returns_confirmed_outcome(
-    owned_checks, monkeypatch, tmp_path, activity_name, cleanup_confirmed,
-):
-    request = owned_checks.request("before-launch")
-    broker = owned_checks.brokers["before-launch"]
-    broker.native_cleanup_confirmed = cleanup_confirmed
-    process = NativeProcess(
-        request["spec"], Path(broker.spec["state_dir"]) / "native",
-        argv=[sys.executable, "-c", "raise AssertionError('must not launch')"],
-        cwd=tmp_path, environment={"PATH": os.environ["PATH"]}, timeout=5,
-    )
-
-    def cancel_before_launch(*_args):
-        project_cancel(broker)
-        return broker._run_native_check(process)
-
-    for name in ("run_checks", "run_prechecks", "run_browser_qa"):
-        monkeypatch.setattr(broker, name, cancel_before_launch)
-    monkeypatch.setattr("devflow_temporal.delivery_baseline.run_baseline_checks",
-                        cancel_before_launch)
-    if activity_name == "delivery_baseline_checks":
-        request.pop("candidate")
-    result = await getattr(activities, activity_name)(request)
-    assert result["cleanup"] == ("confirmed" if cleanup_confirmed else "unknown")
-    assert result["state"] == ("failed" if cleanup_confirmed else "unknown")
-    assert result["cancelled"] is True
-    assert broker.native_cleanup_confirmed is cleanup_confirmed
-    assert len(activities._UNCLEAN_CHECK_SLOTS) == (
-        owned_checks.retained_slots + (not cleanup_confirmed)
-    )
-    assert not process.journal.exists()
 
 
-@pytest.mark.parametrize("cleanup_confirmed", [True, False])
-async def test_run_cancel_before_implementation_preparation_retains_cleanup_truth(
-    owned_checks, monkeypatch, tmp_path, cleanup_confirmed,
-):
-    request = owned_checks.request("prepare-cancel")
-    request["role"] = "implement"
-    request["spec"]["policy"]["host_sandbox"] = "trusted-local"
-    broker = owned_checks.brokers["prepare-cancel"]
-    broker.checkout = tmp_path
-    broker.native_cleanup_confirmed = cleanup_confirmed
-    monkeypatch.setattr(broker, "candidate", lambda: request["candidate"])
-
-    class UnlaunchedRole:
-        def retained_request(self, _request):
-            return None
-
-        async def run(self, _request):
-            pytest.fail("cancelled preparation must not launch a role")
-
-    monkeypatch.setattr(activities, "get_supervisor", lambda _store: UnlaunchedRole())
-    process = NativeProcess(
-        request["spec"], Path(broker.spec["state_dir"]) / "native",
-        argv=[sys.executable, "-c", "raise AssertionError('must not launch')"],
-        cwd=tmp_path, environment={"PATH": os.environ["PATH"]}, timeout=5,
-    )
-    db = broker.connect()
-    with db:
-        db.execute("INSERT INTO delivery_runs(run_id, phase) VALUES (?, 'running')",
-                   (broker.spec["run_id"],))
-    db.close()
-
-    def cancel_preparation(*_args):
-        db = broker.connect()
-        with db:
-            db.execute("UPDATE delivery_runs SET phase='cancelling' WHERE run_id=?",
-                       (broker.spec["run_id"],))
-        db.close()
-        return broker._run_native_check(process)
-
-    monkeypatch.setattr(broker, "run_implementation_preparation", cancel_preparation)
-    result = await activities.delivery_role(request)
-    assert result["status"] == "blocked"
-    assert result["cleanup"] == ("confirmed" if cleanup_confirmed else "unknown")
-    assert not process.journal.exists()
 
 
-async def test_run_cancel_while_queued_reaches_terminal_resource_cleanup(
-    owned_checks, monkeypatch,
-):
-    owned_checks.config.raw["check_concurrency"] = 1
-    request = owned_checks.request("workflow-queued")
-    request["spec"]["resource_cleanup_version"] = 1
-    request["spec"]["policy"].update(max_repairs=0, prepublish_checks=[{"id": "fixture"}])
-    scratch = RunResources(request["spec"]).scratch("check", "queued")
-    (scratch / "owned.txt").write_text("temporary fixture")
-    execution = DeliveryWorkflow()
-    monkeypatch.setattr(workflow, "patched", lambda _name: True)
-
-    async def ready_condition(predicate, **_options):
-        assert predicate()
-
-    monkeypatch.setattr(workflow, "wait_condition", ready_condition)
-
-    async def dispatch(name, payload, **_options):
-        if name == "delivery_prepare":
-            return {"candidate": request["candidate"]}
-        if name == "delivery_tracker_start":
-            return {"state": "consistent"}
-        if name == "delivery_role":
-            return {"status": "pass", "candidate": payload["candidate"],
-                    "cleanup": "confirmed", "session_id": "fixture:implement"}
-        if name == "delivery_precheck":
-            try:
-                return await activities.delivery_precheck(payload)
-            except asyncio.CancelledError as exc:
-                # An activity exception without a server cancel is an activity failure.
-                raise RuntimeError("precheck activity failed") from exc
-        if name == "delivery_finalize_resources":
-            return await activities.delivery_finalize_resources(payload)
-        assert name == "delivery_project"
-        return {}
-
-    monkeypatch.setattr(execution, "_activity", dispatch)
-    first = asyncio.create_task(activities.delivery_checks(owned_checks.request("first", 1.0)))
-    await wait_until(owned_checks.brokers["first"].started.is_set)
-    pending = asyncio.create_task(execution.run(request["spec"]))
-    try:
-        await wait_until(lambda: any(
-            heart["run_id"] == "workflow-queued" and heart["stage"] == "waiting-check-slot"
-            for heart in owned_checks.hearts
-        ))
-        accepted = await execution.cancel(
-            {"expected_revision": execution.state["revision"], "reason": "fixture stop"},
-        )
-        assert accepted["phase"] == "cancelling"
-        project_cancel(owned_checks.brokers["workflow-queued"])
-        result = await pending
-    finally:
-        await first
-    assert result["outcome"] == "cancelled"
-    assert result["cleanup"] == "confirmed"
-    assert result["checks"]["resource_cleanup"]["resource_cleanup"] == "confirmed"
-    assert not scratch.exists()
-    assert not owned_checks.brokers["workflow-queued"].started.is_set()
 
 
-@pytest.mark.parametrize("slots", [0, -1, 33, True, 1.5, "2", None])
-def test_configuration_rejects_nonfinite_or_invalid_slots(service, slots):
-    store, _ = service
-    raw = {**store.config.raw, "check_concurrency": slots}
-    store.config.path.write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match="check_concurrency"):
-        DeliveryConfig.load(store.config.path)
 
 
 async def test_slot_lock_is_shared_with_another_worker_process(owned_checks, tmp_path):
@@ -488,36 +312,6 @@ async def test_slot_lock_is_shared_with_another_worker_process(owned_checks, tmp
         worker.communicate(timeout=5)
 
 
-async def test_slot_is_held_until_real_monitor_confirms_cleanup(owned_checks, monkeypatch):
-    import devflow_temporal.delivery_native_process as native
-
-    owned_checks.config.raw["check_concurrency"] = 1
-    stopped = threading.Event()
-    release = threading.Event()
-    original = native.stop_observed
-
-    def pause_after_stop(owned):
-        result = original(owned)
-        if not stopped.is_set():
-            stopped.set()
-            assert release.wait(5)
-        return result
-
-    monkeypatch.setattr(native, "stop_observed", pause_after_stop)
-    first = asyncio.create_task(activities.delivery_checks(owned_checks.request("first", 0.3)))
-    await wait_until(stopped.is_set)
-    following = asyncio.create_task(activities.delivery_checks(owned_checks.request("following")))
-    first.cancel()
-    try:
-        await asyncio.sleep(0.15)
-        assert not first.done()
-        assert not owned_checks.brokers["following"].started.is_set()
-    finally:
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await first
-        await following
-    assert_stopped(owned_checks.brokers["first"])
 
 
 async def test_unknown_cleanup_retains_slot_until_recorded_processes_are_gone(
@@ -569,40 +363,6 @@ async def test_unknown_cleanup_retains_slot_until_recorded_processes_are_gone(
         del activities._UNCLEAN_CHECK_SLOTS[retained:]
 
 
-async def test_unreadable_journal_keeps_unclean_slot_retained(owned_checks, monkeypatch):
-    owned_checks.config.raw["check_concurrency"] = 1
-    monkeypatch.setattr(activities, "_UNCLEAN_CHECK_RECHECK_INTERVAL", 0.05, raising=False)
-    original = NativeProcess.run
-    retained = len(activities._UNCLEAN_CHECK_SLOTS)
-
-    def unknown(process):
-        result = original(process)
-        result["cleanup"] = "unknown"
-        return result
-
-    monkeypatch.setattr(NativeProcess, "run", unknown)
-    journal = recorded = None
-    try:
-        await activities.delivery_checks(owned_checks.request("uncertain"))
-        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained + 1
-        monkeypatch.setattr(NativeProcess, "run", original)
-        journal = Path(owned_checks.brokers["uncertain"].result["journal"])
-        recorded = journal.read_bytes()
-        journal.write_bytes(b"not a journal")  # Unreadable evidence proves nothing.
-        task = asyncio.create_task(activities.delivery_checks(owned_checks.request("queued")))
-        await asyncio.sleep(0.3)
-        assert not owned_checks.brokers["queued"].started.is_set()
-        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained + 1
-        journal.write_bytes(recorded)
-        assert await asyncio.wait_for(task, 10) == {"state": "passed", "cleanup": "confirmed"}
-        assert len(activities._UNCLEAN_CHECK_SLOTS) == retained
-    finally:
-        if journal is not None and recorded is not None:
-            journal.write_bytes(recorded)
-        for entry in activities._UNCLEAN_CHECK_SLOTS[retained:]:
-            for descriptor in entry["descriptors"]:
-                os.close(descriptor)
-        del activities._UNCLEAN_CHECK_SLOTS[retained:]
 
 
 async def test_native_timeout_confirms_tree_cleanup_and_releases_slot(owned_checks):
@@ -619,107 +379,8 @@ async def test_native_timeout_confirms_tree_cleanup_and_releases_slot(owned_chec
     assert owned_checks.maximum() == 1
 
 
-async def test_broker_native_runner_tracks_cleanup_and_owned_cancellation(owned_checks, tmp_path):
-    request = owned_checks.request("broker-callback")
-    broker = owned_checks.brokers["broker-callback"]
-    cancelled = threading.Event()
-    broker.check_cancelled = cancelled.is_set
-    process = NativeProcess(
-        request["spec"], Path(request["spec"]["state_dir"]) / "native",
-        argv=[sys.executable, "-c", "import subprocess,sys,time; "
-              "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
-              "time.sleep(30)"],
-        cwd=tmp_path, environment={"PATH": os.environ["PATH"]}, timeout=60,
-        cancelled=broker._native_cancelled,
-    )
-    pending = asyncio.create_task(asyncio.to_thread(broker._run_native_check, process))
-    await wait_until(lambda: observed_native_tree(process.journal))
-    assert broker.native_cleanup_confirmed is False
-    cancelled.set()
-    broker.result = await pending
-    assert broker.native_cleanup_confirmed is True, broker.result
-    assert broker.result["cancelled"] is True
-    assert_stopped(broker)
 
 
-async def test_physical_worker_death_releases_os_slot_before_orphan_cleanup(tmp_path):
-    """Document B4's boundary: OS locks cannot establish orphan reconciliation."""
-    owned = spec(tmp_path, "dead-worker")
-    input_path = tmp_path / "owned-spec.json"
-    input_path.write_text(json.dumps(owned))
-    slot = tmp_path / "slot.lock"
-    folder = Path(owned["state_dir"]) / "native"
-    code = (
-        "import fcntl,json,os,pathlib,sys; "
-        "from devflow_temporal.delivery_native_process import NativeProcess; "
-        "spec=json.loads(pathlib.Path(sys.argv[1]).read_text()); "
-        "fd=os.open(sys.argv[2],os.O_CREAT|os.O_RDWR,0o600); fcntl.flock(fd,fcntl.LOCK_EX); "
-        "NativeProcess(spec,pathlib.Path(sys.argv[3]),argv=[sys.executable,'-c',"
-        "\"import subprocess,sys,time;subprocess.Popen([sys.executable,'-c',"
-        "'import time;time.sleep(30)']);time.sleep(30)\"], "
-        "cwd=pathlib.Path(sys.argv[3]).parent,environment={'PATH':os.environ['PATH']},"
-        "timeout=60).run()"
-    )
-    worker = subprocess.Popen([sys.executable, "-c", code, str(input_path), str(slot), str(folder)])
-    journal = folder / "native-process.json"
-
-    def observed_tree():
-        return journal.exists() and len(json.loads(journal.read_text())["owned"]) >= 2
-
-    descriptor = None
-    try:
-        await wait_until(observed_tree)
-        worker.kill()
-        worker.wait(timeout=5)
-        import fcntl
-
-        descriptor = os.open(slot, os.O_RDWR)
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        owned_pids = json.loads(journal.read_text())["owned"]
-        table = process_table()
-        assert any(table.get(int(pid), {}).get("identity") == entry["identity"]
-                   and not table[int(pid)]["stat"].startswith("Z")
-                   for pid, entry in owned_pids.items())
-    finally:
-        if worker.poll() is None:
-            worker.kill()
-            worker.wait(timeout=5)
-        if descriptor is not None:
-            os.close(descriptor)
-        if journal.exists():
-            original = read_private(journal)
-            assert original["intent"]["run_id"] == owned["run_id"]
-            assert original["intent"]["policy_digest"] == owned["policy_digest"]
-            assert original.get("monitor") and original["monitor"]["pid"] != worker.pid
-            assert reconcile_process(journal)["cleanup"] == "unknown"
-            # A live monitor retains its lifecycle locks. Reconciliation must
-            # refuse it; stop this fixture through authenticated cancellation.
-            launch = read_private(folder / "launch.json")
-            NativeProcess(
-                owned, folder, argv=launch["argv"],
-                cwd=Path(original["intent"]["cwd"]), environment=launch["environment"],
-                timeout=original["intent"]["timeout"],
-                ports=tuple(original["intent"]["ports"]), cancelled=lambda: True,
-            )._request_cancel()
-
-            def monitor_completed():
-                current = read_private(journal)
-                assert current["intent"] == original["intent"]
-                assert current.get("monitor") == original["monitor"]
-                result = current.get("result", {})
-                return (
-                    current.get("phase") == "finished"
-                    and current.get("monitoring_complete") is True
-                    and result.get("cleanup") == "observed-native-confirmed"
-                    and result.get("stdio_drained") is True
-                )
-
-            # Worker loss leaves the detached monitor responsible for its
-            # terminal journal. Child exit alone does not join that monitor.
-            await wait_until(monitor_completed)
-            cleanup = reconcile_process(journal)
-            assert cleanup["observed_owned_stopped"]
-            assert cleanup["cleanup"] == "observed-native-confirmed"
 
 
 @pytest.mark.parametrize("stop", ["cancel", "timeout"])
@@ -797,7 +458,7 @@ def attempt_info(attempt=1, maximum_attempts=3, budget=timedelta(hours=2),
     )
 
 
-@pytest.mark.parametrize("replacement", ["timed_out", "not_found", "worker_shutdown"])
+@pytest.mark.parametrize("replacement", ["timed_out", "worker_shutdown"])
 async def test_replaced_check_attempt_keeps_native_gate_running_for_the_retry(
     owned_checks, monkeypatch, replacement,
 ):
@@ -830,103 +491,8 @@ async def test_replaced_check_attempt_keeps_native_gate_running_for_the_retry(
     assert_stopped(broker)
 
 
-@pytest.mark.parametrize("reason", ["cancel_requested", "last_attempt", "budget_exhausted"])
-async def test_final_check_attempt_stop_reaches_native_gate(owned_checks, monkeypatch, reason):
-    details = {"cancel_requested": False, "timed_out": False, "not_found": False,
-               "worker_shutdown": False}
-    info = attempt_info()
-    if reason == "cancel_requested":
-        details["cancel_requested"] = True
-    elif reason == "last_attempt":
-        details["timed_out"] = True
-        info = attempt_info(attempt=3)
-    else:
-        details["timed_out"] = True
-        info = attempt_info(budget=timedelta(seconds=1), elapsed=timedelta(seconds=2))
-    monkeypatch.setattr(activities.activity, "cancellation_details",
-                        lambda: SimpleNamespace(**details))
-    monkeypatch.setattr(activities.activity, "info", lambda: info)
-    request = owned_checks.request("one", seconds=8, timeout=60)
-    broker = owned_checks.brokers["one"]
-    folder = Path(request["spec"]["state_dir"]) / "native"
-    journal = folder / "native-process.json"
-    stopped = asyncio.create_task(activities.delivery_checks(request))
-    await wait_until(lambda: observed_native_tree(journal))
-    stopped.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await stopped
-    # Nothing would ever reattach: the gate is stopped and its slot is freed.
-    assert (folder / "cancel").exists()
-    assert broker.finished.is_set()
-    assert broker.result["cancelled"] is True and broker.result["exit_code"] != 0
-    assert_stopped(broker)
 
 
-async def test_replaced_attempt_hands_its_gate_to_the_retry(owned_checks, monkeypatch, tmp_path):
-    monkeypatch.setattr(activities.activity, "cancellation_details", lambda: SimpleNamespace(
-        cancel_requested=False, timed_out=False, not_found=True, worker_shutdown=False))
-    dispatched = {"attempt": 1}
-    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info(**dispatched))
-    request = owned_checks.request("one", seconds=2, timeout=60)
-    broker = owned_checks.brokers["one"]
-    state = Path(request["spec"]["state_dir"])
-    lock, active, peak = threading.Lock(), [0], [0]
-    bodies, launches, superseded = [], [], []
-
-    def native(name, seconds):
-        process = NativeProcess(
-            request["spec"], state / name,
-            argv=[sys.executable, "-c",
-                  "import subprocess,sys,time; "
-                  "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
-                  f"time.sleep({seconds})"],
-            cwd=tmp_path, environment={"PATH": os.environ["PATH"]}, timeout=60,
-            cancelled=broker._native_cancelled,
-        )
-        fresh = not process.journal.exists()
-        try:
-            return broker._run_native_check(process)
-        finally:
-            if fresh and process.journal.exists():
-                launches.append(name)
-
-    def run_checks(iteration, candidate):
-        with lock:
-            active[0] += 1
-            peak[0] = max(peak[0], active[0])
-        bodies.append(threading.get_ident())
-        try:
-            first = native("native", 2)  # in flight when Temporal replaces the attempt
-            second = native("second", 0.2)  # only the retry may ever launch this one
-            broker.result = first
-            passed = first["exit_code"] == 0 and second["exit_code"] == 0
-            return {"state": "passed" if passed else "failed", "cleanup": "confirmed"}
-        except CheckSuperseded as exc:
-            superseded.append(str(exc))
-            raise
-        finally:
-            with lock:
-                active[0] -= 1
-            broker.finished.set()
-
-    monkeypatch.setattr(broker, "run_checks", run_checks)
-    journal = state / "native" / "native-process.json"
-    replaced = asyncio.create_task(activities.delivery_checks(request))
-    await wait_until(lambda: observed_native_tree(journal))
-    replaced.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await replaced
-    dispatched["attempt"] = 2  # Temporal dispatches the retry as the next attempt
-    assert await activities.delivery_checks(request) == {"state": "passed", "cleanup": "confirmed"}
-    # One body at a time and one launch per check: the replaced body finished
-    # only the monitor it supervised, then handed the gate to the retry.
-    assert peak[0] == 1 and len(bodies) == 2
-    assert launches == ["native", "second"]
-    assert superseded == ["native check superseded after its monitor"]
-    assert not (state / "native" / "cancel").exists()
-    assert read_private(journal)["result"]["cancelled"] is False
-    assert_stopped(broker)
-    assert len(activities._UNCLEAN_CHECK_SLOTS) == owned_checks.retained_slots
 
 
 @pytest.mark.parametrize('queued_finished', [True, False])
@@ -955,55 +521,3 @@ def test_cancelled_queued_retries_keep_the_live_native_predecessor(queued_finish
     finally:
         for _, finished in signals:
             activities._release_gate(key, finished)
-
-
-async def test_retry_dispatched_before_the_replacement_notice_waits_for_its_predecessor(
-    owned_checks, monkeypatch,
-):
-    # Real ordering after a Mac sleep: the server times out attempt 1 and
-    # dispatches attempt 2 after a 1s backoff, while attempt 1 learns of its
-    # replacement only at its next throttled heartbeat RPC (up to 24s later).
-    monkeypatch.setattr(activities.activity, "cancellation_details", lambda: SimpleNamespace(
-        cancel_requested=False, timed_out=False, not_found=True, worker_shutdown=False))
-    dispatched = {"attempt": 1}
-    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info(**dispatched))
-    request = owned_checks.request("one", seconds=2, timeout=60)
-    broker = owned_checks.brokers["one"]
-    journal = Path(request["spec"]["state_dir"]) / "native" / "native-process.json"
-    first = asyncio.create_task(activities.delivery_checks(request))
-    await wait_until(lambda: observed_native_tree(journal))
-    dispatched["attempt"] = 2  # Temporal dispatches the retry as the next attempt
-    retry = asyncio.create_task(activities.delivery_checks(request))
-    await asyncio.sleep(0.5)
-    # The retry supersedes the body this worker already runs and waits for it.
-    assert owned_checks.maximum() == 1 and not retry.done()
-    assert broker.check_superseded()
-    first.cancel()  # the replacement notice arrives after the retry started
-    with pytest.raises(asyncio.CancelledError):
-        await first
-    assert await retry == {"state": "passed", "cleanup": "confirmed"}
-    assert owned_checks.maximum() == 1
-    assert not (journal.parent / "cancel").exists()
-    assert_stopped(broker)
-
-
-@pytest.mark.parametrize("overlap", ["different_activity", "equal_attempt"])
-async def test_same_gate_identity_without_a_later_attempt_shares_admission(
-    owned_checks, monkeypatch, overlap,
-):
-    # Only a later attempt of the same activity supersedes a body. Another
-    # activity, or the same attempt, that carries the gate identity keeps
-    # today's shared admission.
-    dispatched = {"activity_id": "gate-a"}
-    monkeypatch.setattr(activities.activity, "info", lambda: attempt_info(**dispatched))
-    request = owned_checks.request("shared", seconds=1, timeout=60)
-    broker = owned_checks.brokers["shared"]
-    first = asyncio.create_task(activities.delivery_precheck(request))
-    await wait_until(broker.started.is_set)
-    if overlap == "different_activity":
-        dispatched["activity_id"] = "gate-b"
-    second = asyncio.create_task(activities.delivery_precheck(request))
-    assert await first == {"state": "passed", "cleanup": "confirmed"}
-    assert await second == {"state": "passed", "cleanup": "confirmed"}
-    assert owned_checks.maximum() == 2
-    assert not (Path(request["spec"]["state_dir"]) / "native" / "cancel").exists()

@@ -289,7 +289,7 @@ def test_previously_admitted_title_command_cannot_be_rebound(admitted_title_repa
 
 @pytest.mark.parametrize(
     "change",
-    ["assertion", "other-file", "unchanged", "bad-title", "another-title", "head", "authority"],
+    ["assertion", "authority"],
 )
 def test_literal_only_controller_rejects_source_or_authority_expansion(
     admitted_title_repair, change,

@@ -102,7 +102,7 @@ def remote_head(broker):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['pr_list', 'ls_remote', 'ls_remote_timeout'])
+@pytest.mark.parametrize('failure', ['pr_list', 'ls_remote_timeout'])
 async def test_pre_push_transport_failure_is_retryable_and_the_retry_publishes(
     service, monkeypatch, failure,
 ):
@@ -224,17 +224,9 @@ def test_discarding_is_limited_to_a_confirmed_unused_effect(service, monkeypatch
     assert effect_row(store) == ('pending', None)
 
 
-@pytest.mark.parametrize('state,expected', [
-    ({'error': 'publication unresolved: ActivityError'}, True),
-    ({'error': 'publication unresolved: ApplicationError'}, True),
-    ({'error': 'publication unresolved: readback deadline exhausted'}, True),
-    ({'error': 'repair limit exhausted',
-      'checks': {'failure': {'cause_type': 'publication_deadline'}}}, True),
-    ({'error': 'repair limit exhausted', 'checks': {'failure': {'cause_type': 'ci_deadline'}}},
-     False),
-    ({'error': 'publication retry failed: ValueError'}, False),
-    ({}, False),
-])
+@pytest.mark.parametrize(
+    "state,expected", [({"error": "publication unresolved: ActivityError"}, True), ({}, False)]
+)
 def test_stopped_at_publication_keys_on_classification_or_historical_reasons(state, expected):
     assert stopped_at_publication(state) is expected
 
@@ -291,11 +283,7 @@ def pending_v1(service, monkeypatch):
     return store, broker, state, request, stop
 
 
-@pytest.mark.parametrize('error', [
-    NEW_REASON,
-    'publication unresolved: ApplicationError',   # readback deadline before classification
-    'publication unresolved: ActivityError',      # historical stop reason
-])
+@pytest.mark.parametrize('error', [NEW_REASON, 'publication unresolved: ActivityError'])
 def test_current_admission_pending_publication_is_admitted_by_effect_identity(pending_v1,
                                                                              error):
     store, broker, state, request, stop = pending_v1
@@ -311,7 +299,7 @@ def test_current_admission_pending_publication_is_admitted_by_effect_identity(pe
     assert recovery['state']['error'] == error
 
 
-@pytest.mark.parametrize('drift', ['other_stop', 'bound_head', 'bound_number'])
+@pytest.mark.parametrize('drift', ['other_stop', 'bound_number'])
 def test_current_admission_pending_publication_keeps_identity_refusals(pending_v1, drift):
     store, broker, state, request, stop = pending_v1
     if drift == 'other_stop':

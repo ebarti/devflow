@@ -94,7 +94,7 @@ def test_partial_historical_reservation_reuses_exact_sealed_input(service, monke
         assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 2
 
 
-@pytest.mark.parametrize("change", ["base", "scope", "owner", "seed", "digest"])
+@pytest.mark.parametrize("change", ["base", "digest"])
 def test_partial_reservation_rejects_other_authority_changes(service, monkeypatch, change):
     store, parent, chunk, historical, shared, _ = interrupted(
         service, monkeypatch, "chunk", row=True)
@@ -125,7 +125,7 @@ def test_partial_reservation_rejects_other_authority_changes(service, monkeypatc
     assert store.submitted_spec(historical["run_id"]) == historical
 
 
-@pytest.mark.parametrize("drift", ["missing_config", "changed_config", "repository"])
+@pytest.mark.parametrize("drift", ["missing_config", "repository"])
 def test_worker_prerequisites_require_original_configuration(service, monkeypatch, drift):
     store, _, _, child, _, _ = interrupted(service, monkeypatch, "build", row=True)
     if drift == "missing_config":

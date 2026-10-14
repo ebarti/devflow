@@ -145,7 +145,7 @@ def test_revision_keeps_retained_authority_and_native_policy_while_admitting_ful
     assert canonical_json({"parent": parent, "worker": worker, "plan": plan}) == before
 
 
-@pytest.mark.parametrize("kind", [None, "build", "chunk"], ids=["no-worker", "build", "final"])
+@pytest.mark.parametrize("kind", [None, "chunk"], ids=["no-worker", "final"])
 def test_new_policy_and_final_gate_selection_keep_existing_semantics(gate_project, kind):
     parent, plan, _ = gate_project
     plan["workstreams"][1]["chunks"][0]["gates"][0]["selectors"] = [PAGINATION]

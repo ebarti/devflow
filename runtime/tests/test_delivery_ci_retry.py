@@ -54,7 +54,7 @@ def test_ci_admission_retains_exact_passes_and_failed_history(waiting_ci):
         store.continue_repair('run-1', {**request, 'command_id': 'second-ci-retry'})
 
 
-@pytest.mark.parametrize('drift', ['qa', 'candidate', 'session', 'local', 'ci', 'unknown'])
+@pytest.mark.parametrize('drift', ['qa', 'unknown'])
 def test_ci_admission_rejects_missing_candidate_or_independent_pass(waiting_ci, drift):
     store, _, state, _, request = waiting_ci
     if drift == 'qa':

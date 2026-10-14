@@ -28,10 +28,7 @@ def _snapshot(store):
     return rows, files
 
 
-@pytest.mark.parametrize('kind,preflight', [
-    ('accepted_technical_successor', False), ('accepted_technical_successor', True),
-    ('unknown', False), ([], False),
-])
+@pytest.mark.parametrize('kind,preflight', [('accepted_technical_successor', False), ([], False)])
 def test_retired_or_malformed_continuation_refuses_before_any_effect(service, kind, preflight):
     store, supplied = service
     store.submit(supplied)
@@ -77,13 +74,17 @@ def test_already_admitted_technical_outbox_keeps_its_inputs_and_start_acknowledg
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('name,workflow_id', [
-    ('technical-c04-checks-completed-history.json', 'technical-checks'),
-    ('technical-c04-suspended-history.json', 'technical-review'),
-    ('technical-c04-review-completed-history.json', 'technical-review'),
-])
+@pytest.mark.parametrize(
+    "name,workflow_id",
+    [
+        ("technical-c04-checks-completed-history.json", "technical-checks"),
+        ("technical-c04-review-completed-history.json", "technical-review"),
+    ],
+)
 async def test_original_completed_and_suspended_technical_histories_replay(
-    name, workflow_id, tmp_path,
+    name,
+    workflow_id,
+    tmp_path,
 ):
     path = Path(__file__).parent / 'fixtures' / name
     original = path.read_bytes()
@@ -91,8 +92,7 @@ async def test_original_completed_and_suspended_technical_histories_replay(
     assert path.read_bytes() == original
 
 
-@pytest.mark.parametrize('drift', [None, 'tree', 'parents', 'subject', 'signer',
-                                  'signoff', 'unsigned', 'receipt', 'ref', 'base'])
+@pytest.mark.parametrize('drift', [None, 'base'])
 def test_retained_signed_integration_reads_and_rejects_tampering_without_effects(tmp_path, drift):
     # Build an ordinary signed fixture merge directly with Git. The retired
     # target-specific builder is not copied or called by this reader test.

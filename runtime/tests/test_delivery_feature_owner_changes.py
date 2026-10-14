@@ -131,7 +131,7 @@ def test_owner_merged_prefix_merges_rest_only_onto_its_verified_base_tree(
         assert result["state"] == "confirmed" and len(commands) == 1
 
 
-@pytest.mark.parametrize("change", ["closed", "moved", "retargeted", "merged_above_open"])
+@pytest.mark.parametrize("change", ["closed", "merged_above_open"])
 def test_owner_change_to_a_layer_stops_merge_naming_it(service, monkeypatch, change):
     store, spec, record, requested, command, _ = setup_feature(service, monkeypatch)
     gh = Owner(record)

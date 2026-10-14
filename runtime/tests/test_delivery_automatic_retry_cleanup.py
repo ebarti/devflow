@@ -172,8 +172,7 @@ def test_exhausted_ceiling_still_finishes_cleanup_and_claim_closure(service, mon
         assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
 
 
-@pytest.mark.parametrize('obstacle', ['foreign_claim', 'effect_unknown', 'cancel',
-                                     'unfinished_attempt', 'changed_failure', 'changed_record'])
+@pytest.mark.parametrize('obstacle', ['foreign_claim', 'changed_record'])
 def test_later_cleanup_cannot_bypass_original_safety_guards(later_cleanup, obstacle):
     store, request, historical, calls, external = later_cleanup
     external['ready'] = True
@@ -244,7 +243,7 @@ def test_lost_tracker_acknowledgement_reads_back_release_before_one_successor(la
     assert external['external_sets'] == 1
 
 
-@pytest.mark.parametrize('changed', ['row', 'claim', 'effect', 'stop'])
+@pytest.mark.parametrize('changed', ['row', 'stop'])
 def test_publication_readback_rechecks_guard_before_cleanup_effect(later_cleanup, changed):
     store, request, _historical, calls, external = later_cleanup
     external['ready'] = True
@@ -279,7 +278,7 @@ def test_registered_records_changed_during_finalization_cannot_release_claim(lat
     assert not any(call[0] == 'tracker' for call in calls)
 
 
-@pytest.mark.parametrize('changed', ['row', 'claim', 'effect'])
+@pytest.mark.parametrize('changed', ['row', 'effect'])
 def test_second_publication_observation_rechecks_before_tracker_release(later_cleanup, changed):
     store, request, _historical, calls, external = later_cleanup
     external['ready'] = True

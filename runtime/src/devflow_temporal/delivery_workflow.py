@@ -217,7 +217,9 @@ def _broker_findings(stage: str, result: dict[str, Any], *, iteration: int) -> l
             bounded_check(item)
             for item in failures
             if isinstance(item, dict) and not item.get("passed")
-        ][:3]
+        ]
+        if workflow.in_workflow() and not workflow.patched("broker-complete-failure-batch-v1"):
+            summary["failed_checks"] = summary["failed_checks"][:3]
     else:
         summary.update(
             {

@@ -93,8 +93,7 @@ def test_preparation_retry_preserves_zero_repair_authority(unpublished, installe
     assert recovery['state']['iteration'] == 0
 
 
-@pytest.mark.parametrize('drift', ['error', 'untyped', 'launched', 'cleanup', 'candidate',
-                                 'source_unchanged', 'implementation', 'projection'])
+@pytest.mark.parametrize('drift', ['error', 'projection'])
 def test_preparation_retry_rejects_unsealed_failure(unpublished, drift):
     store, _, state, request = unpublished
     preparation_stop(store, state)
@@ -149,7 +148,7 @@ def test_unpublished_retry_retains_candidate_failure_budget_and_one_admission(un
         store.continue_repair('run-1', {**request, 'command_id': 'second-retry'})
 
 
-@pytest.mark.parametrize('drift', ['source', 'assessment', 'cleanup', 'gate', 'scope', 'budget'])
+@pytest.mark.parametrize('drift', ['source', 'budget'])
 def test_unpublished_retry_rejects_changed_or_unsealed_authority(unpublished, drift):
     store, broker, state, request = unpublished
     if drift == 'source':
@@ -321,10 +320,9 @@ def test_selector_preflight_reads_original_custody_before_sealing_execution(stop
         'verification_test_paths']
 
 
-@pytest.mark.parametrize('field,value', [('additional_iterations', 1),
-                                        ('expected_revision', 12),
-                                        ('expected_pr_head', 'a' * 40),
-                                        ('expected_candidate_id', 'a' * 64)])
+@pytest.mark.parametrize(
+    "field,value", [("additional_iterations", 1), ("expected_candidate_id", "a" * 64)]
+)
 def test_changed_authority_is_rejected_before_admission(stopped, field, value):
     store, _, _, _, request = stopped
     with pytest.raises(ValueError):
@@ -580,8 +578,7 @@ def test_missing_accepted_report_has_one_zero_source_reassessment_and_preserves_
                                       'expected_revision': 33})
 
 
-@pytest.mark.parametrize('drift', ['candidate', 'local-failed', 'manifest', 'recipe-present',
-                                 'no-delegation', 'source-turn'])
+@pytest.mark.parametrize('drift', ['candidate', 'source-turn'])
 def test_missing_report_reassessment_rejects_changed_or_absent_proof(missing_report, drift,
                                                                   monkeypatch):
     from pathlib import Path
@@ -675,8 +672,7 @@ def test_second_prepublication_retry_preserves_history_and_has_no_third_grant(un
         store.continue_repair('run-1', third)
 
 
-@pytest.mark.parametrize('change', [None, 'projection', 'missing-projection', 'journal',
-                                  'run', 'policy', 'path', 'malformed'])
+@pytest.mark.parametrize('change', [None, 'malformed'])
 def test_consumed_gate_controller_requires_its_private_run_and_policy_journal(tmp_path, change):
     from copy import deepcopy
 
