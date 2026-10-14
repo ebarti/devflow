@@ -289,13 +289,13 @@ def temporal_rows(table, before, after, phase, startup=None, namespaces=None):
                         "restart shard owner/lease is not one new lease")
                 owner_address(scalar(b, 3, 2))
             qa, qb = shard_queues(a), shard_queues(b)
-            require(qa[1] == qb[1], "transfer queue watermark changed")
-            for category in (2, 4, 7):
+            # Immediate queues can checkpoint a new allocator range after shard startup.
+            for category in (1, 2, 4, 7):
                 require(qb[category] >= qa[category], "shard watermark decreased")
                 require(qb[category][0] == qa[category][0] if category != 2 else
                         qb[category][1] == qa[category][1], "unsupported watermark field change")
                 if phase == "preinstall" and category != 2:
-                    require(qb[category] == qa[category], "preinstall visibility/archival state changed")
+                    require(qb[category] == qa[category], "preinstall immediate queue state changed")
     elif table == "task_queues":
         old_index = {(r["range_hash"], canonical(r["task_queue_id"])): r for r in before}
         new_index = {(r["range_hash"], canonical(r["task_queue_id"])): r for r in after}
@@ -346,12 +346,15 @@ def temporal_rows(table, before, after, phase, startup=None, namespaces=None):
             if old == new:
                 continue
             exact_except(old, new, {"data", "version"}, table)
-            require(new["version"] == old["version"] + 2, "unsupported cluster SQL version change")
+            # Startup endpoint persistence and the optional version check save independently.
+            require(type(old["version"]) is int and type(new["version"]) is int
+                    and 0 < old["version"] < new["version"] < 2**63,
+                    "invalid or nonadvancing cluster SQL version")
             a, b = (message(row, {1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13}) for row in (old, new))
             exact_except(a, b, {4, 5, 13}, "cluster metadata")
             va, vb = (wire(scalar(p, 4, 2), {1, 2, 4, 5}) for p in (a, b))
             exact_except(va, vb, {5}, "cluster VersionInfo")
-            require(proto_time(scalar(vb, 5, 2)) > proto_time(scalar(va, 5, 2)), "cluster version clock did not advance")
+            require(proto_time(scalar(vb, 5, 2)) >= proto_time(scalar(va, 5, 2)), "cluster version clock decreased")
             def attributes(data):
                 return proto_map(wire(data, {1}), 1, 0)
             require(proto_map(a, 5, 2, attributes) == proto_map(b, 5, 2, attributes),
@@ -397,8 +400,10 @@ def scanner_rows(nodes, trees, startup, system_namespace):
         branch_uuid = str(uuid.UUID(bytes=blob(node["branch_id"])))
         require(re.fullmatch(str(process["pid"]) + r"@[^@]+@", attrs.identity) is not None,
                 "scanner startup identity does not match new Temporal PID")
-        require(event.event_time.seconds >= born and node["txn_id"] == -event.task_id - 1
-                and event.task_id > 0, "scanner event clock/task does not match new startup")
+        # Event and transaction IDs are separate allocations; other writers can interleave.
+        require(event.event_time.seconds >= born and type(node["txn_id"]) is int
+                and 0 < event.task_id < -node["txn_id"] < 2**63,
+                "scanner event clock/task does not match new startup")
         expected = History()
         item = expected.events.add()
         item.event_id, item.event_type, item.task_id = 1, 1, event.task_id
