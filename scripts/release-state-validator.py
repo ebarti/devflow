@@ -320,8 +320,10 @@ def temporal_rows(table, before, after, phase, startup=None, namespaces=None):
             exact_except(old, new, {"range_id", "data"}, table)
             a, ns, oldname, oldtype, oldkind, oldack = queue_info(old)
             require((ns, oldname, oldtype, oldkind) == (namespace, name, tasktype, kind), "queue semantic identity changed")
-            require(0 <= new["range_id"] - old["range_id"] <= (1 if phase == "preinstall" else 2),
-                    "unsupported queue lease advance")
+            # Matching can renew repeatedly between captures, independently of release phase.
+            require(type(old["range_id"]) is int and type(new["range_id"]) is int
+                    and 0 < old["range_id"] <= new["range_id"] < 2**63,
+                    "invalid or decreasing queue lease")
             require(ack >= oldack and proto_time(scalar(b, 7, 2)) >= proto_time(scalar(a, 7, 2)),
                     "queue ACK/update time decreased")
             require({k: v for k, v in a.items() if k not in {5, 7, 9}}
