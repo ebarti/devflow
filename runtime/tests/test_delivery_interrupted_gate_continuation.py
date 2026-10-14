@@ -425,9 +425,36 @@ def test_reserve_rearms_only_fresh_gates_and_keeps_exhausted_budget(
         assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
 
 
+@pytest.fixture
+def historical_listener_identity(monkeypatch):
+    from test_delivery_feature_review_context import git
+    from test_native_listener_snapshot_contract import listener_source_fragments
+
+    from devflow_temporal import delivery_feature_review_context as context
+
+    # Historical Git transport is modeled with real authenticated tiny objects;
+    # the corrected current runtime still uses its actual protected repository.
+    read_sources = context._sources
+    with TemporaryDirectory(prefix='devflow-historical-observer-') as directory:
+        root = Path(directory).resolve()
+        path = root / context.PREFIX / 'delivery_native_process.py'
+        path.parent.mkdir(parents=True)
+        path.write_text(listener_source_fragments()[0])
+        git(root, 'init', '-q')
+        git(root, 'add', '.')
+        git(root, 'commit', '-qm', 'Isolated historical observer source data')
+        revision = git(root, 'rev-parse', 'HEAD')
+        payload = read_sources(root, revision)[1]
+        def sources(protected, selected):
+            return read_sources(root if selected == revision else protected, selected)
+        monkeypatch.setattr(context, '_sources', sources)
+        yield {'dirty': False, 'local_digest': None, 'revision': revision,
+               'runtime_payload_sha256': payload}
+
+
 @pytest.mark.parametrize('interrupted_assessment', ['listener-verification'], indirect=True)
 def test_listener_verification_keeps_failed_report_and_authenticates_added_records(
-    layout_assessment, monkeypatch,
+    layout_assessment, historical_listener_identity, monkeypatch,
 ):
     from devflow_temporal import delivery_listener_verification as subject
     from devflow_temporal import supervisor as supervising
@@ -450,9 +477,7 @@ def test_listener_verification_keeps_failed_report_and_authenticates_added_recor
     gate = broker.gate_checkout('verify', 7, report['candidate'])
     root = broker.evidence_dir
     born = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=30)
-    old_revision = 'f652acd5b7e593ab3787d9f6d8dd51d888f30c73'
-    identity = {'dirty': False, 'local_digest': None, 'revision': old_revision,
-                'runtime_payload_sha256': _sources(_protected_root(), old_revision)[1]}
+    identity = historical_listener_identity
 
     def native(folder, argv, cwd, *, ports=(), conflict=False, output='1 passed\n'):
         write_private(folder / 'launch.json', {'argv': argv, 'environment': {}})
