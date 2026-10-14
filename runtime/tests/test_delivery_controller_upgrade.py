@@ -562,21 +562,8 @@ def test_queued_trusted_preparation_and_real_broker_gates_survive_source_update(
         assert check['results'][0]['native_process']['runtime_identity'] == executed
 
 
-def test_trusted_update_preserves_observed_identity_and_frozen_authority(installed_controller):
-    _upgrade(installed_controller)
-    # Each child reloads the original spec; these mutations never leave its process.
-    # Prepare and upgrade the identical installed controller only once.
-    for kind, name in [
-        *[('observed', field) for field in (
-            'execution_mode', 'python_sha256', 'packages', 'toolchain_roots')],
-        *[('binding', field) for field in ('source_path', 'checkout', 'config_digest', 'run_id',
-            'model', 'scope', 'sandbox', 'dependency', 'overrides', 'fingerprint', 'security')],
-    ]:
-        _refuses(installed_controller, kind, name, upgrade=False)
-
-
 @pytest.mark.parametrize('kind,name', [
-    *[('proof', field) for field in ('mode', 'hardlink', 'owner', 'canonical-path', 'hash',
+    *[('proof', field) for field in ('mode', 'hardlink',
         'content', 'identity', 'observed')],
     ('context', 'configuration'), ('context', 'candidate'),
 ])

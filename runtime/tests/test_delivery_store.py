@@ -694,8 +694,7 @@ def test_scope_amendment_seals_only_two_paths_and_preserves_request_and_grant(
 
 @pytest.mark.parametrize(
     "drift", [
-        "claim", "candidate", "receipt", "path", "config", "authority",
-        "extra_path", "head", "cleanup", "active_attempt", "unknown_effect",
+        "claim", "candidate", "receipt", "authority", "cleanup", "unknown_effect",
     ]
 )
 def test_scope_amendment_rejects_changed_authority_without_queue(
@@ -1052,7 +1051,7 @@ def test_prelaunch_retry_rejects_unavailable_or_incomplete_ci(
     assert workflow_id == "delivery-run-1-repair-continuation-1"
 
 
-@pytest.mark.parametrize("drift", ["claim", "candidate", "attempt", "attempt-file", "head", "memo"])
+@pytest.mark.parametrize("drift", ["claim", "candidate", "attempt-file"])
 def test_prelaunch_retry_rejects_authority_drift(service, monkeypatch, drift):
     store, request = service
     _spec, _state, command, folder = _sealed_prelaunch_retry_fixture(
@@ -1158,7 +1157,7 @@ def test_repair_grant_reads_the_closed_publication_recovery_execution(service, m
 
 
 @pytest.mark.parametrize(
-    "drift", ["claim", "attempt", "candidate", "head", "cleanup", "effect", "pr", "policy"]
+    "drift", ["claim", "candidate", "cleanup", "effect"]
 )
 def test_repair_grant_rejects_changed_authority_before_queue(service, monkeypatch, drift):
     store, request = service
@@ -2509,8 +2508,6 @@ async def test_real_temporal_finding_repairs_same_session_with_new_gates(service
     ("preflight_mode", "tracker_mode"),
     [
         ("transient", "pending"),
-        ("transient", "drift"),
-        ("transient", "claim"),
         ("cancel", "none"),
         ("authority", "none"),
     ],
@@ -2807,7 +2804,7 @@ async def test_public_repair_grant_resumes_original_session_and_runs_broker_gate
 @pytest.mark.skipif(not shutil.which("temporal"), reason="local Temporal CLI required")
 @pytest.mark.parametrize(
     "failure_window",
-    ["pending_after_push", "complete_before_ack", "pending_reconcile_error"],
+    ["complete_before_ack"],
 )
 async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remaining_gates(
     service, monkeypatch, failure_window

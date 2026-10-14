@@ -77,8 +77,18 @@ async def test_startup_deadline_preserves_logs_and_stops_owned_tree(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_startup_stops_owned_tree(tmp_path):
+async def test_cancelled_startup_stops_owned_tree(tmp_path, monkeypatch):
     script, marker = launcher(tmp_path, child=True)
+    stop = temporal_test_server.stop_observed
+
+    def stale_stop_observation(owned):
+        stop(owned)
+        return False
+
+    # A stale negative from the bounded signal pass is not the final state after
+    # reaping. The independent process/listener assertions below still require
+    # the CLI and its observed child to be gone.
+    monkeypatch.setattr(temporal_test_server, "stop_observed", stale_stop_observation)
 
     async def start():
         async with local_temporal(dev_server_existing_path=str(script)):

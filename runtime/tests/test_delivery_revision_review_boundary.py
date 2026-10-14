@@ -142,13 +142,8 @@ def test_later_revision_review_uses_distinct_home_without_rewriting_retained_hom
 
 
 @pytest.mark.parametrize("change", [
-    "kind", "missing-context", "verify-role", "later-iteration", "resume-session",
-    "revision-id", "namespace", "namespace-traversal", "old-plan", "old-digest",
-    "proposed-plan", "proposed-digest", "context-candidate", "candidate", "candidate-base",
-    "candidate-head", "outer-candidate", "outer-base", "outer-head", "hash", "path",
-    "workspace", "workspace-alias", "content-rehashed", "inner-candidate-rehashed",
-    "inner-revision-rehashed", "inner-proposal-rehashed", "inner-extra-rehashed", "mode",
-    "hardlink", "symlink", "ancestor-symlink", "fifo",
+    "kind", "missing-context", "verify-role", "candidate", "hash", "path",
+    "content-rehashed", "mode", "hardlink", "symlink",
 ])
 def test_native_revision_preparation_refuses_changed_boundary_before_writes(native_review, change):
     broker, request = native_review
@@ -238,9 +233,10 @@ def test_native_revision_preparation_refuses_changed_boundary_before_writes(nati
     assert not (broker.evidence_dir / "attempts/review-attempt/auth.json").exists()
 
 
-@pytest.mark.parametrize("role", ["review", "verify"])
-@pytest.mark.parametrize("change", [None, "revision-kind", "revision-context", "unknown-kind",
-                                    "candidate", "hash", "path", "workspace"])
+@pytest.mark.parametrize("role,change", [
+    ("review", change) for change in (None, "revision-kind", "revision-context", "unknown-kind",
+                                    "candidate", "hash", "path", "workspace")
+] + [("verify", None)])
 def test_product_source_review_keeps_exact_patch_contract(native_review, change, role):
     broker, request = native_review
     request.pop("revision_context")

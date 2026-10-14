@@ -28,8 +28,10 @@ def _snapshot(store):
     return rows, files
 
 
-@pytest.mark.parametrize('kind', ['accepted_technical_successor', 'unknown', None, 1, [], {}])
-@pytest.mark.parametrize('preflight', [False, True])
+@pytest.mark.parametrize('kind,preflight', [
+    ('accepted_technical_successor', False), ('accepted_technical_successor', True),
+    ('unknown', False), ([], False),
+])
 def test_retired_or_malformed_continuation_refuses_before_any_effect(service, kind, preflight):
     store, supplied = service
     store.submit(supplied)

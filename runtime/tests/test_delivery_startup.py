@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import socket
+import socketserver
 import sqlite3
 import subprocess
 import sys
@@ -665,7 +666,13 @@ def test_restart_after_a_dashboard_move_reaches_the_api_where_it_listens(config,
         def log_message(self, *_args):
             pass
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", ports[0]), Handler)
+    class FixtureHTTPServer(http.server.ThreadingHTTPServer):
+        def server_bind(self):
+            # This numeric loopback fixture needs no reverse DNS resolution.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+
+    server = FixtureHTTPServer(("127.0.0.1", ports[0]), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     reloaded = []
     monkeypatch.setattr(control, "_restart_api", lambda current, *_args: (

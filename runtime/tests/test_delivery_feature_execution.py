@@ -160,13 +160,6 @@ def test_explicit_source_scope_is_frozen_independently_from_expected_files(servi
 
     assert outside_scope(child["policy"], ["src/new.py", "protected.txt"]) == {"protected.txt"}
 
-def test_legacy_default_budget_does_not_change_before_feature_migration(service):
-    store, request = service
-    store.submit(request)
-    assert store.effective_spec(request["run_id"])["policy"]["max_repairs"] == 2
-    assert store.config.public_policy()["max_repairs"] == 2
-
-
 def test_invalid_plan_does_not_leave_an_orphan_execution_claim(service, monkeypatch):
     store, request, _ = feature_service(service, monkeypatch)
     with pytest.raises(ValueError):

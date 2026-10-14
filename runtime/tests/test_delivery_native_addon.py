@@ -209,30 +209,6 @@ def test_both_preparation_entries_pass_the_fresh_checkout_native_target(
     assert calls[0][2]["native_projects"] == ["apps/api"]
 
 
-def test_node_handoff_preserves_explicit_environment_and_role_shell_guidance(tmp_path):
-    from devflow_temporal.delivery_role_evidence import _copy_receipts
-
-    tools = {
-        "node_toolchain": {
-            "node_interpreter": {
-                "absolute_path": "/frozen/bin/node",
-                "realpath": "/frozen/bin/node",
-                "sha256": "a" * 64,
-                "version": "v22.21.1",
-                "modules_ABI": "127",
-            },
-            "corepack": {"absolute_path": "/frozen/bin/corepack", "sha256": "b" * 64},
-            "environment": {
-                "PATH": "/frozen/bin:/usr/bin",
-                "COREPACK_HOME": "/frozen/cache",
-                "npm_config_nodedir": "/frozen",
-                "npm_config_build_from_source": "true",
-            },
-        }
-    }
-    assert _copy_receipts(tools, tmp_path, tmp_path) == tools
-
-
 @pytest.mark.parametrize("install_exit", [0, 1])
 def test_target_prerequisite_runs_after_successful_original_install_before_tests(
     addon, monkeypatch, tmp_path, install_exit

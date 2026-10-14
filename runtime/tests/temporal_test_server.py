@@ -157,13 +157,21 @@ async def local_temporal(
                     if monitor is not None:
                         monitor.cancel()
                         await asyncio.gather(monitor, return_exceptions=True)
-                    stopped = await asyncio.to_thread(stop_observed, owned)
+                    await asyncio.to_thread(stop_observed, owned)
                     # An unreaped Popen child cannot have its PID reused, including if
                     # the first identity inspection failed before it could be recorded.
                     if process.poll() is None:
                         process.kill()
                     await asyncio.to_thread(process.wait, timeout=5)
-                    if not stopped:
+                    # The bounded signal pass may finish before the CLI exits. Reap
+                    # our child first, then prove the final state of every recorded
+                    # identity rather than retaining the earlier observation.
+                    table = await asyncio.to_thread(process_table)
+                    if any(
+                        table.get(pid, {}).get("identity") == entry["identity"]
+                        and not table[pid]["stat"].startswith("Z")
+                        for pid, entry in owned.items()
+                    ):
                         raise RuntimeError(
                             "Temporal test server cleanup could not confirm teardown"
                         )

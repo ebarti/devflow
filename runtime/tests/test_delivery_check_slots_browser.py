@@ -21,7 +21,12 @@ from devflow_temporal import delivery_activities as activities
 from devflow_temporal.candidate import candidate_for
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_native_process import listeners, process_table, reconcile_process
+from devflow_temporal.delivery_native_process import (
+    NativeProcess,
+    listeners,
+    process_table,
+    reconcile_process,
+)
 from devflow_temporal.delivery_resources import RunResources, read_private
 
 pytestmark = pytest.mark.skipif(
@@ -80,7 +85,7 @@ def browser_checks(tmp_path, monkeypatch):
         db.row_factory = sqlite3.Row
         return db
 
-    def request(name, seconds=0.5):
+    def request(name, seconds=0.5, release=None):
         value = spec(tmp_path, name)
         checkout = Path(value["checkout"])
         checkout.mkdir(parents=True)
@@ -90,13 +95,18 @@ def browser_checks(tmp_path, monkeypatch):
         _git(checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
              "commit", "-qm", "owned fixture")
         code = (
-            "import socket,subprocess,sys,time; "
+            "import pathlib,socket,subprocess,sys,time; "
             "sockets=[socket.socket() for _ in range(2)]; "
             f"[s.bind(('127.0.0.1',p)) for s,p in zip(sockets,{ports!r})]; "
             "[s.listen() for s in sockets]; "
-            "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
-            f"time.sleep({seconds});print('1 passed')"
+            "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); \n"
         )
+        if release is None:
+            code += f"time.sleep({seconds})\n"
+        else:
+            code += (f"release=pathlib.Path({str(release)!r}); deadline=time.monotonic()+30\n"
+                     "while not release.exists() and time.monotonic()<deadline: time.sleep(.02)\n")
+        code += "print('1 passed')"
         value.update(provider="codex")
         value["policy"].update(host_sandbox="trusted-local", browser_qa={
             "ports": {"QA_WEB_PORT": ports[0], "QA_API_PORT": ports[1]},
@@ -259,7 +269,8 @@ async def test_actual_interrupted_browser_retains_ports_and_generic_capacity(
     browser_checks, tmp_path, monkeypatch, failure,
 ):
     browser_checks.config.raw["check_concurrency"] = 1
-    request = browser_checks.request("interrupted", seconds=30)
+    release = tmp_path / "release-interrupted-browser"
+    request = browser_checks.request("interrupted", release=release)
     broker = browser_checks.brokers["interrupted"]
     folder = broker.evidence_dir / "browser-qa/0/native"
     input_path = tmp_path / "owned-spec.json"
@@ -287,6 +298,17 @@ async def test_actual_interrupted_browser_retains_ports_and_generic_capacity(
         assert original_journal["monitor"]["pid"] != worker.pid
         worker.kill()
         worker.wait(timeout=5)
+        reattached = []
+        request_cancel = NativeProcess._request_cancel
+
+        def release_after_authenticated_reattachment(process):
+            request_cancel(process)  # The production path authenticates the original intent.
+            if process.folder == folder:
+                reattached.append(True)
+                release.touch()
+
+        monkeypatch.setattr(NativeProcess, "_request_cancel",
+                            release_after_authenticated_reattachment)
         if failure == "exception":
             original = reconcile_process
 
@@ -297,6 +319,7 @@ async def test_actual_interrupted_browser_retains_ports_and_generic_capacity(
             monkeypatch.setattr("devflow_temporal.delivery_native_process.reconcile_process",
                                 failed_readback)
         result = await activities.delivery_browser_qa(request)
+        assert reattached, "the fixture released before the original monitor was reattached"
         # Worker loss leaves the detached monitor supervising this same invocation.
         # Only its authenticated completion permits the reservations to be reused.
         assert_interrupted_browser_cleanup(

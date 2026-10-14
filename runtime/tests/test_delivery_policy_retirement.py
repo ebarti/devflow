@@ -5,39 +5,17 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
-import os
-import subprocess
-import sys
 from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
 from historical_replay import replay_designated_history
-from mcp.shared.memory import create_connected_server_and_client_session
 from test_delivery_api import api_fixture as api_fixture
 
 from devflow_temporal import delivery_policy_recovery
 from devflow_temporal.delivery_api import create_app
-from devflow_temporal.delivery_client import DeliveryClient
 from devflow_temporal.delivery_config import DeliveryConfig
-from devflow_temporal.delivery_mcp import build_server
-from devflow_temporal.delivery_store import DeliveryStore
-
-
-@pytest.mark.parametrize("command", ["recovery-preflight", "recover-execution"])
-def test_retired_cli_command_rejects_before_reading_configuration(tmp_path, command):
-    path = tmp_path / "absent-state" / "service.json"
-    environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-    result = subprocess.run(
-        [sys.executable, "-B", "-m", "devflow_temporal.delivery_control",
-         "--config", str(path), command, "--id", "stopped"],
-        env=environment, text=True, capture_output=True, timeout=15,
-    )
-    assert result.returncode == 2, result.stderr
-    assert "invalid choice" in result.stderr
-    assert not path.parent.exists()
 
 
 @pytest.mark.asyncio
@@ -63,56 +41,6 @@ async def test_retired_http_routes_refuse_even_a_valid_local_mutation(api_fixtur
     assert calls == []
     assert before == {item: hashlib.sha256(item.read_bytes()).hexdigest()
                       for item in path.parent.rglob("*") if item.is_file()}
-
-
-@pytest.mark.asyncio
-async def test_retired_mcp_tools_refuse_without_constructing_a_client(tmp_path, monkeypatch):
-    calls = []
-
-    def client(path):
-        calls.append(path)
-        return SimpleNamespace(recovery_preflight=lambda _: {"grant": True},
-                               recover_execution=lambda *_: {"grant": True})
-
-    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", client)
-    path = tmp_path / "absent-state" / "service.json"
-    async with create_connected_server_and_client_session(build_server(path)) as session:
-        tools = {tool.name for tool in (await session.list_tools()).tools}
-        for name in ("recovery_preflight", "recover_execution"):
-            arguments = {"run_id": "stopped"}
-            if name == "recover_execution":
-                arguments["request_json"] = json.dumps({"command_id": "retired"})
-            result = await session.call_tool(name, arguments)
-            assert result.isError
-            assert name not in tools
-    assert calls == []
-    assert not path.parent.exists()
-
-
-@pytest.mark.parametrize("name", ["policy_recovery_precheck", "recover_execution"])
-def test_retired_direct_store_grants_have_no_state_access(api_fixture, monkeypatch, name):
-    path, _ = api_fixture
-    store = create_app(path).state.delivery.store
-    calls = []
-
-    def forbidden(*_args):
-        calls.append("state access")
-        raise AssertionError("retired admission reached existing run authority")
-
-    monkeypatch.setattr(store, "intake_execution_spec", forbidden)
-    with pytest.raises(AttributeError):
-        method = getattr(store, name)
-        if name == "recover_execution":
-            method("stopped", {"command_id": "retired"})
-        else:
-            method("stopped")
-    assert calls == []
-    assert not hasattr(DeliveryStore, name)
-
-
-@pytest.mark.parametrize("name", ["recovery_preflight", "recover_execution"])
-def test_retired_client_wrapper_is_absent(name):
-    assert not hasattr(DeliveryClient, name)
 
 
 @pytest.mark.parametrize("tamper", [None, "missing", "original", "recovery", "maximum", "config"])

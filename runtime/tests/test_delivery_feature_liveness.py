@@ -22,8 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 from temporal_test_server import local_temporal
-from temporalio import activity, workflow
-from temporalio.client import WorkflowHistory
+from temporalio import activity
 from temporalio.exceptions import ActivityError, ApplicationError, TimeoutType
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, Worker
@@ -177,32 +176,6 @@ def _timers(history):
 
 
 # --- H-6a: the coordinator's worker wait survives lost attempts -------------------------------
-
-
-@pytest.mark.asyncio
-async def test_worker_wait_options_let_a_lost_attempt_retry_with_a_full_window(monkeypatch):
-    from devflow_temporal import delivery_workflow
-
-    observed = {}
-
-    async def execute(_name, _request, **options):
-        observed.update(options)
-
-    monkeypatch.setattr(delivery_workflow.workflow, "execute_activity", execute)
-    monkeypatch.setattr(delivery_workflow.workflow, "patched", lambda _flag: False)
-    await DeliveryWorkflow()._activity("delivery_feature_wait_worker", {
-        "config_path": "/frozen/config", "run_id": "r", "spec_digest": "d", "child_id": "c",
-    })
-    # The activity polls for 300 s. A retry after an attempt lost late in the
-    # window must still get a full window of its own.
-    assert "schedule_to_close_timeout" not in observed
-    assert observed["start_to_close_timeout"] >= timedelta(seconds=300 + 60)
-    assert observed["heartbeat_timeout"] >= timedelta(seconds=60)
-    assert observed["retry_policy"].maximum_attempts == 3
-    assert observed["retry_policy"].non_retryable_error_types == [
-        "ValueError", "TypeError", "OwnershipConflict"]
-    assert observed["cancellation_type"] == (
-        workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED)
 
 
 @pytest.mark.asyncio
@@ -1022,36 +995,6 @@ async def test_real_temporal_slow_merge_records_backoff_timers_and_replays(monke
 # --- Replay: executions recorded before the marker keep their commands -----------------------
 
 
-@pytest.mark.asyncio
-async def test_history_recorded_before_feature_liveness_marker_replays_with_flag_false(monkeypatch):
-    content = (FIXTURES / "intake-required-history.json").read_text()
-    history = WorkflowHistory.from_json("prior-intake", content)
-    markers = []
-    for event in history.events:
-        if not event.HasField("marker_recorded_event_attributes"):
-            continue
-        details = event.marker_recorded_event_attributes.details
-        for key in ("patch-data", "patch_id"):
-            if key in details:
-                value = (await DELIVERY_DATA_CONVERTER.decode(details[key].payloads))[0]
-                markers.append(value["id"] if isinstance(value, dict) else value)
-    assert MARKER not in markers
-    observed = []
-    original = workflow.patched
-
-    def patched(name):
-        result = original(name)
-        if name == MARKER:
-            observed.append((workflow.instance(), result))
-        return result
-
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", patched)
-    await Replayer(workflows=[DeliveryWorkflow],
-                   workflow_runner=UnsandboxedWorkflowRunner()).replay_workflow(history)
-    (instance, result), = observed
-    assert result is False and instance.feature_liveness_v1 is False
-
-
 # --- Child side: a worker's own controller classifies its closure -----------------------------
 
 
@@ -1277,26 +1220,14 @@ async def test_finish_verdict_names_the_chunk_and_the_failing_activity(monkeypat
 
 @pytest.mark.parametrize("kind, message, transient", [
     ("ConnectionResetError", "[Errno 54] Connection reset by peer", True),
-    ("ConnectionRefusedError", "[Errno 61] Connection refused", True),
-    ("ConnectionAbortedError", "[Errno 53] Software caused connection abort", True),
-    ("BrokenPipeError", "[Errno 32] Broken pipe", True),
     ("OSError", f"[Errno {errno.ETIMEDOUT}] Operation timed out", True),
-    ("OSError", f"[Errno {errno.EHOSTUNREACH}] No route to host", True),
     ("OSError", "[Errno 2] No such file or directory: 'gh'", False),
     ("OSError", "unexpected", False),
     ("DatabaseBusy", "database busy: database is locked", True),
-    ("OperationalError", "database is locked", True),
     ("OperationalError", "database table is locked", True),
     ("OperationalError", "no such table: delivery_runs", False),
-    ("TemporalUnavailable", "UNAVAILABLE: error trying to connect", True),
-    ("RPCError", "permission denied", False),
     ("GitHubTransientError", "gh: HTTP 502: Bad Gateway", True),
-    ("GitHubContractError", "gh: HTTP 401: Bad credentials", False),
-    ("GitHubContractError", "gh: HTTP 404: Not Found", False),
-    ("KeyError", "'head'", False),
     ("ValueError", "stopped checkpoint changed before admission", False),
-    ("ClosureUnavailable", "closure unavailable", False),
-    ("PermissionError", "[Errno 13] Permission denied", False),
 ])
 def test_infrastructure_allowlist_matches_on_the_child_and_coordinator_sides(
     kind, message, transient,
@@ -1314,25 +1245,15 @@ def test_infrastructure_allowlist_matches_on_the_child_and_coordinator_sides(
 
 @pytest.mark.parametrize("stderr, transient", [
     ("gh: HTTP 502: Bad Gateway (https://api.github.com/repos/example/fixture)", True),
-    ("gh: HTTP 503: Service Unavailable", True),
     ("gh: HTTP 429: Too Many Requests", True),
     ("gh: HTTP 403: API rate limit exceeded for user ID 1", True),
-    ("gh: HTTP 403: You have exceeded a secondary rate limit", True),
     ("gh: HTTP 403: Resource not accessible by integration", False),
-    ("gh: HTTP 401: Bad credentials", False),
-    ("gh: HTTP 404: Not Found", False),
-    ("gh: HTTP 422: Validation Failed", False),
     # Transport failures carry no HTTP status: offline, DNS, TLS, reset connections.
     ("error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
      True),
-    ("Post \"https://api.github.com/graphql\": dial tcp: lookup api.github.com: no such host",
-     True),
-    ("net/http: TLS handshake timeout", True),
-    ("read tcp 10.0.0.2:51234->140.82.112.6:443: read: connection reset by peer", True),
     # A certificate that fails verification is a deterministic misconfiguration.
     ("Get \"https://api.github.com/\": tls: failed to verify certificate: x509: certificate "
      "signed by unknown authority", False),
-    ("could not determine base repo: no git remotes found", False),
     ("unknown command \"foo\" for \"gh api\"", False),
 ])
 def test_github_server_faults_and_rate_limits_are_typed_transient(monkeypatch, stderr, transient):

@@ -13,21 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  install:
-    runs-on: macos-latest
-    # Mac installer checks passed, but the job exceeded its former two-minute deadline.
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12'
-      - run: sh scripts/check-install.sh
   test:
-    runs-on: macos-latest
-    # The passing Mac source tests took 122.123s before setup and cleanup.
+    runs-on: ubuntu-latest
+    # Installer and reconcile modules already run on Mac; keep one execution per case.
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,7 +24,35 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - run: python3.12 -B -m unittest discover -s tests -v
+      - name: Run the remaining portable source tests
+        run: |
+          python3.12 -B - <<'PY'
+          import sys
+          import unittest
+
+          def cases(suite):
+              for test in suite:
+                  if isinstance(test, unittest.TestSuite):
+                      yield from cases(test)
+                  else:
+                      yield test
+
+          discovered = list(cases(unittest.defaultTestLoader.discover('tests')))
+          mac_modules = {'test_reconcile', 'test_service_entry_installation',
+                         'test_upgrade_installation'}
+          native = [test for test in discovered
+                    if type(test).__module__ in mac_modules
+                    or type(test).__module__.startswith('test_delivery')]
+          native_ids = {test.id() for test in native}
+          portable = [test for test in discovered if test.id() not in native_ids]
+          portable_ids = {test.id() for test in portable}
+          assert not native_ids & portable_ids
+          assert native_ids | portable_ids == {test.id() for test in discovered}
+          assert native_ids and portable_ids
+          print(f'Source coverage: {len(native_ids)} Mac + {len(portable_ids)} portable cases')
+          result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(portable))
+          sys.exit(not result.wasSuccessful())
+          PY
   temporal-runtime-tests:
     name: runtime shard ${{ matrix.shard }}
     runs-on: macos-latest
@@ -44,12 +60,14 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      # Four hosts fit one scheduling wave; repeated expensive fixture cases are consolidated.
-      max-parallel: 4
+      # All three Mac hosts start together; host 0 also qualifies native source tests.
+      max-parallel: 3
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Host 0's installer fixtures require historical Git objects.
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
@@ -67,7 +85,32 @@ jobs:
         working-directory: runtime
       - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
-      - run: uv run --frozen python runtime_ci.py --index ${{ matrix.shard }} --count 4
+      - name: Run assigned runtime modules and host 0 Mac source qualification
+        # Three hosted Mac jobs, each with three module-atomic internal partitions.
+        run: |
+          processes=()
+          if [ '${{ matrix.shard }}' = 0 ]; then
+            env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              sh ../scripts/check-install.sh &
+            processes+=("$!")
+            (
+              cd ..
+              env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+                python3.12 -B -m unittest discover -s tests -p 'test_reconcile.py' -v
+            ) &
+            processes+=("$!")
+          fi
+          for lane in 0 1 2; do
+            index=$(( ${{ matrix.shard }} + lane * 3 ))
+            .venv/bin/python runtime_ci.py --index "$index" --count 9 \
+              --basetemp "$RUNNER_TEMP/devflow-pytest-$index" &
+            processes+=("$!")
+          done
+          result=0
+          for process in "${processes[@]}"; do
+            wait "$process" || result=1
+          done
+          exit "$result"
         working-directory: runtime
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ always() }}
@@ -78,14 +121,15 @@ jobs:
   temporal-runtime-macos:
     # Preserve the required context and fail closed on missing/failed shards.
     if: ${{ always() }}
-    needs: temporal-runtime-tests
+    needs: [temporal-runtime-tests, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require every runtime shard to pass
         env:
           SHARDS_RESULT: ${{ needs.temporal-runtime-tests.result }}
-        run: test "$SHARDS_RESULT" = success
+          SOURCE_RESULT: ${{ needs.test.result }}
+        run: test "$SHARDS_RESULT" = success && test "$SOURCE_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -96,9 +140,9 @@ jobs:
           path: runtime/ci-results/
           merge-multiple: true
       - name: Verify complete and disjoint coverage at this revision
-        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 4
+        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 9
   temporal-dashboard:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

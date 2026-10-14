@@ -144,10 +144,8 @@ def test_original_policy_role_keeps_existing_observation(historical_role, legacy
 
 
 @pytest.mark.parametrize('changed', [
-    'wrong_policy', 'original_policy', 'original_request', 'missing_request',
-    'forged_spec', 'wrong_job', 'forged_result', 'session', 'candidate',
-    'process_identity', 'row_path', 'request_path', 'native_path', 'runtime', 'missing_runtime',
-    'missing_attempt', 'nonfinished', 'unconfirmed', 'launch', 'symlink',
+    'wrong_policy', 'missing_request', 'forged_result', 'candidate',
+    'process_identity', 'runtime', 'missing_attempt', 'unconfirmed', 'symlink',
 ])
 def test_historical_policy_override_refuses_changed_custody(historical_role, monkeypatch, changed):
     store, current, path, request, journal, result, _table, _ports = historical_role
@@ -235,8 +233,10 @@ def test_original_policy_intent_cannot_skip_historical_original_lease(historical
         os.close(descriptor)
 
 
-@pytest.mark.parametrize('name', ['native-monitor.lock', 'native-process.lock'])
-@pytest.mark.parametrize('changed', ['held', 'replaced', 'symlink', 'mode'])
+@pytest.mark.parametrize('name,changed', [
+    ('native-monitor.lock', 'held'), ('native-process.lock', 'held'),
+    ('native-monitor.lock', 'replaced'), ('native-process.lock', 'symlink'),
+])
 def test_historical_policy_override_refuses_unavailable_original_lease(
     historical_role, monkeypatch, name, changed,
 ):

@@ -478,7 +478,9 @@ async def test_closed_cancelled_recovery_preserves_cleanup_source_contract(
                     'command_id': 'cancel-before-implementation',
                     'expected_revision': revision, 'reason': 'Controlled initial cancellation'})
                 assert cancel.status_code == 200, cancel.text
-                stopped = await asyncio.wait_for(handle.result(), 15)
+                # Real cleanup precedes the fixture's eight-second tracker
+                # deadline; host contention is not a product latency assertion.
+                stopped = await asyncio.wait_for(handle.result(), 30)
                 assert stopped['outcome'] is None and stopped['phase'] == 'waiting_tracker'
                 assert broker.checkout.exists() == dirty
                 resources = RunResources(spec)

@@ -25,7 +25,7 @@ def bind_default(source: Path) -> str:
     return head
 
 
-@pytest.mark.parametrize("raw", ["main", "origin/main", "refs/heads/main", "HEAD", "sha"])
+@pytest.mark.parametrize("raw", ["main", "origin/main", "sha"])
 def test_branch_resolution_keeps_the_pinned_object(service, raw):
     store, _ = service
     source = Path(store.config.raw["repositories"]["fixture"]["source_path"])

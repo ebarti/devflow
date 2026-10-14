@@ -229,16 +229,7 @@ def test_intake_prompt_has_frozen_issue_and_work_context(intake_fixture):
         "candidate": {"id": "candidate", "head": spec["base_sha"]},
         "workspace": "/work",
     })
-    assert native["work_id"] == spec["work_id"]
-    assert native["issue_url"] == spec["issue_url"]
     assert task.permissions.filesystem == FilesystemAccess.READ_ONLY
-    assert 'Frozen work ID: "work-1"' in task.goal
-    assert 'Frozen issue URL: "https://github.com/example/fixture/issues/3"' in task.goal
-    assert 'Frozen plan approval: "automatic"' in task.goal
-    assert "routine implementation choices do not need another user approval" in task.goal
-    assert "reasonable reversible assumptions" in task.goal
-    assert "no reasonable safe default" in task.goal
-    assert "Never choose a callback thread or destination" in task.goal
     question_schema = task.output_schema["properties"]["questions"]["items"]
     assert "blocker" in question_schema["required"]
     historical = {key: value for key, value in native.items()

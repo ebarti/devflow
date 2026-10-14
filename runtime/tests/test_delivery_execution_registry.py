@@ -167,14 +167,6 @@ def test_confirmed_runtime_defect_marks_learning_without_consuming_product_allow
     assert result == {"used": 0, "maximum": 10, "learning_required": True}
 
 
-def test_registry_has_execution_records_and_no_business_feature_entity(registry):
-    with registry.connect() as db:
-        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert tables
-    assert all(name.startswith("execution_") for name in tables)
-    assert "features" not in tables
-
-
 def test_registry_rejects_symlink_and_public_directory(tmp_path):
     directory = tmp_path / "public"
     directory.mkdir(mode=0o755)

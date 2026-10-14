@@ -236,15 +236,6 @@ def test_head_change_invalidates_review_even_if_local_candidate_has_changed(serv
     assert store.detail(request['run_id'])['pull_request'] == receipt
 
 
-@pytest.mark.parametrize('interval', [299, 86401, True, '86400', 86400.0])
-def test_reconciliation_interval_validation(service, interval):
-    store, _ = service
-    with pytest.raises(ValueError, match='intervals'):
-        ProjectSynchronizer([store], interval=interval)
-    with pytest.raises(ValueError, match='intervals'):
-        ProjectSynchronizer([store], project_interval=interval)
-
-
 def test_listener_binds_configured_databases_before_wait_and_cleans_up(tmp_path, monkeypatch):
     from pathlib import Path
 

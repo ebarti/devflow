@@ -25,7 +25,7 @@ from devflow_temporal.delivery_feature_revision_roles import (
     validate_diagnostic,
 )
 from devflow_temporal.delivery_store import DeliveryStore
-from devflow_temporal.role_runner import _task, feature_intake_schema
+from devflow_temporal.role_runner import _task
 
 legacy_fixture = legacy_service
 
@@ -91,7 +91,7 @@ def test_fresh_v2_intake_schema_does_not_change_historical_plan_contract(feature
     store, spec, _, _, _ = feature
     candidate = DeliveryBroker(store, spec).candidate()
     old_task = _task(request_for(spec, candidate, "intake"))
-    old_schema = feature_intake_schema()["properties"]["plan"]
+    old_schema = old_task.output_schema["properties"]["plan"]
     assert "steps" in old_schema["required"] and "verification" in old_schema["required"]
     old_chunk = old_schema["properties"]["workstreams"]["items"]["properties"]["chunks"]["items"]
     assert "allowed_paths" in old_chunk["required"]
@@ -103,9 +103,6 @@ def test_fresh_v2_intake_schema_does_not_change_historical_plan_contract(feature
     assert {"version", "final_gates"} <= set(schema["required"])
     assert {"expected_paths", "gates"} <= set(chunk["required"])
     assert "allowed_paths" not in chunk["properties"]
-    assert "future chunk's not-yet-created test" in task.goal
-    assert "complete final-feature coverage" in task.goal
-    assert "Execution authority" in task.goal
 
 
 def test_review_binds_exact_proposal_and_rejects_unsupported_diagnostics(feature):

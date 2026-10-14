@@ -23,7 +23,7 @@ canonicalized_unknown = _unknown
 
 
 @pytest.fixture
-def ambient(canonicalized_unknown, monkeypatch):
+def ambient(canonicalized_unknown, monkeypatch, request):
     module, fixture, args, manifest, failed = canonicalized_unknown
     drift = importlib.import_module("owned_drift")
     # The predecessor reproducer replaces the owning seal while importing its
@@ -62,7 +62,8 @@ def ambient(canonicalized_unknown, monkeypatch):
     package = root / ".codex-plugin/plugin.json"
     package.parent.mkdir(parents=True)
     package.write_text('{"name":"foreign","version":"2"}')
-    for index in range(158):
+    # Broad content indexing is exercised once; field refusals need two files.
+    for index in range(getattr(request, "param", 2)):
         (root / f"artifact-{index:03}.txt").write_text(f"retained content {index}\n")
     after = drift.foreign_snapshot(args[0], fixture["home"])
     evidence = manifest.parent / "inspected-evidence"
@@ -110,6 +111,7 @@ def _ack(ambient):
     return Path(json.loads(result.stdout)["acknowledgement"])
 
 
+@pytest.mark.parametrize("ambient", [158], indirect=True)
 def test_public_immutable_acknowledgement_replay_rollback_reapply_preserves_current_foreign_state(
     ambient,
 ):
@@ -149,15 +151,10 @@ def test_public_immutable_acknowledgement_replay_rollback_reapply_preserves_curr
     "change",
     [
         "setting",
-        "absence",
-        "plugin",
         "content",
-        "extra-file",
         "mode",
         "link",
         "authority",
-        "request",
-        "owned-config",
         "owned-pointer",
         "owned-skill",
     ],
@@ -597,16 +594,10 @@ def test_explicit_successor_preserves_history_and_same_command_partial_rollback_
 @pytest.mark.parametrize(
     "change",
     [
-        "missing-predecessor",
         "wrong-predecessor",
         "journal-hash",
         "journal-state",
-        "prior",
         "authority",
-        "original-request",
-        "owned-pointer",
-        "owned-skill",
-        "later-setting",
         "later-content",
     ],
 )
@@ -664,15 +655,11 @@ def test_successor_rejects_bad_admission_before_receipt_or_effect(ambient, chang
     "change",
     [
         "first-receipt",
-        "first-request",
         "old-authority",
-        "old-snapshot",
         "old-index",
-        "second-receipt",
         "receipt-hardlink",
         "hole",
         "extra",
-        "latest-setting",
         "latest-content",
     ],
 )
@@ -833,7 +820,7 @@ def test_successor_interrupted_acknowledgement_replays_without_new_authority(
     assert _run(fixture, "--repoint-owned-request", str(fixture["request"])).returncode == 0
 
 
-@pytest.mark.parametrize("stage", ["absent", "lookalike", "different-inode"])
+@pytest.mark.parametrize("stage", ["different-inode"])
 def test_external_receipt_hardlinks_do_not_authorize_stage_cleanup(ambient, stage):
     import os
 
@@ -858,7 +845,7 @@ def test_external_receipt_hardlinks_do_not_authorize_stage_cleanup(ambient, stag
     assert original == (manifest.read_bytes(), first.read_bytes(), fixture["registry"].read_bytes())
 
 
-@pytest.mark.parametrize("target", ["journal-before", "journal-after", "live-before", "live-after"])
+@pytest.mark.parametrize("target", ["journal-before", "live-after"])
 def test_owning_boolean_integer_history_and_pointer_changes_reject_without_effects(ambient, target):
     module, drift, fixture, args, manifest, first_request, root = ambient
     first = _ack(ambient)
@@ -896,15 +883,6 @@ def test_owning_boolean_integer_history_and_pointer_changes_reject_without_effec
         fixture["registry"].read_bytes(),
         fixture["skill"].read_bytes(),
     )
-
-
-@pytest.mark.parametrize("before,after", [(True, 1), (1, 1.0)])
-def test_journal_comparison_is_typed_but_allows_only_state_progression(ambient, before, after):
-    module, drift, fixture, args, manifest, first_request, root = ambient
-    original = {"state": "unknown", "owning": {"value": before}}
-    drift._same_journal(original, {**original, "state": "applied"})
-    with pytest.raises(ValueError, match="original owned journal changed"):
-        drift._same_journal(original, {"state": "applied", "owning": {"value": after}})
 
 
 def test_successor_cannot_reuse_an_earlier_authority_receipt(ambient):

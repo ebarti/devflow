@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fixtures.activity_liveness_workflow import ActivityLivenessWorkflow
+from fixtures.activity_liveness_workflow import ActivityLivenessWorkflow, FeatureWaitClock
 from temporalio import activity
 from temporalio.client import WorkflowFailureError, WorkflowHistory
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
@@ -357,10 +357,7 @@ async def _wait_for_fixture_native_start(worker, log_path, state, handle):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('stage,interruption', [
     # Writable worker loss and read-only loop stall cover the shared role monitor.
-    (stage, 'worker_loss') for stage in ['implement', 'checks']
-] + [
-    pytest.param('browser_qa', 'worker_loss', marks=pytest.mark.skipif(
-        sys.platform != 'darwin', reason='actual macOS TCP listener inspection required')),
+    ('implement', 'worker_loss'),
     ('review', 'loop_stall'),
     ('intake', 'loop_stall'), ('implement', 'cancel'),
     ('implement', 'deadline'), ('implement', 'terminate'),
@@ -599,9 +596,11 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
 
 @pytest.mark.asyncio
 async def test_real_temporal_lost_feature_wait_attempt_retries_with_a_full_window(tmp_path):
-    """A coordinator wait attempt lost mid-window (worker crash, host sleep) is
-    timed out on the 60 s heartbeat budget and retried with a full window of its
-    own; the coordinator keeps waiting and the feature completes. Slow by design."""
+    """A lost attempt retries with its own full window on a shortened fixture clock.
+
+    The interceptor asserts the real 60/360 s policy before scaling only this
+    fixture's heartbeat and attempt deadline; workflow retry decisions stay real.
+    """
     from test_delivery_feature_workflow_temporal import FeatureActivities
 
     fixtures = FeatureActivities()
@@ -623,7 +622,7 @@ async def test_real_temporal_lost_feature_wait_attempt_retries_with_a_full_windo
             # The host stalls mid-window: no further heartbeats until teardown.
             activity.heartbeat({'stage': 'feature_worker_wait'})
             await asyncio.sleep(600)
-        await asyncio.sleep(10)  # the remainder of this attempt's own poll window
+        await asyncio.sleep(1)  # the remainder of this attempt's own poll window
         return {'closed': True, 'outcome': 'delivered',
                 'closure': {'phase': 'delivered', 'cleanup': 'confirmed'}}
 
@@ -638,22 +637,24 @@ async def test_real_temporal_lost_feature_wait_attempt_retries_with_a_full_windo
     ) as environment:
         async with Worker(environment.client, task_queue=spec['run_id'],
                           workflows=[DeliveryWorkflow],
+                          interceptors=[FeatureWaitClock()],
                           activities=[*handlers, reserve, wait_worker]):
             handle = await environment.client.start_workflow(
                 DeliveryWorkflow.run, spec, id=spec['run_id'], task_queue=spec['run_id'])
-            result = await asyncio.wait_for(handle.result(), 240)
+            result = await asyncio.wait_for(handle.result(), 30)
             history = await handle.fetch_history()
-        await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+        replayer = Replayer(workflows=[DeliveryWorkflow], interceptors=[FeatureWaitClock()])
+        await replayer.replay_workflow(history)
     assert result['phase'] == 'merged'
     assert [attempt for attempt, _ in attempts] == [1, 2]
-    assert attempts[1][1] - attempts[0][1] >= 60, 'the lost attempt was detected by heartbeat'
+    assert attempts[1][1] - attempts[0][1] >= 3, 'the lost attempt was detected by heartbeat'
     waits = [e.activity_task_scheduled_event_attributes for e in history.events
              if e.HasField('activity_task_scheduled_event_attributes')
              and e.activity_task_scheduled_event_attributes.activity_type.name
              == 'delivery_feature_wait_worker']
     assert len(waits) == 1, 'Temporal retried the lost attempt inside one scheduled wait'
-    assert waits[0].heartbeat_timeout.ToTimedelta() == timedelta(seconds=60)
-    assert waits[0].start_to_close_timeout.ToTimedelta() >= timedelta(seconds=360)
+    assert waits[0].heartbeat_timeout.ToTimedelta() == timedelta(seconds=3)
+    assert waits[0].start_to_close_timeout.ToTimedelta() == timedelta(seconds=12)
     # The server records an absent schedule_to_close as zero: no overall deadline
     # can cut the retry short any more (it was 6 minutes).
     assert waits[0].schedule_to_close_timeout.ToTimedelta() == timedelta(0)

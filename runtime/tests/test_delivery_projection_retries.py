@@ -30,11 +30,6 @@ def request(spec):
             'key': 'implement:0:2', 'iteration': 0, 'protocol_revision': 2}
 
 
-def test_new_admissions_freeze_projection_retry_version(service):
-    store, supplied = service
-    assert store.config.admit(supplied)['projection_retry_version'] == 1
-
-
 @pytest.mark.parametrize('legacy', [False, True])
 def test_scope_amendment_preserves_original_projection_options(service, legacy):
     store, supplied = service

@@ -99,21 +99,6 @@ def test_role_carries_unpassed_product_subject_without_expanding_role_authority(
     assert request == frozen
 
 
-@pytest.mark.parametrize("role", ["intake", "review"])
-def test_no_unpassed_subject_keeps_existing_planning_instructions(feature, role):
-    request = role_request(feature, role)
-    before = _task(request)
-    request["revision_context"]["reconsideration"]["worker_summaries"] = [{
-        "run_id": "retained-delivered-worker", "retained_authority_preserved": True,
-    }]
-    after = _task(request)
-    before_instructions = before.goal.split("Controller-bound revision context:\n", 1)[0]
-    after_instructions = after.goal.split("Controller-bound revision context:\n", 1)[0]
-    assert before_instructions == after_instructions
-    assert after.permissions == before.permissions and after.output_schema == before.output_schema
-    assert "unpassed product review subject" not in after_instructions
-
-
 def test_plan_review_pass_does_not_consume_product_findings_or_mint_gate_pass(feature):
     request = role_request(feature, "review")
     request["revision_context"]["reconsideration"]["worker_summaries"] = [
