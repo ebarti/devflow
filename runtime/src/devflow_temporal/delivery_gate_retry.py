@@ -164,6 +164,28 @@ def snapshot(store, run_id, kind=KIND):
 
     if kind == KIND and possible(row):
         return preflight_snapshot(store, spec, row, attempts, effects, closed)
+    from .delivery_check_prelaunch import (
+        PREPARATION_STAGE,
+        preparation_observe,
+        preparation_possible,
+    )
+
+    if kind == PRELAUNCH_KIND and preparation_possible(row):
+        proof = preparation_observe(store, spec, row, attempts, effects, closed)
+        if spec['provider'] != 'fake':
+            from .delivery_native_preparation import native_identity
+
+            if native_identity(spec)['runtime_payload_sha256'] in _consumed_payloads(
+                    spec, state, previous):
+                raise ValueError('published preparation retry requires a repaired measured runtime')
+        return {'row': _sealed_row(row), 'closed': closed, 'original_spec': spec,
+                'attempts': attempts, 'effects': effects, 'candidate': state['candidate'],
+                'publication': state['pull_request'], 'cleanup': proof['resources'],
+                'work_binding': proof['work_binding'], 'previous_digest': digest(previous),
+                'prior_gate_digest': digest(previous), 'stage': PREPARATION_STAGE,
+                'generation': spec['gate_retry_generation'], 'preparation_observation': proof,
+                **({'attribution_observation': previous['seal']['attribution_observation']}
+                   if 'attribution_observation' in previous['seal'] else {})}
     ci_only = kind == CI_KIND
     controller_only = kind == CONTROLLER_KIND
     from .delivery_gate_attribution_recovery import eligible_stop
@@ -487,7 +509,7 @@ def admit(store, run_id, payload, *, preflight=False):
     generation = seal['generation']
     preflight_generation = (seal['preflight_continuation'].get('preflight_generation', 1)
                             if 'preflight_continuation' in seal else 0)
-    if preflight_generation and spec.get('feature_worker'):
+    if (preflight_generation or seal.get('preparation_observation')) and spec.get('feature_worker'):
         from .delivery_feature_execution import require_worker_handoff
 
         require_worker_handoff(store, spec)
@@ -528,6 +550,10 @@ def admit(store, run_id, payload, *, preflight=False):
             else f'transient-gate-retry-{generation}' if seal['stage'] == 'transient'
             else f'gate-retry-{generation}')
         execution['gate_retry_generation'] = generation
+        if seal.get('preparation_observation'):
+            execution.pop('gate_retry_preflight_generation', None)
+            execution.pop('gate_retry_prepared_handoff', None)
+            execution['role_home_generation'] = f'gate-preparation-retry-{generation}'
         if preflight_generation:
             execution['gate_retry_preflight_generation'] = preflight_generation
             execution.pop('gate_retry_prepared_handoff', None)
@@ -578,6 +604,8 @@ def admit(store, run_id, payload, *, preflight=False):
             workflow_id += '-preflight-continuation'
             if preflight_generation > 1:
                 workflow_id += f'-{preflight_generation}'
+        if seal.get('preparation_observation'):
+            workflow_id += '-preparation-retry'
         response = {'run_id': run_id, 'phase': 'gates_retry_queued', 'workflow_id': workflow_id,
                     'candidate_id': after['id'], 'implementation_authority': False,
                     'additional_iterations': 0}
@@ -588,7 +616,8 @@ def admit(store, run_id, payload, *, preflight=False):
                 raise ValueError('gate retry admission lost its stopped projection')
             if work_binding(store, spec, db) != seal['work_binding']:
                 raise ValueError('gate retry admission lost issue ownership')
-            if preflight_generation and spec.get('feature_worker'):
+            if ((preflight_generation or seal.get('preparation_observation'))
+                    and spec.get('feature_worker')):
                 require_worker_handoff(store, spec)
             if observation := seal.get('browser_prelaunch_observation'):
                 from .delivery_browser_prelaunch import resolved_effect
@@ -647,6 +676,8 @@ def gate_namespace(generation, stage=None, *, preflight_generation=0, prepared_h
         suffix = f'-{preflight_generation}' if preflight_generation > 1 else ''
         return gate_namespace(generation, stage) + '/preflight-continuation' + suffix
     if stage is not None:
+        if stage == 'preparation' and type(generation) is int and generation in (1, 2):
+            return f'published-preparation-admission-{generation}'
         if stage == 'report' and generation == 1:
             return 'report-gates-admission'
         if stage == 'ci' and 1 <= generation <= CI_OBSERVATION_RETRIES:
@@ -682,7 +713,17 @@ def effective_spec(store, original, recovery):
         from .delivery_gate_preflight_continuation import _authority
 
         ancestor = current
+        if (ancestor or {}).get('seal', {}).get('preparation_observation'):
+            from .delivery_check_prelaunch import preparation_authority
+
+            preparation_authority(ancestor['execution_spec'], ancestor)
+            ancestor = ancestor['original_recovery']
+            if ancestor == recovery:
+                before = ancestor
         for _ in range(2):
+            if ancestor == recovery:
+                before = ancestor
+                break
             before = (ancestor or {}).get('original_recovery')
             if not before or not ancestor['execution_spec'].get('gate_retry_preflight_generation'):
                 break
@@ -710,7 +751,11 @@ def readback(store, spec, recovery, *, resource_spec=None):
               if resource_spec is not None else DeliveryBroker(store, spec))
     if effective != spec or broker.candidate() != recovery['candidate']:
         raise ValueError('gate retry source or execution authority changed')
-    if spec.get('gate_retry_preflight_generation'):
+    if recovery['seal'].get('preparation_observation'):
+        from .delivery_check_prelaunch import preparation_validate
+
+        preparation_validate(store, spec, recovery, resource_spec=resource_spec or spec)
+    elif spec.get('gate_retry_preflight_generation'):
         from .delivery_gate_preflight_continuation import validate
 
         validate(store, spec, recovery, resource_spec=resource_spec or spec)

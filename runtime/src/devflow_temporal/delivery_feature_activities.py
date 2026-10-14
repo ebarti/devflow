@@ -232,6 +232,7 @@ def _paid_repair(shared, token, run_id, iteration):
 
 def resume_worker(store, parent, child, row):
     from . import delivery_gate_retry as gates
+    from .delivery_check_prelaunch import preparation_possible
     from .delivery_gate_attribution_recovery import possible
     from .delivery_gate_preflight_continuation import possible as preflight_continuation
     from .delivery_stopped_resume import admit, interrupted_resume, pending_repair, snapshot
@@ -242,7 +243,11 @@ def resume_worker(store, parent, child, row):
     # preserves the original candidate/PR/session and never creates a new branch.
     preparation_failed = gates.prepublication_preparation_failed(
         {"error": row["error"], "checks": json.loads(row["checks_json"] or "{}")})
-    if possible(store, child, row) or preflight_continuation(row):
+    if preparation_possible(row):
+        sealed = gates.snapshot(store, child['run_id'], gates.PRELAUNCH_KIND)
+        state = sealed['closed']['result']
+        remaining, kind, admit = 0, gates.PRELAUNCH_KIND, gates.admit
+    elif possible(store, child, row) or preflight_continuation(row):
         sealed = gates.snapshot(store, child['run_id'])
         if not any(key in sealed for key in ('attribution_observation', 'preflight_continuation')):
             raise OwnershipConflict('worker lacks its exact attribution recovery proof')
@@ -296,7 +301,7 @@ def resume_worker(store, parent, child, row):
         "expected_candidate_id": candidate["id"],
         "additional_iterations": remaining,
     }
-    if kind == gates.KIND:
+    if kind in {gates.KIND, gates.PRELAUNCH_KIND}:
         command.update(expected_pr_head=candidate['head'],
                        expected_pr_number=sealed['publication']['number'])
     else:
