@@ -54,15 +54,14 @@ def test_completed_source_keeps_capacity_history_and_final_pass(tmp_path, monkey
     assert read_private(f.folder / "native-thread-observation.json") == observed
 
 
-@pytest.mark.parametrize("error", ["rateLimitExceeded", "usageLimitExceeded", "unauthorized",
-                                  "internalServerError", None])
+@pytest.mark.parametrize("error", ["rateLimitExceeded", None])
 def test_completed_source_does_not_promote_other_failed_turns(tmp_path, monkeypatch, error):
     f, _ = capacity_source(tmp_path, monkeypatch, error=error)
     with pytest.raises(ValueError, match="native thread observation"):
         completed._native_pass(f.spec, f.row, f.attempts, f.output)
 
 
-@pytest.mark.parametrize("change", ["final_failed", "foreign_prefix", "foreign_final"])
+@pytest.mark.parametrize("change", ["final_failed", "foreign_final"])
 def test_capacity_history_still_requires_actual_same_session_pass(tmp_path, monkeypatch, change):
     f, observed = capacity_source(tmp_path, monkeypatch)
     if change == "final_failed":

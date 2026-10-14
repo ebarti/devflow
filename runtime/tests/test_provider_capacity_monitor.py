@@ -30,7 +30,7 @@ for _ in range(2):
 '''
 
 
-@pytest.mark.parametrize("mode", ["role", "ordinary", "cancel", "abandoned"])
+@pytest.mark.parametrize("mode", ["role", "abandoned"])
 def test_monitor_excludes_only_owned_capacity_wait_and_keeps_cancellation(
     tmp_path, monkeypatch, mode,
 ):

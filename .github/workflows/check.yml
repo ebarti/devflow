@@ -86,7 +86,7 @@ jobs:
       - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
       - name: Run assigned runtime modules and host 0 Mac source qualification
-        # Three hosted Mac jobs, each with three module-atomic internal partitions.
+        # Three hosted Mac jobs, each with four module-atomic internal partitions.
         run: |
           processes=()
           if [ '${{ matrix.shard }}' = 0 ]; then
@@ -100,9 +100,9 @@ jobs:
             ) &
             processes+=("$!")
           fi
-          for lane in 0 1 2; do
+          for lane in 0 1 2 3; do
             index=$(( ${{ matrix.shard }} + lane * 3 ))
-            .venv/bin/python runtime_ci.py --index "$index" --count 9 \
+            .venv/bin/python runtime_ci.py --index "$index" --count 12 \
               --basetemp "$RUNNER_TEMP/devflow-pytest-$index" &
             processes+=("$!")
           done
@@ -140,7 +140,7 @@ jobs:
           path: runtime/ci-results/
           merge-multiple: true
       - name: Verify complete and disjoint coverage at this revision
-        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 9
+        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 12
   temporal-dashboard:
     runs-on: ubuntu-latest
     timeout-minutes: 5

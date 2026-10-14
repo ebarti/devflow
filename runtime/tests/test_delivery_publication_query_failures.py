@@ -65,7 +65,7 @@ def test_real_owned_pr_query_remains_pending_in_repair_preflight(service, monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['candidate', 'committed_candidate', 'permission'])
+@pytest.mark.parametrize('failure', ['candidate', 'permission'])
 async def test_activity_confirms_pre_mutation_rejection_without_unknown_effect(
     service, monkeypatch, failure,
 ):

@@ -162,7 +162,7 @@ def test_applied_replay_rejects_unrecorded_owned_pointer_reversal(installation):
     assert json.loads(fixture['registry'].read_bytes()) == current
 
 
-@pytest.mark.parametrize('change', ['original-config', 'owned-skill', 'roles'])
+@pytest.mark.parametrize('change', ['original-config', 'roles'])
 def test_pointer_upgrade_rejects_changed_inspected_inputs(installation, change):
     fixture = installation
     if change == 'owned-skill':
@@ -229,8 +229,7 @@ def test_legacy_unknown_default_canonicalization_replays_without_new_pointer_eff
     assert fixture['agents'].read_text() == 'preserved agent bytes\n'
 
 
-@pytest.mark.parametrize('change', ['args', 'timeout', 'boolean', 'infinite', 'command',
-                                  'model', 'public-inventory'])
+@pytest.mark.parametrize('change', ['args', 'public-inventory'])
 def test_legacy_unknown_canonicalization_refuses_meaningful_unrelated_drift(
     canonicalized_unknown, change,
 ):

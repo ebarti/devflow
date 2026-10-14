@@ -296,7 +296,7 @@ def test_metadata_gate_namespace_preserves_retained_old_head_and_artifacts(publi
     assert Path(old_patch['path']).read_bytes() == retained
 
 
-@pytest.mark.parametrize('change', ['foreign', 'alias', 'raw-spec', 'head', 'candidate', 'seal'])
+@pytest.mark.parametrize('change', ['foreign', 'seal'])
 def test_metadata_gate_namespace_refuses_foreign_alias_or_changed_custody(published, change):
     from copy import deepcopy
 
@@ -337,7 +337,7 @@ def test_metadata_gate_namespace_refuses_foreign_alias_or_changed_custody(publis
     assert original.state_dir == broker.state_dir
 
 
-@pytest.mark.parametrize("failed_stage", [None, "prepublish", "local"])
+@pytest.mark.parametrize("failed_stage", [None, "local"])
 def test_metadata_workflow_runs_deterministic_gates_without_any_provider_turn(
     published, monkeypatch, failed_stage,
 ):

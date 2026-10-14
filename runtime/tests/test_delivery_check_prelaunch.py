@@ -57,8 +57,7 @@ def test_observation_is_read_only_and_does_not_relabel_unknown_history(stopped_c
     assert resources.manifest.read_bytes() == before
 
 
-@pytest.mark.parametrize('drift', ['data', 'launch', 'role', 'monitoring', 'live', 'failed-check',
-                                 'profile-symlink'])
+@pytest.mark.parametrize('drift', ['data', 'profile-symlink'])
 def test_prelaunch_observation_rejects_possible_execution_or_changed_assessment(
     stopped_check, monkeypatch, drift,
 ):

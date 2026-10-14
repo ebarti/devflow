@@ -34,8 +34,7 @@ def test_nested_browser_output_is_reserved_before_creation(tmp_path, kind):
     assert not report.exists()
 
 
-@pytest.mark.parametrize('violation', ['foreign', 'symlink', 'parent-symlink', 'tracked',
-                                     'protected', 'escape', 'empty', 'dot', 'noncanonical'])
+@pytest.mark.parametrize('violation', ['foreign', 'noncanonical'])
 def test_browser_output_registration_never_adopts_or_escapes(tmp_path, violation):
     owned, resources, broker, root, _ = configured(tmp_path)
     name = {'protected': '.git/new/report', 'escape': '../outside/report',

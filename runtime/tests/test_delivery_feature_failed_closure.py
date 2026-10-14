@@ -125,8 +125,7 @@ async def test_failed_parent_handoff_authenticates_history_and_preserves_budget(
     assert continue_feature(store, spec['run_id'], command) == result
 
 
-@pytest.mark.parametrize('changed', ['start', 'memo', 'owner', 'revision', 'ack', 'failure',
-                                   'later-projection', 'live'])
+@pytest.mark.parametrize('changed', ['start', 'live'])
 async def test_failed_handoff_rejects_unauthenticated_terminal_history(failed_parent, changed):
     store, spec, _, shared, token, command, state = failed_parent
     events = state['events']

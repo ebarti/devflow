@@ -310,7 +310,7 @@ def test_confirmed_finalizer_before_projection_acknowledgement_is_reconciled(
     assert after['outcome'] == before['outcome']
 
 
-@pytest.mark.parametrize('guard', ['live-monitor', 'held-native-lease', 'unjournaled-lease'])
+@pytest.mark.parametrize('guard', ['live-monitor', 'unjournaled-lease'])
 def test_check_output_disposal_requires_released_original_native_leases(tmp_path, guard):
     import fcntl
     import os

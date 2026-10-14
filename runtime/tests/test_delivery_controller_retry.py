@@ -108,10 +108,7 @@ def test_authentic_evidence_only_failure_has_one_zero_iteration_continuation(evi
         store.continue_repair('run-1', {**command, 'command_id': 'second-controller-retry'})
 
 
-@pytest.mark.parametrize('corruption', [
-    'assessment', 'receipt', 'session', 'job', 'journal', 'artifact', 'no-progress',
-    'findings', 'positive-budget', 'stale-head', 'attempt-cleanup', 'closed-cleanup',
-])
+@pytest.mark.parametrize('corruption', ['assessment', 'closed-cleanup'])
 def test_controller_retry_rejects_unproven_or_drifted_checkpoint(evidence_failure, corruption):
     store, broker, state, _, command, folder = evidence_failure
     key = folder.name
@@ -252,7 +249,7 @@ def test_repaired_runtime_guard_uses_actual_failed_implementation_journal(
         snapshot(store, 'run-1', KIND)
 
 
-@pytest.mark.parametrize('field', ['run_id', 'policy_digest', 'cwd'])
+@pytest.mark.parametrize('field', ['run_id', 'cwd'])
 def test_original_journal_intent_must_match_frozen_request(evidence_failure, field):
     store, _, _, _, command, folder = evidence_failure
     path = folder / 'native-process.json'

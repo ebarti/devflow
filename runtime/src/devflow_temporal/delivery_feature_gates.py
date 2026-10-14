@@ -45,6 +45,14 @@ class GateAdmissionError(ValueError):
         }
 
 
+class _FailedSelectorTests(ValueError):
+    """Fully attributed failed tests; still never passing selector evidence."""
+
+    def __init__(self, message, receipts):
+        super().__init__(message)
+        self.receipts = receipts
+
+
 def selector_path(selector: str) -> str:
     # The current execution protocol selects whole files. Node IDs and line
     # filters need distinct case receipts and are deliberately not inferred.
@@ -670,13 +678,19 @@ def selector_evidence(
     receipts = []
     for source in sources:
         values = counts[source["selector"]]
-        if not values["passed"] or values["failed"] or values["skipped"]:
+        if not (values["passed"] or values["failed"]) or values["skipped"]:
             raise ValueError(
                 "required selector contributed no complete passing evidence: " + source["selector"]
             )
         if hashlib.sha256(Path(source["path"]).read_bytes()).hexdigest() != source["sha256"]:
             raise ValueError("selected test source changed during verification")
         receipts.append({**source, **values})
+    failed = [item for item in receipts if item["failed"]]
+    if failed:
+        raise _FailedSelectorTests(
+            "required selector contributed no complete passing evidence: " + failed[0]["selector"],
+            receipts,
+        )
     return receipts
 
 

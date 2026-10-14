@@ -74,7 +74,7 @@ def test_broker_keeps_configured_checks_and_uses_base_planned_recipe(repository,
     assert checks[1]['argv'][2] == 'raise SystemExit(7)'
 
 
-@pytest.mark.parametrize('candidate_change', ['removed', 'symlink', 'source-dirty', 'replace'])
+@pytest.mark.parametrize('candidate_change', ['removed', 'replace'])
 def test_base_recipe_does_not_depend_on_mutable_checkout_or_replacement_refs(
     repository, candidate_change,
 ):

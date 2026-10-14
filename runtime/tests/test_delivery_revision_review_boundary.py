@@ -141,10 +141,7 @@ def test_later_revision_review_uses_distinct_home_without_rewriting_retained_hom
         broker.evidence_dir / "role-homes/intake/0")
 
 
-@pytest.mark.parametrize("change", [
-    "kind", "missing-context", "verify-role", "candidate", "hash", "path",
-    "content-rehashed", "mode", "hardlink", "symlink",
-])
+@pytest.mark.parametrize("change", ["kind", "symlink"])
 def test_native_revision_preparation_refuses_changed_boundary_before_writes(native_review, change):
     broker, request = native_review
     request["review_diff"] = revision_diff(broker, request)

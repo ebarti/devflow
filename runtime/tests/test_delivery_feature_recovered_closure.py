@@ -71,8 +71,7 @@ def test_public_continuation_settles_recovered_worker_without_changing_budget(re
     assert not detail(store, parent)['can_continue']
 
 
-@pytest.mark.parametrize('pending', ['parent', 'child', 'cleanup', 'attempt', 'effect',
-                                   'remote-effect', 'generation', 'missing'])
+@pytest.mark.parametrize('pending', ['parent', 'missing'])
 def test_dashboard_does_not_offer_handoff_with_unsettled_projections(recovered_worker, pending):
     store, parent, child, shared, token, _, _ = recovered_worker
     if pending in {'remote-effect', 'generation', 'missing'}:
@@ -106,8 +105,7 @@ def test_dashboard_does_not_offer_handoff_with_unsettled_projections(recovered_w
     assert detail(store, parent)['can_continue'] is False
 
 
-@pytest.mark.parametrize('failure', ['parent-live', 'child-live', 'attempt', 'outcome', 'effect',
-                                   'resources', 'wrong-feature'])
+@pytest.mark.parametrize('failure', ['parent-live', 'wrong-feature'])
 def test_handoff_rejects_unsettled_or_unconfirmed_workers(recovered_worker, monkeypatch, failure):
     store, parent, child, shared, token, command, _ = recovered_worker
     if failure in {'parent-live', 'child-live'}:

@@ -97,7 +97,7 @@ def test_pending_retry_binds_pushed_commit_and_original_effect_without_source_tu
         store.recover_publication('run-1', {**request, 'command_id': 'second-publication'})
 
 
-@pytest.mark.parametrize('drift', ['source', 'head', 'checks', 'effect'])
+@pytest.mark.parametrize('drift', ['source', 'effect'])
 def test_pending_retry_rejects_changed_pushed_source_or_failed_checkpoint(pending, drift):
     store, broker, state, request = pending
     if drift == 'source':

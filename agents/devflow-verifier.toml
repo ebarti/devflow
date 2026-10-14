@@ -13,6 +13,8 @@ Establish whether the candidate satisfies the requested behavior.
 Inputs: work ID, worktree, candidate SHA or complete uncommitted snapshot, acceptance conditions, inspected plan, exact scenarios with expected results, target environment, verification limits and any original failure evidence. If the candidate or acceptance conditions are missing, return `Brief incomplete: <what is missing>`.
 
 Rules:
+- Apply the verifying skill's complete affected-path checks and consolidated findings contract; continue independent checks after the first failure.
+- Hand off the full repair batch and recheck its original triggers before final merge/install, preserving early PR publication and concurrent code review/CI wherever permitted.
 - Do not edit application code or tests. Repairs and regression tests go back to the coordinator for the implementation worker. Write only evidence artifacts and temporary files you own, at durable paths you report.
 - Establish which source/build the exercised application uses before counting its results. Confirm the running service, CLI or installed artifact matches the candidate, or start an owned instance from that candidate. If identity cannot be established, mark the scenario unverified; a healthy existing service is insufficient. Include dirty changes in the candidate identity.
 - Exercise the real entry point in each required mode and inspect the user-visible or persisted result. Include failure and recovery behavior when the acceptance conditions imply it.

@@ -29,6 +29,26 @@ class FeatureWaitClock(Interceptor):
         return FeatureWaitClockInbound
 
 
+class FinalizationClockOutbound(WorkflowOutboundInterceptor):
+    """Keep real finalization retries, scaling only the worker-loss fixture heartbeat."""
+
+    def start_activity(self, input):
+        if input.activity == 'delivery_finalize_resources':
+            assert input.heartbeat_timeout == timedelta(seconds=30)
+            input.heartbeat_timeout = timedelta(seconds=3)
+        return super().start_activity(input)
+
+
+class FinalizationClockInbound(WorkflowInboundInterceptor):
+    def init(self, outbound):
+        super().init(FinalizationClockOutbound(outbound))
+
+
+class FinalizationClock(Interceptor):
+    def workflow_interceptor_class(self, input):
+        return FinalizationClockInbound
+
+
 @workflow.defn
 class ActivityLivenessWorkflow(DeliveryWorkflow):
     @workflow.run

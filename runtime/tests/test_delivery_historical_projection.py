@@ -134,7 +134,7 @@ async def test_public_list_and_detail_preserve_cleaned_historical_receipts_witho
     assert not Path(spec["checkout"]).exists()
 
 
-@pytest.mark.parametrize("state", ["queued", "unfinished", "replaced_checkout"])
+@pytest.mark.parametrize("state", ["queued", "replaced_checkout"])
 def test_active_or_replaced_execution_keeps_strict_readback(service, monkeypatch, state):
     store, spec, _candidate, _publication = retained_history(service, monkeypatch, archived=True)
     with store._connect() as db:

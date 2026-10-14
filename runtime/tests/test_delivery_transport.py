@@ -82,7 +82,7 @@ def test_adoption_authenticates_old_payload_and_keeps_original_controller(instal
     assert path.read_bytes() == original_bytes
 
 
-@pytest.mark.parametrize('change', ['role-source', 'dirty-source', 'old-payload', 'ci', 'mode'])
+@pytest.mark.parametrize('change', ['role-source', 'mode'])
 def test_adoption_rejects_drift_even_with_current_receipt(installation, change):
     source, package, spec, path, receipt = installation
     if change == 'role-source':

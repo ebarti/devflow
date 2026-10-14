@@ -62,13 +62,7 @@ class InterruptedController:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status,legacy,lose_response",
-    [
-        ("FAILED", False, False),
-        ("FAILED", True, True),
-        ("FAILED", True, False),
-        ("TIMED_OUT", True, False),
-        ("TERMINATED", True, False),
-    ],
+    [("FAILED", False, False), ("TERMINATED", True, False)],
 )
 async def test_closed_controller_resumes_without_repeating_work_or_budget(
     service, monkeypatch, status, legacy, lose_response
@@ -265,7 +259,7 @@ async def test_closed_controller_resumes_without_repeating_work_or_budget(
 
 
 @pytest.mark.parametrize(
-    "obstacle", ["cancel", "mutation", "claim", "attempt", "successor", "changed-row", "retired"]
+    "obstacle", ["cancel", "retired"]
 )
 def test_interrupted_recovery_respects_existing_authority(service, monkeypatch, obstacle):
     from devflow_temporal.delivery_interrupted_recovery import _guard

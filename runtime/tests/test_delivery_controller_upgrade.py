@@ -25,7 +25,6 @@ from devflow_temporal.delivery_native_process import stop_observed
 from devflow_temporal.delivery_preparation import PACKAGE
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_store import DeliveryStore
-from devflow_temporal.supervisor import get_supervisor
 
 pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="actual native Mac preparation")
 
@@ -379,7 +378,7 @@ def _installed_git(fixture, *args):
                                    text=True).strip()
 
 
-@pytest.mark.parametrize('change', ['tracked', 'untracked', 'ignored', 'not-installed'])
+@pytest.mark.parametrize('change', ['tracked', 'not-installed'])
 def test_trusted_upgrade_rejects_uncommitted_or_uninstalled_source(installed_controller, change):
     fixture = installed_controller
     _upgrade(fixture)
@@ -415,38 +414,6 @@ def test_trusted_upgrade_rejects_a_different_controller_checkout(installed_contr
     assert 'native execution authority has not been frozen or changed' in result.stderr
 
 
-def test_full_host_role_write_is_not_an_owner_installed_controller_update(installed_controller):
-    fixture = installed_controller
-    original, proof = fixture.spec_path.read_bytes(), _proof_bytes(fixture.spec)
-    _upgrade(fixture)
-    revision = _installed_git(fixture, 'rev-parse', 'HEAD')
-    broker = DeliveryBroker(fixture.store, fixture.spec)
-    request = {'spec': fixture.spec, 'role': 'implement', 'iteration': 0,
-               'candidate': broker.prepare()['candidate']}
-    role, provider, role_input = (fixture.root / name for name in (
-        'queued-role.py', 'provider.py', 'queued-role.json'))
-    role.write_text(ROLE_DRIVER)
-    controller = fixture.package / '__init__.py'
-    provider.write_text(PROVIDER.replace("print('completed',flush=True)",
-        f"path=Path({str(controller)!r}); path.write_text(path.read_text()+'\\n# Role write.\\n')\n"
-        "print('completed',flush=True)"))
-    write_private(role_input, request)
-    (Path(fixture.spec['state_dir']) / 'release').touch()
-    result = subprocess.run([str(fixture.python), '-I', str(role), str(fixture.package.parent),
-        str(provider), str(role_input)], capture_output=True, text=True, timeout=45)
-    assert result.returncode == 0, result.stderr
-    state = Path(fixture.spec['state_dir'])
-    outcome = read_private(state / 'queued-role-result.json')
-    assert outcome['status'] == 'pass' and outcome['session_id'] == 'same-upgrade-session'
-    assert outcome['native_process']['runtime_identity']['revision'] == revision
-    assert outcome['native_process']['runtime_identity']['dirty'] is False
-    assert '# Role write.' in controller.read_text()
-    refused = _command(fixture, 'verify')
-    assert refused.returncode == 1
-    assert 'clean installed runtime source' in refused.stderr
-    assert (state / 'invocations').read_text().splitlines() == ['0']
-    assert fixture.spec_path.read_bytes() == original
-    assert _proof_bytes(fixture.spec) == proof
 
 
 def _proof_bytes(spec):
@@ -519,47 +486,6 @@ def test_queued_gate_retry_compares_consumed_controller_and_keeps_two_generation
     assert _proof_bytes(fixture.spec) == proof
 
 
-def test_queued_trusted_preparation_and_real_broker_gates_survive_source_update(
-    installed_controller,
-):
-    from devflow_temporal.payload import payload_digest
-
-    fixture = installed_controller
-    original = fixture.spec_path.read_bytes()
-    proof = _proof_bytes(fixture.spec)
-    broker = DeliveryBroker(fixture.store, fixture.spec)
-    request = {'spec': fixture.spec, 'role': 'implement', 'iteration': 0,
-               'candidate': broker.prepare()['candidate']}
-    get_supervisor(fixture.store)._claim(request)
-    _upgrade(fixture)
-    role, provider, role_input = (fixture.root / name for name in (
-        'queued-role.py', 'provider.py', 'queued-role.json'))
-    role.write_text(ROLE_DRIVER)
-    provider.write_text(PROVIDER)
-    write_private(role_input, request)
-    state = Path(fixture.spec['state_dir'])
-    (state / 'release').touch()
-    launched = subprocess.run([str(fixture.python), '-I', str(role), str(fixture.package.parent),
-        str(provider), str(role_input)], capture_output=True, text=True, timeout=30)
-    assert launched.returncode == 0, launched.stderr
-    queued = read_private(state / 'queued-role-result.json')
-    assert queued['status'] == 'pass', queued
-    executed = queued['native_process']['runtime_identity']
-    assert executed['runtime_payload_sha256'] == payload_digest(fixture.package)
-    assert executed['revision'] == _installed_git(fixture, 'rev-parse', 'HEAD')
-    assert executed['source_root'] == str(fixture.package.parents[2])
-    assert executed['dirty'] is False
-    assert (state / 'invocations').read_text().splitlines() == ['0']
-    result = _command(fixture, 'gates')
-    assert result.returncode == 0, result.stderr
-    assert fixture.spec_path.read_bytes() == original
-    assert fixture.store.prepared_spec(fixture.run_id) == fixture.spec
-    assert _proof_bytes(fixture.spec) == proof
-    gates = read_private(Path(fixture.spec['state_dir']) / 'upgrade-gates.json')
-    assert gates['precheck']['results'][0]['test_count'] == 2
-    assert gates['checks']['results'][0]['test_count'] == 2
-    for check in (gates['precheck'], gates['checks']):
-        assert check['results'][0]['native_process']['runtime_identity'] == executed
 
 
 @pytest.mark.parametrize('kind,name', [

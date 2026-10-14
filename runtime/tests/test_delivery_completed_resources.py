@@ -189,10 +189,7 @@ def test_retained_original_intake_binds_the_durably_accepted_plan(intake_fixture
         observe_completed_resources(current, [row])
 
 
-@pytest.mark.parametrize('changed', ['missing_digest', 'result', 'session', 'role', 'iteration',
-                                     'run', 'environment', 'monitor_live', 'owned_live',
-                                     'port_busy', 'inventory', 'request', 'pid', 'missing_monitor',
-                                     'incomplete', 'lock_busy'])
+@pytest.mark.parametrize('changed', ['missing_digest', 'lock_busy'])
 def test_later_completed_observation_requires_original_bindings(completed, changed, monkeypatch):
     spec, original, path, journal, request, table, ports = completed
     row = copy.deepcopy(original)

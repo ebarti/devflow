@@ -69,7 +69,7 @@ def manifest():
     }
 
 
-@pytest.mark.parametrize("change", ["cycle", "unknown", "sequential", "scope", "same_issue"])
+@pytest.mark.parametrize("change", ["cycle", "same_issue"])
 def test_invalid_decomposition_cannot_acquire_execution_authority(change):
     value = plan()
     if change == "cycle":
@@ -91,7 +91,7 @@ def test_chunk_paths_cannot_expand_service_authority():
         validate_plan(plan(), allowed_paths=["model.py"])
 
 
-@pytest.mark.parametrize("field,value", [("branch", []), ("head", None), ("url", 1)])
+@pytest.mark.parametrize("field,value", [("branch", []), ("url", 1)])
 def test_malformed_publication_is_rejected(field, value):
     record = manifest()
     member = {

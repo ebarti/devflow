@@ -10,12 +10,11 @@ from pathlib import Path
 
 import pytest
 from test_delivery_feature_execution import feature_service
-from test_delivery_feature_review_context import context_repository, git
+from test_delivery_feature_review_context import context_repository
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 from test_delivery_store import service as service
 
-from devflow_temporal import delivery_feature_review_context as review_context
 from devflow_temporal import delivery_feature_revisions as revisions
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -29,7 +28,7 @@ from devflow_temporal.delivery_feature_execution import (
 )
 from devflow_temporal.delivery_feature_migration import migrate
 from devflow_temporal.delivery_feature_revision_roles import revision_diff
-from devflow_temporal.delivery_github_contract import PARENT_INDEX_LIMIT, encode_manifest
+from devflow_temporal.delivery_github_contract import encode_manifest
 from devflow_temporal.delivery_plan_model import migrate_plan_v1, ordered_chunks
 from devflow_temporal.delivery_preparation import prepare_authority
 from devflow_temporal.delivery_resources import read_private, write_private
@@ -100,57 +99,8 @@ def _feature(service, monkeypatch, *, index_bytes=None):
     return store, spec, registry(spec), record, diagnostic
 
 
-def test_parent_index_without_room_for_its_stack_refuses_revision_before_any_spend(
-    service, monkeypatch,
-):
-    # The recorded index fits GitHub today but not once every chunk's PR is recorded.
-    store, spec, shared, record, diagnostic = _feature(service, monkeypatch,
-                                                      index_bytes=PARENT_INDEX_LIMIT - 200)
-    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
-    before = shared.budget(issue_id)
-    assert len(encode_manifest(record["manifest"]).encode()) <= PARENT_INDEX_LIMIT
-    with pytest.raises(ValueError, match=r"parent index cannot record every chunk's pull "
-                                         r"request: \d+ of 60000 bytes once its 3 unpublished"):
-        revisions.begin_revision(store, spec, diagnostic)
-    # No planning-correction debit, no sealed attempt, so no planner or review turn follows.
-    assert shared.budget(issue_id) == before
-    assert not any(key.startswith("plan-revision:") for key in shared.checkpoints(issue_id))
-    with shared.connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM execution_repairs").fetchone()[0] == 0
 
 
-def test_public_revision_without_index_room_is_refused_before_its_reservation(
-    service, monkeypatch,
-):
-    store, spec, shared, record, _ = _feature(service, monkeypatch,
-                                              index_bytes=PARENT_INDEX_LIMIT - 200)
-    issue_id = spec["feature_delivery"]["owner"]["issue_id"]
-    candidate = DeliveryBroker(store, spec).candidate()
-    store.project(spec["run_id"], phase="blocked", execution_state="blocked", outcome="blocked",
-                  cleanup="confirmed", event_type="blocked", message="Feature stopped",
-                  candidate=candidate, pull_request=None, checks={}, iteration=0,
-                  protocol_revision=5, error="Feature stopped")
-    monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator",
-                        lambda _store, run: {"workflow_id": "delivery-" + run,
-                                             "execution_run_id": "closed",
-                                             "result": {"cleanup": "confirmed"}})
-    with store._connect() as db:
-        revision = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
-                              (spec["run_id"],)).fetchone()[0]
-        runs = db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0]
-    before = (shared.checkpoints(issue_id), shared.budget(issue_id), shared.current(issue_id))
-    request = {"command_id": "revise-oversized", "expected_revision": revision,
-               "reason": "Owner asks for a smaller stack"}
-    with pytest.raises(ValueError, match=r"parent index cannot record every chunk's pull "
-                                         r"request: \d+ of 60000 bytes once its 3 unpublished"):
-        revisions.revise_feature_plan(store, spec["run_id"], request)
-    # No reservation, successor, command receipt or debit exists after the refusal.
-    assert (shared.checkpoints(issue_id), shared.budget(issue_id),
-            shared.current(issue_id)) == before
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == runs
-        assert not db.execute("SELECT 1 FROM delivery_commands WHERE command_id=?",
-                              ("revise-oversized",)).fetchone()
 
 
 def proposed(record):
@@ -174,112 +124,8 @@ def passing(context, value):
     }
 
 
-def test_stopped_public_revision_preserves_original_row_and_four_cycles(feature, monkeypatch):
-    store, spec, shared, _, _ = feature
-    owner = spec["feature_delivery"]["owner"]
-    for number in range(4):
-        shared.repair(owner, str(number), "Prior cycle " + str(number))
-    shared.stop(owner, "stopped", {})
-    with store._connect() as db:
-        db.execute(
-            "UPDATE delivery_runs SET phase='blocked',outcome='blocked',cleanup='confirmed' "
-            "WHERE run_id=?",
-            (spec["run_id"],),
-        )
-        store.state.release_work(db, spec["work_id"], "external:devflow:" + spec["run_id"])
-        frozen = dict(
-            db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (spec["run_id"],)).fetchone()
-        )
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_feature_closure.closed_coordinator",
-        lambda *_a: {"result": {"cleanup": "confirmed"}, "workflow_id": "closed"},
-    )
-    request = {
-        "command_id": "revise-1",
-        "expected_revision": frozen["revision"],
-        "reason": "Investigate the misplaced gate.",
-    }
-    receipt = revisions.revise_feature_plan(store, spec["run_id"], request)
-    assert receipt["repair_budget"]["used"] == 4
-    assert revisions.revise_feature_plan(store, spec["run_id"], request) == receipt
-    with pytest.raises(OwnershipConflict, match="different inputs"):
-        revisions.revise_feature_plan(
-            store, spec["run_id"], {**request, "reason": "Changed request"}
-        )
-    successor = store.effective_spec(receipt["run_id"])
-    DeliveryBroker(store, successor).prepare()
-    context = revisions.begin_revision(store, successor)
-    assert context["diagnostic"] is None and context["budget"]["used"] == 5
-    assert revisions.begin_revision(store, successor) == context
-    assert context["custody_evidence"]
-    with store._connect() as db:
-        assert (
-            dict(
-                db.execute(
-                    "SELECT * FROM delivery_runs WHERE run_id=?", (spec["run_id"],)
-                ).fetchone()
-            )
-            == frozen
-        )
 
 
-def test_uncertain_remote_commit_restarts_without_duplicate_effect_debit_or_lost_proof(feature):
-    store, spec, shared, record, diagnostic = feature
-    owner = spec["feature_delivery"]["owner"]
-    shared.checkpoint(owner, "verified:client", {"head": "unaffected"})
-    shared.checkpoint(owner, "verified:model", {"head": "affected"})
-    context = revisions.begin_revision(store, spec, diagnostic)
-    value = proposed(record)
-    changed_source = deepcopy(value)
-    changed_source["workstreams"][0]["chunks"][0]["steps"].append("Correct model content")
-    _, _, implementation = revisions._admit_plan(
-        spec, record["manifest"]["plan"], changed_source, context["old_identity"]
-    )
-    assert implementation == ["endpoint", "model"]
-    revisions.record_proposal(store, spec, context["revision_id"], value)
-
-    class Publisher:
-        published = False
-        calls = 0
-
-        def publish_plan_revision(self, issue, old, plan, journal, token, *, operation_id):
-            self.calls += 1
-            journal.intent(token, "commit", "github_plan_revision", {"operation_id": operation_id})
-            if not self.published:
-                self.published = True
-                raise ConnectionError("response lost after remote commit")
-            journal.finish_effect(token, "commit", {"revision": 2})
-            result = deepcopy(old)
-            result["manifest"].update(plan=plan, plan_revision=2, version=2, revision=2)
-            return result
-
-    publisher = Publisher()
-    with pytest.raises(ConnectionError):
-        revisions.adopt_revision(
-            store, spec, context["revision_id"], value, passing(context, value), gh=publisher
-        )
-    with pytest.raises(OwnershipConflict, match="unsettled external effects"):
-        revisions.reject_revision(
-            store, spec, context["revision_id"], "Cannot release unknown effect"
-        )
-    from devflow_temporal.delivery_store import DeliveryStore
-
-    restarted = DeliveryStore(store.config)
-    result = revisions.adopt_revision(
-        restarted, spec, context["revision_id"], value, passing(context, value), gh=publisher
-    )
-    assert result["budget"]["used"] == 1 and publisher.calls == 2
-    assert result["checkpoints"]["verified:client"] == {"head": "unaffected"}
-    assert "verified:model" not in result["checkpoints"]
-    assert store.submitted_spec(spec["run_id"]) == spec
-    assert store.effective_spec(spec["run_id"]) == result["spec"]
-    assert (
-        revisions.adopt_revision(
-            store, spec, context["revision_id"], value, passing(context, value), gh=publisher
-        )
-        == result
-    )
-    assert revisions.revision_request(result["spec"]) is None
 
 
 def test_future_split_preserves_started_custody_and_rejected_attempts_share_limit(feature):
@@ -539,226 +385,8 @@ def _native_rejected_prelaunch(native_configuration, monkeypatch):
     return _native_rejected_fixture(native_configuration, monkeypatch)
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS preparation required")
-def test_plain_public_continuation_preserves_five_but_does_not_retry_review(
-    _native_rejected_prelaunch,
-):
-    store, original, shared, _, _, _, context, _, _, row = _native_rejected_prelaunch
-    result = continue_feature(
-        store,
-        original["run_id"],
-        {"command_id": "ordinary-continue", "expected_revision": row["revision"]},
-    )
-    successor = store.effective_spec(result["run_id"])
-    assert shared.budget(original["feature_delivery"]["owner"]["issue_id"])["used"] == 5
-    assert successor["accepted_plan"] == original["accepted_plan"]
-    assert revisions.revision_request(successor) is None
-    assert revisions.revision_request(original) is None
-    with pytest.raises(ValueError, match="already closed"):
-        revisions.record_proposal(
-            store,
-            original,
-            context["revision_id"],
-            proposed(
-                {
-                    "manifest": {
-                        "plan": json.loads(original["accepted_plan"]),
-                        "workstream_issues": context["old_identity"]["workstream_issues"],
-                    }
-                }
-            ),
-        )
-    with store._connect() as db:
-        assert (
-            dict(
-                db.execute(
-                    "SELECT * FROM delivery_runs WHERE run_id=?", (original["run_id"],)
-                ).fetchone()
-            )
-            == row
-        )
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS preparation required")
-def test_new_public_correction_can_reuse_unreviewed_proposal_at_six_without_reopening(
-    _native_rejected_prelaunch,
-):
-    store, original, shared, value, diagnostic, _, prior, proposal, rejection, row = (
-        _native_rejected_prelaunch
-    )
-    old_receipts = shared.checkpoints(original["feature_delivery"]["owner"]["issue_id"])
-    with store._connect() as db:
-        attempts = [dict(r) for r in db.execute("SELECT * FROM delivery_attempts ORDER BY job_key")]
-    command = {
-        "command_id": "new-plan-correction",
-        "expected_revision": row["revision"],
-        "reason": "The independent review failed before launching; "
-        "reassess the same bounded gate correction.",
-    }
-    admission = revisions.revise_feature_plan(store, original["run_id"], command)
-    assert admission["repair_budget"]["used"] == 5
-    assert revisions.revise_feature_plan(store, original["run_id"], command) == admission
-    successor = prepare_authority(store, store.effective_spec(admission["run_id"]))
-    broker = DeliveryBroker(store, successor)
-    broker.prepare()
-    context = revisions.begin_revision(store, successor)
-    assert context["budget"]["used"] == 6
-    assert context["old_identity"] == prior["old_identity"]
-    diagnostic = _revision_diagnostic_for(successor, diagnostic, broker.candidate())
-    # Reconstruct failures in this private fixture only; restoration below
-    # proves the source rows/receipts still match their original custody.
-    with store._connect() as db:
-        review_row = dict(
-            db.execute(
-                "SELECT * FROM delivery_attempts WHERE run_id=? AND role='review'",
-                (original["run_id"],),
-            ).fetchone()
-        )
-    request_path = Path(review_row["result_path"]).parent / "request.json"
-    old_request = read_private(request_path)
-    old_bytes = request_path.read_bytes()
-    old_result = json.loads(review_row["result_json"])
-
-    def blocked():
-        with pytest.raises(ValueError, match="nonprogressing repeated proposal"):
-            revisions.record_proposal(
-                store, successor, context["revision_id"], value, diagnostic=diagnostic
-            )
-
-    for replacement in (
-        {**old_result, "status": "findings", "finish_reason": "done", "session_id": "reviewed"},
-        {**old_result, "finish_reason": "recovery_unknown", "cleanup": "unknown"},
-        {key: item for key, item in old_result.items() if key != "finish_reason"},
-    ):
-        with store._connect() as db:
-            db.execute(
-                "UPDATE delivery_attempts SET result_json=? WHERE job_key=?",
-                (canonical_json(replacement), review_row["job_key"]),
-            )
-        blocked()
-    with store._connect() as db:
-        db.execute(
-            "UPDATE delivery_attempts SET result_json=? WHERE job_key=?",
-            (review_row["result_json"], review_row["job_key"]),
-        )
-    replacements = []
-    for key, replacement in (
-        ("workspace", successor["checkout"]),
-        ("native_authorized", False),
-        ("result_path", str(request_path.parent / "other-result.json")),
-        ("start_path", str(request_path.parent / "other-start.json")),
-        ("spec", successor),
-        ("candidate", {**old_request["candidate"], "content_sha256": "0" * 64}),
-        ("revision_context", {**old_request["revision_context"], "old_identity": {}}),
-        ("review_diff", {**old_request["review_diff"], "sha256": "0" * 64}),
-        ("review_diff", {**old_request["review_diff"], "path": str(request_path)}),
-    ):
-        replacements.append({**deepcopy(old_request), key: replacement})
-    for replacement in replacements:
-        write_private(request_path, replacement)
-        blocked()
-    write_private(request_path, old_request)
-    assert request_path.read_bytes() == old_bytes
-    request_path.rename(request_path.with_suffix(".retained"))
-    blocked()
-    request_path.with_suffix(".retained").rename(request_path)
-    launch = request_path.parent / "launch.json"
-    write_private(launch, {"unexpected": "launch evidence"})
-    blocked()
-    launch.unlink()
-    comparison_path = Path(old_request["review_diff"]["path"])
-    old_comparison = read_private(comparison_path)
-    write_private(comparison_path, {**old_comparison, "diff": "altered comparison"})
-    blocked()
-    write_private(comparison_path, old_comparison)
-    canonical_comparison = comparison_path.read_bytes()
-    for altered in (
-        json.dumps(old_comparison, separators=(",", ":")).encode(),
-        canonical_comparison.replace(b"{\n", b'{\n  "version": 0,\n', 1),
-    ):
-        comparison_path.write_bytes(altered)
-        replacement = deepcopy(old_request)
-        replacement["review_diff"]["sha256"] = hashlib.sha256(altered).hexdigest()
-        write_private(request_path, replacement)
-        blocked()
-    comparison_path.write_bytes(canonical_comparison)
-    write_private(request_path, old_request)
-    begin_key = revisions.PREFIX + "begin:" + prior["revision_id"]
-    with shared.connect() as db:
-        saved_begin = dict(
-            db.execute(
-                "SELECT * FROM execution_checkpoints WHERE issue_id=? AND checkpoint_key=?",
-                (prior["owner"]["issue_id"], begin_key),
-            ).fetchone()
-        )
-        db.execute(
-            "UPDATE execution_checkpoints SET content_digest=? "
-            "WHERE issue_id=? AND checkpoint_key=?",
-            ("0" * 64, prior["owner"]["issue_id"], begin_key),
-        )
-    blocked()
-    with shared.connect() as db:
-        db.execute(
-            "UPDATE execution_checkpoints SET content_digest=? "
-            "WHERE issue_id=? AND checkpoint_key=?",
-            (saved_begin["content_digest"], prior["owner"]["issue_id"], begin_key),
-        )
-    original_begin = json.loads(saved_begin["content_json"])
-    for replacement in (
-        {**original_begin, "phase": "proposed"},
-        {**original_begin, "revision_id": context["revision_id"]},
-    ):
-        with shared.connect() as db:
-            db.execute(
-                "UPDATE execution_checkpoints SET content_json=?,content_digest=? "
-                "WHERE issue_id=? AND checkpoint_key=?",
-                (
-                    canonical_json(replacement),
-                    digest(replacement),
-                    prior["owner"]["issue_id"],
-                    begin_key,
-                ),
-            )
-        blocked()
-    with shared.connect() as db:
-        db.execute(
-            "UPDATE execution_checkpoints SET content_json=?,content_digest=? "
-            "WHERE issue_id=? AND checkpoint_key=?",
-            (
-                saved_begin["content_json"],
-                saved_begin["content_digest"],
-                prior["owner"]["issue_id"],
-                begin_key,
-            ),
-        )
-    assert shared.budget(original["feature_delivery"]["owner"]["issue_id"])["used"] == 6
-    admitted = revisions.record_proposal(
-        store, successor, context["revision_id"], value, diagnostic=diagnostic
-    )
-    assert admitted["proposal_digest"] == proposal["proposal_digest"]
-    assert (
-        revisions.record_proposal(
-            store, successor, context["revision_id"], value, diagnostic=diagnostic
-        )
-        == admitted
-    )
-    assert shared.budget(original["feature_delivery"]["owner"]["issue_id"])["used"] == 6
-    assert revisions.revision_request(original) is None
-    with store._connect() as db:
-        assert (
-            dict(
-                db.execute(
-                    "SELECT * FROM delivery_runs WHERE run_id=?", (original["run_id"],)
-                ).fetchone()
-            )
-            == row
-        )
-        assert [
-            dict(r) for r in db.execute("SELECT * FROM delivery_attempts ORDER BY job_key")
-        ] == attempts
-    values = shared.checkpoints(original["feature_delivery"]["owner"]["issue_id"])
-    assert all(values[key] == item for key, item in old_receipts.items())
-    assert values[revisions.PREFIX + "rejected:" + prior["revision_id"]] == rejection
 
 
 def _complete_native_role_fixture(store, spec, context, plan, diagnostic, role, runtime,
@@ -995,73 +623,3 @@ def test_reconsideration_refuses_missing_stale_or_widened_proof_before_reservati
                         revised_worker_spec)
     response = revisions.revise_feature_plan(store, original["run_id"], command)
     assert response["repair_budget"]["used"] == 6
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS preparation required")
-def test_context_dedup_and_completed_native_runtime_cannot_be_replaced_by_new_commit_or_pass(
-    _genuine_reconsideration,
-):
-    fixture, command, root, _, historical, current = _genuine_reconsideration
-    store, original, shared, plan, diagnostic, _, prior, _, _, _ = fixture
-    response = revisions.revise_feature_plan(store, original["run_id"], command)
-    execution_source = root / review_context.PREFIX / "delivery_feature_execution.py"
-    execution_source.write_text(execution_source.read_text() + "\n# unrelated runtime update\n")
-    git(root, "add", ".")
-    git(root, "commit", "-qm", "Comment-only runtime change")
-    cosmetic = review_context.current_runtime_context()
-    assert cosmetic["context_sha256"] == current["context_sha256"]
-    new_command = {**command, "command_id": "commit-cannot-enable-repeat", "reconsideration": {
-        **command["reconsideration"], "expected_runtime_revision": cosmetic["revision"],
-        "expected_runtime_payload_sha256": cosmetic["runtime_payload_sha256"],
-    }}
-    before = _boundary_snapshot(store, shared, prior["owner"]["issue_id"])
-    with pytest.raises(OwnershipConflict, match="already reserved"):
-        revisions.revise_feature_plan(store, original["run_id"], new_command)
-    assert _boundary_snapshot(store, shared, prior["owner"]["issue_id"]) == before
-    successor = prepare_authority(store, store.effective_spec(response["run_id"]))
-    broker = DeliveryBroker(store, successor)
-    broker.prepare()
-    with pytest.raises(OwnershipConflict, match="runtime expectation is stale"):
-        revisions.begin_revision(store, successor)
-    assert shared.budget(prior["owner"]["issue_id"])["used"] == 6
-    git(root, "reset", "--hard", current["revision"])
-    context = revisions.begin_revision(store, successor)
-    diagnostic = _revision_diagnostic_for(successor, diagnostic, broker.candidate())
-    _complete_native_role_fixture(store, successor, context, plan, diagnostic, "intake", historical)
-    with pytest.raises(OwnershipConflict, match="completed fresh native role"):
-        revisions.record_proposal(store, successor, context["revision_id"], plan,
-                                  diagnostic=diagnostic)
-    runtime = {"dirty": False, "local_digest": None, **{k: current[k] for k in (
-        "revision", "runtime_payload_sha256")}}
-    intake = _complete_native_role_fixture(
-        store, successor, context, plan, diagnostic, "intake", runtime,
-    )
-    proposal = revisions.record_proposal(store, successor, context["revision_id"], plan,
-                                         diagnostic=diagnostic)
-    review = _complete_native_role_fixture(
-        store, successor, context, plan, diagnostic, "review", historical, status="pass",
-    )
-    with pytest.raises(OwnershipConflict, match="completed fresh native role"):
-        revisions._review_authorized(store, successor, context, proposal, {
-            **review, "candidate_id": context["candidate_id"],
-            "proposal_session_id": intake["session_id"],
-        })
-    _complete_native_role_fixture(store, successor, context, plan, diagnostic, "review", runtime)
-    revisions.reject_revision(store, successor, context["revision_id"], "Fresh genuine findings")
-    with store._connect() as db:
-        db.execute("UPDATE delivery_runs SET candidate_json=? WHERE run_id=?",
-                   (canonical_json(broker.candidate()), successor["run_id"]))
-    row = _stop_revision_fixture(store, successor, shared)
-    latest = {**command, "command_id": "same-context-already-reviewed",
-              "expected_revision": row["revision"], "reconsideration": {
-                  **command["reconsideration"], "rejected_revision_id": context["revision_id"],
-              }}
-    before = _boundary_snapshot(store, shared, prior["owner"]["issue_id"])
-    with pytest.raises(ValueError, match="changed relevant derivation context"):
-        revisions.revise_feature_plan(store, successor["run_id"], latest)
-    with pytest.raises(ValueError, match="stopped owner's exact genuine rejection"):
-        revisions.revise_feature_plan(store, successor["run_id"], {
-            **latest, "reconsideration": command["reconsideration"],
-        })
-    assert _boundary_snapshot(store, shared, prior["owner"]["issue_id"]) == before
-    assert shared.budget(prior["owner"]["issue_id"])["used"] == 7

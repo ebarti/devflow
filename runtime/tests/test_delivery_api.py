@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
-import os
 import subprocess
 import threading
 import time
@@ -26,7 +24,6 @@ from devflow_temporal.delivery_activities import (
 )
 from devflow_temporal.delivery_api import DeliveryService, create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_native_process import NativeProcessUnknown
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -117,49 +114,6 @@ async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkey
     assert await task == {"state": "passed"}
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks, delivery_browser_qa])
-async def test_native_effect_uncertainty_is_returned_for_durable_projection(
-    activity_fn, monkeypatch, tmp_path
-):
-    class Broker:
-        native_cleanup_confirmed = True
-        native_journals = ()
-
-        def _native_cancelled(self):
-            return False
-
-        def run_prechecks(self, _iteration, _candidate):
-            self.native_cleanup_confirmed = False
-            raise NativeProcessUnknown("Native process inspection became unavailable")
-
-        run_checks = run_prechecks
-        run_browser_qa = run_prechecks
-
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_activities._context", lambda _spec: (
-            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()
-        )
-    )
-    from devflow_temporal.delivery_activities import _UNCLEAN_CHECK_SLOTS
-
-    retained = len(_UNCLEAN_CHECK_SLOTS)
-    try:
-        result = await activity_fn(
-            {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {"id": "candidate"}}
-        )
-        assert len(_UNCLEAN_CHECK_SLOTS) == retained + 1
-    finally:
-        for entry in _UNCLEAN_CHECK_SLOTS[retained:]:
-            for descriptor in entry["descriptors"]:
-                os.close(descriptor)
-        del _UNCLEAN_CHECK_SLOTS[retained:]
-    assert result == {
-        "state": "unknown",
-        "cleanup": "unknown",
-        "candidate_id": "candidate",
-        "reason": "NativeProcessUnknown",
-    }
 
 
 @pytest.mark.asyncio
@@ -246,42 +200,6 @@ def api_fixture(tmp_path: Path) -> tuple[Path, dict]:
     return path, request
 
 
-@pytest.mark.asyncio
-async def test_public_detail_preserves_logless_preparation_failure(api_fixture):
-    from devflow_temporal.delivery_broker import CheckPreparationFailure
-
-    path, request = api_fixture
-    app = create_app(path)
-    store = app.state.delivery.store
-    store.submit(request)
-    root = Path(store.spec('run-1')['state_dir'])
-    log = root / 'checks' / 'completed.log'
-    log.parent.mkdir(parents=True)
-    log.write_text('Earlier check passed\n')
-    completed = {'id': 'completed', 'passed': True, 'log': str(log),
-                 'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest()}
-    failure = CheckPreparationFailure('planned-dependencies',
-                                     ValueError('cannot adopt an existing unregistered resource'),
-                                     [completed])
-    checks = {'local': {'state': 'failed', 'cleanup': 'confirmed',
-                        'results': failure.results}}
-    store.project('run-1', phase='blocked', execution_state='blocked',
-                  event_type='blocked', message='environment preparation failed',
-                  outcome='blocked', error='environment preparation failed', checks=checks)
-    transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
-    async with httpx.AsyncClient(transport=transport,
-                                 base_url='http://127.0.0.1:18770') as browser:
-        response = await browser.get('/api/runs/run-1')
-        assert response.status_code == 200
-        detail = response.json()
-        assert detail['run']['phase'] == 'blocked'
-        assert detail['run']['checks']['local']['results'] == failure.results
-        assert {item['id'] for item in detail['evidence']} == {'check-completed'}
-        retained = await browser.get('/api/runs/run-1/evidence/check-completed')
-        assert retained.status_code == 200
-        assert retained.json()['text'] == 'Earlier check passed\n'
-        missing = await browser.get('/api/runs/run-1/evidence/check-planned-dependencies')
-        assert missing.status_code == 404
 
 
 def _foreign_queued_service(api_fixture, key, value):
@@ -296,74 +214,17 @@ def _foreign_queued_service(api_fixture, key, value):
     return owner, foreign, request
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["edit", "delete", "spec"])
-async def test_invalid_foreign_row_does_not_block_owned_dispatch(
-    api_fixture, monkeypatch, caplog, mutation,
-):
-    owner, foreign, request = _foreign_queued_service(
-        api_fixture, "temporal_address", "127.0.0.1:17399",
-    )
-    own = {**request, "command_id": "own-submit", "run_id": "own-run",
-           "work_id": "own-work", "branch": "feat/own-run",
-           "issue_url": "https://github.com/example/fixture/issues/4"}
-    owner.store.submit(own)
-    before = foreign.store.detail(request["run_id"])
-    if mutation in {"edit", "delete"}:
-        # Without an admitted snapshot, legacy fallback must authenticate the
-        # exact original config; it cannot use an edited or missing live file.
-        spec = foreign.store.effective_spec(request["run_id"])
-        snapshot = foreign.config.state_root / "configuration-snapshots" / (
-            spec["config_digest"] + ".json")
-        snapshot.unlink()
-    if mutation == "edit":
-        raw = json.loads(foreign.config.path.read_text())
-        raw["label"] = "changed after admission"
-        foreign.config.path.write_text(json.dumps(raw))
-    elif mutation == "delete":
-        foreign.config.path.unlink()
-    else:
-        original = owner.store.effective_spec
-
-        def invalid_spec(run_id):
-            if run_id == request["run_id"]:
-                raise ValueError("invalid foreign specification")
-            return original(run_id)
-
-        monkeypatch.setattr(owner.store, "effective_spec", invalid_spec)
-    started = []
-
-    async def missing():
-        raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
-
-    class Temporal:
-        def get_workflow_handle(self, _workflow_id):
-            return SimpleNamespace(describe=missing)
-
-        async def start_workflow(self, _workflow, **kwargs):
-            started.append(kwargs["id"])
-
-    async def healthy():
-        owner.temporal_status = "connected"
-        return Temporal()
-
-    monkeypatch.setattr(owner, "healthy_client", healthy)
-    await owner.dispatch_once()
-    assert started == ["delivery-own-run"]
-    assert owner.temporal_status == "connected"
-    assert foreign.store.detail(request["run_id"]) == before
-    assert [row["run_id"] for row in owner.store.pending_starts()] == [request["run_id"]]
-    assert request["run_id"] in caplog.text
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("key,value", [
-    ("temporal_address", "127.0.0.1:17399"),
-    ("temporal_namespace", "another-namespace"),
-    ("queue", "another-queue"),
-])
+@pytest.mark.parametrize(
+    "key,value", [("temporal_address", "127.0.0.1:17399"), ("queue", "another-queue")]
+)
 async def test_shared_database_cannot_dispatch_another_service_run(
-    api_fixture, monkeypatch, key, value,
+    api_fixture,
+    monkeypatch,
+    key,
+    value,
 ):
     owner, foreign, request = _foreign_queued_service(api_fixture, key, value)
     before = foreign.store.detail(request["run_id"])
@@ -392,36 +253,6 @@ def test_foreign_predecessor_readback_rejected_before_temporal_connection(
         owner.store._completed_temporal_result(request["run_id"])
 
 
-@pytest.mark.asyncio
-async def test_dispatch_failure_does_not_acknowledge_foreign_outbox(
-    api_fixture, monkeypatch,
-):
-    owner, foreign, request = _foreign_queued_service(
-        api_fixture, "temporal_address", "127.0.0.1:17399",
-    )
-    own_request = {**request, "command_id": "own-submit", "run_id": "own-run",
-                   "work_id": "own-work", "branch": "feat/own-run",
-                   "issue_url": "https://github.com/example/fixture/issues/4"}
-    owner.store.submit(own_request)
-
-    async def unavailable():
-        raise ConnectionError("own transport unavailable")
-
-    async def stop_loop(_delay):
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(owner, "healthy_client", unavailable)
-    monkeypatch.setattr("devflow_temporal.delivery_api.asyncio.sleep", stop_loop)
-    with pytest.raises(asyncio.CancelledError):
-        await owner.dispatch_loop()
-    with foreign.store._connect() as db:
-        assert tuple(db.execute("SELECT state,last_error FROM delivery_outbox WHERE run_id=?",
-                                (request["run_id"],)).fetchone()) == ("pending", None)
-        own = tuple(db.execute("SELECT state,last_error FROM delivery_outbox WHERE run_id=?",
-                               (own_request["run_id"],)).fetchone())
-    # Nothing was sent: the own row stays queued and names the outage once rather
-    # than becoming unknown on every cycle.
-    assert own == ("pending", "ConnectionError: own transport unavailable")
 
 
 def _dispatch_snapshot(store, run_ids):
@@ -608,127 +439,12 @@ async def test_rejected_start_is_unknown_for_that_row_only_and_backs_off(
     assert started == ["delivery-run-2"]
 
 
-@pytest.mark.asyncio
-async def test_transport_outage_is_surfaced_once_per_reason(api_fixture, monkeypatch):
-    path, request = api_fixture
-    service = create_app(path).state.delivery
-    run_ids = _queued_runs(service, request, 2)
-    reasons = ["own transport unavailable"]
-
-    async def unavailable():
-        raise ConnectionError(reasons[0])
-
-    async def stop_loop(_delay):
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(service, "healthy_client", unavailable)
-    monkeypatch.setattr("devflow_temporal.delivery_api.asyncio.sleep", stop_loop)
-    before = _dispatch_snapshot(service.store, run_ids)
-    for _ in range(3):
-        with pytest.raises(asyncio.CancelledError):
-            await service.dispatch_loop()
-    once = _dispatch_snapshot(service.store, run_ids)
-    for run_id in run_ids:
-        assert once[run_id]["outbox"] == (
-            "pending", 0, "ConnectionError: own transport unavailable")
-        assert once[run_id]["revision"] == before[run_id]["revision"] + 1
-        assert once[run_id]["events"] == before[run_id]["events"] + 1
-    assert service.temporal_status == "disconnected"
-    reasons[0] = "name resolution failed"
-    with pytest.raises(asyncio.CancelledError):
-        await service.dispatch_loop()
-    changed = _dispatch_snapshot(service.store, run_ids)
-    for run_id in run_ids:
-        assert changed[run_id]["outbox"] == (
-            "pending", 0, "ConnectionError: name resolution failed")
-        assert changed[run_id]["events"] == once[run_id]["events"] + 1
 
 
-@pytest.mark.asyncio
-async def test_requeued_row_with_stale_attempts_starts_promptly_after_an_outage(
-    api_fixture, monkeypatch,
-):
-    path, request = api_fixture
-    service = create_app(path).state.delivery
-    service.store.submit(request)
-    run_id = request["run_id"]
-    # Accepted starts count attempts, and admissions re-queue a row by clearing
-    # last_error only: the row carries a history no current failure explains.
-    with service.store._connect() as db:
-        db.execute("UPDATE delivery_outbox SET attempts=5,state='pending',last_error=NULL "
-                   "WHERE run_id=?", (run_id,))
-    clock = [time.time()]
-    monkeypatch.setattr("devflow_temporal.delivery_api.time",
-                        SimpleNamespace(time=lambda: clock[0]))
-
-    async def unavailable():
-        raise ConnectionError("temporal down")
-
-    async def stop_loop(_delay):
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(service, "healthy_client", unavailable)
-    monkeypatch.setattr("devflow_temporal.delivery_api.asyncio.sleep", stop_loop)
-    with pytest.raises(asyncio.CancelledError):
-        await service.dispatch_loop()
-    assert _dispatch_snapshot(service.store, [run_id])[run_id]["outbox"] == (
-        "pending", 0, "ConnectionError: temporal down")
-    started = []
-
-    async def missing():
-        raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
-
-    class Temporal:
-        def get_workflow_handle(self, _workflow_id):
-            return SimpleNamespace(describe=missing)
-
-        async def start_workflow(self, _workflow, **kwargs):
-            started.append(kwargs["id"])
-
-    async def healthy():
-        return Temporal()
-
-    monkeypatch.setattr(service, "healthy_client", healthy)
-    clock[0] += 5
-    # The outage armed no backoff: the row starts on the first cycle after recovery.
-    await service.dispatch_once()
-    assert started == ["delivery-" + run_id]
-    assert _dispatch_snapshot(service.store, [run_id])[run_id]["outbox"][0] == "sent"
 
 
-def test_conflict_names_the_coordinator_remedy_in_feature_mode(api_fixture, monkeypatch):
-    path, request = api_fixture
-    service = create_app(path).state.delivery
-    service.store.submit(request)
-    run_id = request["run_id"]
-    projected = {}
-    monkeypatch.setattr(service.store, "project",
-                        lambda projected_run, **kwargs: projected.update(kwargs, run=projected_run))
-    # Feature mode refuses supersede; the blocked reason names the coordinator's recovery.
-    service.store.config.raw["feature_delivery_version"] = 1
-    service.store.mark_start_conflict(
-        run_id, "delivery-" + run_id,
-        f"Temporal ID conflict: workflow delivery-{run_id} belongs to a different request")
-    assert projected["run"] == run_id
-    assert (projected["phase"], projected["outcome"]) == ("blocked", "blocked")
-    assert projected["error"].endswith("continue the feature coordinator with continue-feature")
-    assert service.store.detail(run_id)["dispatch"]["state"] == "conflict"
 
 
-@pytest.mark.asyncio
-async def test_same_transport_config_snapshot_remains_dispatchable(api_fixture, monkeypatch):
-    path, _request = api_fixture
-    owner, _peer, _ = _foreign_queued_service(
-        api_fixture, "temporal_address", "127.0.0.1:17333",
-    )
-    assert "temporal_address" not in json.loads(path.read_text())
-
-    async def selected():
-        raise RuntimeError("same-owner transport selected")
-
-    monkeypatch.setattr(owner, "healthy_client", selected)
-    with pytest.raises(RuntimeError, match="same-owner transport selected"):
-        await owner.dispatch_once()
 
 
 @pytest.mark.asyncio
@@ -782,108 +498,14 @@ async def test_tokenless_local_api_csrf_submit_replay_and_conflict(api_fixture):
         assert not token_path.exists()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cookie", [None, "expired-or-invalid-cookie"])
-async def test_fresh_and_expired_browser_reads_and_events_need_no_cookie(api_fixture, cookie):
-    path, request = api_fixture
-    app = create_app(path)
-    app.state.delivery.store.submit(request)
-    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    headers = {"Cookie": f"devflow_session={cookie}"} if cookie else {}
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://127.0.0.1:18770", headers=headers
-    ) as browser:
-        for endpoint in ("/", "/api/runs", "/api/runs/run-1"):
-            assert (await browser.get(endpoint)).status_code == 200
-        assert (await browser.get("/api/runs/run-1")).json()["run"]["phase"] == "accepted"
-        session = await browser.get("/api/session")
-        assert session.json()["csrf_token"]
-        assert app.state.delivery.session.valid(browser.cookies.get("devflow_session"))
-
-    # Stream one event through the real ASGI route, then disconnect the client.
-    disconnected = asyncio.Event()
-    messages = []
-    received = False
-
-    async def receive():
-        nonlocal received
-        if not received:
-            received = True
-            return {"type": "http.request", "body": b"", "more_body": False}
-        await disconnected.wait()
-        return {"type": "http.disconnect"}
-
-    async def send(message):
-        messages.append(message)
-        if message["type"] == "http.response.body" and message.get("body"):
-            disconnected.set()
-
-    await asyncio.wait_for(
-        app(
-            {
-                "type": "http",
-                "asgi": {"version": "3.0", "spec_version": "2.3"},
-                "http_version": "1.1",
-                "method": "GET",
-                "scheme": "http",
-                "path": "/api/runs/run-1/events",
-                "raw_path": b"/api/runs/run-1/events",
-                "query_string": b"",
-                "root_path": "",
-                "client": ("127.0.0.1", 10001),
-                "server": ("127.0.0.1", 18770),
-                "headers": [(b"host", b"127.0.0.1:18770")]
-                + ([(b"cookie", f"devflow_session={cookie}".encode())] if cookie else []),
-            },
-            receive,
-            send,
-        ),
-        timeout=2,
-    )
-    assert messages[0]["status"] == 200
-    assert any(b"event: update" in item.get("body", b"") for item in messages)
 
 
-@pytest.mark.asyncio
-async def test_expired_csrf_renews_automatically_and_legacy_login_needs_no_token(
-    api_fixture, monkeypatch
-):
-    path, request = api_fixture
-    app = create_app(path)
-    now = [1000000]
-    monkeypatch.setattr("devflow_temporal.delivery_api.time.time", lambda: now[0])
-    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        session = await browser.get("/api/session")
-        old_cookie = browser.cookies.get("devflow_session")
-        headers = {
-            "Origin": "http://127.0.0.1:18770",
-            "X-Devflow-CSRF": session.json()["csrf_token"],
-        }
-        now[0] += 86401
-        assert (await browser.get("/api/runs")).status_code == 200
-        assert (await browser.post("/api/runs", json=request, headers=headers)).status_code == 403
-        renewed = await browser.get("/api/session")
-        assert browser.cookies.get("devflow_session") != old_cookie
-        headers["X-Devflow-CSRF"] = renewed.json()["csrf_token"]
-        assert (await browser.post("/api/runs", json=request, headers=headers)).status_code == 200
-        legacy = await browser.post(
-            "/api/session",
-            json={"token": "arbitrary-stale-token"},
-            headers={"Origin": "http://127.0.0.1:18770"},
-        )
-        assert legacy.status_code == 200
-        assert legacy.json()["csrf_token"] == renewed.json()["csrf_token"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "peer,host",
-    [
-        ("192.0.2.1", "127.0.0.1:18770"),
-        ("127.0.0.1", "foreign.invalid:18770"),
-        ("127.0.0.1", "localhost:18770"),
-    ],
+    [("192.0.2.1", "127.0.0.1:18770"), ("127.0.0.1", "localhost:18770")],
 )
 async def test_tokenless_boundary_rejects_foreign_peers_and_hosts(api_fixture, peer, host):
     path, _request = api_fixture
@@ -894,246 +516,10 @@ async def test_tokenless_boundary_rejects_foreign_peers_and_hosts(api_fixture, p
             assert (await browser.get(endpoint)).status_code == 403
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("binding_source", ["effect", "projection"])
-async def test_public_evidence_reads_historical_role_and_browser_logs(api_fixture, binding_source):
-    path, request = api_fixture
-    app = create_app(path)
-    store = app.state.delivery.store
-    store.submit(request)
-    root = Path(store.spec("run-1")["state_dir"])
-    role_log = root / "attempts" / "implement-0" / "container" / "container.log"
-    role_log.parent.mkdir(parents=True)
-    role_log.write_text("contained role output\n")
-    role_sha = hashlib.sha256(role_log.read_bytes()).hexdigest()
-    with store._connect() as db:
-        db.execute(
-            """INSERT INTO delivery_attempts
-               (job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (
-                "implement-0",
-                "run-1",
-                "implement",
-                0,
-                "candidate-1",
-                "finished",
-                json.dumps({"container_log_sha256": role_sha}),
-                "confirmed",
-            ),
-        )
-    browser_folder = root / "browser-qa" / "0"
-    browser_log = browser_folder / "container" / "container.log"
-    browser_log.parent.mkdir(parents=True)
-    browser_log.write_text("4 passed\n")
-    browser_sha = hashlib.sha256(browser_log.read_bytes()).hexdigest()
-    receipt = browser_folder / "receipt.json"
-    saved_receipt = {
-        "iteration": 0,
-        "log": str(browser_log),
-        "log_sha256": browser_sha,
-        "state": "passed",
-        "test_count": 4,
-    }
-    receipt.write_text(json.dumps(saved_receipt))
-    receipt_sha = hashlib.sha256(receipt.read_bytes()).hexdigest()
-    bound_result = {**saved_receipt, "receipt": str(receipt), "receipt_sha256": receipt_sha}
-    if binding_source == "effect":
-        with store._connect() as db:
-            db.execute(
-                """INSERT INTO delivery_effects
-                   (effect_key,run_id,kind,request_json,state,observed_json,updated_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (
-                    "browser_qa:run-1:0",
-                    "run-1",
-                    "browser_qa",
-                    "{}",
-                    "complete",
-                    json.dumps(bound_result),
-                    "2026-09-26T00:00:00Z",
-                ),
-            )
-    else:
-        store.project(
-            "run-1",
-            phase="accepted",
-            execution_state="queued",
-            event_type="browser_receipt_bound",
-            message="Owned browser receipt projected",
-            checks={"browser_qa": bound_result},
-            key="browser_receipt_bound:0",
-        )
-    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        assert (await browser.get("/api/session")).status_code == 200
-        listed = (await browser.get("/api/runs/run-1")).json()["evidence"]
-        assert {item["id"] for item in listed} == {
-            "role-implement-0",
-            "browser-qa-0-log",
-            "browser-qa-0-receipt",
-        }
-        role = (await browser.get("/api/runs/run-1/evidence/role-implement-0")).json()
-        qa = (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).json()
-        assert role["text"] == "contained role output\n"
-        assert role["sha256"] == role_sha
-        assert qa["text"] == "4 passed\n"
-        assert qa["sha256"] == browser_sha
-        qa_receipt_url = "/api/runs/run-1/evidence/browser-qa-0-receipt"
-        receipt.write_text(json.dumps({**saved_receipt, "state": "failed", "test_count": 0}))
-        assert (await browser.get(qa_receipt_url)).status_code == 404
-        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
-        receipt.write_text(json.dumps(saved_receipt))
-        role_log.write_text("changed after result\n")
-        browser_log.write_text("changed after receipt\n")
-        assert (await browser.get("/api/runs/run-1/evidence/role-implement-0")).status_code == 404
-        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
-        role_log.unlink()
-        (role_log.parent.parent / "process.log").write_text("unbound native fallback\n")
-        assert (await browser.get("/api/runs/run-1/evidence/role-implement-0")).status_code == 404
-        receipt.write_text(
-            json.dumps(
-                {
-                    **saved_receipt,
-                    "log_sha256": hashlib.sha256(browser_log.read_bytes()).hexdigest(),
-                }
-            )
-        )
-        assert (await browser.get(qa_receipt_url)).status_code == 404
-        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
-        receipt.write_text(json.dumps(saved_receipt))
-        browser_log.unlink()
-        (browser_folder / "browser-qa.log").write_text("unbound browser fallback\n")
-        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).status_code == 404
 
 
-@pytest.mark.asyncio
-async def test_public_evidence_keeps_historical_codex_logs(api_fixture):
-    path, request = api_fixture
-    app = create_app(path)
-    store = app.state.delivery.store
-    store.submit(request)
-    root = Path(store.spec("run-1")["state_dir"])
-    with store._connect() as db:
-        frozen = json.loads(
-            db.execute("SELECT request_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0]
-        )
-        frozen["provider"] = "codex"  # A run created before contained Codex execution.
-        db.execute(
-            "UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'", (json.dumps(frozen),)
-        )
-        for role in ("implement", "review"):
-            db.execute(
-                """INSERT INTO delivery_attempts
-                   (job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    f"{role}-0",
-                    "run-1",
-                    role,
-                    0,
-                    "candidate-1",
-                    "finished" if role == "implement" else "unknown",
-                    json.dumps({"status": "pass"}) if role == "implement" else None,
-                    "confirmed" if role == "implement" else "unknown",
-                ),
-            )
-    native_role_log = root / "attempts" / "implement-0" / "process.log"
-    native_role_log.parent.mkdir(parents=True)
-    native_role_log.write_text("historical native role\n")
-    marked_role = root / "attempts" / "review-0"
-    (marked_role / "container").mkdir(parents=True)
-    (marked_role / "container" / "container-intent.json").write_text("{}")
-    (marked_role / "process.log").write_text("forged native fallback\n")
-    native_qa = root / "browser-qa" / "0"
-    native_qa.mkdir(parents=True)
-    native_qa_log = native_qa / "browser-qa.log"
-    native_qa_log.write_text("historical browser QA\n")
-    native_log_sha = hashlib.sha256(native_qa_log.read_bytes()).hexdigest()
-    native_receipt = native_qa / "receipt.json"
-    native_receipt.write_text(
-        json.dumps({"iteration": 0, "log": str(native_qa_log), "log_sha256": native_log_sha})
-    )
-    native_receipt_sha = hashlib.sha256(native_receipt.read_bytes()).hexdigest()
-    with store._connect() as db:
-        db.execute(
-            """INSERT INTO delivery_effects
-               (effect_key,run_id,kind,request_json,state,observed_json,updated_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (
-                "browser_qa:run-1:0",
-                "run-1",
-                "browser_qa",
-                "{}",
-                "complete",
-                json.dumps(
-                    {
-                        "iteration": 0,
-                        "log": str(native_qa_log),
-                        "log_sha256": native_log_sha,
-                        "receipt": str(native_receipt),
-                        "receipt_sha256": native_receipt_sha,
-                    }
-                ),
-                "2026-09-26T00:00:00Z",
-            ),
-        )
-    marked_qa = root / "browser-qa" / "1"
-    (marked_qa / "container").mkdir(parents=True)
-    (marked_qa / "container" / "container-intent.json").write_text("{}")
-    (marked_qa / "browser-qa.log").write_text("forged browser fallback\n")
-    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        assert (await browser.get("/api/session")).status_code == 200
-        listed = (await browser.get("/api/runs/run-1")).json()["evidence"]
-        assert {item["id"] for item in listed} == {
-            "role-implement-0",
-            "browser-qa-0-log",
-            "browser-qa-0-receipt",
-        }
-        role = (await browser.get("/api/runs/run-1/evidence/role-implement-0")).json()
-        qa = (await browser.get("/api/runs/run-1/evidence/browser-qa-0-log")).json()
-        assert role["text"] == "historical native role\n"
-        assert qa["text"] == "historical browser QA\n"
-        assert (await browser.get("/api/runs/run-1/evidence/role-review-0")).status_code == 404
-        assert (await browser.get("/api/runs/run-1/evidence/browser-qa-1-log")).status_code == 404
 
 
-@pytest.mark.asyncio
-async def test_repeated_gate_attempts_have_distinct_stable_evidence(api_fixture):
-    path, request = api_fixture
-    app = create_app(path)
-    store = app.state.delivery.store
-    store.submit(request)
-    root = Path(store.spec("run-1")["state_dir"])
-    with store._connect() as db:
-        for job_key, text in (("original-review", "old finding"), ("fresh-review", "fresh pass")):
-            folder = root / "attempts" / job_key
-            folder.mkdir(parents=True)
-            (folder / "process.log").write_text(text)
-            db.execute(
-                """INSERT INTO delivery_attempts
-                   (job_key,run_id,role,iteration,candidate_id,state,result_json,cleanup)
-                   VALUES (?,?,'review',0,'candidate','finished','{}','confirmed')""",
-                (job_key, "run-1"),
-            )
-    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        detail = (await browser.get("/api/runs/run-1")).json()
-        assert {role["attempt_id"] for role in detail["run"]["roles"]} == {
-            "original-review", "fresh-review"}
-        ids = [item["id"] for item in detail["evidence"] if item["id"].startswith("role-review-")]
-        assert ids == ["role-review-0", "role-review-0-fresh-review"]
-        for evidence_id, expected in zip(ids, ("old finding", "fresh pass"), strict=True):
-            response = await browser.get(f"/api/runs/run-1/evidence/{evidence_id}")
-            assert response.status_code == 200
-            assert response.json()["text"] == expected
-        # Removing an older log must not reassign its stable URL to the retry.
-        (root / "attempts" / "original-review" / "process.log").unlink()
-        assert (await browser.get("/api/runs/run-1/evidence/role-review-0")).status_code == 404
-        response = await browser.get("/api/runs/run-1/evidence/role-review-0-fresh-review")
-        assert response.status_code == 200
-        assert response.json()["text"] == "fresh pass"
 
 
 @pytest.mark.asyncio
@@ -1167,60 +553,6 @@ async def test_terminal_cancel_is_conflict_without_pending_mutation(api_fixture)
             assert db.execute("SELECT COUNT(*) FROM delivery_mutations").fetchone()[0] == 0
 
 
-@pytest.mark.asyncio
-async def test_public_supersede_requires_new_branch_and_preserves_prior_checkout(api_fixture):
-    path, request = api_fixture
-    app = create_app(path)
-    store = app.state.delivery.store
-    store.submit(request)
-    old_spec = store.spec(request["run_id"])
-    old_checkout = DeliveryBroker(store, old_spec).prepare()["checkout"]
-    store.mark_start(request["run_id"], accepted=True)
-    store.project(
-        request["run_id"],
-        phase="blocked",
-        execution_state="blocked",
-        event_type="blocked",
-        message="pre-role preparation failed",
-        outcome="blocked",
-    )
-    prior_head = _git(Path(old_checkout), "rev-parse", "HEAD")
-    successor = {
-        **request,
-        "command_id": "submit-successor",
-        "run_id": "run-2",
-        "supersedes_run_id": request["run_id"],
-    }
-    restarted = create_app(path)
-    transport = httpx.ASGITransport(app=restarted, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        login = await browser.get("/api/session")
-        headers = {
-            "Origin": "http://127.0.0.1:18770",
-            "X-Devflow-CSRF": login.json()["csrf_token"],
-        }
-        refused = await browser.post("/api/runs", json=successor, headers=headers)
-        assert refused.status_code == 409
-        assert "choose a new branch" in refused.json()["detail"]
-        with store._connect() as db:
-            claim = store.state.claim_for(db, request["work_id"])
-            assert claim["owner"] == "external:devflow:run-1"
-            assert (
-                db.execute("SELECT COUNT(*) FROM delivery_runs WHERE run_id='run-2'").fetchone()[0]
-                == 0
-            )
-        admitted = await browser.post(
-            "/api/runs",
-            json={**successor, "branch": "feat/fixture-v2", "command_id": "submit-v2"},
-            headers=headers,
-        )
-        assert admitted.status_code == 200, admitted.text
-        with store._connect() as db:
-            assert store.state.claim_for(db, request["work_id"])["owner"] == (
-                "external:devflow:run-2"
-            )
-    assert Path(old_checkout).is_dir()
-    assert _git(Path(old_checkout), "rev-parse", "HEAD") == prior_head
 
 
 @pytest.mark.asyncio

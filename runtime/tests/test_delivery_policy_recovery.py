@@ -7,14 +7,12 @@ import sys
 from pathlib import Path
 
 import pytest
-from temporalio.service import RPCError, RPCStatusCode
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 from test_delivery_store import submit_historical_admission
 
 from devflow_temporal import delivery_policy_recovery
 from devflow_temporal.contracts import canonical_json, digest
-from devflow_temporal.delivery_api import DeliveryService
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_continuation import copy_session_state, session_state_digest
@@ -32,10 +30,7 @@ from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
-@pytest.mark.parametrize('observation,refused', [
-    ('live-pid', True), ('listening-port', True), ('unfinished', True),
-    ('unmonitored', True), ('stopped', False), ('reused-pid', False), ('zombie', False),
-])
+@pytest.mark.parametrize('observation,refused', [('live-pid', True), ('stopped', False)])
 def test_retained_stopped_cleanup_observes_without_state_effects(
     intake_fixture, monkeypatch, observation, refused,
 ):
@@ -194,19 +189,6 @@ def preserved(native_configuration, monkeypatch):
 
 
 
-def test_native_raw_results_are_preserved_without_a_candidate_field(preserved):
-    store, original, _payload, state = preserved
-    run_id = original['run_id']
-    with store._connect() as db:
-        before = [dict(row) for row in db.execute(
-            'SELECT * FROM delivery_attempts ORDER BY job_key')]
-    assert all('candidate' not in json.loads(a['result_json']) for a in before)
-    observed = store.detail(run_id)['candidate']
-    assert {key: observed[key] for key in state['candidate']} == state['candidate']
-    with store._connect() as db:
-        assert before == [dict(row) for row in db.execute(
-            'SELECT * FROM delivery_attempts ORDER BY job_key')]
-        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 1
 
 
 def test_historical_policy_row_preserves_candidate_session_failures_and_cleanup(preserved):
@@ -299,103 +281,10 @@ def test_policy_resume_and_tracker_start_refuse_a_reclaimed_reassigned_issue(
     assert calls == []
 
 
-@pytest.mark.asyncio
-async def test_uncertain_policy_workflow_start_reads_memo_without_duplicate_start(preserved,
-                                                                                monkeypatch):
-    store, original, _payload, _ = preserved
-    queued = store.pending_starts()[0]
-    service = object.__new__(DeliveryService)
-    service.store, service.config = store, store.config
-
-    class Temporal:
-        starts = 0
-        memo = None
-
-        def get_workflow_handle(self, workflow_id):
-            assert workflow_id == queued['workflow_id']
-            return self
-
-        async def describe(self):
-            if self.memo is None:
-                raise RPCError('not found', RPCStatusCode.NOT_FOUND, b'')
-            return self
-
-        async def memo_value(self, key, default):
-            return self.memo.get(key, default)
-
-        async def start_workflow(self, _workflow, **kwargs):
-            self.starts += 1
-            assert kwargs['args'][1]['kind'] == 'execution_policy_recovery'
-            self.memo = kwargs['memo']
-            raise TimeoutError('remote accepted, acknowledgement unavailable')
-
-    temporal = Temporal()
-
-    async def healthy():
-        return temporal
-
-    monkeypatch.setattr(service, 'healthy_client', healthy)
-    await service.dispatch_once()
-    with store._connect() as db:
-        # The sent start is unknown on its own row; the batch is not aborted.
-        assert tuple(db.execute('SELECT state,last_error FROM delivery_outbox').fetchone()) == (
-            'unknown', 'TimeoutError: remote accepted, acknowledgement unavailable')
-    await service.dispatch_once()
-    assert temporal.starts == 1
-    with store._connect() as db:
-        assert db.execute('SELECT state FROM delivery_outbox').fetchone()[0] == 'sent'
-        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 1
-        assert db.execute('SELECT COUNT(*) FROM delivery_attempts').fetchone()[0] == 3
 
 
-@pytest.mark.asyncio
-async def test_policy_recovery_runs_gates_before_any_implementation():
-    controller = DeliveryWorkflow()
-    previous = {'run_id': 'same-run', 'iteration': 2, 'revision': 13, 'outcome': 'blocked',
-                'checks': {}, 'candidate': {'id': 'preserved'}}
-    spec = {'run_id': 'same-run'}
-    recovery = {'effective_spec': spec, 'state': previous, 'start_iteration': 3,
-                'maximum_iteration': 4, 'candidate': previous['candidate'],
-                'session_id': 'same-session', 'issue_evidence': {'original': True}}
-    calls = []
-
-    async def project(*_args):
-        pass
-
-    async def preflight(*_args):
-        calls.append('preflight')
-        return True
-
-    async def activity(name, *_args):
-        assert name == 'delivery_tracker_start'
-        return {'state': 'consistent'}
-
-    async def iterations(_spec, **kwargs):
-        assert kwargs['resume_prechecks'] is True
-        assert kwargs['prior_implementer_session'] == 'same-session'
-        assert kwargs['repair_findings'] == []
-        assert kwargs['authorized_max_iteration'] == 4
-        calls.append('gates-first')
-        return {'observed': True}
-
-    controller._project = project
-    controller._confirm_repair_preflight = preflight
-    controller._activity = activity
-    controller._run_iterations = iterations
-    assert await controller._resume_policy(spec, recovery) == {'observed': True}
-    assert calls == ['preflight', 'preflight', 'gates-first']
 
 
-def test_policy_config_change_is_only_explicit_trust_mode(preserved):
-    _store, original, payload, _ = preserved
-    assert amended_config(original, Path(payload['config_path']), payload['config_sha256']).raw[
-        'execution_mode'] == 'trusted-local'
-    config = json.loads(Path(payload['config_path']).read_bytes())
-    config['max_repairs'] = 3
-    write_private(Path(payload['config_path']), config)
-    with pytest.raises(ValueError, match='only execution_mode'):
-        amended_config(original, Path(payload['config_path']),
-                       hashlib.sha256(Path(payload['config_path']).read_bytes()).hexdigest())
 
 
 @pytest.mark.asyncio

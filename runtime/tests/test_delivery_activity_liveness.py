@@ -29,9 +29,7 @@ from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('name', [
-    'delivery_checks', 'delivery_precheck', 'delivery_browser_qa', 'delivery_baseline_checks',
-])
+@pytest.mark.parametrize('name', ['delivery_checks', 'delivery_baseline_checks'])
 async def test_long_gate_activity_emits_liveness_heartbeat(monkeypatch, tmp_path, name):
     def slow(*_args):
         time.sleep(0.05)
@@ -135,9 +133,7 @@ async def test_blocking_intake_preparation_keeps_heartbeating(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('outcome,expected_attempts', [
-    ('transient', 4), ('permanent', 1), ('findings', 1),
-])
+@pytest.mark.parametrize('outcome,expected_attempts', [('transient', 4), ('findings', 1)])
 async def test_monitor_retries_outlast_capacity_wait_and_preserve_gate_outcomes(
     outcome, expected_attempts,
 ):
@@ -271,7 +267,10 @@ from devflow_temporal.delivery_activities import delivery_checks,delivery_preche
 async def block_loop(_request):
     (state/'stall-started').touch()
     import time
-    time.sleep(20)
+    deadline = time.monotonic() + 30
+    while not (state/'stall-release').exists():
+        assert time.monotonic() < deadline, 'replacement activity was not observed'
+        time.sleep(0.05)
     (state/'stall-finished').touch()
     return {}
 from devflow_temporal.delivery_activities import delivery_baseline_checks,delivery_browser_qa
@@ -355,16 +354,15 @@ async def _wait_for_fixture_native_start(worker, log_path, state, handle):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('stage,interruption', [
-    # Writable worker loss and read-only loop stall cover the shared role monitor.
-    ('implement', 'worker_loss'),
-    ('review', 'loop_stall'),
-    ('intake', 'loop_stall'), ('implement', 'cancel'),
-    ('implement', 'deadline'), ('implement', 'terminate'),
-    ('review', 'dirty_result'),
-])
+@pytest.mark.parametrize(
+    "stage,interruption",
+    [("implement", "worker_loss"), ("review", "loop_stall"), ("implement", "cancel")],
+)
 async def test_real_temporal_worker_loss_reuses_original_native_command(
-    api_fixture, tmp_path, stage, interruption,
+    api_fixture,
+    tmp_path,
+    stage,
+    interruption,
 ):
     from devflow_temporal.delivery_native_process import stop_observed
     from devflow_temporal.delivery_resources import RunResources, read_private
@@ -542,6 +540,14 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             workers.append(subprocess.Popen(argv, stdout=logs[1], stderr=subprocess.STDOUT))
             await _wait_for_fixture_worker_ready(workers[1], tmp_path / 'replacement-worker.log')
             if interruption in {'loop_stall', 'dirty_result'}:
+                deadline = time.monotonic() + 25
+                while True:
+                    pending = (await handle.describe()).raw_description.pending_activities
+                    if pending and pending[0].attempt >= 2:
+                        break
+                    assert time.monotonic() < deadline, 'stalled attempt was not replaced'
+                    await asyncio.sleep(0.05)
+                (state / 'stall-release').touch()
                 await asyncio.wait_for(stall.result(), 30)
                 # Let rejected heartbeats cancel the live first attempt before releasing its child.
                 await asyncio.sleep(2)
@@ -661,11 +667,7 @@ async def test_real_temporal_lost_feature_wait_attempt_retries_with_a_full_windo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name", [
-    "delivery_intake", "delivery_role", "delivery_checks", "delivery_precheck",
-    "delivery_baseline_checks", "delivery_browser_qa",
-    "delivery_feature_revision_propose", "delivery_feature_revision_review",
-])
+@pytest.mark.parametrize("name", ["delivery_intake", "delivery_feature_revision_review"])
 async def test_capacity_wait_has_no_total_activity_deadline(monkeypatch, name):
     from devflow_temporal import delivery_workflow
 

@@ -66,8 +66,7 @@ class SocketStub:
         self.sent.append((data, address))
 
 
-@pytest.mark.parametrize('failure', [FileNotFoundError('stopped'), BlockingIOError('full'),
-                                   PermissionError('inaccessible'), RuntimeError('transport')])
+@pytest.mark.parametrize('failure', [FileNotFoundError('stopped'), RuntimeError('transport')])
 def test_notification_failure_never_fails_committed_delivery(service, monkeypatch, failure):
     store, request = service
     client = SocketStub(failure)

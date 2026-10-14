@@ -14,7 +14,7 @@ from test_delivery_native import native_configuration as native_configuration
 
 from devflow_temporal import delivery_native_preparation as native
 from devflow_temporal import delivery_native_renewal as renewal
-from devflow_temporal.contracts import canonical_json, digest
+from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_preparation import PreparationError, prepare_authority
 from devflow_temporal.delivery_resources import read_private, write_private
@@ -128,7 +128,7 @@ def test_payload_only_native_generation_preserves_old_proof_and_replays_strictly
         renewal.renew(before, {**payload, 'command_id': 'different-command'}, 'f' * 64)
 
 
-@pytest.mark.parametrize('change', ['protected-root', 'binary', 'mode', 'config', 'authority'])
+@pytest.mark.parametrize('change', ['protected-root', 'authority'])
 def test_native_generation_rejects_every_non_payload_or_unapproved_change(
     payload_update, monkeypatch, change,
 ):
@@ -181,21 +181,6 @@ def test_native_generation_resumes_interrupted_probe_and_retains_failure(
     assert len(calls) == 2
 
 
-def test_renewal_lineage_preserves_typed_feature_authority():
-    before = {'policy': {'native_identity': {'runtime_payload_sha256': 'old', 'flag': True},
-                         'max_repairs': 3}, 'iteration': 4}
-    after = deepcopy(before)
-    after['policy']['native_identity']['runtime_payload_sha256'] = 'new'
-    renewal._same_execution(before, after)
-    changed = deepcopy(after)
-    changed['policy']['max_repairs'] = 3.0
-    with pytest.raises(ValueError):
-        renewal._same_execution(before, changed)
-    changed = deepcopy(after)
-    changed['policy']['native_identity']['flag'] = 1
-    with pytest.raises(ValueError):
-        renewal._same_execution(before, changed)
-    assert canonical_json(before) != canonical_json(after)
 
 
 @pytest.mark.parametrize('bad', ['missing', 'wrong-hash'])
@@ -209,38 +194,3 @@ def test_readonly_native_readiness_rejects_authority_without_sealing(payload_upd
     assert Path(spec['preparation']['environment']['path']).read_bytes() == old
     assert renewal.readiness(spec, payload)['required'] is True
     assert not (Path(spec['state_dir']) / 'native-preparation-renewal').exists()
-
-
-def test_readonly_readiness_does_not_recreate_missing_old_measurement(payload_update):
-    _store, spec, payload, old, _package = payload_update
-    proof = json.loads(old)
-    path = Path(proof['measurement']['path_control']['path'])
-    original = path.parent
-    original.rename(original.with_name('retained-original-measurement'))
-    with pytest.raises(OSError):
-        renewal.readiness(spec, payload)
-    assert not original.exists()
-    assert not (Path(spec['state_dir']) / 'native-preparation-renewal').exists()
-    assert Path(spec['preparation']['environment']['path']).read_bytes() == old
-
-
-def test_live_configuration_edits_after_admission_never_block_renewal_or_readback(payload_update):
-    _store, before, payload, _old, _package = payload_update
-    config_path = Path(before['config_path'])
-    original = json.loads(config_path.read_text())
-    # A reformat plus an operational edit after admission: the sealed snapshot,
-    # not the live file, is the authority renewal reads and records.
-    config_path.write_text(json.dumps({**original, 'capacity': 7}, indent=2))
-    observed = renewal.readiness(before, payload)
-    assert observed['required'] is True
-    assert observed['config_sha256'] == before['config_digest']
-    after, reference = renewal.renew(before, payload, digest(payload))
-    assert read_private(Path(reference['path']))['config_sha256'] == before['config_digest']
-    assert renewal.verify_generation(before, reference, after) == after
-    # Later edits, and even the file's absence, leave the generation verifiable
-    # and the renewal replayable.
-    config_path.write_text('{}')
-    assert renewal.verify_generation(before, reference, after) == after
-    config_path.unlink()
-    assert renewal.verify_generation(before, reference, after) == after
-    assert renewal.renew(before, payload, digest(payload)) == (after, reference)

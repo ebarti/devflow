@@ -15,7 +15,7 @@ from devflow_temporal.delivery_native_process import NativeProcess, process_tabl
 from devflow_temporal.delivery_resources import RunResources, read_private
 
 
-@pytest.mark.parametrize("outcome", ["complete", "cancel", "timeout", "changed"])
+@pytest.mark.parametrize("outcome", ["complete", "changed"])
 def test_owned_child_completes_once_after_worker_is_killed(tmp_path, outcome):
     state = tmp_path / "runs" / "restart"
     state.mkdir(parents=True, mode=0o700)

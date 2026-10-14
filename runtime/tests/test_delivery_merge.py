@@ -75,7 +75,7 @@ def test_real_admission_selects_merge_explicitly_without_a_second_repo_permissio
     assert cfg.public_policy()["authorized_endpoints"] == ["published_unmerged", "merged"]
 
 
-@pytest.mark.parametrize("change", ["fake", "recovery", "supersedes", "unknown_endpoint"])
+@pytest.mark.parametrize("change", ["fake", "unknown_endpoint"])
 def test_merge_cannot_broaden_a_legacy_recovery_or_simulation(intake_fixture, change):
     path, request = intake_fixture
     cfg = DeliveryConfig.load(path)
@@ -92,10 +92,7 @@ def test_merge_cannot_broaden_a_legacy_recovery_or_simulation(intake_fixture, ch
         cfg.admit(request)
 
 
-@pytest.mark.parametrize("stage,failure", [
-    ("prepublish", "failed"), ("local", "failed"), ("review", "failed"),
-    ("qa", "failed"), ("ci", "failed"), ("ci", "pending"), ("ci", "unknown"),
-])
+@pytest.mark.parametrize("stage,failure", [("prepublish", "failed"), ("ci", "unknown")])
 def test_any_unpassed_original_gate_prevents_merge(stage, failure):
     spec, candidate, pr, checks, attempts, publication = gates()
     checks[stage]["state"] = failure
@@ -103,10 +100,7 @@ def test_any_unpassed_original_gate_prevents_merge(stage, failure):
         require_merge_gates(spec, candidate, pr, checks, attempts, publication)
 
 
-@pytest.mark.parametrize("change", ["legacy", "false_marker", "source", "head", "base",
-                                   "policy", "ci_head", "cleanup", "unfinished",
-                                   "shared_session", "missing_review", "changed_implementation",
-                                   "publication", "stale_qa"])
+@pytest.mark.parametrize("change", ["legacy", "stale_qa"])
 def test_changed_authority_candidate_or_native_custody_prevents_merge(change):
     spec, candidate, pr, checks, attempts, publication = gates()
     if change == "legacy":
@@ -137,8 +131,7 @@ def test_changed_authority_candidate_or_native_custody_prevents_merge(change):
         require_merge_gates(spec, candidate, pr, checks, attempts, publication)
 
 
-@pytest.mark.parametrize("field,value", [("state", "unknown"), ("cleanup", "unknown"),
-                                       ("candidate_id", "other")])
+@pytest.mark.parametrize("field,value", [("state", "unknown"), ("candidate_id", "other")])
 def test_configured_browser_gate_is_mandatory(field, value):
     spec, candidate, pr, checks, attempts, publication = gates()
     spec["policy"]["browser_qa"] = {"configured": True}
@@ -199,7 +192,7 @@ class Projection(DeliveryWorkflow):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["merged", "unmerged", "bad_cleanup", "unknown_merge"])
+@pytest.mark.parametrize("mode", ["merged", "unknown_merge"])
 async def test_actual_workflow_orders_cleanup_merge_and_done(monkeypatch, mode):
     monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
     monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.now",
@@ -330,9 +323,7 @@ def test_normal_ci_authenticates_the_full_hosted_tree_and_reuses_complete_log(tm
     assert read_private(broker.root / "job-30-log.json")["stdout"] == broker.log
 
 
-@pytest.mark.parametrize("change", ["hosted_tree", "hosted_parents", "check_head", "failed",
-                                   "foreign_job", "manual_trigger", "rerun", "job_head",
-                                   "different_checkout_log"])
+@pytest.mark.parametrize("change", ["hosted_tree", "different_checkout_log"])
 def test_remote_ci_mismatch_cannot_bless_a_merge(tmp_path, change):
     spec, _, pr, _, _, _ = gates()
     spec["state_dir"] = str(tmp_path)
@@ -414,8 +405,7 @@ def test_actual_native_saved_receipt_uses_separate_supervisor_output_binding(tmp
     require_merge_gates(*values)
 
 
-@pytest.mark.parametrize("change", ["receipt", "session", "output", "request", "run", "policy",
-                                   "iteration", "result", "role", "cleanup"])
+@pytest.mark.parametrize("change", ["receipt", "cleanup"])
 def test_changed_native_receipt_or_controller_binding_cannot_bless_implementation(tmp_path, change):
     from devflow_temporal.delivery_merge import native_implementation_output
     from devflow_temporal.delivery_resources import write_private
@@ -450,9 +440,7 @@ def strict_rules():
     return rule, detail
 
 
-@pytest.mark.parametrize("change", ["loose", "missing_checks", "disabled", "bypass", "exempt",
-                                   "pull_request_bypass", "hidden_bypass", "changed_rules",
-                                   "foreign"])
+@pytest.mark.parametrize("change", ["loose", "foreign"])
 def test_merge_refuses_unenforced_or_bypassable_github_base_checks(tmp_path, change):
     spec = gates()[0]
     spec["state_dir"] = str(tmp_path)

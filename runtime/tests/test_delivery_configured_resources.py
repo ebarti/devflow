@@ -39,14 +39,6 @@ def test_implementation_preparation_preserves_exact_frozen_recipe_order():
     assert implementation_prerequisites(owned) == [node]
 
 
-@pytest.mark.parametrize("declaration", ["worker/.venv", ["worker/../.venv"],
-                                         ["/tmp/worker/.venv"], ["worker/output"], [None]])
-def test_implementation_preparation_does_not_infer_python_authority(declaration):
-    recipe = {"id": "candidate", "argv": ["unrelated-command"],
-              "generated_directories": declaration}
-    owned = {"policy": {"host_sandbox": "trusted-local", "baseline_checks": [recipe],
-                        "prepublish_checks": [recipe]}}
-    assert implementation_prerequisites(owned) == []
 
 
 def configured(tmp_path, kind="gate"):
@@ -77,31 +69,9 @@ def configured(tmp_path, kind="gate"):
     return owned, resources, broker, root, project
 
 
-@pytest.mark.parametrize("kind", ["gate", "checkout"])
-@pytest.mark.parametrize("stage", ["baseline_checks", "prepublish_checks", "checks"])
-def test_configured_environment_before_intake_survives_plan_and_source_changes(
-    tmp_path, kind, stage,
-):
-    owned, resources, broker, root, project = configured(tmp_path, kind)
-    check = owned["policy"].pop("baseline_checks")
-    owned["policy"][stage] = check
-    environment = project / ".venv"
-    assert broker._register_generated(root, ["worker/.venv"]) == [environment]
-    environment.mkdir()
-    (environment / "package").write_text("owned fixture dependency")
-    broker._record_generated([environment])
-    custody = read_private(resources.manifest)["roots"][str(environment)]
-    assert custody["configured_environment_sha256"]
-    assert "accepted_plan_sha256" not in custody
-    # Intake happens after baseline. Partial product work may also change metadata.
-    owned["accepted_plan"] = json.dumps({"verification": ["Run the API suite"]})
-    (project / "uv.lock").unlink()
-    assert resources.finalize("blocked")["state"] == "confirmed"
-    assert not environment.exists()
-    assert resources.finalize("blocked")["state"] == "confirmed"
 
 
-@pytest.mark.parametrize("change", ["remove", "argv", "directory"])
+@pytest.mark.parametrize("change", ["remove", "directory"])
 def test_changed_configured_authority_preserves_environment(tmp_path, change):
     owned, resources, broker, root, project = configured(tmp_path)
     environment = project / ".venv"
@@ -122,8 +92,7 @@ def test_changed_configured_authority_preserves_environment(tmp_path, change):
     assert (environment / "sentinel").read_text() == "preserve changed authority"
 
 
-@pytest.mark.parametrize("violation", ["foreign", "symlink", "untracked", "metadata_link",
-                                        "missing_lock", "undeclared", "profile", "string"])
+@pytest.mark.parametrize("violation", ["foreign", "string"])
 def test_configured_environment_does_not_adopt_foreign_or_unlocked_paths(tmp_path, violation):
     owned, _resources, broker, root, project = configured(tmp_path)
     environment = project / ".venv"

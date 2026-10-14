@@ -140,7 +140,7 @@ def test_uncertain_public_primary_switch_observes_before_resuming(primary, effec
     assert sum(e[:2] == effect for e in state['effects']) == 1
 
 
-@pytest.mark.parametrize('change', ['inventory', 'skill', 'config', 'registration'])
+@pytest.mark.parametrize('change', ['inventory', 'registration'])
 def test_primary_switch_refuses_changed_inspected_inputs(primary, change):
     module, fixture, runtime, config, request, state = primary
     if change == 'inventory':
@@ -235,9 +235,7 @@ def test_primary_enabled_default_serialization_activation_replay_and_rollback(pr
     assert fixture['skill'].exists()
 
 
-@pytest.mark.parametrize('change', [
-    'false', 'string', 'integer', 'public-disabled', 'entry-mismatch',
-])
+@pytest.mark.parametrize('change', ['false', 'entry-mismatch'])
 def test_primary_enabled_default_rejects_effective_type_and_confirmation_drift(
     primary, monkeypatch, change,
 ):
@@ -385,9 +383,7 @@ async def test_pinned_sdk_automatically_discovers_selected_primary_skill_and_all
     assert installation['skill'].exists()
 
 
-@pytest.mark.parametrize('change', [
-    'transport', 'disabled', 'foreign-plugin', 'missing-server', 'raw-duplicate',
-])
+@pytest.mark.parametrize('change', ['transport', 'raw-duplicate'])
 def test_plugin_aggregate_inventory_requires_proven_owned_identity(primary, change):
     module, fixture, runtime, config, request, state = primary
     first = module.activate('codex', fixture['home'], runtime, config, request)

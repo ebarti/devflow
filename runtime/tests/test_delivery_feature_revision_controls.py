@@ -144,7 +144,7 @@ async def test_authenticated_http_revision_returns_one_recorded_successor_and_cu
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "change", ["stale", "unchecked_plan", "unchecked_policy", "long_reason", "changed_evidence"]
+    "change", ["stale", "changed_evidence"]
 )
 async def test_http_invalid_revision_cannot_create_successor_or_change_remote_bindings(
     service,

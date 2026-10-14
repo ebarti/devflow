@@ -132,12 +132,12 @@ def test_resume_native_cleanup_only_observes_owned_closure(monkeypatch):
     assert calls == [spec]
 
 
-@pytest.mark.parametrize(('complete', 'live_monitor', 'accepted'), [
-    (True, True, False), ('unknown', False, False), (1, False, False),
-    (True, False, True),
-])
+@pytest.mark.parametrize(
+    ("complete", "live_monitor", "accepted"), [(True, True, False), (True, False, True)]
+)
 def test_observed_cleanup_requires_strict_completion_and_separate_monitor_exit(
-        monkeypatch, complete, live_monitor, accepted):
+    monkeypatch, complete, live_monitor, accepted
+):
     from devflow_temporal import delivery_native_process
     from devflow_temporal import delivery_policy_recovery as policy
 

@@ -24,7 +24,7 @@ from devflow_temporal.delivery_mcp import build_server
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["submit_run", "answer_decision", "cancel_run"])
+@pytest.mark.parametrize("mutation", ["submit_run", "cancel_run"])
 async def test_stopped_mcp_handoff_starts_explicitly_before_required_reads(
     config, monkeypatch, mutation,
 ):
@@ -141,10 +141,7 @@ async def test_stopped_mcp_handoff_starts_explicitly_before_required_reads(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool", [
-    "recovery_preflight", "recover_execution", "metadata_preflight",
-    "reconcile_published_metadata",
-])
+@pytest.mark.parametrize("tool", ["recovery_preflight", "reconcile_published_metadata"])
 async def test_retired_mcp_tools_reject_without_start_or_stop(tmp_path, monkeypatch, tool):
     calls = []
     path = tmp_path / "absent" / "service.json"

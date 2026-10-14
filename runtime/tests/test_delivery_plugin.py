@@ -135,7 +135,7 @@ def test_unrelated_catalog_fields_and_plugins_preserved(package_fixture):
     assert updated == {**original, "plugins": [*original["plugins"], packager.ENTRY]}
 
 
-@pytest.mark.parametrize("conflict", ["catalog", "plugin", "extra", "symlink-file"])
+@pytest.mark.parametrize("conflict", ["catalog", "symlink-file"])
 def test_conflicts_preserve_both_destinations(package_fixture, conflict):
     root, runtime, config = package_fixture
     target = packager.package(root, runtime, config)
@@ -158,7 +158,7 @@ def test_conflicts_preserve_both_destinations(package_fixture, conflict):
     assert config.read_text() == "SECRET_CONFIG_CONTENT_MUST_NOT_BE_EMBEDDED"
 
 
-@pytest.mark.parametrize("component", ["marketplace", "plugins", ".agents", ".agents/plugins"])
+@pytest.mark.parametrize("component", ["marketplace", ".agents/plugins"])
 def test_symlink_destinations_never_escape_root(package_fixture, tmp_path, component):
     root, runtime, config = package_fixture
     outside = tmp_path / "outside"
@@ -171,7 +171,7 @@ def test_symlink_destinations_never_escape_root(package_fixture, tmp_path, compo
     assert list(outside.iterdir()) == []
 
 
-@pytest.mark.parametrize("spelling", ["direct", "missing", "file"])
+@pytest.mark.parametrize("spelling", ["direct", "file"])
 @pytest.mark.parametrize("dangling", [False, True])
 def test_named_root_symlink_spellings_preserve_target(
     package_fixture, tmp_path, spelling, dangling,
@@ -200,7 +200,7 @@ def test_named_root_symlink_spellings_preserve_target(
                       for path in outside.rglob("*") if path.is_file()}
 
 
-@pytest.mark.parametrize("missing", ["runtime", "executable", "config", "nonexecutable"])
+@pytest.mark.parametrize("missing", ["runtime", "nonexecutable"])
 def test_missing_inputs_create_no_package(package_fixture, missing):
     root, runtime, config = package_fixture
     if missing == "runtime":

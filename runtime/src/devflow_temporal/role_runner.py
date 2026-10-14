@@ -376,6 +376,18 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "change acceptance or policy. Return planning_defect=null for ordinary findings. "
             "Planning context: " + json.dumps(request.get("planning_context"), sort_keys=True)
         )
+    instructions += (
+        "\n\nMap inspected acceptance across the full affected entry -> handoff -> checks -> "
+        "review -> publication -> resume/settlement path. Within current role/stage authority, "
+        "exercise every required feasible scenario/boundary; read-only planners inspect/plan, "
+        "never implement or run future broker gates. Continue independent checks after failure; "
+        "return all findings together and dependent checks blocked/unverified. Future broker "
+        "gates remain pending, not failures merely because they are later. The implementation "
+        "owner repairs the complete findings batch before final merge/install and rechecks "
+        "original triggers/later affected boundaries, reusing valid unchanged evidence. "
+        "Preserve early PR publication/concurrent review-CI where permitted; controller "
+        "ordering, gates and authority remain unchanged."
+    )
     from .delivery_source_scope import authority
 
     authority_note = json.dumps(authority(spec["policy"]), sort_keys=True)

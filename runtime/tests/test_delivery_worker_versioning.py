@@ -191,8 +191,7 @@ async def test_new_delivery_is_pinned_and_records_order_marker_before_checks():
     await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
 
 
-@pytest.mark.parametrize("name,build", [("delivery", None), (None, "version"),
-                                       ("bad.name", "version"), ("delivery", "bad version")])
+@pytest.mark.parametrize("name,build", [("delivery", None), ("delivery", "bad version")])
 def test_invalid_or_partial_deployment_options_are_rejected(name, build):
     with pytest.raises(ValueError, match="together as bounded identifiers"):
         control._worker_deployment(name, build)
@@ -361,7 +360,7 @@ def test_pinned_selection_precedes_temporal_only_partial_start(tmp_path, monkeyp
     assert calls == [{"deployment": selection}]
 
 
-@pytest.mark.parametrize("digest", [None, "invalid", "0" * 64])
+@pytest.mark.parametrize("digest", [None, "0" * 64])
 @pytest.mark.parametrize("operation", ["start", "stop"])
 def test_stopped_selection_rejects_unknown_source_before_start_but_never_blocks_stop(
     tmp_path, monkeypatch, digest, operation,

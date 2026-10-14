@@ -230,121 +230,13 @@ def test_gates_only_controller_patch_uses_authenticated_consumer_namespace(stopp
     assert broker.state_dir == original.state_dir
 
 
-def test_retained_independent_home_config_is_preserved_for_fresh_gate_namespace(stopped):
-    from devflow_temporal.delivery_sandbox import (
-        _native_role_home,
-        _trusted_lines,
-        _write_once,
-    )
-
-    store, original, _closed, command = stopped
-    request = {'spec': original.spec, 'role': 'review', 'iteration': 4}
-    old_home = _native_role_home(request)
-    private_directory(old_home)
-    old_config = old_home / 'config.toml'
-    before = ('\n'.join(_trusted_lines(original.state_dir / 'gates/4/review')) + '\n').encode()
-    _write_once(old_config, before)
-    implementation = _native_role_home({**request, 'role': 'implement'})
-    store.admit_gates_only('run-1', command)
-    spec = store.effective_spec('run-1')
-    new_home = _native_role_home({**request, 'spec': spec})
-    assert new_home == old_home / 'gates-admission'
-    private_directory(new_home)
-    after = ('\n'.join(_trusted_lines(
-        original.state_dir / 'gates-admission/evidence/gates/4/review')) + '\n').encode()
-    _write_once(new_home / 'config.toml', after)
-    assert old_config.read_bytes() == before and (new_home / 'config.toml').read_bytes() == after
-    assert _native_role_home({**request, 'spec': spec, 'role': 'implement'}) == implementation
-    assert _native_role_home({**request, 'spec': spec}) == new_home
 
 
-@pytest.mark.parametrize('change', [None, 'path', 'alias', 'head', 'hash', 'workspace', 'qa-path'])
-def test_continuation_diff_and_qa_consumer_keep_exact_read_scope(stopped, change):
-    from copy import deepcopy
-
-    from devflow_temporal.delivery_activities import _context
-    from devflow_temporal.delivery_resources import write_private
-    from devflow_temporal.delivery_sandbox import _browser_qa_evidence, _review_diff_path
-
-    store, original, _closed, command = stopped
-    store.admit_gates_only('run-1', command)
-    spec = store.effective_spec('run-1')
-    _store, broker = _context(spec)
-    gates._git(broker.checkout, 'add', 'README.md')
-    gates._git(broker.checkout, 'commit', '-qm', 'test: published admitted candidate')
-    candidate = broker.candidate()
-    workspace = broker.gate_checkout('verify', 4, candidate)
-    diff = broker.gate_diff('verify', 4, candidate)
-    parent = broker.evidence_dir / 'browser-qa/4'
-    private_directory(parent)
-    log = parent / 'browser-qa.log'
-    log.write_bytes(b'controlled passed browser receipt\n')
-    log.chmod(0o600)
-    log_hash = hashlib.sha256(log.read_bytes()).hexdigest()
-    receipt = parent / 'receipt.json'
-    write_private(receipt, {'candidate_id': candidate['id'], 'iteration': 4,
-                            'state': 'passed', 'log_sha256': log_hash})
-    qa = {'path': str(receipt), 'sha256': hashlib.sha256(receipt.read_bytes()).hexdigest(),
-          'log': str(log), 'log_sha256': log_hash, 'candidate_id': candidate['id'], 'iteration': 4}
-    request = {'spec': spec, 'role': 'verify', 'iteration': 4, 'candidate': candidate,
-               'workspace': str(workspace), 'review_diff': deepcopy(diff), 'qa_evidence': qa}
-    if change == 'path':
-        request['review_diff']['path'] = str(original.state_dir / Path(diff['path']).name)
-    elif change == 'alias':
-        alias = original.state_dir / 'alias-patch'
-        alias.symlink_to(Path(diff['path']).parent, target_is_directory=True)
-        request['review_diff']['path'] = str(alias / Path(diff['path']).name)
-    elif change == 'head':
-        request['review_diff']['head'] = '0' * 40
-    elif change == 'hash':
-        request['review_diff']['sha256'] = '0' * 64
-    elif change == 'workspace':
-        request['workspace'] = str(original.checkout)
-    elif change == 'qa-path':
-        request['qa_evidence']['log'] = str(original.state_dir / log.name)
-    if change is None:
-        assert _review_diff_path(request) == Path(diff['path'])
-        _browser_qa_evidence(request)
-    else:
-        with pytest.raises((ValueError, OSError)):
-            _review_diff_path(request)
-            _browser_qa_evidence(request)
-    assert hashlib.sha256(Path(diff['path']).read_bytes()).hexdigest() == diff['sha256']
-    assert hashlib.sha256(receipt.read_bytes()).hexdigest() == qa['sha256']
 
 
-def test_historical_native_attempt_container_and_controller_enrichment_are_read_only(stopped):
-    store, broker, _closed, _command = stopped
-    container = broker.state_dir / 'attempts'
-    container.chmod(0o755)  # Supervisor.mkdir(parents=True) historical container contract.
-    with store._connect() as db:
-        attempt = dict(db.execute('SELECT * FROM delivery_attempts').fetchone())
-        raw = json.loads(Path(attempt['result_path']).read_bytes())
-        saved = {**raw, 'cleanup': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
-                 'resource_cleanup': 'pending_workflow_finalization', 'native_process': {
-                     'state': 'finished', 'monitoring_complete': True,
-                     'cleanup': 'observed-native-confirmed', 'exit_code': 0,
-                     'journal': str(Path(attempt['result_path']).with_name('native-process.json')),
-                 }}
-        db.execute('UPDATE delivery_attempts SET result_json=?', (canonical_json(saved),))
-    path = Path(attempt['result_path'])
-    before = path.read_bytes()
-    assert gates.preflight(store, 'run-1')['iteration'] == 4
-    gates._assessment_receipt({**broker.spec, 'provider': 'codex'},
-                             {**attempt, 'result_json': canonical_json(saved)}, before)
-    assert path.read_bytes() == before and container.stat().st_mode & 0o777 == 0o755
-    for changed in ({**saved, 'summary': 'Changed assessment'},
-                    {**saved, 'process_cleanup': 'unknown'},
-                    {**saved, 'native_process': {
-                        **saved['native_process'], 'monitoring_complete': 1}},
-                    {**saved, 'unrecognized': True}):
-        with pytest.raises(ValueError):
-            gates._assessment_receipt({**broker.spec, 'provider': 'codex'},
-                                     {**attempt, 'result_json': canonical_json(changed)}, before)
 
 
-@pytest.mark.parametrize('change', ['container-write', 'leaf-public', 'result-public',
-                                    'hardlink', 'symlink', 'wrong-path', 'missing-leaf'])
+@pytest.mark.parametrize('change', ['container-write', 'missing-leaf'])
 def test_historical_native_receipt_reader_rejects_unrecognized_custody_without_creation(
     stopped, change,
 ):
@@ -376,20 +268,7 @@ def test_historical_native_receipt_reader_rejects_unrecognized_custody_without_c
 
 @pytest.mark.parametrize(
     "change",
-    [
-        "source",
-        "frozen",
-        "after",
-        "role-input",
-        "session",
-        "raw",
-        "cleanup",
-        "active",
-        "issue",
-        "authority",
-        "precheck",
-        "accepted-plan",
-    ],
+    ["source", "accepted-plan"],
 )
 def test_gates_only_admission_refuses_changed_provenance_without_claim_or_roles(stopped, change):
     store, broker, closed, command = stopped

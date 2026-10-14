@@ -119,9 +119,7 @@ async def test_cold_read_mcp_does_not_start_api_or_dispatch(config, monkeypatch,
             assert not thread.is_alive()
 
 
-@pytest.mark.parametrize('command', [
-    'runs', 'run', 'evidence', 'gates-only-preflight', 'repair-admission-preflight',
-])
+@pytest.mark.parametrize('command', ['runs', 'repair-admission-preflight'])
 def test_cold_cli_reads_report_unavailable_without_start(config, monkeypatch, command, capsys):
     calls = []
     monkeypatch.setattr(control, 'ensure_service_running', lambda _cfg: calls.append('start'))

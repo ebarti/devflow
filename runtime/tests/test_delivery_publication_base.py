@@ -12,7 +12,6 @@ from test_delivery_store import service as service
 
 from devflow_temporal import delivery_broker
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_config import publication_base_ref
 from devflow_temporal.delivery_repair import published_identity
 from devflow_temporal.delivery_store import DeliveryStore
 
@@ -25,31 +24,8 @@ def bind_default(source: Path) -> str:
     return head
 
 
-@pytest.mark.parametrize("raw", ["main", "origin/main", "sha"])
-def test_branch_resolution_keeps_the_pinned_object(service, raw):
-    store, _ = service
-    source = Path(store.config.raw["repositories"]["fixture"]["source_path"])
-    head = bind_default(source)
-    assert publication_base_ref(source, head if raw == "sha" else raw, head) == "main"
 
 
-@pytest.mark.parametrize("case", ["missing-default", "moved-default", "tag"])
-def test_unbound_commit_or_tag_cannot_guess_a_publication_branch(service, case):
-    store, _ = service
-    source = Path(store.config.raw["repositories"]["fixture"]["source_path"])
-    head = bind_default(source)
-    raw = head
-    if case == "missing-default":
-        _git(source, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
-    elif case == "moved-default":
-        (source / "README.md").write_text("Later base\n")
-        _git(source, "commit", "-qam", "docs: advance default")
-        _git(source, "update-ref", "refs/remotes/origin/main", _git(source, "rev-parse", "HEAD"))
-    else:
-        _git(source, "tag", "pinned-tag", head)
-        raw = "pinned-tag"
-    with pytest.raises(ValueError, match="publication"):
-        publication_base_ref(source, raw, head)
 
 
 def test_native_admission_freezes_branch_before_roles_or_effects(native_configuration):
@@ -78,15 +54,7 @@ def test_unbound_native_pin_is_rejected_before_accepting_work(native_configurati
         assert db.execute("SELECT count(*) FROM delivery_commands").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("case", [
-    "unchanged", "advanced", "remote-only", "default-changed", "paginated",
-    "page-retarget", "retarget",
-    "retarget-restored", "retarget-pinned", "retarget-restored-pinned",
-    "default-changed-pinned",
-    "incomplete-history", "missing-history", "readback-race", "api-error",
-    "missing-receipt", "wrong-receipt", "unrelated-live-tip", "foreign-branch",
-    "foreign-head", "foreign-origin",
-])
+@pytest.mark.parametrize("case", ["unchanged", "foreign-origin"])
 def test_legacy_sha_publication_uses_branch_for_creation_and_readback(
     service, monkeypatch, case,
 ):

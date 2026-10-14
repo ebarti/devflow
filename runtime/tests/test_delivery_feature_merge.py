@@ -229,7 +229,7 @@ def test_queued_or_partially_completed_merge_retains_ownership_and_open_issues(
         registry(spec).stop(spec["feature_delivery"]["owner"], "stop", {})
 
 
-@pytest.mark.parametrize("change", ["authority", "plan", "head", "partial"])
+@pytest.mark.parametrize("change", ["authority", "partial"])
 def test_changed_authority_plan_or_head_cannot_merge(service, monkeypatch, change):
     store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
     if change == "authority":

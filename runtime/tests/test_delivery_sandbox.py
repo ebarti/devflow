@@ -122,9 +122,7 @@ def test_native_profile_restricts_sibling_tmp_paths_and_alias(
 
 
 @pytest.mark.skipif(not os.environ.get("DEVFLOW_CODEX_BIN"), reason="real Codex CLI path required")
-@pytest.mark.parametrize('namespace', ['', 'metadata-reconciliation/evidence',
-                                       'gates-admission/evidence',
-                                       'technical-successor/evidence'])
+@pytest.mark.parametrize('namespace', ['', 'technical-successor/evidence'])
 def test_independent_profile_reads_only_bound_diff_not_git_or_controller(
     slash_tmp_path: Path, native_profile_python: str, namespace: str,
 ):

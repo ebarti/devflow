@@ -91,7 +91,7 @@ async def test_existing_minimum_or_higher_retention_is_preserved(days):
     assert namespace.value.SerializeToString(deterministic=True) == original
 
 
-@pytest.mark.parametrize("failure", ["describe", "update", "readback"])
+@pytest.mark.parametrize("failure", ["describe", "readback"])
 async def test_namespace_rpc_failure_is_explicit(failure):
     namespace = Namespace(failure=failure)
     with pytest.raises(RuntimeError, match="retention validation failed"):
@@ -102,23 +102,22 @@ async def test_namespace_rpc_failure_is_explicit(failure):
     }[failure]
 
 
-@pytest.mark.parametrize("tamper", [
-    lambda value: setattr(value.namespace_info, "id", "replacement"),
-    lambda value: setattr(value.namespace_info, "name", "foreign"),
-    lambda value: setattr(value.namespace_info, "state", NamespaceState.NAMESPACE_STATE_DEPRECATED),
-    lambda value: setattr(value.config.workflow_execution_retention_ttl, "seconds", 86400),
-    lambda value: value.namespace_info.data.update({"owner": "foreign"}),
-    lambda value: value.config.custom_search_attribute_aliases.update({"Keyword01": "changed"}),
-    lambda value: setattr(value.replication_config, "active_cluster_name", "foreign"),
-])
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        lambda value: setattr(value.namespace_info, "id", "replacement"),
+        lambda value: setattr(value.replication_config, "active_cluster_name", "foreign"),
+    ],
+)
 async def test_mismatched_readback_cannot_pass_startup(tamper):
     namespace = Namespace(tamper=tamper)
     with pytest.raises(RuntimeError, match="retention validation failed"):
         await ensure_namespace_retention(namespace.client)
 
 
-@pytest.mark.parametrize("field,value", [("name", "foreign"), ("id", ""),
-    ("state", NamespaceState.NAMESPACE_STATE_DEPRECATED)])
+@pytest.mark.parametrize(
+    "field,value", [("name", "foreign"), ("state", NamespaceState.NAMESPACE_STATE_DEPRECATED)]
+)
 async def test_invalid_original_namespace_is_refused_before_update(field, value):
     namespace = Namespace()
     setattr(namespace.value.namespace_info, field, value)

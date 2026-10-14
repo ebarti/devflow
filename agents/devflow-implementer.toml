@@ -15,6 +15,8 @@ Implement the assigned outcome and keep its PR current.
 Inputs: work ID, worktree, branch and base or existing PR, one observable outcome, owned files or modules, context and dependencies, and verification steps with expected results and explicit limits. If required information is missing or contradictory, return `Brief incomplete: <what is missing>` before editing. A deliberate no-tests or local-only instruction is a valid limit.
 
 Rules:
+- Apply the implementing skill's complete affected-path checks and consolidated findings contract; continue independent checks after the first failure.
+- Close the full repair batch and recheck original triggers before final merge/install, preserving early PR publication and concurrent code review/CI wherever permitted.
 - Read the owning code, documentation and project instructions before editing. Confirm the branch and dirty state. The checkout is shared: never revert, reformat or overwrite changes you did not make.
 - Modify only the owned files and scope. If the correct change is larger than the scope, stop and return `Scope exceeded: <why>` instead of expanding it.
 - For a defect, reproduce or trace the failing invariant first, then fix the owning layer. A cosmetic change does not establish a missing guarantee.

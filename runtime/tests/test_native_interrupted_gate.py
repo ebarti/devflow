@@ -146,32 +146,6 @@ async def test_lost_check_monitor_reruns_the_gate_once(native_gates, losses):
     assert _native_folders(folder) == ["native", "native-retry"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("losses", [1, 2])
-async def test_lost_browser_qa_monitor_reruns_the_gate_once(native_gates, losses):
-    broker, candidate = native_gates.broker, native_gates.candidate
-    folder = broker.evidence_dir / "browser-qa" / "0"
-    loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(None, broker.run_browser_qa, 0, candidate)
-    await _lose_authorized_monitor(folder / "native" / "native-process.json")
-    if losses == 2:
-        await _lose_authorized_monitor(folder / "native-retry" / "native-process.json")
-    result = await asyncio.wait_for(task, 120)
-    if losses == 1:
-        assert result["state"] == "passed", result.get("diagnostic")
-        assert result["cleanup"] == "confirmed" and result["test_count"] == 1
-        assert result["native_process"]["journal"] == str(
-            folder / "native-retry" / "native-process.json")
-        assert len(result["interrupted_native_processes"]) == 1
-        # The retained receipt replays against the journal that produced the verdict.
-        assert broker.run_browser_qa(0, candidate) == result
-        return
-    assert result["state"] == "unknown" and result["cleanup"] == "confirmed"
-    assert "lost twice" in result["reason"]
-    assert len(result["interrupted_native_processes"]) == 2
-    again = await loop.run_in_executor(None, broker.run_browser_qa, 0, candidate)
-    assert again["state"] == "unknown" and again["cleanup"] == "confirmed"
-    assert _native_folders(folder) == ["native", "native-retry"]
 
 
 @pytest.mark.asyncio

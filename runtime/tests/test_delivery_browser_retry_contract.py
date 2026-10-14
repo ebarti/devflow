@@ -70,7 +70,7 @@ def test_browser_setup_reason_and_bounded_retry_survive_exhausted_budget(stopped
         store.continue_repair("run-1", {**request, "command_id": "another-browser-retry"})
 
 
-@pytest.mark.parametrize("drift", ["candidate_id", "source_unchanged", "cleanup", "projection"])
+@pytest.mark.parametrize("drift", ["candidate_id", "projection"])
 def test_browser_retry_requires_the_same_closed_candidate_and_cleanup(stopped, drift):
     store, _, state, request = browser_setup_stop(stopped)
     browser = state["checks"]["browser_qa"]

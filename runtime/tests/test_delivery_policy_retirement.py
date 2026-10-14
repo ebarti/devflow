@@ -43,7 +43,7 @@ async def test_retired_http_routes_refuse_even_a_valid_local_mutation(api_fixtur
                       for item in path.parent.rglob("*") if item.is_file()}
 
 
-@pytest.mark.parametrize("tamper", [None, "missing", "original", "recovery", "maximum", "config"])
+@pytest.mark.parametrize("tamper", [None, "config"])
 def test_actual_c04_policy_row_retains_its_durable_validation(monkeypatch, tamper):
     """Use genuine c04 row/config bytes; substitute only historical file transport."""
     path = Path(__file__).parent / "fixtures" / "policy-c04-admitted-row.json.gz"

@@ -17,6 +17,8 @@ Direct implementation requests enter through [coordinating](../devflow-coordinat
 
 5. **Check within scope.** Run the agreed checks and appropriate project checks permitted by the user's limits. Do not run tests for a no-tests request. Record commands, expected/observed behavior, failed checks and unperformed checks honestly. Keep evidence at durable paths.
 
+Map inspected acceptance across the affected entry, handoff, checks, review, publication and resume/settlement path. Within current authority/stage, exercise every required feasible scenario; continue independent checks after failure and hand off all findings together. Mark dependent checks blocked/unverified. Repair the batch on the same candidate/PR before final merge/install; recheck original triggers and later affected boundaries, reusing valid unchanged evidence. Preserve early PR publication and concurrent review/CI where permitted. Cover admitted useful checks, not all tests.
+
 6. **Push repairs and identify the candidate.** Commit further fixes to the same branch, push them to the same PR, update its description and read back base/head SHAs. Verify the remote head contains the reported changes. Separate dirty/untracked work from the committed candidate. With no-commit scope, return the base SHA, worktree, full changed/untracked file list and a durable patch/snapshot with a content hash covering the assigned changes.
 
 7. **Hand off.** Return candidate identity, PR/stack references, changed scope, check outcomes and remaining work. The coordinator records results and updates the issue. Do not merge, release or deploy as part of implementation unless separately assigned.
