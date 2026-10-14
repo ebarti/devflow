@@ -150,6 +150,10 @@ def interrupted_assessment(service, monkeypatch, request):
                 "spawnSync('corepack',['pnpm','--filter','@fixture/api','exec','vitest','run',"
                 "'--reporter=junit','--outputFile.junit='+path.join(root,'junit.xml')]);"],
         }]
+        repository['checks'].insert(0, {'id': 'before-api', 'cwd': '.',
+                                         'argv': ['git', 'diff', '--check']})
+        repository['checks'].append({'id': 'unexecuted-tail', 'cwd': '.',
+                                    'argv': ['git', 'diff', '--check']})
         original.config.path.write_text(json.dumps(raw))
         service = (stores.DeliveryStore(DeliveryConfig.load(original.config.path)), submitted)
     store, submitted, _ = feature_service(service, monkeypatch)
@@ -675,7 +679,7 @@ def layout_assessment(preparation_assessment, monkeypatch):
                                         (spec['run_id'],)).fetchone()[0])
     broker = DeliveryBroker(f.store, spec)
     gate = broker.gate_checkout('verify', 7, recovery['candidate'])
-    recipe = spec['policy']['checks'][0]
+    recipe = next(c for c in spec['policy']['checks'] if c['id'] == 'api')
     folder = _gate_evidence_root(spec) / 'checks/7/api'
     raw = RunResources(spec).check_artifacts(folder / 'pytest-artifacts')
     (raw / 'fixtures').mkdir()
@@ -732,7 +736,10 @@ def layout_assessment(preparation_assessment, monkeypatch):
         'candidate_id': state['candidate']['id'],
         'results': [{'passed': True, 'cleanup': 'confirmed'}]},
         'local': {'state': 'failed', 'source_unchanged': True,
-                  'candidate_id': state['candidate']['id'], 'results': [failed]},
+                  'candidate_id': state['candidate']['id'], 'results': [{
+                      'id': 'before-api', 'argv': ['git', 'diff', '--check'],
+                      'passed': True, 'cleanup': 'confirmed', 'exit_code': 0,
+                      'rejected_output': False, 'rejection_causes': []}, failed]},
         'resource_cleanup': receipt}
     born = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=20)
     history, projected = asyncio.run(history_for(
@@ -784,6 +791,9 @@ def test_retained_layout_report_reserve_keeps_preparation_lineage_and_unused_bou
     assert recovery['state'] == before and before['roles'][-1]['status'] == 'blocked'
     assert recovery['original_recovery'] == f.recovery
     assert recovery['seal']['report_observation']['junit']['passed'] == 1
+    assert [r['id'] for r in before['checks']['local']['results']] == ['before-api', 'api']
+    assert [r['id'] for r in spec['policy']['checks']] == [
+        'before-api', 'api', 'unexecuted-tail']
     assert recovery['seal']['attribution_observation'] == f.recovery['seal'][
         'attribution_observation']
     assert len(gates._assessment_ancestry(recovery)) == 5
@@ -817,6 +827,9 @@ def test_retained_layout_report_reserve_keeps_preparation_lineage_and_unused_bou
             return gates.readback(f.store, body['spec'], body['recovery'])
         if name in {'delivery_tracker_start', 'delivery_tracker'}:
             return {'state': 'consistent'}
+        if name == 'delivery_checks':
+            assert body['spec']['policy']['checks'] == f.spec['policy']['checks']
+            assert body['spec']['policy']['checks'][-1]['id'] == 'unexecuted-tail'
         if name == 'delivery_role':
             assert body['role'] in {'review', 'verify'}
             return {'role': body['role'], 'status': 'pass', 'iteration': 7,

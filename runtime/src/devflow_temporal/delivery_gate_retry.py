@@ -215,6 +215,7 @@ def _report_layout_evidence(spec, state, broker, *, resource_spec=None):
     from .delivery_check_evidence import _owned_bytes, junit_counts, verify_manifest
     from .delivery_feature_gates import (
         _wrapped_junit_project,
+        bind_selector_report,
         resolve_required_selectors,
         retained_junit,
         selector_evidence,
@@ -231,11 +232,11 @@ def _report_layout_evidence(spec, state, broker, *, resource_spec=None):
             or not precheck.get('results') or not local.get('results')
             or any(r.get('passed') is not True or r.get('cleanup') != 'confirmed'
                    for r in precheck['results'])
-            or any(r.get('cleanup') != 'confirmed' for r in local['results'])
+            or any(r.get('cleanup') != 'confirmed' or type(r.get('exit_code')) is not int
+                   or r['exit_code'] != 0 or r.get('rejected_output') is not False
+                   or r.get('rejection_causes') != [] for r in local['results'])
             or len(failures) != 1
-            or len({r.get('id') for r in local['results']}) != len(local['results'])
-            or not {r['id'] for r in spec['policy']['checks']}.issubset(
-                {r.get('id') for r in local['results']})):
+            or len({r.get('id') for r in local['results']}) != len(local['results'])):
         raise ValueError('report layout recovery requires unchanged complete native checks')
     failed = failures[0]
     recipes = [r for r in spec['policy']['checks'] if r['id'] == failed.get('id')]
@@ -244,10 +245,38 @@ def _report_layout_evidence(spec, state, broker, *, resource_spec=None):
     recipe, native = recipes[0], failed.get('native_process') or {}
     bindings = {}
     _gate_roots(resource_spec or spec, execution_specs=bindings)
+    if any(admitted.get('gate_retry_stage') == 'report'
+           and admitted != (resource_spec or spec) for admitted in bindings.values()):
+        raise ValueError('this run already received its bounded report assessment retry')
     root = Path(spec['state_dir']) / gate_namespace(
         spec['gate_retry_generation'], spec['gate_retry_stage']) / 'evidence'
     if bindings.get(root) != spec:
         raise ValueError('report layout recovery lost its admitted execution namespace')
+    configured = {r['id']: r for r in spec['policy']['checks']}
+    ids = list(configured)
+    prefix = [r for r in local['results'] if r['id'] in configured]
+    # The native broker stops at the first rejected verdict. Unexecuted tail
+    # recipes remain required by the unchanged policy in the fresh assessment.
+    if (local['results'][-1] != failed
+            or [r['id'] for r in prefix] != ids[:ids.index(recipe['id']) + 1]
+            or any(r.get('argv') != bind_selector_report(configured[r['id']],
+                root / 'checks' / str(state['iteration']) / r['id'])['argv'] for r in prefix)):
+        raise ValueError('report layout recovery lost its exact configured check prefix')
+    extra = [r for r in local['results'] if r['id'] not in configured]
+    if extra:
+        addon = local.get('native_addon_preparation') or {}
+        path = root / 'checks' / str(state['iteration']) / 'native-addon-preparation.json'
+        dynamic = ['native-addon-node-identity', 'native-addon-build', 'native-addon-load']
+        start = next(i for i, r in enumerate(local['results']) if r['id'] == extra[0]['id'])
+        if (addon.get('state') != 'passed' or addon.get('candidate_id') != candidate['id']
+                or addon.get('receipt') != str(path) or addon.get('results') != extra
+                or [r['id'] for r in extra] != dynamic or not start
+                or local['results'][start:start + len(extra)] != extra
+                or '/store' not in local['results'][start - 1].get('argv', [])
+                or read_private(path) != {k: v for k, v in addon.items()
+                                          if k not in {'receipt', 'receipt_sha256'}}
+                or hashlib.sha256(_owned_bytes(path)).hexdigest() != addon.get('receipt_sha256')):
+            raise ValueError('report layout recovery lost its admitted native prerequisite prefix')
     folder = root / 'checks' / str(state['iteration']) / recipe['id']
     checkout = root / 'gates' / str(state['iteration']) / 'verify'
     cwd = checkout / recipe['cwd']
