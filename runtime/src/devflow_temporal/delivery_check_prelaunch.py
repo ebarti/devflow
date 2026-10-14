@@ -200,7 +200,14 @@ def preparation_observe(store, spec, row, attempts, effects, closed):
         raise ValueError('published preparation native records changed')
     for path in extra:
         precheck_dependency(spec, path, journals[path], proof)
-        if read_private(Path(path)).get('result', {}).get('exit_code') != 0:
+        journal = read_private(Path(path))
+        result = journal.get('result') or {}
+        if (journal.get('phase') != 'finished' or journal.get('monitoring_complete') is not True
+                or result.get('monitoring_complete') is not True
+                or journal.get('interrupted_monitor') or result.get('interrupted_monitor')
+                or type(result.get('exit_code')) is not int or result['exit_code'] != 0
+                or result.get('cleanup') != 'observed-native-confirmed'
+                or result.get('stdio_drained') is not True):
             raise ValueError('published preparation prerequisite did not complete successfully')
     with store._connect() as db:
         binding = work_binding(store, spec, db)

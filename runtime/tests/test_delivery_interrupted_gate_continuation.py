@@ -454,6 +454,39 @@ def preparation_assessment(interrupted_assessment, monkeypatch, request):
     elif changed == 'empty':
         state['checks']['prepublish']['results'] = []
     born = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=20)
+    folder = _gate_evidence_root(spec) / 'dependency-preparation/native-12/process'
+    journal = read_private(f.folder / 'native-process.json')
+    journal['intent']['policy_digest'] = spec['policy_digest']
+    identity = born.astimezone().strftime('%a %b %d %H:%M:%S %Y')
+    journal.update(monitor={'pid': 320001, 'identity': identity},
+                   owned={'320002': {'identity': identity, 'ppid': 320001, 'pgid': 320002}},
+                   monitoring_complete=True,
+                   result={'exit_code': 0, 'cleanup': 'observed-native-confirmed',
+                           'monitoring_complete': True, 'stdio_drained': True})
+    if changed == 'prerequisite-monitor':
+        journal['monitoring_complete'] = False
+        journal['result'].update(monitoring_complete=False, interrupted_monitor=True)
+    write_private(folder / 'native-process.json', journal)
+    write_private(folder / 'launch.json', read_private(f.folder / 'launch.json'))
+    write_private(folder / 'ready.json', {'pid': 320002, 'identity': identity})
+    final = {k: v for k, v in receipt.items() if k not in {'receipt', 'receipt_sha256'}}
+    final['processes'] = [*final['processes'], {'journal': str(folder / 'native-process.json'),
+                                              'cleanup': 'observed-native-confirmed'}]
+    write_private(Path(receipt['receipt']), final)
+    manifest = read_private(RunResources(spec).manifest)
+    manifest['processes'].append(str(folder / 'native-process.json'))
+    manifest['finalization'] = final
+    write_private(RunResources(spec).manifest, manifest)
+    receipt = {**final, 'receipt': receipt['receipt'],
+               'receipt_sha256': hashlib.sha256(Path(receipt['receipt']).read_bytes()).hexdigest()}
+    state['checks']['resource_cleanup'] = receipt
+    def native_observation(_spec, _attempts):
+        journals = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in (f.folder / 'native-process.json', folder / 'native-process.json')}
+        return {'journal_sha256': journals, 'finalization_sha256': receipt['receipt_sha256'],
+                'manifest_sha256': hashlib.sha256(
+                    RunResources(spec).manifest.read_bytes()).hexdigest(),
+                'roots': {}}
     history, projected = asyncio.run(history_for(
         f.store, spec, recovery, state, born, preparation=True))
     facts = asyncio.run(closure_facts(history))
@@ -472,7 +505,7 @@ def preparation_assessment(interrupted_assessment, monkeypatch, request):
     with f.store._connect() as db:
         f.store.state.release_work(db, spec['work_id'], 'external:devflow:' + spec['run_id'])
     monkeypatch.setattr('devflow_temporal.delivery_resources.observe_completed_resources',
-                        preflight.observe_completed_resources)
+                        native_observation)
     return SimpleNamespace(**{**vars(f), 'spec': spec, 'state': state, 'closed': closed,
                               'recovery': recovery})
 
@@ -549,5 +582,15 @@ def test_unlaunched_preparation_rejects_assessed_or_ambiguous_results(preparatio
     row, *_ = _rows(f.store, f.spec['run_id'])
     assert not preparation_possible(row)
     with pytest.raises(ValueError):
+        gates.snapshot(f.store, f.spec['run_id'], gates.PRELAUNCH_KIND)
+    assert f.shared.budget(f.token['issue_id'])['used'] == 10
+
+
+@pytest.mark.parametrize('preparation_assessment', ['prerequisite-monitor'], indirect=True)
+def test_unlaunched_preparation_keeps_successful_prerequisite_monitoring_truthful(
+    preparation_assessment,
+):
+    f = preparation_assessment
+    with pytest.raises(ValueError, match='prerequisite did not complete successfully'):
         gates.snapshot(f.store, f.spec['run_id'], gates.PRELAUNCH_KIND)
     assert f.shared.budget(f.token['issue_id'])['used'] == 10
