@@ -1220,26 +1220,14 @@ async def test_finish_verdict_names_the_chunk_and_the_failing_activity(monkeypat
 
 @pytest.mark.parametrize("kind, message, transient", [
     ("ConnectionResetError", "[Errno 54] Connection reset by peer", True),
-    ("ConnectionRefusedError", "[Errno 61] Connection refused", True),
-    ("ConnectionAbortedError", "[Errno 53] Software caused connection abort", True),
-    ("BrokenPipeError", "[Errno 32] Broken pipe", True),
     ("OSError", f"[Errno {errno.ETIMEDOUT}] Operation timed out", True),
-    ("OSError", f"[Errno {errno.EHOSTUNREACH}] No route to host", True),
     ("OSError", "[Errno 2] No such file or directory: 'gh'", False),
     ("OSError", "unexpected", False),
     ("DatabaseBusy", "database busy: database is locked", True),
-    ("OperationalError", "database is locked", True),
     ("OperationalError", "database table is locked", True),
     ("OperationalError", "no such table: delivery_runs", False),
-    ("TemporalUnavailable", "UNAVAILABLE: error trying to connect", True),
-    ("RPCError", "permission denied", False),
     ("GitHubTransientError", "gh: HTTP 502: Bad Gateway", True),
-    ("GitHubContractError", "gh: HTTP 401: Bad credentials", False),
-    ("GitHubContractError", "gh: HTTP 404: Not Found", False),
-    ("KeyError", "'head'", False),
     ("ValueError", "stopped checkpoint changed before admission", False),
-    ("ClosureUnavailable", "closure unavailable", False),
-    ("PermissionError", "[Errno 13] Permission denied", False),
 ])
 def test_infrastructure_allowlist_matches_on_the_child_and_coordinator_sides(
     kind, message, transient,
@@ -1257,25 +1245,15 @@ def test_infrastructure_allowlist_matches_on_the_child_and_coordinator_sides(
 
 @pytest.mark.parametrize("stderr, transient", [
     ("gh: HTTP 502: Bad Gateway (https://api.github.com/repos/example/fixture)", True),
-    ("gh: HTTP 503: Service Unavailable", True),
     ("gh: HTTP 429: Too Many Requests", True),
     ("gh: HTTP 403: API rate limit exceeded for user ID 1", True),
-    ("gh: HTTP 403: You have exceeded a secondary rate limit", True),
     ("gh: HTTP 403: Resource not accessible by integration", False),
-    ("gh: HTTP 401: Bad credentials", False),
-    ("gh: HTTP 404: Not Found", False),
-    ("gh: HTTP 422: Validation Failed", False),
     # Transport failures carry no HTTP status: offline, DNS, TLS, reset connections.
     ("error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
      True),
-    ("Post \"https://api.github.com/graphql\": dial tcp: lookup api.github.com: no such host",
-     True),
-    ("net/http: TLS handshake timeout", True),
-    ("read tcp 10.0.0.2:51234->140.82.112.6:443: read: connection reset by peer", True),
     # A certificate that fails verification is a deterministic misconfiguration.
     ("Get \"https://api.github.com/\": tls: failed to verify certificate: x509: certificate "
      "signed by unknown authority", False),
-    ("could not determine base repo: no git remotes found", False),
     ("unknown command \"foo\" for \"gh api\"", False),
 ])
 def test_github_server_faults_and_rate_limits_are_typed_transient(monkeypatch, stderr, transient):

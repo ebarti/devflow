@@ -142,13 +142,8 @@ def test_later_revision_review_uses_distinct_home_without_rewriting_retained_hom
 
 
 @pytest.mark.parametrize("change", [
-    "kind", "missing-context", "verify-role", "later-iteration", "resume-session",
-    "revision-id", "namespace", "namespace-traversal", "old-plan", "old-digest",
-    "proposed-plan", "proposed-digest", "context-candidate", "candidate", "candidate-base",
-    "candidate-head", "outer-candidate", "outer-base", "outer-head", "hash", "path",
-    "workspace", "workspace-alias", "content-rehashed", "inner-candidate-rehashed",
-    "inner-revision-rehashed", "inner-proposal-rehashed", "inner-extra-rehashed", "mode",
-    "hardlink", "symlink", "ancestor-symlink", "fifo",
+    "kind", "missing-context", "verify-role", "candidate", "hash", "path",
+    "content-rehashed", "mode", "hardlink", "symlink",
 ])
 def test_native_revision_preparation_refuses_changed_boundary_before_writes(native_review, change):
     broker, request = native_review

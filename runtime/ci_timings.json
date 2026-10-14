@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "https://github.com/ebarti/devflow/actions/runs/38534928064",
-  "measurement": "Module testcase seconds from successful Check38534928064 at36bdae6. Four removed duplicate compositions subtract their recorded105.643/30.214/34.477/33.218s. Lost-feature-wait and worker-wait cancellation use local5.28s fixture measurements in place of recorded72.049/48.590s; those changes are estimates for hosted balancing. Other removals conservatively retain baseline costs. Used only for balancing; every collected test remains required.",
+  "measurement": "Module testcase seconds from successful Check38534928064 at36bdae6. Four removed duplicate compositions subtract their recorded105.643/30.214/34.477/33.218s. Lost-feature-wait and worker-wait cancellation use local5.28s fixture measurements in place of recorded72.049/48.590s; those changes are estimates for hosted balancing. Other removals conservatively retain baseline costs. Used only for balancing; every collected test remains required. Browser reattachment and numeric HTTP fixture estimates replace recorded31.389/31.495/35.612s with local1.45/1.36/0.52s. Lean guard-matrix cuts retain their older module cost conservatively until hosted measurement.",
   "seconds": {
     "tests/test_closed_native_historical_policy.py": 6.308,
     "tests/test_closed_native_orphans.py": 9.18,
@@ -26,7 +26,7 @@
     "tests/test_delivery_check_executor_lifetime.py": 53.699,
     "tests/test_delivery_check_prelaunch.py": 0.89,
     "tests/test_delivery_check_slots.py": 66.778,
-    "tests/test_delivery_check_slots_browser.py": 76.022,
+    "tests/test_delivery_check_slots_browser.py": 15.948,
     "tests/test_delivery_check_slots_workflow.py": 2.361,
     "tests/test_delivery_ci_retry.py": 5.177,
     "tests/test_delivery_cleanup_boundaries.py": 8.505,
@@ -147,7 +147,7 @@
     "tests/test_delivery_session_custody.py": 4.275,
     "tests/test_delivery_settings.py": 0.888,
     "tests/test_delivery_source_scope.py": 0.002,
-    "tests/test_delivery_startup.py": 41.212,
+    "tests/test_delivery_startup.py": 6.12,
     "tests/test_delivery_stopped_resume.py": 24.814,
     "tests/test_delivery_stopped_scope_resume.py": 14.435,
     "tests/test_delivery_store.py": 115.099,
