@@ -542,14 +542,12 @@ class DeliveryBroker:
                     raise
                 return None  # Explicit fake fixtures may have no Git repository.
 
-        initial_index = index_description()
         evidence_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec)
         from .delivery_feature_gates import (
             GateAdmissionError,
-            _FailedSelectorTests,
             bind_selector_report,
             resolve_required_selectors,
             retain_admission_failure,
@@ -588,6 +586,7 @@ class DeliveryBroker:
                     )
             except (ValueError, OSError, KeyError) as exc:
                 raise CheckPreparationFailure('native-addon-authority', exc) from exc
+        initial_index = index_description()
         native_dependencies = (
             self._ensure_native_dependency_store(checkout)
             if self.spec["provider"] == "codex"
@@ -596,6 +595,14 @@ class DeliveryBroker:
         )
         node_toolchain = None
         native_addon = None
+
+        def require_prepared_source(check_id):
+            if (candidate_for(checkout)["id"] != candidate["id"]
+                    or index_description() != initial_index):
+                raise CheckPreparationFailure(
+                    check_id, ValueError("check source or Git index changed during preparation"),
+                    results)
+
         for check in checks:
             argv = check.get("argv")
             relative = check.get("cwd", ".")
@@ -677,6 +684,7 @@ class DeliveryBroker:
                     "timeout": int(check.get("timeout_seconds", 600)),
                     "cancelled": self._native_cancelled,
                 }
+                require_prepared_source(check["id"])
                 native_result = self._run_native_check(NativeProcess(
                     self.spec, evidence_dir / check["id"] / "native", **options,
                 ))
@@ -684,6 +692,7 @@ class DeliveryBroker:
                     # A lost monitor yields no verdict. One fresh invocation
                     # re-runs the gate; the interrupted journal stays as evidence.
                     interrupted.append(native_result)
+                    require_prepared_source(check["id"])
                     native_result = self._run_native_check(NativeProcess(
                         self.spec, evidence_dir / check["id"] / "native-retry", **options,
                     ))
@@ -793,12 +802,12 @@ class DeliveryBroker:
                         check, checkout, selected_sources[check["id"]],
                         junit=retained_junit(check_evidence, candidate["id"], self.state_dir),
                         spec=self.spec)
-                except _FailedSelectorTests as exc:
-                    selector_receipts = exc.receipts
-                    evidence_failure = test_verdict_failure = str(exc)
                 except (ValueError, OSError) as exc:
                     evidence_failure = str(exc)
-                    test_verdict_failure = None
+                    selector_receipts = getattr(exc, "_failed_selector_receipts", None)
+                    test_verdict_failure = (
+                        evidence_failure if selector_receipts is not None else None
+                    )
             rejected_causes = rejection_causes(
                 parsed_output, [check["reject_regex"]] if check.get("reject_regex") else [],
                 test_results=check.get("kind") == "test",

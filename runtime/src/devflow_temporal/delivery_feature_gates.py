@@ -45,14 +45,6 @@ class GateAdmissionError(ValueError):
         }
 
 
-class _FailedSelectorTests(ValueError):
-    """Fully attributed failed tests; still never passing selector evidence."""
-
-    def __init__(self, message, receipts):
-        super().__init__(message)
-        self.receipts = receipts
-
-
 def selector_path(selector: str) -> str:
     # The current execution protocol selects whole files. Node IDs and line
     # filters need distinct case receipts and are deliberately not inferred.
@@ -687,10 +679,11 @@ def selector_evidence(
         receipts.append({**source, **values})
     failed = [item for item in receipts if item["failed"]]
     if failed:
-        raise _FailedSelectorTests(
+        error = ValueError(
             "required selector contributed no complete passing evidence: " + failed[0]["selector"],
-            receipts,
         )
+        error._failed_selector_receipts = receipts
+        raise error
     return receipts
 
 

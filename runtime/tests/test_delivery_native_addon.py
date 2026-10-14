@@ -7,6 +7,7 @@ import json
 import pytest
 import yaml
 
+from devflow_temporal.delivery_broker import _git
 from devflow_temporal.delivery_native_dependencies import (
     native_addon_authority,
     validate_native_addon,
@@ -18,6 +19,7 @@ def addon(tmp_path, monkeypatch):
     checkout = tmp_path / "checkout"
     api = checkout / "apps/api"
     api.mkdir(parents=True)
+    _git(checkout, "init", "-q")
     frozen = {
         "package.json": json.dumps(
             {

@@ -120,6 +120,7 @@ def test_changed_native_authority_is_a_preparation_failure_with_confirmed_cleanu
 ):
     checkout = tmp_path / "checkout"
     checkout.mkdir()
+    broker_module._git(checkout, "init", "-q")
     broker = DeliveryBroker.__new__(DeliveryBroker)
     broker.spec = {"provider": "codex", "run_id": "run-1",
                    "policy": {"execution_backend": "native-macos"}}
