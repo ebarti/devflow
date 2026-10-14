@@ -11,6 +11,10 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pytest
+from temporalio.testing import ActivityEnvironment
+from test_delivery_feature_recovered_closure import recovered_worker as recovered_worker
+from test_delivery_store import service as service
+
 from devflow_temporal import delivery_activities as worker_activities
 from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_gate_retry as gates
@@ -30,9 +34,6 @@ from devflow_temporal.delivery_resources import (
     write_private,
 )
 from devflow_temporal.delivery_store import DeliveryStore
-from temporalio.testing import ActivityEnvironment
-from test_delivery_feature_recovered_closure import recovered_worker as recovered_worker
-from test_delivery_store import service as service
 
 
 @pytest.fixture
