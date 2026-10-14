@@ -247,6 +247,12 @@ def resume_worker(store, parent, child, row):
         sealed = gates.snapshot(store, child['run_id'], gates.PRELAUNCH_KIND)
         state = sealed['closed']['result']
         remaining, kind, admit = 0, gates.PRELAUNCH_KIND, gates.admit
+    elif gates.report_layout_possible(row):
+        sealed = gates.snapshot(store, child['run_id'])
+        if (sealed.get('report_observation') or {}).get('cause') != 'fixture_junit_report_layout':
+            raise OwnershipConflict('worker lacks its exact retained report recovery proof')
+        state = sealed['closed']['result']
+        remaining, kind, admit = 0, gates.KIND, gates.admit
     elif possible(store, child, row) or preflight_continuation(row):
         sealed = gates.snapshot(store, child['run_id'])
         if not any(key in sealed for key in ('attribution_observation', 'preflight_continuation')):

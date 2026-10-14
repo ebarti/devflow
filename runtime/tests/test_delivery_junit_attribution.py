@@ -200,3 +200,81 @@ def test_evidence_failure_survives_bounded_feedback_and_private_receipts(service
     monkeypatch.setattr(protocol.workflow, "patched", lambda key: False)
     legacy = json.loads(_broker_findings("local_checks", result, iteration=5)[0].split(": ", 1)[1])
     assert "evidence_failure" not in legacy["failed_checks"][0]
+
+
+def test_frozen_wrapper_report_survives_fixture_cleanup_and_verdict_replay(
+    wrapped_project, tmp_path,
+):
+    import os
+    import shlex
+    import shutil
+    import sys
+    from pathlib import Path
+
+    from test_delivery_resources import spec as owned_spec
+
+    from devflow_temporal.delivery_check_evidence import junit_counts, retain_artifacts
+    from devflow_temporal.delivery_feature_gates import retained_junit
+    from devflow_temporal.delivery_native_process import NativeProcess
+    from devflow_temporal.delivery_resources import RunResources
+
+    source, recipe, authority = wrapped_project
+    # The frozen wrapper derives its report directory from the controller's
+    # basetemp, including the dedicated disposable fixtures child.
+    recipe['argv'][3] = (
+        "import path from 'node:path';import fs from 'node:fs';"
+        "import {spawnSync} from 'node:child_process';"
+        "const value=process.env.PYTEST_ADDOPTS||'';"
+        "if(!value.startsWith('--basetemp='))throw Error('controller artifact path missing');"
+        "const root=value.slice(11).replace(/^'|'$/g,'');fs.mkdirSync(root,{recursive:true});"
+        "const child=spawnSync('corepack',['pnpm','--filter','@fixture/api','exec','vitest',"
+        "'run','--reporter=default','--reporter=junit','--outputFile.junit='+"
+        "path.join(root,'junit.xml')],{stdio:'inherit',env:{...process.env,"
+        "PYTHONPATH:path.resolve('workers/automation/src')}});"
+        "if(child.error)throw child.error;process.exit(child.status??1);"
+    )
+    authority['policy']['checks'] = [deepcopy(recipe)]
+    candidate = candidate_for(source)
+    sources = resolve_required_selectors(recipe, source)
+    report = junit([('test/server.test.ts', 'passed'), ('benchmark/local-scale.test.ts', 'passed')])
+    runner = tmp_path / 'bin/corepack'
+    runner.parent.mkdir()
+    runner.write_text(
+        f'#!{sys.executable}\n'
+        'import sys; from pathlib import Path\n'
+        "assert sys.argv[1:7] == ['pnpm','--filter','@fixture/api','exec','vitest','run']\n"
+        "assert sys.argv[7:9] == ['--reporter=default','--reporter=junit']\n"
+        "assert sys.argv[9].startswith('--outputFile.junit=')\n"
+        f'Path(sys.argv[9].split("=",1)[1]).write_bytes({report!r})\n'
+    )
+    runner.chmod(0o700)
+    owned = owned_spec(tmp_path)
+    resources = RunResources(owned)
+    raw = resources.check_artifacts(
+        Path(owned['state_dir']) / 'checks/7/wrapped-api/pytest-artifacts')
+    inode = raw.stat().st_ino
+    environment = {'PATH': str(runner.parent) + os.pathsep + os.environ['PATH'],
+                   'PYTEST_ADDOPTS': '--basetemp=' + shlex.quote(str(raw / 'fixtures'))}
+    node = str(Path(shutil.which('node')).resolve())
+    process = NativeProcess(owned, raw.parent / 'native', argv=[node, *recipe['argv'][1:]],
+                            cwd=source, environment=environment, timeout=5)
+    result = process.run()
+    assert result['exit_code'] == 0 and raw.stat().st_ino == inode
+    reference = retain_artifacts(raw.parent, candidate)
+    manifest = json.loads(Path(reference['path']).read_text())
+    assert [item['relative_path'] for item in manifest['artifacts']] == ['fixtures/junit.xml']
+    assert resources.cleanup_check_artifacts(raw, [process.journal])['state'] == 'removed'
+    assert not raw.exists()
+    for _ in range(2):
+        assert process.run() == result
+        assert retain_artifacts(raw.parent, candidate) == reference
+        assert retained_junit(reference, candidate['id'], Path(owned['state_dir'])) == report
+        assert junit_counts(reference, candidate['id'], Path(owned['state_dir'])) == {
+            'tests': 2, 'failures': 0, 'errors': 0, 'skipped': 0, 'passed': 2,
+        }
+        receipts = selector_evidence(recipe, source, sources, junit=retained_junit(
+            reference, candidate['id'], Path(owned['state_dir'])), spec=authority)
+        assert {r['selector']: r['passed'] for r in receipts} == dict.fromkeys(SELECTORS, 1)
+        assert not raw.exists()
+    assert candidate_for(source) == candidate
+    assert resources.finalize('blocked')['resource_cleanup'] == 'confirmed'

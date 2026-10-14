@@ -60,7 +60,7 @@ def tmp_path():
         yield Path(directory).resolve()
 
 
-async def history_for(store, spec, recovery, state, born, *, preparation=False):
+async def history_for(store, spec, recovery, state, born, *, preparation=False, report=False):
     async def payload(values):
         return Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode(values))
 
@@ -78,21 +78,25 @@ async def history_for(store, spec, recovery, state, born, *, preparation=False):
         'phase', 'execution_state', 'outcome', 'cleanup', 'error', 'checks',
         'pull_request', 'tracker', 'usage', 'decision', 'intake')},
         'protocol_revision': state['revision'],
-        'event_type': 'blocked' if preparation else 'tracker_deadline',
-        'message': state['error'], 'key': f"tracker_deadline:7:{state['revision']}"}
+        'event_type': 'blocked' if preparation or report else 'tracker_deadline',
+        'message': state['error'],
+        'key': f"{'blocked' if report else 'tracker_deadline'}:7:{state['revision']}"}
     calls = [
         ('delivery_gates_readback', {'spec': spec, 'recovery': recovery}, {'state': 'OPEN'}),
         ('delivery_tracker_start', {'spec': spec, 'repair_continuation': True},
          {'state': 'consistent'}),
         ('delivery_project', {**common, 'event_type': 'gates_retry_started',
-                             'protocol_revision': (recovery['state']['revision'] + 1 if preparation
+                             'protocol_revision': (recovery['state']['revision'] + 1
+                                                   if preparation or report
                                                    else state['revision'] - 1)}, {}),
         ('delivery_precheck', common, state['checks']['prepublish']),
         ('delivery_finalize_resources', {'spec': spec, 'outcome': 'blocked'},
-         state['checks']['resource_cleanup'] if preparation else None),
+         state['checks']['resource_cleanup'] if preparation or report else None),
         ('delivery_terminal_tracker', {'spec': spec}, state['tracker']),
         ('delivery_project', projected, {}),
     ]
+    if report:
+        calls.insert(4, ('delivery_checks', common, state['checks']['local']))
     for number, (name, request, result) in enumerate(calls):
         event_id = len(events) + 1
         scheduled = HistoryEvent(event_id=event_id,
@@ -115,13 +119,44 @@ async def history_for(store, spec, recovery, state, born, *, preparation=False):
     terminal = HistoryEvent(event_id=len(events) + 1,
         workflow_execution_completed_event_attributes=WorkflowExecutionCompletedEventAttributes(
             result=await payload([state])))
-    terminal.event_time.FromDatetime(born + timedelta(seconds=9))
+    terminal.event_time.FromDatetime(born + timedelta(seconds=11 if report else 9))
     events.append(terminal)
     return WorkflowHistory(workflow_id, events), projected
 
 
 @pytest.fixture
 def interrupted_assessment(service, monkeypatch, request):
+    if getattr(request, 'param', None) == 'layout-report':
+        from devflow_temporal.delivery_config import DeliveryConfig
+
+        original, submitted = service
+        source = Path(original.config.raw['repositories']['fixture']['source_path'])
+        package = source / 'apps/api'
+        (package / 'test').mkdir(parents=True)
+        (package / 'package.json').write_text('{"name":"@fixture/api"}')
+        (package / 'test/smoke.test.ts').write_text("test('frozen selector',()=>{});\n")
+        _git(source, 'add', '.')
+        _git(source, 'commit', '-qm', 'Frozen wrapper report fixture')
+        raw = deepcopy(original.config.raw)
+        repository = raw['repositories']['fixture']
+        repository['expected_base_sha'] = _git(source, 'rev-parse', 'HEAD')
+        repository['checks'] = [{
+            'id': 'api', 'cwd': '.', 'kind': 'test', 'junit_required': True,
+            'test_count_regex': r'([0-9]+) passed', 'min_tests': 1,
+            'required_selectors': ['apps/api/test/smoke.test.ts'],
+            'selector_project': '.', 'selector_evidence_version': 1,
+            'argv': ['node', '--input-type=module', '-e',
+                "import path from 'node:path';import {spawnSync} from 'node:child_process';"
+                "const root=(process.env.PYTEST_ADDOPTS||'').slice(11).replace(/^'|'$/g,'');"
+                "spawnSync('corepack',['pnpm','--filter','@fixture/api','exec','vitest','run',"
+                "'--reporter=junit','--outputFile.junit='+path.join(root,'junit.xml')]);"],
+        }]
+        repository['checks'].insert(0, {'id': 'before-api', 'cwd': '.',
+                                         'argv': ['git', 'diff', '--check']})
+        repository['checks'].append({'id': 'unexecuted-tail', 'cwd': '.',
+                                    'argv': ['git', 'diff', '--check']})
+        original.config.path.write_text(json.dumps(raw))
+        service = (stores.DeliveryStore(DeliveryConfig.load(original.config.path)), submitted)
     store, submitted, _ = feature_service(service, monkeypatch)
     store.submit(submitted)
     parent = store.effective_spec(submitted['run_id'])
@@ -131,6 +166,8 @@ def interrupted_assessment(service, monkeypatch, request):
     chunk = ordered_chunks(json.loads(parent['accepted_plan']))[0]
     child = worker_spec(parent, chunk, {'url': 'https://github.com/example/fixture/issues/10'},
                         kind='chunk', base_sha=parent['base_sha'], base_branch='main')
+    if getattr(request, 'param', None) == 'layout-report':
+        child['resource_cleanup_version'] = 1
     register_worker(store, parent, child)
     shared.checkpoint(token, f"assignment:{chunk['id']}:chunk",
         {'run_id': child['run_id'], 'store_path': token['store_path'],
@@ -626,3 +663,226 @@ def test_preparation_success_uses_the_exact_authenticated_prerequisite_bytes(
         gates.snapshot(f.store, f.spec['run_id'], gates.PRELAUNCH_KIND)
     assert calls == [True]
     assert f.shared.budget(f.token['issue_id'])['used'] == 10
+
+
+@pytest.fixture
+def layout_assessment(preparation_assessment, monkeypatch):
+    import shlex
+
+    from devflow_temporal.delivery_check_evidence import retain_artifacts
+    from devflow_temporal.delivery_feature_revision_subject import _runtime
+
+    f = preparation_assessment
+    resumed = activities.reserve(f.parent, f.chunk['id'], 'chunk')
+    spec = resumed['spec']
+    with f.store._connect() as db:
+        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
+                                        (spec['run_id'],)).fetchone()[0])
+    broker = DeliveryBroker(f.store, spec)
+    gate = broker.gate_checkout('verify', 7, recovery['candidate'])
+    recipe = next(c for c in spec['policy']['checks'] if c['id'] == 'api')
+    folder = _gate_evidence_root(spec) / 'checks/7/api'
+    raw = RunResources(spec).check_artifacts(folder / 'pytest-artifacts')
+    (raw / 'fixtures').mkdir()
+    (raw / 'fixtures/junit.xml').write_text('<testsuites><testsuite>'
+        '<testcase classname="test/smoke.test.ts" name="measured"/>'
+        '</testsuite></testsuites>')
+    reference = retain_artifacts(folder, recovery['candidate'])
+    native_folder = folder / 'native'
+    write_private(native_folder / 'launch.json', {'argv': recipe['argv'], 'environment': {
+        'PYTEST_ADDOPTS': '--basetemp=' + shlex.quote(str(raw / 'fixtures'))}})
+    log = native_folder / 'process.log'
+    log.write_text('1 passed\n')
+    log.chmod(0o600)
+    # The original native actor is a named fake transport seam in this protocol
+    # fixture; real frozen wrapper execution/cleanup is covered by the parser case.
+    from devflow_temporal.delivery_feature_review_context import _protected_root, _sources
+
+    root = _protected_root()
+    revision = _git(root, 'rev-parse', 'HEAD')
+    identity = {'dirty': False, 'local_digest': None, 'revision': revision,
+                'runtime_payload_sha256': _sources(root, revision)[1]}
+    assert _runtime(identity)['runtime_payload_sha256'] == identity['runtime_payload_sha256']
+    native = {'state': 'finished', 'exit_code': 0, 'monitoring_complete': True,
+        'cleanup': 'observed-native-confirmed', 'stdio_drained': True, 'timed_out': False,
+        'cancelled': False, 'listener_conflict': False, 'runtime_identity': identity,
+        'journal': str(native_folder / 'native-process.json'), 'log': str(log),
+        'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest()}
+    launch = read_private(native_folder / 'launch.json')
+    journal = {'intent': {'run_id': spec['run_id'], 'policy_digest': spec['policy_digest'],
+        'argv': recipe['argv'], 'cwd': str(gate), 'ports': [], 'timeout': 5,
+        'environment_sha256': digest(launch['environment'])},
+        'phase': 'finished', 'monitoring_complete': True, 'runtime_identity': identity,
+        'owned': {'390002': {'identity': 'private transport seam'}}, 'ports': [], 'result': native}
+    write_private(native_folder / 'native-process.json', journal)
+    final_path = Path(spec['state_dir']) / 'resources/finalization.json'
+    final = read_private(final_path)
+    final['processes'].append({'journal': native['journal'], 'cleanup': native['cleanup']})
+    write_private(final_path, final)
+    registry_path = Path(spec['state_dir']) / 'resources/manifest.json'
+    manifest = read_private(registry_path)
+    manifest['processes'].append(native['journal'])
+    manifest['finalization'] = final
+    write_private(registry_path, manifest)
+    receipt = {**final, 'receipt': str(final_path),
+               'receipt_sha256': hashlib.sha256(final_path.read_bytes()).hexdigest()}
+    failed = {'id': recipe['id'], 'argv': recipe['argv'], 'cwd': str(gate), 'passed': False,
+        'exit_code': 0, 'cleanup': 'confirmed', 'test_count': 1, 'rejected_output': False,
+        'rejection_causes': [], 'evidence_failure': 'required per-selector JUnit report is missing',
+        'native_process': native, 'artifacts': reference}
+    state = {**deepcopy(f.state), 'revision': recovery['state']['revision'] + 5,
+        'candidate': recovery['candidate'], 'pull_request': recovery['publication'],
+        'error': 'repair limit exhausted'}
+    state['checks'] = {'prepublish': {'state': 'passed', 'source_unchanged': True,
+        'candidate_id': state['candidate']['id'],
+        'results': [{'passed': True, 'cleanup': 'confirmed'}]},
+        'local': {'state': 'failed', 'source_unchanged': True,
+                  'candidate_id': state['candidate']['id'], 'results': [{
+                      'id': 'before-api', 'argv': ['git', 'diff', '--check'],
+                      'passed': True, 'cleanup': 'confirmed', 'exit_code': 0,
+                      'rejected_output': False, 'rejection_causes': []}, failed]},
+        'resource_cleanup': receipt}
+    born = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=20)
+    history, projected = asyncio.run(history_for(
+        f.store, spec, recovery, state, born, report=True))
+    facts = asyncio.run(closure_facts(history))
+    seal(f.store, history, facts, run_id=spec['run_id'], source='temporal')
+    closed = {k: facts[k] for k in ('workflow_id', 'execution_run_id', 'closed_at',
+                                  'request_digest', 'recovery_digest', 'result')}
+    f.closures[closed['workflow_id']] = closed
+    clock = stores._now
+    monkeypatch.setattr(stores, '_now', lambda: (born + timedelta(seconds=10)).isoformat())
+    f.store.project(spec['run_id'], **{k: state.get(k) for k in (
+        'phase', 'outcome', 'execution_state', 'cleanup', 'iteration', 'candidate',
+        'pull_request', 'checks', 'error', 'usage', 'tracker', 'decision', 'intake')},
+        protocol_revision=state['revision'], event_type='blocked', message=state['error'],
+        key=projected['key'])
+    monkeypatch.setattr(stores, '_now', clock)
+    with f.store._connect() as db:
+        f.store.state.release_work(db, spec['work_id'], 'external:devflow:' + spec['run_id'])
+    # Ordinary maintenance refreshes only the cleanup receipt after closure.
+    final = deepcopy(final)
+    final['processes'][-1].update(monitoring_complete=True, owned_ports_clear=True,
+                                observed_pids=[390002])
+    write_private(final_path, final)
+    manifest['finalization'] = final
+    write_private(registry_path, manifest)
+    current_receipt = {**final, 'receipt': str(final_path),
+                       'receipt_sha256': hashlib.sha256(final_path.read_bytes()).hexdigest()}
+    maintenance_key = digest({'closed_workflow': {
+        **{k: closed[k] for k in ('workflow_id', 'execution_run_id', 'closed_at')},
+        'status': 'COMPLETED'}, 'native_observations': current_receipt['processes'],
+        'resource_cleanup': current_receipt})
+    f.store.project(spec['run_id'], phase='blocked', execution_state='blocked', outcome='blocked',
+        cleanup='confirmed', iteration=state['iteration'],
+        checks={**state['checks'], 'resource_cleanup': current_receipt},
+        event_type='resource_cleanup_reconciled', message='Observed ordinary completed cleanup',
+        key=maintenance_key)
+    def native_observation(_spec, _attempts):
+        return {'journal_sha256': {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                                  for path in read_private(registry_path)['processes']},
+                'finalization_sha256': hashlib.sha256(final_path.read_bytes()).hexdigest(),
+                'manifest_sha256': hashlib.sha256(registry_path.read_bytes()).hexdigest(),
+                'roots': {}}
+    monkeypatch.setattr('devflow_temporal.delivery_resources.observe_completed_resources',
+                        native_observation)
+    return SimpleNamespace(**{**vars(f), 'spec': spec, 'state': state, 'closed': closed,
+                              'recovery': recovery, 'failed': failed, 'journal': journal,
+                              'registry_path': registry_path,
+                              'current_receipt': current_receipt})
+
+
+@pytest.mark.parametrize('interrupted_assessment', ['layout-report'], indirect=True)
+def test_retained_layout_report_reserve_keeps_preparation_lineage_and_unused_bound(
+    layout_assessment, monkeypatch,
+):
+    from devflow_temporal.delivery_activities import delivery_gates_readback
+
+    f = layout_assessment
+    budget, before = f.shared.budget(f.token['issue_id']), deepcopy(f.state)
+    with f.store._connect() as db:
+        event = db.execute('SELECT sequence,payload_json FROM delivery_events WHERE run_id=? '
+                           "AND type='resource_cleanup_reconciled' ORDER BY sequence DESC LIMIT 1",
+                           (f.spec['run_id'],)).fetchone()
+        changed = json.loads(event['payload_json'])
+        changed['key'] = 'f' * 64
+        db.execute('UPDATE delivery_events SET payload_json=? WHERE sequence=?',
+                   (json.dumps(changed), event['sequence']))
+    try:
+        with pytest.raises(ValueError):
+            gates.snapshot(f.store, f.spec['run_id'])
+    finally:
+        with f.store._connect() as db:
+            db.execute('UPDATE delivery_events SET payload_json=? WHERE sequence=?',
+                       (event['payload_json'], event['sequence']))
+    result = activities.reserve(f.parent, f.chunk['id'], 'chunk')
+    spec = result['spec']
+    assert result['resumed'] and result['workflow_id'].endswith('report-gates-retry-1')
+    with f.store._connect() as db:
+        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
+                                        (spec['run_id'],)).fetchone()[0])
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
+    assert spec['gate_retry_stage'] == 'report' and 'gate_retry_preflight_generation' not in spec
+    assert recovery['state'] == before and before['roles'][-1]['status'] == 'blocked'
+    assert recovery['original_recovery'] == f.recovery
+    assert recovery['seal']['report_observation']['junit']['passed'] == 1
+    assert recovery['seal']['report_observation']['resources']['finalization_sha256'] == (
+        f.current_receipt['receipt_sha256'])
+    assert before['checks']['resource_cleanup']['receipt_sha256'] != (
+        f.current_receipt['receipt_sha256'])
+    assert [r['id'] for r in before['checks']['local']['results']] == ['before-api', 'api']
+    assert [r['id'] for r in spec['policy']['checks']] == [
+        'before-api', 'api', 'unexecuted-tail']
+    assert recovery['seal']['attribution_observation'] == f.recovery['seal'][
+        'attribution_observation']
+    assert len(gates._assessment_ancestry(recovery)) == 5
+    assert gates.admit(f.store, spec['run_id'], recovery['command'])['workflow_id'] == result[
+        'workflow_id']
+    assert asyncio.run(delivery_gates_readback({'spec': spec, 'recovery': recovery}))['number'] == 7
+    assert f.shared.budget(f.token['issue_id']) == budget and budget['used'] == 10
+    assert f.state == before
+    assert not gates.report_layout_possible({'recovery_json': json.dumps(recovery),
+                                               'checks_json': json.dumps(before['checks'])})
+    with pytest.raises(ValueError):
+        gates.admit(f.store, spec['run_id'],
+                    {**recovery['command'], 'command_id': 'second-layout-report'})
+    for path, value, reason in [
+        (Path(f.failed['artifacts']['path']), b'{}', 'manifest'),
+        (Path(f.failed['native_process']['journal']), b'{}', 'native'),
+        (Path(f.failed['native_process']['journal']).with_name('launch.json'), b'{}', 'launch'),
+    ]:
+        original = path.read_bytes()
+        path.write_bytes(value)
+        try:
+            with pytest.raises((ValueError, KeyError)):
+                gates.readback(f.store, spec, recovery)
+        finally:
+            path.write_bytes(original)
+        assert gates.readback(f.store, spec, recovery)['number'] == 7, reason
+    flow, calls = DeliveryWorkflow(), []
+    async def activity(name, body, **_kw):
+        calls.append(name)
+        if name == 'delivery_gates_readback':
+            return gates.readback(f.store, body['spec'], body['recovery'])
+        if name in {'delivery_tracker_start', 'delivery_tracker'}:
+            return {'state': 'consistent'}
+        if name == 'delivery_checks':
+            assert body['spec']['policy']['checks'] == f.spec['policy']['checks']
+            assert body['spec']['policy']['checks'][-1]['id'] == 'unexecuted-tail'
+        if name == 'delivery_role':
+            assert body['role'] in {'review', 'verify'}
+            return {'role': body['role'], 'status': 'pass', 'iteration': 7,
+                    'session_id': 'fresh-' + body['role'], 'cleanup': 'confirmed',
+                    'candidate': recovery['candidate']}
+        return {'state': 'passed', 'cleanup': 'confirmed'}
+    async def project(*_a, **_kw):
+        pass
+    monkeypatch.setattr(flow, '_activity', activity)
+    monkeypatch.setattr(flow, '_project', project)
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
+    finished = asyncio.run(flow._resume_published_gates(spec, recovery))
+    assert finished['outcome'] == 'delivered' and finished['iteration'] == 7
+    assert finished['roles'][:len(before['roles'])] == before['roles']
+    assert 'delivery_precheck' in calls and 'delivery_checks' in calls
+    assert 'delivery_publish' not in calls and f.state == before
+    assert f.shared.budget(f.token['issue_id']) == budget
