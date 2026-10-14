@@ -137,7 +137,10 @@ def precheck_dependency(spec, journal_path, journal_sha256, history):
     from .delivery_resources import read_private
 
     journal_path = Path(journal_path)
-    journal = read_private(journal_path)
+    raw = read_private(journal_path, raw=True)
+    if hashlib.sha256(raw).hexdigest() != journal_sha256:
+        raise ValueError('interrupted gate native launch differs from its actual precheck')
+    journal = json.loads(raw)
     launch = read_private(journal_path.with_name('launch.json'))
     ready = read_private(journal_path.with_name('ready.json'))
     intent, monitor = journal['intent'], journal['monitor']
@@ -151,8 +154,7 @@ def precheck_dependency(spec, journal_path, journal_sha256, history):
         born = datetime.strptime(monitor['identity'], '%a %b %d %H:%M:%S %Y').astimezone(UTC)
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError('interrupted precheck native birth identity is unreadable') from exc
-    if (hashlib.sha256(journal_path.read_bytes()).hexdigest() != journal_sha256
-            or intent['run_id'] != spec['run_id']
+    if (intent['run_id'] != spec['run_id']
             or intent['policy_digest'] != spec['policy_digest']
             or intent['argv'] != launch.get('argv') or intent['argv'] != argv
             or intent['timeout'] != 1800
@@ -169,6 +171,7 @@ def precheck_dependency(spec, journal_path, journal_sha256, history):
             or not datetime.fromisoformat(history['precheck_started_at']) - timedelta(seconds=1)
             <= born <= datetime.fromisoformat(history['precheck_completed_at'])):
         raise ValueError('interrupted gate native launch differs from its actual precheck')
+    return journal
 
 
 def observe_interrupted(store, spec, row, attempts, effects, closed):

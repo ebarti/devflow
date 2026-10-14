@@ -594,3 +594,35 @@ def test_unlaunched_preparation_keeps_successful_prerequisite_monitoring_truthfu
     with pytest.raises(ValueError, match='prerequisite did not complete successfully'):
         gates.snapshot(f.store, f.spec['run_id'], gates.PRELAUNCH_KIND)
     assert f.shared.budget(f.token['issue_id'])['used'] == 10
+
+
+
+def test_preparation_success_uses_the_exact_authenticated_prerequisite_bytes(
+    preparation_assessment, monkeypatch,
+):
+    from devflow_temporal import delivery_check_prelaunch as subject
+    from devflow_temporal import delivery_resources as resources
+
+    f = preparation_assessment
+    old = f.recovery['seal']['cleanup']['journal_sha256']
+    journals = f.state['checks']['resource_cleanup']['processes']
+    path = Path(next(item['journal'] for item in journals if item['journal'] not in old))
+    successful = read_private(path)
+    interrupted = deepcopy(successful)
+    interrupted['monitoring_complete'] = False
+    interrupted['result'].update(monitoring_complete=False, interrupted_monitor=True)
+    write_private(path, interrupted)
+    original, calls = resources.read_private, []
+    def read(given, *, raw=False):
+        if Path(given) == path:
+            calls.append(raw)
+            if len(calls) == 2:
+                return ((json.dumps(successful, sort_keys=True, indent=2) + '\n').encode()
+                        if raw else deepcopy(successful))
+        return original(given, raw=raw)
+    monkeypatch.setattr(resources, 'read_private', read)
+    monkeypatch.setattr(subject, 'read_private', read)
+    with pytest.raises(ValueError, match='prerequisite did not complete successfully'):
+        gates.snapshot(f.store, f.spec['run_id'], gates.PRELAUNCH_KIND)
+    assert calls == [True]
+    assert f.shared.budget(f.token['issue_id'])['used'] == 10

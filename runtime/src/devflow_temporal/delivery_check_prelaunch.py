@@ -199,8 +199,7 @@ def preparation_observe(store, spec, row, attempts, effects, closed):
                    for key in extra)):
         raise ValueError('published preparation native records changed')
     for path in extra:
-        precheck_dependency(spec, path, journals[path], proof)
-        journal = read_private(Path(path))
+        journal = precheck_dependency(spec, path, journals[path], proof)
         result = journal.get('result') or {}
         if (journal.get('phase') != 'finished' or journal.get('monitoring_complete') is not True
                 or result.get('monitoring_complete') is not True
