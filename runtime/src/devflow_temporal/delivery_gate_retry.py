@@ -910,6 +910,14 @@ def admit(store, run_id, payload, *, preflight=False):
         execution = prepare_runtime(
             spec, root, command_digest, digest(seal),
             **({'handoff': (store, seal, payload)} if verification else {}))
+        preparation_owner = None
+        preparation_path = root / 'runtime-preparation/successor/intent.json'
+        if verification and preparation_path.exists():
+            prepared_intent = read_private(preparation_path)
+            if (prepared_intent['command_digest'] != command_digest
+                    or prepared_intent['seal_digest'] != digest(seal)):
+                raise ValueError('unused runtime preparation changed before gate admission')
+            preparation_owner = prepared_intent['coordinator']['owner']
         if 'verification_test_paths' in payload:
             execution['verification_test_paths'] = payload['verification_test_paths']
         from .delivery_session_custody import implementation_generation
@@ -1003,6 +1011,8 @@ def admit(store, run_id, payload, *, preflight=False):
                  or layout or verification)
                     and spec.get('feature_worker')):
                 require_worker_handoff(store, spec)
+            if preparation_owner is not None:
+                _preparation_parent_claim(store, preparation_owner, db)
             if observation := seal.get('browser_prelaunch_observation'):
                 from .delivery_browser_prelaunch import resolved_effect
 
@@ -1186,6 +1196,19 @@ def readback(store, spec, recovery, *, resource_spec=None):
     return recovery['publication']
 
 
+def _preparation_parent_claim(store, owner, db):
+    from .delivery_feature_execution import require_execution
+
+    parent = store.effective_spec(owner['run_id'])
+    if (parent.get('feature_delivery', {}).get('owner') != owner
+            or owner['store_path'] != str(store.config.tracking_db)
+            or store.state.claim_for(db, parent['work_id']) is None):
+        raise ValueError('unused runtime preparation lost its current parent claim')
+    require_execution(store, parent)
+    work_binding(store, parent, db)
+    return parent
+
+
 def _unused_runtime_preparation(spec, root, raw, handoff, command_digest, seal_digest):
     """Preserve unused preparation; only the fresh stopped snapshot grants gates."""
     from .delivery_continuation import continuation_authority
@@ -1213,9 +1236,14 @@ def _unused_runtime_preparation(spec, root, raw, handoff, command_digest, seal_d
             or any(not isinstance(intent.get(key), str)
                    or not re.fullmatch(r'[0-9a-f]{64}', intent[key])
                    for key in ('command_digest', 'seal_digest'))
-            or (root / 'admission.json').exists() or (root / 'admission.json').is_symlink()
             or spec['policy'].get('host_sandbox') != 'trusted-local'):
         raise ValueError('unused runtime preparation has no cache-only listener handoff')
+    pending = root / 'admission.json'
+    if pending.exists() or pending.is_symlink():
+        envelope = read_private(pending)
+        if (envelope.get('command') != command or envelope.get('seal') != seal
+                or digest(envelope.get('original_recovery')) != seal['previous_digest']):
+            raise ValueError('unused runtime preparation has a different pending admission')
     config = load_execution_config(spec)
 
     def frozen_preparation(value):
@@ -1309,13 +1337,8 @@ def _unused_runtime_preparation(spec, root, raw, handoff, command_digest, seal_d
 
     original_producer = producer(intent['command_digest'], released=True)
     require_worker_handoff(store, spec)
-    parent = store.effective_spec(current_token['run_id'])
-    if parent['feature_delivery']['owner'] != current_token:
-        raise ValueError('unused runtime preparation current coordinator changed')
     with store._connect() as db:
-        work_binding(store, parent, db)
-        if store.state.claim_for(db, parent['work_id']) is None:
-            raise ValueError('unused runtime preparation lost its current parent claim')
+        _preparation_parent_claim(store, current_token, db)
         row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
                          (spec['run_id'],)).fetchone()
         admission = db.execute('SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
