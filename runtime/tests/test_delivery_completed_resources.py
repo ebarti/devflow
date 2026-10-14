@@ -2,14 +2,20 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import threading
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_native_process as processes
-from devflow_temporal.contracts import digest
+from devflow_temporal import delivery_orphans as orphans
+from devflow_temporal import delivery_resources as resources
+from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_resources import (
     RunResources,
     observe_completed_resources,
@@ -224,10 +230,167 @@ def test_later_completed_observation_requires_original_bindings(completed, chang
         import fcntl
 
         from devflow_temporal import delivery_resources
-        def busy(_fd, operation):
+        original_flock = fcntl.flock
+
+        def busy(descriptor, operation):
+            if operation == fcntl.LOCK_SH:
+                return original_flock(descriptor, operation)
             assert operation == fcntl.LOCK_EX | fcntl.LOCK_NB
             raise BlockingIOError('opaque original lease is busy')
         monkeypatch.setattr(delivery_resources.fcntl, 'flock', busy)
     write_private(path, journal)
     with pytest.raises((ValueError, KeyError)):
         observe_completed_resources(spec, [row])
+
+
+@pytest.fixture
+def retained(tmp_path, monkeypatch):
+    state = tmp_path / 'private-worker'
+    spec = {'run_id': state.name, 'state_dir': str(state), 'policy': {},
+            'checkout': str(tmp_path / 'candidate')}
+    owner = resources.RunResources(spec)
+    gate = state / 'gates/7/verify'
+    resources.private_directory(gate.parent)
+    owner.register(gate, 'gate')
+    resources.private_directory(gate)
+    owner.created(gate)
+    monkeypatch.setattr(processes, 'process_table', lambda: {})
+    monkeypatch.setattr(resources.subprocess, 'run',
+                        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=''))
+    monkeypatch.setattr(resources.RunResources, '_retain_source',
+                        lambda *_args: 'private synthetic retained gate')
+    owner.finalize('blocked')
+    return spec, owner, gate
+
+
+def test_observation_and_finalizer_share_one_complete_resource_generation(retained, monkeypatch):
+    spec, owner, _gate = retained
+    final = owner.root / 'finalization.json'
+    before = owner.manifest.read_bytes(), final.read_bytes()
+    baseline = resources.observe_completed_resources(spec, [])
+    writer_attempted, running, finish = (threading.Event() for _ in range(3))
+    reader_lease, errors = [], []
+    flock, write = resources.fcntl.flock, resources.write_private
+
+    def authenticated_flock(descriptor, operation):
+        if threading.current_thread() is writer and operation == resources.fcntl.LOCK_EX:
+            writer_attempted.set()
+        flock(descriptor, operation)
+        if (threading.current_thread() is threading.main_thread()
+                and operation == resources.fcntl.LOCK_SH):
+            reader_lease.append(True)
+
+    def paused_write(path, value):
+        write(path, value)
+        if path == owner.manifest and value.get('finalization', {}).get('state') == 'running':
+            running.set()
+            assert finish.wait(5)
+
+    def finalize():
+        try:
+            owner.finalize('blocked')
+        except BaseException as exc:
+            errors.append(exc)
+
+    writer = threading.Thread(target=finalize, name='private-resource-finalizer')
+
+    def overlap(argv, **_kwargs):
+        assert argv[0] == '/usr/sbin/lsof'
+        writer.start()
+        assert writer_attempted.wait(5)
+        if not reader_lease:
+            # Force the old unlocked reader to return the real intermediate hash.
+            assert running.wait(5)
+        return SimpleNamespace(returncode=1, stdout='')
+
+    monkeypatch.setattr(resources.fcntl, 'flock', authenticated_flock)
+    monkeypatch.setattr(resources, 'write_private', paused_write)
+    monkeypatch.setattr(resources.subprocess, 'run', overlap)
+    try:
+        observation = resources.observe_completed_resources(spec, [])
+        assert observation == baseline
+        assert observation['manifest_sha256'] == hashlib.sha256(before[0]).hexdigest()
+    finally:
+        finish.set()
+        if writer.ident is not None:
+            writer.join(5)
+    assert not writer.is_alive() and not errors
+    assert (owner.manifest.read_bytes(), final.read_bytes()) == before
+
+    # Observation must authenticate an existing private lease, never repair it.
+    lock = owner.root / 'ownership.lock'
+    lock.chmod(0o644)
+    with pytest.raises(ValueError, match='ownership lock.*private'):
+        resources.observe_completed_resources(spec, [])
+    assert lock.stat().st_mode & 0o777 == 0o644
+    lock.unlink()
+    with pytest.raises(FileNotFoundError):
+        resources.observe_completed_resources(spec, [])
+    assert not lock.exists()
+    assert (owner.manifest.read_bytes(), final.read_bytes()) == before
+
+
+def test_retained_custody_is_complete_but_new_or_changed_resources_remain_pending(
+        retained, monkeypatch):
+    spec, owner, gate = retained
+    row = {'cleanup_rowid': 1, 'run_id': spec['run_id'], 'request_json': canonical_json(spec),
+           'recovery_json': None, 'workflow_id': 'private-closed-worker', 'cleanup': 'confirmed',
+           'checks_json': canonical_json({'resource_cleanup': {'resource_cleanup': 'confirmed'}})}
+
+    class PrivateRows:
+        def execute(self, sql, _parameters=()):
+            if 'WHERE EXISTS' in sql:
+                return []
+            assert 'cleanup_rowid' in sql
+            return [row]
+
+    class PrivateStore:
+        @contextmanager
+        def _connect(self):
+            yield PrivateRows()
+
+    store, clock = PrivateStore(), [100.0]
+    monkeypatch.setattr(orphans.time, 'monotonic', lambda: clock[0])
+
+    def scan():
+        clock[0] += 61
+        return orphans._unfinished_rows(store)
+
+    assert scan() == []
+    before = owner.manifest.read_bytes()
+    owner.finalize('blocked')
+    assert owner.manifest.read_bytes() == before
+    assert scan() == []  # Identical-byte publication is not new disposable work.
+
+    row['cleanup'] = 'unknown'
+    assert len(scan()) == 1  # A lost cleanup acknowledgement still needs reconciliation.
+    row['cleanup'] = 'confirmed'
+    assert scan() == []
+    row['checks_json'] = '{}'
+    assert len(scan()) == 1
+    row['checks_json'] = canonical_json({'resource_cleanup': {'resource_cleanup': 'confirmed'}})
+    assert scan() == []
+
+    original = gate.with_name('preserved-original')
+    gate.rename(original)
+    gate.mkdir(mode=0o700)
+    assert len(scan()) == 1  # Unchanged manifest metadata cannot hide a replacement.
+    gate.rmdir()
+    original.rename(gate)
+    assert scan() == []
+
+    journal = owner.state / 'private-check/native-process.json'
+    resources.write_private(journal, {'phase': 'allocated'})
+    owner.process(journal)
+    assert len(scan()) == 1  # A new actor is not covered by the old finalization inventory.
+    with owner.locked() as manifest:
+        manifest['processes'] = []
+        resources.write_private(owner.manifest, manifest)
+    assert scan() == []
+
+    artifact = owner.state / 'checks/7/new/pytest-artifacts'
+    resources.private_directory(artifact.parent)
+    owner.register(artifact, 'check-artifacts')
+    resources.private_directory(artifact)
+    owner.created(artifact)
+    assert len(scan()) == 1  # A newly allocated root still requires its original finalizer.

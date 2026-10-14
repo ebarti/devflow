@@ -398,15 +398,27 @@ class RunResources:
         _ancestors(self.state)
 
     @contextmanager
-    def locked(self):
-        descriptor = os.open(
-            self.root / "ownership.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
-        )
+    def locked(self, *, read_only: bool = False):
+        lock = self.root / "ownership.lock"
+        flags = os.O_RDONLY if read_only else os.O_CREAT | os.O_RDWR
+        descriptor = os.open(lock, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+
+        def authenticate():
+            info, current = os.fstat(descriptor), lock.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+                raise ValueError("resource observation ownership lock changed or is not private")
+
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if read_only:
+                authenticate()
+            fcntl.flock(descriptor, fcntl.LOCK_SH if read_only else fcntl.LOCK_EX)
+            if read_only:
+                authenticate()
             value = (
                 read_private(self.manifest)
-                if self.manifest.exists()
+                if read_only or self.manifest.exists()
                 else {
                     "schema": "devflow-run-resources-v1",
                     "run_id": self.spec["run_id"],
@@ -420,6 +432,8 @@ class RunResources:
             ):
                 raise ValueError("run resource ownership changed")
             yield value
+            if read_only:
+                authenticate()
         finally:
             os.close(descriptor)
 
@@ -999,12 +1013,22 @@ def observe_completed_resources(spec, attempts):
 
 
 def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, attempts=()):
+    registry = RunResources(spec, read_only=True)
+    # Finalizers publish intermediate manifests under this same exclusive lease.
+    # Authenticate one complete generation, including the returned raw-byte hashes.
+    with registry.locked(read_only=True) as manifest:
+        return _observe_locked_resources(spec, registry, manifest, unknown_allowed=unknown_allowed,
+                                         freshly_completed=freshly_completed, attempts=attempts)
+
+
+def _observe_locked_resources(spec, registry, manifest, *, unknown_allowed=False,
+                              freshly_completed=False, attempts=()):
     state = Path(spec["state_dir"])
     _ancestors(state / "resources/manifest.json")
     manifest_path, final_path = (
         state / "resources" / name for name in ("manifest.json", "finalization.json")
     )
-    manifest, finalization = read_private(manifest_path), read_private(final_path)
+    finalization = read_private(final_path)
     if (
         manifest.get("run_id") != spec["run_id"]
         or manifest.get("state_identity") != _identity(state)
@@ -1027,7 +1051,6 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
 
     table = process_table()
     journals, roots = {}, {}
-    registry = RunResources(spec, read_only=True)
     receipts = {item["journal"]: item for item in finalization.get("processes", [])}
     if set(receipts) != set(manifest["processes"]):
         raise ValueError("predecessor finalized actor inventory changed")
