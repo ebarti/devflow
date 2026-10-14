@@ -797,8 +797,15 @@ class SavedCustody:
                 lifecycle["processes"][role].update(pid=process["pid"], identity=process["birth"])
             require(after["lifecycle"] == lifecycle, "managed lifecycle descriptor changed outside PID/birth")
             service = json.loads(json.dumps(before["service"]))
+            identity = service["runtime_identity"]
+            old_revision = identity["revision"]
+            require(isinstance(old_revision, str) and re.fullmatch(r"[0-9a-f]{40}", old_revision)
+                    and (identity["release"] is None or isinstance(identity["release"], str))
+                    and service["version"] == (identity["release"] or f"local-{old_revision[:8]}"),
+                    "original public service version differs from runtime identity")
             service["pid"] = identities["processes"]["api"]["pid"]
-            service["runtime_identity"]["revision"] = revision
+            identity["revision"] = revision
+            service["version"] = identity["release"] or f"local-{revision[:8]}"
             require(after["service"] == service and after["service"]["capacity"]["active"] == 0
                     and not after["service"]["runtime_identity"]["dirty"], "public service/policy/readiness changed")
             for name in ("service-processes.json", "worker-ready.json"):
@@ -825,6 +832,7 @@ class SavedCustody:
         expected_sync = json.loads(json.dumps(self.baseline["sync"]))
         expected_sync.update(pid=sync["pid"], birth=sync["birth"])
         arguments = expected_sync["plist"]["ProgramArguments"]
+        require(expected_sync["argv"] == arguments, "original synchronizer argv/plist mismatch")
         source = str(Path(arguments[0]).parents[3])
         config_path = arguments[arguments.index("--config") + 1]
         activation_path = arguments[arguments.index("--activation-file") + 1]
@@ -832,6 +840,7 @@ class SavedCustody:
         token = hashlib.sha256(json.dumps([source, revision, config_path, config_sha]).encode()).hexdigest()
         arguments[arguments.index("--activation-token") + 1] = token
         arguments[arguments.index("--expected-revision") + 1] = revision
+        expected_sync["argv"] = list(arguments)
         require(arguments[arguments.index("--config-sha256") + 1] == config_sha,
                 "synchronizer policy hash changed")
         require(sync == expected_sync and sync["TZ_present"] is False, "synchronizer changed outside exact qualified activation/PID/birth")
