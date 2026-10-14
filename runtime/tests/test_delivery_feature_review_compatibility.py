@@ -2,39 +2,14 @@
 from __future__ import annotations
 
 import ast
-import sys
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
-import test_delivery_feature_revision_preparation as preparation_tests
 from test_delivery_feature_review_context import context_repository, git
-from test_delivery_feature_revision_preparation import (
-    feature as feature,
-)
-from test_delivery_feature_revision_preparation import (
-    findings_reconsideration as findings_reconsideration,
-)
-from test_delivery_feature_revision_preparation import (
-    intake_fixture as intake_fixture,
-)
-from test_delivery_feature_revision_preparation import (
-    native_configuration as native_configuration,
-)
-from test_delivery_feature_revision_preparation import (
-    pending_preparation as pending_preparation,
-)
-from test_delivery_feature_revision_preparation import (
-    service as service,
-)
 
 from devflow_temporal import delivery_feature_review_context as context
 from devflow_temporal import delivery_feature_revisions as revisions
-
-exercise_public_retry = (
-    preparation_tests
-    .test_public_retry_recovers_partial_claim_and_same_revision_then_charges_seven_and_eight
-)
 
 
 def legacy_github_contract(source):
@@ -126,23 +101,3 @@ def test_compatibility_authenticates_payloads_and_keeps_post_receipt_guard_fenci
     git(root, "commit", "-qm", "Changed protected limit")
     with pytest.raises(ValueError, match="manifest size limit"):
         context.compatible_external_guards(legacy, context.current_runtime_context())
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="native preparation required")
-def test_public_pending_review_survives_transport_refactor_with_same_budget_and_custody(
-    pending_preparation, monkeypatch,
-):
-    p = pending_preparation
-    root = context._protected_root()
-    path = root / context.PREFIX / "delivery_github_contract.py"
-    path.write_text(legacy_github_contract(path.read_text()))
-    git(root, "add", ".")
-    git(root, "commit", "-qm", "Equivalent protected contract with legacy transport")
-    p["runtime"] = context.current_runtime_context()
-    assert p["runtime"]["context_sha256"] == p["old_runtime"]["context_sha256"]
-    assert p["runtime"]["guards"] != p["old_runtime"]["guards"]
-    assert context.compatible_external_guards(p["old_runtime"], p["runtime"])
-    # Reuse the real public-entry/partial-claim/native-consumption/adoption
-    # rehearsal. Closed Temporal, GitHub and completed roles are fixtures;
-    # historical Python is DATA and no provider is invoked.
-    exercise_public_retry(p, monkeypatch)

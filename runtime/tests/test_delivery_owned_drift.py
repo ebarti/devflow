@@ -23,7 +23,7 @@ canonicalized_unknown = _unknown
 
 
 @pytest.fixture
-def ambient(canonicalized_unknown, monkeypatch):
+def ambient(canonicalized_unknown, monkeypatch, request):
     module, fixture, args, manifest, failed = canonicalized_unknown
     drift = importlib.import_module("owned_drift")
     # The predecessor reproducer replaces the owning seal while importing its
@@ -62,7 +62,8 @@ def ambient(canonicalized_unknown, monkeypatch):
     package = root / ".codex-plugin/plugin.json"
     package.parent.mkdir(parents=True)
     package.write_text('{"name":"foreign","version":"2"}')
-    for index in range(158):
+    # Broad content indexing is exercised once; field refusals need two files.
+    for index in range(getattr(request, "param", 2)):
         (root / f"artifact-{index:03}.txt").write_text(f"retained content {index}\n")
     after = drift.foreign_snapshot(args[0], fixture["home"])
     evidence = manifest.parent / "inspected-evidence"
@@ -110,6 +111,7 @@ def _ack(ambient):
     return Path(json.loads(result.stdout)["acknowledgement"])
 
 
+@pytest.mark.parametrize("ambient", [158], indirect=True)
 def test_public_immutable_acknowledgement_replay_rollback_reapply_preserves_current_foreign_state(
     ambient,
 ):

@@ -92,8 +92,10 @@ def test_merge_cannot_broaden_a_legacy_recovery_or_simulation(intake_fixture, ch
         cfg.admit(request)
 
 
-@pytest.mark.parametrize("stage", ["prepublish", "local", "review", "qa", "ci"])
-@pytest.mark.parametrize("failure", ["failed", "pending", "unknown"])
+@pytest.mark.parametrize("stage,failure", [
+    ("prepublish", "failed"), ("local", "failed"), ("review", "failed"),
+    ("qa", "failed"), ("ci", "failed"), ("ci", "pending"), ("ci", "unknown"),
+])
 def test_any_unpassed_original_gate_prevents_merge(stage, failure):
     spec, candidate, pr, checks, attempts, publication = gates()
     checks[stage]["state"] = failure

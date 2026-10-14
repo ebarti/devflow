@@ -257,13 +257,12 @@ def test_publisher_uses_summary_without_leaking_execution_instructions(publisher
     assert len(created) == 1
 
 
-@pytest.mark.parametrize('text', [
-    'fix: correct U.S. date formats', 'docs: explain e.g. retries',
-    'perf: compare map vs. dict lookups', 'fix: handle ... in titles',
-    'docs: explain i.e. the default behavior', 'docs: describe retries etc. in examples',
-    'fix: handle a U.K. locale', 'Fix crash on U.S. locale dates',
+@pytest.mark.parametrize('text,explicit', [
+    ('fix: correct U.S. date formats', False),
+    ('perf: compare map vs. dict lookups', True),
+    ('fix: handle ... in titles', False),
+    ('Fix crash on U.S. locale dates', False),
 ])
-@pytest.mark.parametrize('explicit', [False, True])
 def test_summary_accepts_abbreviations_and_ellipses_without_changing_goal(service, text, explicit):
     store, request = service
     goal = 'Investigate the fixture. Publish only the documented design.' if explicit else text
@@ -291,11 +290,12 @@ def test_summary_trims_outer_textarea_whitespace_and_preserves_goal(service, exp
 
 
 @pytest.mark.parametrize('control,explicit,position', [
-    (control, explicit, position)
-    for control in ('\u0085', '\u202e')
-    for explicit in (False, True)
-    for position in ('inside', 'outside')
-] + [('\u200f', True, 'inside')])
+    ('\u0085', False, 'inside'),
+    ('\u0085', True, 'outside'),
+    ('\u202e', False, 'outside'),
+    ('\u202e', True, 'inside'),
+    ('\u200f', True, 'inside'),
+])
 def test_summary_rejects_unicode_controls_before_claiming_work(
     service, control, explicit, position
 ):

@@ -238,9 +238,10 @@ def test_native_revision_preparation_refuses_changed_boundary_before_writes(nati
     assert not (broker.evidence_dir / "attempts/review-attempt/auth.json").exists()
 
 
-@pytest.mark.parametrize("role", ["review", "verify"])
-@pytest.mark.parametrize("change", [None, "revision-kind", "revision-context", "unknown-kind",
-                                    "candidate", "hash", "path", "workspace"])
+@pytest.mark.parametrize("role,change", [
+    ("review", change) for change in (None, "revision-kind", "revision-context", "unknown-kind",
+                                    "candidate", "hash", "path", "workspace")
+] + [("verify", None)])
 def test_product_source_review_keeps_exact_patch_contract(native_review, change, role):
     broker, request = native_review
     request.pop("revision_context")

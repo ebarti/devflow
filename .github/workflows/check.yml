@@ -39,15 +39,16 @@ jobs:
       - run: python3.12 -B -m unittest discover -s tests -v
   temporal-runtime-tests:
     name: runtime shard ${{ matrix.shard }}
+    needs: [install, test]
     runs-on: macos-latest
     # Hosted Mac throughput varies; a passing shard reached 99% at the 20-minute limit.
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      # Four hosts fit one scheduling wave; repeated expensive fixture cases are consolidated.
-      max-parallel: 4
+      # Complete Mac qualification before all three available runtime hosts start together.
+      max-parallel: 3
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -67,7 +68,7 @@ jobs:
         working-directory: runtime
       - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
-      - run: uv run --frozen python runtime_ci.py --index ${{ matrix.shard }} --count 4
+      - run: uv run --frozen python runtime_ci.py --index ${{ matrix.shard }} --count 3
         working-directory: runtime
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ always() }}
@@ -96,9 +97,9 @@ jobs:
           path: runtime/ci-results/
           merge-multiple: true
       - name: Verify complete and disjoint coverage at this revision
-        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 4
+        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 3
   temporal-dashboard:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

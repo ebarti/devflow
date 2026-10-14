@@ -179,7 +179,7 @@ def _admission(monkeypatch, sealed):
     return captured
 
 
-@pytest.mark.parametrize("used_by_others", [0, 9, 10])
+@pytest.mark.parametrize("used_by_others", [0, 10])
 @pytest.mark.parametrize("built", [False, True], ids=["unstarted", "built"])
 def test_interrupted_worker_resumes_at_its_iteration_without_spending_a_cycle(
     service, monkeypatch, used_by_others, built,

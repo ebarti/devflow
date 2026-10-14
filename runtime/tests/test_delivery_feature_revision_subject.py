@@ -816,8 +816,7 @@ def test_public_unpassed_context_refuses_before_owner_or_debit(findings_reconsid
     assert shared.budget(issue_id)["used"] == budget
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
-def test_public_findings_review_then_original_worker_handoff_charges_seven_and_eight_once(
+def _exercise_public_findings_review_and_original_worker_handoff(
     findings_reconsideration, monkeypatch,
 ):
     from test_delivery_feature_revisions import (

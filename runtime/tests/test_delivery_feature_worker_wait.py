@@ -5,6 +5,7 @@ import asyncio
 import json
 import shutil
 from copy import deepcopy
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -98,6 +99,7 @@ async def test_long_worker_wait_has_bounded_history_and_remains_cancellable(
     ) as environment:
         async with Worker(environment.client, task_queue=spec['run_id'],
                           workflows=[DeliveryWorkflow],
+                          max_heartbeat_throttle_interval=timedelta(milliseconds=50),
                           activities=[*handlers, reserve, activities.delivery_feature_wait_worker]):
             handle = await environment.client.start_workflow(DeliveryWorkflow.run, spec,
                 id=spec['run_id'], task_queue=spec['run_id'])
@@ -110,9 +112,9 @@ async def test_long_worker_wait_has_bounded_history_and_remains_cancellable(
                 'command_id': 'stop-existing-worker', 'expected_revision': state['revision'],
                 'reason': 'Preserve the same feature and worker',
             })
-            # WAIT_CANCELLATION_COMPLETED learns of the cancel on the activity's
-            # next heartbeat, which the SDK throttles to 0.8 x the 60 s budget.
-            result = await asyncio.wait_for(handle.result(), 75 if cancel else 15)
+            # Keep the production heartbeat budget; only SDK delivery throttling
+            # is shortened so a fixture heartbeat promptly observes cancellation.
+            result = await asyncio.wait_for(handle.result(), 15)
             history = await handle.fetch_history()
     assert result['outcome'] == 'cancelled'
     assert observations >= 100

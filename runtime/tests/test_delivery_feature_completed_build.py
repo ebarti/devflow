@@ -345,8 +345,8 @@ def test_public_mixed_completed_source_and_unpassed_chunk_keep_seven_and_eight(
     # The existing consolidated public sequence checks exact lost-response replay,
     # fresh intake/review/adoption, original finding/session dispatch and no-alias
     # planning7/writer8. The completed build adds its real source proof path.
-    subject_tests.test_public_findings_review_then_original_worker_handoff_charges_seven_and_eight_once(
-                findings_reconsideration, monkeypatch)
+    subject_tests._exercise_public_findings_review_and_original_worker_handoff(
+        findings_reconsideration, monkeypatch)
     assert refused == ["proposal", "adoption"]
     current_parent = store.effective_spec(shared.current(prior["owner"]["issue_id"])["run_id"])
     before = shared.budget(prior["owner"]["issue_id"])
