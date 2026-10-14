@@ -3,6 +3,11 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PYTHON=${DEVFLOW_PYTHON:-python3.12}
+if [ "${1:-}" = "--release-state-check" ]; then
+  shift
+  unset TZ PYTHONPATH PYTHONOPTIMIZE
+  exec "${DEVFLOW_PYTHON:-$ROOT/runtime/.venv/bin/python}" -B "$ROOT/scripts/release-state-validator.py" "$@"
+fi
 if [ "${1:-}" = "--delivery-launchers" ]; then
   shift
   exec "$PYTHON" -B "$ROOT/scripts/install-delivery-launchers.py" "$@"

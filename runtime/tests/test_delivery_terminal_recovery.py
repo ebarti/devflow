@@ -237,6 +237,12 @@ async def test_authentic_closed_tail_queues_only_tracker_successor(
     @activity.defn(name='delivery_terminal_tracker')
     async def tracker(payload):
         calls.append('tracker')
+        if timed_out and calls.count('tracker') == 2:
+            # Keep the authentic timeout inside an observed activity boundary.
+            # The first pending projection is acknowledged before this attempt;
+            # no later SQL projection can commit after Temporal closes the run.
+            await predecessor_closed.wait()
+            raise asyncio.CancelledError
         pending = calls.count('tracker') <= 3
         if not pending:
             with service.store._connect() as db:
@@ -246,6 +252,7 @@ async def test_authentic_closed_tail_queues_only_tracker_successor(
                 'desired': payload['status'], 'readback_at': 'pending' if pending else 'fresh'}
 
     pause_once = timed_out
+    predecessor_closed = asyncio.Event()
 
     @activity.defn(name='delivery_terminal_preflight')
     async def preflight(payload):
@@ -284,7 +291,10 @@ async def test_authentic_closed_tail_queues_only_tracker_successor(
                 if not timed_out:
                     raise
                 assert (await handle.describe()).status.name == 'TIMED_OUT'
-            assert calls == ['cleanup', 'tracker', 'tracker', 'tracker']
+            finally:
+                predecessor_closed.set()
+            expected_tracker_attempts = 2 if timed_out else 3
+            assert calls == ['cleanup', *(['tracker'] * expected_tracker_attempts)]
             before = service.store.detail(request['run_id'])
             assert before['phase'] == 'waiting_tracker'
             transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
