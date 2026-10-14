@@ -79,7 +79,8 @@ async def history_for(store, spec, recovery, state, born, *, preparation=False, 
         'pull_request', 'tracker', 'usage', 'decision', 'intake')},
         'protocol_revision': state['revision'],
         'event_type': 'blocked' if preparation or report else 'tracker_deadline',
-        'message': state['error'], 'key': f"tracker_deadline:7:{state['revision']}"}
+        'message': state['error'],
+        'key': f"{'blocked' if report else 'tracker_deadline'}:7:{state['revision']}"}
     calls = [
         ('delivery_gates_readback', {'spec': spec, 'recovery': recovery}, {'state': 'OPEN'}),
         ('delivery_tracker_start', {'spec': spec, 'repair_continuation': True},
@@ -759,6 +760,24 @@ def layout_assessment(preparation_assessment, monkeypatch):
     monkeypatch.setattr(stores, '_now', clock)
     with f.store._connect() as db:
         f.store.state.release_work(db, spec['work_id'], 'external:devflow:' + spec['run_id'])
+    # Ordinary maintenance refreshes only the cleanup receipt after closure.
+    final = deepcopy(final)
+    final['processes'][-1].update(monitoring_complete=True, owned_ports_clear=True,
+                                observed_pids=[390002])
+    write_private(final_path, final)
+    manifest['finalization'] = final
+    write_private(registry_path, manifest)
+    current_receipt = {**final, 'receipt': str(final_path),
+                       'receipt_sha256': hashlib.sha256(final_path.read_bytes()).hexdigest()}
+    maintenance_key = digest({'closed_workflow': {
+        **{k: closed[k] for k in ('workflow_id', 'execution_run_id', 'closed_at')},
+        'status': 'COMPLETED'}, 'native_observations': current_receipt['processes'],
+        'resource_cleanup': current_receipt})
+    f.store.project(spec['run_id'], phase='blocked', execution_state='blocked', outcome='blocked',
+        cleanup='confirmed', iteration=state['iteration'],
+        checks={**state['checks'], 'resource_cleanup': current_receipt},
+        event_type='resource_cleanup_reconciled', message='Observed ordinary completed cleanup',
+        key=maintenance_key)
     def native_observation(_spec, _attempts):
         return {'journal_sha256': {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
                                   for path in read_private(registry_path)['processes']},
@@ -769,7 +788,8 @@ def layout_assessment(preparation_assessment, monkeypatch):
                         native_observation)
     return SimpleNamespace(**{**vars(f), 'spec': spec, 'state': state, 'closed': closed,
                               'recovery': recovery, 'failed': failed, 'journal': journal,
-                              'registry_path': registry_path})
+                              'registry_path': registry_path,
+                              'current_receipt': current_receipt})
 
 
 @pytest.mark.parametrize('interrupted_assessment', ['layout-report'], indirect=True)
@@ -780,6 +800,21 @@ def test_retained_layout_report_reserve_keeps_preparation_lineage_and_unused_bou
 
     f = layout_assessment
     budget, before = f.shared.budget(f.token['issue_id']), deepcopy(f.state)
+    with f.store._connect() as db:
+        event = db.execute('SELECT sequence,payload_json FROM delivery_events WHERE run_id=? '
+                           "AND type='resource_cleanup_reconciled' ORDER BY sequence DESC LIMIT 1",
+                           (f.spec['run_id'],)).fetchone()
+        changed = json.loads(event['payload_json'])
+        changed['key'] = 'f' * 64
+        db.execute('UPDATE delivery_events SET payload_json=? WHERE sequence=?',
+                   (json.dumps(changed), event['sequence']))
+    try:
+        with pytest.raises(ValueError):
+            gates.snapshot(f.store, f.spec['run_id'])
+    finally:
+        with f.store._connect() as db:
+            db.execute('UPDATE delivery_events SET payload_json=? WHERE sequence=?',
+                       (event['payload_json'], event['sequence']))
     result = activities.reserve(f.parent, f.chunk['id'], 'chunk')
     spec = result['spec']
     assert result['resumed'] and result['workflow_id'].endswith('report-gates-retry-1')
@@ -791,6 +826,10 @@ def test_retained_layout_report_reserve_keeps_preparation_lineage_and_unused_bou
     assert recovery['state'] == before and before['roles'][-1]['status'] == 'blocked'
     assert recovery['original_recovery'] == f.recovery
     assert recovery['seal']['report_observation']['junit']['passed'] == 1
+    assert recovery['seal']['report_observation']['resources']['finalization_sha256'] == (
+        f.current_receipt['receipt_sha256'])
+    assert before['checks']['resource_cleanup']['receipt_sha256'] != (
+        f.current_receipt['receipt_sha256'])
     assert [r['id'] for r in before['checks']['local']['results']] == ['before-api', 'api']
     assert [r['id'] for r in spec['policy']['checks']] == [
         'before-api', 'api', 'unexecuted-tail']

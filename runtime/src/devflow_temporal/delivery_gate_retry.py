@@ -366,8 +366,8 @@ def _report_layout_observe(store, spec, row, attempts, effects, closed, previous
     source_readback(store, spec, previous)
     evidence = _report_layout_evidence(spec, state, broker)
     resources = observe_completed_resources(spec, attempts)
-    if resources['finalization_sha256'] != state['checks']['resource_cleanup'].get(
-            'receipt_sha256'):
+    current_cleanup = json.loads(row['checks_json'])['resource_cleanup']
+    if resources['finalization_sha256'] != current_cleanup.get('receipt_sha256'):
         raise ValueError('report layout recovery lost its finalized native cleanup')
     with store._connect() as db:
         if (_rows(store, spec['run_id'])[:3] != (row, attempts, effects)
@@ -632,7 +632,15 @@ def snapshot(store, run_id, kind=KIND):
     if transient_retry:
         failed_gate = True
     if report_retry:
-        if state.get('checks') != json.loads(row['checks_json'] or '{}'):
+        current_checks = json.loads(row['checks_json'] or '{}')
+        original_checks = state.get('checks') or {}
+        if layout_report:
+            # The real closed-worker proof below authenticates ordinary later
+            # cleanup writes; every original assessment verdict remains exact.
+            current_checks = {k: v for k, v in current_checks.items() if k != 'resource_cleanup'}
+            original_checks = {k: v for k, v in original_checks.items()
+                               if k != 'resource_cleanup'}
+        if original_checks != current_checks:
             raise ValueError('report recovery lost its passed check projection')
         report_observation = (_report_layout_observe(
             store, spec, row, attempts, effects, closed, previous, broker) if layout_report
