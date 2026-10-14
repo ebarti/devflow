@@ -27,7 +27,7 @@ from .delivery_native_process import (
 from .delivery_native_process import (
     prelaunch_journal as _prelaunch_journal,
 )
-from .delivery_resources import RunResources, _gate_roots, read_private
+from .delivery_resources import RunResources, _ancestors, _gate_roots, _identity, read_private
 from .supervisor import DeliverySupervisor, get_supervisor
 
 _LOG = logging.getLogger(__name__)
@@ -351,9 +351,30 @@ def _disposable_work(manifest, row):
             and (row['cleanup'] == 'unknown' or json.loads(row['checks_json'] or '{}').get(
                 'resource_cleanup', {}).get('resource_cleanup') != 'confirmed')):
         return True  # Finalizer committed, but its projection acknowledgement was lost.
-    return any(entry['kind'] != 'checkout' and os.path.lexists(raw)
+    confirmed = (finalization.get('state') == 'confirmed'
+                 and finalization.get('resource_cleanup') == 'confirmed'
+                 and finalization.get('process_cleanup') == 'observed-native-confirmed')
+    receipts = ({item['path']: item for item in finalization.get('roots', [])}
+                if confirmed else {})
+    if confirmed and [item.get('journal') for item in finalization.get('processes', [])] \
+            != manifest.get('processes', []):
+        return True  # Newly registered actors still need their original closure checks.
+
+    def preserved(raw, entry):
+        receipt = entry.get('receipt') or {}
+        if (not confirmed or receipt.get('state') != 'retained'
+                or receipt != receipts.get(raw) or receipt.get('kind') != entry['kind']):
+            return False
+        path = Path(raw)
+        try:
+            _ancestors(path)
+            return path.resolve(strict=True) == path and _identity(path) == entry.get('identity')
+        except (OSError, ValueError):
+            return False
+
+    return any(entry['kind'] != 'checkout' and os.path.lexists(raw) and not preserved(raw, entry)
                for raw, entry in manifest.get('roots', {}).items()) or (
-                   manifest.get('finalization', {}).get('state') == 'running')
+                   finalization.get('state') == 'running')
 
 
 def _unfinished_rows(store):
@@ -394,16 +415,17 @@ def _unfinished_rows(store):
             signature = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size,
                          row['workflow_id'], row['recovery_json'],
                          row['cleanup'], row['checks_json'])
-            if seen.get(row['run_id']) == signature:
-                continue
             manifest = read_private(manifest_path)
             if manifest.get('run_id') != row['run_id']:
+                continue
+            pending = _disposable_work(manifest, row)
+            if seen.get(row['run_id']) == signature and not pending:
                 continue
             if manifest.get('finalization', {}).get('state') == 'confirmed':
                 if len(seen) >= 512:
                     seen.pop(next(iter(seen)))
                 seen[row['run_id']] = signature
-            if _disposable_work(manifest, row):
+            if pending:
                 rows.append(row)
         except (OSError, ValueError, KeyError, TypeError):
             continue  # A changed or unreadable manifest supplies no cleanup authority.
