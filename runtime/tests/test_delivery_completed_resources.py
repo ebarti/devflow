@@ -167,6 +167,58 @@ def test_retained_journals_use_exact_preparation_and_namespace_authority(
         db.execute("UPDATE delivery_preparations SET effective_spec_digest='foreign'")
     with pytest.raises(ValueError, match='preparation custody changed'):
         observe_completed_resources(current, [row])
+    with store._connect() as db:
+        db.execute('UPDATE delivery_preparations SET effective_spec_digest=?', (digest(original),))
+    # A later role keeps its original attempt path and policy across admissions.
+    # Preservation holds both authenticated lifecycle leases through its yield.
+    import fcntl
+
+    from devflow_temporal.supervisor import DeliverySupervisor
+
+    later_request = copy.deepcopy(request)
+    later_request['spec'] = current
+    folder = state / 'attempts' / DeliverySupervisor._job_key(later_request)
+    private_directory(folder)
+    later_path = folder / 'native-process.json'
+    later_request.update(result_path=str(folder / 'result.json'),
+                         start_path=str(folder / 'start.json'))
+    later_journal = copy.deepcopy(journal)
+    later_journal['intent']['policy_digest'] = current['policy_digest']
+    later_journal['runtime_identity'] = {'opaque': 'original-runtime'}
+    later_journal['result'].update(journal=str(later_path),
+                                   runtime_identity=later_journal['runtime_identity'])
+    result = {**json.loads(row['result_json']), 'native_process': later_journal['result']}
+    later_journal['provider_session']['result_digest'] = digest(result)
+    write_private(later_path, later_journal)
+    write_private(folder / 'request.json', later_request)
+    write_private(folder / 'launch.json', read_private(path.with_name('launch.json')))
+    for name in ('native-monitor.lock', 'native-process.lock'):
+        (folder / name).touch(mode=0o600)
+    later_row = {**row, 'run_id': original['run_id'], 'job_key': folder.name,
+                 'result_path': str(folder / 'result.json'), 'result_json': canonical_json(result)}
+    with store._connect() as db:
+        columns = ','.join(later_row)
+        placeholders = ','.join('?' for _key in later_row)
+        db.execute(f'INSERT INTO delivery_attempts ({columns}) VALUES ({placeholders})',
+                   tuple(later_row.values()))
+    owner = RunResources(current)
+    owner.process(later_path)
+    before_role = later_path.read_bytes()
+    with owner.locked() as manifest:
+        with owner._closed_journals(manifest, [str(later_path)]) as observed:
+            assert observed == [{'journal': str(later_path),
+                                 'sha256': hashlib.sha256(before_role).hexdigest()}]
+            for name in ('native-monitor.lock', 'native-process.lock'):
+                with (folder / name).open('rb') as lease:
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert later_path.read_bytes() == before_role
+        later_journal['provider_session']['result_digest'] = 'foreign'
+        write_private(later_path, later_journal)
+        with pytest.raises(ValueError, match='completed role binding changed'):
+            with owner._closed_journals(manifest, [str(later_path)]):
+                pytest.fail('changed historical receipt authorized preservation')
+        later_path.write_bytes(before_role)
 
 
 def test_retained_original_intake_binds_the_durably_accepted_plan(intake_fixture, monkeypatch):

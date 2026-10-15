@@ -206,15 +206,19 @@ def sealed_ci_findings(seal):
     return _ci_diagnostics(ci, seal['predecessor_spec'], state.get('pull_request'))
 
 
-def pending_repair(seal):
+def pending_repair(seal, *, db=None):
     """Recover unexecuted work from the sealed admission that requested it."""
     from .delivery_feature_revision_recovery import retained_recovery
 
     previous = retained_recovery(seal.get('original_recovery')) or {}
-    if (not seal.get('session_custody', {}).get('missing_rollout')
-            or previous.get('kind') != KIND
+    if (previous.get('kind') != KIND
             or seal['predecessor_spec'].get('feature_worker', {}).get('kind') == 'build'):
         return None
+    if not seal.get('session_custody', {}).get('missing_rollout'):
+        if db is None or not _unstarted_repair(seal, previous, db):
+            return None
+        if previous.get('pending_repair'):
+            return previous['pending_repair']
     state = previous['state']
     if previous.get('resume_iteration', state['iteration'] + 1) == state['iteration']:
         # The predecessor re-ran its own sealed iteration; it requested no repair.
@@ -229,6 +233,92 @@ def pending_repair(seal):
         for finding in role.get('findings', [])]]
     return {'iteration': iteration,
             'findings': [finding for finding in findings if finding is not None]}
+
+
+def _unstarted_repair(seal, previous, db, *, closing=False):
+    """An exact admitted and charged repair has not reached a provider attempt."""
+    from .delivery_feature_execution import registry
+
+    spec, state = seal['predecessor_spec'], seal['state']
+    prior = previous['state']
+    iteration = state['iteration']
+    requested = (previous.get('pending_repair') or {}).get(
+        'iteration', previous.get('resume_iteration', prior['iteration'] + 1))
+    if (not spec.get('feature_worker') or not spec.get('repair_allowance')
+            or requested != iteration or iteration <= 0
+            or (requested == prior['iteration'] and not previous.get('pending_repair'))):
+        return False
+    if custody(db, seal['original_recovery']) != spec:
+        raise ValueError('unstarted repair lost its exact predecessor admission')
+    candidate = seal['candidate']
+    roles, before = state.get('roles', []), prior.get('roles', [])
+    remainder = roles[len(before):]
+    preparation = remainder[0].get('implementation_preparation', {}) if len(remainder) == 1 else {}
+    unlaunched = (len(remainder) == 1 and remainder[0].get('role') == 'implement'
+                  and remainder[0].get('iteration') == iteration
+                  and remainder[0].get('status') == 'blocked'
+                  and remainder[0].get('session_id') is None
+                  and remainder[0].get('cleanup') == 'confirmed'
+                  and remainder[0].get('candidate') == candidate
+                  and preparation.get('state') == 'failed'
+                  and preparation.get('cleanup') == 'confirmed'
+                  and preparation.get('source_unchanged') is True
+                  and preparation.get('results')
+                  and all(item.get('cleanup') == 'confirmed'
+                          for item in preparation['results'])
+                  and preparation['results'][-1].get('launched') is False
+                  and preparation['results'][-1].get('failure_kind') == 'preparation')
+    if (previous['execution_spec'] != spec
+            or candidate != state.get('candidate')
+            or candidate != previous['execution_candidate']
+            or candidate != {**previous['candidate'], 'policy_digest': spec['policy_digest']}
+            or roles[:len(before)] != before or (remainder and not unlaunched)
+            or seal['attempts'] != previous['attempts']
+            or seal['effects'] != previous['effects']
+            or any(attempt['iteration'] == iteration for attempt in seal['attempts'])
+            or any(attempt['state'] != 'finished' or attempt['cleanup'] != 'confirmed'
+                   for attempt in seal['attempts'])
+            or any(effect['state'] != 'complete' or effect['observed_json'] is None
+                   for effect in seal['effects'])
+            or seal.get('session_id') != previous.get('session_id')
+            or seal.get('session_custody') != previous.get('session_custody')
+            or (not closing and (state.get('phase') not in {'blocked', 'cancelled'}
+                                  or state.get('cleanup') != 'confirmed'))
+            or (closing and (state.get('phase') != 'cancelling'
+                             or state.get('cleanup') != 'pending_role_completion'
+                             or state.get('outcome') is not None))):
+        raise ValueError('unstarted repair differs from its unchanged source or receipt inventory')
+    custody_record = previous.get('session_custody')
+    if custody_record and (spec.get('implementation_role_home_generation')
+                           != custody_record['generation']):
+        raise ValueError('unstarted repair changed its original implementation home')
+    # A successor runtime renews allowance authority, not the already paid debit.
+    from .delivery_feature_revision_recovery import retained_recovery
+
+    origin = previous
+    while origin.get('pending_repair'):
+        prior_link = retained_recovery(origin.get('original_recovery')) or {}
+        if (prior_link.get('kind') != KIND
+                or origin['pending_repair'].get('iteration') != iteration):
+            raise ValueError('unstarted repair lost its original debit admission')
+        origin = prior_link
+    shared = registry(spec)
+    owner = origin['execution_spec']['repair_allowance']['owner']
+    current_owner = spec['repair_allowance']['owner']
+    if any(current_owner.get(key) != owner.get(key) for key in ('issue_id', 'store_path')):
+        raise ValueError('unstarted repair changed its original debit owner')
+    current = shared.current(owner['issue_id'])
+    with shared.connect() as registry_db:
+        debit = registry_db.execute(
+            'SELECT generation,reason FROM execution_repairs WHERE issue_id=? AND repair_key=?',
+            (owner['issue_id'], f"{spec['run_id']}:{iteration}")).fetchone()
+    if (not current or current['issue_id'] != owner['issue_id']
+            or current['store_path'] != owner['store_path']
+            or current['generation'] < owner['generation']
+            or not debit or debit['generation'] != owner['generation']
+            or debit['reason'] != 'Product repair at worker iteration ' + str(iteration)):
+        raise ValueError('unstarted repair lacks its exact existing product debit')
+    return True
 
 
 def interrupted_resume(seal):
@@ -353,7 +443,7 @@ def custody(db, recovery, *, retained_memo=None):
                                                  + recovery['command']['additional_iterations'])):
         raise ValueError('stopped resume lost its immutable command authority')
     if (('pending_repair' in recovery
-             and pending_repair(details) != recovery['pending_repair'])
+             and pending_repair(details, db=db) != recovery['pending_repair'])
             or (recovery['command']['additional_iterations'] == 0
                 and not (recovery.get('pending_repair') or interrupted
                          or details.get('resume_stage') == 'checks'))):
@@ -395,18 +485,32 @@ def effective_spec(store, recovery):
     return spec
 
 
-def _historical_candidate(broker, state, candidate, latest, recovery):
+def _historical_candidate(broker, state, candidate, latest, recovery, pending=None):
     """Authenticate native policy rebindings without rewriting the stopped role."""
     from . import delivery_gate_retry as gates
     from .delivery_feature_revision_recovery import retained_recovery
 
     kinds = {gates.KIND, gates.PREPUBLICATION_KIND, gates.PRELAUNCH_KIND,
              gates.CI_KIND, gates.CONTROLLER_KIND}
+    expected = broker.spec
+    while recovery and recovery.get('kind') == KIND and pending:
+        details = retained_recovery(recovery)
+        if (details['execution_spec'] != expected
+                or candidate != state.get('candidate')
+                or candidate != details['execution_candidate']
+                or latest not in details['state'].get('roles', [])):
+            raise ValueError('unstarted implementation lost its sealed policy predecessor')
+        expected, state, candidate = (details['predecessor_spec'], details['state'],
+                                      details['candidate'])
+        recovery = details.get('original_recovery')
+        pending = details.get('pending_repair')
+        if candidate == latest.get('candidate'):
+            return True
     if (candidate != state.get('candidate') or not recovery
             or recovery.get('kind') not in kinds):
         return False
     spec = gates.effective_spec(broker.store, recovery['original_spec'], recovery)
-    if spec != broker.spec:
+    if spec != expected:
         raise ValueError('stopped candidate lost its gate execution authority')
     measured = {'native_identity', 'environment_proof_sha256', 'security_binding_sha256'}
     while recovery and recovery.get('kind') in kinds:
@@ -443,14 +547,15 @@ def _historical_candidate(broker, state, candidate, latest, recovery):
     return False
 
 
-def _candidate(broker, state, attempts, *, missing_rollout=None, recovery=None):
+def _candidate(broker, state, attempts, *, missing_rollout=None, recovery=None, pending=None):
     candidate = broker.candidate()
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
     if latest and latest.get('status') != 'pass':
         if (latest.get('cleanup') != 'confirmed'
                 or (latest.get('candidate') != candidate
-                    and not _historical_candidate(broker, state, candidate, latest, recovery))):
+                    and not _historical_candidate(
+                        broker, state, candidate, latest, recovery, pending))):
             raise ValueError('blocked implementation source or session is unconfirmed')
         matches = [a for a in attempts if a['role'] == 'implement'
                    and a['iteration'] == latest['iteration']
@@ -581,9 +686,17 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     from .delivery_session_custody import implementation_custody
 
     session_custody = implementation_custody(spec, state, attempts, retained_recovery(previous))
+    implementations = [role for role in state.get('roles', []) if role.get('role') == 'implement']
+    sessions = {role['session_id'] for role in implementations if role.get('session_id')}
+    pending_seal = {'predecessor_spec': spec, 'state': state, 'candidate': state['candidate'],
+                    'attempts': attempts, 'effects': effects, 'original_recovery': previous,
+                    'session_id': next(iter(sessions)) if len(sessions) == 1 else None,
+                    **({'session_custody': session_custody} if session_custody else {})}
+    with store._connect() as db:
+        pending = pending_repair(pending_seal, db=db)
     candidate, session = _candidate(
         broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'),
-        recovery=previous)
+        recovery=previous, pending=pending)
     publication = state.get('pull_request')
     if publication:
         published_identity(broker, candidate, publication)
@@ -645,7 +758,8 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         from .delivery_feature_revision_recovery import gate_only_recovery
 
         gate_only = gate_only_recovery(store, seal, _revision)
-    pending = None if gate_only else pending_repair(seal)
+    with store._connect() as db:
+        pending = None if gate_only else pending_repair(seal, db=db)
     ci_findings = None if gate_only else sealed_ci_findings(seal)
     if (command['expected_revision'] != seal['state']['revision']
             or command['expected_iteration'] != seal['state']['iteration']

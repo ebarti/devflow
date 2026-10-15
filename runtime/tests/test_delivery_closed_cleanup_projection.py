@@ -71,11 +71,11 @@ async def _closed(unpublished, *, committed=False):
     return store, spec, state, client, description
 
 
-def _maintenance(store, spec, description, *, uncertain=True):
+def _maintenance(store, spec, description, *, uncertain=True, status="COMPLETED"):
     before = _row(store)
     receipt = RunResources(spec).finalize("blocked", uncertain=uncertain)
     closed = {"workflow_id": description.id, "execution_run_id": description.run_id,
-              "closed_at": description.close_time.isoformat(), "status": "COMPLETED"}
+              "closed_at": description.close_time.isoformat(), "status": status}
     store.project(
         "run-1", phase=before["phase"], execution_state=before["execution_state"],
         outcome=before["outcome"], error=before["error"],
@@ -86,6 +86,30 @@ def _maintenance(store, spec, description, *, uncertain=True):
                     "resource_cleanup": receipt}),
     )
     return receipt
+
+
+@pytest.mark.asyncio
+async def test_failed_closure_cleanup_retains_exact_projection_and_event_custody(unpublished):
+    from devflow_temporal.delivery_closed_projection import _cleanup_row, _same_row
+
+    store, spec, _, _, description = await _closed(unpublished)
+    original = _row(store)
+    projection = {**{key: original[key] for key in (
+        'phase', 'execution_state', 'iteration', 'outcome', 'cleanup', 'error',
+        'protocol_revision')},
+        **{key: json.loads(original[column] or 'null') for key, column in (
+            ('candidate', 'candidate_json'), ('pull_request', 'pr_json'), ('checks', 'checks_json'),
+            ('tracker', 'tracker_json'), ('usage', 'usage_json'), ('decision', 'decision_json'),
+            ('intake', 'intake_json'))}, 'spec': spec, 'event_type': 'chunk_integrating',
+        'key': 'chunk_integrating:0:5'}
+    _maintenance(store, spec, description, uncertain=False, status='FAILED')
+    row, events = _row(store), store.events('run-1')
+    assert _cleanup_row(row, spec, description, {1: projection}, events) is None
+    bound = _cleanup_row(row, spec, description, {1: projection}, events, status='FAILED')
+    assert bound and _same_row(bound[0], projection)
+    assert bound[0]['revision'] == original['revision']
+    events[-1]['payload_json'] = '{}'
+    assert _cleanup_row(row, spec, description, {1: projection}, events, status='FAILED') is None
 
 
 def _observation(store):

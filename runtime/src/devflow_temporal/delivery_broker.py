@@ -528,6 +528,7 @@ class DeliveryBroker:
         candidate: dict[str, Any],
         *, python_environments: dict[str, Path] | None = None,
         native_projects: list[str] | None = None,
+        preserve_workspace_dependencies: bool = False,
     ) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         checkout = checkout.resolve(strict=True)
@@ -634,6 +635,7 @@ class DeliveryBroker:
             native_result = None
             interrupted = []
             check_evidence = None
+            preserved_modules = []
             if self.spec["provider"] == "codex":
                 from .delivery_native_process import NativeProcess
                 from .delivery_preparation import verify_prepared_spec
@@ -662,6 +664,14 @@ class DeliveryBroker:
                                 or isolated_python.resolve() != isolated_python):
                             raise ValueError('locked Python environment left controller ownership')
                         environment['UV_PROJECT_ENVIRONMENT'] = str(isolated_python)
+                    if preserve_workspace_dependencies and '/store' in argv:
+                        from .delivery_resources import RunResources
+
+                        require_prepared_source(check['id'])
+                        if self.candidate() != candidate:
+                            raise ValueError('implementation dependency source changed')
+                        preserved_modules = RunResources(self.spec).preserve_workspace_dependencies(
+                            checkout, candidate, check)
                     generated = self._register_generated(checkout,
                         list(dict.fromkeys([
                             *([] if isolated_python is not None else
@@ -842,6 +852,8 @@ class DeliveryBroker:
                                 == 'failed_unknown' else 'confirmed'),
                     **({'artifact_cleanup': artifact_cleanup} if artifact_cleanup else {}),
                     **({'range_binding': range_binding} if range_binding else {}),
+                    **({'preserved_workspace_dependencies': preserved_modules}
+                       if preserved_modules else {}),
                     **(
                         {
                             "process_cleanup": native_result["cleanup"],
@@ -1283,6 +1295,7 @@ class DeliveryBroker:
             interpreters.append({'project': check['cwd'],
                                  'interpreter': str(environment / 'bin/python')})
         options = {'python_environments': isolated} if isolated else {}
+        options['preserve_workspace_dependencies'] = True
         options['native_projects'] = [
             c['cwd'] for c in planned if c['id'].startswith('planned-vitest-')
         ]

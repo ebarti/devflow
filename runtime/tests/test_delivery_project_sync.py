@@ -131,7 +131,7 @@ def test_local_tracking_releases_claim_without_any_remote_call(
         store.config.path.write_text(json.dumps(store.config.raw))
     store.submit(request)
     spec = store.spec(request["run_id"])
-    monkeypatch.setattr(delivery_activities, "_context", lambda *_: (store, None))
+    monkeypatch.setattr(delivery_activities, "_context", lambda *_, **_options: (store, None))
     monkeypatch.setattr(delivery_activities.subprocess, "run",
                         lambda *_args, **_kwargs: pytest.fail("unexpected remote call"))
     receipt = delivery_activities._tracker_sync(spec, status, release=True, terminal=True)
@@ -561,7 +561,7 @@ def test_terminal_tracking_retains_publication_custody_readback(monkeypatch, fre
 
     seen = []
     spec = {"provider": "codex", **({"project_sync_version": 1} if fresh else {})}
-    monkeypatch.setattr(delivery_activities, "_context", lambda *_: (None, None))
+    monkeypatch.setattr(delivery_activities, "_context", lambda *_, **_options: (None, None))
 
     def guard(*_):
         seen.append("guard")

@@ -10,7 +10,7 @@ import os
 import sqlite3
 import stat
 import subprocess
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -607,6 +607,116 @@ class RunResources:
                         break
             write_private(self.manifest, manifest)
 
+    def preserve_workspace_dependencies(
+        self, checkout: Path, candidate: dict, recipe: dict,
+    ) -> list:
+        """Move legacy unregistered modules aside; only new output becomes disposable."""
+        from .candidate import candidate_for
+        from .delivery_broker import _git
+        from .delivery_configured_resources import (
+            implementation_prerequisites,
+            workspace_dependency_directories,
+        )
+        from .delivery_metadata_recovery import _immutable
+
+        source_candidate = candidate_for(checkout)
+        if (self.spec.get('provider') != 'codex'
+                or self.spec['policy'].get('host_sandbox') != 'trusted-local'
+                or checkout != Path(self.spec['checkout'])
+                or recipe not in implementation_prerequisites(self.spec)
+                or recipe.get('argv', [])[:3] != ['corepack', 'pnpm', 'install']
+                or not {'--offline', '--frozen-lockfile', '--ignore-scripts', '/store'}
+                <= set(recipe['argv'])
+                or digest(self.spec['policy']) != self.spec['policy_digest']
+                or candidate.get('policy_digest') != self.spec['policy_digest']
+                or any(source_candidate[key] != candidate.get(key)
+                       for key in ('id', 'head', 'content_sha256'))):
+            raise ValueError('legacy modules lack their exact frozen implementation authority')
+        self._allowed(checkout, 'checkout')
+        declarations = workspace_dependency_directories(checkout)
+        preserved = []
+        with self.locked() as manifest:
+            parent = manifest['roots'].get(str(checkout), {})
+            if parent.get('kind') != 'checkout' or parent.get('identity') != _identity(checkout):
+                raise ValueError('legacy modules lost their original checkout identity')
+            pending = []
+            for relative, declaration in declarations.items():
+                source = checkout / relative
+                folder = self.state / 'preserved-workspace-dependencies' / digest(relative)
+                if str(source) not in manifest['roots'] and (os.path.lexists(source)
+                                                            or os.path.lexists(folder)):
+                    pending.append((source, folder, declaration))
+            if not pending:
+                return preserved
+            # Keep every prior launch lease while proving actors and ports closed.
+            with self._closed_journals(manifest, manifest['processes']):
+                admission = str(_gate_evidence_root(self.spec))
+                for source, folder, declaration in pending:
+                    self._allowed(source, 'generated')
+                    if _git(checkout, 'ls-files', '--', source.relative_to(checkout).as_posix()):
+                        raise ValueError('legacy modules contain tracked source')
+                    destination, intent = folder / 'node_modules', folder / 'intent.json'
+                    _ancestors(destination, allow_missing=True)
+                    binding = {'run_id': self.spec['run_id'], 'checkout': str(checkout),
+                               'checkout_identity': parent['identity'], 'candidate': candidate,
+                               'recipe_sha256': digest(recipe), 'admission_evidence': admission,
+                               'source': str(source), 'destination': str(destination),
+                               'workspace_declaration_sha256': declaration}
+                    if os.path.lexists(intent):
+                        saved = read_private(intent)
+                        if {key: saved.get(key) for key in binding} != binding:
+                            raise ValueError('legacy module preservation authority changed')
+                    else:
+                        if os.path.lexists(destination) or not os.path.lexists(source):
+                            raise ValueError('legacy module preservation has no original identity')
+                        saved = {**binding, 'identity': _identity(source),
+                                 'source_parent_identity': _identity(source.parent)}
+                        private_directory(folder)
+                        _immutable(intent, saved)
+                    _ancestors(destination)
+                    if _identity(source.parent) != saved['source_parent_identity']:
+                        raise ValueError('legacy module parent was replaced')
+                    if os.path.lexists(source):
+                        if (os.path.lexists(destination) or _identity(source) != saved['identity']):
+                            raise ValueError(
+                                'legacy module preservation source is ambiguous or replaced')
+                        if Path('/usr/sbin/lsof').is_file():
+                            try:
+                                users = subprocess.run(
+                                    ['/usr/sbin/lsof', '-nP', '-F', 'p', '+D', str(source)],
+                                    text=True, capture_output=True, timeout=30)
+                            except subprocess.SubprocessError as exc:
+                                raise ValueError('legacy module holders are unconfirmed') from exc
+                            if users.returncode not in (0, 1) or any(
+                                    line.startswith('p') and line[1:].isdecimal()
+                                    for line in users.stdout.splitlines()):
+                                raise ValueError('legacy modules have a live or unknown holder')
+                        # Darwin RENAME_EXCL refuses even an empty destination directory.
+                        # The private registry lease serializes controller retries.
+                        import ctypes
+
+                        native = getattr(ctypes.CDLL(None, use_errno=True), 'renamex_np', None)
+                        if native is None:
+                            raise ValueError('exclusive native module preservation is unavailable')
+                        native.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+                        native.restype = ctypes.c_int
+                        if native(os.fsencode(source), os.fsencode(destination), 0x00000004):
+                            raise OSError(ctypes.get_errno(),
+                                          'exclusive legacy module rename failed')
+                        for directory in (source.parent, folder):
+                            descriptor = os.open(
+                                directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                            try:
+                                os.fsync(descriptor)
+                            finally:
+                                os.close(descriptor)
+                    if (os.path.lexists(source) or _identity(destination) != saved['identity']):
+                        raise ValueError('legacy module preservation destination was replaced')
+                    receipt = {**saved, 'state': 'preserved', 'disposable': False}
+                    _immutable(folder / 'receipt.json', receipt)
+                    preserved.append(receipt)
+        return preserved
+
     def created(self, path: Path, *, head: str | None = None) -> None:
         with self.locked() as manifest:
             entry = manifest["roots"][str(path)]
@@ -684,6 +794,7 @@ class RunResources:
         )
 
         descriptors, receipts = [], []
+        role_leases = ExitStack()
         execution_specs = {}
         _gate_roots(self.spec, execution_specs=execution_specs)
         try:
@@ -721,6 +832,37 @@ class RunResources:
                     'measured_policy_digest')
                     if path.is_relative_to(self.state / 'native-preparation')
                     else execution['policy_digest']) or execution['policy_digest']
+                role_attempt = (path.name == 'native-process.json'
+                                and path.parent.parent == self.state / 'attempts')
+                request, row = None, None
+                if role_attempt:
+                    from .delivery_execution_config import load_execution_config
+                    from .supervisor import DeliverySupervisor
+
+                    if 'config_path' in self.spec:
+                        config = load_execution_config(self.spec)
+                        with closing(sqlite3.connect(
+                                config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
+                            db.row_factory = sqlite3.Row
+                            row = db.execute(
+                                'SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',
+                                (path.parent.name, self.spec['run_id'])).fetchone()
+                    if (row is not None or os.path.lexists(path.with_name('request.json'))
+                            or 'provider_session' in value):
+                        if row is None:
+                            raise ValueError('registered role has no durable original attempt')
+                        request = read_private(path.with_name('request.json'))
+                        if (request['spec'] not in execution_specs.values()
+                                or DeliverySupervisor._job_key(request) != row['job_key']):
+                            raise ValueError(
+                                'registered role request lost its admitted execution policy')
+                historical_role = request is not None and request['spec'] != execution
+                if historical_role:
+                    from .delivery_orphans import _completed_role_execution
+
+                    execution = role_leases.enter_context(_completed_role_execution(
+                        path, value, execution_specs, request, row))
+                    expected_digest = execution['policy_digest']
                 intent = value['intent']
                 launch = launch_binding(path.parent, value)
                 if (intent['run_id'] != self.spec['run_id']
@@ -731,10 +873,12 @@ class RunResources:
                             or intent['environment_sha256'] != digest(launch['environment'])))
                         or value.get('phase') != 'finished'
                         or (value.get('monitoring_complete') is not True
-                            and not lost_monitor_without_provider(value, role_attempt=(
-                                path.parent.parent == self.state / 'attempts')))):
+                            and not lost_monitor_without_provider(
+                                value, role_attempt=role_attempt))):
                     raise ValueError('registered native process closure is unconfirmed')
-                for name in ('native-monitor.lock', 'native-process.lock'):
+                # The completed-role validator already holds these exact leases.
+                for name in (() if historical_role else (
+                        'native-monitor.lock', 'native-process.lock')):
                     lock_path = path.with_name(name)
                     descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
                     descriptors.append(descriptor)
@@ -770,6 +914,7 @@ class RunResources:
         finally:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
+            role_leases.close()
 
     def check_artifacts(self, path: Path) -> Path:
         self._allowed(path, 'check-artifacts', finalizing=True)

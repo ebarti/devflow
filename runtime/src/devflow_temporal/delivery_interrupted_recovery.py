@@ -8,7 +8,11 @@ resume point are replayed. Native/effect journals still guard repeated activitie
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import os
+import stat
+from contextlib import contextmanager
 from pathlib import Path
 
 from temporalio.api.common.v1 import WorkflowExecution
@@ -27,6 +31,40 @@ RESULT = "interrupted_execution_recovered"
 CLOSED = frozenset({"FAILED", "TIMED_OUT", "TERMINATED"})
 # Repeated controller failure on unchanged code needs a repair, not an endless loop.
 MAX_RECOVERIES = 3
+
+
+class InstallationRecoveryDeferred(RuntimeError):
+    """The installer owns the shared recovery fence; maintenance must stay read-only."""
+
+
+@contextmanager
+def installation_recovery_lease(config, *, exclusive=False):
+    """Serialize installation with effectful resets across every local service."""
+    from .delivery_feature_execution import registry_path
+    from .delivery_resources import _ancestors, private_directory
+
+    path = registry_path(config).parent / 'installation-recovery.lock'
+    private_directory(path.parent)
+    _ancestors(path)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+
+    def authenticate():
+        info, current = os.fstat(descriptor), path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+            raise ValueError('installation recovery lease changed or is not a private owned file')
+
+    try:
+        authenticate()
+        try:
+            fcntl.flock(descriptor, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise InstallationRecoveryDeferred('installation recovery lease is held') from exc
+        authenticate()
+        yield path
+    finally:
+        os.close(descriptor)
 
 
 def _records(store, run_id, kind):
@@ -74,7 +112,7 @@ def _record(store, row, kind, payload):
             )
 
 
-def _guard(store, row, spec):
+def _guard(store, row, spec, *, terminal_settlement=False):
     if execution_retired(spec) or not store.owns_execution(spec):
         raise ValueError("interrupted execution no longer belongs to this service")
     with store._connect() as db:
@@ -133,7 +171,7 @@ def _guard(store, row, spec):
         from .delivery_feature_execution import registry, require_execution
 
         if spec.get("feature_worker"):
-            require_execution(store, spec)
+            require_execution(store, spec, terminal_settlement=terminal_settlement)
         else:
             shared = registry(spec)
             with shared.connect() as db:
@@ -150,6 +188,224 @@ def _guard(store, row, spec):
                 pass
         elif any(Path(spec["state_dir"]).rglob("native-process.json")):
             raise ValueError("native process has no owning resource manifest")
+
+
+def _failure_types(failure):
+    result = []
+    while failure.ByteSize():
+        if failure.HasField('application_failure_info'):
+            result.append(failure.application_failure_info.type)
+        if not failure.HasField('cause'):
+            break
+        failure = failure.cause
+    return result
+
+
+def _terminal_projection_row(store, row, spec, projected, acknowledged_revision, facts):
+    """Accept only closure-bound orphan maintenance over the acknowledged projection."""
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from .delivery_closed_projection import _cleanup_row, _same_row
+
+    if row['revision'] == acknowledged_revision and _same_row(row, projected):
+        return True
+    receipt = json.loads(row['checks_json'] or '{}').get('resource_cleanup') or {}
+    if (row['cleanup'] != 'confirmed' or receipt.get('state') != 'confirmed'
+            or receipt.get('resource_cleanup') != 'confirmed'
+            or receipt.get('process_cleanup') != 'observed-native-confirmed'):
+        return False
+    with store._connect() as db:
+        events = [dict(event) for event in db.execute(
+            'SELECT * FROM delivery_events WHERE run_id=? AND run_revision>=? ORDER BY sequence',
+            (spec['run_id'], acknowledged_revision))]
+    description = SimpleNamespace(id=facts['workflow_id'], run_id=facts['execution_run_id'],
+                                  close_time=datetime.fromisoformat(facts['closed_at']))
+    bound = _cleanup_row(row, spec, description, {'acknowledged': projected}, events,
+                         status=facts['status'])
+    return bool(bound and bound[0]['revision'] == acknowledged_revision
+                and _same_row(bound[0], projected))
+
+
+async def _terminal_drain_point(store, row, spec, history):
+    """Replay only settlement after an acknowledged coordinator prelaunch stop."""
+    from .delivery_broker import DeliveryBroker
+    from .delivery_feature_execution import registry, require_execution
+    from .delivery_policy_recovery import _rows
+    from .delivery_session_custody import implementation_custody
+    from .delivery_stopped_resume import _unstarted_repair
+
+    if not spec.get('feature_worker') or not history.events[-1].HasField(
+            'workflow_execution_failed_event_attributes'):
+        return None
+    shared = registry(spec)
+    current = shared.current(spec['feature_delivery']['owner']['issue_id'])
+    if not current or current['state'] != 'draining':
+        return None
+    require_execution(store, spec, terminal_settlement=True)
+    owner = shared.token(current)
+    scheduled, failed, completed, updates = [], {}, {}, {}
+    for event in history.events:
+        if event.HasField('activity_task_scheduled_event_attributes'):
+            attrs = event.activity_task_scheduled_event_attributes
+            payloads = await DELIVERY_DATA_CONVERTER.decode(list(attrs.input.payloads))
+            if len(payloads) != 1 or not isinstance(payloads[0], dict):
+                return None
+            scheduled.append((event, attrs.activity_type.name, payloads[0]))
+        elif event.HasField('activity_task_failed_event_attributes'):
+            attrs = event.activity_task_failed_event_attributes
+            failed[attrs.scheduled_event_id] = (event.event_id, _failure_types(attrs.failure))
+        elif event.HasField('activity_task_completed_event_attributes'):
+            attrs = event.activity_task_completed_event_attributes
+            payloads = await DELIVERY_DATA_CONVERTER.decode(list(attrs.result.payloads))
+            completed[attrs.scheduled_event_id] = (
+                event.event_id, payloads[0] if payloads else None)
+        elif event.HasField('workflow_execution_update_accepted_event_attributes'):
+            updates[event.event_id] = event.workflow_execution_update_accepted_event_attributes
+    if [name for _, name, _ in scheduled[-3:]] != [
+            'delivery_finalize_resources', 'delivery_terminal_tracker', 'delivery_project']:
+        return None
+    (finalizer, _, final_request), (tracker, _, tracker_request), (projection, _, request) = (
+        scheduled[-3:])
+    point = finalizer.activity_task_scheduled_event_attributes.workflow_task_completed_event_id
+    failure = history.events[-1].workflow_execution_failed_event_attributes.failure
+    if (_failure_types(failure) != ['ProjectionRejected', 'OwnershipConflict']
+            or not failure.HasField('activity_failure_info')
+            or failure.activity_failure_info.scheduled_event_id != projection.event_id
+            or failed.get(finalizer.event_id, (None, []))[1] != ['OwnershipConflict']
+            or failed.get(projection.event_id, (None, []))[1]
+            != ['ProjectionRejected', 'OwnershipConflict']
+            or any(item.get('spec') != spec for item in (final_request, tracker_request, request))
+            or final_request.get('outcome') != 'cancelled'
+            or final_request.get('uncertain') is not True
+            or request.get('event_type') != 'tracker_deadline'
+            or request.get('phase') != request.get('outcome') or request.get('outcome') != 'blocked'
+            or request.get('execution_state') != 'blocked'
+            or request.get('cleanup') != 'unknown'
+            or request.get('iteration') != row['iteration']
+            or tracker_request.get('status') != 'blocked'
+            or tracker_request.get('release') is not False
+            or completed.get(tracker.event_id, (None, {}))[1].get('reason') != 'OwnershipConflict'
+            or completed[tracker.event_id][1].get('retryable') is not False):
+        return None
+    role = next((item for item in reversed(scheduled[:-3]) if item[1] == 'delivery_role'), None)
+    acknowledged = [item for item in scheduled[:-3] if item[1] == 'delivery_project'
+                    and item[0].event_id in completed]
+    if not role or not acknowledged:
+        return None
+    role_event, _, role_request = role
+    projected_event, _, projected = acknowledged[-1]
+    if (role_request.get('role') != 'implement' or role_request.get('spec') != spec
+            or role_request.get('iteration') != row['iteration']
+            or failed.get(role_event.event_id, (None, []))[1] != ['OwnershipConflict']
+            or not role_event.event_id < failed[role_event.event_id][0] < point
+            or projected.get('event_type') != 'role_started'
+            or projected.get('spec') != spec or projected.get('iteration') != row['iteration']
+            or projected.get('phase') != 'repair' or projected.get('outcome') is not None
+            or projected.get('execution_state') != 'running'
+            or not _terminal_projection_row(
+                store, row, spec, projected,
+                completed[projected_event.event_id][1].get('revision'),
+                await closure_facts(history))):
+        return None
+    revision, cancelled = projected['protocol_revision'], None
+    cancel_events = []
+    for event in history.events:
+        if not event.HasField('workflow_execution_update_completed_event_attributes'):
+            continue
+        attrs = event.workflow_execution_update_completed_event_attributes
+        accepted = updates.get(attrs.accepted_event_id)
+        if not accepted or accepted.accepted_request.input.name != 'cancel':
+            return None
+        supplied = await DELIVERY_DATA_CONVERTER.decode(
+            list(accepted.accepted_request.input.args.payloads))
+        outcomes = await DELIVERY_DATA_CONVERTER.decode(list(attrs.outcome.success.payloads))
+        if len(supplied) != 1 or len(outcomes) != 1:
+            return None
+        command, state = supplied[0], outcomes[0]
+        if (attrs.meta.update_id != accepted.accepted_request.meta.update_id
+                or not role_event.event_id < attrs.accepted_event_id < event.event_id < point
+                or command != {'command_id': 'feature-stop-' + digest(owner)[:16] + '-'
+                               + spec['run_id'] + '-' + str(revision),
+                               'expected_revision': revision,
+                               'reason': 'Coordinator stopping; preserve the feature checkpoint'}
+                or state.get('revision') != revision + 1
+                or (cancelled and {k: v for k, v in state.items() if k != 'revision'}
+                    != {k: v for k, v in cancelled.items() if k != 'revision'})):
+            return None
+        revision, cancelled = state['revision'], state
+        cancel_events.append(event.event_id)
+    if not cancelled or request.get('protocol_revision') != revision + 1:
+        return None
+    start = await DELIVERY_DATA_CONVERTER.decode(list(
+        history.events[0].workflow_execution_started_event_attributes.input.payloads))
+    previous = json.loads(row['recovery_json'] or 'null')
+    if (len(start) != 2 or start != [spec, previous]
+            or history.workflow_id != (row['workflow_id'] or 'delivery-' + spec['run_id'])
+            or role_request.get('candidate') != cancelled.get('candidate')
+            or request.get('candidate') != cancelled.get('candidate')):
+        return None
+    from .delivery_feature_revision_recovery import retained_recovery
+
+    details = retained_recovery(previous)
+    _, attempts, effects, _ = _rows(store, spec['run_id'])
+    session = implementation_custody(spec, cancelled, attempts, details)
+    candidate = DeliveryBroker(store, spec).candidate()
+    seal = {'predecessor_spec': spec, 'state': cancelled, 'candidate': candidate,
+            'attempts': attempts, 'effects': effects, 'original_recovery': previous,
+            'session_id': (session or {}).get('session_id'),
+            **({'session_custody': session} if session else {})}
+    with store._connect() as db:
+        if not _unstarted_repair(seal, details, db, closing=True):
+            return None
+    return {'resume_event_id': point, 'finalizer_request_sha256': digest(final_request),
+            'iteration': row['iteration'], 'owner': owner, 'cancel_events': cancel_events,
+            'candidate': candidate, 'attempts_sha256': digest(attempts),
+            'effects_sha256': digest(effects), 'session_custody_sha256': digest(session),
+            'recovery_digest': digest(previous)}
+
+
+async def terminal_finalization_uncertain(store, request):
+    """Only an acknowledged history reset can resolve prelaunch caller uncertainty."""
+    from temporalio import activity
+    from temporalio.exceptions import ApplicationError
+
+    from .delivery_closures import sealed_closure
+
+    if not activity.in_activity():
+        return request.get('uncertain', False)
+    info, spec = activity.info(), request['spec']
+    intents = [item for item in _records(store, spec['run_id'], INTENT)
+               if item.get('workflow_id') == info.workflow_id and item.get('terminal_settlement')]
+    if not intents:
+        return request.get('uncertain', False)
+    results = _records(store, spec['run_id'], RESULT)
+    matched = [(intent, result) for intent in intents for result in results
+               if result.get('key') == intent['key']
+               and result.get('recovered_run_id') == info.workflow_run_id]
+    if len(matched) != 1:
+        raise ApplicationError('terminal recovery acknowledgement is unconfirmed',
+                               type='ResourceCleanupTransient')
+    intent, result = matched[0]
+    if (result != {**intent, 'recovered_run_id': info.workflow_run_id}
+            or intent['key'] != digest({k: v for k, v in intent.items() if k != 'key'})
+            or info.workflow_id != store.active_workflow_id(spec['run_id'])):
+        raise ValueError('terminal recovery lost its exact reset acknowledgement')
+    closed = await sealed_closure(store, info.workflow_id,
+                                   execution_run_id=intent['execution_run_id'])
+    with store._connect() as db:
+        row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                              (spec['run_id'],)).fetchone())
+    proof = await _terminal_drain_point(store, row, spec, closed['history']) if closed else None
+    if (not closed or closed['status'] != 'FAILED'
+            or history_sha256(closed['history']) != intent['history_sha256']
+            or proof != intent['terminal_settlement']
+            or intent['resume_event_id'] != proof['resume_event_id']
+            or proof['finalizer_request_sha256'] != digest(request)):
+        raise ValueError('terminal finalizer lost its sealed prelaunch failure proof')
+    # RunResources still reconciles every registered process and derives unknown
+    # if any actor, port, lease or resource identity cannot be confirmed.
+    return False
 
 
 def _resume_point(history):
@@ -199,6 +455,12 @@ def _resume_point(history):
 
 
 async def recover_interrupted(store, client, row, spec, description):
+    """Hold shared installation custody across all recovery writes and Temporal effects."""
+    with installation_recovery_lease(store.config):
+        return await _recover_interrupted(store, client, row, spec, description)
+
+
+async def _recover_interrupted(store, client, row, spec, description):
     """Called by the existing bounded maintenance sweep, also for legacy admissions."""
     intents = await asyncio.to_thread(_records, store, row["run_id"], INTENT)
     results = await asyncio.to_thread(_records, store, row["run_id"], RESULT)
@@ -246,7 +508,6 @@ async def recover_interrupted(store, client, row, spec, description):
         or client.service_client.config.target_host != store.config.temporal_address
     ):
         raise ValueError("controller recovery transport differs from the admitted owner")
-    await asyncio.to_thread(_guard, store, row, spec)
     history = await client.get_workflow_handle(
         description.id, run_id=description.run_id
     ).fetch_history()
@@ -275,6 +536,8 @@ async def recover_interrupted(store, client, row, spec, description):
         or len(inputs) not in (1, 2)
     ):
         raise ValueError("interrupted history does not authenticate this admission")
+    terminal = await _terminal_drain_point(store, row, spec, history)
+    await asyncio.to_thread(_guard, store, row, spec, terminal_settlement=bool(terminal))
     runtime = await asyncio.to_thread(payload_digest, Path(__file__).resolve().parent)
     prior = next((item for item in intents if item["execution_run_id"] == description.run_id), None)
     if prior is None:
@@ -288,14 +551,15 @@ async def recover_interrupted(store, client, row, spec, description):
             "execution_run_id": description.run_id,
             "status": facts["status"],
             "history_sha256": history_sha256(history),
-            "resume_event_id": _resume_point(history),
+            "resume_event_id": terminal['resume_event_id'] if terminal else _resume_point(history),
             "runtime_payload_sha256": runtime,
+            **({'terminal_settlement': terminal} if terminal else {}),
         }
         prior["key"] = digest(prior)
     if prior["history_sha256"] != history_sha256(history):
         raise ValueError("interrupted history changed after recovery intent")
     await asyncio.to_thread(seal, store, history, facts, run_id=row["run_id"], source="temporal")
-    await asyncio.to_thread(_guard, store, row, spec)
+    await asyncio.to_thread(_guard, store, row, spec, terminal_settlement=bool(terminal))
     fresh = await client.get_workflow_handle(description.id).describe()
     if fresh.run_id != description.run_id or fresh.status != description.status:
         raise ValueError("current execution changed before recovery dispatch")

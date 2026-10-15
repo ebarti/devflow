@@ -711,3 +711,64 @@ def test_native_prechecks_preserve_unregistered_historical_workspace_modules(tmp
     assert broker.candidate() == candidate
     with pytest.raises(ValueError, match='existing unregistered resource'):
         broker._register_generated(checkout, ['node_modules'])
+
+    # Implementation stays in the original session checkout. Its exact frozen
+    # install preserves legacy bytes by rename before reserving fresh output.
+    from devflow_temporal import delivery_metadata_recovery
+
+    install = {'id': 'docs-install', 'argv': ['corepack', 'pnpm', 'install', '--offline',
+               '--frozen-lockfile', '--ignore-scripts', '--store-dir', '/store']}
+    owned['policy']['prepublish_checks'] = [install]
+    owned['policy_digest'] = digest(owned['policy'])
+    candidate = broker.candidate()
+    folder = resources.state / 'preserved-workspace-dependencies' / digest('apps/api/node_modules')
+    destination = folder / 'node_modules'
+    immutable = delivery_metadata_recovery._immutable
+    original_run = subprocess.run
+    monkeypatch.setattr(subprocess, 'run', lambda argv, **options: (
+        subprocess.CompletedProcess(argv, 1, stdout='', stderr='')
+        if argv[0] == '/usr/sbin/lsof' else original_run(argv, **options)))
+
+    class InterruptedPreservation(RuntimeError):
+        pass
+
+    def interrupt_intent(path, value):
+        immutable(path, value)
+        if path.name == 'intent.json':
+            raise InterruptedPreservation('before rename')
+
+    monkeypatch.setattr(delivery_metadata_recovery, '_immutable', interrupt_intent)
+    with pytest.raises(InterruptedPreservation, match='before rename'):
+        resources.preserve_workspace_dependencies(checkout, candidate, install)
+    assert historical.stat().st_ino == original_identity and not destination.exists()
+
+    def interrupt_receipt(path, value):
+        if path.name == 'receipt.json':
+            raise InterruptedPreservation('after rename')
+        immutable(path, value)
+
+    monkeypatch.setattr(delivery_metadata_recovery, '_immutable', interrupt_receipt)
+    with pytest.raises(InterruptedPreservation, match='after rename'):
+        resources.preserve_workspace_dependencies(checkout, candidate, install)
+    assert not historical.exists() and destination.stat().st_ino == original_identity
+    assert (destination / 'preserved').read_text() == 'historical ignored modules'
+    replacement = folder / 'replacement'
+    destination.rename(replacement)
+    destination.mkdir()
+    with pytest.raises(ValueError, match='destination was replaced'):
+        resources.preserve_workspace_dependencies(checkout, candidate, install)
+    destination.rmdir()
+    replacement.rename(destination)
+    monkeypatch.setattr(delivery_metadata_recovery, '_immutable', immutable)
+    receipt = resources.preserve_workspace_dependencies(checkout, candidate, install)
+    assert receipt[0]['state'] == 'preserved' and receipt[0]['disposable'] is False
+    assert resources.preserve_workspace_dependencies(checkout, candidate, install) == receipt
+    fresh = broker._register_generated(checkout, ['node_modules'])
+    for path in fresh:
+        path.mkdir(exist_ok=True)
+    broker._record_generated(fresh)
+    assert historical.stat().st_ino != original_identity
+    assert destination.stat().st_ino == original_identity
+    assert (destination / 'preserved').read_text() == 'historical ignored modules'
+    assert str(destination) not in read_private(resources.manifest)['roots']
+    assert broker.candidate() == candidate

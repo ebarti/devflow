@@ -6,6 +6,7 @@ import json
 import logging
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 from temporalio.client import WorkflowExecutionStatus
@@ -38,7 +39,7 @@ def _same_row(row, projection):
                     for key, column in JSON_FIELDS.items()))
 
 
-def _cleanup_row(row, spec, description, scheduled, events):
+def _cleanup_row(row, spec, description, scheduled, events, *, status="COMPLETED"):
     """Prove contiguous cleanup writes over an exact history-bound projection.
 
     The latest maintenance key binds the closure and finalization receipt. Older
@@ -52,8 +53,10 @@ def _cleanup_row(row, spec, description, scheduled, events):
             or receipt.get("state") != row["cleanup"]
             or receipt.get("resource_cleanup") != row["cleanup"]):
         return None
+    if status not in {"COMPLETED", "FAILED"}:
+        raise ValueError('cleanup projection requires an authenticated completed or failed closure')
     closed = {"workflow_id": description.id, "execution_run_id": description.run_id,
-              "closed_at": description.close_time.isoformat(), "status": "COMPLETED"}
+              "closed_at": description.close_time.isoformat(), "status": status}
     key = digest({"closed_workflow": closed, "native_observations": receipt["processes"],
                   "resource_cleanup": receipt})
     maintenance = next((event for event in reversed(events)
@@ -457,7 +460,13 @@ def _iso(moment):
     return moment.isoformat(timespec="microseconds")
 
 
-def _candidates(store, now, limit):
+def _runtime_generation():
+    from .payload import payload_digest
+
+    return payload_digest(Path(__file__).resolve().parent)
+
+
+def _candidates(store, now, limit, generation):
     """Flagged rows whose current execution identity is unsettled and due."""
     placeholders = ",".join("?" * len(SETTLED))
     with store._connect() as db:
@@ -473,9 +482,10 @@ def _candidates(store, now, limit):
                        AND (r.outcome IS NULL OR r.outcome='blocked'))
                        OR (p.state NOT IN ({placeholders})
                        AND (p.next_check_at IS NULL OR p.next_check_at<=?
-                            OR p.revision!=r.revision)))
+                            OR p.revision!=r.revision
+                            OR (p.state='unproven' AND COALESCE(p.key,'')!=?))))
                 ORDER BY COALESCE(p.next_check_at,''), r.run_id LIMIT ?""",
-            (*sorted(SETTLED), _iso(now), limit))]
+            (*sorted(SETTLED), _iso(now), generation, limit))]
 
 
 def _remember(store, row, observed, now):
@@ -487,11 +497,12 @@ def _remember(store, row, observed, now):
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         previous = db.execute(
-            "SELECT attempts,state FROM delivery_closed_projections "
+            "SELECT attempts,state,key FROM delivery_closed_projections "
             "WHERE run_id=? AND workflow_id=?", (row["run_id"], workflow_id)).fetchone()
         # Backoff counts consecutive identical verdicts; a changed verdict restarts it.
         attempts = 0 if state in SETTLED else (
-            previous["attempts"] + 1 if previous and previous["state"] == state else 1)
+            previous["attempts"] + 1 if previous and previous["state"] == state
+            and (state != 'unproven' or previous['key'] == observed.get('key')) else 1)
         next_check = None
         if state not in SETTLED:
             cap = (OPEN_EXECUTION_BACKOFF_CAP if state in {"not_completed", "not_started"}
@@ -510,14 +521,33 @@ def _remember(store, row, observed, now):
 
 
 async def reconcile_completed_projections(store, client, *, now=None, limit=PASS_LIMIT):
+    """An installer fence defers observation and its skip/backoff writers together."""
+    from .delivery_interrupted_recovery import (
+        InstallationRecoveryDeferred,
+        installation_recovery_lease,
+    )
+
+    try:
+        with installation_recovery_lease(store.config):
+            return await _reconcile_completed_projections(store, client, now=now, limit=limit)
+    except InstallationRecoveryDeferred:
+        return []
+
+
+async def _reconcile_completed_projections(store, client, *, now=None, limit=PASS_LIMIT):
     """Bound each maintenance pass to due candidates; all SQLite work stays off the loop."""
+    from .delivery_interrupted_recovery import InstallationRecoveryDeferred
+
     now = now or datetime.now(UTC)
     results = []
-    for row in await asyncio.to_thread(_candidates, store, now, limit):
+    generation = await asyncio.to_thread(_runtime_generation)
+    for row in await asyncio.to_thread(_candidates, store, now, limit, generation):
         try:
             observed = await reconcile_projection(store, client, row)
         except asyncio.CancelledError:
             raise
+        except InstallationRecoveryDeferred:
+            continue  # No skip record, settled verdict or backoff write while installation owns it.
         except Exception as exc:
             logger.warning("Run %s completed projection remains unproven (%s)",
                            row["run_id"], type(exc).__name__)
@@ -526,6 +556,8 @@ async def reconcile_completed_projections(store, client, *, now=None, limit=PASS
             from .delivery_automatic_retry import _record_skip
 
             await asyncio.to_thread(_record_skip, store, row, exc)
+        if observed['state'] == 'unproven':
+            observed = {**observed, 'key': generation}
         await asyncio.to_thread(_remember, store, row, observed, now)
         results.append({"run_id": row["run_id"], **observed})
     return results
