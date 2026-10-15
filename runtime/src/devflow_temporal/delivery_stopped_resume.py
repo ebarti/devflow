@@ -292,8 +292,21 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
     if custody_record and (spec.get('implementation_role_home_generation')
                            != custody_record['generation']):
         raise ValueError('unstarted repair changed its original implementation home')
+    # A successor runtime renews allowance authority, not the already paid debit.
+    from .delivery_feature_revision_recovery import retained_recovery
+
+    origin = previous
+    while origin.get('pending_repair'):
+        prior_link = retained_recovery(origin.get('original_recovery')) or {}
+        if (prior_link.get('kind') != KIND
+                or origin['pending_repair'].get('iteration') != iteration):
+            raise ValueError('unstarted repair lost its original debit admission')
+        origin = prior_link
     shared = registry(spec)
-    owner = spec['repair_allowance']['owner']
+    owner = origin['execution_spec']['repair_allowance']['owner']
+    current_owner = spec['repair_allowance']['owner']
+    if any(current_owner.get(key) != owner.get(key) for key in ('issue_id', 'store_path')):
+        raise ValueError('unstarted repair changed its original debit owner')
     current = shared.current(owner['issue_id'])
     with shared.connect() as registry_db:
         debit = registry_db.execute(

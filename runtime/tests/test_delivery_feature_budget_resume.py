@@ -295,6 +295,23 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
     assert captured['command']['additional_iterations'] == 0
     assert shared.budget(token['issue_id'])['used'] == 1
     assert authenticated and all(item == previous for item in authenticated)
+    # Another authenticated unstarted admission renews runtime allowance ownership,
+    # while the immutable worker:8 debit still belongs to the original owner.
+    renewed = copy.deepcopy(child)
+    renewed['repair_allowance']['owner'] = {**token, 'generation': token['generation'] + 1}
+    renewed['policy']['native_identity'] = {'runtime_payload_sha256': 'b' * 64}
+    renewed['policy_digest'] = digest(renewed['policy'])
+    rebound = {**candidate, 'policy_digest': renewed['policy_digest']}
+    link = {**previous, 'predecessor_spec': child, 'execution_spec': renewed,
+            'candidate': candidate, 'execution_candidate': rebound, 'state': sealed['state'],
+            'pending_repair': pending, 'original_recovery': previous}
+    repeated = {**sealed, 'predecessor_spec': renewed, 'candidate': rebound,
+                'state': {**sealed['state'], 'candidate': rebound}, 'original_recovery': link}
+    with store._connect() as db:
+        assert resume_mod.pending_repair(repeated, db=db) == pending
+    broker.spec = renewed
+    assert resume_mod._historical_candidate(broker, repeated['state'], rebound, role, link, pending)
+    assert shared.budget(token['issue_id'])['used'] == 1
     for change in ('source', 'attempt', 'cleanup'):
         altered = copy.deepcopy(sealed)
         if change == 'source':

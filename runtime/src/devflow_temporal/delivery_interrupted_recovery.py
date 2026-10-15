@@ -8,7 +8,11 @@ resume point are replayed. Native/effect journals still guard repeated activitie
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import os
+import stat
+from contextlib import contextmanager
 from pathlib import Path
 
 from temporalio.api.common.v1 import WorkflowExecution
@@ -27,6 +31,40 @@ RESULT = "interrupted_execution_recovered"
 CLOSED = frozenset({"FAILED", "TIMED_OUT", "TERMINATED"})
 # Repeated controller failure on unchanged code needs a repair, not an endless loop.
 MAX_RECOVERIES = 3
+
+
+class InstallationRecoveryDeferred(RuntimeError):
+    """The installer owns the shared recovery fence; maintenance must stay read-only."""
+
+
+@contextmanager
+def installation_recovery_lease(config, *, exclusive=False):
+    """Serialize installation with effectful resets across every local service."""
+    from .delivery_feature_execution import registry_path
+    from .delivery_resources import _ancestors, private_directory
+
+    path = registry_path(config).parent / 'installation-recovery.lock'
+    private_directory(path.parent)
+    _ancestors(path)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+
+    def authenticate():
+        info, current = os.fstat(descriptor), path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+            raise ValueError('installation recovery lease changed or is not a private owned file')
+
+    try:
+        authenticate()
+        try:
+            fcntl.flock(descriptor, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise InstallationRecoveryDeferred('installation recovery lease is held') from exc
+        authenticate()
+        yield path
+    finally:
+        os.close(descriptor)
 
 
 def _records(store, run_id, kind):
@@ -417,6 +455,12 @@ def _resume_point(history):
 
 
 async def recover_interrupted(store, client, row, spec, description):
+    """Hold shared installation custody across all recovery writes and Temporal effects."""
+    with installation_recovery_lease(store.config):
+        return await _recover_interrupted(store, client, row, spec, description)
+
+
+async def _recover_interrupted(store, client, row, spec, description):
     """Called by the existing bounded maintenance sweep, also for legacy admissions."""
     intents = await asyncio.to_thread(_records, store, row["run_id"], INTENT)
     results = await asyncio.to_thread(_records, store, row["run_id"], RESULT)

@@ -23,6 +23,52 @@ from devflow_temporal.delivery_closed_projection import (
 from devflow_temporal.delivery_store import DeliveryStore
 
 
+@pytest.mark.asyncio
+async def test_installation_fence_defers_recovery_without_writing_or_stranding_it(
+    service, monkeypatch, tmp_path,
+):
+    from devflow_temporal import delivery_closed_projection, delivery_interrupted_recovery
+    from devflow_temporal.delivery_interrupted_recovery import installation_recovery_lease
+
+    store, request = service
+    store.submit(request)
+    store.config.raw['execution_registry'] = str(tmp_path / 'ownership/registry.sqlite3')
+    calls = []
+
+    async def inner(*_args):
+        calls.append('recovery')
+        return {'state': 'execution_recovered'}
+
+    async def reconcile(_store, client, row):
+        return await delivery_interrupted_recovery.recover_interrupted(
+            _store, client, row, {}, None)
+
+    monkeypatch.setattr(delivery_interrupted_recovery, '_recover_interrupted', inner)
+    monkeypatch.setattr(delivery_closed_projection, 'reconcile_projection', reconcile)
+    monkeypatch.setattr(delivery_closed_projection, '_runtime_generation', lambda: 'b' * 64)
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    with store._connect() as db:
+        revision = db.execute('SELECT revision FROM delivery_runs').fetchone()[0]
+        db.execute('INSERT INTO delivery_closed_projections '
+                   '(run_id,workflow_id,state,attempts,revision,next_check_at,'
+                   'error,key,updated_at) '
+                   'VALUES (?,?,?,?,?,?,?,?,?)',
+                   ('run-1', 'delivery-run-1', 'unproven', 8, revision,
+                    (now + timedelta(hours=1)).isoformat(), 'OldRuntimeFailure', 'a' * 64,
+                    now.isoformat()))
+        before = list(db.iterdump())
+    with installation_recovery_lease(store.config, exclusive=True) as lock:
+        assert lock.is_file() and lock.stat().st_mode & 0o777 == 0o600
+        assert await reconcile_completed_projections(store, None, now=now) == []
+        with store._connect() as db:
+            assert list(db.iterdump()) == before
+        assert calls == []
+    assert lock.exists()  # Neither installer nor runtime unlinks the shared inode.
+    assert await reconcile_completed_projections(store, None, now=now) == [
+        {'run_id': 'run-1', 'state': 'execution_recovered'}]
+    assert calls == ['recovery']
+
+
 class _Client:
     def __init__(self):
         self.describes = []
@@ -54,7 +100,7 @@ def _due_at(store, key):
 
 
 @pytest.mark.asyncio
-async def test_maintenance_persists_backoff_and_settles_closed_executions(service):
+async def test_maintenance_persists_backoff_and_settles_closed_executions(service, monkeypatch):
     store, request = service
     store.submit(request)
     client = _Client()
@@ -106,6 +152,18 @@ async def test_maintenance_persists_backoff_and_settles_closed_executions(servic
     assert delays == [min(BACKOFF_CAP, BACKOFF_BASE * 2 ** n) for n in range(8)]
     assert delays[-1] == BACKOFF_CAP
     assert _maintenance_rows(store)[key]["error"] == "RuntimeError"
+    # A repaired source gets one prompt observation, then normal same-source backoff.
+    from devflow_temporal import delivery_closed_projection
+
+    monkeypatch.setattr(delivery_closed_projection, '_runtime_generation', lambda: 'b' * 64)
+    moment += timedelta(seconds=1)
+    observed = await reconcile_completed_projections(store, client, now=moment)
+    assert observed[0]['state'] == 'unproven'
+    assert _maintenance_rows(store)[key]['attempts'] == 1
+    assert _maintenance_rows(store)[key]['key'] == 'b' * 64
+    assert _due_at(store, key) == moment + BACKOFF_BASE
+    assert await reconcile_completed_projections(
+        store, client, now=moment + timedelta(seconds=1)) == []
     # A closed, not completed execution settles: never described again.
     client.error = None
     client.status, client.close_time = WorkflowExecutionStatus.CANCELED, datetime.now(UTC)
