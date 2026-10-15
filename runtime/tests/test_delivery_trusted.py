@@ -272,8 +272,11 @@ def test_legacy_terminal_tracker_uses_actual_helper_ack_before_release(
     store = DeliveryStore(config)
     store.submit(request)
     spec = store.spec(request['run_id'])
-    monkeypatch.setattr('devflow_temporal.delivery_activities._context',
-                        lambda _spec: (store, None))
+    def tracker_context(_spec, *, terminal_settlement=False):
+        assert terminal_settlement is True
+        return store, None
+
+    monkeypatch.setattr('devflow_temporal.delivery_activities._context', tracker_context)
     monkeypatch.setitem(sys.modules, 'state', store.state)
     helper_spec = importlib.util.spec_from_file_location('github', config.helpers_dir / 'github.py')
     helper = importlib.util.module_from_spec(helper_spec)
