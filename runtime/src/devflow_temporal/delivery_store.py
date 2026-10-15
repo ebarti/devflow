@@ -1291,8 +1291,15 @@ class DeliveryStore:
                 and isinstance(supplied, dict)
                 and type(supplied.get("additional_iterations")) is int
                 and supplied["additional_iterations"] > 0):
-            from .delivery_stopped_resume import KIND, fixed_budget_allows
+            from .delivery_stopped_resume import KIND, admit, fixed_budget_allows
 
+            if original_budget.get('feature_worker') and supplied.get('continuation_kind') == KIND:
+                from .delivery_feature_execution import registry
+
+                if registry(original_budget).budget(
+                        original_budget['feature_delivery']['owner']['issue_id']
+                ).get('allowance', {}).get('sequence'):
+                    return admit(self, run_id, supplied, preflight=preflight)
             if (supplied.get('continuation_kind') != KIND
                     or not fixed_budget_allows(original_budget,
                                               supplied.get('expected_iteration'),

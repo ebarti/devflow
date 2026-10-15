@@ -76,14 +76,77 @@ def scope_spec(store, seal, command):
 
 
 def fixed_budget_allows(spec, iteration, iterations, *, pending=False):
-    """A resume may spend unused original turns, never enlarge the frozen ceiling."""
+    """Spend original turns or the finite extension sealed by a runtime allowance."""
     maximum = spec.get('policy', {}).get('max_repairs')
+    authority = spec.get('repair_allowance')
+    if authority is not None:
+        if (not spec.get('feature_worker') or not isinstance(authority, dict)
+                or authority.get('run_id') != spec.get('run_id')
+                or type(authority.get('start_iteration')) is not int
+                or type(authority.get('maximum_iteration')) is not int
+                or not 0 <= authority['start_iteration'] <= authority['maximum_iteration']
+                or authority['maximum_iteration'] - authority['start_iteration'] > 100):
+            return False
+        maximum = authority['maximum_iteration']
     allowed = range(1, 101) if spec.get('feature_worker') else (1, 2)
     return (type(iteration) is int and iteration >= 0
             and type(iterations) is int
             and (iterations in allowed or (iterations == 0 and pending))
             and type(maximum) is int and maximum >= 0
             and iteration + iterations <= maximum)
+
+
+def validate_worker_allowance(spec, *, current=False):
+    """Authenticate the receipt even when reading an old immutable recovery."""
+    from .delivery_feature_execution import registry
+
+    authority = spec['repair_allowance']
+    if (not isinstance(authority, dict)
+            or set(authority) != {'run_id', 'owner', 'receipt', 'start_iteration',
+                                  'maximum_iteration'}
+            or not fixed_budget_allows(spec, authority.get('start_iteration'), 0, pending=True)
+            or not isinstance(authority['owner'], dict)
+            or authority['owner'].get('issue_id') != spec['feature_delivery']['owner']['issue_id']
+            or authority['owner'].get('store_path')
+                != spec['feature_delivery']['owner']['store_path']):
+        raise ValueError('worker changed its finite runtime repair allowance')
+    receipt = registry(spec).repair_allowance(authority['owner'], authority['receipt'],
+                                             current=current)
+    if authority['maximum_iteration'] - authority['start_iteration'] > receipt['maximum']:
+        raise ValueError('worker exceeded its installed runtime repair allowance')
+    if current:
+        from .delivery_feature_review_context import current_runtime_identity
+
+        if current_runtime_identity()['runtime_payload_sha256'] != (
+                authority['receipt']['runtime_payload_sha256']):
+            raise ValueError('installed runtime differs from the sealed repair allowance')
+    return authority
+
+
+def worker_allowance(spec, iteration, iterations):
+    """Derive extension authority from the current owner, never command fields."""
+    if not spec.get('feature_worker'):
+        return None
+    from .delivery_feature_execution import registry
+    from .delivery_feature_review_context import current_runtime_identity
+
+    shared = registry(spec)
+    issue_id = spec['feature_delivery']['owner']['issue_id']
+    budget = shared.budget(issue_id)
+    reference = budget.get('allowance')
+    if not reference or reference['sequence'] == 0:
+        return None
+    if current_runtime_identity()['runtime_payload_sha256'] != reference['runtime_payload_sha256']:
+        raise ValueError('installed runtime differs from the current repair allowance')
+    current = shared.current(issue_id)
+    if not current or current['store_path'] != spec['feature_delivery']['owner']['store_path']:
+        raise ValueError('worker repair allowance belongs to a different owner store')
+    owner = shared.token(current)
+    shared.repair_allowance(owner, reference, current=True)
+    if iterations > budget['maximum'] - budget['used']:
+        raise ValueError('feature product repair limit exhausted')
+    return {'run_id': spec['run_id'], 'owner': owner, 'receipt': reference,
+            'start_iteration': iteration, 'maximum_iteration': iteration + iterations}
 
 
 def _recorded_findings(state):
@@ -231,6 +294,11 @@ def custody(db, recovery, *, retained_memo=None):
     # Revision admissions record their own gate resume; any other resume
     # position comes from an interrupted worker's re-derivable plan.
     interrupted = 'resume_iteration' in details and not details.get('feature_plan_revision')
+    if spec.get('repair_allowance'):
+        authority = validate_worker_allowance(spec)
+        if (authority['start_iteration'] != recovery['state']['iteration']
+                or authority['maximum_iteration'] != recovery['maximum_iteration']):
+            raise ValueError('stopped resume changed its sealed runtime allowance')
     if (spec.get('retry_budget_version') == 1
             and not fixed_budget_allows(spec, recovery['state']['iteration'],
                                         recovery['command']['additional_iterations'],
@@ -506,8 +574,11 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         raise ValueError('zero additional iterations require an authenticated pending repair '
                          'or an interrupted iteration')
     maximum = seal['state']['iteration'] + command['additional_iterations']
+    authority = worker_allowance(seal['predecessor_spec'], seal['state']['iteration'],
+                                 command['additional_iterations'])
+    budget_spec = {**original, **({'repair_allowance': authority} if authority else {})}
     if (original.get('retry_budget_version') == 1
-            and not fixed_budget_allows(original, seal['state']['iteration'],
+            and not fixed_budget_allows(budget_spec, seal['state']['iteration'],
                                         command['additional_iterations'],
                                         pending=bool(pending or gate_only or interrupted))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
@@ -546,6 +617,12 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                 raise ValueError('adopted worker derivation changed during runtime preparation')
         elif scope_spec(store, seal, command) != amended:
             raise ValueError('stopped scope configuration changed during runtime preparation')
+        execution.pop('repair_allowance', None)
+        if authority:
+            if worker_allowance(spec, seal['state']['iteration'],
+                                command['additional_iterations']) != authority:
+                raise ValueError('runtime repair allowance changed during preparation')
+            execution['repair_allowance'] = authority
         execution['role_home_generation'] = spec.get('role_home_generation', '')
         if not execution['role_home_generation']:
             execution.pop('role_home_generation')

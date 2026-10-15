@@ -181,6 +181,10 @@ def require_execution(store, spec, *, allow_stopped=False):
         from temporalio import activity
 
         _worker_assignment(store, spec)
+        if spec.get("repair_allowance"):
+            from .delivery_stopped_resume import validate_worker_allowance
+
+            validate_worker_allowance(spec, current=True)
         if activity.in_activity() and (
             activity.info().workflow_id != store.active_workflow_id(spec["run_id"])
         ):
@@ -592,6 +596,8 @@ def continue_feature(store, run_id, request, *, _revision=None):
     ):
         raise OwnershipConflict("feature workers or effects have not reached a safe handoff")
     closed_coordinator(store, run_id)
+    if original["provider"] != "fake" and not replay_claim:
+        _renew_repair_allowance(store, shared, token)
     fields = {
         "work_id",
         "issue_url",
@@ -617,6 +623,36 @@ def continue_feature(store, run_id, request, *, _revision=None):
         supplied.update(accepted_plan=accepted, plan_approval="automatic")
     return (store.submit(supplied, _feature_revision=_revision) if _revision is not None
             else store.submit(supplied))
+
+
+def _renew_repair_allowance(store, shared, token):
+    """A supported continuation may renew only from server-written runtime evidence."""
+    budget = shared.budget(token["issue_id"])
+    try:
+        baseline = {}
+        if not budget.get("allowance"):
+            with store._connect() as db:
+                row = db.execute(
+                    "SELECT identity_json FROM delivery_dashboard_state WHERE run_id=?",
+                    (token["run_id"],),
+                ).fetchone()
+            recorded = json.loads(row[0]) if row and row[0] else {}
+            if recorded.get("dirty") is not False or recorded.get("local_digest") is not None:
+                raise ValueError("predecessor has no clean recorded runtime identity")
+            native = store.spec(token["run_id"])["policy"].get("native_identity", {})
+            from .delivery_feature_review_context import _protected_root, _sources
+
+            _, payload = _sources(_protected_root(), recorded.get("revision"))
+            if native and native.get("runtime_payload_sha256") != payload:
+                raise ValueError("predecessor runtime differs from its prepared payload")
+            baseline = {"revision": recorded["revision"], "runtime_payload_sha256": payload}
+        shared.renew_repair_allowance(token, baseline)
+    except (OSError, ValueError) as exc:
+        # An old, still-funded feature retains its original continuation contract.
+        # Missing or unverified identity never creates a new allowance.
+        if isinstance(exc, OwnershipConflict) or budget["used"] >= budget["maximum"]:
+            raise OwnershipConflict("cannot authenticate a new installed repair allowance: "
+                                    + str(exc)) from exc
 
 
 def _settlement_workers(store, spec, closed):

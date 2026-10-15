@@ -2387,9 +2387,11 @@ class DeliveryWorkflow:
             if authorized_max_iteration is not None
             else spec["policy"]["max_repairs"]
         )
-        if (spec.get("retry_budget_version") == 1
-                and max_repairs > spec["policy"]["max_repairs"]):
-            raise ValueError("workflow continuation exceeded its fixed repair budget")
+        if spec.get("retry_budget_version") == 1:
+            from .delivery_stopped_resume import fixed_budget_allows
+
+            if not fixed_budget_allows(spec, max_repairs, 0, pending=True):
+                raise ValueError("workflow continuation exceeded its fixed repair budget")
         acceptance_note = (
             "Operator acceptance criteria (requirements to assess, not evidence of success): "
             + json.dumps(operator_brief, sort_keys=True)

@@ -285,8 +285,10 @@ def resume_worker(store, parent, child, row):
             remaining = plan["additional_iterations"]
         else:
             budget = shared.budget(token["issue_id"])
-            remaining = min(budget["maximum"] - budget["used"],
-                            child["policy"]["max_repairs"] - state["iteration"])
+            remaining = budget["maximum"] - budget["used"]
+            if not budget.get("allowance", {}).get("sequence"):
+                remaining = min(remaining,
+                                child["policy"]["max_repairs"] - state["iteration"])
             pending = pending_repair(sealed) if remaining == 0 else None
             if remaining < 0 or (remaining == 0 and not pending):
                 raise OwnershipConflict(
