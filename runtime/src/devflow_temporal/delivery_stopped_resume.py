@@ -253,6 +253,9 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
     candidate = seal['candidate']
     roles, before = state.get('roles', []), prior.get('roles', [])
     remainder = roles[len(before):]
+    if not closing and _completed_repair(seal, previous, remainder):
+        # This paid turn ran. Ordinary stopped-repair proof decides its next turn.
+        return False
     preparation = remainder[0].get('implementation_preparation', {}) if len(remainder) == 1 else {}
     unlaunched = (len(remainder) == 1 and remainder[0].get('role') == 'implement'
                   and remainder[0].get('iteration') == iteration
@@ -319,6 +322,70 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
             or debit['reason'] != 'Product repair at worker iteration ' + str(iteration)):
         raise ValueError('unstarted repair lacks its exact existing product debit')
     return True
+
+
+def _completed_repair(seal, previous, remainder):
+    """Authenticate progress beyond the unchanged, unstarted admission inventory."""
+    from .supervisor import DeliverySupervisor
+
+    spec, state = seal['predecessor_spec'], seal['state']
+    completed = [role for role in remainder if role.get('role') == 'implement'
+                 and role.get('iteration') == state['iteration']]
+    if len(completed) != 1:
+        return False
+    role = completed[0]
+    candidate = previous['execution_candidate']
+    recorded = []
+    for progressed in remainder:
+        if (progressed.get('role') not in {'implement', 'review', 'verify'}
+                or progressed.get('iteration') != state['iteration']
+                or not progressed.get('input_candidate_id')):
+            return False
+        expected = DeliverySupervisor._job_key({
+            'spec': spec, 'role': progressed['role'], 'iteration': state['iteration'],
+            'candidate': {'id': progressed['input_candidate_id']}})
+        if progressed.get('attempt_id', expected) != expected:
+            return False
+        receipt = {key: value for key, value in progressed.items()
+                   if key not in {'role', 'iteration', 'candidate', 'attempt_id',
+                                  'input_candidate_id', 'provider'}}
+        matches = [attempt for attempt in seal['attempts']
+                   if attempt.get('job_key') == expected and attempt['role'] == progressed['role']
+                   and attempt['iteration'] == state['iteration']
+                   and attempt['candidate_id'] == progressed['input_candidate_id']
+                   and attempt['session_id'] == progressed.get('session_id')
+                   and attempt['state'] == 'finished' and attempt['cleanup'] == 'confirmed'
+                   and json.loads(attempt['result_json']) == receipt]
+        if len(matches) != 1:
+            return False
+        recorded.extend(matches)
+    before = previous['state'].get('roles', [])
+    return (previous['execution_spec'] == spec and state.get('roles', [])[:len(before)] == before
+            and role.get('status') in {'pass', 'findings', 'blocked'}
+            and role.get('cleanup') == 'confirmed'
+            and role.get('input_candidate_id') == candidate['id']
+            and bool(previous.get('session_id'))
+            and role.get('session_id') == seal.get('session_id') == previous['session_id']
+            and (seal.get('session_custody') or {}).get('generation')
+                == (previous.get('session_custody') or {}).get('generation')
+            and all(role.get('candidate', {}).get(key) == seal['candidate'].get(key)
+                    for key in ('base_sha', 'environment_digest', 'policy_digest'))
+            # A nonpass role stops before the workflow replaces its top candidate.
+            # _candidate must still authenticate that role's exact current source.
+            and (role['status'] != 'pass' or role['candidate'].get('content_sha256')
+                 == seal['candidate'].get('content_sha256'))
+            and all(attempt in seal['attempts'] for attempt in previous['attempts'])
+            and all(attempt in previous['attempts'] or attempt in recorded
+                    for attempt in seal['attempts'])
+            and all(effect in seal['effects'] for effect in previous['effects'])
+            and all(effect in previous['effects'] or (
+                effect['effect_key'] == f"publish:{spec['run_id']}:{state['iteration']}"
+                and effect['kind'] == 'publish' and effect['state'] == 'complete'
+                and json.loads(effect['request_json']) == {
+                    'input_candidate_id': role['candidate']['id'], 'iteration': state['iteration']}
+                and state.get('pull_request') is not None
+                and json.loads(effect['observed_json']) == state['pull_request'])
+                    for effect in seal['effects']))
 
 
 def interrupted_resume(seal):
