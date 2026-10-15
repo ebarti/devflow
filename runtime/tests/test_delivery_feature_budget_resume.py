@@ -337,7 +337,16 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
                                        if key not in RECEIPT_ONLY})})
     with store._connect() as db:
         assert resume_mod.pending_repair(finished, db=db) is None
-    for change in ('receipt', 'review_receipt', 'prior_receipt', 'session', 'home', 'source'):
+    for status in ('findings', 'blocked'):
+        assessed = copy.deepcopy(finished)
+        assessed['state']['roles'][1]['status'] = status
+        assessed['state']['roles'][1]['attempt_id'] = assessed['attempts'][-2]['job_key']
+        receipt = json.loads(assessed['attempts'][-2]['result_json'])
+        assessed['attempts'][-2]['result_json'] = json.dumps({**receipt, 'status': status})
+        with store._connect() as db:
+            assert resume_mod.pending_repair(assessed, db=db) is None
+    for change in ('receipt', 'review_receipt', 'prior_receipt', 'session', 'home', 'source',
+                   'attempt_id'):
         altered = copy.deepcopy(finished)
         if change == 'receipt':
             altered['attempts'][-2]['result_json'] = '{}'
@@ -349,6 +358,8 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
             altered['session_id'] = 'replacement-session'
         elif change == 'home':
             altered['session_custody']['generation'] = 'replacement-home'
+        elif change == 'attempt_id':
+            altered['state']['roles'][1]['attempt_id'] = 'unrelated-attempt'
         else:
             altered['candidate']['content_sha256'] = '0' * 64
         with store._connect() as db, pytest.raises(ValueError, match='unchanged source'):

@@ -343,6 +343,8 @@ def _completed_repair(seal, previous, remainder):
         expected = DeliverySupervisor._job_key({
             'spec': spec, 'role': progressed['role'], 'iteration': state['iteration'],
             'candidate': {'id': progressed['input_candidate_id']}})
+        if progressed.get('attempt_id', expected) != expected:
+            return False
         receipt = {key: value for key, value in progressed.items()
                    if key not in {'role', 'iteration', 'candidate', 'attempt_id',
                                   'input_candidate_id', 'provider'}}
@@ -357,7 +359,8 @@ def _completed_repair(seal, previous, remainder):
             return False
     before = previous['state'].get('roles', [])
     return (previous['execution_spec'] == spec and state.get('roles', [])[:len(before)] == before
-            and role.get('status') == 'pass' and role.get('cleanup') == 'confirmed'
+            and role.get('status') in {'pass', 'findings', 'blocked'}
+            and role.get('cleanup') == 'confirmed'
             and role.get('input_candidate_id') == candidate['id']
             and bool(previous.get('session_id'))
             and role.get('session_id') == seal.get('session_id') == previous['session_id']
