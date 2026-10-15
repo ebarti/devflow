@@ -607,6 +607,116 @@ class RunResources:
                         break
             write_private(self.manifest, manifest)
 
+    def preserve_workspace_dependencies(
+        self, checkout: Path, candidate: dict, recipe: dict,
+    ) -> list:
+        """Move legacy unregistered modules aside; only new output becomes disposable."""
+        from .candidate import candidate_for
+        from .delivery_broker import _git
+        from .delivery_configured_resources import (
+            implementation_prerequisites,
+            workspace_dependency_directories,
+        )
+        from .delivery_metadata_recovery import _immutable
+
+        source_candidate = candidate_for(checkout)
+        if (self.spec.get('provider') != 'codex'
+                or self.spec['policy'].get('host_sandbox') != 'trusted-local'
+                or checkout != Path(self.spec['checkout'])
+                or recipe not in implementation_prerequisites(self.spec)
+                or recipe.get('argv', [])[:3] != ['corepack', 'pnpm', 'install']
+                or not {'--offline', '--frozen-lockfile', '--ignore-scripts', '/store'}
+                <= set(recipe['argv'])
+                or digest(self.spec['policy']) != self.spec['policy_digest']
+                or candidate.get('policy_digest') != self.spec['policy_digest']
+                or any(source_candidate[key] != candidate.get(key)
+                       for key in ('id', 'head', 'content_sha256'))):
+            raise ValueError('legacy modules lack their exact frozen implementation authority')
+        self._allowed(checkout, 'checkout')
+        declarations = workspace_dependency_directories(checkout)
+        preserved = []
+        with self.locked() as manifest:
+            parent = manifest['roots'].get(str(checkout), {})
+            if parent.get('kind') != 'checkout' or parent.get('identity') != _identity(checkout):
+                raise ValueError('legacy modules lost their original checkout identity')
+            pending = []
+            for relative, declaration in declarations.items():
+                source = checkout / relative
+                folder = self.state / 'preserved-workspace-dependencies' / digest(relative)
+                if str(source) not in manifest['roots'] and (os.path.lexists(source)
+                                                            or os.path.lexists(folder)):
+                    pending.append((source, folder, declaration))
+            if not pending:
+                return preserved
+            # Keep every prior launch lease while proving actors and ports closed.
+            with self._closed_journals(manifest, manifest['processes']):
+                admission = str(_gate_evidence_root(self.spec))
+                for source, folder, declaration in pending:
+                    self._allowed(source, 'generated')
+                    if _git(checkout, 'ls-files', '--', source.relative_to(checkout).as_posix()):
+                        raise ValueError('legacy modules contain tracked source')
+                    destination, intent = folder / 'node_modules', folder / 'intent.json'
+                    _ancestors(destination, allow_missing=True)
+                    binding = {'run_id': self.spec['run_id'], 'checkout': str(checkout),
+                               'checkout_identity': parent['identity'], 'candidate': candidate,
+                               'recipe_sha256': digest(recipe), 'admission_evidence': admission,
+                               'source': str(source), 'destination': str(destination),
+                               'workspace_declaration_sha256': declaration}
+                    if os.path.lexists(intent):
+                        saved = read_private(intent)
+                        if {key: saved.get(key) for key in binding} != binding:
+                            raise ValueError('legacy module preservation authority changed')
+                    else:
+                        if os.path.lexists(destination) or not os.path.lexists(source):
+                            raise ValueError('legacy module preservation has no original identity')
+                        saved = {**binding, 'identity': _identity(source),
+                                 'source_parent_identity': _identity(source.parent)}
+                        private_directory(folder)
+                        _immutable(intent, saved)
+                    _ancestors(destination)
+                    if _identity(source.parent) != saved['source_parent_identity']:
+                        raise ValueError('legacy module parent was replaced')
+                    if os.path.lexists(source):
+                        if (os.path.lexists(destination) or _identity(source) != saved['identity']):
+                            raise ValueError(
+                                'legacy module preservation source is ambiguous or replaced')
+                        if Path('/usr/sbin/lsof').is_file():
+                            try:
+                                users = subprocess.run(
+                                    ['/usr/sbin/lsof', '-nP', '-F', 'p', '+D', str(source)],
+                                    text=True, capture_output=True, timeout=30)
+                            except subprocess.SubprocessError as exc:
+                                raise ValueError('legacy module holders are unconfirmed') from exc
+                            if users.returncode not in (0, 1) or any(
+                                    line.startswith('p') and line[1:].isdecimal()
+                                    for line in users.stdout.splitlines()):
+                                raise ValueError('legacy modules have a live or unknown holder')
+                        # Darwin RENAME_EXCL refuses even an empty destination directory.
+                        # The private registry lease serializes controller retries.
+                        import ctypes
+
+                        native = getattr(ctypes.CDLL(None, use_errno=True), 'renamex_np', None)
+                        if native is None:
+                            raise ValueError('exclusive native module preservation is unavailable')
+                        native.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+                        native.restype = ctypes.c_int
+                        if native(os.fsencode(source), os.fsencode(destination), 0x00000004):
+                            raise OSError(ctypes.get_errno(),
+                                          'exclusive legacy module rename failed')
+                        for directory in (source.parent, folder):
+                            descriptor = os.open(
+                                directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                            try:
+                                os.fsync(descriptor)
+                            finally:
+                                os.close(descriptor)
+                    if (os.path.lexists(source) or _identity(destination) != saved['identity']):
+                        raise ValueError('legacy module preservation destination was replaced')
+                    receipt = {**saved, 'state': 'preserved', 'disposable': False}
+                    _immutable(folder / 'receipt.json', receipt)
+                    preserved.append(receipt)
+        return preserved
+
     def created(self, path: Path, *, head: str | None = None) -> None:
         with self.locked() as manifest:
             entry = manifest["roots"][str(path)]

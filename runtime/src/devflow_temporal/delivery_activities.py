@@ -447,7 +447,8 @@ async def _with_heartbeat(operation, request: dict[str, Any], stage: str) -> dic
 
 
 def _context(
-    spec: dict[str, Any], *, preparation_input: bool = False, allow_stopped_feature: bool = False
+    spec: dict[str, Any], *, preparation_input: bool = False, allow_stopped_feature: bool = False,
+    terminal_settlement: bool = False,
 ) -> tuple[DeliveryStore, DeliveryBroker]:
     config = load_execution_config(spec)
     store = DeliveryStore(config)
@@ -461,7 +462,8 @@ def _context(
     if spec.get("feature_delivery"):
         from .delivery_feature_execution import require_execution
 
-        require_execution(store, spec, allow_stopped=allow_stopped_feature)
+        require_execution(store, spec, allow_stopped=allow_stopped_feature,
+                          terminal_settlement=terminal_settlement)
     if broker.evidence_dir != broker.state_dir:
         namespace = str(broker.evidence_dir.relative_to(broker.state_dir).parent)
         from .delivery_resources import private_directory
@@ -507,7 +509,13 @@ async def delivery_technical_readback(request: dict[str, Any]) -> dict[str, Any]
 @activity.defn(name="delivery_project")
 async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
     def execute() -> dict[str, Any]:
-        store, _ = _context(request["spec"], preparation_input=True)
+        outcome = request.get('outcome')
+        terminal = (outcome in {'blocked', 'cancelled', 'delivered'}
+                    and request.get('phase') == outcome
+                    and request.get('execution_state') == (
+                        'blocked' if outcome == 'blocked' else 'terminal'))
+        store, _ = _context(request["spec"], preparation_input=True,
+                            terminal_settlement=terminal)
         result = store.project(
             request["spec"]["run_id"],
             phase=request["phase"],
@@ -600,12 +608,17 @@ async def delivery_finalize_resources(request: dict[str, Any]) -> dict[str, Any]
     def execute() -> dict[str, Any]:
         from .delivery_resources import RunResources
 
-        _context(request["spec"], preparation_input=True)
+        terminal = request.get('outcome') in {'blocked', 'cancelled', 'delivered'}
+        store, _ = _context(request["spec"], preparation_input=True,
+                            terminal_settlement=terminal)
         if request["spec"].get("resource_cleanup_version") != 1:
             raise ApplicationError("run has no resource finalization contract", non_retryable=True)
-        receipt = RunResources(request["spec"]).finalize(
-            request["outcome"], uncertain=request.get("uncertain", False)
-        )
+        uncertain = request.get('uncertain', False)
+        if uncertain and terminal and request['spec'].get('feature_worker'):
+            from .delivery_interrupted_recovery import terminal_finalization_uncertain
+
+            uncertain = asyncio.run(terminal_finalization_uncertain(store, request))
+        receipt = RunResources(request["spec"]).finalize(request["outcome"], uncertain=uncertain)
         if receipt.get("retryable"):
             raise ApplicationError(
                 "owned temporary resource removal needs a bounded retry",
@@ -747,11 +760,22 @@ async def _run_role(request: dict[str, Any]) -> dict[str, Any]:
             )
         except CheckCancelledBeforeLaunch:
             prerequisites = _cancelled_check_result(request, broker)
+        except CheckPreparationFailure as exc:
+            prerequisites = {
+                'state': 'failed',
+                'cleanup': ('confirmed' if broker.native_cleanup_confirmed
+                            and all(item.get('cleanup') == 'confirmed' for item in exc.results)
+                            else 'unknown'),
+                'candidate_id': candidate['id'],
+                'source_unchanged': broker.candidate() == candidate,
+                'results': exc.results, 'diagnostic': str(exc),
+            }
         if prerequisites.get("state") != "passed":
             return {"status": "blocked", "role": role, "iteration": iteration,
                     "candidate": candidate, "cleanup": prerequisites.get("cleanup", "unknown"),
                     "summary": "Controller dependency preparation failed before the role",
-                    "findings": ["Required locked execution prerequisites are unavailable"],
+                    "findings": [prerequisites.get('diagnostic')
+                                 or "Required locked execution prerequisites are unavailable"],
                     "session_id": None, "implementation_preparation": prerequisites}
         from .delivery_role_evidence import historical_context
 
@@ -1147,7 +1171,7 @@ def _tracker_error_retryable(exc) -> bool:
 
 def _tracker_sync(spec: dict[str, Any], status: str, *, release: bool,
                   terminal: bool = False, reason: str | None = None) -> dict[str, Any]:
-    store, _ = _context(spec)
+    store, _ = _context(spec, terminal_settlement=terminal)
     if spec.get("project_sync_version") == 1:
         from .delivery_features import record_tracking
 
@@ -1334,7 +1358,7 @@ async def delivery_terminal_tracker(request: dict[str, Any]) -> dict[str, Any]:
                 and not feature_parent):
             from .delivery_terminal_recovery import published_readback
 
-            store, _ = await asyncio.to_thread(_context, request["spec"])
+            store, _ = await asyncio.to_thread(_context, request["spec"], terminal_settlement=True)
             await asyncio.to_thread(published_readback, store, request["spec"],
                                     request.get("candidate"), request["pull_request"])
         return await asyncio.to_thread(

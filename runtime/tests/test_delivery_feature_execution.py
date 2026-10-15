@@ -234,6 +234,10 @@ def test_workers_are_hidden_from_feature_run_list_and_have_narrow_fresh_authorit
     require_execution(store, child)
     shared = registry(parent)
     token = parent["feature_delivery"]["owner"]
+    shared.drain(token)
+    with pytest.raises(OwnershipConflict, match='active coordinator'):
+        require_execution(store, child)
+    require_execution(store, child, terminal_settlement=True)
     shared.finish_worker(token, worker_key(child["run_id"], token), {"cleanup": "confirmed"})
     with pytest.raises(OwnershipConflict, match="active execution assignment"):
         require_execution(store, child)

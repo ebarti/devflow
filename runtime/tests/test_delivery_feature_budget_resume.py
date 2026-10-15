@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 
 import pytest
@@ -244,6 +245,71 @@ def test_repair_with_budget_left_still_draws_on_it(service, monkeypatch):
     captured = _admission(monkeypatch, plan_seal(child, [implementation(0, "findings")]))
     activities.resume_worker(store, parent, child, _row(store, child))
     assert captured["command"]["additional_iterations"] == 1
+
+
+def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_session(
+    service, monkeypatch,
+):
+    store, parent, child, shared, token = _worker(
+        service, monkeypatch, used_by_others=0, kind='chunk')
+    before = copy.deepcopy(child)
+    old = {**CANDIDATE, 'base_sha': child['base_sha'], 'environment_digest': 'e' * 64,
+           'policy_digest': child['policy_digest']}
+    child = copy.deepcopy(child)
+    child['policy']['native_identity'] = {'runtime_payload_sha256': 'a' * 64}
+    child['policy_digest'] = digest(child['policy'])
+    child['repair_allowance'] = {'owner': token}
+    child['implementation_role_home_generation'] = ''
+    candidate = {**old, 'policy_digest': child['policy_digest']}
+    role = {**implementation(7, 'blocked'), 'candidate': old,
+            'findings': ['Retained actual product finding']}
+    previous = {'kind': resume_mod.KIND, 'predecessor_spec': before,
+                'execution_spec': child, 'candidate': old, 'execution_candidate': candidate,
+                'state': {'iteration': 7, 'error': 'Prior repair limit exhausted', 'roles': [role]},
+                'attempts': [{'role': 'implement', 'iteration': 7, 'state': 'finished',
+                              'cleanup': 'confirmed'}], 'effects': [],
+                'session_id': 'original-implementation',
+                'session_custody': {'generation': '', 'session_id': 'original-implementation'}}
+    sealed = {**plan_seal(child, [role], iteration=8), 'candidate': candidate,
+              'original_recovery': previous, 'attempts': previous['attempts'],
+              'session_custody': previous['session_custody']}
+    sealed['state'].update(candidate=candidate, cleanup='confirmed')
+    # This fixture models immutable prior-admission readback; actual registry
+    # generation/debit, source/inventory checks and public worker selection execute.
+    authenticated = []
+    def custody(_db, recovery):
+        authenticated.append(recovery)
+        return recovery['execution_spec']
+    monkeypatch.setattr(resume_mod, 'custody', custody)
+    shared.repair(token, f"{child['run_id']}:8", 'Product repair at worker iteration 8')
+    with store._connect() as db:
+        pending = resume_mod.pending_repair(sealed, db=db)
+    assert pending == {'iteration': 8, 'findings': [
+        'Prior repair limit exhausted', 'Retained actual product finding']}
+    broker = type('Broker', (), {'spec': child, 'store': store})()
+    assert resume_mod._historical_candidate(broker, sealed['state'], candidate, role,
+                                             previous, pending)
+    captured = _admission(monkeypatch, sealed)
+    activities.resume_worker(store, parent, child, _row(store, child))
+    assert captured['command']['expected_iteration'] == 8
+    assert captured['command']['additional_iterations'] == 0
+    assert shared.budget(token['issue_id'])['used'] == 1
+    assert authenticated and all(item == previous for item in authenticated)
+    for change in ('source', 'attempt', 'cleanup'):
+        altered = copy.deepcopy(sealed)
+        if change == 'source':
+            altered['candidate']['head'] = 'b' * 40
+        elif change == 'attempt':
+            altered['attempts'].append({'iteration': 8})
+        else:
+            altered['state']['cleanup'] = 'unknown'
+        with store._connect() as db, pytest.raises(ValueError, match='unchanged source'):
+            resume_mod.pending_repair(altered, db=db)
+    with shared.connect() as db:
+        db.execute('UPDATE execution_repairs SET reason=? WHERE repair_key=?',
+                   ('Unrelated charge', f"{child['run_id']}:8"))
+    with store._connect() as db, pytest.raises(ValueError, match='exact existing product debit'):
+        resume_mod.pending_repair(sealed, db=db)
 
 
 def test_pending_repair_debit_may_be_a_bound_revision_alias(service, monkeypatch):

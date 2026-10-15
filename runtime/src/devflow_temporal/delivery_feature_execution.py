@@ -169,7 +169,7 @@ def _worker_assignment(store, spec):
     return shared, current, row
 
 
-def require_execution(store, spec, *, allow_stopped=False):
+def require_execution(store, spec, *, allow_stopped=False, terminal_settlement=False):
     feature = spec.get("feature_delivery")
     if not feature:
         return
@@ -180,11 +180,15 @@ def require_execution(store, spec, *, allow_stopped=False):
         # old Temporal execution remains fenced by the exact workflow ID.
         from temporalio import activity
 
-        _worker_assignment(store, spec)
+        shared, current, _ = _worker_assignment(store, spec)
+        if current['store_path'] != str(store.config.tracking_db):
+            raise OwnershipConflict('worker assignment belongs to another owner store')
+        if not terminal_settlement and current['state'] != 'active':
+            raise OwnershipConflict('worker activity requires an active coordinator')
         if spec.get("repair_allowance"):
             from .delivery_stopped_resume import validate_worker_allowance
 
-            validate_worker_allowance(spec, current=True)
+            validate_worker_allowance(spec, current=not terminal_settlement)
         if activity.in_activity() and (
             activity.info().workflow_id != store.active_workflow_id(spec["run_id"])
         ):

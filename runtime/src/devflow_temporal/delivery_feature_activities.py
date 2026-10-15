@@ -286,13 +286,20 @@ def resume_worker(store, parent, child, row):
         sealed = snapshot(store, child["run_id"])
         state = sealed["state"]
         plan = interrupted_resume(sealed)
-        if plan:
+        with store._connect() as db:
+            pending = pending_repair(sealed, db=db)
+        if pending and not sealed.get('session_custody', {}).get('missing_rollout'):
+            # Preparation never reached a provider; finish this exact paid cycle.
+            if not _paid_repair(shared, token, child['run_id'], state['iteration']):
+                raise OwnershipConflict('pending repair has no matching product allowance debit')
+            remaining = 0
+        elif plan:
             # Interrupted work needs no repair cycle, whatever the feature budget holds.
             remaining = plan["additional_iterations"]
         else:
             budget = shared.budget(token["issue_id"])
             remaining = remaining_worker_repairs(budget, child, state["iteration"])
-            pending = pending_repair(sealed) if remaining == 0 else None
+            pending = pending if remaining == 0 else None
             if remaining < 0 or (remaining == 0 and not pending):
                 raise OwnershipConflict(
                     f"feature product repair limit exhausted: {budget['used']} of "

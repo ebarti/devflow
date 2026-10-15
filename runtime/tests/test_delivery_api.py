@@ -16,6 +16,7 @@ from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 
 from devflow_temporal.delivery_activities import (
+    _run_role,
     delivery_browser_qa,
     delivery_checks,
     delivery_precheck,
@@ -117,7 +118,7 @@ async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('activity_fn', [delivery_precheck, delivery_checks])
+@pytest.mark.parametrize('activity_fn', [delivery_precheck, delivery_checks, _run_role])
 async def test_check_preparation_failure_keeps_diagnostics_without_claiming_a_launch(
     activity_fn, monkeypatch, tmp_path,
 ):
@@ -133,14 +134,24 @@ async def test_check_preparation_failure_keeps_diagnostics_without_claiming_a_la
             raise CheckPreparationFailure('planned-dependencies', ValueError('owned root rejected'))
 
         run_checks = run_prechecks
+        run_implementation_preparation = run_prechecks
 
         def candidate(self):
             return {'id': 'candidate'}
 
     monkeypatch.setattr('devflow_temporal.delivery_activities._context', lambda _: (
         SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()))
-    result = await activity_fn({'spec': {'provider': 'codex'}, 'iteration': 0,
+    monkeypatch.setattr('devflow_temporal.delivery_activities.get_supervisor', lambda _: None)
+    monkeypatch.setattr('devflow_temporal.delivery_activities._role_context',
+                        lambda request, *_: (request, tmp_path, None, None))
+    result = await activity_fn({'spec': {'provider': 'codex',
+                                        'policy': {'host_sandbox': 'trusted-local'}},
+                               'role': 'implement', 'iteration': 0,
                                'candidate': {'id': 'candidate'}})
+    if activity_fn is _run_role:
+        assert result['status'] == 'blocked' and result['session_id'] is None
+        assert result['findings'] == ['owned root rejected']
+        result = result['implementation_preparation']
     assert result['state'] == 'failed' and result['cleanup'] == 'confirmed'
     assert result['source_unchanged'] is True
     assert result['results'][0]['launched'] is False

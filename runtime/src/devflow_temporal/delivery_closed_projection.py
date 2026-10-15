@@ -38,7 +38,7 @@ def _same_row(row, projection):
                     for key, column in JSON_FIELDS.items()))
 
 
-def _cleanup_row(row, spec, description, scheduled, events):
+def _cleanup_row(row, spec, description, scheduled, events, *, status="COMPLETED"):
     """Prove contiguous cleanup writes over an exact history-bound projection.
 
     The latest maintenance key binds the closure and finalization receipt. Older
@@ -52,8 +52,10 @@ def _cleanup_row(row, spec, description, scheduled, events):
             or receipt.get("state") != row["cleanup"]
             or receipt.get("resource_cleanup") != row["cleanup"]):
         return None
+    if status not in {"COMPLETED", "FAILED"}:
+        raise ValueError('cleanup projection requires an authenticated completed or failed closure')
     closed = {"workflow_id": description.id, "execution_run_id": description.run_id,
-              "closed_at": description.close_time.isoformat(), "status": "COMPLETED"}
+              "closed_at": description.close_time.isoformat(), "status": status}
     key = digest({"closed_workflow": closed, "native_observations": receipt["processes"],
                   "resource_cleanup": receipt})
     maintenance = next((event for event in reversed(events)
