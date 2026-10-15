@@ -140,7 +140,15 @@ def gate_project(tmp_path):
 
 
 def test_api_chunk_proves_current_browser_and_final_keeps_pagination(gate_project):
+    from devflow_temporal.role_runner import _task
+
     spec, plan, source = gate_project
+    reason = (
+        "Verify rendered current-browser navigation, filters and bulk operations on api1; "
+        "the pagination spec is created by dependent web1."
+    )
+    plan["workstreams"][0]["chunks"][0]["gates"][0]["reason"] = reason
+    spec["accepted_plan"] = json.dumps(plan)
     original = deepcopy(spec)
     chunks = ordered_chunks(plan)
     api = worker_spec(
@@ -160,6 +168,21 @@ def test_api_chunk_proves_current_browser_and_final_keeps_pagination(gate_projec
     assert api["policy"]["allowed_paths"] == original["policy"]["allowed_paths"]
     assert api["expected_paths"] == ["README.md"]
     assert resolve_required_selectors(qa, source)[0]["selector"] == BULK
+    api["provider"] = "fake"
+    api["policy"]["roles"] = {
+        role: {"model": "fixture-model", "effort": "high"}
+        for role in ("implement", "review", "verify")
+    }
+    for role in ("implement", "review", "verify"):
+        task = _task({
+            "spec": api,
+            "role": role,
+            "candidate": {"id": "api-candidate", "head": spec["base_sha"]},
+            "workspace": str(source),
+            "iteration": 1,
+        })
+        assert json.dumps(api["feature_gate_selections"], sort_keys=True) in task.goal
+        assert reason in task.goal
     final = derive_chunk_gates(spec, plan, chunks[-1], final=True)
     assert final["policy"]["browser_qa"]["required_selectors"] == [BULK, PAGINATION]
     with pytest.raises(GateAdmissionError, match="fixed tracked candidate"):
