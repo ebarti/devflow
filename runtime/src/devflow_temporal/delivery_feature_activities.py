@@ -235,7 +235,13 @@ def resume_worker(store, parent, child, row):
     from .delivery_check_prelaunch import preparation_possible
     from .delivery_gate_attribution_recovery import possible
     from .delivery_gate_preflight_continuation import possible as preflight_continuation
-    from .delivery_stopped_resume import admit, interrupted_resume, pending_repair, snapshot
+    from .delivery_stopped_resume import (
+        admit,
+        interrupted_resume,
+        pending_repair,
+        remaining_worker_repairs,
+        snapshot,
+    )
 
     shared = registry(parent)
     token = parent["feature_delivery"]["owner"]
@@ -285,10 +291,7 @@ def resume_worker(store, parent, child, row):
             remaining = plan["additional_iterations"]
         else:
             budget = shared.budget(token["issue_id"])
-            remaining = budget["maximum"] - budget["used"]
-            if not budget.get("allowance", {}).get("sequence"):
-                remaining = min(remaining,
-                                child["policy"]["max_repairs"] - state["iteration"])
+            remaining = remaining_worker_repairs(budget, child, state["iteration"])
             pending = pending_repair(sealed) if remaining == 0 else None
             if remaining < 0 or (remaining == 0 and not pending):
                 raise OwnershipConflict(

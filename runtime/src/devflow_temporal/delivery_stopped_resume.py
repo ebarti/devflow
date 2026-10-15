@@ -85,15 +85,47 @@ def fixed_budget_allows(spec, iteration, iterations, *, pending=False):
                 or type(authority.get('start_iteration')) is not int
                 or type(authority.get('maximum_iteration')) is not int
                 or not 0 <= authority['start_iteration'] <= authority['maximum_iteration']
-                or authority['maximum_iteration'] - authority['start_iteration'] > 100):
+                or authority['maximum_iteration'] - authority['start_iteration']
+                    > 100 + int(bool(authority.get('credit')))):
             return False
         maximum = authority['maximum_iteration']
-    allowed = range(1, 101) if spec.get('feature_worker') else (1, 2)
+    allowed = range(1, 102) if spec.get('feature_worker') else (1, 2)
     return (type(iteration) is int and iteration >= 0
             and type(iterations) is int
             and (iterations in allowed or (iterations == 0 and pending))
             and type(maximum) is int and maximum >= 0
             and iteration + iterations <= maximum)
+
+
+def remaining_worker_repairs(budget, spec, iteration, *, credit=0):
+    """Only a renewed receipt replaces the original worker's absolute ceiling."""
+    remaining = budget['maximum'] - budget['used'] + credit
+    return (remaining if budget.get('allowance', {}).get('sequence') else
+            min(remaining, spec['policy']['max_repairs'] - iteration))
+
+
+def paid_alias_credit(spec, owner, iteration, revision_id):
+    """A sealed existing alias spends its bound debit, including across owners."""
+    from .delivery_feature_execution import registry
+
+    key = 'plan-revision:repair-alias:' + spec['run_id'] + ':' + str(iteration)
+    with registry(spec).connect() as db:
+        row = db.execute('SELECT content_digest,content_json FROM execution_checkpoints '
+                         'WHERE issue_id=? AND checkpoint_key=?',
+                         (owner['issue_id'], key)).fetchone()
+        if not row:
+            return None
+        alias = json.loads(row['content_json'])
+        debit = db.execute('SELECT 1 FROM execution_repairs WHERE issue_id=? AND repair_key=?',
+                           (owner['issue_id'], alias.get('repair_key'))).fetchone()
+    if (row['content_digest'] != digest(alias) or not debit
+            or alias.get('revision_id') != revision_id
+            or alias.get('reason') != 'Product repair at worker iteration ' + str(iteration)
+            or type(alias.get('generation')) is not int
+            or not 1 <= alias['generation'] <= owner['generation']):
+        raise ValueError('worker paid repair credit lost its exact alias debit')
+    return {'kind': 'alias', 'iteration': iteration, 'revision_id': revision_id,
+            'checkpoint_key': key, 'sha256': digest(alias)}
 
 
 def validate_worker_allowance(spec, *, current=False):
@@ -102,8 +134,10 @@ def validate_worker_allowance(spec, *, current=False):
 
     authority = spec['repair_allowance']
     if (not isinstance(authority, dict)
-            or set(authority) != {'run_id', 'owner', 'receipt', 'start_iteration',
-                                  'maximum_iteration'}
+            or set(authority) not in ({'run_id', 'owner', 'receipt', 'start_iteration',
+                                      'maximum_iteration'},
+                                     {'run_id', 'owner', 'receipt', 'start_iteration',
+                                      'maximum_iteration', 'credit'})
             or not fixed_budget_allows(spec, authority.get('start_iteration'), 0, pending=True)
             or not isinstance(authority['owner'], dict)
             or authority['owner'].get('issue_id') != spec['feature_delivery']['owner']['issue_id']
@@ -112,7 +146,22 @@ def validate_worker_allowance(spec, *, current=False):
         raise ValueError('worker changed its finite runtime repair allowance')
     receipt = registry(spec).repair_allowance(authority['owner'], authority['receipt'],
                                              current=current)
-    if authority['maximum_iteration'] - authority['start_iteration'] > receipt['maximum']:
+    credit = authority.get('credit')
+    if credit:
+        if (not isinstance(credit, dict)
+                or credit.get('iteration') != authority['start_iteration'] + 1
+                or not isinstance(credit.get('revision_id'), str)):
+            raise ValueError('worker changed its prepaid repair credit')
+        if credit.get('kind') == 'alias':
+            if paid_alias_credit(spec, authority['owner'], credit['iteration'],
+                                 credit['revision_id']) != credit:
+                raise ValueError('worker changed its prepaid alias credit')
+        elif (credit.get('kind') != 'gates'
+              or set(credit) != {'kind', 'iteration', 'revision_id', 'evidence_sha256'}
+              or not re.fullmatch(r'[0-9a-f]{64}', str(credit.get('evidence_sha256', '')))):
+            raise ValueError('worker changed its sealed gate credit')
+    if (authority['maximum_iteration'] - authority['start_iteration']
+            > receipt['maximum'] + int(bool(credit))):
         raise ValueError('worker exceeded its installed runtime repair allowance')
     if current:
         from .delivery_feature_review_context import current_runtime_identity
@@ -123,7 +172,7 @@ def validate_worker_allowance(spec, *, current=False):
     return authority
 
 
-def worker_allowance(spec, iteration, iterations):
+def worker_allowance(spec, iteration, iterations, *, credit=None):
     """Derive extension authority from the current owner, never command fields."""
     if not spec.get('feature_worker'):
         return None
@@ -143,10 +192,11 @@ def worker_allowance(spec, iteration, iterations):
         raise ValueError('worker repair allowance belongs to a different owner store')
     owner = shared.token(current)
     shared.repair_allowance(owner, reference, current=True)
-    if iterations > budget['maximum'] - budget['used']:
+    if iterations > budget['maximum'] - budget['used'] + int(bool(credit)):
         raise ValueError('feature product repair limit exhausted')
     return {'run_id': spec['run_id'], 'owner': owner, 'receipt': reference,
-            'start_iteration': iteration, 'maximum_iteration': iteration + iterations}
+            'start_iteration': iteration, 'maximum_iteration': iteration + iterations,
+            **({'credit': credit} if credit else {})}
 
 
 def _recorded_findings(state):
@@ -299,6 +349,12 @@ def custody(db, recovery, *, retained_memo=None):
         if (authority['start_iteration'] != recovery['state']['iteration']
                 or authority['maximum_iteration'] != recovery['maximum_iteration']):
             raise ValueError('stopped resume changed its sealed runtime allowance')
+        credit = authority.get('credit')
+        if credit and (credit['revision_id'] != (details.get('feature_plan_revision') or {}).get(
+                'revision_id') or (credit['kind'] == 'gates' and (
+                    details.get('resume_stage') != 'checks'
+                    or credit['evidence_sha256'] != digest(details.get('gate_evidence'))))):
+            raise ValueError('stopped resume changed its prepaid revision authority')
     if (spec.get('retry_budget_version') == 1
             and not fixed_budget_allows(spec, recovery['state']['iteration'],
                                         recovery['command']['additional_iterations'],
@@ -531,7 +587,7 @@ def _unpublished_remote(broker):
 
 def admit(store, run_id, command, *, preflight=False, _revision=None):
     original = store.submitted_spec(run_id)
-    allowed = range(0, 101) if original.get('feature_worker') else (0, 1, 2)
+    allowed = range(0, 102) if original.get('feature_worker') else (0, 1, 2)
     if (not isinstance(command, dict) or set(command) not in (FIELDS, FIELDS | SCOPE_FIELDS)
             or command.get('continuation_kind') != KIND
             or not isinstance(command.get('command_id'), str)
@@ -574,8 +630,20 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         raise ValueError('zero additional iterations require an authenticated pending repair '
                          'or an interrupted iteration')
     maximum = seal['state']['iteration'] + command['additional_iterations']
+    credit = None
+    if _revision is not None:
+        from .delivery_feature_execution import registry
+
+        shared = registry(seal['predecessor_spec'])
+        owner = shared.token(shared.current(seal['predecessor_spec']['feature_delivery'][
+            'owner']['issue_id']))
+        iteration = seal['state']['iteration'] + 1
+        credit = ({'kind': 'gates', 'iteration': iteration,
+                   'revision_id': _revision['revision_id'], 'evidence_sha256': digest(gate_only)}
+                  if gate_only else paid_alias_credit(seal['predecessor_spec'], owner, iteration,
+                                                       _revision['revision_id']))
     authority = worker_allowance(seal['predecessor_spec'], seal['state']['iteration'],
-                                 command['additional_iterations'])
+                                 command['additional_iterations'], credit=credit)
     budget_spec = {**original, **({'repair_allowance': authority} if authority else {})}
     if (original.get('retry_budget_version') == 1
             and not fixed_budget_allows(budget_spec, seal['state']['iteration'],
@@ -620,7 +688,7 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         execution.pop('repair_allowance', None)
         if authority:
             if worker_allowance(spec, seal['state']['iteration'],
-                                command['additional_iterations']) != authority:
+                                command['additional_iterations'], credit=credit) != authority:
                 raise ValueError('runtime repair allowance changed during preparation')
             execution['repair_allowance'] = authority
         execution['role_home_generation'] = spec.get('role_home_generation', '')

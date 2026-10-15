@@ -872,6 +872,30 @@ class ExecutionRegistry:
                              value)
             return self._budget(db, token["issue_id"])
 
+    def require_unspent_budget(self, issue_id: str, recorded: dict) -> dict:
+        """A reserved preparation may outlive a receipt, but never an extra charge."""
+        with self.connect() as db:
+            current = self._budget(db, issue_id)
+            lifetime = current.get("lifetime_used", current["used"])
+            expected = {"used": lifetime, "maximum": current["maximum"],
+                        "learning_required": current["learning_required"]}
+            reference = recorded.get("allowance")
+            if reference:
+                allowances = self._repair_allowances(db, issue_id)
+                matches = [value for key, value in allowances
+                           if {"checkpoint_key": key, "sha256": digest(value),
+                               "sequence": value["sequence"], **value["runtime"]} == reference]
+                if not matches:
+                    raise OwnershipConflict("preparation budget lost its recorded allowance")
+                allowance = matches[0]
+                expected.update(used=lifetime - allowance["lifetime_start"],
+                                maximum=allowance["maximum"], lifetime_used=lifetime,
+                                allowance=reference)
+            if recorded != expected:
+                raise OwnershipConflict(
+                    "preparation continuation changed its unspent planning budget")
+            return current
+
     def repair_allowance(self, token: dict, reference: dict, *, current=False) -> dict:
         """Authenticate a sealed worker allowance; history may outlive its owner."""
         with self.connect() as db:

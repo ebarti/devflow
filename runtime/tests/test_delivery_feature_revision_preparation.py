@@ -10,6 +10,9 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from test_delivery_execution_registry import installed_runtime as installed_runtime
+from test_delivery_execution_registry import registry as registry
+from test_delivery_execution_registry import snapshot as snapshot
 from test_delivery_feature_review_context import git
 from test_delivery_feature_revision_subject import feature as feature
 from test_delivery_feature_revision_subject import (
@@ -441,3 +444,44 @@ def test_three_preparation_links_are_bounded_and_each_ancestor_remains_authentic
     assert "feature_plan_revision_request" not in plain
     assert revisions.revision_request(plain) is None
     assert shared.budget(issue_id)["used"] == 6
+
+
+
+def test_preparation_proof_survives_receipt_and_renewal_but_never_a_new_charge(
+    registry, snapshot, installed_runtime, monkeypatch,
+):
+    shared = registry
+    owner = shared.claim(snapshot, 'preparation-owner', '/synthetic/tracking.sqlite3')
+    for number in range(5):
+        shared.repair(owner, 'old-' + str(number), 'literal historical charge')
+    shared.stop(owner, 'closed-preparation', {})
+    original = {'feature_delivery': {'owner': owner, 'registry': str(shared.path)}}
+    original_budget = shared.budget(owner['issue_id'])
+    context = {**installed_runtime.baseline, 'context_sha256': 'b' * 64, 'guards': {}}
+    receipt = {'current_runtime': deepcopy(context), 'original_repair_budget': original_budget}
+    public = {'reconsideration': deepcopy(receipt), 'request': {'reconsideration': {}},
+              'record': {}, 'predecessor_closure': {}, 'unresolved_prior_findings': []}
+    before = deepcopy(public)
+    monkeypatch.setattr(revisions, '_current_runtime_selectors',
+                        lambda selectors: (context, selectors))
+    monkeypatch.setattr(review_context, 'compatible_external_guards', lambda *_: True)
+    monkeypatch.setattr(revisions, '_reconsideration_proof', lambda *_: (
+        {**deepcopy(receipt), 'current_runtime': deepcopy(context),
+         'original_repair_budget': shared.budget(owner['issue_id'])}, []))
+    def refresh():
+        return revisions._refresh_preparation_reconsideration(None, original, public, {})[0]
+
+    assert refresh() == receipt
+    shared.renew_repair_allowance(owner, installed_runtime.baseline)
+    assert refresh() == receipt
+    context.update(installed_runtime.advance(2))
+    shared.renew_repair_allowance(owner, installed_runtime.baseline)
+    assert refresh()['original_repair_budget'] == original_budget
+    assert shared.require_unspent_budget(owner['issue_id'], original_budget)['used'] == 0
+    assert public == before
+    current = shared.claim(snapshot, 'preparation-successor', owner['store_path'],
+                           predecessor=owner)
+    shared.repair(current, 'new-unrelated-charge', 'a real charge invalidates the reservation')
+    with pytest.raises(OwnershipConflict, match='unspent planning budget'):
+        refresh()
+    assert public == before
