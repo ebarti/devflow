@@ -101,13 +101,15 @@ def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
 
                 if custody(db, recovery) != spec:
                     raise ValueError('native stopped resume policy changed')
-                if spec.get('repair_allowance'):
-                    from .delivery_stopped_resume import validate_worker_allowance
-
-                    validate_worker_allowance(spec, current=True)
                 maximum = recovery['maximum_iteration']
             else:
                 maximum = max([maximum, *(grant[0] for grant in grants)])
+    if role != "intake" and spec.get("repair_allowance"):
+        from .delivery_stopped_resume import validate_worker_allowance
+
+        # Gate-only continuations inherit the same receipt. Historical grant rows
+        # cannot enlarge its sealed ceiling, whatever continuation kind is active.
+        maximum = validate_worker_allowance(spec, current=True)["maximum_iteration"]
     if (
         role not in spec["policy"]["roles"]
         or type(iteration) is not int

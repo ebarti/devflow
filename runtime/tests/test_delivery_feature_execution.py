@@ -8,6 +8,7 @@ import sqlite3
 from copy import deepcopy
 
 import pytest
+from test_delivery_execution_registry import installed_runtime as installed_runtime
 from test_delivery_github_contract import plan
 from test_delivery_store import service as legacy_service
 
@@ -423,3 +424,62 @@ async def test_cancel_during_build_does_not_start_integration_or_merge(monkeypat
     assert result["outcome"] == "cancelled"
     assert "chunk" not in kinds
     assert not any(name == "delivery_feature_merge" for name, _ in controller.events)
+
+
+def test_supported_continuation_renews_only_a_new_payload_after_safe_handoff(
+    service, monkeypatch, installed_runtime,
+):
+    from devflow_temporal.delivery_feature_execution import continue_feature
+
+    runtime = installed_runtime
+    store, request, _ = feature_service(service, monkeypatch)
+    store.submit(request)
+    initial = store.effective_spec(request["run_id"])
+    shared = registry(initial)
+    for number in range(10):
+        shared.repair(initial["feature_delivery"]["owner"], f"repair-{number}", "product repair")
+    with store._connect() as db:
+        db.execute("UPDATE delivery_dashboard_state SET identity_json=? WHERE run_id=?",
+                   (json.dumps({**runtime.baseline, "dirty": False, "local_digest": None}),
+                    initial["run_id"]))
+    # The service and worker fixtures remain fake; only the coordinator's native
+    # continuation selector is exercised here, without launching a native process.
+    submitted = store.submitted_spec
+
+    def native_coordinator(run_id):
+        spec = submitted(run_id)
+        return {**spec, "provider": "codex"} if not spec.get("feature_worker") else spec
+
+    monkeypatch.setattr(store, "submitted_spec", native_coordinator)
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda *_: {"result": {}})
+
+    def close(spec, key):
+        shared.stop(spec["feature_delivery"]["owner"], key, {})
+        with store._connect() as db:
+            db.execute("UPDATE delivery_runs SET phase='cancelled',outcome='cancelled',"
+                       "execution_state='terminal' WHERE run_id=?", (spec["run_id"],))
+            store.state.release_work(db, spec["work_id"], "external:devflow:" + spec["run_id"])
+
+    close(initial, "same-runtime-stop")
+    first = continue_feature(store, initial["run_id"],
+                             {"command_id": "same-runtime", "expected_revision": 1})
+    assert (shared.budget("I_feature")["used"],
+            shared.budget("I_feature")["allowance"]["sequence"]) == (10, 0)
+    parent = store.effective_spec(first["run_id"])
+    runtime.advance(2)
+    command = {"command_id": "new-install", "expected_revision": 1}
+    with pytest.raises(OwnershipConflict, match="stopped checkpoint"):
+        continue_feature(store, parent["run_id"], command)
+    assert shared.budget("I_feature")["used"] == 10
+    close(parent, "new-runtime-stop")
+    second = continue_feature(store, parent["run_id"], command)
+    budget = shared.budget("I_feature")
+    assert (budget["used"], budget["lifetime_used"], budget["allowance"]["sequence"]) == (0, 10, 1)
+    # An exact replay returns before identity/authentication, even if the service
+    # was subsequently restarted with a dirty source tree.
+    (runtime.root / "README.md").write_text("Uncommitted fixture change\n")
+    assert continue_feature(store, parent["run_id"], command) == second
+    assert shared.budget("I_feature") == budget
+    with pytest.raises(OwnershipConflict, match="safe handoff"):
+        continue_feature(store, parent["run_id"], {**command, "command_id": "alternate-command"})
+    assert shared.budget("I_feature") == budget

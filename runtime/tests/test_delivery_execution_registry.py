@@ -184,3 +184,101 @@ def test_registry_rejects_symlink_and_public_directory(tmp_path):
 def test_registry_rejects_relative_paths():
     with pytest.raises(ValueError, match="absolute"):
         ExecutionRegistry(Path("relative.sqlite3"))
+
+
+@pytest.fixture
+def installed_runtime(tmp_path, monkeypatch):
+    """Small clean Git payloads exercise installed identity without any live runtime."""
+    from types import SimpleNamespace
+
+    from test_delivery_feature_review_context import git
+
+    from devflow_temporal import delivery_feature_review_context as context
+
+    root = tmp_path / "installed-runtime"
+    package = root / context.PREFIX
+    package.mkdir(parents=True)
+    source = package / "fixture.py"
+    source.write_text("VERSION = 0\n")
+    git(root, "init", "-q")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "Earlier installed payload")
+    old = git(root, "rev-parse", "HEAD")
+    monkeypatch.setattr(context, "_protected_root", lambda: root)
+
+    def advance(number):
+        source.write_text(f"VERSION = {number}\n")
+        git(root, "add", ".")
+        git(root, "commit", "-qm", f"Installed payload {number}")
+        return context.current_runtime_identity()
+
+    return SimpleNamespace(root=root, old=old, baseline=advance(1), advance=advance,
+                           checkout=lambda revision: git(root, "checkout", "--detach", revision),
+                           identity=context.current_runtime_identity, git=git)
+
+
+def test_installed_allowances_keep_literal_history_and_reject_replay_and_rollback(
+    registry, snapshot, installed_runtime, monkeypatch,
+):
+    runtime = installed_runtime
+    token = owner(registry, snapshot)
+    for number in range(10):
+        registry.repair(token, f"old-{number}", "original product charge")
+    with registry.connect() as db:
+        original_charges = [tuple(row) for row in db.execute("SELECT * FROM execution_repairs")]
+    registry.stop(token, "first-stop", {})
+    monkeypatch.setenv("GIT_DIR", "/caller-controlled/git")
+    assert runtime.identity() == runtime.baseline
+    injected = runtime.root / "runtime/src/devflow_temporal/injected.py"
+    injected.write_text("# Uncommitted source cannot mint an allowance\n")
+    with pytest.raises(ValueError, match="clean protected current runtime"):
+        registry.renew_repair_allowance(token, runtime.baseline)
+    assert "allowance" not in registry.budget("I_feature")
+    injected.unlink()
+    same = registry.renew_repair_allowance(token, runtime.baseline)
+    assert (same["used"], same["lifetime_used"], same["allowance"]["sequence"]) == (10, 10, 0)
+    assert registry.renew_repair_allowance(token, runtime.baseline) == same
+
+    installed = runtime.advance(2)
+    renewed = registry.renew_repair_allowance(token, runtime.baseline)
+    assert (renewed["used"], renewed["maximum"], renewed["lifetime_used"]) == (0, 10, 10)
+    assert renewed["allowance"]["runtime_payload_sha256"] == installed["runtime_payload_sha256"]
+    successor = owner(registry, snapshot, "successor", predecessor=token)
+    assert registry.repair(successor, "old-0", "original product charge") == renewed
+    for number in range(9):
+        registry.repair(successor, f"new-{number}", "current worker repair")
+    barrier = Barrier(2)
+
+    def last_cycle(key):
+        barrier.wait()
+        try:
+            return registry.repair(successor, key, "shared worker or plan repair")
+        except OwnershipConflict:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(last_cycle, ["worker:10", "plan-revision:10"]))
+    assert sum(value is not None for value in results) == 1
+    exhausted = registry.budget("I_feature")
+    assert (exhausted["used"], exhausted["lifetime_used"]) == (10, 20)
+    with registry.connect() as db:
+        assert [tuple(row) for row in db.execute(
+            "SELECT * FROM execution_repairs ORDER BY rowid LIMIT 10")] == original_charges
+    with pytest.raises(OwnershipConflict, match="ownership changed"):
+        registry.repair(token, "stale-charge", "stale owner")
+    registry.stop(successor, "second-stop", {})
+    runtime.checkout(runtime.baseline["revision"])
+    assert registry.renew_repair_allowance(successor, {}) == exhausted
+    runtime.checkout(runtime.old)  # An older payload unseen by the new receipt mechanism.
+    with pytest.raises(ValueError, match="Git object data"):
+        registry.renew_repair_allowance(successor, {})
+    assert registry.budget("I_feature") == exhausted
+    runtime.checkout(installed["revision"])
+    (runtime.root / "README.md").write_text("Same payload, another revision\n")
+    runtime.git(runtime.root, "add", ".")
+    runtime.git(runtime.root, "commit", "-qm", "Reinstall identical Python payload")
+    assert registry.renew_repair_allowance(successor, {}) == exhausted
+    third = runtime.advance(3)
+    fresh = registry.renew_repair_allowance(successor, {})
+    assert (fresh["used"], fresh["lifetime_used"], fresh["allowance"]["sequence"]) == (0, 20, 2)
+    assert fresh["allowance"]["runtime_payload_sha256"] == third["runtime_payload_sha256"]
