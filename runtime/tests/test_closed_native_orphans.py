@@ -796,7 +796,8 @@ def test_same_confirmed_cleanup_observation_repairs_an_intervening_unknown_proje
     spec = store.effective_spec(submission['run_id'])
     run_id = spec['run_id']
     decision = {'retained': 'decision'}
-    other_checks = {'failure': {'classification': 'terminal', 'reason': 'original verdict'}}
+    other_checks = {'failure': {'classification': 'terminal', 'reason': 'original verdict',
+                                'retryable': False}}
     store.project(run_id, phase='blocked', execution_state='blocked', outcome='blocked',
         cleanup='unknown', error='original verdict', candidate={'id': 'retained-candidate'},
         pull_request={'number': 7}, tracker={'state': 'conflicted'}, usage={'tokens': 17},
@@ -834,6 +835,8 @@ def test_same_confirmed_cleanup_observation_repairs_an_intervening_unknown_proje
     assert project(confirmed) == before  # An old unguarded delivery remains idempotent.
     for changed in ({'phase': 'different'}, {'candidate': {'id': 'different'}},
                     {'checks': {'changed_product_finding': True}},
+                    {'checks': {**other_checks, 'resource_cleanup': confirmed,
+                                'failure': {**other_checks['failure'], 'retryable': 0}}},
                     {'tracker': {'state': 'different'}}):
         assert project(confirmed, expected_row=before, **changed) == before
     assert project(confirmed, expected_row=before, event_type='blocked',

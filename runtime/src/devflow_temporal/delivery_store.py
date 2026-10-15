@@ -3360,8 +3360,10 @@ class DeliveryStore:
                     and row["cleanup"] == "unknown" and values["cleanup"] == "confirmed"
                     and receipt.get("state") == receipt.get("resource_cleanup") == "confirmed"
                     and receipt.get("process_cleanup") == "observed-native-confirmed"
-                    and {k: v for k, v in (checks or {}).items() if k != "resource_cleanup"}
-                    == {k: v for k, v in before_checks.items() if k != "resource_cleanup"}
+                    and canonical_json({k: v for k, v in (checks or {}).items()
+                                        if k != "resource_cleanup"})
+                    == canonical_json({k: v for k, v in before_checks.items()
+                                       if k != "resource_cleanup"})
                     and all(values[field] == row[field] for field in values
                             if field not in {"cleanup", "checks_json", "revision", "updated_at"})
                 )
