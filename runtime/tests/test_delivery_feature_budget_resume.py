@@ -319,22 +319,29 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
     completed = {**implementation(8), 'candidate': output,
                  'input_candidate_id': candidate['id']}
     finished['candidate'] = {**output, 'id': 'e' * 64, 'head': 'c' * 40}
+    reviewed = {**gate('review', 8, 'findings'),
+                'input_candidate_id': finished['candidate']['id']}
     finished['state'] = {**finished['state'], 'candidate': finished['candidate'],
-                         'roles': [role, completed, gate('review', 8, 'findings')]}
+                         'roles': [role, completed, reviewed]}
     finished['session_custody'] = {**finished['session_custody'],
                                   'session_state_digest': 'advanced'}
-    job = DeliverySupervisor._job_key({'spec': child, 'role': 'implement', 'iteration': 8,
-                                       'candidate': candidate})
-    finished['attempts'] = [*copy.deepcopy(finished['attempts']), {
-        'job_key': job, 'role': 'implement', 'iteration': 8, 'candidate_id': candidate['id'],
-        'state': 'finished', 'cleanup': 'confirmed', 'session_id': completed['session_id'],
-        'result_json': json.dumps({key: value for key, value in completed.items()
-                                   if key not in RECEIPT_ONLY})}]
+    finished['attempts'] = copy.deepcopy(finished['attempts'])
+    for progressed in (completed, reviewed):
+        input_id = progressed['input_candidate_id']
+        job = DeliverySupervisor._job_key({'spec': child, 'role': progressed['role'],
+                                           'iteration': 8, 'candidate': {'id': input_id}})
+        finished['attempts'].append({
+            'job_key': job, 'role': progressed['role'], 'iteration': 8, 'candidate_id': input_id,
+            'state': 'finished', 'cleanup': 'confirmed', 'session_id': progressed['session_id'],
+            'result_json': json.dumps({key: value for key, value in progressed.items()
+                                       if key not in RECEIPT_ONLY})})
     with store._connect() as db:
         assert resume_mod.pending_repair(finished, db=db) is None
-    for change in ('receipt', 'prior_receipt', 'session', 'home', 'source'):
+    for change in ('receipt', 'review_receipt', 'prior_receipt', 'session', 'home', 'source'):
         altered = copy.deepcopy(finished)
         if change == 'receipt':
+            altered['attempts'][-2]['result_json'] = '{}'
+        elif change == 'review_receipt':
             altered['attempts'][-1]['result_json'] = '{}'
         elif change == 'prior_receipt':
             altered['attempts'][0]['cleanup'] = 'unknown'
