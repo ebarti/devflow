@@ -395,13 +395,62 @@ def effective_spec(store, recovery):
     return spec
 
 
-def _candidate(broker, state, attempts, *, missing_rollout=None):
+def _historical_candidate(broker, state, candidate, latest, recovery):
+    """Authenticate native policy rebindings without rewriting the stopped role."""
+    from . import delivery_gate_retry as gates
+    from .delivery_feature_revision_recovery import retained_recovery
+
+    kinds = {gates.KIND, gates.PREPUBLICATION_KIND, gates.PRELAUNCH_KIND,
+             gates.CI_KIND, gates.CONTROLLER_KIND}
+    if (candidate != state.get('candidate') or not recovery
+            or recovery.get('kind') not in kinds):
+        return False
+    spec = gates.effective_spec(broker.store, recovery['original_spec'], recovery)
+    if spec != broker.spec:
+        raise ValueError('stopped candidate lost its gate execution authority')
+    measured = {'native_identity', 'environment_proof_sha256', 'security_binding_sha256'}
+    while recovery and recovery.get('kind') in kinds:
+        seal, previous = recovery['seal'], recovery.get('original_recovery')
+        before, stopped = seal['original_spec'], recovery['state']
+        historical = seal['candidate']
+        implementation = next((role for role in reversed(stopped.get('roles', []))
+                               if role.get('role') == 'implement'), None)
+        previous_digest = digest(previous) if previous else None
+        root = Path(spec['state_dir']) / gates.gate_namespace(
+            spec.get('gate_retry_generation', 1), spec.get('gate_retry_stage'),
+            preflight_generation=spec.get('gate_retry_preflight_generation', 0),
+            prepared_handoff=spec.get('gate_retry_prepared_handoff', 0))
+        if (read_private(root / 'admission.json') != recovery
+                or recovery['execution_spec'] != spec
+                or recovery['command']['additional_iterations'] != 0
+                or recovery['candidate'] != candidate
+                or stopped != seal['closed']['result']
+                or stopped.get('candidate') != historical or implementation != latest
+                or seal['previous_digest'] != previous_digest
+                or seal['closed']['recovery_digest'] != previous_digest
+                or any(before[key] != spec[key]
+                       for key in ('run_id', 'work_id', 'state_dir', 'checkout', 'provider'))
+                or digest(before['policy']) != before['policy_digest']
+                or digest(spec['policy']) != spec['policy_digest']
+                or historical['policy_digest'] != before['policy_digest']
+                or candidate != {**historical, 'policy_digest': spec['policy_digest']}
+                or {k: v for k, v in before['policy'].items() if k not in measured}
+                != {k: v for k, v in spec['policy'].items() if k not in measured}):
+            raise ValueError('stopped implementation lost its sealed policy history')
+        if historical == latest.get('candidate'):
+            return True
+        spec, candidate, recovery = before, historical, retained_recovery(previous)
+    return False
+
+
+def _candidate(broker, state, attempts, *, missing_rollout=None, recovery=None):
     candidate = broker.candidate()
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
     if latest and latest.get('status') != 'pass':
-        if (latest.get('candidate') != candidate or latest.get('cleanup') != 'confirmed'
-                ):
+        if (latest.get('cleanup') != 'confirmed'
+                or (latest.get('candidate') != candidate
+                    and not _historical_candidate(broker, state, candidate, latest, recovery))):
             raise ValueError('blocked implementation source or session is unconfirmed')
         matches = [a for a in attempts if a['role'] == 'implement'
                    and a['iteration'] == latest['iteration']
@@ -533,7 +582,8 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
 
     session_custody = implementation_custody(spec, state, attempts, retained_recovery(previous))
     candidate, session = _candidate(
-        broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'))
+        broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'),
+        recovery=previous)
     publication = state.get('pull_request')
     if publication:
         published_identity(broker, candidate, publication)
