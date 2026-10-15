@@ -30,7 +30,10 @@ from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
-@pytest.mark.parametrize('observation,refused', [('live-pid', True), ('stopped', False)])
+@pytest.mark.parametrize('observation,refused', [
+    ('live-pid', True), ('stopped', False), ('reconciled-gate', False),
+    ('reconciled-provider', True), ('tampered-reconciliation', True),
+])
 def test_retained_stopped_cleanup_observes_without_state_effects(
     intake_fixture, monkeypatch, observation, refused,
 ):
@@ -46,6 +49,19 @@ def test_retained_stopped_cleanup_observes_without_state_effects(
         'monitoring_complete': observation != 'unmonitored',
         'owned': {str(pid): {'identity': recorded_identity}}, 'ports': [port],
     }
+    if observation in {'reconciled-gate', 'reconciled-provider', 'tampered-reconciliation'}:
+        journal.update(monitoring_complete=False,
+                       intent={'run_id': spec['run_id'], 'ports': [port]},
+                       result={'interrupted_monitor': True, 'provider_outcome': 'unknown',
+                               'cleanup': 'observed-native-confirmed'})
+        journal['cleanup_reconciliation'] = {
+            'kind': 'interrupted_monitor', 'intent_sha256': digest(journal['intent']),
+            'owned_sha256': digest(journal['owned'])}
+        if observation != 'reconciled-provider':
+            journal_path = (Path(spec['state_dir']) / 'dependency-preparation'
+                            / 'native-5' / 'process' / 'native-process.json')
+        if observation == 'tampered-reconciliation':
+            journal['cleanup_reconciliation']['owned_sha256'] = '0' * 64
     write_private(journal_path, journal)
     with resources.locked() as manifest:
         manifest['processes'].append(str(journal_path))
