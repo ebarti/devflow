@@ -339,6 +339,7 @@ def _reconcile(store, original, spec, closed):
     store.project(spec['run_id'], phase=current['phase'],
         execution_state=current['execution_state'], outcome=current['outcome'],
         error=current['error'], checks=checks, cleanup=receipt['resource_cleanup'],
+        decision=json.loads(current['decision_json'] or 'null'), expected_row=current,
         event_type='resource_cleanup_reconciled',
         message='Owner maintenance observed native cleanup after workflow closure',
         key=digest({'closed_workflow': closed, 'native_observations': observations,

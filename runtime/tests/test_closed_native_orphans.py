@@ -779,3 +779,104 @@ def test_prior_unknown_attempt_survives_second_unresolved_pass(
             )
         ]
     assert any(p.get("original_attempts") == [unknown] for p in payloads)
+
+
+def test_same_confirmed_cleanup_observation_repairs_an_intervening_unknown_projection(
+    api_fixture, monkeypatch,
+):
+    from contextlib import contextmanager
+    from copy import deepcopy
+
+    from devflow_temporal import delivery_orphans
+    from devflow_temporal.contracts import digest
+
+    path, submission = api_fixture
+    store = DeliveryStore(DeliveryConfig.load(path))
+    store.submit(submission)
+    spec = store.effective_spec(submission['run_id'])
+    run_id = spec['run_id']
+    decision = {'retained': 'decision'}
+    other_checks = {'failure': {'classification': 'terminal', 'reason': 'original verdict',
+                                'retryable': False}}
+    store.project(run_id, phase='blocked', execution_state='blocked', outcome='blocked',
+        cleanup='unknown', error='original verdict', candidate={'id': 'retained-candidate'},
+        pull_request={'number': 7}, tracker={'state': 'conflicted'}, usage={'tokens': 17},
+        decision=decision, intake={'accepted': True}, checks=other_checks,
+        event_type='blocked', message='Original terminal result', key='original-terminal')
+    confirmed = {'state': 'confirmed', 'resource_cleanup': 'confirmed',
+                 'process_cleanup': 'observed-native-confirmed', 'processes': []}
+    unknown = {**confirmed, 'state': 'unknown', 'resource_cleanup': 'unknown',
+               'reason': 'retained checkout observation interrupted by SIGTERM'}
+    closed = {'workflow_id': 'delivery-' + run_id, 'execution_run_id': 'closed-original',
+              'closed_at': '2026-10-01T00:00:00+00:00', 'status': 'COMPLETED'}
+
+    def key(receipt):
+        return digest({'closed_workflow': closed, 'native_observations': [],
+                       'resource_cleanup': receipt})
+
+    def row():
+        with store._connect() as db:
+            return dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                                   (run_id,)).fetchone())
+
+    def project(receipt, **changes):
+        request = {'phase': 'blocked', 'execution_state': 'blocked', 'outcome': 'blocked',
+                   'error': 'original verdict', 'decision': decision,
+                   'cleanup': receipt['resource_cleanup'],
+                   'checks': {**other_checks, 'resource_cleanup': receipt},
+                   'event_type': 'resource_cleanup_reconciled',
+                   'message': 'Closed native resource observation', 'key': key(receipt)}
+        return store.project(run_id, **{**request, **changes})
+
+    project(confirmed)
+    project(unknown)
+    before, events = row(), store.events(run_id)
+    assert before['cleanup'] == 'unknown'
+    assert project(confirmed) == before  # An old unguarded delivery remains idempotent.
+    for changed in ({'phase': 'different'}, {'candidate': {'id': 'different'}},
+                    {'checks': {'changed_product_finding': True}},
+                    {'checks': {**other_checks, 'resource_cleanup': confirmed,
+                                'failure': {**other_checks['failure'], 'retryable': 0}}},
+                    {'tracker': {'state': 'different'}}):
+        assert project(confirmed, expected_row=before, **changed) == before
+    assert project(confirmed, expected_row=before, event_type='blocked',
+                   key='original-terminal') == before
+    assert store.events(run_id) == events
+    finalized = []
+
+    class FinalizedResources:
+        # The finalizer/actor transport is opaque here; all row/ledger reads,
+        # _reconcile, canonical key construction, CAS and project writes are real.
+        def __init__(self, _spec, *, read_only):
+            self.manifest = path
+
+        @contextmanager
+        def locked(self):
+            yield {'processes': [], 'roots': {}, 'finalization': confirmed}
+
+        def finalize(self, outcome, *, uncertain):
+            assert outcome == 'blocked' and not uncertain
+            finalized.append(True)
+            return deepcopy(confirmed)
+
+    monkeypatch.setattr(delivery_orphans, 'RunResources', FinalizedResources)
+    monkeypatch.setattr(delivery_orphans, '_observe_registered_processes', lambda *_: [])
+    delivery_orphans._reconcile(store, before, spec, closed)
+    repaired = row()
+    assert repaired['cleanup'] == 'confirmed'
+    assert repaired['revision'] == before['revision'] + 1
+    assert json.loads(repaired['checks_json']) == {**other_checks, 'resource_cleanup': confirmed}
+    assert {key: value for key, value in repaired.items()
+            if key not in {'cleanup', 'checks_json', 'revision', 'updated_at'}} == {
+                key: value for key, value in before.items()
+                if key not in {'cleanup', 'checks_json', 'revision', 'updated_at'}}
+    repaired_events = store.events(run_id)
+    assert len(repaired_events) == len(events) + 1
+    assert repaired_events[-1]['payload']['key'] == key(confirmed)
+    assert sum(e['payload'].get('key') == key(confirmed) for e in repaired_events) == 2
+    with pytest.raises(ValueError, match='projection row changed'):
+        project(confirmed, expected_row=before)
+    assert project(confirmed, expected_row=repaired) == repaired
+    delivery_orphans._reconcile(store, repaired, spec, closed)
+    assert finalized == [True]
+    assert row() == repaired and store.events(run_id) == repaired_events

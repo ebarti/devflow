@@ -3305,14 +3305,13 @@ class DeliveryStore:
                 # A late cancel-request projection cannot overwrite the final
                 # workflow result after its update was accepted.
                 return dict(row)
-            if key is not None and any(
+            duplicate = key is not None and any(
                 json.loads(item[0]).get("key") == key
                 for item in db.execute(
                     "SELECT payload_json FROM delivery_events WHERE run_id=? AND type=?",
                     (run_id, event_type),
                 )
-            ):
-                return dict(row)
+            )
             revision = row["revision"] + 1
             current_candidate = json.loads(row["candidate_json"]) if row["candidate_json"] else None
             candidate_revision = row["candidate_revision"]
@@ -3350,6 +3349,26 @@ class DeliveryStore:
                 else row["error"],
                 "updated_at": _now(),
             }
+            if duplicate:
+                # The same authentic cleanup can recur after an interrupted
+                # observation projected unknown. Only a current-row CAS may
+                # acknowledge that cleanup again, preserving every other field.
+                before_checks = json.loads(row["checks_json"] or "{}")
+                receipt = (checks or {}).get("resource_cleanup") or {}
+                cleanup_acknowledgement = (
+                    event_type == "resource_cleanup_reconciled" and expected_row is not None
+                    and row["cleanup"] == "unknown" and values["cleanup"] == "confirmed"
+                    and receipt.get("state") == receipt.get("resource_cleanup") == "confirmed"
+                    and receipt.get("process_cleanup") == "observed-native-confirmed"
+                    and canonical_json({k: v for k, v in (checks or {}).items()
+                                        if k != "resource_cleanup"})
+                    == canonical_json({k: v for k, v in before_checks.items()
+                                       if k != "resource_cleanup"})
+                    and all(values[field] == row[field] for field in values
+                            if field not in {"cleanup", "checks_json", "revision", "updated_at"})
+                )
+                if not cleanup_acknowledgement:
+                    return dict(row)
             assignments = ",".join(f"{field}=?" for field in values)
             db.execute(
                 f"UPDATE delivery_runs SET {assignments} WHERE run_id=?",

@@ -592,6 +592,48 @@ class InstallRollback(unittest.TestCase):
 
 
 class SavedReleaseCustody(unittest.TestCase):
+    def test_preinstall_shard_checkpoint_keeps_lease_and_monotonic_queue_contract(self):
+        spec = importlib.util.spec_from_file_location(
+            "test_release_state_validator", ROOT / "scripts/release-state-validator.py")
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+
+        def varint(value):
+            result = bytearray()
+            while value >= 128:
+                result.append((value & 127) | 128)
+                value >>= 7
+            return bytes(result) + bytes([value])
+
+        def field(number, value):
+            if isinstance(value, int):
+                return varint(number << 3) + varint(value)
+            return varint(number << 3 | 2) + varint(len(value)) + value
+
+        def shard(immediate, *, immediate_time=0, scheduled_id=0, lease=5, owner=b"original"):
+            queues = b""
+            for category in (1, 2, 4, 7):
+                stamp, task_id = (500, scheduled_id) if category == 2 else (immediate_time, immediate)
+                key = field(1, field(1, stamp)) + field(2, task_id)
+                queues += field(17, field(1, category) + field(2, field(2, key)))
+            data = field(1, 1) + field(2, lease) + field(3, owner) + field(7, field(1, 100)) + queues
+            return {"shard_id": 1, "range_id": lease, "data_encoding": "Proto3",
+                    "data": {"blob": data.hex()}}
+
+        before = [shard(70254672)]
+        # The saved stopped-store failure advanced these immediate IDs by exactly one.
+        validator.temporal_rows("shards", before, [shard(70254673)], "preinstall")
+        with self.assertRaisesRegex(validator.Refusal, "shard watermark decreased"):
+            validator.temporal_rows("shards", before, [shard(70254671)], "preinstall")
+        with self.assertRaisesRegex(validator.Refusal, "unsupported watermark field change"):
+            validator.temporal_rows("shards", before, [shard(70254673, immediate_time=1)], "preinstall")
+        with self.assertRaisesRegex(validator.Refusal, "unsupported watermark field change"):
+            validator.temporal_rows("shards", before, [shard(70254673, scheduled_id=1)], "preinstall")
+        with self.assertRaisesRegex(validator.Refusal, "preinstall shard owner/lease changed"):
+            validator.temporal_rows("shards", before, [shard(70254673, owner=b"foreign")], "preinstall")
+        with self.assertRaisesRegex(validator.Refusal, "preinstall shard owner/lease changed"):
+            validator.temporal_rows("shards", before, [shard(70254673, lease=6)], "preinstall")
+
     def test_select_projection_authenticates_generated_columns_and_every_cell(self):
         spec = importlib.util.spec_from_file_location(
             "test_release_state_validator", ROOT / "scripts/release-state-validator.py")
