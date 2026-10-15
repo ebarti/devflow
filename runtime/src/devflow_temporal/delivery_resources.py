@@ -10,7 +10,7 @@ import os
 import sqlite3
 import stat
 import subprocess
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -794,6 +794,7 @@ class RunResources:
         )
 
         descriptors, receipts = [], []
+        role_leases = ExitStack()
         execution_specs = {}
         _gate_roots(self.spec, execution_specs=execution_specs)
         try:
@@ -831,6 +832,37 @@ class RunResources:
                     'measured_policy_digest')
                     if path.is_relative_to(self.state / 'native-preparation')
                     else execution['policy_digest']) or execution['policy_digest']
+                role_attempt = (path.name == 'native-process.json'
+                                and path.parent.parent == self.state / 'attempts')
+                request, row = None, None
+                if role_attempt:
+                    from .delivery_execution_config import load_execution_config
+                    from .supervisor import DeliverySupervisor
+
+                    if 'config_path' in self.spec:
+                        config = load_execution_config(self.spec)
+                        with closing(sqlite3.connect(
+                                config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
+                            db.row_factory = sqlite3.Row
+                            row = db.execute(
+                                'SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',
+                                (path.parent.name, self.spec['run_id'])).fetchone()
+                    if (row is not None or os.path.lexists(path.with_name('request.json'))
+                            or 'provider_session' in value):
+                        if row is None:
+                            raise ValueError('registered role has no durable original attempt')
+                        request = read_private(path.with_name('request.json'))
+                        if (request['spec'] not in execution_specs.values()
+                                or DeliverySupervisor._job_key(request) != row['job_key']):
+                            raise ValueError(
+                                'registered role request lost its admitted execution policy')
+                historical_role = request is not None and request['spec'] != execution
+                if historical_role:
+                    from .delivery_orphans import _completed_role_execution
+
+                    execution = role_leases.enter_context(_completed_role_execution(
+                        path, value, execution_specs, request, row))
+                    expected_digest = execution['policy_digest']
                 intent = value['intent']
                 launch = launch_binding(path.parent, value)
                 if (intent['run_id'] != self.spec['run_id']
@@ -841,10 +873,12 @@ class RunResources:
                             or intent['environment_sha256'] != digest(launch['environment'])))
                         or value.get('phase') != 'finished'
                         or (value.get('monitoring_complete') is not True
-                            and not lost_monitor_without_provider(value, role_attempt=(
-                                path.parent.parent == self.state / 'attempts')))):
+                            and not lost_monitor_without_provider(
+                                value, role_attempt=role_attempt))):
                     raise ValueError('registered native process closure is unconfirmed')
-                for name in ('native-monitor.lock', 'native-process.lock'):
+                # The completed-role validator already holds these exact leases.
+                for name in (() if historical_role else (
+                        'native-monitor.lock', 'native-process.lock')):
                     lock_path = path.with_name(name)
                     descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
                     descriptors.append(descriptor)
@@ -880,6 +914,7 @@ class RunResources:
         finally:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
+            role_leases.close()
 
     def check_artifacts(self, path: Path) -> Path:
         self._allowed(path, 'check-artifacts', finalizing=True)
