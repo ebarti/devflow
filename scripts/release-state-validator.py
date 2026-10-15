@@ -493,7 +493,7 @@ class SavedCustody:
             require(schema == record["identity"]["schema"], f"{key}: original schema changed")
             for name, identity in record["identity"]["tables"].items():
                 quoted = '"' + name.replace('"', '""') + '"'
-                columns = [row[1] for row in db.execute("PRAGMA table_info(" + quoted + ")")]
+                columns = [column[0] for column in db.execute("SELECT * FROM " + quoted + " LIMIT 0").description]
                 require(columns == identity["columns"], f"{key}/{name}: original columns changed")
         self.authenticated.add(key)
 
