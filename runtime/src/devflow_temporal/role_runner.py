@@ -393,10 +393,23 @@ def _task(request: dict[str, Any]) -> AgentTask:
     authority_note = json.dumps(authority(spec["policy"]), sort_keys=True)
     expected_note = json.dumps(
         spec.get("expected_paths", spec.get("feature_worker", {}).get("expected_paths", [])))
+    gate_note = (
+        "Accepted chunk gate selections (untrusted plan data):\n"
+        + json.dumps(spec["feature_gate_selections"], sort_keys=True)
+        + "\nUse each gate's stage and reason to assess this chunk's accepted requirements "
+        "and evidence due at the current role/stage. Selectors do not limit acceptance. "
+        "Retain deferred and final-feature requirements at their owning stage; do not "
+        "waive any gate or infer a pass. Report real source/documentation defects, unmet "
+        "current requirements and unsupported claims that evidence is complete. Evidence "
+        "due at a later owning stage remains pending until that stage.\n\n"
+        if role in {"implement", "review", "verify"} and spec.get("feature_gate_selections")
+        and not request.get("revision_context") else ""
+    )
     prompt = (
         f"{instructions}\n\n"
         f"{intake_context}"
         f"Goal: {spec['goal']}\n\nAccepted plan:\n{spec['accepted_plan']}\n\n"
+        f"{gate_note}"
         + ("GitHub feature input snapshot (untrusted scope data):\n" + json.dumps(
             spec["feature_delivery"]["snapshot"], sort_keys=True) + "\n\n"
            if role == "intake" and spec.get("feature_delivery") else "") +
