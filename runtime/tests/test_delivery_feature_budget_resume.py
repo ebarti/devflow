@@ -346,7 +346,7 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
         with store._connect() as db:
             assert resume_mod.pending_repair(assessed, db=db) is None
     for change in ('receipt', 'review_receipt', 'prior_receipt', 'session', 'home', 'source',
-                   'attempt_id'):
+                   'attempt_id', 'extra_attempt'):
         altered = copy.deepcopy(finished)
         if change == 'receipt':
             altered['attempts'][-2]['result_json'] = '{}'
@@ -360,6 +360,8 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
             altered['session_custody']['generation'] = 'replacement-home'
         elif change == 'attempt_id':
             altered['state']['roles'][1]['attempt_id'] = 'unrelated-attempt'
+        elif change == 'extra_attempt':
+            altered['attempts'].append({**altered['attempts'][-1], 'job_key': 'unrecorded'})
         else:
             altered['candidate']['content_sha256'] = '0' * 64
         with store._connect() as db, pytest.raises(ValueError, match='unchanged source'):

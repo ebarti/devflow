@@ -335,6 +335,7 @@ def _completed_repair(seal, previous, remainder):
         return False
     role = completed[0]
     candidate = previous['execution_candidate']
+    recorded = []
     for progressed in remainder:
         if (progressed.get('role') not in {'implement', 'review', 'verify'}
                 or progressed.get('iteration') != state['iteration']
@@ -357,6 +358,7 @@ def _completed_repair(seal, previous, remainder):
                    and json.loads(attempt['result_json']) == receipt]
         if len(matches) != 1:
             return False
+        recorded.extend(matches)
     before = previous['state'].get('roles', [])
     return (previous['execution_spec'] == spec and state.get('roles', [])[:len(before)] == before
             and role.get('status') in {'pass', 'findings', 'blocked'}
@@ -370,6 +372,8 @@ def _completed_repair(seal, previous, remainder):
                     for key in ('content_sha256', 'base_sha', 'environment_digest',
                                 'policy_digest'))
             and all(attempt in seal['attempts'] for attempt in previous['attempts'])
+            and all(attempt in previous['attempts'] or attempt in recorded
+                    for attempt in seal['attempts'])
             and all(effect in seal['effects'] for effect in previous['effects']))
 
 
