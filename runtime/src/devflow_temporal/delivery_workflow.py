@@ -17,6 +17,7 @@ from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 from .contracts import digest
 from .delivery_baseline_contract import preparation_failure as _preparation_failure
 from .delivery_baseline_contract import repairable_baseline
+from .delivery_budget_contract import fixed_budget_allows
 from .delivery_metadata_contract import evidence_applicability
 from .delivery_publication import stopped_at_publication
 from .delivery_questions import valid_blocking_questions
@@ -2387,11 +2388,9 @@ class DeliveryWorkflow:
             if authorized_max_iteration is not None
             else spec["policy"]["max_repairs"]
         )
-        if spec.get("retry_budget_version") == 1:
-            from .delivery_stopped_resume import fixed_budget_allows
-
-            if not fixed_budget_allows(spec, max_repairs, 0, pending=True):
-                raise ValueError("workflow continuation exceeded its fixed repair budget")
+        if (spec.get("retry_budget_version") == 1
+                and not fixed_budget_allows(spec, max_repairs, 0, pending=True)):
+            raise ValueError("workflow continuation exceeded its fixed repair budget")
         acceptance_note = (
             "Operator acceptance criteria (requirements to assess, not evidence of success): "
             + json.dumps(operator_brief, sort_keys=True)

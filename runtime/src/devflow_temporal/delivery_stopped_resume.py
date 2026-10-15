@@ -9,6 +9,7 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_baseline_contract import repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
+from .delivery_budget_contract import fixed_budget_allows
 from .delivery_config import scope_amended_spec, scope_amendment_config
 from .delivery_execution_config import load_execution_config
 from .delivery_gate_retry import prepare_runtime, transient_stop
@@ -74,27 +75,6 @@ def scope_spec(store, seal, command):
         raise ValueError('scope amendment changed stopped implementation bytes')
     return effective
 
-
-def fixed_budget_allows(spec, iteration, iterations, *, pending=False):
-    """Spend original turns or the finite extension sealed by a runtime allowance."""
-    maximum = spec.get('policy', {}).get('max_repairs')
-    authority = spec.get('repair_allowance')
-    if authority is not None:
-        if (not spec.get('feature_worker') or not isinstance(authority, dict)
-                or authority.get('run_id') != spec.get('run_id')
-                or type(authority.get('start_iteration')) is not int
-                or type(authority.get('maximum_iteration')) is not int
-                or not 0 <= authority['start_iteration'] <= authority['maximum_iteration']
-                or authority['maximum_iteration'] - authority['start_iteration']
-                    > 100 + int(bool(authority.get('credit')))):
-            return False
-        maximum = authority['maximum_iteration']
-    allowed = range(1, 102) if spec.get('feature_worker') else (1, 2)
-    return (type(iteration) is int and iteration >= 0
-            and type(iterations) is int
-            and (iterations in allowed or (iterations == 0 and pending))
-            and type(maximum) is int and maximum >= 0
-            and iteration + iterations <= maximum)
 
 
 def remaining_worker_repairs(budget, spec, iteration, *, credit=0):
