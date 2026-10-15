@@ -312,6 +312,40 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
     broker.spec = renewed
     assert resume_mod._historical_candidate(broker, repeated['state'], rebound, role, link, pending)
     assert shared.budget(token['issue_id'])['used'] == 1
+    # Once the paid turn finishes, a publish may change its head but not content.
+    # It must leave the pending classifier through its exact admitted receipt.
+    finished = copy.deepcopy(sealed)
+    output = {**candidate, 'id': 'd' * 64, 'content_sha256': 'f' * 64}
+    completed = {**implementation(8), 'candidate': output,
+                 'input_candidate_id': candidate['id']}
+    finished['candidate'] = {**output, 'id': 'e' * 64, 'head': 'c' * 40}
+    finished['state'] = {**finished['state'], 'candidate': finished['candidate'],
+                         'roles': [role, completed, gate('review', 8, 'findings')]}
+    finished['session_custody'] = {**finished['session_custody'],
+                                  'session_state_digest': 'advanced'}
+    job = DeliverySupervisor._job_key({'spec': child, 'role': 'implement', 'iteration': 8,
+                                       'candidate': candidate})
+    finished['attempts'] = [*copy.deepcopy(finished['attempts']), {
+        'job_key': job, 'role': 'implement', 'iteration': 8, 'candidate_id': candidate['id'],
+        'state': 'finished', 'cleanup': 'confirmed', 'session_id': completed['session_id'],
+        'result_json': json.dumps({key: value for key, value in completed.items()
+                                   if key not in RECEIPT_ONLY})}]
+    with store._connect() as db:
+        assert resume_mod.pending_repair(finished, db=db) is None
+    for change in ('receipt', 'prior_receipt', 'session', 'home', 'source'):
+        altered = copy.deepcopy(finished)
+        if change == 'receipt':
+            altered['attempts'][-1]['result_json'] = '{}'
+        elif change == 'prior_receipt':
+            altered['attempts'][0]['cleanup'] = 'unknown'
+        elif change == 'session':
+            altered['session_id'] = 'replacement-session'
+        elif change == 'home':
+            altered['session_custody']['generation'] = 'replacement-home'
+        else:
+            altered['candidate']['content_sha256'] = '0' * 64
+        with store._connect() as db, pytest.raises(ValueError, match='unchanged source'):
+            resume_mod.pending_repair(altered, db=db)
     for change in ('source', 'attempt', 'cleanup'):
         altered = copy.deepcopy(sealed)
         if change == 'source':
