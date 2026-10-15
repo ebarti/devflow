@@ -351,7 +351,8 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
         assessed['attempts'][-2]['result_json'] = json.dumps({**receipt, 'status': status})
         assessed['state']['roles'] = assessed['state']['roles'][:2]
         assessed['attempts'] = assessed['attempts'][:-1]
-        assessed['candidate'] = assessed['state']['candidate'] = output
+        # Nonpass stops before _run_iterations replaces its admitted top candidate.
+        assessed['candidate'] = assessed['state']['candidate'] = candidate
         assessed['state']['pull_request'] = None
         assessed['effects'] = copy.deepcopy(previous['effects'])
         with store._connect() as db:

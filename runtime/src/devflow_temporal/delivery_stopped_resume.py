@@ -369,8 +369,11 @@ def _completed_repair(seal, previous, remainder):
             and (seal.get('session_custody') or {}).get('generation')
                 == (previous.get('session_custody') or {}).get('generation')
             and all(role.get('candidate', {}).get(key) == seal['candidate'].get(key)
-                    for key in ('content_sha256', 'base_sha', 'environment_digest',
-                                'policy_digest'))
+                    for key in ('base_sha', 'environment_digest', 'policy_digest'))
+            # A nonpass role stops before the workflow replaces its top candidate.
+            # _candidate must still authenticate that role's exact current source.
+            and (role['status'] != 'pass' or role['candidate'].get('content_sha256')
+                 == seal['candidate'].get('content_sha256'))
             and all(attempt in seal['attempts'] for attempt in previous['attempts'])
             and all(attempt in previous['attempts'] or attempt in recorded
                     for attempt in seal['attempts'])
