@@ -287,8 +287,11 @@ def test_policy_resume_and_tracker_start_refuse_a_reclaimed_reassigned_issue(
         store.state.claim_work(db, original['work_id'], owner)
     with pytest.raises(ValueError, match='frozen authority'):
         resume_preflight(store, effective, recovery)
-    monkeypatch.setattr('devflow_temporal.delivery_activities._context',
-                        lambda _spec: (store, None))
+    def context(_spec, *, terminal_settlement=False):
+        assert terminal_settlement is False
+        return store, None
+
+    monkeypatch.setattr('devflow_temporal.delivery_activities._context', context)
     calls = []
     monkeypatch.setattr('devflow_temporal.delivery_activities.subprocess.run',
                         lambda *args, **_kwargs: calls.append(args))

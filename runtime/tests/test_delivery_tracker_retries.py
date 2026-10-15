@@ -262,7 +262,7 @@ def test_tracker_activity_preserves_typed_helper_error(
         raw={'repositories': {'fixture': {'project_url': 'https://example.invalid/project',
                                          'assignee': 'owner'}}},
         helpers_dir=tmp_path, tracking_db=tmp_path / 'fixture.sqlite3'))
-    monkeypatch.setattr(delivery_activities, '_context', lambda _spec: (store, None))
+    monkeypatch.setattr(delivery_activities, '_context', lambda _spec, **_options: (store, None))
     monkeypatch.setattr(delivery_activities.subprocess, 'run', lambda *_, **__: SimpleNamespace(
         returncode=1, stdout='', stderr=json.dumps({'error': 'fixture', 'error_type': error_type})))
     result = delivery_activities._tracker_sync(
@@ -325,7 +325,7 @@ def terminal_readback_controller(monkeypatch, tmp_path, failure, *, failures=4, 
     broker.spec, broker.source = admitted, tmp_path
     broker._publication_base_ref = lambda **_: 'main'
     monkeypatch.setattr(delivery_terminal_recovery, 'DeliveryBroker', lambda *_: broker)
-    monkeypatch.setattr(delivery_activities, '_context', lambda _: (object(), broker))
+    monkeypatch.setattr(delivery_activities, '_context', lambda _, **_options: (object(), broker))
     queries, syncs, projected = [], [], []
 
     def command(argv, **_):
