@@ -2,16 +2,19 @@
 
 import base64
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import io
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -586,6 +589,70 @@ class InstallRollback(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires native"):
                 self.rollback.exchange_function()
         self.assertEqual(os.readlink(self.compatibility), before)
+
+
+class SavedReleaseCustody(unittest.TestCase):
+    def test_select_projection_authenticates_generated_columns_and_every_cell(self):
+        spec = importlib.util.spec_from_file_location(
+            "test_release_state_validator", ROOT / "scripts/release-state-validator.py")
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+        with tempfile.TemporaryDirectory(prefix="devflow-saved-custody-") as temporary:
+            path = Path(temporary).resolve() / "rollback.sqlite3"
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                db.execute("CREATE TABLE visibility (id INTEGER PRIMARY KEY, value TEXT, payload BLOB, "
+                           "stored TEXT GENERATED ALWAYS AS (upper(value)) STORED, "
+                           "virtual INTEGER GENERATED ALWAYS AS (length(value)) VIRTUAL)")
+                db.execute("INSERT INTO visibility(id,value,payload) VALUES(1,'old',x'00ff')")
+                db.commit()
+                cursor = db.execute('SELECT * FROM "visibility"')
+                columns = [column[0] for column in cursor.description]
+                original = validator.raw_row(cursor.fetchone())
+                omitted = [row[1] for row in db.execute('PRAGMA table_info("visibility")')]
+                self.assertEqual(columns, ["id", "value", "payload", "stored", "virtual"])
+                self.assertEqual(omitted, columns[:3])
+                schema = [list(row) for row in db.execute(
+                    "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")]
+                db.execute("UPDATE visibility SET value='longer' WHERE id=1")
+                updated = validator.raw_row(db.execute('SELECT * FROM "visibility"').fetchone())
+                db.rollback()
+            key = ("0", "temporal")
+            identity = {"schema": schema, "tables": {"visibility": {
+                **validator.digest_rows(Counter([validator.canonical(original)])), "columns": columns}}}
+            record = {"backup": str(path), "sha256": validator.sha(path), "identity": identity}
+
+            def custody(names=columns):
+                # Exercise real immutable-backup authentication without inventing twelve unrelated stores.
+                saved = object.__new__(validator.SavedCustody)
+                saved.original = {key: copy.deepcopy(record)}
+                saved.original[key]["identity"]["tables"]["visibility"]["columns"] = names
+                saved.authenticated, saved.cache = set(), {}
+                saved.statistics = {"changed_tables": 0, "changed_rows": 0}
+                return saved
+
+            saved = custody()
+            saved.authenticate(key)
+            self.assertEqual(saved.dict_rows(key, "visibility"), [dict(zip(columns, original, strict=True))])
+            current = {"identity": copy.deepcopy(identity), "raw_changes": {
+                "visibility": {"removed": [original], "added": [updated]}}}
+            current["identity"]["tables"]["visibility"].update(
+                validator.digest_rows(Counter([validator.canonical(updated)])))
+            reconstructed = saved.reconstruct(key, current)
+            self.assertEqual(saved.dict_rows(key, "visibility", reconstructed["visibility"]),
+                             [dict(zip(columns, updated, strict=True))])
+            with self.assertRaisesRegex(validator.Refusal, "original columns changed"):
+                custody(omitted).authenticate(key)
+            with self.assertRaisesRegex(validator.Refusal, "original columns changed"):
+                custody(list(reversed(columns))).authenticate(key)
+            malformed = copy.deepcopy(current)
+            malformed["raw_changes"]["visibility"]["added"][0].pop()
+            with self.assertRaisesRegex(validator.Refusal, "invalid row shape"):
+                saved.reconstruct(key, malformed)
+            tampered = copy.deepcopy(current)
+            tampered["raw_changes"]["visibility"]["added"][0][-2] = "foreign generated value"
+            with self.assertRaisesRegex(validator.Refusal, "full reconstructed rows/hash/count mismatch"):
+                saved.reconstruct(key, tampered)
+            self.assertEqual(validator.sha(path), record["sha256"])
 
 
 if __name__ == "__main__":
