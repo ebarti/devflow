@@ -521,6 +521,20 @@ def _remember(store, row, observed, now):
 
 
 async def reconcile_completed_projections(store, client, *, now=None, limit=PASS_LIMIT):
+    """An installer fence defers observation and its skip/backoff writers together."""
+    from .delivery_interrupted_recovery import (
+        InstallationRecoveryDeferred,
+        installation_recovery_lease,
+    )
+
+    try:
+        with installation_recovery_lease(store.config):
+            return await _reconcile_completed_projections(store, client, now=now, limit=limit)
+    except InstallationRecoveryDeferred:
+        return []
+
+
+async def _reconcile_completed_projections(store, client, *, now=None, limit=PASS_LIMIT):
     """Bound each maintenance pass to due candidates; all SQLite work stays off the loop."""
     from .delivery_interrupted_recovery import InstallationRecoveryDeferred
 

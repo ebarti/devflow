@@ -34,12 +34,16 @@ async def test_installation_fence_defers_recovery_without_writing_or_stranding_i
     store.submit(request)
     store.config.raw['execution_registry'] = str(tmp_path / 'ownership/registry.sqlite3')
     calls = []
+    refuse_early = True
 
     async def inner(*_args):
         calls.append('recovery')
         return {'state': 'execution_recovered'}
 
     async def reconcile(_store, client, row):
+        calls.append('observation')
+        if refuse_early:
+            raise ValueError('owner refused before interrupted recovery')
         return await delivery_interrupted_recovery.recover_interrupted(
             _store, client, row, {}, None)
 
@@ -64,9 +68,10 @@ async def test_installation_fence_defers_recovery_without_writing_or_stranding_i
             assert list(db.iterdump()) == before
         assert calls == []
     assert lock.exists()  # Neither installer nor runtime unlinks the shared inode.
+    refuse_early = False
     assert await reconcile_completed_projections(store, None, now=now) == [
         {'run_id': 'run-1', 'state': 'execution_recovered'}]
-    assert calls == ['recovery']
+    assert calls == ['observation', 'recovery']
 
 
 class _Client:
