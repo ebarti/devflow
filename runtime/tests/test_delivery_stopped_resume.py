@@ -175,13 +175,56 @@ def blocked_source(stopped, *, session='original-implementation', prelaunch=Fals
 
 
 def test_partial_failed_implementation_is_admitted_only_with_exact_original_receipt(stopped):
-    store, _, _, command = stopped
+    from devflow_temporal import delivery_gate_retry as gates
+    from devflow_temporal.delivery_resources import private_directory, write_private
+
+    store, broker, state, command = stopped
     actual = blocked_source(stopped)
-    store.continue_repair('run-1', command)
+    # A partial implementation can differ from its last top-level checkpoint.
+    assert resume.snapshot(store, 'run-1')['candidate'] == actual
+    state['candidate'] = actual
+    project(store, state)
+    closed = store._completed_temporal_result('run-1')
+    original, previous = store.effective_spec('run-1'), None
+    role = copy.deepcopy(state['roles'][0])
+    for generation in (1, 2):
+        before = original if previous is None else previous['execution_spec']
+        execution = copy.deepcopy(before)
+        # Model native preparation's policy rebinding; fake preparation normally
+        # returns an unchanged policy and hid this historical-role mismatch.
+        execution['policy']['native_identity'] = {'runtime_payload_sha256': str(generation) * 64}
+        execution['policy_digest'] = digest(execution['policy'])
+        execution['gate_retry_generation'] = generation
+        candidate = {**actual, 'policy_digest': execution['policy_digest']}
+        predecessor = copy.deepcopy(closed)
+        previous = {'kind': gates.PREPUBLICATION_KIND, 'command': {'additional_iterations': 0},
+                    'original_spec': original, 'execution_spec': execution,
+                    'original_recovery': previous, 'state': predecessor['result'],
+                    'candidate': candidate, 'publication': None,
+                    'seal': {'original_spec': before, 'closed': predecessor,
+                             'candidate': state['candidate'],
+                             'previous_digest': closed['recovery_digest']}}
+        root = broker.state_dir / gates.gate_namespace(generation)
+        private_directory(root)
+        write_private(root / 'admission.json', previous)
+        workflow_id = 'delivery-run-1-gates-retry-' + str(generation)
+        with store._connect() as db:
+            db.execute('INSERT OR REPLACE INTO delivery_gate_admissions VALUES (?,?,?)',
+                       ('run-1', 'gates-' + str(generation), canonical_json(previous)))
+            db.execute('UPDATE delivery_runs SET recovery_json=?,workflow_id=? WHERE run_id=?',
+                       (canonical_json(previous), workflow_id, 'run-1'))
+        state.update(candidate=candidate, revision=state['revision'] + 1)
+        project(store, state)
+        closed.update(workflow_id=workflow_id, recovery_digest=digest(previous))
+    assert state['roles'][0] == role
+    assert role['candidate']['policy_digest'] != state['candidate']['policy_digest']
+    assert resume.review_snapshot(store, 'run-1')['session_id'] == 'original-implementation'
+    store.continue_repair('run-1', command | {'expected_revision': state['revision']})
     recovery = saved(store)
-    assert recovery['execution_candidate'] == actual
-    assert recovery['state']['candidate'] != actual
+    assert recovery['execution_candidate'] == state['candidate']
+    assert recovery['state']['roles'][0] == role
     assert recovery['session_id'] == 'original-implementation'
+    assert resume.readback(store, store.effective_spec('run-1'), recovery) == {'state': 'confirmed'}
 
 
 @pytest.mark.parametrize('kind', ['prelaunch', 'preparation'])
