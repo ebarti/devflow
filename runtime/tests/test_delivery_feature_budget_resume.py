@@ -321,8 +321,14 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
     finished['candidate'] = {**output, 'id': 'e' * 64, 'head': 'c' * 40}
     reviewed = {**gate('review', 8, 'findings'),
                 'input_candidate_id': finished['candidate']['id']}
+    publication = {'number': 7, 'head': finished['candidate']['head'],
+                   'candidate': finished['candidate'], 'state': 'OPEN'}
     finished['state'] = {**finished['state'], 'candidate': finished['candidate'],
-                         'roles': [role, completed, reviewed]}
+                         'roles': [role, completed, reviewed], 'pull_request': publication}
+    finished['effects'] = [{'effect_key': f"publish:{child['run_id']}:8", 'kind': 'publish',
+                            'state': 'complete', 'observed_json': json.dumps(publication),
+                            'request_json': json.dumps({'input_candidate_id': output['id'],
+                                                        'iteration': 8})}]
     finished['session_custody'] = {**finished['session_custody'],
                                   'session_state_digest': 'advanced'}
     finished['attempts'] = copy.deepcopy(finished['attempts'])
@@ -343,10 +349,15 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
         assessed['state']['roles'][1]['attempt_id'] = assessed['attempts'][-2]['job_key']
         receipt = json.loads(assessed['attempts'][-2]['result_json'])
         assessed['attempts'][-2]['result_json'] = json.dumps({**receipt, 'status': status})
+        assessed['state']['roles'] = assessed['state']['roles'][:2]
+        assessed['attempts'] = assessed['attempts'][:-1]
+        assessed['candidate'] = assessed['state']['candidate'] = output
+        assessed['state']['pull_request'] = None
+        assessed['effects'] = copy.deepcopy(previous['effects'])
         with store._connect() as db:
             assert resume_mod.pending_repair(assessed, db=db) is None
     for change in ('receipt', 'review_receipt', 'prior_receipt', 'session', 'home', 'source',
-                   'attempt_id', 'extra_attempt'):
+                   'attempt_id', 'extra_attempt', 'extra_effect'):
         altered = copy.deepcopy(finished)
         if change == 'receipt':
             altered['attempts'][-2]['result_json'] = '{}'
@@ -362,6 +373,8 @@ def test_unstarted_paid_preparation_keeps_iteration_findings_and_original_sessio
             altered['state']['roles'][1]['attempt_id'] = 'unrelated-attempt'
         elif change == 'extra_attempt':
             altered['attempts'].append({**altered['attempts'][-1], 'job_key': 'unrecorded'})
+        elif change == 'extra_effect':
+            altered['effects'].append({**altered['effects'][-1], 'effect_key': 'unrecorded'})
         else:
             altered['candidate']['content_sha256'] = '0' * 64
         with store._connect() as db, pytest.raises(ValueError, match='unchanged source'):

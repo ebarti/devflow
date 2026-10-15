@@ -374,7 +374,15 @@ def _completed_repair(seal, previous, remainder):
             and all(attempt in seal['attempts'] for attempt in previous['attempts'])
             and all(attempt in previous['attempts'] or attempt in recorded
                     for attempt in seal['attempts'])
-            and all(effect in seal['effects'] for effect in previous['effects']))
+            and all(effect in seal['effects'] for effect in previous['effects'])
+            and all(effect in previous['effects'] or (
+                effect['effect_key'] == f"publish:{spec['run_id']}:{state['iteration']}"
+                and effect['kind'] == 'publish' and effect['state'] == 'complete'
+                and json.loads(effect['request_json']) == {
+                    'input_candidate_id': role['candidate']['id'], 'iteration': state['iteration']}
+                and state.get('pull_request') is not None
+                and json.loads(effect['observed_json']) == state['pull_request'])
+                    for effect in seal['effects']))
 
 
 def interrupted_resume(seal):
