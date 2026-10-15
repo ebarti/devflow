@@ -289,13 +289,11 @@ def temporal_rows(table, before, after, phase, startup=None, namespaces=None):
                         "restart shard owner/lease is not one new lease")
                 owner_address(scalar(b, 3, 2))
             qa, qb = shard_queues(a), shard_queues(b)
-            # Immediate queues can checkpoint a new allocator range after shard startup.
+            # Queue checkpoints can advance while the old server runs and after restart.
             for category in (1, 2, 4, 7):
                 require(qb[category] >= qa[category], "shard watermark decreased")
                 require(qb[category][0] == qa[category][0] if category != 2 else
                         qb[category][1] == qa[category][1], "unsupported watermark field change")
-                if phase == "preinstall" and category != 2:
-                    require(qb[category] == qa[category], "preinstall immediate queue state changed")
     elif table == "task_queues":
         old_index = {(r["range_hash"], canonical(r["task_queue_id"])): r for r in before}
         new_index = {(r["range_hash"], canonical(r["task_queue_id"])): r for r in after}
