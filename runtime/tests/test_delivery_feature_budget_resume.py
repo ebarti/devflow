@@ -6,6 +6,7 @@ import asyncio
 import json
 
 import pytest
+from test_delivery_execution_registry import installed_runtime as installed_runtime
 from test_delivery_feature_execution import feature_service
 from test_delivery_store import _git
 from test_delivery_store import service as service
@@ -466,3 +467,156 @@ def test_published_chunk_resume_never_publishes_or_implements_again(service, mon
     with store._connect() as db:
         assert db.execute("SELECT effect_key,request_json,observed_json FROM delivery_effects "
                           "WHERE kind='publish'").fetchall() == effects
+
+
+def test_new_install_resumes_original_worker_beyond_its_frozen_iteration_ceiling(
+    service, monkeypatch, installed_runtime,
+):
+    from copy import deepcopy
+
+    from devflow_temporal.delivery_native_guard import validate_native_turn
+
+    runtime = installed_runtime
+    store, parent, child, shared, token = _worker(
+        service, monkeypatch, used_by_others=10, kind="chunk")
+    original = deepcopy(store.submitted_spec(child["run_id"]))
+    broker = DeliveryBroker(store, child)
+    candidate = broker.prepare()["candidate"]
+    last = child["policy"]["max_repairs"]
+    implemented = {**implementation(last), "candidate": candidate, "findings": []}
+    reviewed = {**gate("review", last, "findings"), "findings": ["Repair the failing contract"]}
+    _attempt(store, child, implemented, candidate["id"])
+    state = {"run_id": child["run_id"], "revision": 9, "iteration": last, "phase": "cancelled",
+             "execution_state": "terminal", "outcome": "cancelled", "cleanup": "confirmed",
+             "candidate": candidate, "pull_request": None, "roles": [implemented, reviewed],
+             "checks": {}, "error": None, "usage": {}, "findings": [], "candidate_revision": 1}
+    box = {}
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda *_a, **_k: box["closed"])
+    monkeypatch.setattr(DeliveryBroker, "_existing_pr", lambda *_a, **_k: None)
+    monkeypatch.setattr(store, "_ensure_no_remote_pr", lambda *_: None)
+    shared.finish_worker(token, worker_key(child["run_id"], token), {"cleanup": "confirmed"})
+    _close(store, child, state, box, workflow_id=_row(store, child)["workflow_id"],
+           execution="closed-original-worker", recovery_digest=None)
+    shared.stop(token, "original-feature-stopped", {})
+    runtime.advance(2)
+    shared.renew_repair_allowance(token, runtime.baseline)
+    next_token = shared.claim(parent["feature_delivery"]["snapshot"], "next-coordinator",
+                              token["store_path"], predecessor=token)
+    parent = {**parent, "feature_delivery": {**parent["feature_delivery"], "owner": next_token}}
+    admitted = activities.resume_worker(store, parent, child, _row(store, child))
+    recovery = _recovery(store, child)
+    effective = admitted["spec"]
+    assert (recovery["state"]["iteration"], recovery["maximum_iteration"]) == (last, last + 10)
+    assert recovery["session_id"] == "original-implementation"
+    assert recovery["execution_candidate"]["id"] == candidate["id"]
+    assert effective["policy"]["max_repairs"] == last
+    assert store.submitted_spec(child["run_id"]) == original
+    assert store.continue_repair(child["run_id"], recovery["command"]) == {
+        "run_id": child["run_id"], "workflow_id": admitted["workflow_id"],
+        "dashboard_url": store.config.dashboard_url + "/runs/" + child["run_id"],
+        "phase": "repair_continuation_queued", "authorized_through_iteration": last + 10,
+        "admission_sha256": digest(recovery),
+    }
+    validate_native_turn(effective, "implement", last + 10, store)
+    with pytest.raises(ValueError, match="finite turn limit"):
+        validate_native_turn(effective, "implement", last + 11, store)
+
+    def first_repair(flow, name, body):
+        assert name == "delivery_role" and body["role"] == "implement"
+        assert body["iteration"] == last + 1 and body["resume_session"] == recovery["session_id"]
+        shared.repair(next_token, f"{child['run_id']}:{body['iteration']}",
+                      "Product repair at worker iteration " + str(body["iteration"]))
+        flow.cancel_requested = True
+        return {**implementation(body["iteration"], "findings"), "candidate": candidate,
+                "findings": ["Retained original session"], "finish_reason": "done"}
+
+    result, calls = _drive(monkeypatch, effective, recovery, first_repair)
+    assert result["outcome"] in {"blocked", "cancelled"}, result.get("error")
+    assert ("delivery_role", "implement", last + 1) in calls
+    assert (shared.budget(token["issue_id"])["used"],
+            shared.budget(token["issue_id"])["lifetime_used"]) == (1, 11)
+    shared.finish_worker(next_token, worker_key(child["run_id"], next_token),
+                         {"cleanup": "confirmed"})
+    shared.stop(next_token, "renewed-feature-stopped", {})
+    shared.claim(parent["feature_delivery"]["snapshot"], "another-coordinator",
+                 token["store_path"], predecessor=next_token)
+    # Historical custody remains readable, but it cannot launch a stale role.
+    with store._connect() as db:
+        assert resume_mod.custody(db, recovery) == effective
+    with pytest.raises(OwnershipConflict, match="ownership changed"):
+        validate_native_turn(effective, "implement", last + 1, store)
+
+
+@pytest.mark.parametrize("maximum", [10, 100])
+@pytest.mark.parametrize("credit_kind", ["paid_now", "paid_before_upgrade", "passed_gates"])
+def test_adopted_worker_uses_current_allowance_and_only_authenticated_prepaid_credit(
+    service, monkeypatch, installed_runtime, maximum, credit_kind,
+):
+    from copy import deepcopy
+
+    from devflow_temporal import delivery_feature_revision_recovery as revision
+    from devflow_temporal import delivery_feature_revisions as revisions
+    from devflow_temporal.delivery_config import DeliveryConfig
+    from devflow_temporal.delivery_execution_registry import ExecutionRegistry
+    from devflow_temporal.delivery_store import DeliveryStore
+
+    legacy, request = service
+    raw = deepcopy(legacy.config.raw)
+    raw['max_repairs'] = maximum
+    legacy.config.path.write_text(json.dumps(raw))
+    configured = DeliveryStore(DeliveryConfig.load(legacy.config.path))
+    store, parent, child, shared, first = _worker(
+        (configured, request), monkeypatch, used_by_others=maximum)
+    revision_id = 'correction-with-prepaid-turn'
+    repair_key = ('worker-other:1' if credit_kind == 'paid_before_upgrade' else
+                  'plan-revision:' + revision_id)
+    iteration = maximum
+    alias_key = 'plan-revision:repair-alias:' + child['run_id'] + ':' + str(iteration + 1)
+    if credit_kind == 'paid_before_upgrade':
+        shared.revision_checkpoint(first, alias_key, {
+            'revision_id': revision_id, 'repair_key': repair_key, 'generation': first['generation'],
+            'reason': 'Product repair at worker iteration ' + str(iteration + 1)})
+    shared.finish_worker(first, worker_key(child['run_id'], first), {'cleanup': 'confirmed'})
+    shared.stop(first, 'before-renewal', {})
+    installed_runtime.advance(2)
+    shared.renew_repair_allowance(first, installed_runtime.baseline)
+    owner = shared.claim(parent['feature_delivery']['snapshot'], 'renewed-coordinator',
+                         first['store_path'], predecessor=first)
+    parent = {**parent, 'feature_delivery': {**parent['feature_delivery'], 'owner': owner}}
+    if credit_kind == 'paid_now':
+        shared.repair(owner, repair_key, 'Planning correction ' + revision_id)
+    receipt = {'revision_id': revision_id,
+               'identity': {'plan_revision': 2, 'plan_digest': 'a' * 64},
+               'diagnostic_worker_run_id': (
+                   None if credit_kind == 'passed_gates' else child['run_id']),
+               'repair_key': repair_key}
+    seal = plan_seal(child, [implementation(iteration, 'findings')], iteration=iteration)
+    monkeypatch.setattr(revision, '_receipt', lambda _spec: receipt)
+    monkeypatch.setattr(revisions, 'worker_revision_required', lambda *_: True)
+    monkeypatch.setattr(revision, '_derive', lambda *_: deepcopy(child))
+    monkeypatch.setattr(revision, 'validate_revision_recovery',
+                        lambda _store, predecessor, _admission: predecessor)
+    monkeypatch.setattr(revision, 'gate_only_recovery', lambda *_: (
+        {'exact_passed_implementation': True} if credit_kind == 'passed_gates' else None))
+    monkeypatch.setattr(resume_mod, 'snapshot', lambda *_a, **_kw: deepcopy(seal))
+    # The adopted-plan reservation is an explicit seam; accounting, exact alias
+    # receipts, current installed payload and finite stopped admission are real.
+    monkeypatch.setattr(ExecutionRegistry, 'reserve_revision_worker', lambda *_: None)
+    admit = resume_mod.admit
+    observed = {}
+
+    def preflight(store, run_id, command, **kwargs):
+        observed.update(command)
+        return {**admit(store, run_id, command, preflight=True, **kwargs),
+                'workflow_id': 'modeled-next-workflow'}
+
+    monkeypatch.setattr(resume_mod, 'admit', preflight)
+    result = revision.resume_revision_worker(store, parent, child, _row(store, child))
+    expected = maximum + int(credit_kind != 'paid_now')
+    assert result['resumed'] and observed['additional_iterations'] == expected
+    budget = shared.budget(owner['issue_id'])
+    assert budget['used'] == int(credit_kind == 'paid_now')
+    assert budget['lifetime_used'] == maximum + int(credit_kind == 'paid_now')
+    with pytest.raises(ValueError, match='repair limit exhausted|finite exact-checkpoint'):
+        admit(store, child['run_id'], {**observed, 'additional_iterations': expected + 1},
+              preflight=True, _revision={'revision_id': revision_id})

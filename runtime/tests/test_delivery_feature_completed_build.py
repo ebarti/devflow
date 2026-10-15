@@ -352,5 +352,35 @@ def test_public_mixed_completed_source_and_unpassed_chunk_keep_seven_and_eight(
     before = shared.budget(prior["owner"]["issue_id"])
     result = revisions.resume_revision_worker(store, current_parent, spec)
     assert result["completed"] is True and result["spec"] == spec
-    assert shared.budget(prior["owner"]["issue_id"]) == before == {
-        "used": 8, "maximum": 10, "learning_required": True}
+    issue_id = prior["owner"]["issue_id"]
+    assert shared.budget(issue_id) == before
+    with shared.connect() as db:
+        allowances = list(db.execute(
+            "SELECT * FROM execution_checkpoints WHERE issue_id=? "
+            "AND checkpoint_key LIKE 'repair-allowance:%'", (issue_id,)))
+        assert db.execute("SELECT COUNT(*) FROM execution_repairs WHERE issue_id=?",
+                          (issue_id,)).fetchone()[0] == 8
+    assert len(allowances) == 1
+    saved = allowances[0]
+    baseline = json.loads(saved["content_json"])
+    owner = baseline["owner"]
+    original = store.submitted_spec(owner["run_id"])
+    prepared = store.spec(owner["run_id"])
+    with store._connect() as db:
+        recorded = json.loads(db.execute(
+            "SELECT identity_json FROM delivery_dashboard_state WHERE run_id=?",
+            (owner["run_id"],)).fetchone()[0])
+    assert owner == original["feature_delivery"]["owner"]
+    assert owner["store_path"] == str(store.config.tracking_db)
+    assert recorded["dirty"] is False and recorded["local_digest"] is None
+    runtime_identity = {"revision": recorded["revision"], "runtime_payload_sha256":
+                        prepared["policy"]["native_identity"]["runtime_payload_sha256"]}
+    assert baseline == {"version": 1, "sequence": 0, "runtime": runtime_identity,
+                        "lifetime_start": 0, "maximum": 10, "owner": owner, "previous": None}
+    assert saved["generation"] == owner["generation"]
+    assert saved["checkpoint_key"] == (
+        "repair-allowance:" + runtime_identity["runtime_payload_sha256"])
+    assert saved["content_digest"] == digest(baseline)
+    assert before == {"used": 8, "maximum": 10, "learning_required": True, "lifetime_used": 8,
+                      "allowance": {"checkpoint_key": saved["checkpoint_key"],
+                                    "sha256": digest(baseline), "sequence": 0, **runtime_identity}}

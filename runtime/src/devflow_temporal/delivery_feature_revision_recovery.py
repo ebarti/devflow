@@ -132,7 +132,13 @@ def validate_custody(store, recovery):
 def resume_revision_worker(store, parent, child, row=None):
     from .delivery_feature_execution import registry, worker_key
     from .delivery_feature_revisions import worker_revision_required
-    from .delivery_stopped_resume import KIND, admit, snapshot
+    from .delivery_stopped_resume import (
+        KIND,
+        admit,
+        paid_alias_credit,
+        remaining_worker_repairs,
+        snapshot,
+    )
 
     receipt = _receipt(parent)
     if not receipt:
@@ -211,10 +217,8 @@ def resume_revision_worker(store, parent, child, row=None):
     state, candidate = sealed["state"], sealed["candidate"]
     associated = receipt.get("diagnostic_worker_run_id") == child["run_id"]
     gate_only = gate_only_recovery(store, sealed, admission)
-    remaining = min(
-        budget["maximum"] - budget["used"] + int(bool(associated or gate_only)),
-        child["policy"]["max_repairs"] - state["iteration"],
-    )
+    remaining = remaining_worker_repairs(budget, child, state["iteration"],
+                                         credit=int(bool(associated or gate_only)))
     if remaining < 1 and not (remaining == 0 and gate_only):
         raise OwnershipConflict("feature product repair limit exhausted")
     command = {
@@ -232,7 +236,8 @@ def resume_revision_worker(store, parent, child, row=None):
         child["feature_worker"]["workstream_id"],
         admission,
     )
-    if associated:
+    if associated and not paid_alias_credit(child, token, state["iteration"] + 1,
+                                            receipt["revision_id"]):
         iteration = state["iteration"] + 1
         alias_key = f"{child['run_id']}:{iteration}"
         shared.revision_checkpoint(

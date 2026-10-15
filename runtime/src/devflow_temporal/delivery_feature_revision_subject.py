@@ -368,7 +368,7 @@ def _native_role(spec, role, attempt, session, lower, upper, admitted_candidate,
 
 def _progress(store, spec, row, attempts, recovery, seal):
     from .delivery_feature_revision_recovery import retained_recovery
-    from .delivery_stopped_resume import KIND, custody
+    from .delivery_stopped_resume import KIND, custody, fixed_budget_allows
 
     transport = seal.get("original_recovery")
     if (not recovery or recovery.get("kind") != KIND
@@ -392,7 +392,7 @@ def _progress(store, spec, row, attempts, recovery, seal):
     lower, upper = _time(recovery["closed"]["closed_at"]), _time(closed["closed_at"])
     roles, prefix = state.get("roles", []), prior.get("roles", [])
     maximum = recovery["maximum_iteration"]
-    if (type(maximum) is not int or maximum > spec["policy"]["max_repairs"]
+    if (not fixed_budget_allows(spec, maximum, 0, pending=True)
             or not prior["iteration"] < state["iteration"] <= maximum
             or state["revision"] != row["protocol_revision"]
             or response.get("workflow_id") != closed["workflow_id"]
@@ -468,7 +468,14 @@ def retained_worker_subject(store, original, row, attempts, recovery):
                 or full_candidate(latest.get("candidate")) != current):
             raise ValueError("current retained review subject is not an exact finished finding")
         findings = bounded_findings(latest.get("findings"))
-        if seal["state"]["iteration"] >= original["policy"]["max_repairs"]:
+        remaining = original["policy"]["max_repairs"] - seal["state"]["iteration"]
+        if original.get("feature_delivery"):
+            from .delivery_feature_execution import registry
+            from .delivery_stopped_resume import remaining_worker_repairs
+
+            budget = registry(original).budget(original["feature_delivery"]["owner"]["issue_id"])
+            remaining = remaining_worker_repairs(budget, original, seal["state"]["iteration"])
+        if remaining <= 0:
             raise ValueError("unpassed retained worker has no ordinary implementation turn left")
         disposition = {"kind": "latest_finished_implementation_findings", "status": "findings",
                        "finish_reason": "done", "candidate": current,

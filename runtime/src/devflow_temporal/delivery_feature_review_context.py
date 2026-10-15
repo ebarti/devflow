@@ -473,8 +473,8 @@ def authenticated_runtime_context(identity):
             **normalized_context(sources)}
 
 
-def current_runtime_context():
-    """Require actual installed bytes and HEAD to be the same clean payload."""
+def current_runtime_identity():
+    """Authenticate installed bytes without imposing the review AST schema."""
     from .payload import payload_digest
 
     root = _protected_root()
@@ -483,7 +483,17 @@ def current_runtime_context():
     identity = {"dirty": False, "local_digest": None,
                 "revision": _git(root, "rev-parse", "HEAD").decode().strip(),
                 "runtime_payload_sha256": payload_digest(root / PREFIX)}
-    return authenticated_runtime_context(identity)
+    _, payload = _sources(root, identity["revision"])
+    if payload != identity["runtime_payload_sha256"]:
+        raise ValueError("actual native runtime payload differs from immutable Git objects")
+    return {key: identity[key] for key in ("revision", "runtime_payload_sha256")}
+
+
+def current_runtime_context():
+    """Require the authenticated current payload and its supported review AST."""
+    return authenticated_runtime_context({
+        **current_runtime_identity(), "dirty": False, "local_digest": None,
+    })
 
 
 def candidate_subject(candidate):

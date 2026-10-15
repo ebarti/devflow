@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 from contextlib import contextmanager
@@ -768,6 +769,149 @@ class ExecutionRegistry:
                 "result": json.loads(row["result_json"] or "null"),
             }
 
+    @staticmethod
+    def _repair_allowances(db, issue_id):
+        rows = db.execute(
+            "SELECT checkpoint_key,content_digest,content_json FROM execution_checkpoints "
+            "WHERE issue_id=? AND checkpoint_key LIKE 'repair-allowance:%' ORDER BY rowid",
+            (issue_id,),
+        )
+        allowances = []
+        for row in rows:
+            value = json.loads(row["content_json"])
+            previous = allowances[-1] if allowances else None
+            runtime = value.get("runtime", {})
+            if (row["content_digest"] != digest(value)
+                    or value.get("version") != 1
+                    or value.get("sequence") != len(allowances)
+                    or row["checkpoint_key"] != "repair-allowance:" + str(
+                        runtime.get("runtime_payload_sha256"))
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(
+                        runtime.get("runtime_payload_sha256", "")))
+                    or not re.fullmatch(r"[0-9a-f]{40}", str(runtime.get("revision", "")))
+                    or type(value.get("lifetime_start")) is not int
+                    or value["lifetime_start"] < (previous[1]["lifetime_start"] if previous else 0)
+                    or type(value.get("maximum")) is not int or not 1 <= value["maximum"] <= 100
+                    or value.get("owner", {}).get("issue_id") != issue_id
+                    or value.get("previous") != (
+                        {"checkpoint_key": previous[0], "sha256": digest(previous[1])}
+                        if previous else None)):
+                raise OwnershipConflict("repair allowance lost its immutable lineage")
+            allowances.append((row["checkpoint_key"], value))
+        return allowances
+
+    @staticmethod
+    def _budget(db, issue_id):
+        limit = db.execute(
+            "SELECT * FROM execution_repair_limits WHERE issue_id=?", (issue_id,),
+        ).fetchone()
+        if not limit:
+            raise OwnershipConflict("feature has no admitted repair allowance")
+        lifetime = db.execute(
+            "SELECT COUNT(*) FROM execution_repairs WHERE issue_id=?", (issue_id,),
+        ).fetchone()[0]
+        result = {"used": lifetime, "maximum": limit["maximum"],
+                  "learning_required": bool(limit["learning_required"])}
+        allowances = ExecutionRegistry._repair_allowances(db, issue_id)
+        if allowances:
+            key, current = allowances[-1]
+            if current["lifetime_start"] > lifetime:
+                raise OwnershipConflict("repair allowance lost its lifetime charges")
+            result.update(used=lifetime - current["lifetime_start"],
+                          maximum=current["maximum"], lifetime_used=lifetime,
+                          allowance={"checkpoint_key": key, "sha256": digest(current),
+                                     "sequence": current["sequence"], **current["runtime"]})
+        return result
+
+    def renew_repair_allowance(self, token: dict, baseline: dict) -> dict:
+        """One allowance per new installed payload, admitted only by a stopped owner.
+
+        The current identity is measured here, never supplied by a command. The
+        caller obtains the baseline from the predecessor's durable preparation.
+        Payload identity and an ancestor check prevent reinstalls and rollbacks
+        from creating credit; the latest receipt always selects the allowance.
+        """
+        from .delivery_feature_review_context import (
+            _git,
+            _protected_root,
+            _sources,
+            current_runtime_identity,
+        )
+
+        current = current_runtime_identity()
+        with self.serialized(token["issue_id"]), self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            owner = self.require(db, token, active=False)
+            if owner["state"] != "stopped":
+                raise OwnershipConflict("repair renewal requires the current stopped owner")
+            self._settled(db, token["issue_id"])
+            budget = self._budget(db, token["issue_id"])
+            allowances = self._repair_allowances(db, token["issue_id"])
+            if not allowances:
+                _, payload = _sources(_protected_root(), baseline.get("revision"))
+                if payload != baseline.get("runtime_payload_sha256"):
+                    raise OwnershipConflict("repair allowance baseline differs from preparation")
+                initial = {"version": 1, "sequence": 0, "runtime": baseline,
+                           "lifetime_start": 0, "maximum": budget["maximum"],
+                           "owner": token, "previous": None}
+                key = "repair-allowance:" + payload
+                self._checkpoint(db, token, key, initial)
+                allowances = [(key, initial)]
+            if any(value["runtime"]["runtime_payload_sha256"]
+                   == current["runtime_payload_sha256"] for _, value in allowances):
+                return self._budget(db, token["issue_id"])
+            key, previous = allowances[-1]
+            # Git failure (including an old or unrelated commit) grants no credit.
+            _git(_protected_root(), "merge-base", "--is-ancestor",
+                 previous["runtime"]["revision"], current["revision"])
+            value = {"version": 1, "sequence": previous["sequence"] + 1, "runtime": current,
+                     "lifetime_start": budget.get("lifetime_used", budget["used"]),
+                     "maximum": budget["maximum"], "owner": token,
+                     "previous": {"checkpoint_key": key, "sha256": digest(previous)}}
+            self._checkpoint(db, token, "repair-allowance:" + current["runtime_payload_sha256"],
+                             value)
+            return self._budget(db, token["issue_id"])
+
+    def require_unspent_budget(self, issue_id: str, recorded: dict) -> dict:
+        """A reserved preparation may outlive a receipt, but never an extra charge."""
+        with self.connect() as db:
+            current = self._budget(db, issue_id)
+            lifetime = current.get("lifetime_used", current["used"])
+            expected = {"used": lifetime, "maximum": current["maximum"],
+                        "learning_required": current["learning_required"]}
+            reference = recorded.get("allowance")
+            if reference:
+                allowances = self._repair_allowances(db, issue_id)
+                matches = [value for key, value in allowances
+                           if {"checkpoint_key": key, "sha256": digest(value),
+                               "sequence": value["sequence"], **value["runtime"]} == reference]
+                if not matches:
+                    raise OwnershipConflict("preparation budget lost its recorded allowance")
+                allowance = matches[0]
+                expected.update(used=lifetime - allowance["lifetime_start"],
+                                maximum=allowance["maximum"], lifetime_used=lifetime,
+                                allowance=reference)
+            if recorded != expected:
+                raise OwnershipConflict(
+                    "preparation continuation changed its unspent planning budget")
+            return current
+
+    def repair_allowance(self, token: dict, reference: dict, *, current=False) -> dict:
+        """Authenticate a sealed worker allowance; history may outlive its owner."""
+        with self.connect() as db:
+            allowances = self._repair_allowances(db, token["issue_id"])
+            matching = [(key, value) for key, value in allowances
+                        if {"checkpoint_key": key, "sha256": digest(value),
+                            "sequence": value["sequence"], **value["runtime"]} == reference]
+            if (not matching or matching[0][1]["sequence"] == 0
+                    or matching[0][1]["owner"]["generation"] > token["generation"]):
+                raise OwnershipConflict("worker repair allowance has no renewal receipt")
+            if current:
+                self.require(db, token)
+                if self._budget(db, token["issue_id"]).get("allowance") != reference:
+                    raise OwnershipConflict("worker repair allowance was superseded")
+            return matching[0][1]
+
     def repair(self, token: dict, key: str, reason: str, *, devflow_defect: bool = False) -> dict:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -775,9 +919,7 @@ class ExecutionRegistry:
                 self.require_settlement(db, token)
             else:
                 self.require(db, token)
-            limit = db.execute(
-                "SELECT * FROM execution_repair_limits WHERE issue_id=?", (token["issue_id"],)
-            ).fetchone()
+            budget = self._budget(db, token["issue_id"])
             old = db.execute(
                 "SELECT * FROM execution_repairs WHERE issue_id=? AND repair_key=?",
                 (token["issue_id"], key),
@@ -805,27 +947,23 @@ class ExecutionRegistry:
                     or bound["generation"] > token["generation"]
                 ):
                     raise OwnershipConflict("revision repair alias lost its exact cumulative debit")
-                return {
-                    "used": count,
-                    "maximum": limit["maximum"],
-                    "learning_required": bool(limit["learning_required"]),
-                }
+                return budget
             if old and old["reason"] != reason:
                 raise OwnershipConflict("repair identity changed")
             if not old and not devflow_defect:
-                if count >= limit["maximum"]:
+                if budget["used"] >= budget["maximum"]:
                     raise OwnershipConflict("feature product repair limit exhausted")
                 db.execute(
                     "INSERT INTO execution_repairs VALUES (?,?,?,?,?)",
                     (token["issue_id"], key, token["generation"], reason, now()),
                 )
                 count += 1
-            learning = bool(limit["learning_required"] or count >= 5 or devflow_defect)
+            learning = bool(budget["learning_required"] or count >= 5 or devflow_defect)
             db.execute(
                 "UPDATE execution_repair_limits SET learning_required=? WHERE issue_id=?",
                 (int(learning), token["issue_id"]),
             )
-            return {"used": count, "maximum": limit["maximum"], "learning_required": learning}
+            return self._budget(db, token["issue_id"])
 
     def current(self, issue_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -856,19 +994,7 @@ class ExecutionRegistry:
 
     def budget(self, issue_id: str) -> dict:
         with self.connect() as db:
-            row = db.execute(
-                "SELECT * FROM execution_repair_limits WHERE issue_id=?", (issue_id,)
-            ).fetchone()
-            if not row:
-                raise OwnershipConflict("feature has no admitted repair allowance")
-            used = db.execute(
-                "SELECT COUNT(*) FROM execution_repairs WHERE issue_id=?", (issue_id,)
-            ).fetchone()[0]
-            return {
-                "used": used,
-                "maximum": row["maximum"],
-                "learning_required": bool(row["learning_required"]),
-            }
+            return self._budget(db, issue_id)
 
     def drain(self, token: dict) -> None:
         with self.connect() as db:

@@ -55,8 +55,17 @@ that wait. A cancellation still settles the original operation before handoff.
 ## Controls and states
 
 Enable new admissions with `feature_delivery_version: 1` after custody migration.
-`max_repairs` defaults to 10 and is frozen for the feature across continuations.
-At five product repair cycles `learning_required` becomes true and remains true
+`max_repairs` defaults to 10 and is shared by all workstreams and plan corrections.
+A supported **Continue this feature** admission grants one fresh configured allowance
+when the server authenticates a new installed runtime payload descending from the
+previous installation. The registry retains every lifetime charge and an immutable
+allowance receipt. Ordinary continuation, command replay, restart, reinstalling the
+same payload, and revisiting an old payload grant no new cycles. Original worker
+iterations, candidates, sessions, approvals and submitted policies remain intact.
+`repair_budget.used` and `maximum` describe the current allowance; after runtime
+identity is recorded, `lifetime_used` preserves cumulative use and `allowance`
+identifies the installed payload and its receipt.
+At five lifetime product repair cycles `learning_required` becomes true and remains true
 after success. Known Devflow defects can set that passive flag without adding a
 product repair. The retrospective itself is separate work. Existing finite native
 provider retries remain separate; no additional infrastructure-repair controller

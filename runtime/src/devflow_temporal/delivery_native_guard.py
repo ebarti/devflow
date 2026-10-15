@@ -81,7 +81,8 @@ def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
         if role == "intake"
         else spec["policy"].get("max_repairs", 2)
     )
-    if role != "intake" and spec.get("retry_budget_version") != 1:
+    if role != "intake" and (spec.get("retry_budget_version") != 1
+                             or spec.get("repair_allowance")):
         with store._connect() as db:
             grants = db.execute(
                 """SELECT maximum_iteration FROM delivery_repair_grants WHERE run_id=?
@@ -103,6 +104,12 @@ def validate_native_turn(spec: dict, role: str, iteration: int, store) -> None:
                 maximum = recovery['maximum_iteration']
             else:
                 maximum = max([maximum, *(grant[0] for grant in grants)])
+    if role != "intake" and spec.get("repair_allowance"):
+        from .delivery_stopped_resume import validate_worker_allowance
+
+        # Gate-only continuations inherit the same receipt. Historical grant rows
+        # cannot enlarge its sealed ceiling, whatever continuation kind is active.
+        maximum = validate_worker_allowance(spec, current=True)["maximum_iteration"]
     if (
         role not in spec["policy"]["roles"]
         or type(iteration) is not int

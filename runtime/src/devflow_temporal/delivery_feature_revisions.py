@@ -589,6 +589,13 @@ def _refresh_preparation_reconsideration(store, original, public, values):
     proof, findings = _reconsideration_proof(
         store, original, selectors, public["record"], public["predecessor_closure"], values,
     )
+    if proof["original_repair_budget"] != receipt["original_repair_budget"]:
+        shared = _registry(original)
+        current_budget = shared.require_unspent_budget(
+            original["feature_delivery"]["owner"]["issue_id"], receipt["original_repair_budget"])
+        if proof["original_repair_budget"] != current_budget:
+            raise OwnershipConflict("preparation proof lost its current repair allowance")
+        proof["original_repair_budget"] = deepcopy(receipt["original_repair_budget"])
     if ({**proof, "current_runtime": receipt["current_runtime"]} != receipt
             or findings != public["unresolved_prior_findings"]):
         raise OwnershipConflict("preparation retry changed its reserved subject or prerequisites")
@@ -758,9 +765,7 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     candidate = json.loads(row["candidate_json"])
     original = store.effective_spec(public["predecessor_run_id"])
     proof, selectors = _refresh_preparation_reconsideration(store, original, public, values)
-    budget = shared.budget(token["issue_id"])
-    if budget != proof["original_repair_budget"]:
-        raise OwnershipConflict("preparation continuation changed its unspent planning budget")
+    shared.require_unspent_budget(token["issue_id"], proof["original_repair_budget"])
     receipt = {
         "version": 1, "revision_id": revision_id, "admission_sha256": digest(public),
         "predecessor": token, "successor_id": successor_id, "command": deepcopy(request),
@@ -769,7 +774,7 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
         "closure": {k: v for k, v in closed.items() if k != "result"},
         "observation": observation,
         "plan_approval": spec.get("plan_approval", "required"),
-        "config_digest": spec["config_digest"], "budget": budget,
+        "config_digest": spec["config_digest"], "budget": deepcopy(proof["original_repair_budget"]),
         "reconsideration": proof, "selectors": selectors,
     }
     if incoming:
