@@ -510,7 +510,17 @@ def _owned_native_spec(store, run_id):
     return spec
 
 
+def _reconcile_with_installation_lease(store, row, spec, closed):
+    from .delivery_interrupted_recovery import installation_recovery_lease
+
+    # The thread retains custody even if its awaiting asyncio task is cancelled.
+    with installation_recovery_lease(store.config):
+        _reconcile(store, row, spec, closed)
+
+
 async def reconcile_closed_native(store, client):
+    from .delivery_interrupted_recovery import InstallationRecoveryDeferred
+
     if (client.service_client.config.target_host != store.config.temporal_address
             or client.namespace != store.config.raw.get('temporal_namespace', 'default')):
         raise ValueError('native maintenance transport differs from frozen owner')
@@ -536,9 +546,12 @@ async def reconcile_closed_native(store, client):
             closed = {'workflow_id': description.id, 'execution_run_id': description.run_id,
                       'closed_at': description.close_time.isoformat(),
                       'status': description.status.name}
-            await asyncio.to_thread(_reconcile, store, row, spec, closed)
+            await asyncio.to_thread(_reconcile_with_installation_lease,
+                                    store, row, spec, closed)
         except asyncio.CancelledError:
             raise
+        except InstallationRecoveryDeferred:
+            continue
         except Exception as exc:
             # A transient read or foreign/edited configuration cannot stop another row.
             _LOG.warning('Native cleanup observation unavailable for %s: %s',
