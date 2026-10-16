@@ -406,6 +406,17 @@ def _disposable_work(manifest, row):
     if any(entry.get('generated_output_preservation', {}).get('state') == 'pending'
            for entry in manifest.get('roots', {}).values()):
         return True  # An exclusive preservation move may have lost its acknowledgement.
+    if (finalization.get('state') == 'unknown'
+            and finalization.get('process_cleanup') == 'observed-native-confirmed'
+            and any(entry['kind'] == 'generated' and entry.get('identity') is None
+                    and entry.get('state') == 'allocated'
+                    and entry.get('generated_output_preservation', {}).get('state') == 'preserved'
+                    and entry.get('receipt', {}).get('state') == 'failed_unknown'
+                    and entry['receipt'].get('path') == raw
+                    and entry['receipt'] in finalization.get('roots', [])
+                    and not os.path.lexists(raw)
+                    for raw, entry in manifest.get('roots', {}).items())):
+        return True  # Revalidate the original preservation before acknowledging cleanup.
     if (finalization.get('state') == 'confirmed'
             and (row['cleanup'] == 'unknown' or json.loads(row['checks_json'] or '{}').get(
                 'resource_cleanup', {}).get('resource_cleanup') != 'confirmed')):

@@ -23,6 +23,7 @@ from devflow_temporal.delivery_resources import (
     RunResources,
     observe_finalized_resources,
     read_private,
+    write_private,
 )
 
 
@@ -225,6 +226,30 @@ def test_failed_allocated_output_is_preserved_and_replayed_after_lost_ack(tmp_pa
     assert observed['finalization_sha256'] == hashlib.sha256(
         (resources.root / 'finalization.json').read_bytes()).hexdigest()
     assert resources.finalize('blocked')['state'] == 'confirmed'
+    manifest_bytes = resources.manifest.read_bytes()
+    intent_bytes = (folder / 'intent.json').read_bytes()
+    for changed in ('receipt', 'receipt_sha256', 'policy_digest', 'source'):
+        altered = json.loads(manifest_bytes)
+        marker = altered['roots'][str(report)]['generated_output_preservation']
+        try:
+            if changed in ('receipt', 'receipt_sha256'):
+                marker[changed] = (str(resources.root / 'foreign/receipt.json')
+                                   if changed == 'receipt' else '0' * 64)
+            else:
+                forged = json.loads(intent_bytes)
+                forged['binding'][changed] = ('0' * 64 if changed == 'policy_digest'
+                                               else str(root / 'dist/foreign'))
+                write_private(folder / 'intent.json', forged)
+                marker['intent_sha256'] = hashlib.sha256(
+                    (folder / 'intent.json').read_bytes()).hexdigest()
+            write_private(resources.manifest, altered)
+            before_observation = resources.manifest.read_bytes()
+            with pytest.raises(ValueError):
+                observe_finalized_resources(owned)
+            assert resources.manifest.read_bytes() == before_observation
+        finally:
+            (folder / 'intent.json').write_bytes(intent_bytes)
+            resources.manifest.write_bytes(manifest_bytes)
     retained = destination.with_name('retained-original')
     destination.rename(retained)
     destination.mkdir()
