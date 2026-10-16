@@ -195,14 +195,19 @@ async def test_closed_native_role_is_reconciled_after_worker_sigkill_without_rep
     'wrong_recovery', 'describe_error', 'foreign_owner', 'changed_config', 'non_native',
 ])
 async def test_uncertain_closed_row_does_not_reconcile_or_block_the_next_owner(
-    api_fixture, monkeypatch, uncertain,
+    api_fixture, monkeypatch, uncertain, tmp_path,
 ):
+    import threading
     from datetime import UTC, datetime
     from types import SimpleNamespace
 
     from temporalio.client import WorkflowExecutionStatus
 
     from devflow_temporal import delivery_orphans
+    from devflow_temporal.delivery_interrupted_recovery import (
+        InstallationRecoveryDeferred,
+        installation_recovery_lease,
+    )
 
     path, submission = api_fixture
     store = DeliveryStore(DeliveryConfig.load(path))
@@ -214,6 +219,7 @@ async def test_uncertain_closed_row_does_not_reconcile_or_block_the_next_owner(
             db.execute('INSERT INTO delivery_attempts '
                        '(job_key,run_id,role,iteration,candidate_id,state) VALUES (?,?,?,?,?,?)',
                        (f'attempt-{index}', f'run-{index}', 'implement', 0, 'input', 'starting'))
+    store.config.raw['execution_registry'] = str(tmp_path / 'ownership/registry.sqlite3')
     specs = {f'run-{index}': store.effective_spec(f'run-{index}') for index in range(2)}
     for spec in specs.values():
         spec['provider'] = 'codex'
@@ -266,11 +272,56 @@ async def test_uncertain_closed_row_does_not_reconcile_or_block_the_next_owner(
     client = SimpleNamespace(get_workflow_handle=Handle, namespace='default',
         service_client=SimpleNamespace(config=SimpleNamespace(
             target_host=store.config.temporal_address)))
+    with store._connect() as db:
+        before = list(db.iterdump())
+    with installation_recovery_lease(store.config, exclusive=True):
+        await delivery_orphans.reconcile_closed_native(store, client)
+        assert reconciled == []
+        with store._connect() as db:
+            assert list(db.iterdump()) == before
     await delivery_orphans.reconcile_closed_native(store, client)
     assert reconciled == ['run-1']
     with store._connect() as db:
         assert db.execute("SELECT COUNT(*) FROM delivery_attempts "
                           "WHERE state='starting' AND cleanup='none'").fetchone()[0] == 2
+
+    if uncertain == 'running':
+        # Cancelling the await cannot release custody of a still-running thread.
+        started, release, finished = (threading.Event() for _ in range(3))
+        completed = tmp_path / 'cleanup-completed'
+
+        def delayed_cleanup(_store, row, _spec, _closed):
+            started.set()
+            try:
+                assert release.wait(5)
+                completed.write_text(row['run_id'])
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(delivery_orphans, '_reconcile', delayed_cleanup)
+        task = asyncio.create_task(delivery_orphans.reconcile_closed_native(store, client))
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            with pytest.raises(InstallationRecoveryDeferred):
+                with installation_recovery_lease(store.config, exclusive=True):
+                    pass
+            assert not completed.exists()
+        finally:
+            release.set()
+            if not task.done():
+                await task
+            assert await asyncio.to_thread(finished.wait, 2)
+        assert completed.read_text() == 'run-1'
+        async with asyncio.timeout(2):
+            while True:
+                try:
+                    with installation_recovery_lease(store.config, exclusive=True):
+                        break
+                except InstallationRecoveryDeferred:
+                    await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
