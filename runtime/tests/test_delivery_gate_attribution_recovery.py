@@ -435,6 +435,13 @@ argv = ["uv", "--project", "workers/automation", "run", "--locked", "--all-extra
     broker = DeliveryBroker(store, child)
     broker.prepare()
     initial = broker.candidate()
+    first_implemented = first_publication = None
+    if browser_mode:
+        (broker.checkout / 'README.md').write_text('Earlier published source before repair\n')
+        first_implemented = broker.candidate()
+        _git(broker.checkout, 'add', 'README.md')
+        _git(broker.checkout, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Earlier publication')
+        first_publication = broker.candidate()
     (broker.checkout / 'README.md').write_text('Published identical source before attribution\n')
     implemented = broker.candidate()
     _git(broker.checkout, 'add', 'README.md')
@@ -462,7 +469,9 @@ argv = ["uv", "--project", "workers/automation", "run", "--locked", "--all-extra
                    (json.dumps(spec), spec['run_id']))
     broker = DeliveryBroker(store, spec)
     candidate = broker.candidate()
-    initial['policy_digest'] = implemented['policy_digest'] = spec['policy_digest']
+    for historical in (initial, implemented, first_implemented, first_publication):
+        if historical is not None:
+            historical['policy_digest'] = spec['policy_digest']
     publication = {'number': 7, 'head': candidate['head'], 'candidate': candidate,
                    'url': 'https://github.com/example/fixture/pull/7', 'state': 'OPEN'}
     monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_a, **_kw: {
@@ -516,12 +525,15 @@ argv = ["uv", "--project", "workers/automation", "run", "--locked", "--all-extra
         )
 
         qa = spec['policy']['browser_qa']
-        browser_folder = root / 'browser-qa/0'
+        gate = root / 'gates/1/verify'
+        private_directory(gate.parent)
+        subprocess.run(['git', 'clone', '-q', str(broker.checkout), str(gate)], check=True)
+        browser_folder = root / 'browser-qa/1'
         private_directory(browser_folder / 'artifacts/0')
         screenshot = browser_folder / 'artifacts/0/success.png'
         screenshot.write_bytes(b'owned frozen screenshot')
         screenshot.chmod(0o600)
-        log = '1 passed\n' + json.dumps({'config': {'rootDir': str(broker.checkout)},
+        log = '1 passed\n' + json.dumps({'config': {'rootDir': str(gate)},
             'stats': {'expected': 1}, 'suites': [{'specs': [{'file': 'selected.spec.ts',
                 'tests': [{'status': 'expected', 'expectedStatus': 'passed',
                            'results': [{'status': 'passed'}]}]}]}]})
@@ -536,15 +548,15 @@ argv = ["uv", "--project", "workers/automation", "run", "--locked", "--all-extra
             'phase': 'finished', 'monitoring_complete': True,
             'result': monitor, 'runtime_identity': old_runtime, 'intent': {
                 'run_id': spec['run_id'], 'policy_digest': spec['policy_digest'],
-                'cwd': str(root / 'gates/0/verify'), 'ports': list(qa['ports'].values()),
+                'cwd': str(gate), 'ports': list(qa['ports'].values()),
                 'argv': qa['argv'], 'environment_sha256': digest(launch['environment'])}})
         browser = {'state': 'passed', 'candidate_id': candidate['id'],
             'source_unchanged': True, 'cleanup': 'confirmed', 'argv': qa['argv'],
-            'cwd': str(root / 'gates/0/verify'), 'qa_config_sha256': digest(qa),
+            'cwd': str(gate), 'qa_config_sha256': digest(qa),
             'log': str(browser_folder / 'browser-qa.log'),
             'log_sha256': hashlib.sha256(log.encode()).hexdigest(), 'native_process': monitor,
-            'selectors': selector_evidence(qa, broker.checkout,
-                resolve_required_selectors(qa, broker.checkout), playwright=log),
+            'selectors': selector_evidence(qa, gate,
+                resolve_required_selectors(qa, gate), playwright=log),
             'artifacts': [{'path': str(screenshot), 'size': screenshot.stat().st_size,
                           'sha256': hashlib.sha256(screenshot.read_bytes()).hexdigest()}]}
         write_private(browser_folder / 'receipt.json', browser)
@@ -557,19 +569,26 @@ argv = ["uv", "--project", "workers/automation", "run", "--locked", "--all-extra
                       qa={'state': 'failed', 'candidate_id': candidate['id']})
     session, roles, scheduled = 'original-native-session', [], []
     start = datetime(2026, 10, 16, 10, tzinfo=UTC)
-    turns = [('implement', 0, initial, implemented, 'pass', 2)]
-    if browser_mode:
-        turns.append(('verify', 0, candidate, candidate, 'findings', 6))
-    turns.append(('implement', 1, candidate, candidate, 'findings', 8 if browser_mode else 6))
+    final_iteration = 2 if browser_mode else 1
+    turns = ([('implement', 0, initial, first_implemented, 'pass', 2),
+              ('implement', 1, first_publication, implemented, 'pass', 6),
+              ('review', 1, candidate, candidate, 'pass', 10),
+              ('verify', 1, candidate, candidate, 'findings', 12),
+              ('implement', 2, candidate, candidate, 'findings', 14)] if browser_mode else
+             [('implement', 0, initial, implemented, 'pass', 2),
+              ('implement', 1, candidate, candidate, 'findings', 6)])
     for role_name, iteration, input_candidate, output, status, event in turns:
-        actor_session = session if role_name == 'implement' else 'original-verifier-session'
-        workspace = spec['checkout'] if role_name == 'implement' else str(root / 'gates/0/verify')
+        actor_session = (session if role_name == 'implement' else
+                         'original-' + role_name + '-session')
+        workspace = (spec['checkout'] if role_name == 'implement' else
+                     str(root / 'gates' / str(iteration) / role_name))
         body = {'spec': spec, 'role': role_name, 'iteration': iteration,
                 'candidate': input_candidate,
                 'resume_session': session if iteration and role_name == 'implement' else None,
-                'evidence_context': {'candidate': candidate, 'iteration': 0, 'checks': checks}
-                if iteration else {}}
-        if browser_mode and iteration:
+                'evidence_context': {'candidate': candidate,
+                    'iteration': final_iteration - 1, 'checks': checks}
+                if iteration == final_iteration else {}}
+        if browser_mode and iteration == final_iteration:
             body['findings'] = [missing_finding]
         scheduled.append(deepcopy(body))
         job = DeliverySupervisor._job_key(body)
@@ -620,13 +639,15 @@ argv = ["uv", "--project", "workers/automation", "run", "--locked", "--all-extra
                         321, 'finished-pid',
                         (start + timedelta(seconds=event)).isoformat(),
                         (start + timedelta(seconds=event + 1)).isoformat(), body['result_path']))
-    state = {'run_id': spec['run_id'], 'revision': 7, 'iteration': 1, 'phase': 'blocked',
+    state = {'run_id': spec['run_id'], 'revision': 7, 'iteration': final_iteration,
+             'phase': 'blocked',
              'execution_state': 'blocked', 'outcome': 'blocked', 'cleanup': 'confirmed',
              'error': 'implementer did not establish a pass', 'roles': roles,
              'candidate': candidate, 'pull_request': publication, 'checks': {}, 'usage': {}}
     store.project(spec['run_id'], phase='blocked', execution_state='blocked', outcome='blocked',
                   cleanup='confirmed', error=state['error'], candidate=candidate,
-                  pull_request=publication, iteration=1, protocol_revision=7, checks={}, usage={},
+                  pull_request=publication, iteration=final_iteration, protocol_revision=7,
+                  checks={}, usage={},
                   event_type='blocked', message=state['error'])
     with store._connect() as db:
         store.state.release_work(db, spec['work_id'], 'external:devflow:' + spec['run_id'])
@@ -644,10 +665,16 @@ argv = ["uv", "--project", "workers/automation", "run", "--locked", "--all-extra
                 original_execution_run_id='original-native-closed',
                 input=await encoded([spec, None]), memo=Memo(fields={'request_digest':
                     (await DELIVERY_DATA_CONVERTER.encode([spec['request_digest']]))[0]})))]
-        for name, body, result in [('delivery_role', scheduled[0], roles[0]),
-                ('delivery_publish', {'spec': spec, 'candidate': implemented, 'iteration': 0},
-                 publication), *[('delivery_role', body, role)
-                   for body, role in zip(scheduled[1:], roles[1:], strict=True)]]:
+        operations = []
+        for body, role in zip(scheduled, roles, strict=True):
+            operations.append(('delivery_role', body, role))
+            if role['role'] == 'implement' and role['status'] == 'pass':
+                published = ({**publication, 'head': first_publication['head'],
+                              'candidate': first_publication} if browser_mode
+                             and role['iteration'] == 0 else publication)
+                operations.append(('delivery_publish', {'spec': spec,
+                    'candidate': role['candidate'], 'iteration': role['iteration']}, published))
+        for name, body, result in operations:
             event_id = len(events) + 1
             events.extend([HistoryEvent(event_id=event_id,
                 activity_task_scheduled_event_attributes=ActivityTaskScheduledEventAttributes(
@@ -781,12 +808,23 @@ def test_public_native_browser_handoff_reassesses_without_writer_or_history_debi
 
     item = original
     before = deepcopy(item.state)
+    assert [(r['role'], r['iteration']) for r in before['roles']] == [
+        ('implement', 0), ('implement', 1), ('review', 1), ('verify', 1), ('implement', 2)]
     proof = browser.observe_browser_artifacts(item.store, item.spec, item.row, item.state,
         item.attempts, item.closed, None, item.broker)
     assert proof['unpassed_status'] == 'findings'
     assert proof['cause'] == 'missing_selected_browser_artifacts'
     assert not attribution.possible(item.store, item.spec, item.row)
     assert browser.browser_artifact_possible(item.store, item.spec, item.row)
+    historical_source = Path(item.spec['state_dir']) / 'gates/1/verify/selected.spec.ts'
+    original_source = historical_source.read_bytes()
+    historical_source.write_bytes(original_source + b'// stale historical gate\n')
+    try:
+        with pytest.raises(ValueError, match='exact historical gate candidate'):
+            browser.observe_browser_artifacts(item.store, item.spec, item.row, item.state,
+                item.attempts, item.closed, None, item.broker)
+    finally:
+        historical_source.write_bytes(original_source)
     shared, token = item.shared, item.token
     shared.finish_worker(token, worker_key(item.spec['run_id'], token), {'cleanup': 'confirmed'})
     shared.stop(token, 'browser-controller-handoff', {})
@@ -844,7 +882,7 @@ def test_public_native_browser_handoff_reassesses_without_writer_or_history_debi
         if name == 'delivery_role':
             assert body['role'] in {'review', 'verify'}
             assert all(finding in str(body) for finding in proof['unresolved_findings'])
-            return {'role': body['role'], 'status': 'pass', 'iteration': 1,
+            return {'role': body['role'], 'status': 'pass', 'iteration': before['iteration'],
                     'session_id': 'fresh-' + body['role'], 'cleanup': 'confirmed',
                     'candidate': recovery['candidate']}
         return {'state': 'passed', 'cleanup': 'confirmed'}
@@ -866,7 +904,7 @@ def test_public_native_browser_handoff_reassesses_without_writer_or_history_debi
         assert [tuple(row) for row in db.execute('SELECT * FROM execution_repairs')] == charges
     with item.store._connect() as db:
         assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
-    artifact_parent = Path(item.spec['state_dir']) / 'browser-qa/0/artifacts/0'
+    artifact_parent = Path(item.spec['state_dir']) / 'browser-qa/1/artifacts/0'
     retained_parent = artifact_parent.with_name('retained-original')
     artifact_parent.rename(retained_parent)
     try:

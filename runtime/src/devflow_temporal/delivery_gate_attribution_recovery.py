@@ -110,7 +110,7 @@ def _original_progress(store, spec, row, state, attempts, closed, *, resource_sp
                         event.event_id, await DELIVERY_DATA_CONVERTER.decode(item.result.payloads))
         roles = state.get('roles', [])
         if (not roles or roles[0].get('role') != 'implement' or roles[0].get('iteration') != 0
-                or len(calls) != len(roles) or len(publications) != 1
+                or len(calls) != len(roles) or not publications
                 or set(calls) | set(publications) != set(done)):
             raise ValueError('attribution retry lost its complete original native role history')
         session = roles[0].get('session_id')
@@ -151,23 +151,42 @@ def _original_progress(store, spec, row, state, attempts, closed, *, resource_sp
                 resource_spec=resource_spec, scheduled_input=scheduled))
         if used != {a['job_key'] for a in attempts} or len(used) != len(attempts):
             raise ValueError('attribution retry omitted an original supervised native attempt')
-        published_id, publication_request = next(iter(publications.items()))
-        published_end, publication_result = done[published_id]
-        before = next((role for role in roles if role.get('role') == 'implement'
-                       and role.get('iteration') == publication_request.get('iteration')
-                       and role.get('status') == 'pass'
-                       and role.get('candidate') == publication_request.get('candidate')), None)
         candidate = full_candidate(state['candidate'])
-        if (not before or publication_request.get('spec') != spec
-                or publication_result != [state.get('pull_request')]
-                or full_candidate(state['pull_request'].get('candidate')) != candidate
-                or any(before['candidate'].get(key) != candidate[key] for key in (
-                    'content_sha256', 'base_sha', 'environment_digest', 'policy_digest'))
-                or not done[next(event for event, request in calls.items()
-                                 if request.get('role') == 'implement'
-                                 and request.get('iteration') == before['iteration'])][0]
-                < published_id < published_end < next(reversed(calls))):
-            raise ValueError('attribution retry lost its completed unchanged-source publication')
+        publication_result, before = None, None
+        published_authors = set()
+        for published_id, publication_request in publications.items():
+            published_end, results = done[published_id]
+            matching = [role for role in roles if role.get('role') == 'implement'
+                        and role.get('iteration') == publication_request.get('iteration')
+                        and role.get('status') == 'pass'
+                        and role.get('candidate') == publication_request.get('candidate')]
+            before = matching[0] if len(matching) == 1 else None
+            publication_result = results[0] if len(results) == 1 else None
+            if not isinstance(publication_result, dict):
+                raise ValueError('attribution retry lost its completed native publication')
+            published = full_candidate(publication_result.get('candidate'))
+            authoring = [event for event, request in calls.items()
+                         if request.get('role') == 'implement'
+                         and before is not None and request.get('iteration') == before['iteration']]
+            preceding = next((event for event in reversed(calls) if event < published_id), None)
+            following = next((event for event in calls if event > published_id), None)
+            if (not before or publication_request.get('spec') != spec
+                    or len(authoring) != 1 or following is None
+                    or authoring[0] != preceding or authoring[0] in published_authors
+                    or publication_result.get('state') != 'OPEN'
+                    or publication_result.get('number') != state['pull_request'].get('number')
+                    or publication_result.get('url') != state['pull_request'].get('url')
+                    or publication_result.get('head') != published['head']
+                    or any(before['candidate'].get(key) != published[key] for key in (
+                        'content_sha256', 'base_sha', 'environment_digest', 'policy_digest'))
+                    or full_candidate(calls[following].get('candidate')) != published
+                    or not done[authoring[0]][0] < published_id < published_end < following):
+                raise ValueError('attribution retry lost its completed unchanged-source '
+                                 'publication')
+            published_authors.add(authoring[0])
+        if (publication_result != state.get('pull_request')
+                or full_candidate(publication_result.get('candidate')) != candidate):
+            raise ValueError('attribution retry lost its exact final native publication')
         custody = implementation_custody(spec, state, attempts, None)
         if not custody or custody['session_id'] != session:
             raise ValueError('attribution retry lost its original implementation session custody')
@@ -176,7 +195,7 @@ def _original_progress(store, spec, row, state, attempts, closed, *, resource_sp
                          'native_progress_sha256': digest(proofs),
                          'session_custody': custody,
                          'published_implementation': before['candidate'],
-                         'publication_sha256': digest(publication_result[0])}, proofs[-1]
+                         'publication_sha256': digest(publication_result)}, proofs[-1]
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(lambda: asyncio.run(read())).result(35)
