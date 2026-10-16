@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ def stopped_feature_scope(service, monkeypatch):
     from test_delivery_feature_execution import feature_service
 
     from devflow_temporal import delivery_feature_activities as activities
+    from devflow_temporal.delivery_activities import _bind_planning_repair
     from devflow_temporal.delivery_feature_execution import (
         register_worker,
         registry,
@@ -54,6 +56,7 @@ def stopped_feature_scope(service, monkeypatch):
     store.submit(request)
     parent = store.effective_spec(request['run_id'])
     shared, token = registry(parent), parent['feature_delivery']['owner']
+    shared.checkpoint(token, 'accepted-plan', {'digest': digest(plan)})
     chunk = ordered_chunks(plan)[0]
     issue = {'id': 'I_child', 'number': 10, 'url': 'https://github.com/example/fixture/issues/10'}
     _git(source, 'checkout', '-b', 'prerequisite')
@@ -68,6 +71,7 @@ def stopped_feature_scope(service, monkeypatch):
         'chunk_id': chunk['id'], 'kind': 'build'})
     broker = DeliveryBroker(store, child)
     broker.prepare()
+    input_candidate = broker.candidate()
     (broker.checkout / 'README.md').write_text('Retained partial implementation\n')
     candidate = broker.candidate()
     evidence = broker.state_dir / 'scope-finding.txt'
@@ -81,11 +85,26 @@ def stopped_feature_scope(service, monkeypatch):
     receipt = {'status': 'blocked', 'session_id': 'original-implementation',
                'finish_reason': 'done', 'cleanup': 'confirmed',
                'findings': ['contract.test.ts and exemptions.json require owning-file edits'],
+               'native_process': {'state': 'finished', 'exit_code': 0,
+                                  'cleanup': 'observed-native-confirmed',
+                                  'monitoring_complete': True, 'stdio_drained': True},
+               'summary': 'Retained native assessment requires omitted owning files',
                'planning_defect': diagnostic}
+    initial = {**copy.deepcopy(receipt), 'status': 'findings',
+               'planning_defect': {**copy.deepcopy(diagnostic),
+                                   'candidate_id': input_candidate['id']}}
+    initial_role = {key: value for key, value in initial.items() if key != 'planning_defect'}
+    initial_role.update(role='implement', iteration=0, candidate=candidate,
+                        input_candidate_id=input_candidate['id'])
+    shared.repair(token, child['run_id'] + ':1', 'Product repair at worker iteration 1')
+    role = _bind_planning_repair({'spec': child, 'iteration': 1}, copy.deepcopy(receipt))
+    assert role.get('planning_defect_repair') and 'planning_defect_repair' not in receipt
+    role.update(role='implement', iteration=1, candidate=candidate,
+                input_candidate_id=candidate['id'])
     state = {'run_id': child['run_id'], 'phase': 'blocked', 'outcome': 'blocked',
              'execution_state': 'blocked', 'cleanup': 'confirmed', 'revision': 9, 'iteration': 1,
              'candidate': candidate, 'pull_request': None,
-             'roles': [{**receipt, 'role': 'implement', 'iteration': 1, 'candidate': candidate}],
+             'roles': [initial_role, role],
              'checks': {'planning_defect': diagnostic},
              'error': 'workstream identified a planning defect'}
     store.project(child['run_id'], phase='blocked', execution_state='blocked', outcome='blocked',
@@ -93,11 +112,12 @@ def stopped_feature_scope(service, monkeypatch):
                   error=state['error'], iteration=1, protocol_revision=9,
                   candidate=candidate, checks=state['checks'])
     with store._connect() as db:
-        db.execute("INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,state,"
-                   "session_id,result_json,cleanup) "
-                   "VALUES (?,?,'implement',1,?,'finished',?,?,'confirmed')",
-                   ('original-build', child['run_id'], candidate['id'], receipt['session_id'],
-                    canonical_json(receipt)))
+        for iteration, native, admitted in ((0, initial, input_candidate), (1, receipt, candidate)):
+            db.execute("INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
+                       "state,session_id,result_json,cleanup) "
+                       "VALUES (?,?,'implement',?,?,'finished',?,?,'confirmed')",
+                       ('original-build-' + str(iteration), child['run_id'], iteration,
+                        admitted['id'], receipt['session_id'], canonical_json(native)))
         store.state.release_work(db, child['work_id'], 'external:devflow:' + child['run_id'])
     shared.finish_worker(token, worker_key(child['run_id'], token), {'cleanup': 'confirmed'})
     shared.stop(token, 'original-feature-stop', {})
@@ -139,6 +159,7 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
 
     from devflow_temporal import delivery_feature_activities as activities
     from devflow_temporal.delivery_api import create_app
+    from devflow_temporal.delivery_execution_registry import ExecutionRegistry
     from devflow_temporal.delivery_feature_execution import continue_feature, registry
     from devflow_temporal.delivery_feature_scope import MARKER
     from devflow_temporal.delivery_github_contract import GitHubDelivery
@@ -147,7 +168,36 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
     store, parent, child, broker, state, command = stopped_feature_scope
     original = copy.deepcopy(child)
     before = copy.deepcopy(state)
+    with store._connect() as db:
+        native_attempt = dict(db.execute('SELECT * FROM delivery_attempts '
+                                         'WHERE run_id=? AND iteration=1',
+                                         (child['run_id'],)).fetchone())
+    for absent in (False, True):
+        ordinary = copy.deepcopy(before['roles'][-1])
+        ordinary.pop('planning_defect_repair')
+        native = json.loads(native_attempt['result_json'])
+        ordinary['planning_defect'] = native['planning_defect'] = None
+        if absent:
+            ordinary.pop('planning_defect')
+            native.pop('planning_defect')
+        assert resume._implementation_receipt(
+            child, ordinary, {**native_attempt, 'result_json': canonical_json(native)})
     shared = registry(parent)
+    registry_before = {p: p.read_bytes() for p in shared.path.parent.iterdir() if p.is_file()}
+    real_open = os.open
+    def readonly_open(path, flags, *args, **kwargs):
+        if Path(path).parent == shared.path.parent:
+            assert not flags & (os.O_CREAT | os.O_RDWR | os.O_WRONLY | os.O_TRUNC)
+        return real_open(path, flags, *args, **kwargs)
+    with monkeypatch.context() as readonly:
+        readonly.setattr(os, 'open', readonly_open)
+        readonly.setattr(ExecutionRegistry, '__init__',
+                         lambda *_: pytest.fail('read-only receipt initialized registry schema'))
+        observed = resume.review_snapshot(store, child['run_id'])
+    assert observed['session_id'] == 'original-implementation'
+    assert observed['candidate'] == before['candidate']
+    assert {p: p.read_bytes() for p in shared.path.parent.iterdir()
+            if p.is_file()} == registry_before
     original_owner = shared.current('I_feature')
     remote = copy.deepcopy(parent['feature_delivery']['snapshot'])
     changed = json.loads(parent['accepted_plan'])
@@ -246,7 +296,7 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
     assert imported.validate_candidate_scope() == {'README.md', *command['added_paths']}
     for name in command['added_paths']:
         assert (imported.checkout / name).read_text() == 'Corrected owning file\n'
-    assert registry(successor).budget('I_feature')['used'] == 0
+    assert registry(successor).budget('I_feature')['used'] == 1
     # An ordinary later continuation inherits the same guard and sealed receipt.
     integration_spec = integration['spec']
     shared.finish_worker(token, worker_key(integration_spec['run_id'], token),
@@ -270,7 +320,10 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
     assert store.effective_spec(successor['run_id'])[MARKER] == successor[MARKER]
 
 
-@pytest.mark.parametrize('drift', ['owner', 'session', 'candidate', 'config', 'path'])
+@pytest.mark.parametrize('drift', [
+    'owner', 'session', 'candidate', 'config', 'path', 'missing-binding', 'diagnostic-digest',
+    'repair-key', 'revision-id', 'missing-debit', 'wrong-reason', 'paid-owner',
+    'native-result', 'wrong-assignment'])
 def test_feature_scope_refuses_changed_custody_before_new_admission(stopped_feature_scope, drift):
     from devflow_temporal.delivery_feature_execution import continue_feature, registry
 
@@ -279,7 +332,7 @@ def test_feature_scope_refuses_changed_custody_before_new_admission(stopped_feat
         with registry(parent).connect() as db:
             db.execute('UPDATE execution_claims SET generation=generation+1')
     elif drift == 'session':
-        state['roles'][0]['session_id'] = 'foreign-session'
+        state['roles'][-1]['session_id'] = 'foreign-session'
     elif drift == 'candidate':
         (broker.checkout / 'README.md').write_text('Unsealed source change\n')
     elif drift == 'config':
@@ -288,8 +341,33 @@ def test_feature_scope_refuses_changed_custody_before_new_admission(stopped_feat
         raw['max_repairs'] = 99
         path.write_text(json.dumps(raw))
         command['amended_config_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
-    else:
+    elif drift == 'path':
         command['added_paths'] = ['*.ts']
+    elif drift == 'missing-binding':
+        del state['roles'][-1]['planning_defect_repair']
+    elif drift in {'diagnostic-digest', 'repair-key', 'revision-id'}:
+        field = {'diagnostic-digest': 'diagnostic_sha256', 'repair-key': 'repair_key',
+                 'revision-id': 'revision_id'}[drift]
+        state['roles'][-1]['planning_defect_repair'][field] = 'tampered'
+    elif drift == 'native-result':
+        with store._connect() as db:
+            row = db.execute('SELECT result_json FROM delivery_attempts '
+                             'WHERE run_id=? AND iteration=1', (child['run_id'],)).fetchone()
+            native = json.loads(row[0])
+            native['summary'] = 'Changed native assessment after controller closure'
+            db.execute('UPDATE delivery_attempts SET result_json=? WHERE run_id=? AND iteration=1',
+                       (canonical_json(native), child['run_id']))
+    else:
+        with registry(parent).connect() as db:
+            if drift == 'missing-debit':
+                db.execute('DELETE FROM execution_repairs')
+            elif drift == 'wrong-reason':
+                db.execute("UPDATE execution_repairs SET reason='unrelated repair'")
+            elif drift == 'paid-owner':
+                db.execute('UPDATE execution_repairs SET generation=generation+1')
+            else:
+                db.execute("UPDATE execution_workers SET workstream_id='foreign-workstream'")
+    budget = registry(parent).budget('I_feature')
     with store._connect() as db:
         before = db.execute('SELECT count(*) FROM delivery_runs').fetchone()[0]
     with pytest.raises(ValueError):
@@ -298,6 +376,7 @@ def test_feature_scope_refuses_changed_custody_before_new_admission(stopped_feat
         assert db.execute('SELECT count(*) FROM delivery_runs').fetchone()[0] == before
         assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
                               (command['command_id'],)).fetchone()
+    assert registry(parent).budget('I_feature') == budget
 
 
 @pytest.fixture
