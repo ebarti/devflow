@@ -477,6 +477,9 @@ class DeliverySupervisor:
                     break
                 await asyncio.sleep(0.05)
             if not start_path.is_file():
+                # A late child still waits for GO; deny it with EOF before joining.
+                assert child.stdin is not None
+                child.stdin.close()
                 await child.wait()
                 return self._mark_unknown(
                     job_key, "role child did not report a startup identity"
