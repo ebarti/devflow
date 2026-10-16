@@ -178,16 +178,18 @@ async def test_checks_overlap_but_obey_finite_slots(owned_checks):
 
 
 @pytest.mark.parametrize("stop", ["cancel", "timeout"])
-async def test_activity_stop_joins_real_native_tree_before_slot_reuse(owned_checks, stop):
+async def test_activity_stop_joins_real_native_tree_before_slot_reuse(owned_checks, stop, tmp_path):
     owned_checks.config.raw["check_concurrency"] = 1
     request = owned_checks.request("stopped", seconds=2)
+    completion_barrier = tmp_path / "release-activity-stop-fixture"
+    request["spec"]["completion_barrier"] = str(completion_barrier)
     broker = owned_checks.brokers["stopped"]
     task = asyncio.create_task(activities.delivery_checks(request))
     journal = Path(broker.spec["state_dir"]) / "native/native-process.json"
-    await wait_until(journal.exists)
-    await asyncio.sleep(0.2)
+    await wait_until(lambda: observed_native_tree(journal))
     following = asyncio.create_task(activities.delivery_precheck(owned_checks.request("following")))
     try:
+        assert not broker.finished.is_set()
         if stop == "cancel":
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -199,6 +201,7 @@ async def test_activity_stop_joins_real_native_tree_before_slot_reuse(owned_chec
         assert broker.result["cancelled"] is True
         assert_stopped(broker)
     finally:
+        completion_barrier.touch()
         await wait_until(broker.finished.is_set)
         await following
     assert owned_checks.maximum() == 1

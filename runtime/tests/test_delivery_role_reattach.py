@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -46,6 +47,62 @@ async def test_lost_activity_response_reuses_completed_implementation(role_fixtu
     assert second == first
     with store._connect() as db:
         assert [dict(row) for row in db.execute('SELECT * FROM delivery_attempts')] == before
+
+
+@pytest.mark.asyncio
+async def test_late_fake_start_exits_without_authorizing_work(role_fixture, monkeypatch):
+    store, broker, request = role_fixture
+    spawn, sleep = asyncio.create_subprocess_exec, asyncio.sleep
+    children = []
+    code = """
+import json,os,sys,time
+from pathlib import Path
+request=json.loads(Path(sys.argv[1]).read_text())
+start=Path(request['start_path'])
+while not start.with_suffix('.release').exists(): time.sleep(0.01)
+start.write_text(json.dumps({'pid':os.getpid()}))
+if sys.stdin.readline().strip() != 'GO': raise SystemExit(2)
+(Path(request['workspace'])/'devflow-fake-change.txt').touch()
+"""
+
+    async def delayed_child(*argv, **kwargs):
+        argv = list(argv)
+        argv[argv.index(sys.executable)] = str(Path(sys.executable).resolve())
+        argv[argv.index('-m'):] = ['-c', code, argv[-1]]
+        child = await spawn(*argv, **kwargs)
+        children.append(child)
+        wait = child.wait
+        start = Path(argv[-1]).with_name('start.release')
+
+        async def release_then_wait():
+            # The child starts only after the supervisor denies its startup.
+            start.touch()
+            return await wait()
+
+        monkeypatch.setattr(child, 'wait', release_then_wait)
+        return child
+
+    async def poll_without_delay(_seconds):
+        await sleep(0)
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', delayed_child)
+    monkeypatch.setattr(asyncio, 'sleep', poll_without_delay)
+    try:
+        result = await asyncio.wait_for(delivery_role(request), timeout=3)
+        assert result['status'] == 'recovery_unknown'
+        assert len(children) == 1 and children[0].returncode == 2
+        assert not (broker.checkout / 'devflow-fake-change.txt').exists()
+        with store._connect() as db:
+            row = db.execute('SELECT state,cleanup,result_path FROM delivery_attempts').fetchone()
+        assert row['state'] == 'unknown' and row['cleanup'] == 'unknown'
+        result_path = Path(row['result_path'])
+        assert result_path.with_name('start.json').is_file()
+        assert not result_path.exists()
+    finally:
+        for child in children:
+            if child.returncode is None:
+                child.kill()
+            await child.wait()
 
 
 @pytest.mark.asyncio
