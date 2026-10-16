@@ -101,6 +101,9 @@ def build_server(config_path: Path) -> FastMCP:
         Supply command_id and expected_revision from the current projection.
         Ownership must be stopped with workers/effects settled. Earlier repair
         cycles and published PRs remain attached to the same GitHub feature.
+        A retained planning-defect build may add one or two unchanged tracked
+        files with added_paths, amended_config_path and amended_config_sha256;
+        the private config must change only that exact appended file list.
         """
         return client(config_path).continue_feature(run_id, json.loads(request_json))
 

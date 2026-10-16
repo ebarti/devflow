@@ -493,7 +493,8 @@ class DeliveryStore:
         return int(cursor.lastrowid)
 
     def submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None,
-               _feature_revision: dict | None = None) -> dict[str, Any]:
+               _feature_revision: dict | None = None,
+               _feature_scope: dict | None = None) -> dict[str, Any]:
         run_id = supplied.get("run_id")
         command_id = supplied.get("command_id")
         if not isinstance(run_id, str) or not isinstance(command_id, str):
@@ -557,6 +558,9 @@ class DeliveryStore:
             from .delivery_feature_revisions import authenticate_continued_plan
 
             authenticate_continued_plan(self, spec)
+            from .delivery_feature_scope import prepare_submission
+
+            prepare_submission(self, spec, _feature_scope)
         if _feature_revision is not None:
             from .delivery_feature_revisions import authenticate_revision_submission
 

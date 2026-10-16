@@ -333,6 +333,14 @@ def resume_worker(store, parent, child, row):
                        expected_pr_number=sealed['publication']['number'])
     else:
         command['expected_candidate_head'] = candidate['head']
+    from .delivery_feature_scope import MARKER
+
+    scope = parent.get(MARKER)
+    if (scope and scope['worker_run_id'] == child['run_id']
+            and child.get(MARKER) != scope):
+        command.update(scope['scope'])
+        # Refuse changed scope/custody before reserving the successor writer.
+        admit(store, child['run_id'], command, preflight=True)
     shared.reserve_worker(
         token, worker_key(child["run_id"], token), child["feature_worker"]["workstream_id"]
     )
