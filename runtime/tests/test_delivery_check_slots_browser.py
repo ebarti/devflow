@@ -85,10 +85,15 @@ def browser_checks(tmp_path, monkeypatch):
         db.row_factory = sqlite3.Row
         return db
 
-    def request(name, seconds=0.5, release=None):
+    def request(name, seconds=0.5, release=None, *, owned_checkout=False):
         value = spec(tmp_path, name)
         checkout = Path(value["checkout"])
+        if owned_checkout:
+            checkout.parent.mkdir(parents=True, exist_ok=True)
+            RunResources(value).register(checkout, "checkout")
         checkout.mkdir(parents=True)
+        if owned_checkout:
+            RunResources(value).created(checkout)
         (checkout / "README.md").write_text("Owned browser fixture\n")
         _git(checkout, "init", "-q")
         _git(checkout, "add", ".")
@@ -380,3 +385,106 @@ async def test_actual_cached_browser_reconciliation_retains_capacity(
     assert_locked(root / "slot-0.lock")
     for port in browser_checks.ports:
         assert_locked(root / f"port-{port}.lock")
+
+
+async def test_selected_playwright_retains_real_success_evidence(
+    browser_checks, tmp_path, monkeypatch,
+):
+    """Optional installed-browser probe; no product checkout or provider is executed."""
+    import shutil
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    cli = os.environ.get("DEVFLOW_TEST_PLAYWRIGHT_CLI")
+    chromium = os.environ.get("DEVFLOW_TEST_CHROMIUM_EXECUTABLE")
+    if not cli or not chromium or not shutil.which("node"):
+        pytest.skip("set installed Playwright CLI and Chromium executable for evidence probe")
+    request = browser_checks.request("selected-evidence", owned_checkout=True)
+    broker = browser_checks.brokers["selected-evidence"]
+    checkout = Path(request["spec"]["checkout"])
+    module = str(Path(cli).with_name("test.js"))
+    (checkout / ".gitignore").write_text("dist/\n")
+    (checkout / "fixture.html").write_text("<h1>Owned browser evidence</h1>")
+    (checkout / "server.py").write_text(
+        "import http.server, sys\n"
+        "http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), "
+        "http.server.SimpleHTTPRequestHandler).serve_forever()\n")
+    (checkout / "selected.spec.cjs").write_text(
+        f"const {{ test, expect }} = require({module!r});\n"
+        "test('retains successful browser evidence', async ({ page }, info) => {\n"
+        "  const response = await page.goto("
+        f"'http://127.0.0.1:{browser_checks.ports[0]}/fixture.html');\n"
+        "  expect(response.status()).toBe(200);\n"
+        "  await expect(page.locator('h1')).toHaveText('Owned browser evidence');\n"
+        "  console.log('owned request /fixture.html response ' + response.status());\n"
+        "  await page.screenshot({ path: info.outputPath('success.png') });\n"
+        "});\n")
+    (checkout / "second.spec.cjs").write_text((checkout / "selected.spec.cjs").read_text())
+    servers = [{"command": f"{sys.executable} server.py {port}",
+                "url": f"http://127.0.0.1:{port}"} for port in browser_checks.ports]
+    (checkout / "playwright.config.cjs").write_text(
+        "module.exports = " + json.dumps({
+            "testDir": ".", "testMatch": "*.spec.cjs", "workers": 1,
+            "outputDir": "dist/playwright-report",
+            "webServer": servers, "use": {"trace": "retain-on-failure",
+                "launchOptions": {"executablePath": chromium}},
+        }) + ";\n")
+    _git(checkout, "add", ".")
+    _git(checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+         "commit", "-qm", "selected browser evidence fixture")
+    # A tool shim preserves the admitted literal Playwright runner without package installation.
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    executable = tools / "playwright"
+    import shlex
+    executable.write_text("#!/bin/sh\nexec " + shlex.quote(shutil.which("node")) + " "
+                          + shlex.quote(cli) + ' "$@"\n')
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
+    qa = request["spec"]["policy"]["browser_qa"]
+    frozen_argv = ["playwright", "test", "--config", "playwright.config.cjs",
+                   "selected.spec.cjs", "second.spec.cjs",
+                   "--reporter=line,json", "--trace", "retain-on-failure"]
+    qa.update(argv=frozen_argv, artifact_paths=["dist/playwright-report"],
+              required_selectors=["selected.spec.cjs", "second.spec.cjs"],
+              selector_evidence_version=1,
+              selector_project=".")
+    request["candidate"] = broker.candidate()
+    original_policy = json.dumps(request["spec"]["policy"], sort_keys=True)
+    result = await activities.delivery_browser_qa(request)
+    assert result["state"] == "passed", result
+    assert result["argv"] == frozen_argv
+    assert json.dumps(request["spec"]["policy"], sort_keys=True) == original_policy
+    journal = read_private(Path(result["native_process"]["journal"]))
+    assert journal["intent"]["argv"] == result["effective_argv"]
+    assert result["effective_argv"] != frozen_argv
+    assert result["selectors"][0]["selector"] == "selected.spec.cjs"
+    assert all(selected["passed"] == 1 for selected in result["selectors"])
+    assert len(result["selectors"]) == result["test_count"] == 2
+    assert result["source_unchanged"] and broker.candidate() == request["candidate"]
+    artifacts = {Path(item["source"]).name: item for item in result["artifacts"]}
+    junit = Path(artifacts["junit.xml"]["path"])
+    assert len(ET.parse(junit).findall(".//testcase")) == 2
+    assert Path(artifacts["success.png"]["path"]).read_bytes().startswith(b"\x89PNG")
+    traces = [item for item in result["artifacts"] if Path(item["source"]).name == "trace.zip"]
+    assert len(traces) == 2
+    for item in traces:
+        with zipfile.ZipFile(item["path"]) as trace:
+            network = b"".join(trace.read(name) for name in trace.namelist()
+                               if name.endswith(".network"))
+            assert b"fixture.html" in network and b'"status":200' in network
+    assert "owned request /fixture.html response 200" in Path(result["log"]).read_text()
+    manifest = read_private(RunResources(request["spec"]).manifest)
+    output = checkout / "dist/playwright-report"
+    assert manifest["roots"][str(output)]["identity"]
+    receipt = Path(result["receipt"])
+    retained = receipt.read_bytes()
+    assert await activities.delivery_browser_qa(request) == result
+    assert receipt.read_bytes() == retained
+    original_junit = junit.read_bytes()
+    junit.write_bytes(original_junit + b"changed")
+    try:
+        with pytest.raises(ValueError, match="receipt authority changed"):
+            broker.run_browser_qa(0, request["candidate"])
+    finally:
+        junit.write_bytes(original_junit)

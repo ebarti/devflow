@@ -268,6 +268,12 @@ def resume_worker(store, parent, child, row):
             raise OwnershipConflict('worker lacks its exact retained report recovery proof')
         state = sealed['closed']['result']
         remaining, kind, admit = 0, gates.KIND, gates.admit
+    elif gates.browser_artifact_possible(store, child, row):
+        sealed = gates.snapshot(store, child["run_id"])
+        if not sealed.get("browser_artifact_observation"):
+            raise OwnershipConflict("worker lacks its exact browser artifact recovery proof")
+        state = sealed["closed"]["result"]
+        remaining, kind, admit = 0, gates.KIND, gates.admit
     elif possible(store, child, row) or preflight_continuation(row):
         sealed = gates.snapshot(store, child['run_id'])
         if not any(key in sealed for key in ('attribution_observation', 'preflight_continuation')):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 from pathlib import Path
@@ -60,6 +61,36 @@ def _artifacts(checkout: Path, configured: list[str]) -> list[dict[str, Any]]:
                 raise ValueError("browser QA artifact set exceeds the evidence bound")
             found.append({"path": str(path), "sha256": _hash(path), "size": path.stat().st_size})
     return found
+
+
+
+def _playwright_evidence(qa: dict, checkout: Path) -> tuple[list[str], dict[str, str]]:
+    """Generate real success evidence for selected recipes, including frozen v2 inputs."""
+    argv = list(qa["argv"])
+    if not qa.get("required_selectors"):
+        return argv, {}
+    start = next((i + 2 for i in range(len(argv) - 1)
+                  if argv[i:i + 2] == ["playwright", "test"]), None)
+    if start is None:
+        return argv, {}
+    if not qa.get("artifact_paths"):
+        raise ValueError("selected Playwright QA requires an owned artifact directory")
+    # Registration pins this existing configured root. Reject earlier output
+    # symlinks before the reporters or runner can write through them.
+    _artifacts(checkout, qa["artifact_paths"])
+    root = checkout / qa["artifact_paths"][0]
+    clean, index = argv[:start], start
+    while index < len(argv):
+        if argv[index] in {"--reporter", "--trace", "--output"}:
+            index += 2
+        elif argv[index].split("=", 1)[0] in {"--reporter", "--trace", "--output"}:
+            index += 1
+        else:
+            clean.append(argv[index])
+            index += 1
+    return ([*clean, "--reporter=line,json,junit", "--trace=on",
+             "--output=" + str(root / "test-results")],
+            {"PLAYWRIGHT_JUNIT_OUTPUT_FILE": str(root / "junit.xml")})
 
 
 def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
@@ -134,9 +165,11 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     scratch = RunResources(spec).browser_scratch()
     profile, environment = prepare_browser_qa(spec, checkout, folder, scratch, qa)
     generated = broker._register_generated(checkout, qa.get("artifact_paths", []))
+    argv, reporter_environment = _playwright_evidence(qa, checkout)
+    environment.update(reporter_environment)
     options = {
-        "argv": (list(qa["argv"]) if trusted_local(spec)
-                 else ["/usr/bin/sandbox-exec", "-f", str(profile), *qa["argv"]]),
+        "argv": (argv if trusted_local(spec)
+                 else ["/usr/bin/sandbox-exec", "-f", str(profile), *argv]),
         "cwd": cwd, "environment": environment, "timeout": qa["timeout_seconds"],
         "ports": ports, "cancelled": broker._native_cancelled,
     }
@@ -215,6 +248,8 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         **request,
         "state": "passed" if passed else "failed",
         "cwd": str(cwd),
+        "effective_argv": argv,
+        "reporter_environment": reporter_environment,
         "profile_sha256": _hash(profile),
         "execution_mode": spec["policy"].get("host_sandbox", "native-profile"),
         "exit_code": process["exit_code"],
@@ -238,3 +273,171 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     result.update(receipt=str(receipt), receipt_sha256=_hash(receipt))
     broker._finish_effect(key, result)
     return result
+
+
+def browser_artifact_possible(store, spec, row):
+    """Read-only routing hint; the admission separately authenticates the cause."""
+    if (spec.get("provider") != "codex" or spec.get("gate_retry_generation") is not None
+            or spec.get("feature_worker", {}).get("kind") != "chunk"
+            or row.get("error") != "implementer did not establish a pass"):
+        return False
+    from .delivery_feature_revision_subject import _private_receipt
+
+    with store._connect() as db:
+        attempts = list(db.execute("SELECT job_key FROM delivery_attempts WHERE run_id=? "
+            "AND role='implement' AND iteration=? AND state='finished'",
+            (spec["run_id"], row["iteration"])))
+    if (len(attempts) != 1 or not isinstance(attempts[0][0], str)
+            or len(attempts[0][0]) != 64
+            or any(char not in "0123456789abcdef" for char in attempts[0][0])):
+        return False
+    request = _private_receipt(Path(spec["state_dir"]) / "attempts" / attempts[0][0]
+                               / "request.json", canonical=True)
+    checks = (request.get("evidence_context") or {}).get("checks") or {}
+    findings = request.get("findings") or []
+    return (request.get("spec") == spec and bool(findings)
+            and all(isinstance(finding, str) and "junit" in finding.lower()
+                    and "trace" in finding.lower() for finding in findings)
+            and checks.get("local", {}).get("state") == "passed"
+            and checks.get("browser_qa", {}).get("state") == "passed"
+            and checks.get("qa", {}).get("state") == "failed")
+
+
+def observe_browser_artifacts(
+    store, spec, row, state, attempts, closed, transport, broker, *, resource_spec=None,
+):
+    """Retain a native rejection; authorize only fresh gates for absent browser artifacts."""
+    from .delivery_check_evidence import _owned_bytes
+    from .delivery_feature_gates import selector_evidence
+    from .delivery_feature_revision_recovery import gate_evidence
+    from .delivery_feature_revision_subject import (
+        _private_receipt,
+        _runtime,
+        bounded_findings,
+        full_candidate,
+    )
+    from .delivery_gate_attribution_recovery import _original_progress, eligible_stop
+
+    if (transport is not None or not eligible_stop(spec, state)
+            or spec.get("provider") != "codex" or spec.get("gate_selections_version") != 2):
+        raise ValueError("browser artifact retry requires its original selected native worker")
+    session, progress, proof = _original_progress(
+        store, spec, row, state, attempts, closed, resource_spec=resource_spec)
+    candidate = full_candidate(broker.candidate())
+    latest = next(r for r in reversed(state["roles"]) if r.get("role") == "implement")
+    passed = gate_evidence({"state": state, "candidate": candidate, "session_id": session,
+                            "attempts": attempts})
+    matches = [a for a in attempts if a["role"] == "implement"
+               and a["iteration"] == latest["iteration"] and a["session_id"] == session]
+    if (not passed or len(matches) != 1 or latest.get("iteration") != state["iteration"]
+            or latest.get("finish_reason") != "done" or latest.get("cleanup") != "confirmed"
+            or latest.get("session_id") != session
+            or full_candidate(latest.get("candidate")) != candidate):
+        raise ValueError("browser artifact retry cannot approve changed or unproved source")
+    request = _private_receipt(Path(spec["state_dir"]) / "attempts" / matches[0]["job_key"]
+                               / "request.json", canonical=True)
+    context = request.get("evidence_context") or {}
+    checks = context.get("checks") or {}
+    prior = context.get("iteration")
+    verifier = [r for r in state["roles"] if r.get("role") == "verify"
+                and r.get("iteration") == prior and r.get("status") != "pass"]
+    findings = bounded_findings(request.get("findings"))
+    latest_findings = bounded_findings(latest.get("findings"))
+    qa = spec["policy"].get("browser_qa") or {}
+    browser = checks.get("browser_qa") or {}
+    if (digest(request) != proof["request_sha256"] or len(verifier) != 1
+            or verifier[0].get("findings") != findings
+            or full_candidate(verifier[0].get("candidate")) != candidate
+            or not all(all(token in finding.lower() for token in ("junit", "trace"))
+                       for finding in [*findings, *latest_findings])
+            or not all("controller" in finding.lower() for finding in latest_findings)
+            or not all(token in spec.get("accepted_plan", "").lower()
+                       for token in ("junit", "trace"))
+            or full_candidate(context.get("candidate")) != candidate
+            or request.get("candidate", {}).get("id") != candidate["id"]
+            or not qa.get("required_selectors") or not qa.get("artifact_paths")
+            or "--reporter=line,json" not in qa["argv"]
+            or not any(qa["argv"][i:i + 2] == ["playwright", "test"]
+                       for i in range(len(qa["argv"]) - 1))
+            or checks.get("prepublish", {}).get("state") != "passed"
+            or checks.get("prepublish", {}).get("source_unchanged") is not True
+            or checks.get("local", {}).get("state") != "passed"
+            or checks.get("local", {}).get("candidate_id") != candidate["id"]
+            or checks.get("local", {}).get("source_unchanged") is not True
+            or checks.get("review", {}).get("state") != "passed"
+            or checks.get("qa", {}).get("state") != "failed"
+            or checks.get("qa", {}).get("candidate_id") != candidate["id"]
+            or browser.get("state") != "passed" or browser.get("cleanup") != "confirmed"
+            or browser.get("source_unchanged") is not True
+            or browser.get("candidate_id") != candidate["id"]):
+        raise ValueError("browser artifact retry lost its exact native missing-artifact finding")
+    root = Path(spec["state_dir"])
+    folder = root / "browser-qa" / str(prior)
+    receipt = folder / "receipt.json"
+    raw = _owned_bytes(receipt)
+    _private_receipt(receipt, canonical=True)
+    if (browser.get("receipt") != str(receipt)
+            or hashlib.sha256(raw).hexdigest() != browser.get("receipt_sha256")
+            or json.loads(raw) != {k: v for k, v in browser.items()
+                                  if k not in {"receipt", "receipt_sha256"}}
+            or browser.get("argv") != qa["argv"]
+            or browser.get("qa_config_sha256") != digest(qa)
+            or browser.get("effective_argv", qa["argv"]) != qa["argv"]
+            or browser.get("log") != str(folder / "browser-qa.log")
+            or browser.get("cwd") != str(root / "gates" / str(prior) / "verify"
+                                         / qa.get("cwd", "."))):
+        raise ValueError("browser artifact retry lost its retained frozen browser receipt")
+    if ((folder / "browser-qa.log").stat().st_size > 8 * 1024 * 1024
+            or (folder / "browser-qa.log").stat().st_mode & 0o777 != 0o600):
+        raise ValueError("browser artifact retry log exceeds its retained evidence bound")
+    log = _owned_bytes(folder / "browser-qa.log")
+    native = browser.get("native_process") or {}
+    journal = _private_receipt(folder / "native/native-process.json")
+    launch = _private_receipt(folder / "native/launch.json")
+    if (hashlib.sha256(log).hexdigest() != browser.get("log_sha256")
+            or native.get("journal") != str(folder / "native/native-process.json")
+            or journal.get("phase") != "finished"
+            or journal.get("monitoring_complete") is not True
+            or journal.get("runtime_identity") != native.get("runtime_identity")
+            or journal.get("result") != native or native.get("exit_code") != 0
+            or native.get("cleanup") != "observed-native-confirmed"
+            or native.get("monitoring_complete") is not True
+            or native.get("stdio_drained") is not True
+            or any(native.get(k) is not False
+                   for k in ("cancelled", "timed_out", "listener_conflict"))
+            or journal.get("intent", {}).get("run_id") != spec["run_id"]
+            or journal.get("intent", {}).get("policy_digest") != spec["policy_digest"]
+            or journal.get("intent", {}).get("cwd") != browser.get("cwd")
+            or set(journal.get("intent", {}).get("ports", [])) != set(qa["ports"].values())
+            or set(native.get("observed_listeners", {})) != {str(p) for p in qa["ports"].values()}
+            or journal.get("intent", {}).get("argv") != qa["argv"]
+            or launch.get("argv") != qa["argv"]
+            or journal["intent"].get("environment_sha256") != digest(launch.get("environment"))):
+        raise ValueError("browser artifact retry lost its completed frozen native invocation")
+    sources = resolve_required_selectors(qa, broker.checkout, spec=spec)
+    selected = selector_evidence(qa, broker.checkout, sources,
+                                 playwright=visible_output(log.decode("utf-8", errors="replace")))
+    fields = ("selector", "sha256", "passed", "failed", "skipped")
+    if [{k: item[k] for k in fields} for item in selected] != [
+            {k: item[k] for k in fields} for item in browser.get("selectors", [])]:
+        raise ValueError("browser artifact retry lost its exact selected source evidence")
+    artifacts = browser.get("artifacts") or []
+    if (not 1 <= len(artifacts) <= 128
+            or any(Path(item["path"]).suffix == ".xml"
+                   or Path(item["path"]).name == "trace.zip" for item in artifacts)):
+        raise ValueError("browser artifact retry does not prove absent JUnit and traces")
+    for item in artifacts:
+        path = Path(item["path"])
+        if (not path.is_relative_to(folder / "artifacts")
+                or not 0 <= item["size"] <= 50 * 1024 * 1024
+                or path.stat().st_mode & 0o777 != 0o600
+                or len(content := _owned_bytes(path)) != item["size"]
+                or hashlib.sha256(content).hexdigest() != item["sha256"]):
+            raise ValueError("browser artifact retry retained artifact custody changed")
+    return {"cause": "missing_selected_browser_artifacts", "progress": progress,
+            "implementation_evidence": passed, "latest_assessment": proof,
+            "unpassed_status": latest["status"],
+            "unresolved_findings": [*findings, *latest_findings],
+            "browser_receipt_sha256": browser["receipt_sha256"],
+            "check_runtime": _runtime(native.get("runtime_identity")),
+            "selected_source_evidence": selected}

@@ -1694,6 +1694,7 @@ class DeliveryWorkflow:
         self.state["revision"] += 1
         await self._project(spec, "gates_retry_started",
                             "Rechecking preserved code with fresh gates, review and QA")
+        artifact_observation = recovery.get("seal", {}).get("browser_artifact_observation")
         return await self._run_iterations(
             spec, start_iteration=self.state["iteration"],
             prior_implementer_session=next((role.get("session_id") for role in reversed(
@@ -1704,7 +1705,11 @@ class DeliveryWorkflow:
                                  'unresolved_findings'],
                              "controller_attribution_proof": recovery['seal'][
                                  'attribution_observation']}
-                            if 'attribution_observation' in recovery.get('seal', {}) else None),
+                            if 'attribution_observation' in recovery.get('seal', {}) else
+                            {"historical_assessment_remains_rejected": True,
+                             "unresolved_findings": artifact_observation['unresolved_findings'],
+                             "controller_browser_artifact_proof": artifact_observation}
+                            if artifact_observation else None),
             authorized_max_iteration=self.state["iteration"],
             resume_prechecks=True, published_checkpoint=published,
         )

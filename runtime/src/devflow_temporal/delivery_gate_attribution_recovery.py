@@ -66,7 +66,7 @@ def possible(store, spec, row):
                 'required selector contributed no complete passing evidence: '))
 
 
-def _original_progress(store, spec, row, state, attempts, closed):
+def _original_progress(store, spec, row, state, attempts, closed, *, resource_spec=None):
     """Authenticate the first native execution without inventing a stopped admission."""
     from .delivery_closures import sealed_closure
     from .delivery_codec import DELIVERY_DATA_CONVERTER
@@ -148,7 +148,7 @@ def _original_progress(store, spec, row, state, attempts, closed):
             proofs.append(_native_role(
                 spec, role, matching[0], None if event_id == next(iter(calls)) else session,
                 times[event_id], times[finished], full_candidate(state['candidate']),
-                scheduled_input=scheduled))
+                resource_spec=resource_spec, scheduled_input=scheduled))
         if used != {a['job_key'] for a in attempts} or len(used) != len(attempts):
             raise ValueError('attribution retry omitted an original supervised native attempt')
         published_id, publication_request = next(iter(publications.items()))
