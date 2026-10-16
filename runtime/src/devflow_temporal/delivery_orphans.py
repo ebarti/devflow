@@ -277,8 +277,60 @@ def _retain_observation(store, original, attempt, closed, observation):
                 'Original native cleanup observed before attempt completion', payload)
 
 
+def _completed_build_cleanup(store, row, spec, closed):
+    from .delivery_policy_recovery import cleanup_only_build
+
+    if (spec.get('feature_worker', {}).get('kind') != 'build'
+            or row['outcome'] != 'blocked' or row['error'] != 'resource cleanup is unknown'
+            or closed.get('status') != 'COMPLETED'):
+        return None
+    completed = store._completed_temporal_result(spec['run_id'],
+        workflow_id=row['workflow_id'] or 'delivery-' + spec['run_id'])
+    state = completed['result']
+    recovery = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    if (any(completed.get(key) != closed.get(key) for key in
+            ('workflow_id', 'execution_run_id', 'closed_at'))
+            or completed['request_digest'] != row['request_digest']
+            or completed['recovery_digest'] != (digest(recovery) if recovery else None)
+            or state.get('run_id') != spec['run_id']
+            or any(state.get(key) != row[key] for key in
+                   ('phase', 'outcome', 'execution_state', 'iteration', 'error'))
+            or state.get('revision') != row['protocol_revision']
+            or state.get('candidate') != json.loads(row['candidate_json'] or 'null')
+            or {k: v for k, v in state.get('checks', {}).items() if k != 'resource_cleanup'}
+            != {k: v for k, v in json.loads(row['checks_json'] or '{}').items()
+                if k != 'resource_cleanup'}):
+        raise ValueError('resource cleanup lost its exact completed build result')
+    return completed if cleanup_only_build(spec, state) else None
+
+
+def _retain_build_cleanup(store, row, completed, receipt):
+    """Retain proof before projection, so an interrupted acknowledgement can replay."""
+    if (completed is None or receipt.get('state') != 'confirmed'
+            or receipt.get('resource_cleanup') != 'confirmed'
+            or receipt.get('process_cleanup') != 'observed-native-confirmed'):
+        return
+    keys = ('workflow_id', 'execution_run_id', 'closed_at', 'request_digest', 'recovery_digest')
+    payload = {'closed_workflow': {key: completed[key] for key in keys},
+               'original_result_digest': digest(completed['result']),
+               'resource_cleanup': receipt, 'tracker': json.loads(row['tracker_json'] or '{}')}
+    payload['key'] = digest(payload)
+    with store._connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        current = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                             (row['run_id'],)).fetchone()
+        if current is None or dict(current) != row:
+            raise ValueError('completed build changed before cleanup reconciliation')
+        if not any(json.loads(item[0]) == payload for item in db.execute(
+                "SELECT payload_json FROM delivery_events WHERE run_id=? "
+                "AND type='resource_cleanup_reconciled'", (row['run_id'],))):
+            store._event(db, row['run_id'], row['revision'], 'resource_cleanup_reconciled',
+                         'Original completed build resource cleanup confirmed', payload)
+
+
 def _reconcile(store, original, spec, closed):
     current = _unchanged(store, original)
+    completed = _completed_build_cleanup(store, current, spec, closed)
     with store._connect() as db:
         attempts = [dict(row) for row in db.execute(
             'SELECT * FROM delivery_attempts WHERE run_id=?', (spec['run_id'],))]
@@ -336,6 +388,7 @@ def _reconcile(store, original, spec, closed):
         return
     current = _unchanged(store, original)
     checks = {**json.loads(current['checks_json'] or '{}'), 'resource_cleanup': receipt}
+    _retain_build_cleanup(store, current, completed, receipt)
     store.project(spec['run_id'], phase=current['phase'],
         execution_state=current['execution_state'], outcome=current['outcome'],
         error=current['error'], checks=checks, cleanup=receipt['resource_cleanup'],

@@ -18,7 +18,9 @@ from .delivery_policy_recovery import (
     _remote,
     _rows,
     _stopped_cleanup,
+    cleanup_only_build,
     closed_checks,
+    completed_cleanup_binding,
     reconciled_cleanup,
     work_binding,
 )
@@ -394,7 +396,7 @@ def _completed_repair(seal, previous, remainder):
 
 
 def interrupted_resume(seal):
-    """Plan a cancelled worker's continuation that needs no product repair, if any.
+    """Plan a stopped worker's continuation that needs no product repair, if any.
 
     It stays at the sealed iteration. A passed implementation is never run again, a
     published candidate is never published again, and gates rerun fresh under the
@@ -403,7 +405,9 @@ def interrupted_resume(seal):
     from .delivery_feature_revision_recovery import gate_evidence
 
     spec, state = seal['predecessor_spec'], seal['state']
-    if (not spec.get('feature_worker') or state.get('phase') != 'cancelled'
+    cleanup = (cleanup_only_build(spec, state) and completed_cleanup_binding(
+        seal.get('cleanup_reconciliation'), seal.get('closed'), state))
+    if (not spec.get('feature_worker') or (state.get('phase') != 'cancelled' and not cleanup)
             or any(isinstance(check, dict) and check.get('state') == 'failed'
                    for check in state.get('checks', {}).values())):
         return None
@@ -523,6 +527,12 @@ def custody(db, recovery, *, retained_memo=None):
     if not admission_identity_consistent(details):
         raise ValueError('stopped resume changed its admission identity')
     if interrupted:
+        reconciliation = details.get('cleanup_reconciliation')
+        if reconciliation is not None and not any(json.loads(item[0]) == reconciliation
+                for item in db.execute("SELECT payload_json FROM delivery_events WHERE run_id=? "
+                                       "AND type='resource_cleanup_reconciled'",
+                                       (spec['run_id'],))):
+            raise ValueError('stopped build lost its original cleanup reconciliation')
         plan = interrupted_resume(details) or {}
         if (plan.get('additional_iterations') != details['command']['additional_iterations']
                 or any(details.get(key) != plan.get(key)
@@ -768,7 +778,7 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
         validate_revision_recovery(store, spec, _revision)
         stopped.add('delivered')
     expected_execution = 'terminal' if row['outcome'] in {'cancelled', 'delivered'} else 'blocked'
-    reconciled = reconciled_cleanup(store, row, state)
+    reconciled = reconciled_cleanup(store, row, state, closed=closed)
     state_checks, row_checks = closed_checks(row, state, reconciled)
     if (row['phase'] not in stopped or row['outcome'] != row['phase']
             or row['execution_state'] != expected_execution or row['cleanup'] != 'confirmed'
@@ -848,6 +858,8 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     return {'predecessor_spec': spec, 'row': row, 'attempts': attempts, 'effects': effects,
             'closed': closed, 'state': state, 'candidate': candidate, 'session_id': session,
             'publication': publication, 'original_recovery': previous,
+            **({'cleanup_reconciliation': reconciled}
+               if cleanup_only_build(spec, state) and reconciled else {}),
             'cleanup_digest': (observed_native_cleanup(spec, read_only=True) if review_subject
                                else observed_native_cleanup(spec)), 'work_binding': binding,
             **({'session_custody': session_custody} if session_custody else {})}

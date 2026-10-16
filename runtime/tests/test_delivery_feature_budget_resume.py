@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import sys
+from pathlib import Path
 
 import pytest
 from test_delivery_execution_registry import installed_runtime as installed_runtime
@@ -771,3 +773,151 @@ def test_adopted_worker_uses_current_allowance_and_only_authenticated_prepaid_cr
     with pytest.raises(ValueError, match='repair limit exhausted|finite exact-checkpoint'):
         admit(store, child['run_id'], {**observed, 'additional_iterations': expected + 1},
               preflight=True, _revision={'revision_id': revision_id})
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='exclusive native output preservation')
+def test_cleanup_only_build_reuses_pass_after_bound_maintenance(service, monkeypatch):
+    from devflow_temporal import delivery_orphans as orphans
+    from devflow_temporal.delivery_native_process import NativeProcess
+    from devflow_temporal.delivery_resources import RunResources, read_private
+
+    store, request, _ = feature_service(service, monkeypatch)
+    source = Path(store.config.raw['repositories']['fixture']['source_path'])
+    (source / '.gitignore').write_text('dist/\n')
+    _git(source, 'add', '.gitignore')
+    _git(source, 'commit', '-qm', 'ignore disposable output')
+    store.config.raw['repositories']['fixture']['expected_base_sha'] = _git(
+        source, 'rev-parse', 'HEAD')
+    store.config.path.write_text(json.dumps(store.config.raw))
+    store.submit(request)
+    parent = store.effective_spec(request['run_id'])
+    chunk = ordered_chunks(json.loads(request['accepted_plan']))[0]
+    child = worker_spec(parent, chunk, {'url': 'https://github.com/example/fixture/issues/10'},
+                        kind='build', base_sha=parent['base_sha'], base_branch='main')
+    # The parent/registry stay disposable. No Codex provider or global registry is used.
+    child['provider'] = 'codex'
+    child['resource_cleanup_version'] = 1
+    child['policy'].update(host_sandbox='trusted-local', execution_backend='native-macos',
+                           browser_qa={'artifact_paths': ['dist/playwright-report']})
+    child['policy_digest'] = digest(child['policy'])
+    register_worker(store, parent, child)
+    shared, token = registry(parent), parent['feature_delivery']['owner']
+    for iteration in range(10):
+        shared.repair(token, f'other:{iteration}', 'Other already charged repairs')
+    broker = DeliveryBroker(store, child)
+    broker.prepare()
+    resources = RunResources(child)
+    report = broker.checkout / 'dist/playwright-report'
+    report.parent.mkdir()
+    resources.register(report, 'generated')  # Historical pre-role allocated/null custody.
+    result = NativeProcess(child, Path(child['state_dir']) / 'output-probe',
+        argv=[sys.executable, '-c',
+              "from pathlib import Path; p=Path('dist/playwright-report'); p.mkdir(); "
+              "(p/'.last-run.json').write_text('native stand-in'); "
+              "Path('README.md').write_text('Completed implementation\\n')"],
+        cwd=broker.checkout, environment={'PATH': '/usr/bin:/bin'}, timeout=15).run()
+    assert result['cleanup'] == 'observed-native-confirmed'
+    candidate = broker.candidate()
+    role = {**implementation(2), 'candidate': candidate, 'findings': []}
+    _attempt(store, child, role, candidate['id'])
+    monkeypatch.setattr(activities, '_context', lambda spec: (store, DeliveryBroker(store, spec)))
+    checkpoint = activities.seal_build(child, candidate)
+    failed = resources.finalize('blocked')
+    assert failed['state'] == 'unknown'
+    state = {'run_id': child['run_id'], 'revision': 9, 'iteration': 2, 'phase': 'blocked',
+             'execution_state': 'blocked', 'outcome': 'blocked', 'cleanup': 'unknown',
+             'candidate': candidate, 'pull_request': None, 'roles': [role], 'tracker': {},
+             'checks': {'build_checkpoint': checkpoint, 'resource_cleanup': failed},
+             'error': 'resource cleanup is unknown'}
+    store.project(child['run_id'], phase='blocked', execution_state='blocked', outcome='blocked',
+        cleanup='unknown', candidate=candidate, checks=state['checks'], iteration=2,
+        protocol_revision=9, error=state['error'], event_type='blocked', message=state['error'])
+    closed = {'workflow_id': _row(store, child)['workflow_id'], 'execution_run_id': 'original',
+              'closed_at': '2026-10-16T00:00:00+00:00', 'request_digest': child['request_digest'],
+              'recovery_digest': None, 'result': copy.deepcopy(state)}
+    # Server/GitHub transport, runtime preparation and session-home observation are seams.
+    # The bound result/attempt/session, resources, maintenance, admission and budget are real.
+    monkeypatch.setattr(store, '_completed_temporal_result',
+                        lambda *_a, **_k: copy.deepcopy(closed))
+    monkeypatch.setattr(resume_mod, 'prepare_runtime', lambda spec, *_a: copy.deepcopy(spec))
+    monkeypatch.setattr('devflow_temporal.delivery_session_custody.implementation_custody',
+                        lambda *_a: None)
+    monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_a, **_k: None)
+    monkeypatch.setattr(store, '_ensure_no_remote_pr', lambda *_a: None)
+    described = {key: closed[key] for key in ('workflow_id', 'execution_run_id', 'closed_at')}
+    project = store.project
+
+    def lost_projection(*_a, **_k):
+        raise RuntimeError('lost maintenance projection acknowledgement')
+
+    monkeypatch.setattr(store, 'project', lost_projection)
+    with pytest.raises(RuntimeError, match='lost maintenance projection'):
+        orphans._reconcile(store, _row(store, child), child, {**described, 'status': 'COMPLETED'})
+    assert _row(store, child)['cleanup'] == 'unknown'
+    assert orphans._disposable_work(read_private(resources.manifest), _row(store, child))
+    monkeypatch.setattr(store, 'project', project)
+    orphans._reconcile(store, _row(store, child), child, {**described, 'status': 'COMPLETED'})
+    after = _row(store, child)
+    assert after['cleanup'] == 'confirmed' and after['outcome'] == 'blocked'
+    assert not report.exists() and broker.candidate() == candidate
+    folder = next((resources.root / 'preserved-generated-output').iterdir())
+    assert (folder / 'output/.last-run.json').read_text() == 'native stand-in'
+    assert read_private(resources.manifest)['roots'][str(report)]['identity'] is None
+    monkeypatch.setattr(activities, 'current_record', lambda *_a: {})  # GitHub readback seam.
+    activities.finish_worker(parent, child['run_id'])
+    seal = resume_mod.snapshot(store, child['run_id'])
+    assert seal['state'] == state and seal['cleanup_reconciliation']['closed_workflow'] == {
+        key: value for key, value in closed.items() if key != 'result'}
+    for change in ({'error': 'real product failure'},
+                   {'checks': {**state['checks'], 'local': {'state': 'failed'}}},
+                   {'roles': [{**role, 'status': 'findings', 'findings': ['repair']}]}):
+        changed = {**state, **change}
+        record = {**seal['cleanup_reconciliation'], 'original_result_digest': digest(changed)}
+        record['key'] = digest({k: v for k, v in record.items() if k != 'key'})
+        assert resume_mod.interrupted_resume({**seal, 'state': changed,
+                                              'cleanup_reconciliation': record}) is None
+    assert resume_mod.interrupted_resume({**seal, 'session_id': 'foreign-session'}) is None
+    with store._connect() as db:
+        store.state.claim_work(db, child['work_id'], 'external:devflow:foreign',
+                               store.config.dashboard_url)
+    with pytest.raises(ValueError, match='closed finalized delivery'):
+        resume_mod.snapshot(store, child['run_id'])
+    with store._connect() as db:
+        store.state.release_work(db, child['work_id'], 'external:devflow:foreign')
+    original_source = (broker.checkout / 'README.md').read_bytes()
+    (broker.checkout / 'README.md').write_text('Unsealed source edit')
+    with pytest.raises(ValueError, match='candidate changed'):
+        resume_mod.snapshot(store, child['run_id'])
+    (broker.checkout / 'README.md').write_bytes(original_source)
+    altered = {**seal['cleanup_reconciliation'], 'original_result_digest': 'f' * 64}
+    assert resume_mod.interrupted_resume({**seal, 'cleanup_reconciliation': altered}) is None
+    with store._connect() as db:
+        proof = next(dict(row) for row in db.execute(
+            "SELECT rowid AS proof_rowid,* FROM delivery_events WHERE run_id=? "
+            "AND type='resource_cleanup_reconciled'",
+            (child['run_id'],))
+                     if json.loads(row['payload_json']) == seal['cleanup_reconciliation'])
+        db.execute('DELETE FROM delivery_events WHERE rowid=?', (proof['proof_rowid'],))
+    with pytest.raises(ValueError, match='closed finalized delivery'):
+        resume_mod.snapshot(store, child['run_id'])
+    with store._connect() as db:
+        store._event(db, child['run_id'], proof['run_revision'], proof['type'], proof['message'],
+                     seal['cleanup_reconciliation'])
+    before_budget = shared.budget(token['issue_id'])
+    resumed = activities.resume_worker(store, parent, child, _row(store, child))
+    recovery = _recovery(store, child)
+    assert (recovery['resume_iteration'], recovery['command']['additional_iterations'],
+            recovery['resume_stage'], recovery['maximum_iteration']) == (2, 0, 'checks', 2)
+    assert recovery['session_id'] == role['session_id']
+    assert recovery['state'] == state and closed['result'] == state
+    assert resume_mod.readback(store, resumed['spec'], recovery) == {'state': 'confirmed'}
+
+    def seal_only(flow, name, body):
+        assert name == 'delivery_feature_seal_build'
+        return activities.seal_build(body['spec'], body['candidate'])
+
+    delivered, calls = _drive(monkeypatch, resumed['spec'], recovery, seal_only)
+    assert delivered['outcome'] == 'delivered' and delivered['iteration'] == 2
+    assert delivered['candidate'] == candidate and delivered['roles'] == [role]
+    assert [name for name, *_ in calls] == ['delivery_tracker_start', 'delivery_feature_seal_build']
+    assert shared.budget(token['issue_id']) == before_budget
