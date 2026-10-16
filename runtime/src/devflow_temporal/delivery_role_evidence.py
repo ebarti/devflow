@@ -145,8 +145,17 @@ def _dependency_context(store, spec, folder):
     worker = spec['feature_worker']
     if not assigned(spec, worker['chunk_id'], worker['kind']):
         raise OwnershipConflict('dependency receiver lost its accepted feature assignment')
+    dependencies = set()
+    pending = list(chunks[worker['chunk_id']]['depends_on'])
+    while pending:
+        chunk_id = pending.pop()
+        if chunk_id not in dependencies:
+            dependencies.add(chunk_id)
+            pending.extend(chunks[chunk_id]['depends_on'])
     records = []
-    for chunk_id in chunks[worker['chunk_id']]['depends_on']:
+    for chunk_id in chunks:
+        if chunk_id not in dependencies:
+            continue
         proof = values.get('verified:' + chunk_id)
         members = [member for member in record['manifest']['publication']['members']
                    if member['chunk_id'] == chunk_id]

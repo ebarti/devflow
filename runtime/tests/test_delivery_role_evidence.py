@@ -385,31 +385,39 @@ def dependency_handoff(service, monkeypatch):
 
     store, supplied, _ = feature_service(service, monkeypatch)
     plan = json.loads(supplied['accepted_plan'])
-    plan['workstreams'] = plan['workstreams'][:1]
-    plan['workstreams'][0]['chunks'][1]['depends_on'] = ['model']
+    final = plan['workstreams'][0]['chunks'].pop()
+    final['depends_on'] = ['client']
+    plan['workstreams'][1]['chunks'][0]['depends_on'] = ['model']
+    plan['workstreams'].append({'id': 'final', 'title': 'Final comparison', 'issue_number': 12,
+                               'acceptance': ['Compare against baseline'], 'chunks': [final]})
     supplied['accepted_plan'] = json.dumps(plan)
     store.submit(supplied)
     parent = store.effective_spec(supplied['run_id'])
     shared, token = registry(parent), parent['feature_delivery']['owner']
-    issue = {'id': 'I_10', 'number': 10,
-             'url': 'https://github.com/example/fixture/issues/10'}
+    issues = {stream['id']: {'id': 'I_' + str(stream['issue_number']),
+              'number': stream['issue_number'], 'url':
+              'https://github.com/example/fixture/issues/' + str(stream['issue_number'])}
+              for stream in plan['workstreams']}
     record = {'comment_id': 11, 'comment_node_id': 'IC_11', 'manifest': {
         'version': 1, 'issue_id': 'I_feature', 'repository_id': 'R_fixture',
         'revision': 1, 'creation_key': 'create-feature', 'plan': plan,
-        'workstream_issues': {'api': issue}, 'publication': {'stack_id': None, 'members': []}}}
+        'workstream_issues': issues, 'publication': {'stack_id': None, 'members': []}}}
     for key, value in [('accepted-plan', {'digest': digest(plan)}),
                        ('github-record', {'comment_id': 11, 'comment_node_id': 'IC_11'}),
-                       ('workstream-issues', {'api': issue})]:
+                       ('workstream-issues', issues)]:
         shared.checkpoint(token, key, value)
     remote = Remote(record)
     monkeypatch.setattr(GitHubDelivery, 'api', remote.api)
     # These are the original immutable worker inputs, before coordinator continuation.
-    source, receiver = [worker_spec(parent, chunk, issue, kind=kind,
-        base_sha=parent['base_sha'], base_branch='main') for chunk, kind in
-        zip(ordered_chunks(plan), ['chunk', 'build'], strict=True)]
-    source['policy']['checks'] = [{'id': 'measurement', 'argv': [sys.executable, '-c',
-        'print("historical prerequisite measurement: 42")']}]
-    source['policy_digest'] = digest(source['policy'])
+    ancestor, immediate, receiver = [worker_spec(parent, chunk, issues[chunk['workstream_id']],
+        kind=kind, base_sha=parent['base_sha'], base_branch='main') for chunk, kind in
+        zip(ordered_chunks(plan), ['chunk', 'chunk', 'build'], strict=True)]
+    sources = [ancestor, immediate]
+    for source in sources:
+        measurement = source['feature_worker']['chunk_id'] + ' prerequisite measurement: 42'
+        source['policy']['checks'] = [{'id': 'measurement', 'argv': [sys.executable, '-c',
+            'print(' + repr(measurement) + ')']}]
+        source['policy_digest'] = digest(source['policy'])
     def assign(spec):
         register_worker(store, parent, spec)
         worker = spec['feature_worker']
@@ -422,29 +430,35 @@ def dependency_handoff(service, monkeypatch):
         _git(broker.checkout, 'commit', '-am', 'feat: original worker', '--signoff')
         return broker
 
-    producer = assign(source)
-    candidate = producer.candidate()
-    local = producer.run_checks(0, candidate)
-    assert local['state'] == 'passed' and len(local['results']) == 1
-    checks = {'local': local, **{stage: {'state': 'passed', 'candidate_id': candidate['id']}
-                               for stage in ('prepublish', 'review', 'qa')}}
-    pr = {'number': 20, 'url': 'https://github.com/example/fixture/pull/20',
-          'head': candidate['head'], 'state': 'OPEN', 'base': source['base_sha']}
-    record['manifest']['publication']['members'].append({
-        **{key: pr[key] for key in ('number', 'url', 'head')}, 'chunk_id': 'model',
-        'branch': source['branch'], 'base_branch': 'main'})
-    with store._connect() as db:
-        db.execute("INSERT INTO delivery_effects(effect_key,run_id,kind,request_json,state,"
-                   "observed_json,updated_at) VALUES (?,?,'publish',?,'complete',?,?)",
-                   ('publish-source', source['run_id'],
-                    json.dumps({'iteration': 0, 'input_candidate_id': candidate['id']}),
-                    json.dumps(pr), '2026-10-16T00:00:00+00:00'))
-    store.project(source['run_id'], phase='delivered', execution_state='terminal',
-        event_type='delivered', message='Fixture prerequisite completed', candidate=candidate,
-        pull_request=pr, checks=checks, iteration=0, protocol_revision=10,
-        outcome='delivered', cleanup='confirmed', error=None)
-    # Use the real completion producer for the verified checkpoint and registry retirement.
-    finish_worker(parent, source['run_id'])
+    source_checks = {}
+    for index, source in enumerate(sources):
+        number = 20 + index
+        producer = assign(source)
+        candidate = producer.candidate()
+        local = producer.run_checks(0, candidate)
+        assert local['state'] == 'passed' and len(local['results']) == 1
+        checks = {'local': local, **{stage: {'state': 'passed', 'candidate_id': candidate['id']}
+                                   for stage in ('prepublish', 'review', 'qa')}}
+        pr = {'number': number, 'url': 'https://github.com/example/fixture/pull/' + str(number),
+              'head': candidate['head'], 'state': 'OPEN', 'base': source['base_sha']}
+        record['manifest']['publication']['members'].append({
+            **{key: pr[key] for key in ('number', 'url', 'head')},
+            'chunk_id': source['feature_worker']['chunk_id'], 'branch': source['branch'],
+            'base_branch': sources[index - 1]['branch'] if index else 'main'})
+        record['manifest']['publication']['stack_id'] = 42 if index else None
+        with store._connect() as db:
+            db.execute("INSERT INTO delivery_effects(effect_key,run_id,kind,request_json,state,"
+                       "observed_json,updated_at) VALUES (?,?,'publish',?,'complete',?,?)",
+                       ('publish-' + source['run_id'], source['run_id'],
+                        json.dumps({'iteration': 0, 'input_candidate_id': candidate['id']}),
+                        json.dumps(pr), '2026-10-16T00:00:00+00:00'))
+        store.project(source['run_id'], phase='delivered', execution_state='terminal',
+            event_type='delivered', message='Fixture prerequisite completed', candidate=candidate,
+            pull_request=pr, checks=checks, iteration=0, protocol_revision=10,
+            outcome='delivered', cleanup='confirmed', error=None)
+        # Use the real completion producer for the verified checkpoint and registry retirement.
+        finish_worker(parent, source['run_id'])
+        source_checks[source['run_id']] = checks
     assign(receiver)
     shared.finish_worker(token, worker_key(receiver['run_id'], token), {'cleanup': 'confirmed'})
     shared.stop(token, 'stopped-original-coordinator', {})
@@ -463,7 +477,7 @@ def dependency_handoff(service, monkeypatch):
                'workspace': receiver['checkout'],
                'candidate': DeliveryBroker(store, receiver).candidate(),
                'resume_session': 'original-dependent-session', 'findings': ['Compare prerequisite']}
-    return store, request, source, checks, record, deepcopy(parent)
+    return store, request, sources, source_checks, record, deepcopy(parent)
 
 
 @pytest.mark.parametrize('role', ['implement', 'review', 'verify'])
@@ -475,30 +489,35 @@ def test_completed_dependency_reaches_original_worker_roles_after_coordinator_co
     from devflow_temporal.role_runner import _task
     from devflow_temporal.supervisor import DeliverySupervisor
 
-    store, request, source, checks, record, old_parent = dependency_handoff
+    store, request, sources, source_checks, record, old_parent = dependency_handoff
     request = {**request, 'role': role, 'evidence_context': {'checks': {}}}
     assert request['spec']['feature_worker']['parent_run_id'] == old_parent['run_id']
     frozen = deepcopy(request)
     key = DeliverySupervisor._job_key(request)
-    original_log = Path(checks['local']['results'][0]['log'])
-    original_bytes = original_log.read_bytes()
+    originals = [Path(source_checks[source['run_id']]['local']['results'][0]['log'])
+                 for source in sources]
+    original_bytes = [path.read_bytes() for path in originals]
     copied = allocate(request, key, store=store)
     context = read_context(copied)
     assert request == frozen
-    dependency, = context['historical_dependencies']
     assert context['checks'] == {}  # Historical passes never become current gates.
-    assert dependency['candidate']['id'] != request['candidate']['id']
-    assert dependency['provenance'] == {
-        'kind': 'completed_feature_dependency', 'historical': True,
-        'run_id': source['run_id'], 'chunk_id': 'model', 'feature_issue_id': 'I_feature',
-        'accepted_plan_sha256': digest(record['manifest']['plan']),
-        'source_spec_sha256': digest(source), 'checks_sha256': digest(checks),
-        'publication': {'head': dependency['candidate']['head'], 'number': 20}}
-    log = Path(dependency['checks']['local']['results'][0]['log'])
-    assert log.is_relative_to(Path(request['spec']['state_dir']) / 'role-evidence' / key)
-    assert log.read_bytes() == original_bytes and original_log.read_bytes() == original_bytes
-    assert 'native_process' not in dependency['checks']['local']['results'][0]
-    assert 'historical prerequisite measurement: 42' in log.read_text()
+    dependencies = context['historical_dependencies']
+    assert [item['provenance']['chunk_id'] for item in dependencies] == ['model', 'client']
+    for index, (dependency, source) in enumerate(zip(dependencies, sources, strict=True)):
+        checks = source_checks[source['run_id']]
+        assert dependency['candidate']['id'] != request['candidate']['id']
+        assert dependency['provenance'] == {
+            'kind': 'completed_feature_dependency', 'historical': True,
+            'run_id': source['run_id'], 'chunk_id': source['feature_worker']['chunk_id'],
+            'feature_issue_id': 'I_feature',
+            'accepted_plan_sha256': digest(record['manifest']['plan']),
+            'source_spec_sha256': digest(source), 'checks_sha256': digest(checks),
+            'publication': {'head': dependency['candidate']['head'], 'number': 20 + index}}
+        log = Path(dependency['checks']['local']['results'][0]['log'])
+        assert log.is_relative_to(Path(request['spec']['state_dir']) / 'role-evidence' / key)
+        assert log.read_bytes() == original_bytes[index]
+        assert originals[index].read_bytes() == original_bytes[index]
+        assert 'prerequisite measurement: 42' in log.read_text()
     assert 'historical_dependencies' in _task(copied).goal
     assert 'native_process' not in json.dumps(context)
 
@@ -507,7 +526,8 @@ def test_completed_dependency_reaches_original_worker_roles_after_coordinator_co
 def test_dependency_handoff_refuses_unbound_or_uncompleted_sources(dependency_handoff, drift):
     from devflow_temporal.delivery_role_evidence import allocate
 
-    store, request, source, _, _, _ = dependency_handoff
+    store, request, sources, _, _, _ = dependency_handoff
+    source = sources[0]  # The immediate prerequisite stays verified; refuse its broken ancestor.
     if drift in {'missing', 'unrelated'}:
         from devflow_temporal.delivery_feature_execution import registry
 
@@ -532,7 +552,8 @@ def test_dependency_copy_refuses_changed_bytes_but_launched_request_keeps_frozen
     from devflow_temporal.delivery_role_evidence import allocate, read_context
     from devflow_temporal.supervisor import DeliverySupervisor
 
-    store, request, source, checks, _, _ = dependency_handoff
+    store, request, sources, source_checks, _, _ = dependency_handoff
+    checks = source_checks[sources[0]['run_id']]
     supervisor = DeliverySupervisor(store, capacity=1)
     key = supervisor._job_key(request)
     enriched = allocate(request, key, store=store)
