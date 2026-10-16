@@ -8,7 +8,7 @@ import re
 import stat
 from pathlib import Path
 
-from .contracts import canonical_json
+from .contracts import canonical_json, digest
 from .delivery_resources import _ancestors, private_directory
 
 # Only evidence data is copied. Transport, sessions, credentials, request payloads and
@@ -106,7 +106,104 @@ def _copy_receipts(value, root, folder):
     return clean
 
 
-def allocate(request: dict, job_key: str) -> dict:
+def _dependency_context(store, spec, folder):
+    """Copy completed prerequisites through their source run's receipt boundary.
+
+    A retained worker may still name a stopped parent. Its current assignment,
+    adopted GitHub plan and verified checkpoints determine the source instead.
+    These records are role context only; they never enter the worker's gates.
+    """
+    from .delivery_execution_registry import OwnershipConflict
+    from .delivery_feature_execution import _worker_assignment, require_execution
+    from .delivery_feature_pass import checkpoints
+    from .delivery_feature_publication import current_record, publication_child_binding
+    from .delivery_github_contract import ordered_chunks
+
+    shared, current, _ = _worker_assignment(store, spec)
+    parent = store.effective_spec(current['run_id'])
+    if current['store_path'] != str(store.config.tracking_db):
+        raise OwnershipConflict('dependency evidence belongs to another runtime store')
+    require_execution(store, parent)
+    record = current_record(parent)
+    chunks = {chunk['id']: chunk for chunk in ordered_chunks(record['manifest']['plan'])}
+    values = checkpoints(parent)
+
+    def assigned(child, chunk_id, kind):
+        worker = child['feature_worker']
+        binding = publication_child_binding(record, chunk_id)
+        return (child['feature_delivery']['registry'] == spec['feature_delivery']['registry']
+                and child['feature_delivery']['owner']['issue_id'] == current['issue_id']
+                and child['feature_delivery']['owner']['store_path'] == current['store_path']
+                and child['github_repo'] == parent['github_repo']
+                and worker['chunk_id'] == chunk_id and worker['kind'] == kind
+                and worker['workstream_id'] == binding['workstream_id']
+                and child['issue_url'] == binding['issue_url']
+                and values.get(f'assignment:{chunk_id}:{kind}') == {
+                    'run_id': child['run_id'], 'store_path': current['store_path'],
+                    'chunk_id': chunk_id, 'kind': kind})
+
+    worker = spec['feature_worker']
+    if not assigned(spec, worker['chunk_id'], worker['kind']):
+        raise OwnershipConflict('dependency receiver lost its accepted feature assignment')
+    records = []
+    for chunk_id in chunks[worker['chunk_id']]['depends_on']:
+        proof = values.get('verified:' + chunk_id)
+        members = [member for member in record['manifest']['publication']['members']
+                   if member['chunk_id'] == chunk_id]
+        if (not proof or len(members) != 1
+                or any(proof.get(key) != members[0][key] for key in ('head', 'number'))
+                or proof.get('store_path') != current['store_path']):
+            raise OwnershipConflict('dependency has no completed published verification')
+        source = store.effective_spec(proof['run_id'])
+        if (not assigned(source, chunk_id, 'chunk')
+                or source['branch'] != members[0]['branch']):
+            raise OwnershipConflict('dependency source lost its accepted feature assignment')
+        with store._connect() as db:
+            row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                             (source['run_id'],)).fetchone()
+            unfinished = db.execute(
+                "SELECT 1 FROM delivery_attempts WHERE run_id=? "
+                "AND (state!='finished' OR cleanup!='confirmed') LIMIT 1",
+                (source['run_id'],)).fetchone()
+            candidate = json.loads(row['candidate_json'] or 'null')
+            checks = json.loads(row['checks_json'] or '{}')
+            pr = json.loads(row['pr_json'] or 'null')
+            published = [json.loads(effect['request_json']) for effect in db.execute(
+                "SELECT request_json,observed_json FROM delivery_effects "
+                "WHERE run_id=? AND kind='publish' AND state='complete'",
+                (source['run_id'],)) if json.loads(effect['observed_json'] or 'null') == pr]
+        if (row['outcome'] != 'delivered' or row['cleanup'] != 'confirmed' or unfinished
+                or digest(checks) != proof['checks_digest'] or not published
+                or not candidate or candidate['head'] != proof['head']
+                or candidate['base_sha'] != source['base_sha']
+                or candidate['policy_digest'] != source['policy_digest']
+                or not pr or any(pr.get(key) != proof[key] for key in ('head', 'number'))
+                or pr.get('url') != members[0]['url']
+                or any(checks.get(stage, {}).get('state') != 'passed'
+                       for stage in ('prepublish', 'local', 'review', 'qa'))
+                or any(checks.get(stage, {}).get('candidate_id') != candidate['id']
+                       for stage in ('local', 'review', 'qa'))
+                or checks.get('prepublish', {}).get('candidate_id')
+                != published[-1].get('input_candidate_id')):
+            raise OwnershipConflict('completed dependency candidate or checks changed')
+        source_root = Path(source['state_dir'])
+        if (not source_root.is_absolute() or source_root.name != source['run_id']
+                or source_root.resolve(strict=True) != source_root):
+            raise ValueError('dependency evidence left its owned source run')
+        evidence = _copy_receipts({'candidate': candidate, 'iteration': row['iteration'],
+                                   'checks': checks}, source_root, folder)
+        records.append({**evidence, 'provenance': {
+            'kind': 'completed_feature_dependency', 'historical': True,
+            'run_id': source['run_id'], 'chunk_id': chunk_id,
+            'feature_issue_id': current['issue_id'],
+            'accepted_plan_sha256': digest(record['manifest']['plan']),
+            'source_spec_sha256': digest(source), 'checks_sha256': proof['checks_digest'],
+            'publication': {key: pr[key] for key in ('head', 'number')},
+        }})
+    return records
+
+
+def allocate(request: dict, job_key: str, *, store=None) -> dict:
     if not re.fullmatch(r'[0-9a-f]{64}', job_key):
         raise ValueError('role evidence requires a controller attempt identity')
     root = _root(request)
@@ -133,8 +230,12 @@ def allocate(request: dict, job_key: str) -> dict:
             if (manifest['source_candidate']['content_sha256']
                     != request['candidate']['content_sha256']):
                 raise ValueError('implementation artifacts describe another candidate content')
-    if context:
-        clean = _copy_receipts(context, root, folder)
+    clean = _copy_receipts(context, root, folder) if context else {}
+    if store is not None and request['spec'].get('feature_worker') and role != 'intake':
+        dependencies = _dependency_context(store, request['spec'], folder)
+        if dependencies:
+            clean['historical_dependencies'] = dependencies
+    if clean:
         content = (json.dumps(clean, sort_keys=True, indent=2) + '\n').encode()
         path = folder / 'receipts.json'
         _immutable(path, content)

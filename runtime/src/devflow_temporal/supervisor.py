@@ -428,7 +428,7 @@ class DeliverySupervisor:
             request = launch_steering(self.store, request, job_key)
             from .delivery_role_evidence import allocate
 
-            request = allocate(request, job_key)
+            request = allocate(request, job_key, store=self.store)
             _private_json(request_path, request)
             if Path("/usr/bin/sandbox-exec").is_file():
                 profile, role_env = prepare_sandbox(request, folder)
@@ -657,7 +657,7 @@ class DeliverySupervisor:
                     "start_path": str(folder / "start.json"),
                 }, job_key)
                 if not request_path.exists():
-                    native_request = allocate(native_request, job_key)
+                    native_request = allocate(native_request, job_key, store=self.store)
                 else:
                     # Reattachment keeps the original durable launch contract.
                     native_request = read_private(request_path)

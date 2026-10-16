@@ -450,7 +450,7 @@ async def test_actual_prelaunch_receipt_preserves_empty_folder_retry_predicate(
         native_role, monkeypatch):
     case = native_role
 
-    def allocate(request, job_key):
+    def allocate(request, job_key, *, store=None):
         raise ValueError('fixture evidence handoff rejected after admission')
 
     monkeypatch.setattr(delivery_role_evidence, 'allocate', allocate)
