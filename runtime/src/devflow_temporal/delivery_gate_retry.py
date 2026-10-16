@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
+from .delivery_browser_qa import browser_artifact_possible, observe_browser_artifacts
 from .delivery_execution_config import load_execution_config
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import (
@@ -526,7 +527,8 @@ def snapshot(store, run_id, kind=KIND):
     controller_only = kind == CONTROLLER_KIND
     from .delivery_gate_attribution_recovery import eligible_stop
 
-    attribution_retry = kind == KIND and eligible_stop(spec, state)
+    browser_artifact_retry = kind == KIND and browser_artifact_possible(store, spec, row)
+    attribution_retry = kind == KIND and eligible_stop(spec, state) and not browser_artifact_retry
     failure = state.get('checks', {}).get('failure') or {}
     reconciled = reconciled_cleanup(store, row, state)
     state_checks, row_checks = closed_checks(row, state, reconciled)
@@ -597,7 +599,7 @@ def snapshot(store, run_id, kind=KIND):
         if native_identity(spec)['runtime_payload_sha256'] in _consumed_payloads(
                 spec, state, previous, include_implementation=controller_only):
             raise ValueError('a later gate retry requires a repaired measured runtime')
-    if attribution_retry or verification_retry:
+    if attribution_retry or verification_retry or browser_artifact_retry:
         from .delivery_feature_revision_subject import ObservationBroker
 
         broker = ObservationBroker(store, spec)
@@ -630,6 +632,7 @@ def snapshot(store, run_id, kind=KIND):
     report_observation = None
     controller_observation = None
     attribution_observation = None
+    browser_artifact_observation = None
     verification_observation = None
     if attribution_retry:
         from .delivery_gate_attribution_recovery import observe
@@ -640,6 +643,15 @@ def snapshot(store, run_id, kind=KIND):
         if native_identity(spec)['runtime_payload_sha256'] == attribution_observation[
                 'check_runtime']['runtime_payload_sha256']:
             raise ValueError('attribution retry requires a repaired measured runtime')
+        failed_gate = True
+    if browser_artifact_retry:
+        from .delivery_native_preparation import native_identity
+
+        browser_artifact_observation = observe_browser_artifacts(
+            store, spec, row, state, attempts, closed, previous, broker)
+        if native_identity(spec)["runtime_payload_sha256"] == browser_artifact_observation[
+                "check_runtime"]["runtime_payload_sha256"]:
+            raise ValueError("browser artifact retry requires a repaired measured runtime")
         failed_gate = True
     if controller_only:
         from .delivery_controller_retry import observe
@@ -731,7 +743,8 @@ def snapshot(store, run_id, kind=KIND):
                                       'local check process cleanup is unknown' if prelaunch
                                       else unpublished_error
                                       if unpublished else state.get('error')
-                                      if controller_only or attribution_retry
+                                      if (controller_only or attribution_retry
+                                          or browser_artifact_retry)
                                       else 'repair limit exhausted'}))
             or row['protocol_revision'] != state.get('revision')
             or row['iteration'] != state.get('iteration')
@@ -739,6 +752,7 @@ def snapshot(store, run_id, kind=KIND):
             or closed['recovery_digest'] != (digest(previous) if previous else None)
             or not implementation or (implementation.get('status') != 'pass'
                                       and not (controller_only or attribution_retry
+                                               or browser_artifact_retry
                                                or layout_report or verification_retry))
             or not failed_gate
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
@@ -799,6 +813,8 @@ def snapshot(store, run_id, kind=KIND):
             **({'verification_observation': verification_observation}
                if verification_observation else {}),
             **({'controller_observation': controller_observation} if controller_only else {}),
+            **({'browser_artifact_observation': browser_artifact_observation}
+               if browser_artifact_retry else {}),
             **({'attribution_observation': (previous['seal']['attribution_observation']
                                            if layout_report or verification_retry
                                            else attribution_observation)}
@@ -809,7 +825,7 @@ def snapshot(store, run_id, kind=KIND):
                      else 'report' if report_retry
                      else 'ci' if ci_only else 'published'
                      if published_after_recovery or prelaunch or controller_only
-                     or attribution_retry else None,
+                     or attribution_retry or browser_artifact_retry else None,
             'generation': (transient_generations + 1 if transient_retry
                            else ci_observations + 1 if ci_only
                            else (2 if previous else 1) if attribution_retry
@@ -1131,6 +1147,22 @@ def readback(store, spec, recovery, *, resource_spec=None):
         from .delivery_gate_preflight_continuation import validate
 
         validate(store, spec, recovery, resource_spec=resource_spec or spec)
+    elif expected := recovery["seal"].get("browser_artifact_observation"):
+        original = recovery["seal"]["original_spec"]
+        _, current_attempts, _, _ = _rows(store, spec["run_id"])
+        current = {attempt["job_key"]: attempt for attempt in current_attempts}
+        if any(current.get(attempt["job_key"]) != attempt
+               for attempt in recovery["seal"]["attempts"]):
+            raise ValueError("browser artifact retry original native attempt changed")
+        closed = store._completed_temporal_result(
+            spec["run_id"], workflow_id=recovery["seal"]["closed"]["workflow_id"])
+        if (closed != recovery["seal"]["closed"] or observe_browser_artifacts(
+                store, original, recovery["seal"]["row"], closed["result"],
+                recovery["seal"]["attempts"], closed, recovery["original_recovery"],
+                ObservationBroker(
+                    store, original, resource_spec=resource_spec or spec),
+                resource_spec=resource_spec or spec) != expected):
+            raise ValueError("browser artifact retry original cause or source evidence changed")
     elif expected := recovery['seal'].get('attribution_observation'):
         from .delivery_feature_revision_subject import ObservationBroker
         from .delivery_gate_attribution_recovery import observe
