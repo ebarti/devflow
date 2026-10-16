@@ -1001,18 +1001,19 @@ class RunResources:
                 manifest["processes"].append(str(journal))
                 write_private(self.manifest, manifest)
 
-    def _generated_output_binding(self, path, entry, manifest):
+    def _generated_output_binding(self, path, entry, manifest, *, execution=None):
         from .delivery_configured_resources import declared_generated_directories
 
-        checkout = Path(self.spec['checkout'])
+        execution = self.spec if execution is None else execution
+        checkout = Path(execution['checkout'])
         relative = path.relative_to(checkout).as_posix()
-        configured = declared_generated_directories(self.spec) | set(
-            (self.spec['policy'].get('browser_qa') or {}).get('artifact_paths', []))
+        configured = declared_generated_directories(execution) | set(
+            (execution['policy'].get('browser_qa') or {}).get('artifact_paths', []))
         parent = manifest['roots'].get(str(checkout), {})
-        if (self.spec.get('provider') != 'codex'
-                or self.spec['policy'].get('host_sandbox') != 'trusted-local'
-                or self.spec['policy'].get('execution_backend') != 'native-macos'
-                or digest(self.spec['policy']) != self.spec['policy_digest']
+        if (execution.get('provider') != 'codex'
+                or execution['policy'].get('host_sandbox') != 'trusted-local'
+                or execution['policy'].get('execution_backend') != 'native-macos'
+                or digest(execution['policy']) != execution['policy_digest']
                 or relative not in configured
                 or {'.venv', 'node_modules'} & set(Path(relative).parts)
                 or entry['kind'] != 'generated' or entry['state'] != 'allocated'
@@ -1023,21 +1024,39 @@ class RunResources:
                 or (not os.path.lexists(checkout) and parent.get('receipt', {}).get('state')
                     not in {'removed', 'already_absent'})):
             raise ValueError('unconfirmed output lacks its exact configured checkout authority')
-        return {'run_id': self.spec['run_id'], 'source': str(path),
+        return {'run_id': execution['run_id'], 'source': str(path),
                 'checkout': str(checkout), 'checkout_identity': parent['identity'],
-                'policy_digest': self.spec['policy_digest'],
+                'policy_digest': execution['policy_digest'],
                 'generation': entry.get('generation', 0)}
 
     def _read_generated_preservation(self, path, entry, manifest):
         binding = self._generated_output_binding(path, entry, manifest)
         folder = self.root / 'preserved-generated-output' / digest(binding)
+        marker = entry.get('generated_output_preservation', {})
+        if (marker.get('state') == 'preserved'
+                and marker.get('receipt') != str(folder / 'receipt.json')):
+            # Runtime preparation can rebind policy without moving the sealed output.
+            # Resolve its origin only from the same run's authenticated execution history.
+            executions = {}
+            _gate_roots(self.spec, execution_specs=executions)
+            for execution in executions.values():
+                try:
+                    original = self._generated_output_binding(
+                        path, entry, manifest, execution=execution)
+                except (OSError, ValueError, KeyError):
+                    continue
+                historical = self.root / 'preserved-generated-output' / digest(original)
+                if marker.get('receipt') == str(historical / 'receipt.json'):
+                    binding, folder = original, historical
+                    break
+            else:
+                raise ValueError('preserved output lost its admitted execution policy')
         intent = folder / 'intent.json'
         _ancestors(intent)
         if intent.resolve(strict=True) != intent:
             raise ValueError('unconfirmed output preservation left its original run')
         raw = read_private(intent, raw=True)
         saved = json.loads(raw)
-        marker = entry.get('generated_output_preservation', {})
         if (saved.get('binding') != binding
                 or marker.get('intent_sha256') != hashlib.sha256(raw).hexdigest()
                 or saved.get('destination') != str(folder / 'output')

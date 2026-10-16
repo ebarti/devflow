@@ -21,6 +21,7 @@ from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_execution_registry import OwnershipConflict
 from devflow_temporal.delivery_feature_execution import (
+    continue_feature,
     register_worker,
     registry,
     worker_key,
@@ -458,7 +459,7 @@ def _attempt(store, child, role, candidate_id):
                     json.dumps({k: v for k, v in role.items() if k not in RECEIPT_ONLY})))
 
 
-def _drive(monkeypatch, spec, recovery, respond):
+def _drive(monkeypatch, spec, recovery, respond, *, project=False):
     flow, calls = DeliveryWorkflow(), []
 
     async def activity(name, body, **_):
@@ -475,7 +476,8 @@ def _drive(monkeypatch, spec, recovery, respond):
 
     monkeypatch.setattr(flow, "_activity", activity)
     monkeypatch.setattr(flow, "_confirm_repair_preflight", confirmed)
-    monkeypatch.setattr(flow, "_project", nothing)
+    if not project:
+        monkeypatch.setattr(flow, "_project", nothing)
     monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _id: True)
     return asyncio.run(flow._resume_stopped(spec, recovery)), calls
 
@@ -776,10 +778,17 @@ def test_adopted_worker_uses_current_allowance_and_only_authenticated_prepaid_cr
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='exclusive native output preservation')
-def test_cleanup_only_build_reuses_pass_after_bound_maintenance(service, monkeypatch):
+@pytest.mark.parametrize('runtime_rebound', [False, True])
+def test_cleanup_only_build_reuses_pass_after_bound_maintenance(
+    service, monkeypatch, runtime_rebound,
+):
     from devflow_temporal import delivery_orphans as orphans
     from devflow_temporal.delivery_native_process import NativeProcess
-    from devflow_temporal.delivery_resources import RunResources, read_private
+    from devflow_temporal.delivery_resources import (
+        RunResources,
+        observe_finalized_resources,
+        read_private,
+    )
 
     store, request, _ = feature_service(service, monkeypatch)
     source = Path(store.config.raw['repositories']['fixture']['source_path'])
@@ -798,7 +807,9 @@ def test_cleanup_only_build_reuses_pass_after_bound_maintenance(service, monkeyp
     child['provider'] = 'codex'
     child['resource_cleanup_version'] = 1
     child['policy'].update(host_sandbox='trusted-local', execution_backend='native-macos',
-                           browser_qa={'artifact_paths': ['dist/playwright-report']})
+                           browser_qa={'artifact_paths': ['dist/playwright-report']},
+                           environment_proof_sha256='a' * 64, security_binding_sha256='b' * 64,
+                           native_identity={'runtime_payload_sha256': 'c' * 64})
     child['policy_digest'] = digest(child['policy'])
     register_worker(store, parent, child)
     shared, token = registry(parent), parent['feature_delivery']['owner']
@@ -838,9 +849,40 @@ def test_cleanup_only_build_reuses_pass_after_bound_maintenance(service, monkeyp
               'recovery_digest': None, 'result': copy.deepcopy(state)}
     # Server/GitHub transport, runtime preparation and session-home observation are seams.
     # The bound result/attempt/session, resources, maintenance, admission and budget are real.
+    closures = {child['run_id']: closed}
     monkeypatch.setattr(store, '_completed_temporal_result',
-                        lambda *_a, **_k: copy.deepcopy(closed))
-    monkeypatch.setattr(resume_mod, 'prepare_runtime', lambda spec, *_a: copy.deepcopy(spec))
+                        lambda run_id, **_k: copy.deepcopy(closures[run_id]))
+
+    def handoff(parent):
+        owner = parent['feature_delivery']['owner']
+        stopped = {'run_id': parent['run_id'], 'revision': 3, 'iteration': 0,
+                   'phase': 'blocked', 'execution_state': 'blocked', 'outcome': 'blocked',
+                   'cleanup': 'confirmed', 'error': 'Worker resource cleanup needs recovery'}
+        store.project(parent['run_id'], **{k: v for k, v in stopped.items()
+                                          if k not in {'run_id', 'revision'}},
+                      protocol_revision=3, event_type='blocked', message=stopped['error'])
+        shared.stop(owner, 'stopped:' + str(owner['generation']), {'state': stopped})
+        with store._connect() as db:
+            store.state.release_work(db, parent['work_id'], 'external:devflow:' + parent['run_id'])
+        closures[parent['run_id']] = {
+            'workflow_id': store.active_workflow_id(parent['run_id']),
+            'execution_run_id': 'closed-parent-' + str(owner['generation']),
+            'request_digest': parent['request_digest'], 'recovery_digest': None, 'result': stopped}
+        result = continue_feature(store, parent['run_id'], {
+            'command_id': 'continue-parent-' + str(owner['generation']),
+            'expected_revision': _row(store, parent)['revision']})
+        return store.effective_spec(result['run_id'])
+
+    def prepare_runtime(spec, *_a):
+        prepared = copy.deepcopy(spec)
+        if runtime_rebound:
+            prepared['policy'].update(
+                environment_proof_sha256='d' * 64, security_binding_sha256='e' * 64,
+                native_identity={'runtime_payload_sha256': 'f' * 64})
+            prepared['policy_digest'] = digest(prepared['policy'])
+        return prepared
+
+    monkeypatch.setattr(resume_mod, 'prepare_runtime', prepare_runtime)
     monkeypatch.setattr('devflow_temporal.delivery_session_custody.implementation_custody',
                         lambda *_a: None)
     monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_a, **_k: None)
@@ -910,6 +952,7 @@ def test_cleanup_only_build_reuses_pass_after_bound_maintenance(service, monkeyp
         store._event(db, child['run_id'], proof['run_revision'], proof['type'], proof['message'],
                      seal['cleanup_reconciliation'])
     before_budget = shared.budget(token['issue_id'])
+    parent = handoff(parent)
     resumed = activities.resume_worker(store, parent, child, _row(store, child))
     recovery = _recovery(store, child)
     assert (recovery['resume_iteration'], recovery['command']['additional_iterations'],
@@ -918,12 +961,82 @@ def test_cleanup_only_build_reuses_pass_after_bound_maintenance(service, monkeyp
     assert recovery['state'] == state and closed['result'] == state
     assert resume_mod.readback(store, resumed['spec'], recovery) == {'state': 'confirmed'}
 
-    def seal_only(flow, name, body):
-        assert name == 'delivery_feature_seal_build'
-        return activities.seal_build(body['spec'], body['candidate'])
+    effective = resumed['spec']
+    assert (effective['policy_digest'] != child['policy_digest']) == runtime_rebound
+    saved = {name: (folder / name).read_bytes() for name in ('intent.json', 'receipt.json')}
+    observe_finalized_resources(effective)  # Original preservation, current runtime authority.
+    for authority in ('native_identity', 'browser_qa'):
+        foreign = copy.deepcopy(effective)
+        foreign['policy'][authority] = ({'runtime_payload_sha256': '0' * 64}
+                                         if authority == 'native_identity'
+                                         else {'artifact_paths': ['dist/foreign']})
+        foreign['policy_digest'] = digest(foreign['policy'])
+        with pytest.raises(ValueError):
+            observe_finalized_resources(foreign)
+    assert RunResources(effective).finalize('blocked')['state'] == 'confirmed'
+    assert RunResources(effective).finalize('blocked')['state'] == 'confirmed'
 
-    delivered, calls = _drive(monkeypatch, resumed['spec'], recovery, seal_only)
+    def terminal_resources(flow, name, body):
+        if name == 'delivery_feature_seal_build':
+            return activities.seal_build(body['spec'], body['candidate'])
+        if name == 'delivery_finalize_resources':
+            return RunResources(body['spec']).finalize(body['outcome'], uncertain=body['uncertain'])
+        assert name == 'delivery_project'
+        store.project(body['spec']['run_id'], **{k: v for k, v in body.items() if k != 'spec'})
+
+    # Replay a later failed revalidation, when the allocated source is already
+    # absent and only its preserved marker can make maintenance discover work.
+    destination = folder / 'output'
+    retained = folder / 'retained-original'
+    destination.rename(retained)
+    destination.mkdir()
+    (destination / 'foreign').write_text('preserve replacement')
+    try:
+        second, calls = _drive(monkeypatch, effective, recovery, terminal_resources, project=True)
+        assert second['outcome'] == 'blocked' and second['cleanup'] == 'unknown'
+        assert second['error'] == 'resource cleanup is unknown'
+        assert (destination / 'foreign').read_text() == 'preserve replacement'
+        assert all((folder / name).read_bytes() == raw for name, raw in saved.items())
+        store._native_cleanup_scan_after = 0
+        pending = [row for row in orphans._unfinished_rows(store)
+                   if row['run_id'] == child['run_id']]
+        assert len(pending) == 1
+    finally:
+        (destination / 'foreign').unlink()
+        destination.rmdir()
+        retained.rename(destination)
+    closed.update(workflow_id=resumed['workflow_id'], execution_run_id='second-cleanup-failure',
+                  closed_at='2026-10-16T01:00:00+00:00', recovery_digest=digest(recovery),
+                  result=copy.deepcopy(second))
+    described = {key: closed[key] for key in ('workflow_id', 'execution_run_id', 'closed_at')}
+    orphans._reconcile(store, pending[0], effective, {**described, 'status': 'COMPLETED'})
+    assert _row(store, child)['cleanup'] == 'confirmed'
+    assert closed['result'] == second and recovery['state'] == state
+    store._native_cleanup_scan_after = 0
+    assert not any(row['run_id'] == child['run_id'] for row in orphans._unfinished_rows(store))
+    activities.finish_worker(parent, child['run_id'])
+
+    parent = handoff(parent)
+    again = activities.resume_worker(store, parent, effective, _row(store, child))
+    latest = _recovery(store, child)
+    assert latest['command']['additional_iterations'] == 0
+    assert latest['session_id'] == role['session_id'] and latest['state'] == second
+    assert resume_mod.readback(store, again['spec'], latest) == {'state': 'confirmed'}
+    delivered, calls = _drive(monkeypatch, again['spec'], latest, terminal_resources, project=True)
     assert delivered['outcome'] == 'delivered' and delivered['iteration'] == 2
-    assert delivered['candidate'] == candidate and delivered['roles'] == [role]
-    assert [name for name, *_ in calls] == ['delivery_tracker_start', 'delivery_feature_seal_build']
+    assert delivered['candidate'] == {**candidate, 'policy_digest': effective['policy_digest']}
+    assert delivered['roles'] == [role]
+    assert not any(name == 'delivery_role' for name, *_ in calls)
+    observe_finalized_resources(again['spec'])
+    activities.finish_worker(parent, child['run_id'])
+    assert all((folder / name).read_bytes() == raw for name, raw in saved.items())
+    integrated = worker_spec(parent, chunk, {'url': child['issue_url']}, kind='chunk',
+                             seed=checkpoint, base_sha=parent['base_sha'], base_branch='main')
+    register_worker(store, parent, integrated)
+    ordinary = DeliveryBroker(store, integrated)
+    ordinary.prepare()
+    assert (ordinary.checkout / 'README.md').read_text() == 'Completed implementation\n'
     assert shared.budget(token['issue_id']) == before_budget
+    with store._connect() as db:
+        assert db.execute('SELECT count(*) FROM delivery_attempts WHERE run_id=?',
+                          (child['run_id'],)).fetchone()[0] == 1
