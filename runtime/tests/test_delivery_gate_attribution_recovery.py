@@ -480,7 +480,8 @@ argv = ["uv", "--project", "workers/automation", "run", "--locked", "--all-extra
     monkeypatch.setattr(preparation, 'native_identity', lambda _: current_runtime)
     monkeypatch.setattr(preparation, 'verify_native_spec', lambda _: None)
     monkeypatch.setattr(gates, 'load_execution_config', lambda _: store.config)
-    monkeypatch.setattr(gates, 'prepare_runtime', lambda given, *_a, **_kw: deepcopy(given))
+    monkeypatch.setattr(gates, 'prepare_runtime', lambda given, *_a, **_kw: {
+        **deepcopy(given), 'terminal_tracker_version': 1})
     git = gates._git
     runtime_root = Path(gates.__file__).resolve().parents[3]
     monkeypatch.setattr(gates, '_git', lambda path, *args:
@@ -795,6 +796,129 @@ def test_original_native_changed_session_source_or_unrelated_admission_refuses(o
         observed(item)
 
 
+def _retained_browser_ordering_failure(item, spec, recovery):
+    """Synthetic native completion; all retained native/history validators remain real."""
+    from datetime import UTC, datetime, timedelta
+
+    from temporalio.api.common.v1 import ActivityType, Memo, Payloads, WorkflowType
+    from temporalio.api.history.v1 import (
+        ActivityTaskCompletedEventAttributes,
+        ActivityTaskScheduledEventAttributes,
+        HistoryEvent,
+        WorkflowExecutionCompletedEventAttributes,
+        WorkflowExecutionStartedEventAttributes,
+    )
+    from temporalio.client import WorkflowHistory
+
+    from devflow_temporal import delivery_closures as closures
+    from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
+    from devflow_temporal.delivery_policy_recovery import _rows
+    from devflow_temporal.delivery_resources import _gate_path
+    from devflow_temporal.delivery_sandbox import _native_role_home
+    from devflow_temporal.supervisor import DeliverySupervisor
+
+    state = deepcopy(recovery['state'])
+    candidate, iteration = recovery['candidate'], state['iteration']
+    checks = {stage: {'state': 'passed', 'candidate_id': candidate['id'],
+                     'source_unchanged': True, 'results': []}
+              for stage in ('prepublish', 'local')}
+    old = recovery['seal']['browser_artifact_observation']
+    brief = {'historical_assessment_remains_rejected': True,
+             'unresolved_findings': old['unresolved_findings'],
+             'controller_browser_artifact_proof': old}
+    common = {'spec': spec, 'candidate': candidate, 'iteration': iteration}
+    request = {**common, 'role': 'review', 'resume_session': None, 'qa_evidence': None,
+               'evidence_context': {'role_artifacts': []}, 'check_evidence': checks['local'],
+               'findings': ['Operator acceptance criteria (requirements to assess, '
+                            'not evidence of success): ' + json.dumps(brief, sort_keys=True)]}
+    scheduled = deepcopy(request)
+    job = DeliverySupervisor._job_key(request)
+    folder = Path(spec['state_dir']) / 'attempts' / job
+    request.update(workspace=str(_gate_path(spec, 'review', iteration)), native_authorized=True,
+        role_evidence_key=job, result_path=str(folder / 'result.json'),
+        start_path=str(folder / 'start.json'))
+    finding = '[P2] Required browser JUnit and successful traces remain missing.'
+    raw = {'status': 'findings', 'summary': finding, 'findings': [finding],
+           'session_id': 'rejected-gate-review', 'finish_reason': 'done'}
+    native = {**state['roles'][-1]['native_process'],
+              'journal': str(folder / 'native-process.json')}
+    result = {**raw, 'cleanup': 'confirmed', 'native_process': native}
+    argv = ['/fixture/python', '-I', '-m', 'devflow_temporal.role_runner',
+            str(folder / 'request.json')]
+    launch = {'argv': argv, 'environment': {
+        'CODEX_HOME': str(_native_role_home(request) / 'codex')}}
+    write_private(folder / 'request.json', request)
+    write_private(folder / 'result.json', raw)
+    write_private(folder / 'launch.json', launch)
+    write_private(folder / 'native-process.json', {
+        'phase': 'finished', 'monitoring_complete': True, 'result': native,
+        'runtime_identity': native['runtime_identity'], 'owned': {'321': {'identity': 'finished'}},
+        'intent': {'run_id': spec['run_id'], 'policy_digest': spec['policy_digest'],
+                   'argv': argv, 'cwd': request['workspace'],
+                   'environment_sha256': digest(launch['environment'])},
+        'provider_session': {'role': 'review', 'iteration': iteration,
+            'session_id': raw['session_id'], 'resumed_from': None, 'result_digest': digest(result),
+            'output_candidate': {k: candidate[k] for k in ('id', 'head', 'content_sha256')}}})
+    role = {**result, 'role': 'review', 'iteration': iteration, 'candidate': candidate,
+            'input_candidate_id': candidate['id']}
+    born = datetime(2026, 10, 16, 12, tzinfo=UTC)
+    with item.store._connect() as db:
+        db.execute('INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,'
+            'state,session_id,result_json,cleanup,pid,process_identity,started_at,finished_at,'
+            'result_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (job, spec['run_id'], 'review', iteration, candidate['id'], 'finished',
+             raw['session_id'], json.dumps(result), 'confirmed', 321, 'finished',
+             (born + timedelta(seconds=6)).isoformat(),
+             (born + timedelta(seconds=7)).isoformat(), request['result_path']))
+    checks.update(review={'state': 'failed', 'candidate_id': candidate['id']},
+        failure={'classification': 'terminal', 'stage': 'review',
+                 'reason': 'repair limit exhausted'})
+    state.update(revision=state['revision'] + 10, roles=[*state['roles'], role],
+        candidate=candidate,
+        pull_request=recovery['publication'], checks=checks, error='repair limit exhausted')
+    item.store.project(spec['run_id'], phase='blocked', execution_state='blocked',
+        outcome='blocked',
+        cleanup='confirmed', event_type='blocked', message=state['error'], error=state['error'],
+        candidate=candidate, pull_request=state['pull_request'], checks=checks,
+        iteration=iteration, protocol_revision=state['revision'], tracker=state['tracker'],
+        usage=state['usage'], decision=state['decision'], intake=state['intake'])
+    with item.store._connect() as db:
+        item.store.state.release_work(db, spec['work_id'], 'external:devflow:' + spec['run_id'])
+    row = _rows(item.store, spec['run_id'])[0]
+
+    async def seal():
+        async def payload(values):
+            return Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode(values))
+        events = [HistoryEvent(event_id=1, workflow_execution_started_event_attributes=
+            WorkflowExecutionStartedEventAttributes(workflow_type=WorkflowType(
+                name='DevflowDeliveryWorkflow'), workflow_id=row['workflow_id'],
+                original_execution_run_id='closed-ordering-retry',
+                input=await payload([spec, recovery]),
+                memo=Memo(fields={k: (await DELIVERY_DATA_CONVERTER.encode([v]))[0]
+                    for k, v in {'request_digest': spec['request_digest'],
+                                 'recovery_digest': digest(recovery)}.items()})))]
+        for name, body, value in [('delivery_precheck', common, checks['prepublish']),
+                ('delivery_checks', common, checks['local']), ('delivery_role', scheduled, role)]:
+            event = len(events) + 1
+            events.extend([HistoryEvent(event_id=event,
+                activity_task_scheduled_event_attributes=ActivityTaskScheduledEventAttributes(
+                    activity_type=ActivityType(name=name), input=await payload([body]))),
+                HistoryEvent(event_id=event + 1,
+                    activity_task_completed_event_attributes=ActivityTaskCompletedEventAttributes(
+                        scheduled_event_id=event, result=await payload([value])))])
+        events.append(HistoryEvent(event_id=len(events) + 1,
+            workflow_execution_completed_event_attributes=WorkflowExecutionCompletedEventAttributes(
+                result=await payload([state]))))
+        for event in events:
+            event.event_time.FromDatetime(born + timedelta(seconds=event.event_id))
+        history = WorkflowHistory(row['workflow_id'], events)
+        facts = await closures.closure_facts(history)
+        closures.seal(item.store, history, facts, run_id=spec['run_id'], source='temporal')
+        return {k: facts[k] for k in ('workflow_id', 'execution_run_id', 'closed_at',
+                                      'request_digest', 'recovery_digest', 'result')}
+    return state, asyncio.run(seal())
+
+
 @pytest.mark.parametrize('original', ['browser'], indirect=True)
 def test_public_native_browser_handoff_reassesses_without_writer_or_history_debit(
     original, monkeypatch,
@@ -866,7 +990,62 @@ def test_public_native_browser_handoff_reassesses_without_writer_or_history_debi
     budget = shared.budget(token['issue_id'])
     assert budget['used'] == 0 and budget['lifetime_used'] == 10
     assert budget['allowance']['sequence'] == 1
-    flow, calls = DeliveryWorkflow(), []
+    rejected, closed = _retained_browser_ordering_failure(item, spec, recovery)
+    original_closed = item.closed
+    parent_transport = item.store._completed_temporal_result
+
+    def completed(run_id, *, workflow_id=None):
+        if run_id != spec['run_id']:
+            # Existing synthetic parent-closure transport boundary.
+            return parent_transport(run_id, workflow_id=workflow_id)
+        return deepcopy({closed['workflow_id']: closed,
+                         original_closed['workflow_id']: original_closed}[workflow_id])
+
+    monkeypatch.setattr(item.store, '_completed_temporal_result', completed)
+    row = _rows(item.store, spec['run_id'])[0]
+    assert browser.browser_artifact_possible(item.store, spec, row)
+    seal = gates.snapshot(item.store, spec['run_id'])
+    assert seal['browser_artifact_observation']['cause'] == 'browser_artifact_assessment_order'
+    assert seal['generation'] == 2
+    attempts = _rows(item.store, spec['run_id'])[1]
+    latest = next(a for a in attempts if a['role'] == 'review'
+                  and a['iteration'] == rejected['iteration'])
+    request_path = Path(spec['state_dir']) / 'attempts' / latest['job_key'] / 'request.json'
+    native_request = json.loads(request_path.read_bytes())
+    write_private(request_path, {**native_request, 'role_evidence_key': '0' * 64})
+    try:
+        with pytest.raises(ValueError, match='supervised launcher'):
+            gates.snapshot(item.store, spec['run_id'])
+    finally:
+        write_private(request_path, native_request)
+    # The actual failed gate also stops its parent. Exercise the next public
+    # continuation before reserving the same worker's second gate namespace.
+    current_token = current_parent['feature_delivery']['owner']
+    shared.finish_worker(current_token, worker_key(spec['run_id'], current_token),
+                         {'cleanup': 'confirmed'})
+    shared.stop(current_token, 'browser-ordering-rejection', {})
+    item.store.project(current_parent['run_id'], phase='blocked', outcome='blocked',
+        cleanup='confirmed', execution_state='blocked', event_type='blocked',
+        message='Required browser evidence was not produced before review')
+    with item.store._connect() as db:
+        item.store.state.release_work(db, current_parent['work_id'],
+                                      'external:devflow:' + current_parent['run_id'])
+        revision = db.execute('SELECT revision FROM delivery_runs WHERE run_id=?',
+                              (current_parent['run_id'],)).fetchone()[0]
+    command = {'command_id': 'continue-browser-ordering', 'expected_revision': revision}
+    successor = continue_feature(item.store, current_parent['run_id'], command)
+    assert continue_feature(item.store, current_parent['run_id'], command) == successor
+    current_parent = item.store.effective_spec(successor['run_id'])
+    assert shared.budget(token['issue_id']) == budget
+    resumed = activities.resume_worker(item.store, current_parent, spec, row)
+    spec = resumed['spec']
+    recovery = json.loads(_rows(item.store, spec['run_id'])[0]['recovery_json'])
+    assert spec['gate_retry_generation'] == 2 and recovery['state'] == rejected
+    assert recovery['command']['additional_iterations'] == 0
+    assert gates.readback(item.store, spec, recovery)['number'] == 7
+    assert item.store.continue_repair(spec['run_id'], recovery['command'])['workflow_id'] \
+        == resumed['workflow_id']
+    calls = []
 
     async def activity(name, body, **_kw):
         calls.append((name, body))
@@ -874,30 +1053,111 @@ def test_public_native_browser_handoff_reassesses_without_writer_or_history_debi
             return gates.readback(item.store, body['spec'], body['recovery'])
         if name in {'delivery_tracker_start', 'delivery_tracker'}:
             return {'state': 'consistent'}
+        if name == 'delivery_project':
+            return item.store.project(spec['run_id'], **{k: v for k, v in body.items()
+                                                        if k != 'spec'})
+        if name == 'delivery_finalize_resources':
+            from devflow_temporal.delivery_resources import RunResources
+
+            return RunResources(spec).finalize(body['outcome'])
+        if name == 'delivery_terminal_tracker':
+            return {'state': 'consistent', 'pending': False}
         if name == 'delivery_browser_qa':
-            # Actual reporters/browser generation is exercised by the native browser probe.
-            return {'state': 'passed', 'cleanup': 'confirmed',
-                    'receipt': '/fixture/fresh-browser-receipt', 'receipt_sha256': 'f' * 64,
-                    'log': '/fixture/fresh-browser-log', 'log_sha256': 'e' * 64}
+            import hashlib
+            import zipfile
+
+            from devflow_temporal.delivery_resources import _gate_evidence_root
+
+            # Explicit synthetic browser/provider boundary. The actual native
+            # report generator is separately qualified; these are real retained bytes.
+            folder = _gate_evidence_root(spec) / 'browser-qa' / str(before['iteration'])
+            private_directory(folder)
+            (folder / 'junit.xml').write_text('<testsuite><testcase name="selected"/></testsuite>')
+            with zipfile.ZipFile(folder / 'trace.zip', 'w') as trace:
+                trace.writestr('trace.trace', json.dumps({
+                    'candidate_id': recovery['candidate']['id']}))
+            log = folder / 'browser-qa.log'
+            log.write_bytes(b'1 passed: synthetic owned browser actor\n')
+            log.chmod(0o600)
+            receipt = {'state': 'passed', 'candidate_id': recovery['candidate']['id'],
+                'iteration': before['iteration'],
+                'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest(),
+                'artifacts': [{'path': str(path),
+                               'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+                              for path in (folder / 'junit.xml', folder / 'trace.zip')]}
+            write_private(folder / 'receipt.json', receipt)
+            return {**receipt, 'cleanup': 'confirmed', 'receipt': str(folder / 'receipt.json'),
+                'receipt_sha256': hashlib.sha256(
+                    (folder / 'receipt.json').read_bytes()).hexdigest(),
+                'log': str(log)}
         if name == 'delivery_role':
             assert body['role'] in {'review', 'verify'}
-            assert all(finding in str(body) for finding in proof['unresolved_findings'])
+            from devflow_temporal.delivery_sandbox import _browser_qa_evidence
+
+            assert all(finding in str(body) for finding in recovery['seal'][
+                'browser_artifact_observation']['unresolved_findings'])
+            assert body.get('qa_evidence'), 'review must reject absent fresh browser evidence'
+            _browser_qa_evidence(body)
+            receipt = json.loads(Path(body['qa_evidence']['path']).read_bytes())
+            import hashlib
+            import zipfile
+            from xml.etree import ElementTree
+
+            artifacts = {Path(a['path']).name: Path(a['path']) for a in receipt['artifacts']}
+            assert set(artifacts) == {'junit.xml', 'trace.zip'}
+            for artifact in receipt['artifacts']:
+                assert hashlib.sha256(Path(artifact['path']).read_bytes()).hexdigest() \
+                    == artifact['sha256']
+            assert ElementTree.parse(artifacts['junit.xml']).find('testcase') is not None
+            with zipfile.ZipFile(artifacts['trace.zip']) as trace:
+                assert json.loads(trace.read('trace.trace'))['candidate_id'] \
+                    == recovery['candidate']['id']
             return {'role': body['role'], 'status': 'pass', 'iteration': before['iteration'],
                     'session_id': 'fresh-' + body['role'], 'cleanup': 'confirmed',
                     'candidate': recovery['candidate']}
-        return {'state': 'passed', 'cleanup': 'confirmed'}
+        return {'state': 'passed', 'cleanup': 'confirmed',
+                'candidate_id': recovery['candidate']['id'], 'source_unchanged': True}
 
-    async def project(*_a, **_kw):
-        pass
+    async def execute():
+        import shutil
 
-    monkeypatch.setattr(flow, '_activity', activity)
-    monkeypatch.setattr(flow, '_project', project)
-    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
-    result = asyncio.run(flow._resume_published_gates(spec, recovery))
+        from temporalio import activity as temporal_activity
+        from temporalio.testing import WorkflowEnvironment
+        from temporalio.worker import Replayer, Worker
+
+        def handler(name):
+            @temporal_activity.defn(name=name)
+            async def run(body):
+                return await activity(name, body)
+            return run
+        names = ['delivery_gates_readback', 'delivery_tracker_start', 'delivery_tracker',
+                 'delivery_project', 'delivery_precheck', 'delivery_checks', 'delivery_browser_qa',
+                 'delivery_role', 'delivery_ci', 'delivery_finalize_resources',
+                 'delivery_terminal_tracker']
+        async with await WorkflowEnvironment.start_local(
+            dev_server_existing_path=shutil.which('temporal'),
+            dev_server_database_filename=str(Path(item.spec['state_dir']).parent / 'flow.sqlite3'),
+        ) as environment:
+            async with Worker(environment.client, task_queue=spec['run_id'],
+                    workflows=[DeliveryWorkflow], activities=[handler(name) for name in names]):
+                handle = await environment.client.start_workflow(DeliveryWorkflow.run,
+                    args=[spec, recovery], id=resumed['workflow_id'], task_queue=spec['run_id'],
+                    memo={'request_digest': spec['request_digest'],
+                          'recovery_digest': digest(recovery)})
+                result = await handle.result()
+                history = await handle.fetch_history()
+        await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+        return result
+
+    result = asyncio.run(execute())
     assert result['outcome'] == 'delivered' and result['iteration'] == before['iteration']
-    assert result['roles'][:len(before['roles'])] == before['roles'] and item.state == before
+    assert result['roles'][:len(rejected['roles'])] == rejected['roles'] and item.state == before
     assert [body['role'] for name, body in calls if name == 'delivery_role'] == ['review', 'verify']
-    assert any(name == 'delivery_browser_qa' for name, _ in calls)
+    assert [name if name != 'delivery_role' else body['role'] for name, body in calls
+            if name in {'delivery_browser_qa', 'delivery_role', 'delivery_ci'}] == [
+                'delivery_browser_qa', 'review', 'verify', 'delivery_ci']
+    assert calls[-1][0] == 'delivery_project' and calls[-1][1]['event_type'] == 'delivered'
+    assert result['checks']['terminal_tracker_checkpoint']['state'] == 'confirmed'
     assert not any(name == 'delivery_publish' for name, _ in calls)
     assert shared.budget(token['issue_id']) == budget
     with shared.connect() as db:

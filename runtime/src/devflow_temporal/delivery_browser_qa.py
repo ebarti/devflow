@@ -277,7 +277,20 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
 
 def browser_artifact_possible(store, spec, row):
     """Read-only routing hint; the admission separately authenticates the cause."""
-    if (spec.get("provider") != "codex" or spec.get("gate_retry_generation") is not None
+    if spec.get("gate_retry_generation") is not None:
+        previous = json.loads(row.get("recovery_json") or "null") or {}
+        checks = json.loads(row.get("checks_json") or "{}")
+        return (spec.get("provider") == "codex"
+                and spec.get("feature_worker", {}).get("kind") == "chunk"
+                and spec.get("gate_retry_generation") == 1
+                and spec.get("gate_retry_stage") == "published"
+                and previous.get("execution_spec") == spec
+                and previous.get("seal", {}).get("browser_artifact_observation", {}).get("cause")
+                == "missing_selected_browser_artifacts"
+                and row.get("error") == "repair limit exhausted"
+                and checks.get("review", {}).get("state") == "failed"
+                and "browser_qa" not in checks)
+    if (spec.get("provider") != "codex"
             or spec.get("feature_worker", {}).get("kind") != "chunk"
             or row.get("error") != "implementer did not establish a pass"):
         return False
@@ -318,6 +331,9 @@ def observe_browser_artifacts(
     )
     from .delivery_gate_attribution_recovery import _original_progress, eligible_stop
 
+    if spec.get("gate_retry_generation") is not None:
+        return _observe_browser_ordering(store, spec, row, state, attempts, closed, transport,
+                                         broker, resource_spec=resource_spec)
     if (transport is not None or not eligible_stop(spec, state)
             or spec.get("provider") != "codex" or spec.get("gate_selections_version") != 2):
         raise ValueError("browser artifact retry requires its original selected native worker")
@@ -449,3 +465,179 @@ def observe_browser_artifacts(
             "browser_receipt_sha256": browser["receipt_sha256"],
             "check_runtime": _runtime(native.get("runtime_identity")),
             "selected_source_evidence": selected}
+
+
+def browser_ordering_authority(spec, recovery):
+    """The one successor of an authenticated browser-artifact ordering failure."""
+    from .delivery_continuation import continuation_authority
+
+    previous = recovery.get("original_recovery") or {}
+    before = previous.get("execution_spec") or {}
+    proof = recovery.get("seal", {}).get("browser_artifact_observation") or {}
+    if (recovery.get("kind") != "published_gate_retry"
+            or proof.get("cause") != "browser_artifact_assessment_order"
+            or spec.get("gate_retry_stage") != "published"
+            or spec.get("gate_retry_generation") != 2
+            or spec.get("gate_retry_preflight_generation")
+            or spec.get("gate_retry_prepared_handoff")
+            or before.get("gate_retry_stage") != "published"
+            or before.get("gate_retry_generation") != 1
+            or previous.get("original_recovery") is not None
+            or previous.get("seal", {}).get("browser_artifact_observation", {}).get("cause")
+            != "missing_selected_browser_artifacts"
+            or recovery.get("command", {}).get("additional_iterations") != 0
+            or recovery["seal"].get("previous_digest") != digest(previous)
+            or recovery["seal"].get("prior_gate_digest") != digest(previous)
+            or recovery["seal"].get("original_spec") != before
+            or recovery["state"] != recovery["seal"]["closed"]["result"]
+            or continuation_authority(spec["policy"]) != continuation_authority(before["policy"])
+            or any(spec.get(key) != before.get(key) for key in (
+                "run_id", "work_id", "state_dir", "checkout", "source_path", "branch",
+                "base_sha", "accepted_plan", "feature_worker", "feature_delivery",
+                "feature_plan_revision", "config_digest", "plan_approval", "authorized_endpoint",
+                "origin_url", "base_ref", "publication_base_ref", "expected_paths",
+                "implementation_role_home_generation", "provider"))):
+        raise ValueError("browser ordering retry changed its singleton assessment authority")
+    return previous, before, proof
+
+
+def _observe_browser_ordering(
+    store, spec, row, state, attempts, closed, previous, broker, *, resource_spec=None,
+):
+    """Authenticate a review that ran before its required browser producer."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import UTC
+
+    from . import delivery_gate_retry as gates
+    from .delivery_closures import sealed_closure
+    from .delivery_codec import DELIVERY_DATA_CONVERTER
+    from .delivery_feature_closure import completed_worker
+    from .delivery_feature_revision_subject import _native_role, bounded_findings
+    from .delivery_resources import _gate_roots
+
+    prior = previous or {}
+    old = prior.get("seal", {}).get("browser_artifact_observation") or {}
+    original = prior.get("state") or {}
+    candidate = broker.candidate()
+    checks = state.get("checks") or {}
+    roles = state.get("roles") or []
+    if (spec.get("provider") != "codex" or spec.get("gate_selections_version") != 2
+            or spec.get("gate_retry_generation") != 1
+            or spec.get("gate_retry_stage") != "published"
+            or spec.get("gate_retry_preflight_generation")
+            or spec.get("gate_retry_prepared_handoff")
+            or prior.get("kind") != gates.KIND or prior.get("execution_spec") != spec
+            or prior.get("original_recovery") is not None
+            or old.get("cause") != "missing_selected_browser_artifacts"
+            or prior.get("command", {}).get("additional_iterations") != 0
+            or state.get("candidate") != candidate
+            or state.get("pull_request") != prior.get("publication")
+            or state.get("iteration") != original.get("iteration")
+            or roles[:-1] != original.get("roles") or not roles
+            or state.get("error") != "repair limit exhausted"
+            or checks.get("failure") != {"classification": "terminal", "stage": "review",
+                                         "reason": "repair limit exhausted"}
+            or any(key in checks for key in ("browser_qa", "qa", "ci"))
+            or any(checks.get(stage, {}).get("state") != "passed"
+                   or checks[stage].get("candidate_id") != candidate["id"]
+                   or checks[stage].get("source_unchanged") is not True
+                   for stage in ("prepublish", "local"))):
+        raise ValueError("browser ordering retry lost its exact closed gate-only assessment")
+    review = roles[-1]
+    findings = bounded_findings(review.get("findings"))
+    if (review.get("role") != "review" or review.get("iteration") != state["iteration"]
+            or review.get("status") not in {"findings", "blocked"}
+            or review.get("finish_reason") != "done" or review.get("cleanup") != "confirmed"
+            or review.get("candidate") != candidate or review.get("planning_defect")
+            or not all("junit" in text.lower() and "trace" in text.lower() for text in findings)
+            or checks.get("review", {}).get("state") != "failed"
+            or checks["review"].get("candidate_id") != candidate["id"]):
+        raise ValueError("browser ordering retry lost its native missing-artifact rejection")
+    old_attempts = prior["seal"]["attempts"]
+    current = {a["job_key"]: a for a in attempts}
+    added = [a for a in attempts if a["job_key"] not in {a["job_key"] for a in old_attempts}]
+    with store._connect() as db:
+        effects = [dict(e) for e in db.execute(
+            "SELECT * FROM delivery_effects WHERE run_id=? ORDER BY effect_key", (spec["run_id"],))]
+    if (len(current) != len(attempts) or len(added) != 1
+            or any(current.get(a["job_key"]) != a for a in old_attempts)
+            or effects != prior["seal"]["effects"]):
+        raise ValueError("browser ordering retry changed its complete original native ledger")
+    latest = resource_spec or spec
+    gates.readback(store, spec, prior, resource_spec=latest)
+    bindings = {}
+    _gate_roots(latest, execution_specs=bindings)
+    root = Path(spec["state_dir"]) / gates.gate_namespace(1, "published") / "evidence"
+    if bindings.get(root) != spec:
+        raise ValueError("browser ordering retry lost its exact first assessment namespace")
+
+    async def read():
+        sealed = await sealed_closure(store, closed["workflow_id"])
+        if sealed is None:
+            raise ValueError("browser ordering retry requires its sealed completed history")
+        authenticated = await completed_worker(sealed["history"], store, spec,
+            {**row, "recovery_json": json.dumps(prior)}, closed)
+        calls, done, times = {}, {}, {}
+        names = {"delivery_precheck": "prepublish", "delivery_checks": "local",
+                 "delivery_role": "review"}
+        for event in sealed["history"].events:
+            times[event.event_id] = event.event_time.ToDatetime(tzinfo=UTC)
+            if event.HasField("activity_task_scheduled_event_attributes"):
+                activity = event.activity_task_scheduled_event_attributes
+                if activity.activity_type.name in {"delivery_browser_qa", "delivery_publish"}:
+                    raise ValueError(
+                        "browser ordering retry cannot replace produced browser or code")
+                if activity.activity_type.name in names:
+                    values = await DELIVERY_DATA_CONVERTER.decode(activity.input.payloads)
+                    common = {"spec": spec, "candidate": candidate,
+                              "iteration": state["iteration"]}
+                    if len(values) != 1 or any(values[0].get(k) != v for k, v in common.items()):
+                        raise ValueError("browser ordering retry scheduled another candidate")
+                    request = values[0]
+                    if activity.activity_type.name == "delivery_role":
+                        brief = {"historical_assessment_remains_rejected": True,
+                                 "unresolved_findings": old["unresolved_findings"],
+                                 "controller_browser_artifact_proof": old}
+                        if (request.get("role") != "review"
+                                or request.get("resume_session") is not None
+                                or request.get("qa_evidence") is not None
+                                or request.get("check_evidence") != checks["local"]
+                                or request.get("findings") != ["Operator acceptance criteria "
+                                    "(requirements to assess, not evidence of success): "
+                                    + json.dumps(brief, sort_keys=True)]
+                                or request.get("evidence_context") != {"role_artifacts": [
+                                    r["role_artifacts"] for r in original["roles"]
+                                    if r.get("role_artifacts") and r.get("role") == "implement"
+                                    and r.get("iteration") == state["iteration"]]}):
+                            raise ValueError(
+                                "browser ordering review lost its rejected predecessor")
+                    elif request != common:
+                        raise ValueError("browser ordering retry changed its check request")
+                    calls[event.event_id] = (activity.activity_type.name, request)
+            elif event.HasField("activity_task_completed_event_attributes"):
+                activity = event.activity_task_completed_event_attributes
+                if activity.scheduled_event_id in calls:
+                    done[activity.scheduled_event_id] = (event.event_id,
+                        await DELIVERY_DATA_CONVERTER.decode(activity.result.payloads))
+        ids = list(calls)
+        if ([calls[i][0] for i in ids] != list(names) or set(ids) != set(done)
+                or any(done[i][1] != [review if calls[i][0] == "delivery_role"
+                                     else checks[names[calls[i][0]]]] for i in ids)
+                or any(not start < done[start][0] < stop
+                       for start, stop in zip(ids, ids[1:], strict=False))):
+            raise ValueError("browser ordering retry lost its exact completed gate sequence")
+        event = ids[-1]
+        session = next(r["session_id"] for r in reversed(original["roles"])
+                       if r.get("role") == "implement")
+        proof = _native_role(spec, review, added[0], session, times[event],
+                             times[done[event][0]], candidate, resource_spec=latest,
+                             scheduled_input=calls[event][1])
+        return {"history_sha256": authenticated["history_sha256"], "review": proof}
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        progress = pool.submit(lambda: asyncio.run(read())).result(35)
+    return {"cause": "browser_artifact_assessment_order", "progress": progress,
+            "original_observation_sha256": digest(old), "unpassed_status": review["status"],
+            "unresolved_findings": [*old["unresolved_findings"], *findings],
+            "check_runtime": progress["review"]["runtime_identity"]}

@@ -589,8 +589,8 @@ def _browser_qa_evidence(request: dict[str, Any]) -> None:
         if request['role'] == 'verify' and request['spec']['policy'].get('browser_qa'):
             raise ValueError('configured browser QA receipt is required for verification')
         return
-    if request['role'] != 'verify' or not isinstance(evidence, dict):
-        raise ValueError('browser QA evidence belongs only to independent verification')
+    if request['role'] not in {'review', 'verify'} or not isinstance(evidence, dict):
+        raise ValueError('browser QA evidence belongs only to independent assessment')
     from .delivery_resources import _ancestors, _gate_evidence_root
 
     parent = _gate_evidence_root(request['spec']) / 'browser-qa' / str(request['iteration'])

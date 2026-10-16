@@ -1312,7 +1312,8 @@ def test_continuation_rejects_temporal_projection_before_workflow_close(service,
 
 
 
-def test_verify_task_requires_hash_of_broker_executed_qa_receipt():
+@pytest.mark.parametrize("role", ["review", "verify"])
+def test_verify_task_requires_hash_of_broker_executed_qa_receipt(role, tmp_path, monkeypatch):
     digest = "a" * 64
     spec = {
         "run_id": "qa-run",
@@ -1320,14 +1321,14 @@ def test_verify_task_requires_hash_of_broker_executed_qa_receipt():
         "goal": "Verify feature",
         "accepted_plan": "Inspect browser and API results",
         "policy": {
-            "roles": {"verify": {"model": "gpt-6-sol", "effort": "max"}},
+            "roles": {role: {"model": "gpt-6-sol", "effort": "max"}},
             "allowed_paths": ["README.md"],
             "host_sandbox": "native-profile",
         },
     }
     request = {
         "spec": spec,
-        "role": "verify",
+        "role": role,
         "iteration": 0,
         "candidate": {"id": "candidate", "head": "head"},
         "workspace": "/owned/checkout",
@@ -1341,14 +1342,40 @@ def test_verify_task_requires_hash_of_broker_executed_qa_receipt():
     assert "broker, not you, executed" in task.goal
     assert task.output_schema["properties"]["qa_receipt_sha256"]["type"] == "string"
     assert "qa_receipt_sha256" in task.output_schema["required"]
+    legacy = _task({**request, "qa_evidence": None})
+    assert "qa_receipt_sha256" not in legacy.output_schema["required"]
+    assert "immutable receipt" not in legacy.goal
+    from dataclasses import replace
 
+    from test_delivery_provider_retry import harness
 
+    from devflow_temporal import delivery_native_threads, role_runner
 
-
-
-
-
-
+    binary = tmp_path / "synthetic-codex"
+    binary.write_bytes(b"fixture executable; never launched")
+    for number, returned in enumerate((digest, "b" * 64, None)):
+        root = tmp_path / str(number)
+        root.mkdir()
+        assessment = {"status": "pass", "summary": "Synthetic independent assessment",
+                      "findings": []}
+        if returned is not None:
+            assessment["qa_receipt_sha256"] = returned
+        runtime, native_task, observation, *_ = harness(
+            root, monkeypatch, [], assessment=assessment)
+        native_task = replace(native_task, output_schema=task.output_schema)
+        monkeypatch.setattr(delivery_native_threads, "NativeThreadObservation",
+                            lambda _r, observation=observation: observation)
+        monkeypatch.setattr("agent_runtime_kit.adapters.CodexAgentRuntime",
+                            lambda runtime=runtime, **_kw: runtime)
+        monkeypatch.setattr(role_runner, "_task", lambda _r, native_task=native_task: native_task)
+        supplied = {**request, "spec": {**spec, "policy": {**spec["policy"],
+            "codex_bin": str(binary),
+            "codex_bin_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            "execution_backend": "native-macos", "config_overrides": []}}}
+        result = asyncio.run(role_runner._run_codex(supplied))
+        assert result["status"] == ("pass" if returned == digest else "blocked"), result
+        if returned != digest:
+            assert "did not bind its assessment" in result["findings"][0]
 
 
 def test_gate_diff_is_bound_to_base_head_and_rejects_tampering(service):
@@ -2072,15 +2099,28 @@ async def test_publication_recovery_reuses_existing_pr_and_resumes_only_remainin
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("qa_state", ["passed", "unknown"])
-async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure(qa_state):
+@pytest.mark.parametrize("qa_state", ["passed", "unknown", "stale", "missing"])
+async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure(
+    qa_state, tmp_path,
+):
+    import zipfile
+    from xml.etree import ElementTree
+
+    from devflow_temporal.delivery_resources import private_directory, write_private
+    from devflow_temporal.delivery_sandbox import _browser_qa_evidence
     calls = []
     candidate = {"id": "candidate-1", "head": "head-1"}
     spec = {
         "run_id": f"browser-qa-{qa_state}",
         "provider": "fake",
+        "state_dir": str(tmp_path / f"browser-qa-{qa_state}"),
         "policy": {"max_repairs": 0, "browser_qa": {"id": "owned-browser"}},
     }
+
+    folder = Path(spec["state_dir"]) / "browser-qa/0"
+    private_directory(folder)
+    receipt_path, log_path = folder / "receipt.json", folder / "browser-qa.log"
+    receipt_sha, log_sha = None, None
 
     @activity.defn(name="delivery_project")
     async def project_stub(_payload):
@@ -2098,15 +2138,31 @@ async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure
     async def role_stub(payload):
         role = payload["role"]
         calls.append(role)
-        if role == "verify":
+        if role in {"review", "verify"}:
+            # Synthetic provider boundary: reject absent/stale real retained
+            # receipt/artifact bytes instead of unconditionally returning pass.
+            if not payload.get("qa_evidence"):
+                return {"status": "findings", "findings": ["JUnit/traces remain missing"],
+                        "candidate": candidate}
+            try:
+                _browser_qa_evidence(payload)
+            except ValueError:
+                return {"status": "findings", "findings": ["Stale browser evidence"],
+                        "candidate": candidate}
             assert payload["qa_evidence"] == {
-                "path": "/owned/receipt.json",
-                "sha256": "a" * 64,
-                "log": "/owned/browser-qa.log",
-                "log_sha256": "b" * 64,
-                "candidate_id": candidate["id"],
-                "iteration": 0,
-            }
+                "path": str(receipt_path), "sha256": receipt_sha,
+                "log": str(log_path), "log_sha256": log_sha,
+                "candidate_id": candidate["id"], "iteration": 0}
+            receipt = json.loads(receipt_path.read_bytes())
+            for artifact in receipt["artifacts"]:
+                if not Path(artifact["path"]).is_file():
+                    return {"status": "findings", "findings": ["Required trace is missing"],
+                            "candidate": candidate}
+                data = Path(artifact["path"]).read_bytes()
+                assert hashlib.sha256(data).hexdigest() == artifact["sha256"]
+            assert ElementTree.parse(folder / "junit.xml").find("testcase") is not None
+            with zipfile.ZipFile(folder / "trace.zip") as trace:
+                assert json.loads(trace.read("trace.trace"))["candidate_id"] == candidate["id"]
         return {"status": "pass", "session_id": f"fake:{role}", "candidate": candidate}
 
     @activity.defn(name="delivery_precheck")
@@ -2119,15 +2175,29 @@ async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure
 
     @activity.defn(name="delivery_browser_qa")
     async def browser_stub(_payload):
+        nonlocal receipt_sha, log_sha
         calls.append("browser_qa")
-        return {
-            "state": qa_state,
-            "cleanup": "unknown" if qa_state == "unknown" else "confirmed",
-            "receipt": "/owned/receipt.json",
-            "receipt_sha256": "a" * 64,
-            "log": "/owned/browser-qa.log",
-            "log_sha256": "b" * 64,
-        }
+        # Explicit synthetic browser producer; real native reporter generation
+        # is covered separately. Preserve actual JUnit/trace/log bytes here.
+        (folder / "junit.xml").write_text('<testsuite><testcase name="owned"/></testsuite>')
+        with zipfile.ZipFile(folder / "trace.zip", "w") as trace:
+            trace.writestr("trace.trace", json.dumps({"candidate_id": candidate["id"]}))
+        artifacts = [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                     for path in (folder / "junit.xml", folder / "trace.zip")]
+        log_path.write_bytes(b"1 passed: synthetic browser actor\n")
+        log_path.chmod(0o600)
+        log_sha = hashlib.sha256(log_path.read_bytes()).hexdigest()
+        receipt = {"state": "passed", "candidate_id": (
+            "stale" if qa_state == "stale" else candidate["id"]), "iteration": 0,
+            "log_sha256": log_sha, "artifacts": artifacts}
+        write_private(receipt_path, receipt)
+        if qa_state == "missing":
+            (folder / "trace.zip").unlink()
+        receipt_sha = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        return {"state": "unknown" if qa_state == "unknown" else "passed",
+                "cleanup": "unknown" if qa_state == "unknown" else "confirmed",
+                "receipt": str(receipt_path), "receipt_sha256": receipt_sha,
+                "log": str(log_path), "log_sha256": log_sha}
 
     @activity.defn(name="delivery_checks")
     async def checks_stub(_payload):
@@ -2167,7 +2237,8 @@ async def test_managed_browser_qa_precedes_independent_verify_and_blocks_failure
                 task_queue=spec["run_id"],
             )
             result = await handle.result()
-    assert calls[:4] == ["implement", "local_checks", "review", "browser_qa"]
+    assert calls[:3] == ["implement", "local_checks", "browser_qa"]
+    assert ("review" in calls) is (qa_state != "unknown")
     assert ("verify" in calls) is (qa_state == "passed")
     assert result["outcome"] == ("delivered" if qa_state == "passed" else "blocked")
     if qa_state == "unknown":

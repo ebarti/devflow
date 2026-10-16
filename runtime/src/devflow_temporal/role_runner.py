@@ -336,7 +336,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
         "receipt bytes in qa_receipt_sha256. Your independent role assesses this "
         "evidence and may run additional permitted local checks, but must not claim "
         "you executed the broker's browser test.\n"
-        if qa_evidence and role == "verify"
+        if qa_evidence and role in {"review", "verify"}
         else ""
     )
     intake_context = (
@@ -450,7 +450,7 @@ def _task(request: dict[str, Any]) -> AgentTask:
     ) if role == "intake" else ASSESSMENT_SCHEMA
     if role == "intake" and spec.get("feature_delivery"):
         schema = feature_intake_schema(spec.get("feature_plan_version", 1))
-    if qa_evidence and role == "verify":
+    if qa_evidence and role in {"review", "verify"}:
         schema = {
             **ASSESSMENT_SCHEMA,
             "properties": {
@@ -654,13 +654,14 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
     qa_evidence = request.get("qa_evidence")
     if (
         qa_evidence
-        and request["role"] == "verify"
+        and request["role"] in {"review", "verify"}
         and (
             not isinstance(parsed, dict) or parsed.get("qa_receipt_sha256") != qa_evidence["sha256"]
         )
     ):
         status = "blocked"
-        findings = ["independent verifier did not bind its assessment to the QA receipt"]
+        assessor = "reviewer" if request["role"] == "review" else "verifier"
+        findings = [f"independent {assessor} did not bind its assessment to the QA receipt"]
     return {
         "status": status,
         "summary": summary,
