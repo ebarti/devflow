@@ -332,7 +332,7 @@ def _retain_build_cleanup(store, row, completed, receipt):
 
 def _reconcile(store, original, spec, closed):
     current = _unchanged(store, original)
-    completed = _completed_build_cleanup(store, current, spec, closed)
+    completed_build = _completed_build_cleanup(store, current, spec, closed)
     with store._connect() as db:
         attempts = [dict(row) for row in db.execute(
             'SELECT * FROM delivery_attempts WHERE run_id=?', (spec['run_id'],))]
@@ -390,7 +390,7 @@ def _reconcile(store, original, spec, closed):
         return
     current = _unchanged(store, original)
     checks = {**json.loads(current['checks_json'] or '{}'), 'resource_cleanup': receipt}
-    _retain_build_cleanup(store, current, completed, receipt)
+    _retain_build_cleanup(store, current, completed_build, receipt)
     store.project(spec['run_id'], phase=current['phase'],
         execution_state=current['execution_state'], outcome=current['outcome'],
         error=current['error'], checks=checks, cleanup=receipt['resource_cleanup'],
