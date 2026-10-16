@@ -431,11 +431,14 @@ def _assessment_ancestry(recovery):
     from .delivery_listener_verification import authority as verification_authority
 
     chain, previous = [], recovery
-    for kind in ('verification', 'report', 'preparation', 'preflight', 'preflight'):
+    for kind in ('browser-ordering', 'verification', 'report', 'preparation',
+                 'preflight', 'preflight'):
         if not previous:
             break
         spec = previous['execution_spec']
-        matches = (bool(previous.get('seal', {}).get('verification_observation'))
+        matches = ((previous.get('seal', {}).get('browser_artifact_observation') or {}).get('cause')
+                   == 'browser_artifact_assessment_order' if kind == 'browser-ordering'
+                   else bool(previous.get('seal', {}).get('verification_observation'))
                    if kind == 'verification' else spec.get('gate_retry_stage') == kind
                    if kind != 'preflight' else bool(spec.get('gate_retry_preflight_generation')))
         if not matches:
@@ -446,12 +449,17 @@ def _assessment_ancestry(recovery):
             prepared_handoff=spec.get('gate_retry_prepared_handoff', 0))
         if read_private(root / 'admission.json') != previous:
             raise ValueError('gate retry finite predecessor admission changed')
-        authority = (verification_authority if kind == 'verification'
+        from .delivery_browser_qa import browser_ordering_authority
+
+        authority = (browser_ordering_authority if kind == 'browser-ordering'
+                     else verification_authority if kind == 'verification'
                      else _report_layout_authority if kind == 'report' else preparation_authority
                      if kind == 'preparation' else _authority)
         chain.append(previous)
         previous = authority(spec, previous)[0]
-    if previous and (previous.get('seal', {}).get('verification_observation')
+    if previous and ((previous.get('seal', {}).get('browser_artifact_observation') or {}).get(
+                         'cause') == 'browser_artifact_assessment_order'
+                     or previous.get('seal', {}).get('verification_observation')
                      or previous['execution_spec'].get('gate_retry_stage')
                      in {'report', 'preparation'}
                      or previous['execution_spec'].get('gate_retry_preflight_generation')):
@@ -563,7 +571,8 @@ def snapshot(store, run_id, kind=KIND):
         and spec.get('gate_retry_stage') == 'published'
         and spec.get('gate_retry_generation') == 1)
     layout_report = bool(kind == KIND and report_layout_possible(row))
-    report_retry = bool(not transient_retry and kind == KIND and previous
+    report_retry = bool(not transient_retry and not browser_artifact_retry
+                        and kind == KIND and previous
                         and previous.get('kind') in {KIND, PRELAUNCH_KIND, CI_KIND}
                         and (spec.get('gate_retry_stage') in {None, 'published', 'ci'}
                              or layout_report))
@@ -724,7 +733,7 @@ def snapshot(store, run_id, kind=KIND):
             or (previous is not None and not (
                 renewed or published_after_recovery or prelaunch
                 or report_retry or ci_only or transient_retry or attribution_retry
-                or verification_retry))
+                or verification_retry or browser_artifact_retry))
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
@@ -796,7 +805,7 @@ def snapshot(store, run_id, kind=KIND):
             ancestor = ancestor.get('original_recovery')
         if admitted and (not (renewed or published_after_recovery or prelaunch
                              or report_retry or ci_only or transient_retry or attribution_retry
-                             or verification_retry)
+                             or verification_retry or browser_artifact_retry)
                          or (digest(prior_gate) != attribution_observation['prior_gate_digest']
                              if attribution_retry else prior_gate != ancestor)):
             raise ValueError('this run already received its bounded gate assessment retry')
@@ -828,7 +837,8 @@ def snapshot(store, run_id, kind=KIND):
                      or attribution_retry or browser_artifact_retry else None,
             'generation': (transient_generations + 1 if transient_retry
                            else ci_observations + 1 if ci_only
-                           else (2 if previous else 1) if attribution_retry
+                           else (2 if previous else 1)
+                           if attribution_retry or browser_artifact_retry
                            else 2 if renewed
                            or (prelaunch and not browser_prelaunch)
                            or (browser_prelaunch and spec.get('gate_retry_stage') == 'published')
@@ -894,7 +904,10 @@ def admit(store, run_id, payload, *, preflight=False):
                             if 'preflight_continuation' in seal else 0)
     layout = (seal.get('report_observation') or {}).get('cause') == 'fixture_junit_report_layout'
     verification = bool(seal.get('verification_observation'))
-    if (preflight_generation or seal.get('preparation_observation') or layout or verification) \
+    ordering = (seal.get('browser_artifact_observation') or {}).get(
+        'cause') == 'browser_artifact_assessment_order'
+    if (preflight_generation or seal.get('preparation_observation')
+            or layout or verification or ordering) \
             and spec.get('feature_worker'):
         from .delivery_feature_execution import require_worker_handoff
 
@@ -1013,7 +1026,7 @@ def admit(store, run_id, payload, *, preflight=False):
             row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
             if canonical_json(_sealed_row(row)) != canonical_json(seal['row']):
                 raise ValueError('gate retry admission lost its stopped projection')
-            if verification:
+            if verification or ordering:
                 if store.state.claim_for(db, spec['work_id']) is not None:
                     raise ValueError('listener verification admission lost its released claim')
                 for table, key, expected in [('delivery_attempts', 'job_key', seal['attempts']),
@@ -1025,7 +1038,7 @@ def admit(store, run_id, payload, *, preflight=False):
             if work_binding(store, spec, db) != seal['work_binding']:
                 raise ValueError('gate retry admission lost issue ownership')
             if ((preflight_generation or seal.get('preparation_observation')
-                 or layout or verification)
+                 or layout or verification or ordering)
                     and spec.get('feature_worker')):
                 require_worker_handoff(store, spec)
             if preparation_owner is not None:

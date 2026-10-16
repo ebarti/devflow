@@ -2627,13 +2627,15 @@ class DeliveryWorkflow:
                 )
             repair_findings = []
             qa_evidence = None
-            checks_before_review = workflow.patched("local-checks-before-review-v1")
+            browser_before_review = workflow.patched("browser-qa-before-assessment-v1")
+            checks_before_review = (workflow.patched("local-checks-before-review-v1")
+                                    or browser_before_review)
             for role in (("verify",) if verify_only else ("review", "verify")):
                 if self.cancel_requested:
                     return await self._cancelled(spec)
                 if role == ("review" if checks_before_review and not verify_only else "verify"):
                     # New runs check before review; old histories retain the QA order.
-                    # Browser QA follows these checks and still precedes verify.
+                    # Required browser evidence follows checks before either assessment.
                     self.state["phase"] = "checks"
                     self.state["revision"] += 1
                     await self._project(spec, "checks_started", "Executing required local checks")
@@ -2672,7 +2674,8 @@ class DeliveryWorkflow:
                             _broker_findings("local_checks", checked, iteration=iteration)
                         )
                         break
-                if role == "verify" and spec["policy"].get("browser_qa"):
+                if (role == ("review" if browser_before_review and not verify_only else "verify")
+                        and spec["policy"].get("browser_qa")):
                     self.state["phase"] = "browser_qa"
                     self.state["revision"] += 1
                     await self._project(
@@ -2735,7 +2738,8 @@ class DeliveryWorkflow:
                             "candidate": self.state["candidate"],
                             "findings": [acceptance_note] if acceptance_note else [],
                             "resume_session": None,
-                            "qa_evidence": qa_evidence if role == "verify" else None,
+                            "qa_evidence": (qa_evidence
+                                            if role == "verify" or browser_before_review else None),
                             **({"evidence_context": {"role_artifacts": [
                                 r["role_artifacts"] for r in self.state["roles"]
                                 if r.get("role_artifacts") and r.get("role") == "implement"
@@ -2780,7 +2784,11 @@ class DeliveryWorkflow:
                 self.state["revision"] += 1
                 await self._project(spec, "findings", "Candidate requires bounded repair")
                 if iteration >= max_repairs:
-                    return await self._stop(spec, "repair limit exhausted")
+                    return await self._stop(
+                        spec, "gate reassessment did not pass"
+                        if browser_before_review and published_checkpoint
+                        and spec.get("gate_retry_generation") is not None
+                        else "repair limit exhausted")
                 continue
             self.state["phase"] = "waiting_ci"
             self.state["revision"] += 1

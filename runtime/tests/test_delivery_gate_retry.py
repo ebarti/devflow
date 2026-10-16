@@ -385,7 +385,7 @@ def test_workflow_runs_fresh_gates_without_implementation_or_publication(
     assert result['checks']['qa']['state'] == ('passed' if qa_status == 'pass' else 'failed')
     if qa_status != 'pass':
         assert not any(name == 'delivery_ci' for name, _ in calls)
-        assert result['error'] == 'repair limit exhausted'
+        assert result['error'] == 'gate reassessment did not pass'
 
 
 def test_fresh_gate_attempt_cannot_reuse_the_failed_qa_job(stopped):

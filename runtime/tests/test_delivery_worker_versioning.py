@@ -176,7 +176,7 @@ async def test_new_delivery_is_pinned_and_records_order_marker_before_checks():
             history = await handle.fetch_history()
             description = await handle.describe()
     assert result["outcome"] == "delivered"
-    assert calls[:4] == ["checks", "review", "browser_qa", "verify"]
+    assert calls[:4] == ["checks", "browser_qa", "review", "verify"]
     version = description.raw_description.workflow_execution_info.versioning_info
     assert version.behavior == VersioningBehavior.PINNED
     assert version.deployment_version.build_id == "marked-v1"

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import gzip
 import shutil
 from pathlib import Path
 
 from historical_replay import replay_designated_history
 from temporalio import activity
+from temporalio.client import WorkflowHistory
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
@@ -73,6 +75,10 @@ async def test_real_workflow_schedules_heartbeat_checks_and_replays_current_hist
     assert CHECK_ACTIVITIES <= scheduled.keys()
     assert all(scheduled[name].heartbeat_timeout.seconds == 30 for name in CHECK_ACTIVITIES)
     await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+    # Captured unchanged at 34cc610 before the new producer-order marker.
+    legacy = Path(__file__).parent / "fixtures/browser-before-assessment-legacy.json.gz"
+    await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(WorkflowHistory.from_json(
+        "browser-evidence-legacy-order", gzip.decompress(legacy.read_bytes()).decode()))
 
 
 async def test_prior_checks_history_replays_on_retained_artifact(tmp_path):
