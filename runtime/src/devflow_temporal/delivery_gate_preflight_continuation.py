@@ -245,7 +245,7 @@ def observe_interrupted(store, spec, row, attempts, effects, closed):
 def possible(row):
     recovery = json.loads(row.get('recovery_json') or 'null')
     return bool(recovery and recovery.get('kind') == 'published_gate_retry'
-                and recovery.get('execution_spec', {}).get('gate_retry_generation') == 2
+                and recovery.get('execution_spec', {}).get('gate_retry_generation') in (1, 2)
                 and recovery['execution_spec'].get('gate_retry_stage') == 'published'
                 and not recovery['execution_spec'].get('gate_retry_preflight_generation')
                 and recovery.get('seal', {}).get('attribution_observation')
@@ -350,7 +350,7 @@ def _authority(spec, recovery):
                   spec.get('gate_retry_preflight_generation') == 1
                   and not before.get('gate_retry_preflight_generation')
                   and (spec.get('gate_retry_generation'),
-                       before.get('gate_retry_generation')) == (2, 2))
+                       before.get('gate_retry_generation')) in ((1, 1), (2, 2)))
     if (not counts
             or (spec.get('gate_retry_stage'), before.get('gate_retry_stage')) != (
                 'published', 'published')
@@ -415,8 +415,8 @@ def _prepared_envelope(root, seal):
         expected_spec.update(
             implementation_role_home_generation=implementation_generation(
                 prepared['seal']['original_spec'], prepared['original_recovery']),
-            role_home_generation='gate-retry-2-preflight-continuation',
-            gate_retry_generation=2, gate_retry_preflight_generation=1,
+            role_home_generation=f"gate-retry-{seal['generation']}-preflight-continuation",
+            gate_retry_generation=seal['generation'], gate_retry_preflight_generation=1,
             gate_retry_stage='published')
         if (intent['command_digest'] != digest({'run_id': spec['run_id'], **command})
                 or intent['seal_digest'] != digest(prepared['seal'])
@@ -479,8 +479,8 @@ def validate(store, spec, recovery, *, resource_spec=None):
 
     previous, before, proof = _authority(spec, recovery)
     if spec.get('gate_retry_prepared_handoff'):
-        root = Path(spec['state_dir']) / gates.gate_namespace(2, 'published',
-                                                           preflight_generation=1)
+        root = Path(spec['state_dir']) / gates.gate_namespace(
+            spec['gate_retry_generation'], 'published', preflight_generation=1)
         prepared, binding = _prepared_envelope(root, recovery['seal'])
         binding['coordinator'] = _prepared_coordinator(store, prepared)
         if (type(spec['gate_retry_prepared_handoff']) is not int

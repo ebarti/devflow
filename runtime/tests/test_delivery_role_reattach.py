@@ -34,7 +34,26 @@ def role_fixture(api_fixture):
 
 
 @pytest.mark.asyncio
-async def test_lost_activity_response_reuses_completed_implementation(role_fixture):
+async def test_lost_activity_response_reuses_completed_implementation(role_fixture, monkeypatch):
+    spawn = asyncio.create_subprocess_exec
+    bootstrap = """
+import runpy,sys
+sys.path.insert(0,FIXTURE_SOURCE)
+class FixtureOnlyImports:
+    def find_spec(self, name, *args):
+        if name.partition('.')[0] in {'agent_runtime_kit','openai_codex'}:
+            raise ImportError('fake role imported provider SDK: '+name)
+sys.meta_path.insert(0,FixtureOnlyImports())
+runpy.run_module('devflow_temporal.role_runner',run_name='__main__')
+""".replace('FIXTURE_SOURCE', repr(str(Path(__file__).resolve().parents[1] / 'src')))
+
+    async def fixture_child(*argv, **kwargs):
+        argv = list(argv)
+        argv[argv.index(sys.executable)] = str(Path(sys.executable).resolve())
+        argv[argv.index('-m'):] = ['-c', bootstrap, argv[-1]]
+        return await spawn(*argv, **kwargs)
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', fixture_child)
     store, broker, request = role_fixture
     first = await delivery_role(request)
     assert first['status'] == 'pass'

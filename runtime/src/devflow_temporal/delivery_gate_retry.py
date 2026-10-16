@@ -812,7 +812,8 @@ def snapshot(store, run_id, kind=KIND):
                      or attribution_retry else None,
             'generation': (transient_generations + 1 if transient_retry
                            else ci_observations + 1 if ci_only
-                           else 2 if attribution_retry or renewed
+                           else (2 if previous else 1) if attribution_retry
+                           else 2 if renewed
                            or (prelaunch and not browser_prelaunch)
                            or (browser_prelaunch and spec.get('gate_retry_stage') == 'published')
                            else 1)}
@@ -1065,7 +1066,7 @@ def gate_namespace(generation, stage=None, *, preflight_generation=0, prepared_h
         return gate_namespace(generation, stage, preflight_generation=1) + '/prepared-handoff'
     if preflight_generation:
         if type(preflight_generation) is not int or preflight_generation not in (1, 2) \
-                or generation != 2 or stage != 'published':
+                or generation not in (1, 2) or stage != 'published':
             raise ValueError('gate preflight continuation exceeds its bounded assessment')
         suffix = f'-{preflight_generation}' if preflight_generation > 1 else ''
         return gate_namespace(generation, stage) + '/preflight-continuation' + suffix
