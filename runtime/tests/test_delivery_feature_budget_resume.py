@@ -830,7 +830,8 @@ def test_cleanup_only_build_reuses_pass_after_bound_maintenance(service, monkeyp
              'checks': {'build_checkpoint': checkpoint, 'resource_cleanup': failed},
              'error': 'resource cleanup is unknown'}
     store.project(child['run_id'], phase='blocked', execution_state='blocked', outcome='blocked',
-        cleanup='unknown', candidate=candidate, checks=state['checks'], iteration=2,
+        cleanup='unknown', candidate=candidate, checks=state['checks'], tracker=state['tracker'],
+        iteration=2,
         protocol_revision=9, error=state['error'], event_type='blocked', message=state['error'])
     closed = {'workflow_id': _row(store, child)['workflow_id'], 'execution_run_id': 'original',
               'closed_at': '2026-10-16T00:00:00+00:00', 'request_digest': child['request_digest'],
@@ -845,6 +846,11 @@ def test_cleanup_only_build_reuses_pass_after_bound_maintenance(service, monkeyp
     monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_a, **_k: None)
     monkeypatch.setattr(store, '_ensure_no_remote_pr', lambda *_a: None)
     described = {key: closed[key] for key in ('workflow_id', 'execution_run_id', 'closed_at')}
+    for column in ('pr_json', 'tracker_json'):
+        changed = {**_row(store, child), column: json.dumps({'changed': True})}
+        with pytest.raises(ValueError, match='exact completed build result'):
+            orphans._completed_build_cleanup(
+                store, changed, child, {**described, 'status': 'COMPLETED'})
     project = store.project
 
     def lost_projection(*_a, **_k):

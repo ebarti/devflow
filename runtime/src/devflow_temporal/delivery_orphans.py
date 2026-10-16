@@ -297,6 +297,8 @@ def _completed_build_cleanup(store, row, spec, closed):
                    ('phase', 'outcome', 'execution_state', 'iteration', 'error'))
             or state.get('revision') != row['protocol_revision']
             or state.get('candidate') != json.loads(row['candidate_json'] or 'null')
+            or state.get('pull_request') != json.loads(row['pr_json'] or 'null')
+            or state.get('tracker') != json.loads(row['tracker_json'] or 'null')
             or {k: v for k, v in state.get('checks', {}).items() if k != 'resource_cleanup'}
             != {k: v for k, v in json.loads(row['checks_json'] or '{}').items()
                 if k != 'resource_cleanup'}):
