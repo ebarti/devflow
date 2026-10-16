@@ -1143,9 +1143,11 @@ class DeliveryBroker:
         from .delivery_resources import RunResources, private_directory
 
         resources = RunResources(self.spec)
+        declared = declared_generated_directories(self.spec)
+        browser = (self.spec['policy'].get('browser_qa') or {}).get('artifact_paths', [])
         if 'node_modules' in names:
             names = list(dict.fromkeys([*names, *workspace_dependency_directories(checkout),
-                                       *sorted(declared_generated_directories(self.spec))]))
+                                       *sorted(declared)]))
         roots = []
         for name in names:
             if (not isinstance(name, str) or not Path(name).parts
@@ -1156,16 +1158,16 @@ class DeliveryBroker:
             root = checkout / name
             if _git(checkout, "ls-files", "--", name):
                 raise ValueError("configured generated directory contains tracked source")
-            if (name in (self.spec["policy"].get("browser_qa") or {}).get("artifact_paths", [])
-                    or name in declared_generated_directories(self.spec)):
-                # Regression checks and implementation probes can invoke the
-                # browser fixture before the dedicated browser gate. Reserve its
-                # configured output before any of those commands can create it.
+            configured_output = name in browser or name in declared
+            if configured_output:
                 resources._allowed(root, "generated", finalizing=True)
                 private_directory(root.parent)
             if not root.parent.is_dir() or root.parent.resolve() != root.parent:
                 raise ValueError("generated directory parent is not a fixed candidate directory")
-            resources.register(root, "generated")
+            if configured_output and not {'.venv', 'node_modules'} & set(Path(name).parts):
+                resources.generated_directory(root)
+            else:
+                resources.register(root, "generated")
             roots.append(root)
         return roots
 
@@ -1264,8 +1266,20 @@ class DeliveryBroker:
         return result
 
 
+    def _prepare_generated_outputs(self, checkout: Path) -> None:
+        from .delivery_configured_resources import declared_generated_directories
+
+        outputs = sorted(declared_generated_directories(self.spec) | set(
+            (self.spec['policy'].get('browser_qa') or {}).get('artifact_paths', [])))
+        try:
+            self._register_generated(checkout, [
+                name for name in outputs
+                if not {'.venv', 'node_modules'} & set(Path(name).parts)])
+        except (ValueError, OSError) as exc:
+            raise CheckPreparationFailure('native-generated-output-custody', exc) from exc
+
     def run_implementation_preparation(self, iteration: int, candidate: dict) -> dict:
-        """Prepare only accepted locked dependencies before a role executes probes."""
+        """Pin configured output and prepare accepted locked dependencies before role probes."""
         if self.candidate() != candidate:
             raise ValueError("implementation preparation candidate is stale")
         from .delivery_configured_resources import implementation_prerequisites
@@ -1278,6 +1292,7 @@ class DeliveryBroker:
         from .delivery_resources import RunResources
 
         resources = RunResources(self.spec)
+        self._prepare_generated_outputs(self.checkout)
         with resources.locked() as manifest:
             owned = set(manifest['roots'])
         isolated = {}

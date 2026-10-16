@@ -229,7 +229,41 @@ def gate_failed(checks):
                for key in GATE_CHECKS)
 
 
-def reconciled_cleanup(store, row, state):
+def cleanup_only_build(spec, state):
+    """The terminal build downgrade caused solely by resource finalization."""
+    receipt = (state.get('checks') or {}).get('resource_cleanup') or {}
+    roles = state.get('roles') or []
+    return (spec.get('feature_worker', {}).get('kind') == 'build'
+            and state.get('phase') == state.get('outcome') == 'blocked'
+            and state.get('execution_state') == 'blocked'
+            and state.get('cleanup') == 'unknown'
+            and state.get('error') == 'resource cleanup is unknown'
+            and state.get('pull_request') is None
+            and receipt.get('state') == receipt.get('resource_cleanup') == 'unknown'
+            and receipt.get('process_cleanup') == 'observed-native-confirmed'
+            and bool(roles) and roles[-1].get('role') == 'implement'
+            and roles[-1].get('iteration') == state.get('iteration')
+            and roles[-1].get('status') == 'pass' and not roles[-1].get('findings')
+            and not any(isinstance(check, dict) and check.get('state') == 'failed'
+                        for check in state.get('checks', {}).values()))
+
+
+def completed_cleanup_binding(record, closed, state):
+    """Authenticate a maintenance observation against the original completed result."""
+    if not isinstance(record, dict) or not isinstance(closed, dict):
+        return False
+    keys = ('workflow_id', 'execution_run_id', 'closed_at', 'request_digest', 'recovery_digest')
+    receipt = record.get('resource_cleanup') or {}
+    return (all(closed.get(key) for key in keys[:-1])
+            and record.get('closed_workflow') == {key: closed.get(key) for key in keys}
+            and record.get('original_result_digest') == digest(state)
+            and record.get('key') == digest({k: v for k, v in record.items() if k != 'key'})
+            and 'closure' not in record
+            and receipt.get('state') == receipt.get('resource_cleanup') == 'confirmed'
+            and receipt.get('process_cleanup') == 'observed-native-confirmed')
+
+
+def reconciled_cleanup(store, row, state, *, closed=None):
     """The maintenance record that later confirmed this closed result's cleanup, if any.
 
     A stop with unknown cleanup is finalized again by the service loop once its
@@ -243,11 +277,13 @@ def reconciled_cleanup(store, row, state):
         records = [json.loads(item[0]) for item in db.execute(
             "SELECT payload_json FROM delivery_events WHERE run_id=? "
             "AND type='resource_cleanup_reconciled' ORDER BY rowid DESC", (row['run_id'],))]
-    # Only the published closure qualifies: the unpublished retry's record
-    # belongs to a run its fresh attempt superseded.
+    # An unpublished automatic retry supersedes its old run. A cleanup-only build
+    # instead continues the exact completed result authenticated by its caller.
+    build = closed is not None and cleanup_only_build(json.loads(row['request_json']), state)
     return next((item for item in records
-                 if item.get('closure') == 'published'
-                 and item.get('original_result_digest') == digest(state)
+                 if ((item.get('closure') == 'published'
+                      and item.get('original_result_digest') == digest(state))
+                     or (build and completed_cleanup_binding(item, closed, state)))
                  and item.get('resource_cleanup') == checks.get('resource_cleanup')
                  and item.get('tracker') == json.loads(row['tracker_json'] or '{}')), None)
 

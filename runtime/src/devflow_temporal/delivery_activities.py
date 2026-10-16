@@ -723,6 +723,8 @@ def _role_context(request, store, broker, supervisor):
             raise ValueError('implementer checkout changed before its role')
         if constraint:
             validate_source(request['spec'], constraint, completed=False)
+    if request['spec'].get('provider') == 'codex' and retained is None:
+        broker._prepare_generated_outputs(workspace)
     return request, workspace, review_diff, retained
 
 

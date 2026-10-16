@@ -89,6 +89,7 @@ def test_nested_workspace_dependencies_and_declared_build_output_are_owned(tmp_p
     import json
     import subprocess
 
+    from devflow_temporal.candidate import candidate_for
     from devflow_temporal.delivery_broker import DeliveryBroker
 
     owned, resources, source, checkout = owned_worktree(tmp_path)
@@ -106,15 +107,23 @@ def test_nested_workspace_dependencies_and_declared_build_output_are_owned(tmp_p
     owned['policy']['checks'] = [{'id': 'build', 'generated_directories': ['dist']}]
     broker = DeliveryBroker.__new__(DeliveryBroker)
     broker.spec = owned
+    candidate = candidate_for(checkout)
     outputs = broker._register_generated(checkout, ['node_modules', 'dist'])
     assert workspace / 'node_modules' in outputs
     assert nested_fixture / 'node_modules' not in outputs
+    build = checkout / 'dist'
+    identities = read_private(resources.manifest)['roots']
+    assert build.is_dir() and identities[str(build)]['identity']
+    assert all(not output.exists() and identities[str(output)]['identity'] is None
+               for output in outputs if output != build)
     for output in outputs:
-        output.mkdir()
+        output.mkdir(exist_ok=True)
         (output / 'small-generated-file').write_text('disposable')
     broker._record_generated(outputs)
+    assert read_private(resources.manifest)['roots'][str(build)] == identities[str(build)]
     assert resources.finalize('blocked')['state'] == 'confirmed'
     assert all(not output.exists() for output in outputs)
+    assert candidate_for(checkout) == candidate
     with pytest.raises(ValueError):
         broker._register_generated(checkout, ['packages/client/fixtures/sample/node_modules'])
 
