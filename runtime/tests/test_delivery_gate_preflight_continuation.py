@@ -31,13 +31,13 @@ from devflow_temporal.delivery_resources import (
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
-def failed_assessment(seed, monkeypatch):
+def failed_assessment(seed, monkeypatch, generation=2):
     store, broker, old_state, old_closed, command = seed
     run_id = old_state["run_id"]
     original_snapshot = gates.snapshot
     seal = original_snapshot(store, run_id)
     proof = {'cause': 'wrapped_junit_source_attribution', 'unresolved_findings': ['Unpassed work']}
-    seal.update(generation=2, stage='published', attribution_observation=proof)
+    seal.update(generation=generation, stage='published', attribution_observation=proof)
     seal['cleanup']['journal_sha256'] = {}
     # This fake-provider fixture models already authenticated original native
     # proof. Actual compact/full native history is exercised by the archive replay.
@@ -49,7 +49,7 @@ def failed_assessment(seed, monkeypatch):
     monkeypatch.setattr(attribution, 'observe', lambda *_a, **_kw: deepcopy(proof))
     spec = store.effective_spec(run_id)
     root = Path(spec['state_dir'])
-    admission = root / 'published-gates-admission-2/admission.json'
+    admission = root / gates.gate_namespace(generation, 'published') / 'admission.json'
     original_bytes = admission.read_bytes()
     recovery = json.loads(original_bytes)
     monkeypatch.setattr(delivery_native_process, 'process_table', lambda: {})
@@ -107,8 +107,8 @@ def failed_assessment(seed, monkeypatch):
 
 
 @pytest.fixture
-def failed(stopped, monkeypatch):
-    return failed_assessment(stopped, monkeypatch)
+def failed(stopped, monkeypatch, request):
+    return failed_assessment(stopped, monkeypatch, generation=getattr(request, "param", 2))
 
 
 def close_and_request(fixture):
@@ -121,6 +121,7 @@ def close_and_request(fixture):
             'expected_revision': fixture.closed['result']['revision']}
 
 
+@pytest.mark.parametrize("failed", [1, 2], indirect=True)
 def test_public_unstarted_assessment_continues_once_without_a_writer(failed, monkeypatch):
     request = close_and_request(failed)
     store = failed.store
@@ -130,7 +131,8 @@ def test_public_unstarted_assessment_continues_once_without_a_writer(failed, mon
     assert store.continue_repair('run-1', request) == response
     assert store.continue_repair('run-1', failed.old_command) == failed.old_response
     spec = store.effective_spec('run-1')
-    assert spec['gate_retry_generation'] == 2 and spec['gate_retry_preflight_generation'] == 1
+    assert spec['gate_retry_generation'] == failed.spec['gate_retry_generation']
+    assert spec['gate_retry_preflight_generation'] == 1
     assert response['workflow_id'].endswith('-preflight-continuation')
     assert response['workflow_id'] != failed.old_response['workflow_id']
     with store._connect() as db:

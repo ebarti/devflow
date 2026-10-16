@@ -379,3 +379,316 @@ def test_real_modern_local_tracking_closes_cleanup_without_promoting_remote_cons
             **tracker, **change})
         with pytest.raises(ValueError, match='later tracker closure is unobservable'):
             retry._reuse_cleanup(store, updated, spec, closed, lambda: False)
+
+
+@pytest.fixture
+def original(service, tmp_path, monkeypatch, request):
+    """Real proof/admission; only GitHub, native preparation and closed transport are fixtures."""
+    from datetime import UTC, datetime, timedelta
+
+    from temporalio.api.common.v1 import ActivityType, Memo, Payloads, WorkflowType
+    from temporalio.api.history.v1 import (
+        ActivityTaskCompletedEventAttributes,
+        ActivityTaskScheduledEventAttributes,
+        HistoryEvent,
+        WorkflowExecutionCompletedEventAttributes,
+        WorkflowExecutionStartedEventAttributes,
+    )
+    from temporalio.client import WorkflowHistory
+    from test_delivery_feature_review_context import context_repository
+
+    from devflow_temporal import delivery_closures as closures
+    from devflow_temporal import delivery_gate_retry as gates
+    from devflow_temporal import delivery_native_preparation as preparation
+    from devflow_temporal.delivery_broker import DeliveryBroker
+    from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
+    from devflow_temporal.delivery_plan_checks import planned_junit_recipes
+    from devflow_temporal.delivery_policy_recovery import _rows
+    from devflow_temporal.delivery_sandbox import _native_role_home
+    from devflow_temporal.supervisor import DeliverySupervisor
+
+    old_store, _ = service
+    source = Path(old_store.config.raw['repositories']['fixture']['source_path'])
+    (source / 'workers/automation/tests').mkdir(parents=True)
+    (source / 'workers/automation/pyproject.toml').write_text(
+        '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+    (source / 'workers/automation/tests/test_exact_v14_schema.py').write_text(
+        '# Source data for the retained JUnit attribution fixture.\n')
+    (source / 'scripts').mkdir()
+    (source / 'scripts/checks.toml').write_text('''schema_version = 1
+[checks.sql]
+kind = "junit"
+argv = ["uv", "--project", "workers/automation", "run", "--locked", "--all-extras", "pytest",
+        "workers/automation/tests/test_exact_v14_schema.py", "-q", "-m", "not system_browser",
+        "--junitxml={report_path}"]
+''')
+    _git(source, 'add', '.')
+    _git(source, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Frozen pytest recipe data')
+    config = old_store.config.raw
+    config['repositories']['fixture']['expected_base_sha'] = _git(source, 'rev-parse', 'HEAD')
+    old_store.config.path.write_text(json.dumps(config))
+    store, parent, child, shared, token = _worker(
+        service, monkeypatch, used_by_others=10, kind='chunk')
+    broker = DeliveryBroker(store, child)
+    broker.prepare()
+    initial = broker.candidate()
+    (broker.checkout / 'README.md').write_text('Published identical source before attribution\n')
+    implemented = broker.candidate()
+    _git(broker.checkout, 'add', 'README.md')
+    _git(broker.checkout, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Published fixture')
+    _git(broker.checkout, 'push', 'origin', 'HEAD:refs/heads/' + child['branch'])
+    spec = deepcopy(child)
+    spec.update(provider='codex', gate_selections_version=2, feature_gate_selections=[{
+        'stage': 'checks', 'recipe_id': 'checks.sql',
+        'selectors': ['workers/automation/tests/test_exact_v14_schema.py']}])
+    spec['policy'].update(execution_backend='native-macos', host_sandbox='trusted-local', checks=[])
+    spec['policy_digest'] = digest(spec['policy'])
+    plan = json.loads(spec['accepted_plan'])
+    plan['verification'] = ['Run scripts/checks.toml checks.sql junit recipe.']
+    spec['accepted_plan'] = json.dumps(plan)
+    with store._connect() as db:
+        db.execute('UPDATE delivery_runs SET request_json=? WHERE run_id=?',
+                   (json.dumps(spec), spec['run_id']))
+    broker = DeliveryBroker(store, spec)
+    candidate = broker.candidate()
+    initial['policy_digest'] = implemented['policy_digest'] = spec['policy_digest']
+    publication = {'number': 7, 'head': candidate['head'], 'candidate': candidate,
+                   'url': 'https://github.com/example/fixture/pull/7', 'state': 'OPEN'}
+    monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_a, **_kw: {
+        **publication, 'headRefOid': candidate['head'], 'isDraft': False})
+    _, _, old_runtime, current_runtime = context_repository(tmp_path, monkeypatch)
+    monkeypatch.setattr(preparation, 'native_identity', lambda _: current_runtime)
+    monkeypatch.setattr(preparation, 'verify_native_spec', lambda _: None)
+    monkeypatch.setattr(gates, 'load_execution_config', lambda _: store.config)
+    monkeypatch.setattr(gates, 'prepare_runtime', lambda given, *_a, **_kw: deepcopy(given))
+    git = gates._git
+    runtime_root = Path(gates.__file__).resolve().parents[3]
+    monkeypatch.setattr(gates, '_git', lambda path, *args:
+                        '' if path == runtime_root and args[0] == 'status' else git(path, *args))
+    root = Path(spec['state_dir'])
+    recipe = planned_junit_recipes(spec, broker.checkout, root / 'checks/0')[0]
+    folder = root / 'checks/0' / recipe['id']
+    private_directory(folder / 'pytest-artifacts')
+    outcome = getattr(request, 'param', 'passed')
+    xml = '<failure/>' if outcome == 'failed' else '<skipped/>' if outcome == 'skipped' else ''
+    (folder / 'pytest-artifacts/junit.xml').write_text(
+        '<testsuite><testcase classname="tests.test_exact_v14_schema" name="exact">'
+        + xml + '</testcase></testsuite>')
+    native = {'state': 'finished', 'exit_code': 0, 'monitoring_complete': True,
+              'cleanup': 'observed-native-confirmed', 'stdio_drained': True,
+              'timed_out': False, 'cancelled': False, 'runtime_identity': old_runtime,
+              'journal': str(folder / 'native-process.json')}
+    write_private(Path(native['journal']), {'phase': 'finished', 'monitoring_complete': True,
+        'result': native, 'runtime_identity': old_runtime, 'intent': {'run_id': spec['run_id'],
+        'policy_digest': spec['policy_digest'], 'cwd': str(broker.checkout),
+        'argv': recipe['argv']}})
+    failed = {'id': recipe['id'], 'passed': False, 'exit_code': 0, 'rejected_output': False,
+              'cleanup': 'confirmed', 'argv': recipe['argv'], 'cwd': str(broker.checkout),
+              'native_process': native, 'artifacts': retain_artifacts(folder, candidate),
+              'junit': {'tests': 1, 'passed': int(outcome == 'passed'),
+                        'failures': int(outcome == 'failed'), 'errors': 0,
+                        'skipped': int(outcome == 'skipped')},
+              'plan_provenance': recipe['plan_provenance'],
+              'evidence_failure': 'required selector contributed no complete passing evidence: '
+                                  'workers/automation/tests/test_exact_v14_schema.py'}
+    checks = {'prepublish': {'state': 'passed', 'candidate_id': implemented['id'],
+              'source_unchanged': True, 'results': [{'passed': True, 'cleanup': 'confirmed'}]},
+              'local': {'state': 'failed', 'candidate_id': candidate['id'],
+                        'source_unchanged': True, 'results': [failed]}}
+    session, roles, scheduled = 'original-native-session', [], []
+    start = datetime(2026, 10, 16, 10, tzinfo=UTC)
+    for iteration, input_candidate, output, status, event in (
+        (0, initial, implemented, 'pass', 2), (1, candidate, candidate, 'findings', 6),
+    ):
+        body = {'spec': spec, 'role': 'implement', 'iteration': iteration,
+                'candidate': input_candidate, 'resume_session': session if iteration else None,
+                'evidence_context': {'candidate': candidate, 'iteration': 0, 'checks': checks}
+                if iteration else {}}
+        scheduled.append(deepcopy(body))
+        job = DeliverySupervisor._job_key(body)
+        attempt_root = root / 'attempts' / job
+        body.update(native_authorized=True, role_evidence_key=job, workspace=spec['checkout'],
+                    result_path=str(attempt_root / 'result.json'),
+                    start_path=str(attempt_root / 'start.json'),
+                    artifact_write_root=str(root / 'role-artifacts/authoring/implement'),
+                    artifact_directory=str(root / 'role-artifacts/authoring/implement' / job))
+        body['evidence_context']['implementation_preparation'] = {
+            'state': 'passed', 'candidate_id': input_candidate['id'], 'cleanup': 'confirmed',
+            'source_unchanged': True}
+        raw = {'status': status, 'finish_reason': 'done', 'session_id': session,
+               'findings': ['Historical selector finding remains unpassed.'] if iteration else []}
+        monitor = {**native, 'journal': str(attempt_root / 'native-process.json')}
+        result = {**raw, 'cleanup': 'confirmed', 'native_process': monitor}
+        argv = ['/fixture/python', '-I', '-m', 'devflow_temporal.role_runner',
+                str(attempt_root / 'request.json')]
+        home = _native_role_home(body)
+        private_directory(home / 'codex/sessions')
+        (home / 'codex/sessions' / (session + '.jsonl')).write_text('Fixture session custody\n')
+        launch = {'argv': argv, 'environment': {'CODEX_HOME': str(home / 'codex')}}
+        journal = {'phase': 'finished', 'monitoring_complete': True, 'result': monitor,
+                   'runtime_identity': old_runtime, 'owned': {'321': {'identity': 'finished-pid'}},
+                   'intent': {'argv': argv, 'run_id': spec['run_id'], 'cwd': spec['checkout'],
+                       'policy_digest': spec['policy_digest'],
+                       'environment_sha256': digest(launch['environment'])},
+                   'provider_session': {'role': 'implement', 'iteration': iteration,
+                       'session_id': session, 'resumed_from': body['resume_session'],
+                       'result_digest': digest(result), 'output_candidate': {
+                           key: output[key] for key in ('id', 'head', 'content_sha256')}}}
+        for name, value in [('request.json', body), ('result.json', raw),
+                            ('launch.json', launch), ('native-process.json', journal)]:
+            write_private(attempt_root / name, value)
+        role = {**result, 'role': 'implement', 'iteration': iteration, 'candidate': output,
+                'input_candidate_id': input_candidate['id']}
+        roles.append(role)
+        with store._connect() as db:
+            db.execute('INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,'
+                       'state,session_id,result_json,cleanup,pid,process_identity,started_at,'
+                       'finished_at,result_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                       (job, spec['run_id'], 'implement', iteration, input_candidate['id'],
+                        'finished', session, json.dumps(result), 'confirmed', 321, 'finished-pid',
+                        (start + timedelta(seconds=event)).isoformat(),
+                        (start + timedelta(seconds=event + 1)).isoformat(), body['result_path']))
+    state = {'run_id': spec['run_id'], 'revision': 7, 'iteration': 1, 'phase': 'blocked',
+             'execution_state': 'blocked', 'outcome': 'blocked', 'cleanup': 'confirmed',
+             'error': 'implementer did not establish a pass', 'roles': roles,
+             'candidate': candidate, 'pull_request': publication, 'checks': {}, 'usage': {}}
+    store.project(spec['run_id'], phase='blocked', execution_state='blocked', outcome='blocked',
+                  cleanup='confirmed', error=state['error'], candidate=candidate,
+                  pull_request=publication, iteration=1, protocol_revision=7, checks={}, usage={},
+                  event_type='blocked', message=state['error'])
+    with store._connect() as db:
+        store.state.release_work(db, spec['work_id'], 'external:devflow:' + spec['run_id'])
+    row, attempts, _, _ = _rows(store, spec['run_id'])
+    for key, column in [('tracker', 'tracker_json'), ('decision', 'decision_json'),
+                        ('intake', 'intake_json')]:
+        state[key] = json.loads(row[column] or 'null')
+
+    async def seal():
+        async def encoded(values):
+            return Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode(values))
+        events = [HistoryEvent(event_id=1, workflow_execution_started_event_attributes=
+            WorkflowExecutionStartedEventAttributes(workflow_type=WorkflowType(
+                name='DevflowDeliveryWorkflow'), workflow_id=row['workflow_id'],
+                original_execution_run_id='original-native-closed',
+                input=await encoded([spec, None]), memo=Memo(fields={'request_digest':
+                    (await DELIVERY_DATA_CONVERTER.encode([spec['request_digest']]))[0]})))]
+        for name, body, result in [('delivery_role', scheduled[0], roles[0]),
+                ('delivery_publish', {'spec': spec, 'candidate': implemented, 'iteration': 0},
+                 publication), ('delivery_role', scheduled[1], roles[1])]:
+            event_id = len(events) + 1
+            events.extend([HistoryEvent(event_id=event_id,
+                activity_task_scheduled_event_attributes=ActivityTaskScheduledEventAttributes(
+                    activity_type=ActivityType(name=name), input=await encoded([body]))),
+                HistoryEvent(event_id=event_id + 1,
+                activity_task_completed_event_attributes=ActivityTaskCompletedEventAttributes(
+                    scheduled_event_id=event_id, result=await encoded([result])))])
+        events.append(HistoryEvent(event_id=8, workflow_execution_completed_event_attributes=
+                                  WorkflowExecutionCompletedEventAttributes(
+                                      result=await encoded([state]))))
+        for event in events:
+            event.event_time.FromDatetime(start + timedelta(seconds=event.event_id))
+        history = WorkflowHistory(row['workflow_id'], events)
+        facts = await closures.closure_facts(history)
+        closures.seal(store, history, facts, run_id=spec['run_id'], source='temporal')
+        return {key: facts[key] for key in ('workflow_id', 'execution_run_id', 'closed_at',
+                                          'request_digest', 'recovery_digest', 'result')}
+    closed = asyncio.run(seal())
+    monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_kw: deepcopy(closed))
+    write_private(root / 'resources/manifest.json', {'processes': []})
+    write_private(root / 'resources/finalization.json', {'state': 'confirmed',
+        'process_cleanup': 'observed-native-confirmed', 'resource_cleanup': 'confirmed',
+        'roots': []})
+    return SimpleNamespace(store=store, spec=spec, row=row, attempts=attempts, closed=closed,
+        state=state, broker=broker, transport=None, shared=shared, token=token, parent=parent,
+        failed=failed, first_candidate=implemented, recipe=recipe)
+
+
+def test_original_native_pytest_proof_admission_readback_and_replay_keep_history(
+        original, monkeypatch):
+    from devflow_temporal import delivery_feature_activities as activities
+    from devflow_temporal import delivery_gate_retry as gates
+    from devflow_temporal.delivery_policy_recovery import _rows
+    from devflow_temporal.delivery_resources import read_private
+    from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+    item = original
+    before = deepcopy(item.state)
+    proof = observed(item)
+    assert item.first_candidate['id'] != item.state['candidate']['id']
+    assert proof['prior_gate_digest'] is None
+    assert proof['cause'] == 'pytest_junit_source_attribution'
+    assert proof['unpassed_status'] == 'findings'
+    assert proof['progress']['published_implementation'] == item.first_candidate
+    assert proof['corrected_selector_evidence'][0]['passed'] == 1
+    assert attribution.possible(item.store, item.spec, item.row)
+    seal = gates.snapshot(item.store, item.spec['run_id'])
+    assert seal['generation'] == 1 and seal['prior_gate_digest'] is None
+    resumed = activities.resume_worker(item.store, item.parent, item.spec, item.row)
+    row = _rows(item.store, item.spec['run_id'])[0]
+    recovery = json.loads(row['recovery_json'])
+    spec = resumed['spec']
+    assert spec['gate_retry_generation'] == 1
+    assert recovery['original_recovery'] is None and recovery['state'] == before
+    assert gates.readback(item.store, spec, recovery)['number'] == 7
+    assert observed(item) == proof
+    assert item.store.continue_repair(spec['run_id'], recovery['command'])['workflow_id'] \
+        == resumed['workflow_id']
+    assert read_private(Path(spec['state_dir']) / 'published-gates-admission/admission.json') \
+        == recovery
+    assert item.shared.budget(item.token['issue_id'])['used'] == 10
+    with item.store._connect() as db:
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
+    flow, calls = DeliveryWorkflow(), []
+    async def activity(name, body, **_kw):
+        calls.append((name, body))
+        if name == 'delivery_gates_readback':
+            return gates.readback(item.store, body['spec'], body['recovery'])
+        if name in {'delivery_tracker_start', 'delivery_tracker'}:
+            return {'state': 'consistent'}
+        if name == 'delivery_role':
+            assert body['role'] in {'review', 'verify'}
+            assert proof['unresolved_findings'][0] in str(body)
+            return {'role': body['role'], 'status': 'pass', 'iteration': 1,
+                    'session_id': 'fresh-' + body['role'], 'cleanup': 'confirmed',
+                    'candidate': recovery['candidate']}
+        return {'state': 'passed', 'cleanup': 'confirmed'}
+    async def project(*_a, **_kw):
+        pass
+    monkeypatch.setattr(flow, '_activity', activity)
+    monkeypatch.setattr(flow, '_project', project)
+    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
+    result = asyncio.run(flow._resume_published_gates(spec, recovery))
+    assert result['outcome'] == 'delivered' and result['iteration'] == 1
+    assert result['roles'][:2] == before['roles'] and item.state == before
+    assert [body['role'] for name, body in calls if name == 'delivery_role'] == ['review', 'verify']
+    assert not any(name == 'delivery_publish' for name, _ in calls)
+    assert item.shared.budget(item.token['issue_id'])['used'] == 10
+
+
+@pytest.mark.parametrize('original', ['failed', 'skipped'], indirect=True)
+def test_original_native_real_failed_or_skipped_junit_never_grants_reassessment(original):
+    with pytest.raises(ValueError, match='completed passing qualified JUnit'):
+        observed(original)
+
+
+def test_original_native_changed_session_source_or_unrelated_admission_refuses(original):
+    item = original
+    path = Path(item.spec['state_dir']) / 'attempts' / item.attempts[-1]['job_key'] / 'request.json'
+    raw = path.read_bytes()
+    saved = json.loads(raw)
+    saved['resume_session'] = 'foreign-session'
+    write_private(path, saved)
+    with pytest.raises(ValueError, match='scheduled input|session or monitor'):
+        observed(item)
+    path.write_bytes(raw)
+    config = item.broker.checkout / 'workers/automation/pyproject.toml'
+    original_config = config.read_text()
+    config.write_text(original_config + 'addopts="--rootdir=elsewhere"\n')
+    with pytest.raises(ValueError, match='changed or unproved implementation'):
+        observed(item)
+    config.write_text(original_config)
+    with item.store._connect() as db:
+        db.execute('INSERT INTO delivery_gate_admissions VALUES(?,?,?)',
+                   (item.spec['run_id'], 'unrelated', json.dumps({'kind': 'unrelated'})))
+    with pytest.raises(ValueError, match='unused original published assessment'):
+        observed(item)
