@@ -638,8 +638,9 @@ def _implementation_receipt(spec, role, attempt):
     if (spec.get('feature_worker') and role['iteration'] > 0
             and (expected.get('planning_defect') is not None
                  or expected.get('planning_defect_repair') is not None)):
-        from .delivery_feature_execution import registry, worker_key
+        from .delivery_feature_execution import worker_key
         from .delivery_feature_revision_roles import validate_diagnostic
+        from .delivery_feature_revision_subject import _ReadOnlyRegistry
 
         diagnostic = expected.get('planning_defect')
         try:
@@ -654,7 +655,8 @@ def _implementation_receipt(spec, role, attempt):
             'repair_key': key, 'diagnostic_sha256': digest(diagnostic)}
         if expected.get('planning_defect_repair') != binding:
             return False
-        shared, owner = registry(spec), spec['feature_delivery']['owner']
+        shared = _ReadOnlyRegistry(Path(spec['feature_delivery']['registry']))
+        owner = spec['feature_delivery']['owner']
         with shared.connect() as db:
             paid = db.execute('SELECT generation,reason FROM execution_repairs '
                               'WHERE issue_id=? AND repair_key=?',

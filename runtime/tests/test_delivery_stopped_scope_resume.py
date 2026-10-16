@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -158,6 +159,7 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
 
     from devflow_temporal import delivery_feature_activities as activities
     from devflow_temporal.delivery_api import create_app
+    from devflow_temporal.delivery_execution_registry import ExecutionRegistry
     from devflow_temporal.delivery_feature_execution import continue_feature, registry
     from devflow_temporal.delivery_feature_scope import MARKER
     from devflow_temporal.delivery_github_contract import GitHubDelivery
@@ -181,6 +183,21 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
         assert resume._implementation_receipt(
             child, ordinary, {**native_attempt, 'result_json': canonical_json(native)})
     shared = registry(parent)
+    registry_before = {p: p.read_bytes() for p in shared.path.parent.iterdir() if p.is_file()}
+    real_open = os.open
+    def readonly_open(path, flags, *args, **kwargs):
+        if Path(path).parent == shared.path.parent:
+            assert not flags & (os.O_CREAT | os.O_RDWR | os.O_WRONLY | os.O_TRUNC)
+        return real_open(path, flags, *args, **kwargs)
+    with monkeypatch.context() as readonly:
+        readonly.setattr(os, 'open', readonly_open)
+        readonly.setattr(ExecutionRegistry, '__init__',
+                         lambda *_: pytest.fail('read-only receipt initialized registry schema'))
+        observed = resume.review_snapshot(store, child['run_id'])
+    assert observed['session_id'] == 'original-implementation'
+    assert observed['candidate'] == before['candidate']
+    assert {p: p.read_bytes() for p in shared.path.parent.iterdir()
+            if p.is_file()} == registry_before
     original_owner = shared.current('I_feature')
     remote = copy.deepcopy(parent['feature_delivery']['snapshot'])
     changed = json.loads(parent['accepted_plan'])
