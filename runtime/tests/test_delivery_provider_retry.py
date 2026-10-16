@@ -42,9 +42,9 @@ from openai_codex.models import Notification
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_native_threads
+from devflow_temporal.bridge import ASSESSMENT_SCHEMA
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_resources import read_private, write_private
-from devflow_temporal.role_runner import ASSESSMENT_SCHEMA
 
 
 def usage(multiplier=1):
@@ -480,7 +480,7 @@ async def test_failed_role_exposes_bounded_typed_provider_reason(
         max_attempts=3 if error == "rateLimitExceeded" else 1,
         failure_message="Controlled provider failure " + "x" * 16384)
     monkeypatch.setattr(delivery_native_threads, "NativeThreadObservation", lambda _r: observation)
-    monkeypatch.setattr(role_runner, "CodexAgentRuntime", lambda **_kw: runtime)
+    monkeypatch.setattr("agent_runtime_kit.adapters.CodexAgentRuntime", lambda **_kw: runtime)
     monkeypatch.setattr(role_runner, "_task", lambda _r: task)
     binary = tmp_path / "codex"
     binary.write_bytes(b"fixture binary")

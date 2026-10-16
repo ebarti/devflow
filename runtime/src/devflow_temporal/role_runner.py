@@ -12,22 +12,12 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from agent_runtime_kit import (
-    AgentResult,
-    AgentTask,
-    FilesystemAccess,
-    PermissionMode,
-    PermissionProfile,
-    SessionResumeState,
-    validate_task,
-)
-from agent_runtime_kit.adapters import CodexAgentRuntime
-from openai_codex import CodexConfig
-
-from .bridge import ASSESSMENT_SCHEMA
 from .delivery_questions import BLOCKER_SCHEMA, valid_blocking_questions
+
+if TYPE_CHECKING:
+    from agent_runtime_kit import AgentResult, AgentTask
 
 INTAKE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -101,6 +91,16 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _task(request: dict[str, Any]) -> AgentTask:
+    from agent_runtime_kit import (
+        AgentTask,
+        FilesystemAccess,
+        PermissionMode,
+        PermissionProfile,
+        SessionResumeState,
+    )
+
+    from .bridge import ASSESSMENT_SCHEMA
+
     spec = request["spec"]
     role = request["role"]
     policy = request.get("execution_role_policy", spec["policy"]["roles"][role])
@@ -490,6 +490,10 @@ def _task(request: dict[str, Any]) -> AgentTask:
 
 
 async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
+    from agent_runtime_kit import validate_task
+    from agent_runtime_kit.adapters import CodexAgentRuntime
+    from openai_codex import CodexConfig
+
     binary = request["spec"]["policy"]["codex_bin"]
     if not Path(binary).is_file():
         raise ValueError("configured Codex executable is missing")
