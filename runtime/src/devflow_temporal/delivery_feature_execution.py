@@ -117,7 +117,16 @@ def admit(store, db, spec, observed=None):
                     "preparation successor lacks its server reservation binding")
     _require_no_legacy_custody(db, spec)
     if snapshot["delivery"]:
-        accepted = snapshot["delivery"]["manifest"]["plan"]
+        manifest = snapshot["delivery"]["manifest"]
+        accepted = manifest["plan"]
+        scope = spec.get("feature_scope_amendment")
+        if scope:
+            identity = spec.get("feature_plan_revision", scope["plan_identity"])
+            if (canonical_json(accepted) != canonical_json(json.loads(spec["accepted_plan"]))
+                    or digest(accepted) != identity["plan_digest"]
+                    or manifest.get("plan_revision", 1) != identity["plan_revision"]):
+                raise OwnershipConflict(
+                    "scope continuation cannot change its accepted feature plan")
         spec["accepted_plan"] = canonical_json(accepted)
         plan_for(spec)
         spec["intake_required"] = False

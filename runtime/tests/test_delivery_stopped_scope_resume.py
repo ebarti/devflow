@@ -139,13 +139,25 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
 
     from devflow_temporal import delivery_feature_activities as activities
     from devflow_temporal.delivery_api import create_app
-    from devflow_temporal.delivery_feature_execution import registry
+    from devflow_temporal.delivery_feature_execution import continue_feature, registry
     from devflow_temporal.delivery_feature_scope import MARKER
+    from devflow_temporal.delivery_github_contract import GitHubDelivery
     from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
     store, parent, child, broker, state, command = stopped_feature_scope
     original = copy.deepcopy(child)
     before = copy.deepcopy(state)
+    shared = registry(parent)
+    original_owner = shared.current('I_feature')
+    remote = copy.deepcopy(parent['feature_delivery']['snapshot'])
+    changed = json.loads(parent['accepted_plan'])
+    changed['acceptance'].append('Unapproved remote outcome')
+    remote['delivery'] = {'manifest': {'plan': changed}}
+    def inventory():
+        with store._connect() as db:
+            return [db.execute('SELECT count(*) FROM ' + table).fetchone()[0]
+                    for table in ('delivery_runs', 'delivery_commands', 'delivery_outbox')]
+    original_inventory = inventory()
     app = create_app(store.config.path)
     app.state.delivery.store = store
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
@@ -153,8 +165,20 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
         session = (await client.get('/api/session')).json()
         client.headers.update({'origin': store.config.dashboard_url,
                                'x-devflow-csrf': session['csrf_token']})
-        response = await client.post('/api/runs/' + parent['run_id'] + '/continue-feature',
-                                     json=command)
+        with monkeypatch.context() as drift:
+            drift.setattr(GitHubDelivery, 'snapshot', lambda *_: copy.deepcopy(remote))
+            refused = await client.post('/api/runs/' + parent['run_id'] + '/continue-feature',
+                                        json=command)
+        assert refused.status_code == 409 and 'accepted feature plan' in refused.text
+        assert inventory() == original_inventory
+        assert shared.current('I_feature') == original_owner
+        accepted_remote = copy.deepcopy(remote)
+        accepted_remote['delivery']['manifest']['plan'] = json.loads(parent['accepted_plan'])
+        with monkeypatch.context() as accepted_snapshot:
+            accepted_snapshot.setattr(GitHubDelivery, 'snapshot',
+                                      lambda *_: copy.deepcopy(accepted_remote))
+            response = await client.post('/api/runs/' + parent['run_id'] + '/continue-feature',
+                                         json=command)
         assert response.status_code == 200, response.text
         admitted = response.json()
         assert (await client.post('/api/runs/' + parent['run_id'] + '/continue-feature',
@@ -223,6 +247,27 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
     for name in command['added_paths']:
         assert (imported.checkout / name).read_text() == 'Corrected owning file\n'
     assert registry(successor).budget('I_feature')['used'] == 0
+    # An ordinary later continuation inherits the same guard and sealed receipt.
+    integration_spec = integration['spec']
+    shared.finish_worker(token, worker_key(integration_spec['run_id'], token),
+                         {'cleanup': 'confirmed'})
+    shared.stop(token, 'stopped-scope-descendant', {})
+    store.project(successor['run_id'], phase='blocked', execution_state='blocked',
+                  outcome='blocked',
+                  cleanup='confirmed', event_type='blocked', message='Stopped scoped descendant')
+    with store._connect() as db:
+        for spec in (integration_spec, successor):
+            store.state.release_work(db, spec['work_id'], 'external:devflow:' + spec['run_id'])
+        revision = db.execute('SELECT revision FROM delivery_runs WHERE run_id=?',
+                              (successor['run_id'],)).fetchone()[0]
+    stopped_owner, stopped_inventory = shared.current('I_feature'), inventory()
+    with monkeypatch.context() as drift:
+        drift.setattr(GitHubDelivery, 'snapshot', lambda *_: copy.deepcopy(remote))
+        with pytest.raises(ValueError, match='accepted feature plan'):
+            continue_feature(store, successor['run_id'], {
+                'command_id': 'scope-descendant', 'expected_revision': revision})
+    assert inventory() == stopped_inventory and shared.current('I_feature') == stopped_owner
+    assert store.effective_spec(successor['run_id'])[MARKER] == successor[MARKER]
 
 
 @pytest.mark.parametrize('drift', ['owner', 'session', 'candidate', 'config', 'path'])
