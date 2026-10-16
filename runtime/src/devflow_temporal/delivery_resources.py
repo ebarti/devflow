@@ -607,6 +607,20 @@ class RunResources:
                         break
             write_private(self.manifest, manifest)
 
+    def generated_directory(self, path: Path) -> None:
+        """Pin a configured disposable output before any native command can use it."""
+        self.register(path, 'generated')
+        with self.locked() as manifest:
+            entry = manifest['roots'][str(path)]
+            if entry['identity'] is None:
+                if os.path.lexists(path):
+                    raise ValueError('cannot adopt an existing unconfirmed generated output')
+                path.mkdir(mode=0o700)
+                entry.update(identity=_identity(path), state='created')
+                write_private(self.manifest, manifest)
+            elif _identity(path) != entry['identity']:
+                raise ValueError('registered generated output was replaced')
+
     def preserve_workspace_dependencies(
         self, checkout: Path, candidate: dict, recipe: dict,
     ) -> list:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import sys
 from importlib.metadata import distribution
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from test_delivery_api import api_fixture as api_fixture
 from test_delivery_configured_resources import configured
 from test_delivery_store import _git
+from test_delivery_store import service as service
 
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_resources import RunResources, read_private
@@ -22,8 +24,7 @@ def test_nested_browser_output_is_reserved_before_creation(tmp_path, kind):
     owned['policy']['browser_qa'] = {'artifact_paths': ['dist/playwright-report']}
     report = root / 'dist/playwright-report'
     broker._register_generated(root, ['dist/playwright-report'])
-    assert report.parent.is_dir() and not report.exists()
-    report.mkdir()
+    assert report.is_dir()
     (report / 'result.json').write_text('earlier regression output')
     broker._record_generated([report])
     before = read_private(resources.manifest)['roots'][str(report)]
@@ -34,7 +35,7 @@ def test_nested_browser_output_is_reserved_before_creation(tmp_path, kind):
     assert not report.exists()
 
 
-@pytest.mark.parametrize('violation', ['foreign', 'noncanonical'])
+@pytest.mark.parametrize('violation', ['foreign', 'noncanonical', 'allocated', 'replaced'])
 def test_browser_output_registration_never_adopts_or_escapes(tmp_path, violation):
     owned, resources, broker, root, _ = configured(tmp_path)
     name = {'protected': '.git/new/report', 'escape': '../outside/report',
@@ -56,13 +57,84 @@ def test_browser_output_registration_never_adopts_or_escapes(tmp_path, violation
             (report / 'data').write_text('preserve')
             if violation == 'tracked':
                 _git(root, 'add', name)
+    if violation in {'allocated', 'replaced'}:
+        report = root / name
+        if violation == 'allocated':
+            report.parent.mkdir()
+            resources.register(report, 'generated')
+        else:
+            broker._register_generated(root, [name])
+            report.rename(tmp_path / 'original-report')
+        report.mkdir()
+        (report / 'data').write_text('preserve')
     before = resources.manifest.read_bytes()
     with pytest.raises(ValueError):
         broker._register_generated(root, [name])
     assert resources.manifest.read_bytes() == before
     assert (sentinel / 'data').read_text() == 'SAFE'
-    if violation in {'foreign', 'tracked'}:
+    if violation in {'foreign', 'tracked', 'allocated', 'replaced'}:
         assert (root / name / 'data').read_text() == 'preserve'
+
+
+@pytest.mark.asyncio
+async def test_implementation_role_pins_output_without_dependency_checks(service, monkeypatch):
+    from devflow_temporal import delivery_activities as activities
+    from devflow_temporal.delivery_store import DeliveryStore
+
+    store, request = service
+    source = Path(store.config.raw['repositories']['fixture']['source_path'])
+    (source / '.gitignore').write_text('dist/\n')
+    _git(source, 'add', '.gitignore')
+    _git(source, 'commit', '-qm', 'ignore disposable output')
+    store.config.raw['repositories']['fixture']['expected_base_sha'] = _git(
+        source, 'rev-parse', 'HEAD')
+    store.config.path.write_text(json.dumps(store.config.raw))
+    store = DeliveryStore(store.config)
+    store.submit(request)
+    owned = store.spec(request['run_id'])
+    owned['resource_cleanup_version'] = 1
+    broker = DeliveryBroker(store, owned)
+    candidate = broker.prepare()['candidate']
+    owned['provider'] = 'codex'
+    owned['policy'].update(host_sandbox='trusted-local',
+                           browser_qa={'artifact_paths': ['dist/playwright-report']},
+                           checks=[{'id': 'configured-output', 'cwd': '.',
+                                    'argv': [sys.executable, '-c', 'pass'],
+                                    'generated_directories': ['dist/check-output']}])
+    resources = RunResources(owned)
+    outputs = ['dist/playwright-report', 'dist/check-output']
+
+    class NativeProbe:
+        def retained_request(self, _request):
+            return None
+
+        async def run(self, role_request):
+            prepared = role_request['evidence_context']['implementation_preparation']
+            assert prepared['state'] == 'passed' and prepared['results'] == []
+            for name in outputs:
+                report = broker.checkout / name
+                assert report.is_dir()
+                assert read_private(resources.manifest)['roots'][str(report)]['identity']
+            assert not (broker.checkout / 'node_modules').exists()
+            subprocess.run([sys.executable, '-c',
+                "from pathlib import Path\n"
+                f"for name in {outputs!r}:\n"
+                " report=Path(name); report.mkdir(parents=True, exist_ok=True)\n"
+                " (report/'.last-run.json').write_text('native role output')\n"
+                "Path('README.md').write_text('native implementation fixture\\n')\n"],
+                cwd=broker.checkout, check=True, capture_output=True)
+            return {'status': 'pass', 'session_id': 'native-stand-in',
+                    'cleanup': 'confirmed', 'findings': []}
+
+    monkeypatch.setattr(activities, '_context', lambda _spec: (store, broker))
+    monkeypatch.setattr(activities, 'get_supervisor', lambda _store: NativeProbe())
+    result = await activities._run_role({'spec': owned, 'role': 'implement', 'iteration': 0,
+                                         'candidate': candidate})
+    assert result['status'] == 'pass', result.get('findings')
+    assert result['candidate'] != candidate
+    assert all((broker.checkout / name / '.last-run.json').is_file() for name in outputs)
+    assert resources.finalize('blocked')['state'] == 'confirmed'
+    assert all(not (broker.checkout / name).exists() for name in outputs)
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='native macOS execution authority')
