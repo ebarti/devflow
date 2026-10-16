@@ -567,6 +567,82 @@ def _wrapped_junit_project(recipe: dict, spec: dict | None) -> str | None:
     return project
 
 
+def _pytest_junit_root(
+    recipe: dict, checkout: Path, names: set[str], spec: dict | None
+) -> Path | None:
+    """Recognize the admitted literal pytest form with unchanged ini_options metadata."""
+    runner, start = _runner(recipe)
+    if spec is None or runner != "pytest" or set(recipe_selectors(recipe, spec)) != names:
+        return None
+    # Keep root/config/prefix overrides and other runner forms on the existing
+    # attribution path; this is not a general pytest configuration interpreter.
+    operands = {index for index, _ in _operands(recipe)}
+    argv, index = recipe["argv"], start
+    while index < len(argv):
+        if index in operands or argv[index] == "-q" or argv[index].startswith("--junitxml="):
+            index += 1
+        elif argv[index] in {"-m", "--junitxml"} and index + 1 < len(argv):
+            index += 2
+        else:
+            return None
+    paths = [checkout / name for name in names]
+    common = next(parent for parent in paths[0].parents
+                  if all(path.is_relative_to(parent) for path in paths))
+    frozen = set(_base_files(spec))
+    for parent in (common, *common.parents):
+        if not parent.is_relative_to(checkout):
+            break
+        if any((parent / name).exists() or (parent / name).is_symlink() for name in (
+            "pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini",
+            "tox.ini", "setup.cfg", "setup.py",
+        )):
+            return None
+        config = parent / "pyproject.toml"
+        if not config.exists() and not config.is_symlink():
+            continue
+        relative = config.relative_to(checkout).as_posix()
+        if (relative not in frozen or config.is_symlink() or not config.is_file()
+                or config.resolve(strict=True) != config):
+            return None
+        entry = _git(Path(spec["source_path"]), "ls-tree", "--full-tree",
+                     spec["base_sha"], "--", relative).split()
+        if (len(entry) != 4 or entry[0] not in {"100644", "100755"} or entry[1] != "blob"
+                or entry[3] != relative
+                or _git(checkout, "hash-object", "--no-filters", "--", relative) != entry[2]):
+            return None
+        config_data = tomllib.loads(config.read_text()).get("tool", {}).get("pytest", {})
+        options = config_data.get("ini_options")
+        if set(config_data) != {"ini_options"} or not isinstance(options, dict) or options.get(
+            "addopts"
+        ):
+            return None
+        return parent
+    return None
+
+
+def _pytest_module_source(
+    origin: str, checkout: Path, roots: list[Path], names: set[str]
+) -> str | None:
+    """Match complete selected modules, including their Python class components."""
+    if not isinstance(origin, str) or not origin:
+        return None
+    matches = set()
+    for root in roots:
+        for name in names:
+            path = checkout / name
+            if not path.is_relative_to(root):
+                continue
+            module = path.relative_to(root).with_suffix("").as_posix().replace("/", ".")
+            suffix = origin.removeprefix(module + ".")
+            if origin == module or (origin.startswith(module + ".") and all(
+                part.isidentifier() for part in suffix.split(".")
+            )):
+                matches.add(name)
+    if len(matches) > 1:
+        raise ValueError("test report source attribution is ambiguous")
+    return next(iter(matches), None)
+
+
 def selector_evidence(
     recipe: dict,
     checkout: Path,
@@ -586,6 +662,9 @@ def selector_evidence(
     roots = [checkout, project]
     cases = []
     if junit is not None:
+        pytest_root = _pytest_junit_root(recipe, checkout, names, spec)
+        if pytest_root is not None:
+            roots.append(pytest_root)
         wrapped_project = _wrapped_junit_project(recipe, spec)
         if wrapped_project is not None:
             roots.append(checkout / wrapped_project)
@@ -606,6 +685,8 @@ def selector_evidence(
                     or case.get("classname")
                     or suite.get("name")
                 )
+                if pytest_root is not None and not (case.get("file") or suite.get("file")):
+                    origin = _pytest_module_source(origin, checkout, roots, names) or origin
                 # pytest JUnit's default classname is the relative Python module.
                 if isinstance(origin, str) and "/" not in origin and origin.startswith("tests."):
                     origin = origin.replace(".", "/") + ".py"

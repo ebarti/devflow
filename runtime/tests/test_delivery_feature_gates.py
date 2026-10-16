@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -360,52 +361,117 @@ def test_browser_entrypoint_rejects_future_file_before_creating_effect(gate_proj
     assert Path(result["selector_admission"]["path"]).is_file()
 
 
-def test_real_pytest_junit_proves_each_selected_source_and_rejects_other_file(tmp_path):
+@pytest.mark.parametrize("project_name", [".", "workers/automation"])
+@pytest.mark.parametrize("family", ["xunit1", "xunit2"])
+def test_real_pytest_junit_proves_each_selected_source_and_rejects_other_file(
+    tmp_path, monkeypatch, project_name, family,
+):
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
     source = tmp_path / "source"
-    tests = source / "tests"
+    project = source / project_name
+    tests = project / "tests"
     tests.mkdir(parents=True)
-    git(source, "init", "-q")
+    config = project / "pyproject.toml"
+    config.write_text('[tool.pytest.ini_options]\njunit_family = "' + family + '"\n')
+    content = (
+        "from pathlib import Path\n"
+        "def test_actual(pytestconfig):\n"
+        "    assert pytestconfig.rootpath == Path(__file__).resolve().parents[1]\n"
+        "class TestOuter:\n"
+        "    def test_method(self): assert True\n"
+        "    class TestNested:\n"
+        "        def test_nested(self): assert True\n"
+    )
     for name in ("test_present.py", "test_other.py"):
-        (tests / name).write_text("def test_actual(): assert True\n")
+        (tests / name).write_text(content)
+    git(source, "init", "-q")
+    git(source, "config", "user.name", "Fixture")
+    git(source, "config", "user.email", "fixture@example.invalid")
     git(source, "add", ".")
+    git(source, "commit", "-qm", "Frozen pytest configuration")
+    selectors = [(tests / name).relative_to(source).as_posix()
+                 for name in ("test_present.py", "test_other.py")]
     recipe = {
-        "required_selectors": ["tests/test_present.py", "tests/test_other.py"],
+        "cwd": ".",
+        "argv": ["uv", "--project", project_name, "run", "--locked", "--all-extras",
+                 "pytest", *selectors, "-q", "--junitxml={report_path}"],
+        "required_selectors": selectors,
         "selector_evidence_version": 1,
         "selector_project": ".",
     }
+    spec = {"source_path": str(source), "base_sha": git(source, "rev-parse", "HEAD")}
     sources = resolve_required_selectors(recipe, source)
     report = tmp_path / "actual-junit.xml"
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "tests/test_present.py",
-            "-q",
-            "--junitxml=" + str(report),
-        ],
-        cwd=source,
-        check=True,
-        capture_output=True,
-    )
+
+    def run(selected, *, success=True):
+        process = subprocess.run(
+            [sys.executable, "-m", "pytest", *selected, "-q", "--junitxml=" + str(report)],
+            cwd=source, capture_output=True,
+        )
+        assert process.returncode == (0 if success else 1), process.stdout + process.stderr
+        return report.read_bytes()
+
+    partial = run(selectors[:1])
+    cases = ET.fromstring(partial).findall(".//testcase")
+    assert {case.get("classname") for case in cases} == {
+        "tests.test_present", "tests.test_present.TestOuter",
+        "tests.test_present.TestOuter.TestNested",
+    }
+    assert all(case.get("file") == ("tests/test_present.py" if family == "xunit1" else None)
+               for case in cases)
     with pytest.raises(ValueError, match="test_other.py"):
-        selector_evidence(recipe, source, sources, junit=report.read_bytes())
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "tests/test_present.py",
-            "tests/test_other.py",
-            "-q",
-            "--junitxml=" + str(report),
-        ],
-        cwd=source,
-        check=True,
-        capture_output=True,
-    )
-    receipts = selector_evidence(recipe, source, sources, junit=report.read_bytes())
-    assert all(item["passed"] == 1 for item in receipts)
+        selector_evidence(recipe, source, sources, junit=partial, spec=spec)
+    complete = run(selectors)
+    receipts = selector_evidence(recipe, source, sources, junit=complete, spec=spec)
+    assert {item["selector"]: item["passed"] for item in receipts} == dict.fromkeys(selectors, 3)
+
+    foreign = ET.fromstring(complete)
+    for case in foreign.findall(".//testcase"):
+        if case.get("classname", "").startswith("tests.test_present"):
+            case.set("file", "foreign/tests/test_present.py")
+    with pytest.raises(ValueError, match="test_present.py"):
+        selector_evidence(recipe, source, sources, junit=ET.tostring(foreign), spec=spec)
+
+    # Only the unchanged admitted configuration can supply an extra report root.
+    if project_name != ".":
+        original = config.read_text()
+        config.write_text(original + 'addopts = "--rootdir=."\n')
+        with pytest.raises(ValueError, match="no complete passing evidence"):
+            selector_evidence(recipe, source, sources, junit=complete, spec=spec)
+        config.write_text(original)
+        shadow = tests / "pytest.ini"
+        shadow.write_text("[pytest]\n")
+        with pytest.raises(ValueError, match="no complete passing evidence"):
+            selector_evidence(recipe, source, sources, junit=complete, spec=spec)
+        shadow.unlink()
+        for option in ("--rootdir=.", "--junitprefix=tests.test_present"):
+            unsupported = {**recipe, "argv": [*recipe["argv"], option]}
+            with pytest.raises(ValueError, match="no complete passing evidence"):
+                selector_evidence(unsupported, source, sources, junit=complete, spec=spec)
+
+        ambiguous = [project / "tests.more/test_present.py",
+                     project / "tests/more/test_present.py"]
+        for path in ambiguous:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("def test_ambiguous(): assert True\n")
+        git(source, "add", ".")
+        paths = [path.relative_to(source).as_posix() for path in ambiguous]
+        collision = {**recipe, "required_selectors": paths,
+                     "argv": ["pytest", *paths, "-q"]}
+        diagnostic = "ambiguous" if family == "xunit2" else "no complete passing evidence"
+        with pytest.raises(ValueError, match=diagnostic):
+            selector_evidence(collision, source, resolve_required_selectors(collision, source),
+                              junit=run(paths[:1]), spec=spec)
+
+    # Actual failing cases retain failure receipts instead of becoming attribution errors.
+    (tests / "test_present.py").write_text(content.replace("assert True", "assert False", 1))
+    sources = resolve_required_selectors(recipe, source)
+    with pytest.raises(ValueError, match="test_present.py") as raised:
+        selector_evidence(recipe, source, sources, junit=run(selectors, success=False), spec=spec)
+    failed = raised.value._failed_selector_receipts
+    assert next(item for item in failed if item["selector"] == selectors[0])["failed"] == 1
 
 
 @pytest.mark.parametrize("failure", [None, "candidate_excluded"])
