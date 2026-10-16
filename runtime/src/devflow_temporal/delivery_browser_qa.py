@@ -414,10 +414,18 @@ def observe_browser_artifacts(
             or launch.get("argv") != qa["argv"]
             or journal["intent"].get("environment_sha256") != digest(launch.get("environment"))):
         raise ValueError("browser artifact retry lost its completed frozen native invocation")
-    sources = resolve_required_selectors(qa, broker.checkout, spec=spec)
-    selected = selector_evidence(qa, broker.checkout, sources,
+    gate = root / "gates" / str(prior) / "verify"
+    if (gate.resolve(strict=True) != gate
+            or any(value != candidate[key] for key, value in candidate_for(gate).items())):
+        raise ValueError("browser artifact retry lost its exact historical gate candidate")
+    current = resolve_required_selectors(qa, broker.checkout, spec=spec)
+    sources = resolve_required_selectors(qa, gate, spec=spec)
+    if [(item["selector"], item["sha256"]) for item in current] != [
+            (item["selector"], item["sha256"]) for item in sources]:
+        raise ValueError("browser artifact retry historical and current selected source differ")
+    selected = selector_evidence(qa, gate, sources,
                                  playwright=visible_output(log.decode("utf-8", errors="replace")))
-    fields = ("selector", "sha256", "passed", "failed", "skipped")
+    fields = ("selector", "path", "sha256", "passed", "failed", "skipped")
     if [{k: item[k] for k in fields} for item in selected] != [
             {k: item[k] for k in fields} for item in browser.get("selectors", [])]:
         raise ValueError("browser artifact retry lost its exact selected source evidence")
