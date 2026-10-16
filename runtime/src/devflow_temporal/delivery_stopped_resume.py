@@ -630,6 +630,57 @@ def _historical_candidate(broker, state, candidate, latest, recovery, pending=No
     return False
 
 
+def _implementation_receipt(spec, role, attempt):
+    """Compare native fields exactly after authenticating a controller-only debit binding."""
+    result = json.loads(attempt['result_json'])
+    expected = {key: value for key, value in role.items() if key not in {
+        'role', 'iteration', 'candidate', 'attempt_id', 'input_candidate_id', 'provider'}}
+    if (spec.get('feature_worker') and role['iteration'] > 0
+            and ('planning_defect' in expected or 'planning_defect_repair' in expected)):
+        from .delivery_feature_execution import registry, worker_key
+        from .delivery_feature_revision_roles import validate_diagnostic
+
+        diagnostic = expected.get('planning_defect')
+        try:
+            validate_diagnostic(diagnostic, chunk_id=spec['feature_worker']['chunk_id'],
+                                candidate_id=role['candidate']['id'])
+        except (KeyError, TypeError, ValueError):
+            return False
+        key = spec['run_id'] + ':' + str(role['iteration'])
+        binding = {
+            'revision_id': 'revision-' + digest({'worker_run_id': spec['run_id'],
+                                               'repair_key': key, 'diagnostic': diagnostic})[:24],
+            'repair_key': key, 'diagnostic_sha256': digest(diagnostic)}
+        if expected.get('planning_defect_repair') != binding:
+            return False
+        shared, owner = registry(spec), spec['feature_delivery']['owner']
+        with shared.connect() as db:
+            paid = db.execute('SELECT generation,reason FROM execution_repairs '
+                              'WHERE issue_id=? AND repair_key=?',
+                              (owner['issue_id'], key)).fetchone()
+            if (not paid or paid['generation'] < owner['generation']
+                    or paid['reason'] != 'Product repair at worker iteration '
+                    + str(role['iteration'])):
+                return False
+            lineage = [dict(row) for row in db.execute(
+                'SELECT issue_id,run_id,store_path,generation FROM execution_snapshots '
+                'WHERE issue_id=? AND generation>=? AND generation<=? ORDER BY generation',
+                (owner['issue_id'], owner['generation'], paid['generation']))]
+            assignment = db.execute(
+                'SELECT generation,workstream_id FROM execution_workers '
+                'WHERE issue_id=? AND worker_key=?', (owner['issue_id'], worker_key(
+                    spec['run_id'], {**owner, 'generation': paid['generation']}))).fetchone()
+        if (len(lineage) != paid['generation'] - owner['generation'] + 1
+                or not lineage or lineage[0] != owner
+                or any(item['store_path'] != owner['store_path'] for item in lineage)
+                or not assignment or assignment['generation'] != paid['generation']
+                or assignment['workstream_id'] != spec['feature_worker']['workstream_id']):
+            return False
+        if 'planning_defect_repair' not in result:
+            expected.pop('planning_defect_repair')
+    return result == expected
+
+
 def _candidate(broker, state, attempts, *, missing_rollout=None, recovery=None, pending=None):
     candidate = broker.candidate()
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
@@ -643,10 +694,7 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, recovery=None, 
         matches = [a for a in attempts if a['role'] == 'implement'
                    and a['iteration'] == latest['iteration']
                    and a['session_id'] == latest['session_id']
-                   and json.loads(a['result_json']) == {
-                       k: v for k, v in latest.items()
-                       if k not in {'role', 'iteration', 'candidate', 'attempt_id',
-                                    'input_candidate_id', 'provider'}}]
+                   and _implementation_receipt(broker.spec, latest, a)]
         prerequisites = latest.get('implementation_preparation', {})
         no_provider = (latest.get('session_id') is None
                        and prerequisites.get('state') == 'failed'
