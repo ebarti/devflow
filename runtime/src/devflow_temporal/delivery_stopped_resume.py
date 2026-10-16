@@ -636,7 +636,8 @@ def _implementation_receipt(spec, role, attempt):
     expected = {key: value for key, value in role.items() if key not in {
         'role', 'iteration', 'candidate', 'attempt_id', 'input_candidate_id', 'provider'}}
     if (spec.get('feature_worker') and role['iteration'] > 0
-            and ('planning_defect' in expected or 'planning_defect_repair' in expected)):
+            and (expected.get('planning_defect') is not None
+                 or expected.get('planning_defect_repair') is not None)):
         from .delivery_feature_execution import registry, worker_key
         from .delivery_feature_revision_roles import validate_diagnostic
 

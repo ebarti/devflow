@@ -166,6 +166,20 @@ async def test_stopped_feature_scope_continues_original_build_and_normal_integra
     store, parent, child, broker, state, command = stopped_feature_scope
     original = copy.deepcopy(child)
     before = copy.deepcopy(state)
+    with store._connect() as db:
+        native_attempt = dict(db.execute('SELECT * FROM delivery_attempts '
+                                         'WHERE run_id=? AND iteration=1',
+                                         (child['run_id'],)).fetchone())
+    for absent in (False, True):
+        ordinary = copy.deepcopy(before['roles'][-1])
+        ordinary.pop('planning_defect_repair')
+        native = json.loads(native_attempt['result_json'])
+        ordinary['planning_defect'] = native['planning_defect'] = None
+        if absent:
+            ordinary.pop('planning_defect')
+            native.pop('planning_defect')
+        assert resume._implementation_receipt(
+            child, ordinary, {**native_attempt, 'result_json': canonical_json(native)})
     shared = registry(parent)
     original_owner = shared.current('I_feature')
     remote = copy.deepcopy(parent['feature_delivery']['snapshot'])
