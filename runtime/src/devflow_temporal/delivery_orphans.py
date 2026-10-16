@@ -348,6 +348,9 @@ def _reconcile(store, original, spec, closed):
 
 def _disposable_work(manifest, row):
     finalization = manifest.get('finalization', {})
+    if any(entry.get('generated_output_preservation', {}).get('state') == 'pending'
+           for entry in manifest.get('roots', {}).values()):
+        return True  # An exclusive preservation move may have lost its acknowledgement.
     if (finalization.get('state') == 'confirmed'
             and (row['cleanup'] == 'unknown' or json.loads(row['checks_json'] or '{}').get(
                 'resource_cleanup', {}).get('resource_cleanup') != 'confirmed')):

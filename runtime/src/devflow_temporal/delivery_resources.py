@@ -577,6 +577,7 @@ class RunResources:
                     )
                     old.pop("receipt", None)
                     old.pop('head', None)
+                    old.pop('generated_output_preservation', None)
                     write_private(self.manifest, manifest)
                 return
             if os.path.lexists(path):
@@ -612,6 +613,8 @@ class RunResources:
         self.register(path, 'generated')
         with self.locked() as manifest:
             entry = manifest['roots'][str(path)]
+            if entry.get('generated_output_preservation'):
+                raise ValueError('unconfirmed output preservation is not finalized')
             if entry['identity'] is None:
                 if os.path.lexists(path):
                     raise ValueError('cannot adopt an existing unconfirmed generated output')
@@ -833,6 +836,12 @@ class RunResources:
                             or info.st_ino != lock_path.lstat().st_ino):
                         raise ValueError('unjournaled native launch lease changed')
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if folder.parent == self.state / 'attempts':
+                    owner = self.state / 'attempt-owners' / folder.name
+                    if os.path.lexists(owner):
+                        descriptor = os.open(owner, os.O_RDONLY | os.O_NOFOLLOW)
+                        descriptors.append(descriptor)
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             for raw in paths:
                 path = Path(raw)
                 if (str(path) not in manifest['processes'] or path.resolve(strict=True) != path
@@ -992,14 +1001,235 @@ class RunResources:
                 manifest["processes"].append(str(journal))
                 write_private(self.manifest, manifest)
 
+    def _generated_output_binding(self, path, entry, manifest):
+        from .delivery_configured_resources import declared_generated_directories
+
+        checkout = Path(self.spec['checkout'])
+        relative = path.relative_to(checkout).as_posix()
+        configured = declared_generated_directories(self.spec) | set(
+            (self.spec['policy'].get('browser_qa') or {}).get('artifact_paths', []))
+        parent = manifest['roots'].get(str(checkout), {})
+        if (self.spec.get('provider') != 'codex'
+                or self.spec['policy'].get('host_sandbox') != 'trusted-local'
+                or self.spec['policy'].get('execution_backend') != 'native-macos'
+                or digest(self.spec['policy']) != self.spec['policy_digest']
+                or relative not in configured
+                or {'.venv', 'node_modules'} & set(Path(relative).parts)
+                or entry['kind'] != 'generated' or entry['state'] != 'allocated'
+                or entry['identity'] is not None
+                or parent.get('kind') != 'checkout' or not parent.get('identity')
+                or (os.path.lexists(checkout)
+                    and parent['identity'] != _identity(checkout))
+                or (not os.path.lexists(checkout) and parent.get('receipt', {}).get('state')
+                    not in {'removed', 'already_absent'})):
+            raise ValueError('unconfirmed output lacks its exact configured checkout authority')
+        return {'run_id': self.spec['run_id'], 'source': str(path),
+                'checkout': str(checkout), 'checkout_identity': parent['identity'],
+                'policy_digest': self.spec['policy_digest'],
+                'generation': entry.get('generation', 0)}
+
+    def _read_generated_preservation(self, path, entry, manifest):
+        binding = self._generated_output_binding(path, entry, manifest)
+        folder = self.root / 'preserved-generated-output' / digest(binding)
+        intent = folder / 'intent.json'
+        _ancestors(intent)
+        if intent.resolve(strict=True) != intent:
+            raise ValueError('unconfirmed output preservation left its original run')
+        raw = read_private(intent, raw=True)
+        saved = json.loads(raw)
+        marker = entry.get('generated_output_preservation', {})
+        if (saved.get('binding') != binding
+                or marker.get('intent_sha256') != hashlib.sha256(raw).hexdigest()
+                or saved.get('destination') != str(folder / 'output')
+                or saved.get('ownership') != 'unproven' or saved.get('disposable') is not False
+                or _identity(folder) != saved['destination_parent_identity']):
+            raise ValueError('unconfirmed output preservation authority changed')
+        for name in ('manifest.json', 'finalization.json'):
+            archived = saved['original_bytes'][name].encode('utf-8')
+            if hashlib.sha256(archived).hexdigest() != saved['original_sha256'][name]:
+                raise ValueError('original unconfirmed output evidence changed')
+        original = json.loads(saved['original_bytes']['manifest.json'])
+        previous = json.loads(saved['original_bytes']['finalization.json'])
+        old = original['roots'].get(str(path), {})
+        failure = {'path': str(path), 'kind': 'generated', 'state': 'failed_unknown',
+                   'reason': 'ValueError: resource creation or replacement has no proven ownership',
+                   'retryable': False}
+        if (old.get('kind') != 'generated' or old.get('identity') is not None
+                or old.get('state') != 'allocated'
+                or old.get('generation', 0) != binding['generation']
+                or old.get('receipt') != failure
+                or original.get('run_id') != self.spec['run_id']
+                or original.get('state_identity') != _identity(self.state)
+                or original.get('finalization') != previous
+                or original.get('processes') != manifest['processes']
+                or original['roots'].get(binding['checkout'], {}).get('identity')
+                != binding['checkout_identity']
+                or previous.get('state') != 'unknown'
+                or previous.get('process_cleanup') != 'observed-native-confirmed'
+                or failure not in previous.get('roots', [])
+                or saved.get('journals') != [
+                    {'journal': raw, 'sha256': hashlib.sha256(
+                        read_private(Path(raw), raw=True)).hexdigest()}
+                    for raw in manifest['processes']]):
+            raise ValueError('original unconfirmed output failure custody changed')
+        return saved, folder
+
+    def _prepare_generated_preservation(self, path, entry, manifest, originals):
+        """Publish the old bytes atomically before finalization changes their manifest."""
+        from .candidate import candidate_for
+        from .delivery_metadata_recovery import _immutable
+
+        binding = self._generated_output_binding(path, entry, manifest)
+        folder = self.root / 'preserved-generated-output' / digest(binding)
+        intent = folder / 'intent.json'
+        _ancestors(intent, allow_missing=True)
+        if os.path.lexists(intent):
+            return
+        attempts = self.state / 'attempts'
+        unstarted = list(attempts.iterdir()) if attempts.exists() else ()
+        with self._closed_journals(
+                manifest, manifest['processes'], unstarted=unstarted) as journals:
+            if os.path.lexists(folder / 'output') or not os.path.lexists(path):
+                raise ValueError('unconfirmed output preservation has no original source')
+            private_directory(folder)
+            saved = {'binding': binding, 'destination': str(folder / 'output'),
+                     'candidate': candidate_for(Path(binding['checkout'])), 'journals': journals,
+                     'observed_identity': _identity(path),
+                     'source_parent_identity': _identity(path.parent),
+                     'destination_parent_identity': _identity(folder),
+                     'original_bytes': {name: raw.decode('utf-8')
+                                        for name, raw in originals.items()},
+                     'original_sha256': {name: hashlib.sha256(raw).hexdigest()
+                                         for name, raw in originals.items()},
+                     'ownership': 'unproven', 'disposable': False}
+            _immutable(intent, saved)
+
+    def _preserve_generated_output(self, path, entry, manifest):
+        """Retain ambiguous bytes, never claim the observed inode was ours to delete."""
+        from .candidate import candidate_for
+        from .delivery_broker import _git
+        from .delivery_metadata_recovery import _immutable
+
+        binding = self._generated_output_binding(path, entry, manifest)
+        checkout = Path(binding['checkout'])
+        relative = path.relative_to(checkout).as_posix()
+        folder = self.root / 'preserved-generated-output' / digest(binding)
+        destination, intent = folder / 'output', folder / 'intent.json'
+        attempts = self.state / 'attempts'
+        unstarted = list(attempts.iterdir()) if attempts.exists() else ()
+        with self._closed_journals(manifest, manifest['processes'], unstarted=unstarted):
+            retained = entry.get('generated_output_preservation', {})
+            if retained.get('state') == 'preserved':
+                self._observe_generated_preservation(path, entry, manifest)
+                return {'state': 'already_absent', 'preserved_output': retained,
+                        'reason': 'unproven generated output preserved without ownership adoption'}
+            if (_git(checkout, 'ls-files', '--', relative)
+                    or _git(checkout, 'ls-files', '--others', '--exclude-standard',
+                            '--', relative)):
+                raise ValueError('unconfirmed output contains candidate source')
+            intent_sha256 = hashlib.sha256(read_private(intent, raw=True)).hexdigest()
+            if (entry.get('generated_output_preservation', {}).get(
+                    'intent_sha256', intent_sha256) != intent_sha256):
+                raise ValueError('unconfirmed output preservation intent changed')
+            entry['generated_output_preservation'] = {
+                'state': 'pending', 'intent_sha256': intent_sha256}
+            write_private(self.manifest, manifest)
+            saved, folder = self._read_generated_preservation(path, entry, manifest)
+            if (_identity(path.parent) != saved['source_parent_identity']
+                    or candidate_for(checkout) != saved['candidate']):
+                raise ValueError(
+                    'unconfirmed output candidate or parent changed during preservation')
+            if os.path.lexists(path):
+                if (os.path.lexists(destination)
+                        or _identity(path) != saved['observed_identity']):
+                    raise ValueError('unconfirmed output preservation source was replaced')
+                observed = subprocess.run(
+                    ['/usr/sbin/lsof', '-nP', '-F', 'p', '+D', str(path)],
+                    text=True, capture_output=True, timeout=30)
+                if observed.returncode not in (0, 1) or any(
+                        line.startswith('p') and line[1:].isdecimal()
+                        for line in observed.stdout.splitlines()):
+                    raise ValueError('unconfirmed output has a live or unknown holder')
+                _ancestors(path)
+                _ancestors(destination)
+                if (_identity(path.parent) != saved['source_parent_identity']
+                        or _identity(folder) != saved['destination_parent_identity']
+                        or _identity(path) != saved['observed_identity']
+                        or candidate_for(checkout) != saved['candidate']):
+                    raise ValueError('unconfirmed output changed before exclusive preservation')
+                import ctypes
+
+                rename = getattr(ctypes.CDLL(None, use_errno=True), 'renamex_np', None)
+                if rename is None:
+                    raise ValueError('exclusive output preservation is unavailable')
+                rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+                rename.restype = ctypes.c_int
+                if rename(os.fsencode(path), os.fsencode(destination), 0x00000004):
+                    raise OSError(ctypes.get_errno(), 'exclusive output preservation failed')
+            if (os.path.lexists(path)
+                    or _identity(destination) != saved['observed_identity']
+                    or candidate_for(checkout) != saved['candidate']):
+                raise ValueError('unconfirmed output preservation destination was replaced')
+            for directory in (path.parent, folder):
+                descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            receipt = {'state': 'preserved', 'intent_sha256': intent_sha256,
+                       'destination': str(destination),
+                       'observed_identity': saved['observed_identity'],
+                       'ownership': 'unproven', 'disposable': False}
+            _immutable(folder / 'receipt.json', receipt)
+            retained = {'state': 'preserved', 'intent_sha256':
+                        entry['generated_output_preservation']['intent_sha256'],
+                        'receipt': str(folder / 'receipt.json'),
+                        'receipt_sha256': hashlib.sha256(
+                            read_private(folder / 'receipt.json', raw=True)).hexdigest()}
+            entry['generated_output_preservation'] = retained
+            return {'state': 'already_absent', 'preserved_output': retained,
+                    'reason': 'unproven generated output preserved without ownership adoption'}
+
+    def _observe_generated_preservation(self, path, entry, manifest):
+        saved, folder = self._read_generated_preservation(path, entry, manifest)
+        retained = entry['generated_output_preservation']
+        receipt = folder / 'receipt.json'
+        if (retained.get('state') != 'preserved' or os.path.lexists(path)
+                or _identity(folder / 'output') != saved['observed_identity']
+                or retained.get('receipt') != str(receipt)
+                or hashlib.sha256(read_private(receipt, raw=True)).hexdigest()
+                != retained.get('receipt_sha256')
+                or read_private(receipt) != {
+                    'state': 'preserved', 'intent_sha256': retained['intent_sha256'],
+                    'destination': str(folder / 'output'),
+                    'observed_identity': saved['observed_identity'],
+                    'ownership': 'unproven', 'disposable': False}):
+            raise ValueError('preserved unconfirmed output changed or is incomplete')
+
     def finalize(self, outcome: str, *, uncertain: bool = False) -> dict[str, Any]:
         from .delivery_native_process import reconcile_process
 
         with self.locked() as manifest:
+            originals = {name: read_private(self.root / name, raw=True)
+                         for name in ('manifest.json', 'finalization.json')
+                         if os.path.lexists(self.root / name)}
             process_receipts = [reconcile_process(Path(path)) for path in manifest["processes"]]
             uncertain = uncertain or any(
                 item["cleanup"] != "observed-native-confirmed" for item in process_receipts
             )
+            if not uncertain:
+                for raw, entry in manifest['roots'].items():
+                    if (entry['kind'] != 'generated' or entry['identity'] is not None
+                            or entry.get('receipt', {}).get('state') != 'failed_unknown'
+                            or entry['receipt'].get('reason') != 'ValueError: resource creation '
+                                'or replacement has no proven ownership'):
+                        continue
+                    try:
+                        self._generated_output_binding(Path(raw), entry, manifest)
+                    except (OSError, ValueError, KeyError):
+                        continue  # Other unknown roots keep the existing ownership refusal.
+                    self._allowed(Path(raw), 'generated', finalizing=True)
+                    self._prepare_generated_preservation(Path(raw), entry, manifest, originals)
             manifest["finalization"] = {"outcome": outcome, "state": "running"}
             write_private(self.manifest, manifest)
             receipts = []
@@ -1010,7 +1240,16 @@ class RunResources:
                 receipt = {"path": raw_path, "kind": entry["kind"]}
                 try:
                     self._allowed(path, entry["kind"], finalizing=True)
-                    if not os.path.lexists(path):
+                    if (entry.get('generated_output_preservation') or (
+                            entry['kind'] == 'generated' and entry['identity'] is None
+                            and entry.get('receipt', {}).get('state') == 'failed_unknown'
+                            and entry['receipt'].get('reason') == 'ValueError: resource creation '
+                                'or replacement has no proven ownership')):
+                        if uncertain:
+                            raise ValueError(
+                                'unconfirmed output preservation requires closed actors')
+                        receipt.update(self._preserve_generated_output(path, entry, manifest))
+                    elif not os.path.lexists(path):
                         receipt.update(state="already_absent")
                         if entry.get("clean_base_removal"):
                             receipt["clean_base_removal"] = entry["clean_base_removal"]
@@ -1337,6 +1576,8 @@ def _observe_locked_resources(spec, registry, manifest, *, unknown_allowed=False
         path = Path(raw)
         registry._allowed(path, entry["kind"], finalizing=True)
         _ancestors(path, allow_missing=True)
+        if entry.get('generated_output_preservation'):
+            registry._observe_generated_preservation(path, entry, manifest)
         if os.path.lexists(path):
             if entry["identity"] != _identity(path):
                 raise ValueError("predecessor root identity changed")

@@ -1266,14 +1266,23 @@ class DeliveryBroker:
         return result
 
 
+    def _prepare_generated_outputs(self, checkout: Path) -> None:
+        from .delivery_configured_resources import declared_generated_directories
+
+        outputs = sorted(declared_generated_directories(self.spec) | set(
+            (self.spec['policy'].get('browser_qa') or {}).get('artifact_paths', [])))
+        try:
+            self._register_generated(checkout, [
+                name for name in outputs
+                if not {'.venv', 'node_modules'} & set(Path(name).parts)])
+        except (ValueError, OSError) as exc:
+            raise CheckPreparationFailure('native-generated-output-custody', exc) from exc
+
     def run_implementation_preparation(self, iteration: int, candidate: dict) -> dict:
         """Pin configured output and prepare accepted locked dependencies before role probes."""
         if self.candidate() != candidate:
             raise ValueError("implementation preparation candidate is stale")
-        from .delivery_configured_resources import (
-            declared_generated_directories,
-            implementation_prerequisites,
-        )
+        from .delivery_configured_resources import implementation_prerequisites
         from .delivery_plan_checks import planned_checks
 
         folder = self.evidence_dir / "implementation-preparation" / str(iteration)
@@ -1283,14 +1292,7 @@ class DeliveryBroker:
         from .delivery_resources import RunResources
 
         resources = RunResources(self.spec)
-        outputs = sorted(declared_generated_directories(self.spec) | set(
-            (self.spec['policy'].get('browser_qa') or {}).get('artifact_paths', [])))
-        try:
-            self._register_generated(self.checkout, [
-                name for name in outputs
-                if not {'.venv', 'node_modules'} & set(Path(name).parts)])
-        except (ValueError, OSError) as exc:
-            raise CheckPreparationFailure('native-generated-output-custody', exc) from exc
+        self._prepare_generated_outputs(self.checkout)
         with resources.locked() as manifest:
             owned = set(manifest['roots'])
         isolated = {}
