@@ -268,6 +268,17 @@ def worker_spec(parent, chunk, issue, *, kind, base_sha, base_branch, seed=None)
     else:
         spec["feature_plan_revision"] = parent.get("feature_plan_revision", {
             "plan_revision": 1, "plan_digest": digest(plan)})
+    from .delivery_feature_scope import MARKER
+
+    amendment = parent.get(MARKER)
+    if amendment:
+        added = amendment["scope"]["added_paths"]
+        if amendment["chunk_id"] == chunk["id"]:
+            policy["allowed_paths"] = list(dict.fromkeys([*policy["allowed_paths"], *added]))
+        else:
+            policy["allowed_paths"] = [
+                path for path in policy["allowed_paths"] if path not in added]
+            spec.pop(MARKER, None)
     policy["initial_decision_prompt"] = None
     policy["recovery"] = None
     policy["pr_body"] = (
@@ -458,12 +469,16 @@ def register_worker(store, parent, spec):
 def continue_feature(store, run_id, request, *, _revision=None):
     from .delivery_config import COMMAND_RE
     from .delivery_feature_closure import closed_coordinator, closed_settlement, closed_worker
+    from .delivery_feature_scope import FIELDS as SCOPE_FIELDS
+    from .delivery_feature_scope import amendment
 
     abandon = request.get("abandon_revision") if isinstance(request, dict) else None
     if (
         not isinstance(request, dict)
         or not {"command_id", "expected_revision"} <= set(request)
-        or set(request) - {"command_id", "expected_revision", "abandon_revision"}
+        or set(request) - {"command_id", "expected_revision", "abandon_revision", *SCOPE_FIELDS}
+        or (set(request) & SCOPE_FIELDS and not SCOPE_FIELDS <= set(request))
+        or (set(request) & SCOPE_FIELDS and (abandon is not None or _revision is not None))
         or not isinstance(request["command_id"], str)
         or not COMMAND_RE.fullmatch(request["command_id"])
         or type(request["expected_revision"]) is not int
@@ -498,6 +513,8 @@ def continue_feature(store, run_id, request, *, _revision=None):
     shared = registry(original)
     token = original["feature_delivery"]["owner"]
     current = shared.current(token["issue_id"])
+    scope = (amendment(store, store.effective_spec(run_id), request, successor_id)
+             if SCOPE_FIELDS <= set(request) else None)
     closed = None
     recorded_workers = None
     if current and shared.token(current) == token and current['state'] == 'active':
@@ -625,6 +642,8 @@ def continue_feature(store, run_id, request, *, _revision=None):
         # The supplied plan is already accepted. Store admission restores the
         # original approval policy from its authenticated stopped predecessor.
         supplied.update(accepted_plan=accepted, plan_approval="automatic")
+    if scope is not None:
+        return store.submit(supplied, _feature_scope=scope)
     return (store.submit(supplied, _feature_revision=_revision) if _revision is not None
             else store.submit(supplied))
 

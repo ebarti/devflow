@@ -32,23 +32,28 @@ FIELDS = {'continuation_kind', 'command_id', 'expected_revision', 'expected_iter
 SCOPE_FIELDS = {'added_paths', 'amended_config_path', 'amended_config_sha256'}
 
 
-def scope_spec(store, seal, command):
+def scope_spec(store, seal, command, *, _feature_scope=None):
     """Add only explicitly named, unchanged tracked files to an authentic stopped role."""
     spec = seal['predecessor_spec']
     if not SCOPE_FIELDS <= command.keys():
         return spec
-    latest = next((role for role in reversed(seal['state'].get('roles', []))
-                   if role.get('role') == 'implement'), None)
-    if (not latest or latest.get('status') != 'findings'
-            or latest.get('finish_reason') != 'done' or not seal['session_id']
-            or not latest.get('findings')
-            or seal['state'].get('error') != 'implementer did not establish a pass'):
-        raise ValueError('scope resume requires an authenticated implementation finding')
-    path = command['amended_config_path']
-    if not isinstance(path, str) or not isinstance(command['amended_config_sha256'], str):
-        raise ValueError('scope amendment configuration must be absolute')
-    effective = scope_amended_spec(spec, Path(path), command['amended_config_sha256'],
-                                   command['added_paths'])
+    if spec.get('feature_worker'):
+        from .delivery_feature_scope import worker_scope
+
+        effective = worker_scope(store, seal, command, _feature_scope)
+    else:
+        latest = next((role for role in reversed(seal['state'].get('roles', []))
+                       if role.get('role') == 'implement'), None)
+        if (not latest or latest.get('status') != 'findings'
+                or latest.get('finish_reason') != 'done' or not seal['session_id']
+                or not latest.get('findings')
+                or seal['state'].get('error') != 'implementer did not establish a pass'):
+            raise ValueError('scope resume requires an authenticated implementation finding')
+        path = command['amended_config_path']
+        if not isinstance(path, str) or not isinstance(command['amended_config_sha256'], str):
+            raise ValueError('scope amendment configuration must be absolute')
+        effective = scope_amended_spec(spec, Path(path), command['amended_config_sha256'],
+                                       command['added_paths'])
     broker = DeliveryBroker(store, spec)
     changed = broker._changed_paths(spec['base_sha'])
     for name in command['added_paths']:
@@ -533,11 +538,22 @@ def custody(db, recovery, *, retained_memo=None):
             raise ValueError('revision gate resume lost its exact passed implementation evidence')
     if SCOPE_FIELDS <= recovery['command'].keys():
         scope = recovery['command']
-        amended = scope_amendment_config(
-            recovery['predecessor_spec'], Path(scope['amended_config_path']),
-            scope['amended_config_sha256'], scope['added_paths'])
-        repository = amended.raw['repositories'][spec['repository_key']]
-        if spec['policy']['allowed_paths'] != repository['allowed_paths']:
+        if spec.get('feature_worker'):
+            from .delivery_feature_scope import MARKER, receipt_config
+
+            receipt = spec[MARKER]
+            amended = receipt_config(db, receipt)
+            allowed = [*details['predecessor_spec']['policy']['allowed_paths'],
+                       *receipt['scope']['added_paths']]
+            if any(scope[key] != receipt['scope'][key] for key in SCOPE_FIELDS):
+                raise ValueError('worker scope lost its sealed file delta')
+        else:
+            amended = scope_amendment_config(
+                recovery['predecessor_spec'], Path(scope['amended_config_path']),
+                scope['amended_config_sha256'], scope['added_paths'])
+            allowed = amended.raw['repositories'][spec['repository_key']]['allowed_paths']
+        if (spec['policy']['allowed_paths'] != allowed
+                or spec['config_digest'] != digest(amended.raw)):
             raise ValueError('stopped scope resume changed its sealed file authority')
     return spec
 
