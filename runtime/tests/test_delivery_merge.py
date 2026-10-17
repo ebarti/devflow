@@ -1,8 +1,10 @@
 """Pure merge gates and controlled remote readback; no native/server fixtures."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+import subprocess
 from copy import deepcopy
 from datetime import UTC, datetime
 
@@ -308,12 +310,15 @@ class Hosted(MergeBroker):
         raise AssertionError(endpoint)
 
 
-def test_normal_ci_authenticates_the_full_hosted_tree_and_reuses_complete_log(tmp_path):
+@pytest.mark.parametrize("colored", [False, True])
+def test_normal_ci_authenticates_the_full_hosted_tree_and_reuses_complete_log(tmp_path, colored):
     from devflow_temporal.delivery_resources import read_private
 
     spec, _, pr, _, _, _ = gates()
     spec["state_dir"] = str(tmp_path)
     broker = Hosted(spec)
+    if colored:
+        broker.log = "\x1b[32m" + broker.log + "\x1b[0m"
     found = {"state": "open", "merged": False, "base": {"sha": "b"},
              "merge_commit_sha": "hosted"}
     first = broker.live_ci(pr, found, "t")
@@ -775,3 +780,37 @@ def test_feature_evidence_authenticates_three_native_hosted_layers(tmp_path, mon
         assert merger.evidence(store, parent, record, live, gh) == [
             "tree-0", "tree-1", "tree-2"]
         assert all(transport.log_reads == 1 for transport in transports.values())
+
+
+@pytest.mark.parametrize("raw,method,body", [
+    (True, "GET", None), (False, "GET", None), (False, "PUT", {"sha": "h"}),
+])
+def test_api_allows_escape_bytes_only_for_privately_captured_raw_observations(
+    tmp_path, monkeypatch, capsys, raw, method, body,
+):
+    spec = gates()[0]
+    spec["state_dir"] = str(tmp_path)
+    broker = MergeBroker(None, spec)
+    payload = b"\x1b[32mcheckout hosted\x1b[0m\nMerge h into b\n" if raw else b'{"state":"open"}\n'
+    endpoint = "repos/owner/repo/actions/jobs/30/logs" if raw else "repos/owner/repo/pulls/1"
+
+    def run(argv, **kwargs):
+        assert kwargs == {"input": json.dumps(body).encode() if body is not None else None,
+                          "capture_output": True, "timeout": 60, "check": False}
+        assert ("--allow-escape-sequences" in argv) is raw
+        return subprocess.CompletedProcess(argv, 0, payload, b"")
+
+    monkeypatch.setattr("devflow_temporal.delivery_merge.subprocess.run", run)
+    observed = broker.api(endpoint, method=method, body=body, raw=raw)
+    assert observed == (payload.decode() if raw else {"state": "open"})
+    receipts = list(broker.root.glob("*.json"))
+    assert len(receipts) == 1
+    encoded = receipts[0].read_bytes()
+    assert b"\x1b" not in encoded
+    receipt = json.loads(encoded)
+    assert receipt["stdout"].encode() == payload
+    assert receipt["stdout_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert receipt["body"] == body and receipt["exit_code"] == 0
+    assert ("--allow-escape-sequences" in receipt["argv"]) is raw
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
