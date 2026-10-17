@@ -370,8 +370,29 @@ def test_reserve_rearms_only_fresh_gates_and_keeps_exhausted_budget(
     f = interrupted_assessment
     before, budget = deepcopy(f.closed), f.shared.budget(f.token['issue_id'])
     assert budget['used'] == budget['maximum'] == 10
-    with pytest.raises(ValueError, match='closed finalized delivery'):
+    from devflow_temporal.delivery_feature_closure import closed_worker
+
+    # Later cleanup is authentic, but the modeled blocked implementation has no
+    # durable supervisor receipt. It still cannot gain generic repair authority.
+    authenticated = closed_worker(f.store, f.child['run_id'], f.closed['workflow_id'],
+                                  sealed_only=True)
+    assert authenticated['result'] == before['result']
+    with f.store._connect() as db:
+        row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                              (f.child['run_id'],)).fetchone())
+        commands = list(db.execute('SELECT * FROM delivery_commands ORDER BY command_id'))
+        assert not db.execute('SELECT 1 FROM delivery_attempts WHERE run_id=?',
+                              (f.child['run_id'],)).fetchone()
+    with pytest.raises(ValueError,
+                       match='^blocked implementation lacks its exact supervisor receipt$'):
         stopped.snapshot(f.store, f.child['run_id'])
+    assert stopped.interrupted_resume({'predecessor_spec': f.spec, 'state': f.state,
+                                      'candidate': f.state['candidate']}) is None
+    assert f.closed == before and f.shared.budget(f.token['issue_id']) == budget
+    with f.store._connect() as db:
+        assert dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                               (f.child['run_id'],)).fetchone()) == row
+        assert list(db.execute('SELECT * FROM delivery_commands ORDER BY command_id')) == commands
     with pytest.raises(ValueError, match='already terminal'):
         f.store.begin_mutation(f.child['run_id'], 'reconcile-old-terminal', 'reconcile_tracker',
                                {'command_id': 'reconcile-old-terminal', 'expected_revision': 77})

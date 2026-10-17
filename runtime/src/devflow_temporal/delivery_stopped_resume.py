@@ -7,7 +7,7 @@ import stat
 from pathlib import Path
 
 from .contracts import canonical_json, digest
-from .delivery_baseline_contract import repairable_baseline
+from .delivery_baseline_contract import preparation_failure, repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_budget_contract import fixed_budget_allows
 from .delivery_config import scope_amended_spec, scope_amendment_config
@@ -395,11 +395,46 @@ def _completed_repair(seal, previous, remainder):
                     for effect in seal['effects']))
 
 
+def _interrupted_preparation(seal):
+    """Only an unlaunched prerequisite, never a failed product assessment."""
+    state = seal['state']
+    checks = state.get('checks') or {}
+    failure = checks.get('failure') or {}
+    stage = {'prepublish_checks': 'prepublish', 'checks': 'local'}.get(failure.get('stage'))
+    check = checks.get(stage) or {}
+    prerequisite = preparation_failure(check)
+    reason = (f'environment preparation failed: {prerequisite}; '
+              'candidate retained without requesting code repair')
+    failed = [item for item in check.get('results', [])
+              if not isinstance(item, dict) or item.get('passed') is not True]
+    checkpoint = checks.get('terminal_tracker_checkpoint') or {}
+    masked = (state.get('error') == 'terminal tracker synchronization conflicted'
+              and checkpoint.get('state') == 'conflicted'
+              and checkpoint.get('closed') is True and checkpoint.get('waiting') is False
+              and checkpoint.get('release') is False
+              and checkpoint.get('event') == checkpoint.get('outcome') == 'blocked'
+              and checkpoint.get('error') == checkpoint.get('reason') == reason)
+    if (seal['predecessor_spec'].get('feature_worker', {}).get('kind') != 'chunk'
+            or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
+            or not state.get('pull_request')
+            or failure.get('classification') != 'terminal' or failure.get('reason') != reason
+            or (state.get('error') != reason and not masked)
+            or check.get('state') != 'failed' or check.get('source_unchanged') is not True
+            or check.get('cleanup') != 'confirmed'
+            or check.get('candidate_id') != seal['candidate']['id']
+            or prerequisite is None or len(failed) != 1
+            or failed[0] != check['results'][-1] or failed[0].get('passed') is not False
+            or failed[0].get('failure_kind') != 'preparation'
+            or failed[0].get('launched') is not False or failed[0].get('cleanup') != 'confirmed'):
+        return None
+    return stage
+
+
 def interrupted_resume(seal):
     """Plan a stopped worker's continuation that needs no product repair, if any.
 
     It stays at the sealed iteration. A passed implementation is never run again, a
-    published candidate is never published again, and gates rerun fresh under the
+    matching published candidate is never published again, and gates rerun fresh under the
     admission's own identity.
     """
     from .delivery_feature_revision_recovery import gate_evidence
@@ -407,14 +442,17 @@ def interrupted_resume(seal):
     spec, state = seal['predecessor_spec'], seal['state']
     cleanup = (cleanup_only_build(spec, state) and completed_cleanup_binding(
         seal.get('cleanup_reconciliation'), seal.get('closed'), state))
-    if (not spec.get('feature_worker') or (state.get('phase') != 'cancelled' and not cleanup)
+    preparation = _interrupted_preparation(seal)
+    if (not spec.get('feature_worker')
+            or (state.get('phase') != 'cancelled' and not cleanup and not preparation)
             or any(isinstance(check, dict) and check.get('state') == 'failed'
-                   for check in state.get('checks', {}).values())):
+                   and name != preparation for name, check in state.get('checks', {}).items())):
         return None
     roles, iteration = state.get('roles', []), state['iteration']
     if not roles:
         # The first implementation never started, and iteration zero is never charged.
-        return {'resume_iteration': 0, 'additional_iterations': 0} if iteration == 0 else None
+        return ({'resume_iteration': 0, 'additional_iterations': 0}
+                if iteration == 0 and not preparation else None)
     last = max((index for index, role in enumerate(roles) if role.get('role') == 'implement'),
                default=None)
     evidence = gate_evidence(seal)
@@ -427,7 +465,9 @@ def interrupted_resume(seal):
             or any(role.get('status') != 'pass' for role in roles[last + 1:])):
         return None
     published = (spec['feature_worker'].get('kind') != 'build'
-                 and (state.get('pull_request') or {}).get('head') == seal['candidate']['head'])
+                 and (state.get('pull_request') or {}).get('head') == seal['candidate']['head']
+                 and (not preparation
+                      or state['pull_request'].get('candidate') == seal['candidate']))
     return {'resume_iteration': iteration, 'additional_iterations': 0,
             'resume_stage': 'published' if published else 'checks', 'gate_evidence': evidence}
 
@@ -779,12 +819,24 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
         stopped.add('delivered')
     expected_execution = 'terminal' if row['outcome'] in {'cancelled', 'delivered'} else 'blocked'
     reconciled = reconciled_cleanup(store, row, state, closed=closed)
-    state_checks, row_checks = closed_checks(row, state, reconciled)
+    cleanup_authority = reconciled
+    if (cleanup_authority is None and spec.get('feature_worker', {}).get('kind') == 'chunk'
+            and row['cleanup'] == 'confirmed' and state.get('cleanup') != 'confirmed'):
+        from .delivery_feature_closure import closed_worker
+
+        # Ordinary maintenance may confirm cleanup after a worker's immutable
+        # terminal result. Reuse settlement's complete history/row/event proof;
+        # neither the closed verdict nor its tracker checkpoint is rewritten.
+        authenticated = closed_worker(store, run_id, predecessor_id, sealed_only=True)
+        if any(authenticated.get(key) != value for key, value in closed.items()):
+            raise ValueError('stopped worker cleanup belongs to a different closed execution')
+        cleanup_authority = authenticated
+    state_checks, row_checks = closed_checks(row, state, cleanup_authority)
     if (row['phase'] not in stopped or row['outcome'] != row['phase']
             or row['execution_state'] != expected_execution or row['cleanup'] != 'confirmed'
             or state.get('run_id') != run_id or state.get('phase') != row['phase']
             or state.get('outcome') != row['outcome']
-            or (state.get('cleanup') != 'confirmed' and reconciled is None)
+            or (state.get('cleanup') != 'confirmed' and cleanup_authority is None)
             or state.get('execution_state') != expected_execution
             or closed.get('workflow_id') != predecessor_id
             or state.get('candidate') != json.loads(row['candidate_json'] or 'null')
