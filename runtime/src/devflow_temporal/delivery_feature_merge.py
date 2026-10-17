@@ -61,8 +61,9 @@ def evidence(store, parent, record, live, gh):
     members = record["manifest"]["publication"]["members"]
     if len(members) != len(ordered_chunks(record["manifest"]["plan"])):
         raise OwnershipConflict("unpublished feature scope remains")
-    trees = []
-    for member, remote in zip(members, live, strict=True):
+    trees, predecessor = [], None
+    native_stack = record["manifest"]["publication"]["stack_id"] is not None
+    for index, (member, remote) in enumerate(zip(members, live, strict=True)):
         proof = checkpoints.get("verified:" + member["chunk_id"])
         if not proof or proof["head"] != member["head"] or proof["number"] != member["number"]:
             raise OwnershipConflict("feature chunk has no current verification checkpoint")
@@ -114,7 +115,13 @@ def evidence(store, parent, record, live, gh):
         commit = gh.api(f"repos/{spec['github_repo']}/git/commits/{member['head']}")
         tree = commit["tree"]["sha"]
         if not remote["merged"]:
-            MergeBroker(store, spec).live_ci(pr, remote, tree)
+            if native_stack and index and predecessor is None:
+                raise OwnershipConflict("native stack predecessor has no current hosted CI binding")
+            predecessor = MergeBroker(store, spec).live_ci(
+                pr, remote, tree, native_stack=native_stack, predecessor=predecessor
+            )
+        else:
+            predecessor = None
         trees.append(tree)
     # Stack merge is enforced against trunk, not the unprotected layer branches.
     base = {**parent, "publication_base_ref": members[0]["base_branch"]}

@@ -2690,6 +2690,11 @@ def revision_checkpoints(spec, values):
                 if not pass_prefix or not alias.startswith(pass_prefix):
                     continue
                 alias = alias[len(pass_prefix) :]
+            elif pass_prefix and (alias.startswith("verified:") or (
+                    alias.startswith("assignment:") and alias.endswith(":chunk"))):
+                # A revision cannot re-expose a previous integration's proofs or
+                # workers after the pass view has deliberately hidden them.
+                continue
             result[alias] = value
     return result
 

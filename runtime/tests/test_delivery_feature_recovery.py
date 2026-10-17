@@ -238,8 +238,9 @@ def test_integration_pass_retains_evidence_and_imports_without_force(service, mo
 
 
 @pytest.mark.parametrize("stale_pr_base", [False, True], ids=["current-pr-base", "stale-pr-base"])
+@pytest.mark.parametrize("plan_revision", [1, 2], ids=["original-plan", "revised-plan"])
 async def test_successor_reintegrates_completed_stack_after_target_moves(
-    service, monkeypatch, stale_pr_base,
+    service, monkeypatch, stale_pr_base, plan_revision,
 ):
     from types import SimpleNamespace
 
@@ -265,6 +266,36 @@ async def test_successor_reintegrates_completed_stack_after_target_moves(
     })
     spec = store.effective_spec(successor["run_id"])
     assert spec["feature_delivery"]["owner"]["generation"] == 2
+    if plan_revision == 2:
+        from devflow_temporal import delivery_feature_revisions as revisions
+
+        # Model the already adopted remote definition; checkpoint composition,
+        # immutable execution overlay and the full coordinator loop remain real.
+        record["manifest"]["plan_revision"] = 2
+        identity = {"plan_revision": 2, "plan_digest": digest(record["manifest"]["plan"]),
+                    "comment_id": 11, "comment_node_id": "IC_11",
+                    "workstream_issues": record["manifest"]["workstream_issues"]}
+        owner = spec["feature_delivery"]["owner"]
+        shared.checkpoint(owner, revisions.PREFIX + "adopted:2", {
+            "identity": identity, "plan": record["manifest"]["plan"],
+            "affected_chunks": [member["chunk_id"] for member in members],
+            "implementation_chunks": [],
+        })
+        for member in members:
+            chunk = member["chunk_id"]
+            shared.checkpoint(owner, "revision:2:verified:" + chunk, {
+                "run_id": "original-" + chunk, "head": member["head"],
+                "number": member["number"],
+            })
+            shared.checkpoint(owner, "revision:2:assignment:" + chunk + ":chunk", {
+                "run_id": "original-" + chunk,
+            })
+        spec = {**spec, "feature_plan_revision": {
+            key: identity[key] for key in ("plan_revision", "plan_digest")}}
+        shared.checkpoint(owner, revisions.PREFIX + "spec:" + spec["run_id"] + ":2", {
+            "identity": identity, "spec": spec, "spec_digest": digest(spec),
+        })
+        monkeypatch.setattr(gh, "load_record", lambda *_: deepcopy(record))
     effective = store.effective_spec
     monkeypatch.setattr(store, "effective_spec", lambda run: specifications[run]
                         if run in specifications else effective(run))
