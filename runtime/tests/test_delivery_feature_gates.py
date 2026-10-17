@@ -820,3 +820,147 @@ argv = ["node", "scripts/reported.mjs", "{report_path}"]
     assert "selectors=[] runs the whole unchanged recipe" in task.goal
     assert "apps/web/src/example.test.ts, not src/example.test.ts" in task.goal
     assert "Correct all controller plan_validation findings" in task.goal
+    assert "no leading/trailing slash" in task.goal
+    assert "use apps/web/src/components, never apps/web/src/components/" in task.goal
+
+
+@pytest.fixture
+def native_intake_provider(tmp_path, monkeypatch):
+    """Deterministic provider completion through the actual native role normalizer."""
+    import hashlib
+
+    from agent_runtime_kit import AgentResult, Usage
+
+    from devflow_temporal import role_runner
+
+    binary = tmp_path / "unused-provider"
+    binary.write_bytes(b"fixture provider; never executed")
+    monkeypatch.setattr(role_runner, "_task", lambda _request: SimpleNamespace(
+        model="fixture-native", reasoning_effort="low"))
+    monkeypatch.setattr("agent_runtime_kit.validate_task",
+                        lambda *_args: SimpleNamespace(supported=True))
+
+    async def normalize(request, output, *, provider_failure=False, observation_state="confirmed"):
+        async def complete(_task):
+            return AgentResult(
+                output=json.dumps(output), parsed_output=deepcopy(output),
+                finish_reason="failed" if provider_failure else "done",
+                error="Controlled provider failure" if provider_failure else None,
+                session_id=f"native-intake:{request['iteration']}", usage=Usage(total_tokens=13),
+            )
+
+        monkeypatch.setattr("agent_runtime_kit.adapters.CodexAgentRuntime",
+                            lambda **_kwargs: SimpleNamespace(run=complete))
+        monkeypatch.setattr("devflow_temporal.delivery_native_threads.NativeThreadObservation",
+                            lambda _request: SimpleNamespace(
+                                legacy=True, data={"state": observation_state},
+                                codex_class=lambda: object, failure=lambda: None,
+                                reference=lambda: {"state": observation_state},
+                            ))
+        native_request = deepcopy(request)
+        native_request["spec"]["policy"].update(
+            codex_bin=str(binary), codex_bin_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+            config_overrides=[], execution_backend="native-macos", host_sandbox="native-profile",
+        )
+        return await role_runner._run_codex(native_request)
+
+    return normalize
+
+
+@pytest.mark.parametrize(("bad", "detail"), [
+    ("trailing_path", "expected path is outside an owned source scope"),
+    ("absolute_path", "expected path is outside an owned source scope"),
+    ("empty_paths", "chunk expected_paths must be a bounded nonempty list"),
+    ("duplicate_paths", "chunk paths must be unique"),
+    ("unknown_dependency", "unknown feature chunk"),
+    ("cycle", "dependency graph contains a cycle"),
+    ("duplicate_chunk", "chunk ID is invalid or duplicated"),
+    ("missing_final", "v2 delivery plan requires"),
+    ("empty_scope", "feature scope must be nonempty bounded text"),
+    ("empty_acceptance", "feature acceptance must be a bounded nonempty list"),
+    ("wrong_workstreams", "NoneType"),
+    ("nonobject_stream", "has no attribute 'get'"),
+    ("nonobject_chunk", "has no attribute 'get'"),
+    ("legacy_plan", "new feature intake requires the explicit v2 plan contract"),
+])
+async def test_native_intake_structural_feedback_preserves_original_proposal(
+    gate_project, monkeypatch, native_intake_provider, bad, detail,
+):
+    from devflow_temporal import delivery_activities as activities
+
+    spec, plan, source = gate_project
+    spec.update(provider="fake", feature_plan_version=2)
+    first = plan["workstreams"][0]["chunks"][0]
+    first["gates"][0]["reason"] = None
+    if bad == "trailing_path":
+        first["expected_paths"] = ["apps/web/src/components/"]
+    elif bad == "absolute_path":
+        first["expected_paths"] = ["/apps/web/src/components"]
+    elif bad == "empty_paths":
+        first["expected_paths"] = []
+    elif bad == "duplicate_paths":
+        first["expected_paths"] = ["README.md", "README.md"]
+    elif bad == "unknown_dependency":
+        first["depends_on"] = ["missing"]
+    elif bad == "cycle":
+        first["depends_on"] = ["web1"]
+    elif bad == "duplicate_chunk":
+        plan["workstreams"][1]["chunks"][0]["id"] = first["id"]
+    elif bad == "missing_final":
+        plan.pop("final_gates")
+    elif bad == "empty_scope":
+        plan["scope"] = ""
+    elif bad == "empty_acceptance":
+        plan["acceptance"] = []
+    elif bad == "nonobject_stream":
+        plan["workstreams"] = [None]
+    elif bad == "nonobject_chunk":
+        plan["workstreams"][0]["chunks"] = [None]
+    elif bad == "legacy_plan":
+        plan.pop("version")
+        plan.pop("final_gates")
+        for stream in plan["workstreams"]:
+            for chunk in stream["chunks"]:
+                chunk["allowed_paths"] = chunk.pop("expected_paths")
+                chunk.pop("gates")
+    else:
+        plan["workstreams"] = None
+    native = {"status": "plan", "summary": "Original proposal", "plan": deepcopy(plan),
+              "questions": [], "findings": []}
+    candidate = {"id": "original", "head": spec["base_sha"]}
+    broker = SimpleNamespace(checkout=source, candidate=lambda: candidate)
+
+    async def run(request):
+        return await native_intake_provider(request, native)
+
+    monkeypatch.setattr(activities, "_context", lambda _spec: (object(), broker))
+    monkeypatch.setattr(activities, "get_supervisor", lambda _store: SimpleNamespace(run=run))
+    result = await activities._run_intake({"spec": spec, "candidate": candidate, "iteration": 0})
+    assert result["status"] == "plan"
+    assert result["plan"] == native["plan"] == plan
+    assert result["summary"] == native["summary"] and result["findings"] == []
+    assert result["session_id"] == "native-intake:0" and result["usage"]["total_tokens"] == 13
+    assert result["plan_validation"]["status"] == "invalid"
+    finding = result["plan_validation"]["findings"][0]
+    assert finding["category"] == "plan_structure" and detail in finding["detail"]
+
+
+@pytest.mark.parametrize("failure", ["provider", "observation", "blocked", "summary"])
+async def test_native_intake_structural_feedback_excludes_unsuccessful_assessments(
+    gate_project, native_intake_provider, failure,
+):
+    spec, plan, source = gate_project
+    spec.update(provider="fake", feature_plan_version=2)
+    plan["workstreams"][0]["chunks"][0]["expected_paths"] = ["apps/web/src/components/"]
+    output = {"status": "blocked" if failure == "blocked" else "plan",
+              "summary": "" if failure == "summary" else "Original outcome", "plan": plan,
+              "questions": [], "findings": [],
+              "plan_validation": {"status": "invalid", "findings": [{"detail": "untrusted"}]}}
+    result = await native_intake_provider(
+        {"spec": spec, "role": "intake", "iteration": 0, "workspace": str(source)}, output,
+        provider_failure=failure == "provider",
+        observation_state="conflicted" if failure == "observation" else "confirmed",
+    )
+    assert result["status"] == "blocked" and "plan_validation" not in result
+    assert result["plan"] is None
+    assert result["session_id"] == "native-intake:0" and result["usage"]["total_tokens"] == 13
