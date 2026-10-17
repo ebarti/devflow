@@ -686,3 +686,137 @@ def test_node_selector_report_binding_rejects_unattributable_junit(
     assert not (tmp_path / "evidence").exists()
     recipe.pop("required_selectors")
     assert bind_selector_report(recipe, tmp_path / "evidence") is recipe
+
+
+@pytest.mark.parametrize(("bad", "detail"), [
+    ("directory", "concrete supported test file"),
+    ("config", "concrete supported test file"),
+    ("lock", "concrete supported test file"),
+    ("package_relative", "escaped the admitted recipe package"),
+    ("unknown_runner", "supported runner or owned JUnit"),
+    ("node", "lack admitted per-file report provenance"),
+    ("missing_browser", "current compatibility selectors"),
+    ("missing_final", "dropped admitted required selectors"),
+    ("future", "outside this chunk's prerequisites"),
+])
+async def test_intake_reports_gate_errors_without_rewriting_provider_plan(
+    gate_project, monkeypatch, bad, detail,
+):
+    from devflow_temporal import delivery_activities as activities
+
+    spec, plan, source = gate_project
+    spec["provider"] = "fake"
+    spec["feature_plan_version"] = 2
+    chunk = plan["workstreams"][0]["chunks"][0]
+    selectors = {
+        "directory": "packages/contracts",
+        "config": "apps/web/tsconfig.json",
+        "lock": "pnpm-lock.yaml",
+        "package_relative": "e2e/tests/jobs-bulk.spec.ts",
+    }
+    if bad in selectors:
+        chunk["gates"][0]["selectors"] = [selectors[bad]]
+    elif bad in {"unknown_runner", "node"}:
+        spec["policy"]["checks"] = [{
+            "id": "lint-test", "cwd": ".",
+            "argv": ["node", "--test", BULK] if bad == "node" else ["node", "scripts/lint.mjs"],
+        }]
+        chunk["gates"].append({"stage": "checks", "recipe_id": "lint-test", "selectors": [BULK]})
+    elif bad == "missing_browser":
+        chunk["gates"] = []
+    elif bad == "missing_final":
+        plan["final_gates"] = []
+    else:
+        chunk["gates"][0]["selectors"] = [BULK, PAGINATION]
+    candidate = {"id": "original", "head": spec["base_sha"]}
+    broker = SimpleNamespace(checkout=source, candidate=lambda: candidate)
+    native = {"status": "plan", "summary": "Original proposal", "plan": deepcopy(plan),
+              "findings": [], "session_id": "original-native-session", "usage": {"total": 13}}
+
+    async def run(_request):
+        return deepcopy(native)
+
+    monkeypatch.setattr(activities, "_context", lambda _spec: (object(), broker))
+    monkeypatch.setattr(activities, "get_supervisor", lambda _store: SimpleNamespace(run=run))
+    result = await activities._run_intake({"spec": spec, "candidate": candidate, "iteration": 0})
+    assert all(result[key] == value for key, value in native.items())
+    assert result["plan_validation"]["status"] == "invalid"
+    assert detail in result["plan_validation"]["findings"][0]["detail"]
+    assert result["candidate"] == candidate
+    assert result["plan"] == plan
+
+
+@pytest.mark.parametrize("failure", ["provider", "cleanup", "checkout", "metadata"])
+async def test_intake_does_not_replan_unrelated_failures(gate_project, monkeypatch, failure):
+    from devflow_temporal import delivery_activities as activities
+
+    spec, plan, source = gate_project
+    spec.update(provider="fake", feature_plan_version=2)
+    plan["workstreams"][0]["chunks"][0]["gates"][0]["selectors"] = ["pnpm-lock.yaml"]
+    candidate = {"id": "original", "head": spec["base_sha"]}
+    observed = iter([candidate, {**candidate, "id": "changed"}])
+    broker = SimpleNamespace(checkout=source, candidate=(
+        lambda: next(observed) if failure == "checkout" else candidate
+    ))
+    native = {"status": "blocked" if failure == "provider" else "plan", "plan": plan,
+              "findings": ["provider failure"] if failure == "provider" else [],
+              "cleanup": "unknown" if failure == "cleanup" else "confirmed"}
+
+    async def run(_request):
+        return deepcopy(native)
+
+    monkeypatch.setattr(activities, "_context", lambda _spec: (object(), broker))
+    monkeypatch.setattr(activities, "get_supervisor", lambda _store: SimpleNamespace(run=run))
+    request = {"spec": spec, "candidate": candidate, "iteration": 0}
+    if failure == "metadata":
+        spec["base_sha"] = "not-a-frozen-commit"
+        with pytest.raises(ValueError, match="frozen source commit"):
+            await activities._run_intake(request)
+    else:
+        result = await activities._run_intake(request)
+        assert "plan_validation" not in result
+        if failure == "checkout":
+            assert result["status"] == "blocked"
+            assert "intake changed the read-only checkout" in result["findings"]
+        else:
+            assert all(result[key] == value for key, value in native.items())
+
+
+def test_intake_catalog_explains_frozen_recipe_owners_and_report_support(gate_project):
+    from devflow_temporal.delivery_feature_gates import intake_recipe_catalog
+    from devflow_temporal.role_runner import _task
+
+    spec, _plan, source = gate_project
+    spec.update(provider="fake", feature_plan_version=2, work_id="work", goal="Bounded change")
+    spec["feature_delivery"]["snapshot"] = {}
+    spec["policy"]["roles"] = {"intake": {"model": "fake", "effort": "low"}}
+    spec["policy"]["checks"] = [
+        {"id": "lint", "argv": ["pnpm", "--filter", "@jobctrl/web", "lint"], "cwd": "."},
+        {"id": "node-test", "argv": ["node", "--test", "test.test.mjs"], "cwd": "."},
+    ]
+    (source / "scripts").mkdir()
+    (source / "scripts/checks.toml").write_text('''schema_version = 1
+[checks.reported]
+kind = "junit"
+cwd = "."
+argv = ["node", "scripts/reported.mjs", "{report_path}"]
+''')
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "Frozen report recipe")
+    spec["base_sha"] = git(source, "rev-parse", "HEAD")
+    catalog = intake_recipe_catalog(spec)
+    by_id = {entry["recipe_id"]: entry for entry in catalog}
+    assert by_id["lint"] == {
+        "stage": "checks", "recipe_id": "lint", "selector_root": "apps/web",
+        "named_selectors": False, "mandatory_selectors": [],
+    }
+    assert not by_id["node-test"]["named_selectors"]
+    assert by_id["checks.reported"]["named_selectors"]
+    assert by_id["job-list-browser"]["selector_root"] == "apps/web"
+    assert by_id["job-list-browser"]["mandatory_selectors"] == [BULK, PAGINATION]
+    task = _task({"spec": spec, "role": "intake", "iteration": 0, "workspace": str(source),
+                  "candidate": {"id": "original", "head": spec["base_sha"]}})
+    assert json.dumps(catalog, sort_keys=True) in task.goal
+    assert "selectors=[] runs the whole unchanged recipe" in task.goal
+    assert "apps/web/src/example.test.ts, not src/example.test.ts" in task.goal
+    assert "Correct all controller plan_validation findings" in task.goal

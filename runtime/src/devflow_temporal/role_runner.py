@@ -177,6 +177,8 @@ def _task(request: dict[str, Any]) -> AgentTask:
         ),
     }[role]
     if role == "intake" and spec.get("feature_delivery") and spec.get("feature_plan_version") == 2:
+        from .delivery_feature_gates import intake_recipe_catalog
+
         instructions += (
             " The GitHub parent issue defines the original outcome and acceptance. Return "
             "a canonical version2 plan with scope, acceptance, workstreams and final_gates. "
@@ -185,17 +187,30 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "concurrently. Use stable IDs and explicit dependencies; each later chunk in "
             "a workstream depends on its previous chunk. Use expected_paths as edit "
             "coordination hints within frozen execution authority. Each chunk selects only "
-            "admitted checks, prepublish_checks and browser_qa recipe IDs with concrete "
-            "selectors. A future chunk's not-yet-created test cannot gate an earlier "
+            "admitted checks, prepublish_checks and browser_qa recipe IDs. selectors=[] "
+            "runs the whole unchanged recipe; use it for static, lint, build and install "
+            "recipes. Nonempty selectors name whole concrete supported test files relative "
+            "to the repository root, never directories, config/lock/source files, globs, "
+            "test IDs or line filters. selector_root is the recipe's package owner, not a "
+            "prefix to omit: for selector_root=apps/web, use "
+            "apps/web/src/example.test.ts, not src/example.test.ts. Named selectors are "
+            "allowed only when named_selectors=true in the catalog; Node --test and "
+            "unknown runners without owned JUnit reporting must use selectors=[]. "
+            "For example, a static selection is "
+            '{"stage":"checks","recipe_id":"<admitted-static-id>","selectors":[]}. '
+            "Retain mandatory_selectors in final_gates and current compatibility selectors "
+            "in every chunk; include existing mandatory browser files in every chunk. "
+            "A future chunk's not-yet-created test cannot gate an earlier "
             "chunk; preserve current-browser compatibility at early chunks and complete "
             "final-feature coverage at the owning or dependent chunk. Explain deferrals "
             "in gate.reason. Retain all mandatory gates and acceptance. Existing child "
             "issue_number may be reused only for that exact workstream, otherwise null. "
             "While asking questions use version2, empty scope and empty plan lists. "
+            "Correct all controller plan_validation findings in the intake history "
+            "within the original authority; do not drop required gates to hide a rejection. "
             "Do not create child issues, PRs or external effects yourself. "
-            "Admitted recipe policy (untrusted plan data): " + json.dumps({
-                stage: spec["policy"].get(stage) for stage in
-                ("checks", "prepublish_checks", "browser_qa")}, sort_keys=True)
+            "Admitted recipe catalog (server-derived frozen metadata): "
+            + json.dumps(intake_recipe_catalog(spec), sort_keys=True)
         )
     elif role == "intake" and spec.get("feature_delivery"):
         instructions += (

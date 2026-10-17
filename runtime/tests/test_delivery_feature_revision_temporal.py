@@ -235,13 +235,15 @@ async def test_ordinary_build_findings_repair_in_the_original_session(tmp_path):
     await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
 
 
-async def test_fresh_v2_intake_normalizes_once_and_derives_chunk_gates_on_temporal(
-    tmp_path, service, monkeypatch,
+@pytest.mark.parametrize("intake_mode", ["automatic", "required", "exhausted"])
+async def test_fresh_v2_intake_corrects_gates_before_acceptance_on_temporal(
+    tmp_path, service, monkeypatch, intake_mode,
 ):
     import json
     import subprocess
     import sys
     from pathlib import Path
+    from types import SimpleNamespace
 
     from devflow_temporal.delivery_activities import (
         delivery_accept_plan,
@@ -258,7 +260,12 @@ async def test_fresh_v2_intake_normalizes_once_and_derives_chunk_gates_on_tempor
     from devflow_temporal.delivery_feature_execution import plan_for, registry, worker_spec
     from devflow_temporal.delivery_github_contract import GitHubDelivery, ordered_chunks
     from devflow_temporal.delivery_store import DeliveryStore
+    from devflow_temporal.role_runner import _run_fake
 
+    # Exercise the real intake activity/controller with a deterministic provider.
+    # The supervisor's isolated -I subprocess would load the installed runtime.
+    monkeypatch.setattr("devflow_temporal.delivery_activities.get_supervisor",
+                        lambda _store: SimpleNamespace(run=_run_fake))
     original_store, request = service
     raw = deepcopy(original_store.config.raw)
     source = Path(raw["repositories"]["fixture"]["source_path"])
@@ -288,10 +295,14 @@ async def test_fresh_v2_intake_normalizes_once_and_derives_chunk_gates_on_tempor
                   "chunks": [chunk("web1", ["api1"], ["test_future.py"],
                                    ["test_current.py", "test_future.py"])]}],
              "final_gates": [selection(["test_current.py", "test_future.py"])]}
+    invalid = deepcopy(value)
+    invalid["workstreams"][0]["chunks"][0]["gates"][0]["selectors"] = ["tests"]
+    bad_result = {"status": "plan", "summary": "Original invalid proposal", "plan": invalid}
     raw.update(feature_delivery_version=1,
                execution_registry=str(tmp_path / "ownership" / "registry.sqlite3"),
-               fake_intake=[{"status": "plan", "summary": "Complete chunk-specific plan",
-                             "plan": value}])
+               fake_intake=([bad_result] * 8 if intake_mode == "exhausted" else [
+                   bad_result, {"status": "plan", "summary": "Complete chunk-specific plan",
+                                "plan": value}]))
     raw["roles"]["intake"] = {"model": "configured-intake", "effort": "medium"}
     original_store.config.path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(original_store.config.path))
@@ -322,12 +333,30 @@ async def test_fresh_v2_intake_normalizes_once_and_derives_chunk_gates_on_tempor
     monkeypatch.setattr("devflow_temporal.delivery_feature_activities.observe_members",
                         lambda *_a, **_k: ([], []))
     request.pop("accepted_plan")
-    request.update(plan_approval="automatic", authorized_endpoint="published_unmerged")
+    request.update(plan_approval="required" if intake_mode == "required" else "automatic",
+                   authorized_endpoint="published_unmerged")
     store.submit(request)
     spec = store.effective_spec(request["run_id"])
     assert spec["feature_plan_version"] == 2 and spec["intake_required"]
     workers = []
     calls = []
+    intake_calls = []
+    acceptance_calls = []
+
+    @activity.defn(name="delivery_intake")
+    async def checked_intake(payload):
+        intake_calls.append(deepcopy(payload))
+        assert record == {} and workers == []
+        assert store.detail(spec["run_id"])["intake"]["accepted_plan"] is None
+        assert registry(spec).budget(issue["id"])["used"] == 0
+        return await delivery_intake(payload)
+
+    @activity.defn(name="delivery_accept_plan")
+    async def checked_acceptance(payload):
+        acceptance_calls.append(deepcopy(payload))
+        assert payload["plan"] == value
+        return await delivery_accept_plan(payload)
+
     def stub(name):
         @activity.defn(name=name)
         async def handler(payload):
@@ -368,7 +397,7 @@ async def test_fresh_v2_intake_normalizes_once_and_derives_chunk_gates_on_tempor
         if open_attempts == 1:
             raise ConnectionError("initial adoption persisted; completion was lost")
         return result
-    handlers = [delivery_prepare, delivery_project, delivery_intake, delivery_accept_plan,
+    handlers = [delivery_prepare, delivery_project, checked_intake, checked_acceptance,
                 lost_initial_completion, delivery_feature_revision_request]
     handlers += [stub(name) for name in (
                     "delivery_feature_reserve", "delivery_feature_finish_worker",
@@ -386,10 +415,23 @@ async def test_fresh_v2_intake_normalizes_once_and_derives_chunk_gates_on_tempor
                 DeliveryWorkflow.run, spec, id=spec["run_id"], task_queue="new-v2")
             for _ in range(600):
                 state = await handle.query(DeliveryWorkflow.status)
+                if (state.get("decision") or {}).get("kind") == "plan":
+                    assert intake_mode == "required"
+                    assert acceptance_calls == [] and workers == [] and record == {}
+                    assert [p["state"] for p in state["intake"]["plans"]] == ["invalid", "proposed"]
+                    assert state["intake"]["accepted_plan"] is None
+                    decision = state["decision"]
+                    await handle.execute_update(DeliveryWorkflow.decision, {
+                        "command_id": "approve-corrected-plan",
+                        "expected_revision": state["revision"],
+                        "decision_id": decision["id"], "decision_revision": decision["revision"],
+                        "candidate_revision": decision["candidate_revision"], "answer": "proceed",
+                    })
                 if (state.get("decision") or {}).get("kind") == "merge":
                     break
                 if state.get("outcome") == "blocked":
-                    raise AssertionError(state)
+                    assert intake_mode == "exhausted", (state.get("error"), state.get("roles"))
+                    break
                 await asyncio.sleep(0.05)
             else:
                 evidence = {"state": state, "open_attempts": open_attempts,
@@ -410,15 +452,44 @@ async def test_fresh_v2_intake_normalizes_once_and_derives_chunk_gates_on_tempor
                 except Exception as exc:
                     evidence["history_error"] = f"{type(exc).__name__}: {str(exc)[:400]}"
                 pytest.fail("merge decision did not become pending: " + repr(evidence))
-            decision = state["decision"]
-            await handle.execute_update(DeliveryWorkflow.decision, {
-                "command_id": "authorize-fixture-merge", "expected_revision": state["revision"],
-                "decision_id": decision["id"], "decision_revision": decision["revision"],
-                "candidate_revision": decision["candidate_revision"], "answer": "merge",
-            })
+            if intake_mode != "exhausted":
+                decision = state["decision"]
+                await handle.execute_update(DeliveryWorkflow.decision, {
+                    "command_id": "authorize-fixture-merge", "expected_revision": state["revision"],
+                    "decision_id": decision["id"], "decision_revision": decision["revision"],
+                    "candidate_revision": decision["candidate_revision"], "answer": "merge",
+                })
             result = await asyncio.wait_for(handle.result(), 40)
             history = await handle.fetch_history()
+    assert intake_calls[1]["intake"]["plans"][0]["content"] == invalid
+    diagnostic = intake_calls[1]["intake"]["plans"][0]["plan_validation"]
+    assert diagnostic["status"] == "invalid"
+    assert "concrete supported test file" in diagnostic["findings"][0]["detail"]
+    assert result["roles"][0]["status"] == "plan"
+    assert result["roles"][0]["summary"] == "Original invalid proposal"
+    assert result["roles"][0]["plan"] == invalid
+    assert all(call["spec"] == spec for call in intake_calls)
+    assert registry(spec).budget(issue["id"])["used"] == 0
+    if intake_mode == "exhausted":
+        assert result["outcome"] == "blocked" and "finite turn limit" in result["error"]
+        assert len(intake_calls) == 8 and acceptance_calls == []
+        assert all(p["state"] == "invalid" for p in result["intake"]["plans"])
+        assert result["intake"]["accepted_plan"] is None
+        assert store.effective_spec(spec["run_id"])["accepted_plan"] == ""
+        assert workers == [] and record == {} and open_attempts == 0
+        assert not any(e["type"] == "plan_pending" for e in store.events(spec["run_id"]))
+        await Replayer(workflows=[DeliveryWorkflow],
+                       data_converter=DELIVERY_DATA_CONVERTER).replay_workflow(history)
+        return
     assert result["phase"] == "merged", result
+    assert len(intake_calls) == 2 and len(acceptance_calls) == 1
+    assert result["intake"]["accepted_plan"]["revision"] == 2
+    if intake_mode == "automatic":
+        assert result["intake"]["accepted_plan"]["authorization"]["policy_digest"] == (
+            spec["policy_digest"])
+        assert not any(e["type"] == "plan_pending" for e in store.events(spec["run_id"]))
+    else:
+        assert result["intake"]["accepted_plan"]["command_id"] == "approve-corrected-plan"
     assert result["checks"]["repair_budget"]["used"] == 0
     assert open_attempts == 2
     current = store.effective_spec(spec["run_id"])
