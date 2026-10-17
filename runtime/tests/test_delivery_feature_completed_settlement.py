@@ -87,12 +87,13 @@ async def completed_parent(service, monkeypatch, request):
     for number in range(10):
         shared.repair(token, 'original-cycle-' + str(number), 'Original product repair')
     chunk = ordered_chunks(json.loads(parent['accepted_plan']))[0]
+    child_kind = 'chunk' if drift == 'worker-cleanup' else 'build'
     child = worker_spec(parent, chunk, {'url': 'https://github.com/example/fixture/issues/10'},
-                        kind='build', base_sha=parent['base_sha'], base_branch='main')
+                        kind=child_kind, base_sha=parent['base_sha'], base_branch='main')
     register_worker(store, parent, child)
-    shared.checkpoint(token, 'assignment:' + chunk['id'] + ':build',
+    shared.checkpoint(token, 'assignment:' + chunk['id'] + ':' + child_kind,
         {'run_id': child['run_id'], 'store_path': token['store_path'],
-         'chunk_id': chunk['id'], 'kind': 'build'})
+         'chunk_id': chunk['id'], 'kind': child_kind})
     state = {'run_id': parent['run_id'], 'revision': 3, 'iteration': 0, 'candidate_revision': 0,
         'phase': 'blocked', 'execution_state': 'blocked', 'outcome': 'blocked',
         'cleanup': 'unknown', 'error': 'Original settlement disk I/O failure',
@@ -122,6 +123,11 @@ async def completed_parent(service, monkeypatch, request):
                     'resource_cleanup': receipt}))
     child_state = {**state, 'run_id': child['run_id'], 'revision': 1, 'cleanup': 'confirmed',
                    'checks': {}, 'error': None}
+    if drift == 'worker-cleanup':
+        child_state.update(cleanup='unknown', error='terminal tracker synchronization conflicted',
+            checks={'terminal_tracker_checkpoint': {
+                'state': 'conflicted', 'event': 'blocked', 'outcome': 'blocked',
+                'closed': True, 'waiting': False, 'release': False}})
     if drift == 'divergent-counters':
         # A retained recovery carries its execution's counter. Ordinary row
         # projections keep their own count across earlier candidate snapshots.
@@ -146,13 +152,30 @@ async def completed_parent(service, monkeypatch, request):
         child_history.events[-1].workflow_execution_completed_event_attributes.result.CopyFrom(
             Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([
                 {**child_state, 'run_id': 'other-child', 'outcome': 'delivered'}])))
-    seal(store, child_history, await closure_facts(child_history),
+    child_facts = await closure_facts(child_history)
+    seal(store, child_history, child_facts,
          run_id=child['run_id'], source='temporal')
     store.project(child['run_id'], **{key: child_state[key] for key in (
         'phase', 'execution_state', 'outcome', 'cleanup', 'error', 'iteration', 'checks',
         'candidate', 'pull_request', 'tracker', 'usage', 'decision', 'intake')},
-        protocol_revision=child_state['revision'], event_type='blocked',
-        message='Interrupted recovery really closed', key='child-closed')
+        protocol_revision=child_state['revision'],
+        event_type='closed_projection_reconciled' if drift == 'worker-cleanup' else 'blocked',
+        message='Interrupted recovery really closed', key=(
+            'closed-project:' + child_facts['execution_run_id'] + ':' + digest(child_state)
+            if drift == 'worker-cleanup' else 'child-closed'))
+    if drift == 'worker-cleanup':
+        child_closure = {key: child_facts[key] for key in (
+            'workflow_id', 'execution_run_id', 'closed_at')}
+        child_closure['status'] = 'COMPLETED'
+        store.project(child['run_id'], phase=child_state['phase'],
+            execution_state=child_state['execution_state'], outcome=child_state['outcome'],
+            error=child_state['error'], cleanup='confirmed',
+            checks={**child_state['checks'], 'resource_cleanup': receipt},
+            event_type='resource_cleanup_reconciled', message='Observed later worker cleanup',
+            key=digest({'closed_workflow': child_closure, 'native_observations': [],
+                        'resource_cleanup': receipt}))
+        with store._connect() as db:
+            store.state.release_work(db, child['work_id'], 'external:devflow:' + child['run_id'])
 
     class Handle:
         def __init__(self, workflow_id):
@@ -171,6 +194,60 @@ async def completed_parent(service, monkeypatch, request):
                               (parent['run_id'],)).fetchone())
     command = {'command_id': 'settle-original-closed-parent', 'expected_revision': row['revision']}
     return store, parent, child, shared, token, command, history, closed
+
+
+@pytest.mark.parametrize('completed_parent', ['worker-cleanup'], indirect=True)
+async def test_stopped_worker_uses_authenticated_later_cleanup(completed_parent, monkeypatch):
+    from devflow_temporal import delivery_stopped_resume as resume
+
+    store, _, child, shared, token, _, _, _ = completed_parent
+    before = store._completed_temporal_result(child['run_id'])
+    budget = shared.budget(token['issue_id'])
+    with store._connect() as db:
+        row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                              (child['run_id'],)).fetchone())
+    def source_boundary(*_args):
+        raise RuntimeError('stopped candidate observation boundary')
+    monkeypatch.setattr(resume, 'DeliveryBroker', source_boundary)
+    with pytest.raises(RuntimeError, match='stopped candidate observation boundary'):
+        resume.snapshot(store, child['run_id'])
+    assert store._completed_temporal_result(child['run_id']) == before
+    assert before['result']['cleanup'] == 'unknown'
+    assert before['result']['checks']['terminal_tracker_checkpoint']['release'] is False
+    assert shared.budget(token['issue_id']) == budget
+    with store._connect() as db:
+        assert dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
+                               (child['run_id'],)).fetchone()) == row
+
+
+@pytest.mark.parametrize('completed_parent', ['worker-cleanup'], indirect=True)
+@pytest.mark.parametrize('drift', ['history', 'worker', 'cleanup-chain', 'candidate', 'state'])
+async def test_stopped_worker_refuses_changed_cleanup_custody(completed_parent, monkeypatch, drift):
+    from devflow_temporal import delivery_stopped_resume as resume
+
+    store, _, child, shared, token, _, _, _ = completed_parent
+    original = store._completed_temporal_result(child['run_id'])
+    if drift == 'history':
+        changed = {**original, 'execution_run_id': 'foreign-execution'}
+        monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_k: changed)
+    else:
+        with store._connect() as db:
+            if drift == 'worker':
+                db.execute("UPDATE delivery_runs SET workflow_id='delivery-other-worker' "
+                           'WHERE run_id=?', (child['run_id'],))
+            elif drift == 'cleanup-chain':
+                db.execute("UPDATE delivery_events SET payload_json='{}' WHERE run_id=? "
+                           "AND type='resource_cleanup_reconciled'", (child['run_id'],))
+            elif drift == 'candidate':
+                db.execute("UPDATE delivery_runs SET candidate_json='{}' WHERE run_id=?",
+                           (child['run_id'],))
+            else:
+                db.execute("UPDATE delivery_runs SET usage_json='{\"tokens\":1}' WHERE run_id=?",
+                           (child['run_id'],))
+    budget = shared.budget(token['issue_id'])
+    with pytest.raises(ValueError):
+        resume.snapshot(store, child['run_id'])
+    assert shared.budget(token['issue_id']) == budget
 
 
 @pytest.mark.parametrize('completed_parent', [None, 'divergent-counters'], indirect=True)

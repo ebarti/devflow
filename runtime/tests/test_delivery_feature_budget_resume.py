@@ -115,6 +115,58 @@ def test_states_needing_a_repair_or_lacking_custody_have_no_interrupted_plan(cas
     assert plan(plan_seal(spec, roles, **options)) is None
 
 
+def preparation_stop(state, candidate, stage):
+    prerequisite = "native-addon-build" if stage == "prepublish" else "native-execution-authority"
+    reason = (f"environment preparation failed: {prerequisite}; "
+              "candidate retained without requesting code repair")
+    state.update(phase="blocked", outcome="blocked", execution_state="blocked",
+                 error="terminal tracker synchronization conflicted")
+    state["checks"].update({
+        stage: {"state": "failed", "candidate_id": candidate["id"],
+                "source_unchanged": True, "cleanup": "confirmed", "results": [
+                    {"id": "earlier-prerequisite", "passed": True},
+                    {"id": prerequisite, "passed": False, "failure_kind": "preparation",
+                     "launched": False, "cleanup": "confirmed"}]},
+        "failure": {"classification": "terminal", "stage": (
+            "prepublish_checks" if stage == "prepublish" else "checks"), "reason": reason},
+        "terminal_tracker_checkpoint": {"state": "conflicted", "event": "blocked",
+            "outcome": "blocked", "closed": True, "waiting": False, "release": False,
+            "error": reason, "reason": reason}})
+
+
+def test_preparation_stop_requires_exact_prerequisite_and_implementation_receipts():
+    sealed = plan_seal(worker("chunk"), [implementation(2)], iteration=2,
+                       pr_head=CANDIDATE["head"])
+    sealed["state"]["pull_request"]["candidate"] = CANDIDATE
+    preparation_stop(sealed["state"], CANDIDATE, "local")
+    assert plan(sealed) == (2, 0, "published")
+    for mutation in ("launched", "product-failure", "earlier-failure", "other-check",
+                     "reason", "tracker", "session", "attempt", "iteration", "role"):
+        changed = copy.deepcopy(sealed)
+        check = changed["state"]["checks"]["local"]
+        if mutation == "launched":
+            check["results"][-1]["launched"] = True
+        elif mutation == "product-failure":
+            check["results"][-1]["failure_kind"] = "assessment"
+        elif mutation == "earlier-failure":
+            check["results"][0]["passed"] = False
+        elif mutation == "other-check":
+            changed["state"]["checks"]["browser_qa"] = {"state": "failed"}
+        elif mutation == "reason":
+            changed["state"]["checks"]["failure"]["reason"] = "product check failed"
+        elif mutation == "tracker":
+            changed["state"]["checks"]["terminal_tracker_checkpoint"]["reason"] = "other stop"
+        elif mutation == "session":
+            changed["session_id"] = "another-session"
+        elif mutation == "attempt":
+            changed["attempts"][0]["result_json"] = "{}"
+        elif mutation == "iteration":
+            changed["state"]["iteration"] += 1
+        else:
+            changed["state"]["roles"].append(gate("review", 2, "findings"))
+        assert plan(changed) is None, mutation
+
+
 def test_pending_repair_ignores_a_predecessor_that_reran_its_own_iteration():
     spec = worker("chunk")
     seal = {"session_custody": {"missing_rollout": True}, "predecessor_spec": spec,
@@ -430,11 +482,13 @@ def test_each_closed_execution_of_a_worker_admits_its_own_resume_command(service
 
 
 def _close(store, child, state, box, *, workflow_id, execution, recovery_digest):
-    store.project(child["run_id"], phase="cancelled", execution_state="terminal",
-                  outcome="cancelled", cleanup="confirmed", event_type="cancelled",
+    store.project(child["run_id"], phase=state["phase"],
+                  execution_state=state["execution_state"], outcome=state["outcome"],
+                  cleanup="confirmed", event_type=state["phase"],
                   message="Feature coordinator stopped", candidate=state["candidate"],
                   pull_request=state["pull_request"], checks=state["checks"],
-                  iteration=state["iteration"], protocol_revision=state["revision"], error=None)
+                  iteration=state["iteration"], protocol_revision=state["revision"],
+                  error=state["error"])
     with store._connect() as db:
         store.state.release_work(db, child["work_id"], "external:devflow:" + child["run_id"])
     box["closed"] = {"workflow_id": workflow_id, "execution_run_id": execution,
@@ -546,8 +600,9 @@ def test_interrupted_build_resumes_twice_without_a_cycle_or_a_second_implementat
                           (child["run_id"],)).fetchone()[0] == 2
 
 
-@pytest.mark.parametrize("ran", [False, True], ids=["after-publication", "after-review"])
-def test_published_chunk_resume_never_publishes_or_implements_again(service, monkeypatch, ran):
+@pytest.mark.parametrize("stop", ["after-publication", "after-review",
+                                  "local-preparation", "prepublish-preparation"])
+def test_published_chunk_resume_reuses_implementation_without_a_cycle(service, monkeypatch, stop):
     from test_delivery_feature_integration import integration, role_result
 
     store, parent, child, broker, candidate, member, _ = integration(service, monkeypatch)
@@ -561,22 +616,31 @@ def test_published_chunk_resume_never_publishes_or_implements_again(service, mon
 
     monkeypatch.setattr(DeliveryBroker, "_existing_pr", owned)
     published = broker.publish(0, implemented["candidate"])
+    if stop == "prepublish-preparation":
+        (broker.checkout / "README.md").write_text("Passed later implementation at the same head\n")
+        implemented["candidate"] = broker.candidate()
+        assert implemented["candidate"]["head"] == published["head"]
+        assert implemented["candidate"]["id"] != published["candidate"]["id"]
+    stopped_candidate = (implemented["candidate"] if stop == "prepublish-preparation"
+                         else published["candidate"])
     implementation_role = {"role": "implement", "iteration": 0, "status": "pass",
                            "session_id": "modeled-implementation", "cleanup": "confirmed",
                            "candidate": implemented["candidate"]}
     _attempt(store, child, implementation_role, implemented["candidate"]["id"])
     roles, checks = [implementation_role], {"prepublish": {
         "state": "passed", "candidate_id": implemented["candidate"]["id"]}}
-    if ran:
+    if stop == "after-review":
         review = gate("review", 0)
         _attempt(store, child, review, published["candidate"]["id"])
         roles.append(review)
         checks["review"] = {"state": "passed", "candidate_id": published["candidate"]["id"]}
     state = {"run_id": child["run_id"], "revision": 9, "iteration": 0, "phase": "cancelled",
              "execution_state": "terminal", "outcome": "cancelled", "cleanup": "confirmed",
-             "candidate": published["candidate"], "pull_request": published, "roles": roles,
+             "candidate": stopped_candidate, "pull_request": published, "roles": roles,
              "checks": checks, "error": None, "usage": {}, "findings": [],
              "candidate_revision": 2}
+    if stop.endswith("preparation"):
+        preparation_stop(state, stopped_candidate, stop.removesuffix("-preparation"))
     box = {}
     monkeypatch.setattr(store, "_completed_temporal_result", lambda *_a, **_k: box["closed"])
     token = parent["feature_delivery"]["owner"]
@@ -587,8 +651,9 @@ def test_published_chunk_resume_never_publishes_or_implements_again(service, mon
 
     resumed = activities.resume_worker(store, parent, child, _row(store, child))
     recovery = _recovery(store, child)
+    expected_stage = "checks" if stop == "prepublish-preparation" else "published"
     assert (recovery["resume_stage"], recovery["resume_iteration"],
-            recovery["command"]["additional_iterations"]) == ("published", 0, 0)
+            recovery["command"]["additional_iterations"]) == (expected_stage, 0, 0)
     # Gates rerun at the sealed iteration under this admission's own attempt identity.
     gate_request = {"role": "review", "iteration": 0, "candidate": published["candidate"]}
     assert resumed["spec"]["gate_admission"] == recovery["command_digest"]
@@ -598,6 +663,11 @@ def test_published_chunk_resume_never_publishes_or_implements_again(service, mon
         assert resume_mod.custody(db, recovery) == resumed["spec"]
         effects = db.execute("SELECT effect_key,request_json,observed_json FROM delivery_effects "
                              "WHERE kind='publish'").fetchall()
+        if stop.endswith("preparation"):
+            with monkeypatch.context() as changed:
+                changed.setattr(resume_mod, "interrupted_resume", lambda _seal: None)
+                with pytest.raises(ValueError, match="interrupted iteration authority"):
+                    resume_mod.custody(db, recovery)
 
     def gates_only(flow, name, body):
         if name == "delivery_role":
@@ -607,18 +677,28 @@ def test_published_chunk_resume_never_publishes_or_implements_again(service, mon
                     "cleanup": "confirmed", "findings": []}
         if name == "delivery_ci":
             return {"state": "passed", "head": body["pull_request"]["head"]}
-        assert name in {"delivery_checks", "delivery_browser_qa", "delivery_tracker"}, name
+        if name == "delivery_publish":
+            assert expected_stage == "checks"
+            return {**published, "candidate": body["candidate"]}
+        assert name in {"delivery_precheck", "delivery_checks", "delivery_browser_qa",
+                        "delivery_tracker"}, name
         return {"state": "passed" if name != "delivery_tracker" else "consistent",
                 "candidate_id": body.get("candidate", {}).get("id"), "cleanup": "confirmed"}
 
     result, calls = _drive(monkeypatch, resumed["spec"], recovery, gates_only)
     assert result["outcome"] == "delivered", result.get("error")
-    assert result["pull_request"] == published and result["candidate"]["id"] == (
-        published["candidate"]["id"])
+    assert result["candidate"]["content_sha256"] == stopped_candidate["content_sha256"]
+    assert result["pull_request"]["candidate"]["id"] == stopped_candidate["id"]
     assert ("delivery_role", "review", 0) in calls and ("delivery_role", "verify", 0) in calls
-    assert not any(name == "delivery_publish" or role == "implement" for name, role, _ in calls)
-    # The original publication stays the stack's only publication evidence.
+    assert not any(role == "implement" for _, role, _ in calls)
+    assert any(name == "delivery_publish" for name, *_ in calls) == (expected_stage == "checks")
+    assert any(name == "delivery_precheck" for name, *_ in calls) == (expected_stage == "checks")
+    # Workflow activities are modeled; admission cannot originate a publication effect.
     assert result["checks"]["prepublish"]["candidate_id"] == implemented["candidate"]["id"]
+    assert recovery["state"] == state
+    assert registry(parent).budget(token["issue_id"])["used"] == 0
+    if stop.endswith("preparation"):
+        assert recovery["state"]["checks"]["terminal_tracker_checkpoint"]["release"] is False
     with store._connect() as db:
         assert db.execute("SELECT effect_key,request_json,observed_json FROM delivery_effects "
                           "WHERE kind='publish'").fetchall() == effects
