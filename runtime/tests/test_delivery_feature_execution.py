@@ -234,13 +234,19 @@ def test_successor_requires_stopped_owner_and_preserves_cumulative_budget(
             assert shared.budget("I_feature")["used"] == 1
         original_config.path.write_text(json.dumps(original_config.raw))
         store.config = original_config
+    # Scheduler capacity is operational; the stopped execution keeps its own policy.
+    operational = deepcopy(store.config.raw)
+    operational["capacity"] = 6
+    store.config.path.write_text(json.dumps(operational))
+    store.config = DeliveryConfig.load(store.config.path)
     store.submit(next_request)
     successor = store.effective_spec("run-next")
     assert successor["feature_delivery"]["owner"]["generation"] == 2
     assert successor["base_sha"] == spec["base_sha"]
     assert successor["base_ref"] == spec["base_ref"]
     assert successor["accepted_plan"] == spec["accepted_plan"]
-    assert successor["policy"] == spec["policy"]
+    assert successor["policy"] == {**spec["policy"], "capacity": 6}
+    assert spec["policy"]["capacity"] == 2 and store.config.raw["capacity"] == 6
     assert shared.budget("I_feature")["used"] == 1
     with pytest.raises(OwnershipConflict):
         require_execution(store, spec)

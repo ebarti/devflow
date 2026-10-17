@@ -324,6 +324,55 @@ def test_completed_preplan_intake_survives_plan_acceptance(completed_intake, sur
     assert executions[path.parents[2]] == current
 
 
+def test_preplan_cleanup_requires_the_current_authenticated_feature_overlay(completed_intake):
+    from devflow_temporal.delivery_execution_registry import ExecutionRegistry
+
+    store, current, row, path, journal, request, table = completed_intake
+    shared = ExecutionRegistry(store.config.path.parent / 'ownership/registry.sqlite3')
+    snapshot = {'issue': {'id': 'private-feature', 'url': current['issue_url'],
+                           'repository_id': 'private-repository'}}
+    token = shared.claim(snapshot, current['run_id'], str(store.config.tracking_db))
+    feature = {'registry': str(shared.path), 'owner': token, 'snapshot': snapshot}
+    submitted = store.submitted_spec(current['run_id'])
+    # Explicit private admission seam: fake preparation gains the real feature
+    # custody fields and preparation marker, with both digests regenerated.
+    submitted.update(feature_delivery=feature, preparation_version=1)
+    request['spec'].update(feature_delivery=feature, preparation_version=1)
+    current.update(feature_delivery=feature, preparation_version=1)
+    write_private(path.with_name('request.json'), request)
+    with store._connect() as db:
+        db.execute('UPDATE delivery_runs SET request_json=?', (canonical_json(submitted),))
+        db.execute('UPDATE delivery_preparations SET submitted_spec_digest=?, '
+                   'effective_spec_digest=?,effective_spec_json=?',
+                   (digest(submitted), digest(request['spec']), canonical_json(request['spec'])))
+    overlay = copy.deepcopy(current)
+    plan = json.loads(overlay['accepted_plan'])
+    plan['scope'] = 'The adopted plan keeps the original completed intake custody'
+    overlay['accepted_plan'] = json.dumps(plan)
+    identity = {'plan_revision': 1, 'plan_digest': digest(plan)}
+    overlay['feature_plan_revision'] = identity
+    key = 'plan-revision:spec:' + current['run_id'] + ':1'
+    shared.checkpoint(token, key, {'identity': identity, 'revision_id': 'private-adoption',
+                                  'spec': overlay, 'spec_digest': digest(overlay)})
+    effective = store.effective_spec(current['run_id'])
+    assert effective == overlay and effective != current
+    fixture = store, effective, row, path, journal, request, table
+    for surface in ('orphan', 'finalizer', 'completed'):
+        assert _observe_intake(fixture, surface)
+        changed = {**effective, 'accepted_plan': 'an unadmitted caller plan'}
+        with pytest.raises(ValueError, match='admitted execution policy'):
+            _observe_intake((store, changed, *fixture[2:]), surface)
+    # The namespace remains the separately authenticated SQL-accepted plan.
+    executions = {}
+    resources._gate_roots(effective, execution_specs=executions)
+    assert executions[path.parents[2]] == current
+    with shared.connect() as db:
+        db.execute('UPDATE execution_checkpoints SET content_digest=? WHERE checkpoint_key=?',
+                   ('foreign', key))
+    with pytest.raises(ValueError, match='checkpoint digest changed'):
+        _observe_intake(fixture, 'orphan')
+
+
 @pytest.mark.parametrize('surface', ['orphan', 'finalizer', 'completed'])
 @pytest.mark.parametrize('changed', [
     'accepted_plan', 'preparation', 'request_plan', 'request_policy', 'result', 'session',

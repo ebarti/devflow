@@ -572,7 +572,14 @@ class DeliveryStore:
                     raise ValueError("feature continuation changed its retained scope authority")
                 frozen = load_execution_config(
                     self.effective_spec(scope["predecessor"]["run_id"]))
-            if self.config.path != frozen.path or digest(self.config.raw) != digest(frozen.raw):
+            # Capacity schedules actors through operational_config; it never
+            # rewrites the predecessor's frozen execution authority.
+            current_authority = {key: value for key, value in self.config.raw.items()
+                                 if key != "capacity"}
+            frozen_authority = {key: value for key, value in frozen.raw.items()
+                                if key != "capacity"}
+            if (self.config.path != frozen.path
+                    or digest(current_authority) != digest(frozen_authority)):
                 raise ValueError("feature continuation changed its original service configuration")
         admission = {}
         if reference:

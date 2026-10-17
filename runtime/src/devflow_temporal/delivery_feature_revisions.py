@@ -85,11 +85,11 @@ def adopted_plan_identity(spec, shared=None):
     }
 
 
-def effective_spec(store, spec):
+def effective_spec(store, spec, *, shared=None):
     """Authenticate an appended plan overlay while retaining the original run input."""
     if not spec.get("feature_delivery") or spec.get("feature_worker"):
         return spec
-    values = _values(spec)
+    values = _values(spec, shared)
     overlays = [
         value
         for key, value in values.items()
