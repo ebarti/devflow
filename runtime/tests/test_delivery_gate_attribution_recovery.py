@@ -953,13 +953,19 @@ def test_public_native_browser_handoff_reassesses_without_writer_or_history_debi
     shared.finish_worker(token, worker_key(item.spec['run_id'], token), {'cleanup': 'confirmed'})
     shared.stop(token, 'browser-controller-handoff', {})
     parent = deepcopy(item.parent)
-    parent['provider'] = 'codex'
-    # Exercise the supported native-provider allowance renewal, with immutable
-    # old charges and a clean installed runtime. No allowance exemption is used.
+    # Keep admitted source/config authority matched; only the coordinator's native
+    # allowance selector is modeled, as in the focused continuation renewal test.
+    submitted = item.store.submitted_spec
+
+    def native_coordinator(run_id):
+        spec = submitted(run_id)
+        return {**spec, 'provider': 'codex'} if not spec.get('feature_worker') else spec
+
+    monkeypatch.setattr(item.store, 'submitted_spec', native_coordinator)
+    assert item.store.effective_spec(parent['run_id'])['provider'] \
+        == item.store.config.raw['provider'] == 'fake'
     old_runtime = item.state['roles'][0]['native_process']['runtime_identity']
     with item.store._connect() as db:
-        db.execute('UPDATE delivery_runs SET request_json=? WHERE run_id=?',
-                   (json.dumps(parent), parent['run_id']))
         db.execute('UPDATE delivery_dashboard_state SET identity_json=? WHERE run_id=?',
                    (json.dumps(old_runtime), parent['run_id']))
     item.store.project(parent['run_id'], phase='blocked', outcome='blocked', cleanup='confirmed',

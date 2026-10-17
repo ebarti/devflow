@@ -6,10 +6,12 @@ import asyncio
 import json
 import sqlite3
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 from test_delivery_execution_registry import installed_runtime as installed_runtime
 from test_delivery_github_contract import plan
+from test_delivery_store import _git
 from test_delivery_store import service as legacy_service
 
 from devflow_temporal import delivery_feature_workflow as protocol
@@ -173,7 +175,10 @@ def test_invalid_plan_does_not_leave_an_orphan_execution_claim(service, monkeypa
         assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 0
 
 
-def test_successor_requires_stopped_owner_and_preserves_cumulative_budget(service, monkeypatch):
+@pytest.mark.parametrize("moved_base", [False, True])
+def test_successor_requires_stopped_owner_and_preserves_cumulative_budget(
+    service, monkeypatch, moved_base,
+):
     store, request, _ = feature_service(service, monkeypatch)
     store.submit(request)
     spec = store.effective_spec(request["run_id"])
@@ -196,9 +201,46 @@ def test_successor_requires_stopped_owner_and_preserves_cumulative_budget(servic
         "command_id": "next-command",
         "feature_predecessor": token,
     }
+    if moved_base:
+        source = Path(spec["source_path"])
+        (source / "README.md").write_text("Current trunk after retained feature integration\n")
+        _git(source, "commit", "-am", "Advance the configured named base")
+        assert _git(source, "rev-parse", spec["base_ref"]) != spec["base_sha"]
+        # A caller-supplied predecessor never relaxes fresh config admission.
+        with pytest.raises(ValueError, match="base ref moved"):
+            store.config.admit(next_request)
+        with pytest.raises(OwnershipConflict, match="original owner custody"):
+            store.submit({**next_request, "feature_predecessor": {**token, "generation": 99}})
+        original_config = store.config
+        for changed in (
+            "allowed_paths", "roles", "checks", "max_repairs", "origin_url", "base_ref",
+        ):
+            raw = deepcopy(original_config.raw)
+            repository = raw["repositories"]["fixture"]
+            if changed == "allowed_paths":
+                repository[changed] = ["README.md", "ADDED"]
+            elif changed == "roles":
+                raw["roles"]["implement"]["model"] = "different-model"
+            elif changed == "checks":
+                repository[changed] = [{"id": "different", "argv": ["true"]}]
+            elif changed == "max_repairs":
+                raw[changed] = 20
+            else:
+                repository[changed] += ".changed"
+            original_config.path.write_text(json.dumps(raw))
+            store.config = DeliveryConfig.load(original_config.path)
+            with pytest.raises(ValueError, match="original service configuration"):
+                store.submit(next_request)
+            assert shared.budget("I_feature")["used"] == 1
+        original_config.path.write_text(json.dumps(original_config.raw))
+        store.config = original_config
     store.submit(next_request)
     successor = store.effective_spec("run-next")
     assert successor["feature_delivery"]["owner"]["generation"] == 2
+    assert successor["base_sha"] == spec["base_sha"]
+    assert successor["base_ref"] == spec["base_ref"]
+    assert successor["accepted_plan"] == spec["accepted_plan"]
+    assert successor["policy"] == spec["policy"]
     assert shared.budget("I_feature")["used"] == 1
     with pytest.raises(OwnershipConflict):
         require_execution(store, spec)
@@ -476,6 +518,17 @@ def test_supported_continuation_renews_only_a_new_payload_after_safe_handoff(
         continue_feature(store, parent["run_id"], command)
     assert shared.budget("I_feature")["used"] == 10
     close(parent, "new-runtime-stop")
+    original_config = store.config
+    refused = deepcopy(original_config.raw)
+    refused["repositories"]["fixture"]["origin_url"] += ".changed"
+    original_config.path.write_text(json.dumps(refused))
+    store.config = DeliveryConfig.load(original_config.path)
+    with pytest.raises(ValueError, match="original service configuration"):
+        continue_feature(store, parent["run_id"], {**command, "command_id": "refused-origin"})
+    assert shared.budget("I_feature")["used"] == 10
+    assert shared.budget("I_feature")["allowance"]["sequence"] == 0
+    original_config.path.write_text(json.dumps(original_config.raw))
+    store.config = original_config
     second = continue_feature(store, parent["run_id"], command)
     budget = shared.budget("I_feature")
     assert (budget["used"], budget["lifetime_used"], budget["allowance"]["sequence"]) == (0, 10, 1)
