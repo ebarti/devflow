@@ -141,7 +141,7 @@ def test_preparation_stop_requires_exact_prerequisite_and_implementation_receipt
     preparation_stop(sealed["state"], CANDIDATE, "local")
     assert plan(sealed) == (2, 0, "published")
     for mutation in ("launched", "product-failure", "earlier-failure", "other-check",
-                     "reason", "tracker", "session", "attempt", "iteration", "role"):
+                     "reason", "tracker", "session", "attempt", "iteration", "unstarted", "role"):
         changed = copy.deepcopy(sealed)
         check = changed["state"]["checks"]["local"]
         if mutation == "launched":
@@ -162,6 +162,8 @@ def test_preparation_stop_requires_exact_prerequisite_and_implementation_receipt
             changed["attempts"][0]["result_json"] = "{}"
         elif mutation == "iteration":
             changed["state"]["iteration"] += 1
+        elif mutation == "unstarted":
+            changed["state"].update(iteration=0, roles=[])
         else:
             changed["state"]["roles"].append(gate("review", 2, "findings"))
         assert plan(changed) is None, mutation

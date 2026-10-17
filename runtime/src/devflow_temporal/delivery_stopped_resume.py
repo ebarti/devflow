@@ -451,7 +451,8 @@ def interrupted_resume(seal):
     roles, iteration = state.get('roles', []), state['iteration']
     if not roles:
         # The first implementation never started, and iteration zero is never charged.
-        return {'resume_iteration': 0, 'additional_iterations': 0} if iteration == 0 else None
+        return ({'resume_iteration': 0, 'additional_iterations': 0}
+                if iteration == 0 and not preparation else None)
     last = max((index for index, role in enumerate(roles) if role.get('role') == 'implement'),
                default=None)
     evidence = gate_evidence(seal)
