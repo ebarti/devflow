@@ -119,10 +119,12 @@ def _complete_attempt(store, spec, row, on_observed=None):
 
 
 @contextmanager
-def _completed_role_execution(path, journal, execution_specs, request, row):
+def _completed_role_execution(path, journal, execution_specs, request, row, *,
+                              completed_intakes=()):
     """Bind a retained role's original policy to its finished durable attempt."""
     execution = request['spec']
-    if execution not in execution_specs.values():
+    if (execution not in execution_specs.values()
+            and (request['role'] != 'intake' or execution not in completed_intakes)):
         raise ValueError('registered role request lost its admitted execution policy')
     if row is None or row['state'] != 'finished' or row['cleanup'] != 'confirmed':
         raise ValueError('registered historical role is not durably completed')
@@ -200,8 +202,9 @@ def _observe_registered_process(spec, path, *, retained_memo=None):
     journal = read_private(path)
     intent = journal['intent']
     launch = _launch_binding(path.parent, journal)
-    execution_specs = {}
-    _gate_roots(spec, execution_specs=execution_specs, retained_memo=retained_memo)
+    execution_specs, completed_intakes = {}, []
+    _gate_roots(spec, execution_specs=execution_specs, completed_intakes=completed_intakes,
+                retained_memo=retained_memo)
     execution = execution_specs[max((root for root in execution_specs if path.is_relative_to(root)),
                                     key=lambda root: len(root.parts))]
     expected_digest = ((execution.get('preparation') or {}).get('measured_policy_digest')
@@ -223,15 +226,15 @@ def _observe_registered_process(spec, path, *, retained_memo=None):
             if row is None:
                 raise ValueError('registered role has no durable original attempt')
             request = read_private(path.with_name('request.json'))
-            if (request['spec'] not in execution_specs.values()
-                    or DeliverySupervisor._job_key(request) != row['job_key']):
+            if DeliverySupervisor._job_key(request) != row['job_key']:
                 raise ValueError('registered role request lost its admitted execution policy')
     # Role jobs retain their original attempt directory across later admissions.
     # Only exact completed custody can override the directory's original policy.
     with ExitStack() as leases:
         if request is not None and request['spec'] != execution:
             execution = leases.enter_context(
-                _completed_role_execution(path, journal, execution_specs, request, row))
+                _completed_role_execution(path, journal, execution_specs, request, row,
+                                          completed_intakes=completed_intakes))
             expected_digest = execution['policy_digest']
             launch = _launch_binding(path.parent, journal)
         if (intent['run_id'] != spec['run_id']

@@ -95,6 +95,7 @@ def _ancestors(path: Path, *, allow_missing: bool = False) -> None:
 
 
 def _gate_roots(spec: dict, *, execution_specs: dict | None = None,
+                completed_intakes: list | None = None,
                 retained_memo: dict | None = None) -> tuple[Path, set[Path]]:
     """Resolve existing continuation custody read-only, never from a caller path."""
     state = Path(spec['state_dir'])
@@ -134,6 +135,7 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None,
                              (spec['run_id'],)).fetchone()
             if row is None or row[0] != spec['request_digest']:
                 raise ValueError('gate namespace has no durable original run')
+            completed_intake = None
             if execution_specs is not None:
                 original = json.loads(row[2])
                 prepared = db.execute(
@@ -146,7 +148,10 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None,
                         raise ValueError('resource namespace preparation custody changed')
                     original = measured
                 if row[3] is not None:
-                    original['accepted_plan'] = row[3]
+                    if (original.get('intake_required') is True
+                            and original.get('accepted_plan') == ''):
+                        completed_intake = original
+                    original = {**original, 'accepted_plan': row[3]}
                 bind(state, original)
             recovery = json.loads(row[1]) if row[1] else None
             first = True
@@ -289,6 +294,12 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None,
                     recovery = recovery.get('original_recovery')
                 if recovery is previous:
                     break
+            # Keep pre-plan admission separate from current namespace authority.
+            # Only an exact original/current caller or authenticated continuation
+            # may use it, and only through the completed-intake custody validator.
+            if (completed_intakes is not None and completed_intake is not None
+                    and (not first or spec in (original, completed_intake))):
+                completed_intakes.append(completed_intake)
     root = state / namespace / 'evidence' if namespace else state
     _ancestors(root, allow_missing=True)
     for path in (state, *((state / namespace, root) if namespace else ())):
@@ -812,8 +823,8 @@ class RunResources:
 
         descriptors, receipts = [], []
         role_leases = ExitStack()
-        execution_specs = {}
-        _gate_roots(self.spec, execution_specs=execution_specs)
+        execution_specs, completed_intakes = {}, []
+        _gate_roots(self.spec, execution_specs=execution_specs, completed_intakes=completed_intakes)
         try:
             for folder in unstarted:
                 journal = folder / 'native-process.json'
@@ -875,8 +886,7 @@ class RunResources:
                         if row is None:
                             raise ValueError('registered role has no durable original attempt')
                         request = read_private(path.with_name('request.json'))
-                        if (request['spec'] not in execution_specs.values()
-                                or DeliverySupervisor._job_key(request) != row['job_key']):
+                        if DeliverySupervisor._job_key(request) != row['job_key']:
                             raise ValueError(
                                 'registered role request lost its admitted execution policy')
                 historical_role = request is not None and request['spec'] != execution
@@ -884,7 +894,8 @@ class RunResources:
                     from .delivery_orphans import _completed_role_execution
 
                     execution = role_leases.enter_context(_completed_role_execution(
-                        path, value, execution_specs, request, row))
+                        path, value, execution_specs, request, row,
+                        completed_intakes=completed_intakes))
                     expected_digest = execution['policy_digest']
                 intent = value['intent']
                 launch = launch_binding(path.parent, value)
@@ -1433,12 +1444,13 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
     registry = RunResources(spec, read_only=True)
     # Finalizers publish intermediate manifests under this same exclusive lease.
     # Authenticate one complete generation, including the returned raw-byte hashes.
-    with registry.locked(read_only=True) as manifest:
-        return _observe_locked_resources(spec, registry, manifest, unknown_allowed=unknown_allowed,
+    with registry.locked(read_only=True) as manifest, ExitStack() as role_leases:
+        return _observe_locked_resources(spec, registry, manifest, role_leases,
+                                         unknown_allowed=unknown_allowed,
                                          freshly_completed=freshly_completed, attempts=attempts)
 
 
-def _observe_locked_resources(spec, registry, manifest, *, unknown_allowed=False,
+def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_allowed=False,
                               freshly_completed=False, attempts=()):
     state = Path(spec["state_dir"])
     _ancestors(state / "resources/manifest.json")
@@ -1477,9 +1489,9 @@ def _observe_locked_resources(spec, registry, manifest, *, unknown_allowed=False
     }
     if freshly_completed and not set(attempt_journals).issubset(manifest['processes']):
         raise ValueError('original completed attempt is not registered')
-    execution_specs = {}
+    execution_specs, completed_intakes = {}, []
     if freshly_completed:
-        _gate_roots(spec, execution_specs=execution_specs)
+        _gate_roots(spec, execution_specs=execution_specs, completed_intakes=completed_intakes)
     for raw in manifest["processes"]:
         path = Path(raw)
         if not path.is_relative_to(state) or path.resolve(strict=True) != path:
@@ -1501,6 +1513,7 @@ def _observe_locked_resources(spec, registry, manifest, *, unknown_allowed=False
             raise ValueError(
                 "predecessor actor identities lost their finalized inventory"
             )
+        historical_role = False
         if freshly_completed:
             from .delivery_native_process import launch_binding
 
@@ -1508,8 +1521,13 @@ def _observe_locked_resources(spec, registry, manifest, *, unknown_allowed=False
             request = read_private(path.with_name('request.json')) if attempt is not None else None
             if request is not None:
                 execution = request['spec']
-                if execution != spec and execution not in execution_specs.values():
-                    raise ValueError('original provider request lost its admitted execution policy')
+                historical_role = execution not in execution_specs.values()
+                if historical_role:
+                    from .delivery_orphans import _completed_role_execution
+
+                    execution = role_leases.enter_context(_completed_role_execution(
+                        path, value, execution_specs, request, attempt,
+                        completed_intakes=completed_intakes))
             else:
                 root = max((root for root in execution_specs if path.is_relative_to(root)),
                            key=lambda root: len(root.parts))
@@ -1570,14 +1588,15 @@ def _observe_locked_resources(spec, registry, manifest, *, unknown_allowed=False
             if (monitor and table.get(monitor['pid'], {}).get('identity') == monitor['identity']
                     and not table[monitor['pid']]['stat'].startswith('Z')):
                 raise ValueError('registered native monitor remains active')
-        lock_path = path.with_name("native-process.lock")
-        descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ValueError("predecessor still owns a native launch lease") from exc
-        finally:
-            os.close(descriptor)
+        if not historical_role:
+            lock_path = path.with_name("native-process.lock")
+            descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("predecessor still owns a native launch lease") from exc
+            finally:
+                os.close(descriptor)
         if (
             value.get("phase") != "finished"
             or (value.get("monitoring_complete") is not True
