@@ -211,6 +211,29 @@ def test_successor_requires_stopped_owner_and_preserves_cumulative_budget(
             store.config.admit(next_request)
         with pytest.raises(OwnershipConflict, match="original owner custody"):
             store.submit({**next_request, "feature_predecessor": {**token, "generation": 99}})
+        original_config = store.config
+        for changed in (
+            "allowed_paths", "roles", "checks", "max_repairs", "origin_url", "base_ref",
+        ):
+            raw = deepcopy(original_config.raw)
+            repository = raw["repositories"]["fixture"]
+            if changed == "allowed_paths":
+                repository[changed] = ["README.md", "ADDED"]
+            elif changed == "roles":
+                raw["roles"]["implement"]["model"] = "different-model"
+            elif changed == "checks":
+                repository[changed] = [{"id": "different", "argv": ["true"]}]
+            elif changed == "max_repairs":
+                raw[changed] = 20
+            else:
+                repository[changed] += ".changed"
+            original_config.path.write_text(json.dumps(raw))
+            store.config = DeliveryConfig.load(original_config.path)
+            with pytest.raises(ValueError, match="original service configuration"):
+                store.submit(next_request)
+            assert shared.budget("I_feature")["used"] == 1
+        original_config.path.write_text(json.dumps(original_config.raw))
+        store.config = original_config
     store.submit(next_request)
     successor = store.effective_spec("run-next")
     assert successor["feature_delivery"]["owner"]["generation"] == 2
@@ -500,7 +523,7 @@ def test_supported_continuation_renews_only_a_new_payload_after_safe_handoff(
     refused["repositories"]["fixture"]["origin_url"] += ".changed"
     original_config.path.write_text(json.dumps(refused))
     store.config = DeliveryConfig.load(original_config.path)
-    with pytest.raises(ValueError, match="configured Git origin changed"):
+    with pytest.raises(ValueError, match="original service configuration"):
         continue_feature(store, parent["run_id"], {**command, "command_id": "refused-origin"})
     assert shared.budget("I_feature")["used"] == 10
     assert shared.budget("I_feature")["allowance"]["sequence"] == 0

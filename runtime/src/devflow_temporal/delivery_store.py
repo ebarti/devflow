@@ -561,6 +561,19 @@ class DeliveryStore:
             # Repeat the same custody/plan check after ordinary config admission.
             authenticate_continued_plan(self, deepcopy(supplied))
             retained = self.effective_spec(supplied["feature_predecessor"]["run_id"])
+            frozen = load_execution_config(retained)
+            scope = retained.get("feature_scope_amendment")
+            if scope:
+                from .delivery_feature_scope import authenticate_receipt
+
+                amended = authenticate_receipt(self, scope)
+                if (amended.path != frozen.path
+                        or digest(amended.raw) != digest(frozen.raw)):
+                    raise ValueError("feature continuation changed its retained scope authority")
+                frozen = load_execution_config(
+                    self.effective_spec(scope["predecessor"]["run_id"]))
+            if self.config.path != frozen.path or digest(self.config.raw) != digest(frozen.raw):
+                raise ValueError("feature continuation changed its original service configuration")
         admission = {}
         if reference:
             admission["_base_ref"] = reference
