@@ -13,6 +13,7 @@ from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_feature_publication as publications
 from devflow_temporal.delivery_activities import _role_result, delivery_repair_preflight
 from devflow_temporal.delivery_broker import DeliveryBroker, _git
+from devflow_temporal.delivery_execution_registry import OwnershipConflict
 from devflow_temporal.delivery_feature_execution import (
     register_worker,
     registry,
@@ -107,31 +108,85 @@ def test_import_exception_does_not_qualify_unrelated_unchanged_candidates(
     assert "implementer produced no candidate change" in result["findings"]
 
 
-def test_initial_chunk_import_can_pass_without_rewriting_its_sealed_build(service, monkeypatch):
+def test_initial_chunk_import_keeps_frozen_base_after_trunk_advances(service, monkeypatch):
     store, supplied, _ = feature_service(service, monkeypatch)
     store.submit(supplied)
     parent = store.effective_spec(supplied["run_id"])
-    chunk = ordered_chunks(json.loads(supplied["accepted_plan"]))[0]
+    plan = json.loads(supplied["accepted_plan"])
+    chunk = ordered_chunks(plan)[0]
     issue = {"url": "https://github.com/example/fixture/issues/10"}
-    build = worker_spec(parent, chunk, issue, kind="build",
-                        base_sha=parent["base_sha"], base_branch="main")
-    register_worker(store, parent, build)
+    record = {"manifest": {"plan": plan, "publication": {"members": []},
+                           "workstream_issues": {chunk["workstream_id"]: issue}}}
+    monkeypatch.setattr(activities, "current_record", lambda _: record)
+    monkeypatch.setattr(activities, "_context", lambda _: (store, None))
+    source = Path(parent["source_path"])
+    _git(source, "checkout", "-B", "main", parent["base_sha"])
+    (source / "unrelated.txt").write_text("Independent trunk change\n")
+    _git(source, "add", "unrelated.txt")
+    _git(source, "commit", "-m", "feat: advance trunk", "--signoff")
+    target = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "origin", "main")
+
+    build = activities.reserve(parent, chunk["id"], "build")["spec"]
     builder = DeliveryBroker(store, build)
     builder.prepare()
+    assert build["base_sha"] == build["base_ref"] == parent["base_sha"]
+    assert _git(builder.checkout, "rev-parse", "HEAD") == parent["base_sha"]
+    assert not (builder.checkout / "unrelated.txt").exists()
     (builder.checkout / "README.md").write_text("The complete independently built chunk\n")
     monkeypatch.setattr(activities, "_context", lambda _: (store, builder))
-    seed = activities.seal_build(build, builder.candidate())
+    activities.seal_build(build, builder.candidate())
     token = parent["feature_delivery"]["owner"]
     registry(parent).finish_worker(token, worker_key(build["run_id"], token),
                                    {"cleanup": "confirmed"})
     with store._connect() as db:
         store.state.release_work(db, build["work_id"], "external:devflow:" + build["run_id"])
-    child = worker_spec(parent, chunk, issue, kind="chunk", seed=seed,
-                        base_sha=parent["base_sha"], base_branch="main")
-    register_worker(store, parent, child)
+    child = activities.reserve(parent, chunk["id"], "chunk")["spec"]
     broker = DeliveryBroker(store, child)
     candidate = broker.prepare()["candidate"]
+    assert child["base_sha"] == child["base_ref"] == parent["base_sha"]
+    assert not (broker.checkout / "unrelated.txt").exists()
     assert role_result(child, broker, candidate)["status"] == "pass"
+    created = []
+
+    def owned(**_):
+        if not created:
+            return None
+        tip = _git(source, "ls-remote", "origin", "refs/heads/" + child["branch"]).split()[0]
+        return {"number": 20, "url": "https://github.com/example/fixture/pull/20",
+                "state": "OPEN", "headRefOid": tip, "baseRefName": created[0]}
+
+    # Only the GitHub PR transport is modeled; the commit and push are real.
+    monkeypatch.setattr(broker, "_existing_pr", owned)
+    monkeypatch.setattr(broker, "_create_owned_pr", created.append)
+    receipt = broker.publish(0, candidate)
+    assert created == ["main"]
+    assert receipt["base"] == parent["base_sha"]
+    assert _git(broker.checkout, "show", "-s", "--format=%P", receipt["head"]) == parent["base_sha"]
+    assert _git(source, "rev-parse", "HEAD") == target
+    assert _git(source, "branch", "--show-current") == "main"
+    assert store.effective_spec(parent["run_id"]) == parent
+
+
+def test_moved_owned_prerequisite_is_refused_before_worker_admission(service, monkeypatch):
+    store, parent, _, broker, _, member, _ = integration(service, monkeypatch)
+    plan = json.loads(parent["accepted_plan"])
+    chunk = ordered_chunks(plan)[1]
+    record = {"manifest": {"plan": plan, "publication": {"members": [member]},
+                           "workstream_issues": {chunk["workstream_id"]: {
+                               "url": "https://github.com/example/fixture/issues/11"}}}}
+    monkeypatch.setattr(activities, "current_record", lambda _: record)
+    monkeypatch.setattr(activities, "_context", lambda _: (store, broker))
+    _git(broker.source, "checkout", member["branch"])
+    (broker.source / "README.md").write_text("Another author advanced the prerequisite\n")
+    _git(broker.source, "commit", "-am", "feat: external update", "--signoff")
+    _git(broker.source, "push", "origin", member["branch"])
+    with store._connect() as db:
+        before = db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0]
+    with pytest.raises(OwnershipConflict, match="stack prerequisite moved before worker admission"):
+        activities.reserve(parent, chunk["id"], "build")
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == before
 
 
 @pytest.mark.parametrize("drift", [None, "binding"])

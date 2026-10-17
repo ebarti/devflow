@@ -160,10 +160,12 @@ def reserve(spec, chunk_id, kind):
         base_branch=branch,
         seed=seed,
     )
-    # Ensure the exact remote prerequisite object is available locally before
-    # admitting a checkout. Never move the configured source working tree.
+    # Initial workers retain the admitted baseline while the shared trunk advances.
+    # Published stack prerequisites stay bound to their recorded branch tips.
+    prerequisite = branch if members else head
+    # Ensure the exact remote object is available without moving the source working tree.
     try:
-        _git(Path(spec["source_path"]), "fetch", "--no-tags", "origin", branch)
+        _git(Path(spec["source_path"]), "fetch", "--no-tags", "origin", prerequisite)
     except RuntimeError as exc:
         # A failed remote query is infrastructure the coordinator may re-issue,
         # never a verdict about the assignment.
