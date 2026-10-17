@@ -134,6 +134,9 @@ class MergeBroker:
             raise RuntimeError("merge activity no longer owns a live execution boundary")
         self.sequence += 1
         argv = ["gh", "api", "--method", method, endpoint]
+        if raw:
+            # Raw logs stay captured as data in private receipts, never terminal output.
+            argv.append("--allow-escape-sequences")
         if body is not None:
             argv.extend(["--input", "-"])
         result = subprocess.run(argv, input=json.dumps(body).encode() if body is not None else None,
