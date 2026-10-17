@@ -297,9 +297,17 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None,
             # Keep pre-plan admission separate from current namespace authority.
             # Only an exact original/current caller or authenticated continuation
             # may use it, and only through the completed-intake custody validator.
-            if (completed_intakes is not None and completed_intake is not None
-                    and (not first or spec in (original, completed_intake))):
-                completed_intakes.append(completed_intake)
+            if completed_intakes is not None and completed_intake is not None:
+                admitted = not first or spec in (original, completed_intake)
+                if (not admitted and original.get('feature_delivery')
+                        and not original.get('feature_worker')):
+                    from .delivery_feature_revision_subject import _ReadOnlyRegistry
+                    from .delivery_feature_revisions import effective_spec
+
+                    shared = _ReadOnlyRegistry(original['feature_delivery']['registry'])
+                    admitted = spec == effective_spec(None, original, shared=shared)
+                if admitted:
+                    completed_intakes.append(completed_intake)
     root = state / namespace / 'evidence' if namespace else state
     _ancestors(root, allow_missing=True)
     for path in (state, *((state / namespace, root) if namespace else ())):
