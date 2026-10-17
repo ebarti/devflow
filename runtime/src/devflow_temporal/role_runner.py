@@ -186,7 +186,11 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "complete independently verifiable chunks. Independent workstreams may build "
             "concurrently. Use stable IDs and explicit dependencies; each later chunk in "
             "a workstream depends on its previous chunk. Use expected_paths as edit "
-            "coordination hints within frozen execution authority. Each chunk selects only "
+            "coordination hints within frozen execution authority. expected_paths must use "
+            "canonical repository-relative paths with forward slashes: no leading/trailing "
+            "slash, doubled slash, '.' or '..' segment, or Git/Codex/agent control paths. "
+            "For example, use apps/web/src/components, never apps/web/src/components/. "
+            "Each chunk selects only "
             "admitted checks, prepublish_checks and browser_qa recipe IDs. selectors=[] "
             "runs the whole unchanged recipe; use it for static, lint, build and install "
             "recipes. Nonempty selectors name whole concrete supported test files relative "
@@ -597,6 +601,9 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
     if request["role"] == "intake":
         questions = parsed.get("questions") if isinstance(parsed, dict) else None
         plan = parsed.get("plan") if isinstance(parsed, dict) else None
+        v2_feature = (request["spec"].get("feature_delivery")
+                      and request["spec"].get("feature_plan_version") == 2)
+        plan_validation = None
         if (
             status not in {"questions", "plan"}
             or not isinstance(summary, str)
@@ -618,12 +625,13 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
             status = "blocked"
         elif status == "plan" and (
             not isinstance(plan, dict)
-            or not isinstance(plan.get("scope"), str) or not plan["scope"].strip()
-            or any(
-                not isinstance(plan.get(field), list) or not plan[field]
-                or any(not isinstance(item, str) or not item.strip() for item in plan[field])
-                for field in (("acceptance",) if request["spec"].get("feature_plan_version") == 2
-                              else ("steps", "verification", "acceptance"))
+            or not v2_feature and (
+                not isinstance(plan.get("scope"), str) or not plan["scope"].strip()
+                or any(
+                    not isinstance(plan.get(field), list) or not plan[field]
+                    or any(not isinstance(item, str) or not item.strip() for item in plan[field])
+                    for field in ("steps", "verification", "acceptance")
+                )
             )
         ):
             status = "blocked"
@@ -636,14 +644,27 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
                 if request["spec"].get("feature_plan_version") == 2:
                     from .delivery_feature_revision_roles import canonical_plan
 
+                    if plan.get("version") != 2:
+                        raise ValueError(
+                            "new feature intake requires the explicit v2 plan contract"
+                        )
                     plan = canonical_plan(plan)
                 else:
                     validate_plan(
                         {key: plan[key] for key in ("scope", "acceptance", "workstreams")},
                         allowed_paths=request["spec"]["policy"]["allowed_paths"],
                     )
-            except (ValueError, KeyError, TypeError):
-                status, findings = "blocked", ["feature plan has invalid workstreams or chunks"]
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                if v2_feature:
+                    # Only a successful, observed plan reaches this validation.
+                    # Retain the original proposal and specific refusal for intake.
+                    plan_validation = {"status": "invalid", "findings": [{
+                        "category": "plan_structure", "detail": f"{type(exc).__name__}: {exc}",
+                    }]}
+                elif isinstance(exc, AttributeError):
+                    raise
+                else:
+                    status, findings = "blocked", ["feature plan has invalid workstreams or chunks"]
         if status == "questions" and request["spec"].get("blocking_questions_version") == 1 and (
             not valid_blocking_questions(questions)
         ):
@@ -652,6 +673,7 @@ async def _run_codex(request: dict[str, Any]) -> dict[str, Any]:
             "status": status, "summary": summary, "findings": findings + provider_findings,
             "questions": questions if status == "questions" else [],
             "plan": plan if status == "plan" else None,
+            **({"plan_validation": plan_validation} if plan_validation else {}),
             "session_id": result.session_id, "usage": asdict(result.usage),
             "finish_reason": result.finish_reason,
             "requested_model": task.model, "requested_effort": task.reasoning_effort,

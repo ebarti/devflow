@@ -10,6 +10,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
+from test_delivery_feature_gates import native_intake_provider as native_intake_provider
 from test_delivery_github_contract import plan
 from test_delivery_store import service as service
 
@@ -235,9 +236,12 @@ async def test_ordinary_build_findings_repair_in_the_original_session(tmp_path):
     await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
 
 
-@pytest.mark.parametrize("intake_mode", ["automatic", "required", "exhausted"])
-async def test_fresh_v2_intake_corrects_gates_before_acceptance_on_temporal(
-    tmp_path, service, monkeypatch, intake_mode,
+@pytest.mark.parametrize(("intake_mode", "defect"), [
+    ("automatic", "gate"), ("automatic", "structure"), ("required", "structure"),
+    ("exhausted", "structure"), ("cancelled", "structure"),
+])
+async def test_fresh_v2_intake_corrects_plans_before_acceptance_on_temporal(
+    tmp_path, service, monkeypatch, native_intake_provider, intake_mode, defect,
 ):
     import json
     import subprocess
@@ -260,12 +264,14 @@ async def test_fresh_v2_intake_corrects_gates_before_acceptance_on_temporal(
     from devflow_temporal.delivery_feature_execution import plan_for, registry, worker_spec
     from devflow_temporal.delivery_github_contract import GitHubDelivery, ordered_chunks
     from devflow_temporal.delivery_store import DeliveryStore
-    from devflow_temporal.role_runner import _run_fake
+    # The deterministic provider completes through actual native normalization,
+    # then the real intake activity/controller; no installed subprocess is used.
+    async def provider(request):
+        output = request["spec"]["policy"]["fake_intake"][request["iteration"]]
+        return await native_intake_provider(request, output)
 
-    # Exercise the real intake activity/controller with a deterministic provider.
-    # The supervisor's isolated -I subprocess would load the installed runtime.
     monkeypatch.setattr("devflow_temporal.delivery_activities.get_supervisor",
-                        lambda _store: SimpleNamespace(run=_run_fake))
+                        lambda _store: SimpleNamespace(run=provider))
     original_store, request = service
     raw = deepcopy(original_store.config.raw)
     source = Path(raw["repositories"]["fixture"]["source_path"])
@@ -296,7 +302,10 @@ async def test_fresh_v2_intake_corrects_gates_before_acceptance_on_temporal(
                                    ["test_current.py", "test_future.py"])]}],
              "final_gates": [selection(["test_current.py", "test_future.py"])]}
     invalid = deepcopy(value)
-    invalid["workstreams"][0]["chunks"][0]["gates"][0]["selectors"] = ["tests"]
+    if defect == "gate":
+        invalid["workstreams"][0]["chunks"][0]["gates"][0]["selectors"] = ["tests"]
+    else:
+        invalid["workstreams"][0]["chunks"][0]["expected_paths"] = ["README.md/"]
     bad_result = {"status": "plan", "summary": "Original invalid proposal", "plan": invalid}
     raw.update(feature_delivery_version=1,
                execution_registry=str(tmp_path / "ownership" / "registry.sqlite3"),
@@ -342,6 +351,7 @@ async def test_fresh_v2_intake_corrects_gates_before_acceptance_on_temporal(
     calls = []
     intake_calls = []
     acceptance_calls = []
+    provider_done, release_provider = asyncio.Event(), asyncio.Event()
 
     @activity.defn(name="delivery_intake")
     async def checked_intake(payload):
@@ -349,7 +359,11 @@ async def test_fresh_v2_intake_corrects_gates_before_acceptance_on_temporal(
         assert record == {} and workers == []
         assert store.detail(spec["run_id"])["intake"]["accepted_plan"] is None
         assert registry(spec).budget(issue["id"])["used"] == 0
-        return await delivery_intake(payload)
+        result = await delivery_intake(payload)
+        if intake_mode == "cancelled":
+            provider_done.set()
+            await release_provider.wait()
+        return result
 
     @activity.defn(name="delivery_accept_plan")
     async def checked_acceptance(payload):
@@ -415,6 +429,14 @@ async def test_fresh_v2_intake_corrects_gates_before_acceptance_on_temporal(
                 DeliveryWorkflow.run, spec, id=spec["run_id"], task_queue="new-v2")
             for _ in range(600):
                 state = await handle.query(DeliveryWorkflow.status)
+                if intake_mode == "cancelled" and provider_done.is_set():
+                    await handle.execute_update(DeliveryWorkflow.cancel, {
+                        "command_id": "cancel-invalid-intake",
+                        "expected_revision": state["revision"],
+                        "reason": "Stop before another planning turn",
+                    })
+                    release_provider.set()
+                    break
                 if (state.get("decision") or {}).get("kind") == "plan":
                     assert intake_mode == "required"
                     assert acceptance_calls == [] and workers == [] and record == {}
@@ -452,7 +474,7 @@ async def test_fresh_v2_intake_corrects_gates_before_acceptance_on_temporal(
                 except Exception as exc:
                     evidence["history_error"] = f"{type(exc).__name__}: {str(exc)[:400]}"
                 pytest.fail("merge decision did not become pending: " + repr(evidence))
-            if intake_mode != "exhausted":
+            if intake_mode not in {"exhausted", "cancelled"}:
                 decision = state["decision"]
                 await handle.execute_update(DeliveryWorkflow.decision, {
                     "command_id": "authorize-fixture-merge", "expected_revision": state["revision"],
@@ -461,11 +483,26 @@ async def test_fresh_v2_intake_corrects_gates_before_acceptance_on_temporal(
                 })
             result = await asyncio.wait_for(handle.result(), 40)
             history = await handle.fetch_history()
+    if intake_mode == "cancelled":
+        assert result["outcome"] == "cancelled"
+        assert len(intake_calls) == 1 and acceptance_calls == []
+        assert result["roles"][0]["plan"] == invalid
+        assert result["roles"][0]["plan_validation"]["status"] == "invalid"
+        assert result["intake"]["accepted_plan"] is None
+        assert workers == [] and record == {} and open_attempts == 0
+        assert registry(spec).budget(issue["id"])["used"] == 0
+        await Replayer(workflows=[DeliveryWorkflow],
+                       data_converter=DELIVERY_DATA_CONVERTER).replay_workflow(history)
+        return
     assert intake_calls[1]["intake"]["plans"][0]["content"] == invalid
     diagnostic = intake_calls[1]["intake"]["plans"][0]["plan_validation"]
     assert diagnostic["status"] == "invalid"
-    assert "concrete supported test file" in diagnostic["findings"][0]["detail"]
+    expected_error = ("concrete supported test file" if defect == "gate" else
+                      "expected path is outside an owned source scope")
+    assert expected_error in diagnostic["findings"][0]["detail"]
     assert result["roles"][0]["status"] == "plan"
+    assert result["roles"][0]["session_id"] == "native-intake:0"
+    assert result["roles"][0]["usage"]["total_tokens"] == 13
     assert result["roles"][0]["summary"] == "Original invalid proposal"
     assert result["roles"][0]["plan"] == invalid
     assert all(call["spec"] == spec for call in intake_calls)

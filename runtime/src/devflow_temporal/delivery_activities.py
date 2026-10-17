@@ -597,6 +597,7 @@ async def _run_intake(request: dict[str, Any]) -> dict[str, Any]:
         result["status"] = "blocked"
         result.setdefault("findings", []).append("intake changed the read-only checkout")
     if (result.get("status") == "plan" and result.get("cleanup") != "unknown"
+            and (result.get("plan_validation") or {}).get("status") != "invalid"
             and request["spec"].get("feature_plan_version") == 2):
         from .delivery_feature_gates import GateAdmissionError, validate_chunk_gates
 
