@@ -494,7 +494,8 @@ class DeliveryStore:
 
     def submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None,
                _feature_revision: dict | None = None,
-               _feature_scope: dict | None = None) -> dict[str, Any]:
+               _feature_scope: dict | None = None,
+               _feature_allowance: dict | None = None) -> dict[str, Any]:
         run_id = supplied.get("run_id")
         command_id = supplied.get("command_id")
         if not isinstance(run_id, str) or not isinstance(command_id, str):
@@ -551,8 +552,21 @@ class DeliveryStore:
             branch = old.get('publication_base_ref')
             if branch and not re.fullmatch(r'[0-9a-fA-F]{40}', old['base_ref']):
                 reference = 'refs/remotes/origin/' + branch
-        spec = (self.config.admit(supplied, _base_ref=reference) if reference
-                else self.config.admit(supplied))
+        retained = None
+        if (supplied.get("feature_predecessor")
+                and self.config.raw.get("feature_delivery_version") == 1):
+            from .delivery_feature_revisions import authenticate_continued_plan
+
+            # Caller-supplied ownership is not authority to select a frozen base.
+            # Repeat the same custody/plan check after ordinary config admission.
+            authenticate_continued_plan(self, deepcopy(supplied))
+            retained = self.effective_spec(supplied["feature_predecessor"]["run_id"])
+        admission = {}
+        if reference:
+            admission["_base_ref"] = reference
+        if retained is not None:
+            admission["_feature_base"] = retained
+        spec = self.config.admit(supplied, **admission)
         spec["request_digest"] = request_digest
         if spec.get("feature_predecessor"):
             from .delivery_feature_revisions import authenticate_continued_plan
@@ -600,6 +614,13 @@ class DeliveryStore:
             from .delivery_feature_execution import observe_admission
 
             observed = observe_admission(self, spec)
+        if _feature_allowance is not None:
+            from .delivery_feature_execution import _renew_repair_allowance, registry
+
+            if retained is None or spec.get("feature_predecessor") != _feature_allowance:
+                raise ValueError("repair allowance requires its authenticated continuation")
+            # A refused config/origin/plan/readback must not renew before admission.
+            _renew_repair_allowance(self, registry(retained), _feature_allowance)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             command = db.execute(

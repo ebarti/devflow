@@ -172,7 +172,7 @@ class DeliveryConfig:
 
     def admit(
         self, supplied: dict[str, Any], *, _base_ref: str | None = None,
-        legacy_publication: bool = False,
+        _feature_base: dict[str, Any] | None = None, legacy_publication: bool = False,
     ) -> dict[str, Any]:
         required = {
             "command_id",
@@ -276,7 +276,28 @@ class DeliveryConfig:
             if resolved_ref not in {branch, "refs/heads/" + branch, "origin/" + branch, _base_ref}:
                 raise ValueError("fresh base changed the configured named branch")
             resolved_ref = _base_ref
-        base_sha = _git(source, "rev-parse", resolved_ref)
+        current_base = _git(source, "rev-parse", resolved_ref)
+        base_sha = current_base
+        if _feature_base is not None:
+            # Store admission has authenticated this exact stopped predecessor.
+            # Its accepted baseline survives integration of the retained workers.
+            owner = _feature_base.get("feature_delivery", {}).get("owner", {})
+            if (not owner or supplied.get("feature_predecessor") != owner
+                    or owner.get("store_path") != str(self.tracking_db)
+                    or _feature_base.get("provider") != self.raw.get("provider", "codex")
+                    or _feature_base.get("source_path") != str(source)
+                    or _feature_base.get("origin_url") != actual_remote
+                    or _feature_base.get("github_repo") != owner_repo
+                    or any(supplied.get(key) != _feature_base.get(key) for key in (
+                        "work_id", "issue_url", "repository_key", "goal", "base_ref",
+                        "authorized_endpoint", "origin_thread_id"))
+                    or (_feature_base.get("publication_summary") is not None
+                        and summary.get("publication_summary")
+                        != _feature_base["publication_summary"])):
+                raise ValueError("feature continuation changed its frozen source identity")
+            base_sha = _git(source, "rev-parse", _feature_base["base_sha"])
+            if base_sha != _feature_base["base_sha"]:
+                raise ValueError("feature continuation lost its frozen base commit")
         base_paths = _git(source, "ls-tree", "-r", "--name-only", base_sha).splitlines()
         if any(path == ".codex" or path.startswith(".codex/") for path in base_paths):
             raise ValueError("project Codex configuration is not admitted")
@@ -284,9 +305,12 @@ class DeliveryConfig:
         if expected and base_sha != expected:
             raise ValueError("base ref moved from the accepted plan")
         publication_branch = (
-            publication_base_ref(source, resolved_ref, base_sha)
+            publication_base_ref(source, resolved_ref, current_base)
             if self.raw.get("provider", "codex") == "codex" else None
         )
+        if (_feature_base is not None and publication_branch is not None
+                and publication_branch != _feature_base.get("publication_base_ref")):
+            raise ValueError("feature continuation changed its named publication branch")
         state_dir = self.state_root / "runs" / supplied["run_id"]
         checkout = self.state_root / "checkouts" / supplied["run_id"]
         policy = {

@@ -626,8 +626,6 @@ def continue_feature(store, run_id, request, *, _revision=None):
     ):
         raise OwnershipConflict("feature workers or effects have not reached a safe handoff")
     closed_coordinator(store, run_id)
-    if original["provider"] != "fake" and not replay_claim:
-        _renew_repair_allowance(store, shared, token)
     fields = {
         "work_id",
         "issue_url",
@@ -651,10 +649,14 @@ def continue_feature(store, run_id, request, *, _revision=None):
         # The supplied plan is already accepted. Store admission restores the
         # original approval policy from its authenticated stopped predecessor.
         supplied.update(accepted_plan=accepted, plan_approval="automatic")
+    admission = {}
+    if original["provider"] != "fake" and not replay_claim:
+        admission["_feature_allowance"] = token
     if scope is not None:
-        return store.submit(supplied, _feature_scope=scope)
-    return (store.submit(supplied, _feature_revision=_revision) if _revision is not None
-            else store.submit(supplied))
+        admission["_feature_scope"] = scope
+    elif _revision is not None:
+        admission["_feature_revision"] = _revision
+    return store.submit(supplied, **admission)
 
 
 def _renew_repair_allowance(store, shared, token):
