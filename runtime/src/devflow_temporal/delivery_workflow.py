@@ -1101,9 +1101,9 @@ class DeliveryWorkflow:
                 return None
             intake = self.state["intake"]
             turn = intake["round"]
-            if spec.get("resource_cleanup_version") == 1 and turn >= spec["policy"].get(
-                "max_intake_rounds", 8
-            ):
+            if (spec.get("resource_cleanup_version") == 1 or any(
+                plan.get("state") == "invalid" for plan in intake["plans"]
+            )) and turn >= spec["policy"].get("max_intake_rounds", 8):
                 await self._stop(spec, "intake exhausted the controller-owned finite turn limit")
                 return None
             self.state["phase"] = "investigating"
@@ -1129,6 +1129,21 @@ class DeliveryWorkflow:
                 self.state["cleanup"] = "unknown"
                 await self._stop(spec, "intake role cleanup is unknown")
                 return None
+            # Only newly returned validation findings add correction commands.
+            # Recorded status=plan results keep their original ordering on replay.
+            validation = result.get("plan_validation") or {}
+            if result.get("status") == "plan" and validation.get("status") == "invalid":
+                intake["plans"].append({
+                    "revision": len(intake["plans"]) + 1, "digest": digest(result["plan"]),
+                    "content": result["plan"], "state": "invalid",
+                    "plan_validation": validation,
+                })
+                intake["round"] += 1
+                self.state["revision"] += 1
+                await self._project(
+                    spec, "plan_invalid", "Controller gate validation needs correction"
+                )
+                continue
             if result.get("status") == "questions":
                 questions = result.get("questions")
                 if not isinstance(questions, list) or not questions:

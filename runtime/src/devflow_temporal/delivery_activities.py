@@ -596,6 +596,18 @@ async def _run_intake(request: dict[str, Any]) -> dict[str, Any]:
     if await asyncio.to_thread(broker.candidate) != candidate:
         result["status"] = "blocked"
         result.setdefault("findings", []).append("intake changed the read-only checkout")
+    if (result.get("status") == "plan" and result.get("cleanup") != "unknown"
+            and request["spec"].get("feature_plan_version") == 2):
+        from .delivery_feature_gates import GateAdmissionError, validate_chunk_gates
+
+        try:
+            await asyncio.to_thread(validate_chunk_gates, result["plan"], request["spec"])
+        except GateAdmissionError as exc:
+            # Keep the provider result intact. Only an observed planning rejection
+            # returns to intake; source/metadata, provider and cleanup failures do not.
+            result = {**result, "plan_validation": {
+                "status": "invalid", "findings": [exc.diagnostic],
+            }}
     return {
         **result, "role": "intake", "iteration": request["iteration"],
         "input_candidate_id": candidate["id"], "candidate": candidate,

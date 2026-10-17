@@ -232,6 +232,25 @@ def recipe_selectors(recipe: dict, spec: dict) -> list[str]:
     return [(PurePosixPath(project) / raw).as_posix() for _, raw in operands]
 
 
+def intake_recipe_catalog(spec: dict) -> list[dict]:
+    """Describe selector admission using the same frozen metadata as validation."""
+    result = []
+    for (stage, recipe_id), recipe in admitted_recipes(spec).items():
+        runner = _runner(recipe)[0]
+        named = runner in {"pytest", "vitest", "playwright"} or (
+            runner is None and bool(recipe.get("junit_required"))
+        )
+        result.append({
+            "stage": stage, "recipe_id": recipe_id,
+            "selector_root": recipe_project(recipe, spec),
+            "named_selectors": named and (stage != "browser_qa" or runner == "playwright"),
+            "mandatory_selectors": (
+                [] if recipe.get("tracked_recipe") else recipe_selectors(recipe, spec)
+            ),
+        })
+    return result
+
+
 def _selection_map(gates: list[dict], recipes: dict) -> dict[tuple[str, str], dict]:
     result = {}
     for gate in gates:
