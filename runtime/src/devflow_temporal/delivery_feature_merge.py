@@ -187,13 +187,14 @@ def _moved_target(store, spec, members, live, gh):
     if not proof:
         return None
     base = store.effective_spec(proof["run_id"])["base_sha"]
-    if not opened:
-        return live[0]["base"]["sha"] if live[0]["base"]["sha"] != base else None
-    # The owner merged the lower layers by hand. The rest merges onto the trunk,
-    # which must hold exactly the tree this layer was verified on.
+    # Native-stack PR base metadata can lag the authoritative trunk ref.
     trunk = members[0]["base_branch"]
     repo = f"repos/{spec['github_repo']}"
     head = gh.api(f"{repo}/git/ref/heads/{trunk}")["object"]["sha"]
+    if not opened:
+        return head if head != base else None
+    # The owner merged the lower layers by hand. The rest merges onto the trunk,
+    # which must hold exactly the tree this layer was verified on.
     if head == base or (gh.api(f"{repo}/git/commits/{head}")["tree"]["sha"]
                         == gh.api(f"{repo}/git/commits/{base}")["tree"]["sha"]):
         return None

@@ -188,11 +188,13 @@ def reserve(spec, chunk_id, kind):
 def begin_integration(spec, target):
     store, _, shared, token = _feature_context(spec)
     with shared.mutation(token):
-        record = current_record(spec)
-        live = live_members(spec, record)
+        gh = GitHubDelivery()
+        record = current_record(spec, gh)
+        live = live_members(spec, record, gh)
         if not live or any(raw["merged"] or raw["state"] != "open" for raw in live):
             raise OwnershipConflict("integration requires the existing open stack")
-        if live[0]["base"]["sha"] != target:
+        trunk = record["manifest"]["publication"]["members"][0]["base_branch"]
+        if gh.api(f"repos/{spec['github_repo']}/git/ref/heads/{trunk}")["object"]["sha"] != target:
             raise OwnershipConflict("target moved again before integration admission")
         prior = current_checkpoints(spec)["integration-pass"]
         if prior and prior["target"] == target:

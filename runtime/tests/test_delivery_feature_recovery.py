@@ -237,7 +237,10 @@ def test_integration_pass_retains_evidence_and_imports_without_force(service, mo
     assert shared.checkpoints("I_feature")["verified:model"]["head"] == old_head
 
 
-async def test_successor_reintegrates_completed_stack_after_target_moves(service, monkeypatch):
+@pytest.mark.parametrize("stale_pr_base", [False, True], ids=["current-pr-base", "stale-pr-base"])
+async def test_successor_reintegrates_completed_stack_after_target_moves(
+    service, monkeypatch, stale_pr_base,
+):
     from types import SimpleNamespace
 
     monkeypatch.setattr(protocol.workflow, "patched", lambda _marker: False)
@@ -269,13 +272,18 @@ async def test_successor_reintegrates_completed_stack_after_target_moves(service
     api = gh.api
 
     def remote(path, **kwargs):
+        if path.endswith("/git/ref/heads/main"):
+            return {"object": {"sha": target}}
         value = api(path, **kwargs)
         if "/pulls/" in path:
-            value["base"]["sha"] = target
+            # Native-stack PR metadata can retain the pre-integration base even
+            # while the authoritative trunk ref has advanced.
+            value["base"]["sha"] = original["base_sha"] if stale_pr_base else target
         return value
 
     monkeypatch.setattr(gh, "api", remote)
     monkeypatch.setattr(publications, "GitHubDelivery", lambda: gh)
+    monkeypatch.setattr(activities, "GitHubDelivery", lambda: gh)
     integrations, commands = [], []
 
     def execute(argv, **kwargs):
@@ -344,3 +352,24 @@ async def test_successor_reintegrates_completed_stack_after_target_moves(service
     assert shared.checkpoints("I_feature")["verified:model"]["run_id"] == "original-model"
     assert checkpoints(spec)["verified:model"]["run_id"] == "integrated-model"
     assert shared.budget("I_feature")["used"] == 1
+
+
+def test_integration_rejects_trunk_movement_despite_matching_stale_pr_base(service, monkeypatch):
+    _, spec, _, _, _, gh = setup_feature(service, monkeypatch)
+    target = "e" * 40
+    api = gh.api
+
+    def remote(path, **kwargs):
+        if path.endswith("/git/ref/heads/main"):
+            return {"object": {"sha": "f" * 40}}
+        value = api(path, **kwargs)
+        if "/pulls/" in path:
+            value["base"]["sha"] = target
+        return value
+
+    monkeypatch.setattr(gh, "api", remote)
+    monkeypatch.setattr(activities, "GitHubDelivery", lambda: gh)
+    with pytest.raises(OwnershipConflict, match="target moved again before integration admission"):
+        activities.begin_integration(spec, target)
+    assert checkpoints(spec)["integration-pass"] is None
+    assert registry(spec).budget(spec["feature_delivery"]["owner"]["issue_id"])["used"] == 0
