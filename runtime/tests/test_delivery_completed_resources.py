@@ -25,7 +25,7 @@ from devflow_temporal.delivery_resources import (
 
 
 @pytest.fixture
-def completed(service, monkeypatch):
+def completed(service, monkeypatch, *, role="implement"):
     store, request = service
     store.submit(request)
     spec = store.intake_execution_spec(request['run_id'])
@@ -33,19 +33,19 @@ def completed(service, monkeypatch):
     state = Path(spec['state_dir'])
     resources = RunResources(spec)
     candidate = {'id': 'opaque-candidate'}
-    identity = {'run_id': spec['run_id'], 'role': 'implement', 'iteration': 0,
+    identity = {'run_id': spec['run_id'], 'role': role, 'iteration': 0,
                 'candidate_id': candidate['id'], 'policy_digest': spec['policy_digest']}
     job_key = digest(identity)
     folder = state / 'attempts' / job_key
     folder.mkdir(parents=True, mode=0o700)
     path = folder / 'native-process.json'
     (folder / 'native-process.lock').touch(mode=0o600)
-    role_request = {'spec': spec, 'role': 'implement', 'iteration': 0, 'candidate': candidate,
+    role_request = {'spec': spec, 'role': role, 'iteration': 0, 'candidate': candidate,
                     'workspace': spec['checkout'], 'result_path': str(folder / 'result.json'),
                     'start_path': str(folder / 'start.json')}
     launch = {'argv': ['opaque', 'role'], 'environment': {'OPAQUE': 'fixture'}}
     result = {'status': 'blocked', 'session_id': 'original-session', 'cleanup': 'confirmed'}
-    row = {'job_key': job_key, 'role': 'implement', 'iteration': 0, 'state': 'finished',
+    row = {'job_key': job_key, 'role': role, 'iteration': 0, 'state': 'finished',
            'cleanup': 'confirmed', 'candidate_id': candidate['id'],
            'session_id': 'original-session', 'result_json': json.dumps(result),
            'pid': 17, 'process_identity': 'opaque-start'}
@@ -243,8 +243,125 @@ def test_retained_original_intake_binds_the_durably_accepted_plan(intake_fixture
     assert observe_completed_resources(current, [row])['journal_sha256']
     with store._connect() as db:
         db.execute("UPDATE delivery_runs SET accepted_plan_text='foreign accepted plan'")
-    with pytest.raises(ValueError, match='provider request lost its admitted execution policy'):
+    with pytest.raises(ValueError, match='request lost its admitted execution policy'):
         observe_completed_resources(current, [row])
+
+
+@pytest.fixture
+def completed_intake(intake_fixture, monkeypatch):
+    """Private prepared intake completed before real plan acceptance; no provider."""
+    from test_delivery_intake import _authorization, _record_plan
+
+    from devflow_temporal.delivery_config import DeliveryConfig
+    from devflow_temporal.delivery_store import DeliveryStore
+
+    config, supplied = intake_fixture
+    store = DeliveryStore(DeliveryConfig.load(config))
+    original, row, path, journal, request, table, ports = completed.__wrapped__(
+        (store, supplied), monkeypatch, role='intake')
+    submitted = copy.deepcopy(original)
+    original['preparation'] = {'measured_policy_digest': original['policy_digest']}
+    journal['runtime_identity'] = {'opaque': 'original-intake-runtime'}
+    journal['result'].update(journal=str(path), runtime_identity=journal['runtime_identity'])
+    result = {**json.loads(row['result_json']), 'native_process': journal['result']}
+    row.update(run_id=original['run_id'], result_path=str(path.with_name('result.json')),
+               result_json=canonical_json(result))
+    journal['provider_session']['result_digest'] = digest(result)
+    journal['lifecycle_locks'] = {}
+    for name in ('native-monitor.lock', 'native-process.lock'):
+        lock = path.with_name(name)
+        lock.touch(mode=0o600, exist_ok=True)
+        info = lock.stat()
+        journal['lifecycle_locks'][name] = {
+            'device': info.st_dev, 'inode': info.st_ino, 'uid': info.st_uid}
+    write_private(path, journal)
+    write_private(path.with_name('request.json'), request)
+    write_private(path.with_name('result.json'), result)
+    with store._connect() as db:
+        # Frozen preparation is injected explicitly: the fake provider never measures a host.
+        db.execute('INSERT INTO delivery_preparations VALUES (?,?,?,?,?)',
+                   (original['run_id'], digest(submitted), digest(original),
+                    canonical_json(original), 'private-fixture'))
+        columns, placeholders = ','.join(row), ','.join('?' for _key in row)
+        db.execute(f'INSERT INTO delivery_attempts ({columns}) VALUES ({placeholders})',
+                   tuple(row.values()))
+    plan = json.loads(config.read_text())['fake_intake'][2]['plan']
+    authorization = _authorization(submitted)
+    _record_plan(store, plan, authorization)
+    accepted = store.accept_intake_plan(original['run_id'], 1, digest(plan), plan,
+                                        authorization=authorization)
+    current = copy.deepcopy(original)
+    current['accepted_plan'] = accepted['accepted_plan']
+    monkeypatch.setattr(orphans, 'process_table', lambda: table)
+    monkeypatch.setattr(orphans, 'listeners', lambda _port: ports)
+    return store, current, row, path, journal, request, table
+
+
+def _observe_intake(fixture, surface):
+    _store, current, row, path, _journal, _request, _table = fixture
+    if surface == 'orphan':
+        return orphans._observe_registered_process(current, path)
+    if surface == 'completed':
+        return observe_completed_resources(current, [row])
+    owner = RunResources(current)
+    with owner.locked() as manifest, owner._closed_journals(manifest, [str(path)]) as observed:
+        return observed
+
+
+@pytest.mark.parametrize('surface', ['orphan', 'finalizer', 'completed'])
+def test_completed_preplan_intake_survives_plan_acceptance(completed_intake, surface):
+    _store, current, _row, path, _journal, request, _table = completed_intake
+    assert request['spec']['accepted_plan'] == '' and current['accepted_plan']
+    before = {name: path.with_name(name).read_bytes()
+              for name in ('request.json', 'result.json', 'native-process.json')}
+    assert _observe_intake(completed_intake, surface)
+    assert all(path.with_name(name).read_bytes() == value for name, value in before.items())
+    # The original request remains a valid cleanup caller, without changing the current plan.
+    original = (completed_intake[0], request['spec'], *completed_intake[2:])
+    assert _observe_intake(original, surface)
+    executions = {}
+    resources._gate_roots(current, execution_specs=executions)
+    assert executions[path.parents[2]] == current
+
+
+@pytest.mark.parametrize('surface', ['orphan', 'finalizer', 'completed'])
+@pytest.mark.parametrize('changed', [
+    'accepted_plan', 'preparation', 'request_plan', 'request_policy', 'result', 'session',
+    'unfinished', 'live_actor', 'other_role',
+])
+def test_completed_preplan_intake_preserves_custody(completed_intake, surface, changed):
+    from devflow_temporal.supervisor import DeliverySupervisor
+
+    store, _current, row, path, journal, request, table = completed_intake
+    if changed == 'accepted_plan':
+        with store._connect() as db:
+            db.execute("UPDATE delivery_runs SET accepted_plan_text='foreign plan'")
+    elif changed == 'preparation':
+        with store._connect() as db:
+            db.execute("UPDATE delivery_preparations SET effective_spec_digest='foreign'")
+    elif changed == 'request_plan':
+        request['spec']['accepted_plan'] = 'unadmitted plan'
+    elif changed == 'request_policy':
+        request['spec']['policy']['roles']['intake']['timeout_seconds'] = 99999
+        request['spec']['policy_digest'] = digest(request['spec']['policy'])
+    elif changed == 'result':
+        row['result_json'] = canonical_json({'status': 'pass'})
+    elif changed == 'session':
+        journal['provider_session']['session_id'] = 'foreign'
+    elif changed == 'unfinished':
+        row['state'] = 'running'
+    elif changed == 'live_actor':
+        table[17] = {'identity': 'opaque-start', 'stat': 'S'}
+    elif changed == 'other_role':
+        request['role'] = row['role'] = 'implement'
+        row['job_key'] = DeliverySupervisor._job_key(request)
+    write_private(path.with_name('request.json'), request)
+    write_private(path, journal)
+    with store._connect() as db:
+        db.execute('UPDATE delivery_attempts SET result_json=?,state=?',
+                   (row['result_json'], row['state']))
+    with pytest.raises(ValueError):
+        _observe_intake(completed_intake, surface)
 
 
 @pytest.mark.parametrize('changed', ['missing_digest', 'lock_busy'])
