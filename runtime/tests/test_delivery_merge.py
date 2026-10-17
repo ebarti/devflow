@@ -618,3 +618,160 @@ def test_actual_merge_entry_rejects_intervening_base_advance_without_server_enfo
     assert proof["simulated_merge_applied"] is False
     assert proof["merge_effect_state"] is None
     assert "active strict GitHub checks" in proof["error"]
+
+
+class NativeHosted(Hosted):
+    """The observed native stack transport after all layers are reintegrated."""
+
+    def __init__(self, spec, *, head="h", tree="t", base_tree="base-tree",
+                 hosted_base="previous-hosted", checkout="c" * 40, index=0):
+        super().__init__(spec)
+        base = spec["base_sha"]
+        self.current_base = base
+        self.direct = {"sha": base, "tree": {"sha": base_tree}}
+        self.previous = {"sha": hosted_base, "tree": {"sha": base_tree}}
+        self.hosted = {"sha": checkout, "tree": {"sha": tree},
+                       "parents": [{"sha": hosted_base}, {"sha": head}]}
+        self.predecessor = {"head": base, "hosted_checkout": hosted_base,
+                            "hosted_tree": base_tree}
+        self.check.update(head_sha=head, details_url=(
+            f"https://github.com/owner/repo/actions/runs/{20 + index}/job/{30 + index}"))
+        self.run.update(id=20 + index, head_sha=head)
+        self.job.update(id=30 + index, run_id=20 + index, head_sha=head)
+        self.log = f"checkout {checkout}\nMerge {head} into {hosted_base}\n"
+        self.found = {"state": "open", "merged": False, "base": {"sha": "stale-metadata"},
+                      "merge_commit_sha": checkout}
+
+    def api(self, endpoint, **kwargs):
+        if "/git/ref/heads/" in endpoint:
+            return {"object": {"sha": self.current_base}}
+        if endpoint.endswith("/git/commits/" + self.spec["base_sha"]):
+            return self.direct
+        if endpoint.endswith("/git/commits/" + self.previous["sha"]):
+            return self.previous
+        return super().api(endpoint, **kwargs)
+
+
+@pytest.mark.parametrize("upper_layer", [False, True], ids=["first", "upper"])
+def test_native_ci_binds_current_ref_and_exact_predecessor_despite_stale_pr_metadata(
+    tmp_path, upper_layer,
+):
+    spec, _, pr, _, _, _ = gates()
+    spec["state_dir"] = str(tmp_path)
+    broker = NativeHosted(spec, hosted_base="previous-hosted" if upper_layer else "b")
+    observed = broker.live_ci(pr, broker.found, "t", native_stack=True,
+                              predecessor=broker.predecessor if upper_layer else None)
+    assert observed["hosted_base"] == broker.hosted["parents"][0]["sha"]
+    assert observed["hosted_tree"] == "t"
+    with pytest.raises(ValueError, match="upstream moved"):
+        broker.live_ci(pr, broker.found, "t")
+
+
+@pytest.mark.parametrize("change", [
+    "foreign_same_tree_parent", "wrong_member", "base_tree", "hosted_base_tree",
+    "whole_tree", "moved_branch", "stale_checkout_log", "stale_merge_log",
+])
+def test_native_ci_rejects_unbound_chain_trees_branch_or_checkout(tmp_path, change):
+    spec, _, pr, _, _, _ = gates()
+    spec["state_dir"] = str(tmp_path)
+    broker = NativeHosted(spec)
+    if change == "foreign_same_tree_parent":
+        broker.hosted["parents"][0]["sha"] = "foreign-same-tree-parent"
+    elif change == "wrong_member":
+        broker.predecessor["head"] = "another-member"
+    elif change == "base_tree":
+        broker.direct["tree"]["sha"] = "changed"
+    elif change == "hosted_base_tree":
+        broker.previous["tree"]["sha"] = "changed"
+    elif change == "whole_tree":
+        broker.hosted["tree"]["sha"] = "changed"
+    elif change == "moved_branch":
+        broker.current_base = "advanced"
+    elif change == "stale_checkout_log":
+        broker.log = "checkout another-commit\nMerge h into previous-hosted\n"
+    else:
+        broker.log = f"checkout {broker.hosted['sha']}\nMerge h into b\n"
+    with pytest.raises(ValueError):
+        broker.live_ci(pr, broker.found, "t", native_stack=True, predecessor=broker.predecessor)
+
+
+@pytest.mark.parametrize("change", [None, "foreign_parent", "merged_prefix"])
+def test_feature_evidence_authenticates_three_native_hosted_layers(tmp_path, monkeypatch, change):
+    from types import SimpleNamespace
+
+    from test_delivery_feature_resumed_evidence import codex_receipt
+    from test_delivery_github_contract import plan
+
+    from devflow_temporal import delivery_feature_merge as merger
+    from devflow_temporal.contracts import canonical_json, digest
+    from devflow_temporal.delivery_execution_registry import OwnershipConflict
+    from devflow_temporal.delivery_github_contract import ordered_chunks
+
+    store = Store(tmp_path / "tracking.sqlite3")
+    store.config = SimpleNamespace(tracking_db=store.path)
+    specs, checkpoints, transports, members = {}, {}, {}, []
+    value = plan()
+    chunks = ordered_chunks(value)
+    with store._connect() as db:
+        db.execute("CREATE TABLE delivery_runs(run_id,outcome,candidate_json,pr_json,checks_json)")
+        db.execute("CREATE TABLE delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
+                   "state,session_id,result_json,cleanup,result_path)")
+    for index, chunk in enumerate(chunks):
+        spec, candidate, pr, checks, attempts, publication = gates()
+        run_id, head, tree = f"worker-{index}", f"head-{index}", f"tree-{index}"
+        base = f"head-{index - 1}" if index else "trunk"
+        spec.update(run_id=run_id, base_sha=base, state_dir=str(tmp_path / run_id),
+                    checkout=str(tmp_path / f"checkout-{index}"),
+                    publication_base_ref=f"layer-{index - 1}" if index else "main")
+        candidate.update(id=f"published-{index}", head=head, base_sha=base)
+        pr.update(number=index + 1, head=head,
+                  url=f"https://github.com/owner/repo/pull/{index + 1}")
+        for stage in ("local", "review", "qa"):
+            checks[stage]["candidate_id"] = candidate["id"]
+        checks["ci"]["head"] = head
+        codex_receipt(store, spec, source={"id": "input"}, output={
+            "id": "source", "head": "source-head", "content_sha256": "contents"})
+        with store._connect() as db:
+            db.execute("INSERT INTO delivery_runs VALUES(?,?,?,?,?)", (
+                run_id, "delivered", canonical_json(candidate), canonical_json(pr),
+                canonical_json(checks)))
+            for attempt in attempts[1:]:
+                db.execute("INSERT INTO delivery_attempts(run_id,role,iteration,candidate_id,"
+                           "state,session_id,result_json,cleanup) VALUES(?,?,0,?,?,?,?,?)", (
+                               run_id, attempt["role"], candidate["id"], "finished",
+                               attempt["session_id"], attempt["result_json"], "confirmed"))
+            db.execute("INSERT INTO delivery_effects VALUES(?,?,?,?,?,?,?)", (
+                "publish:" + run_id, run_id, "publish", canonical_json(publication),
+                "complete", canonical_json(pr), "now"))
+        specs[run_id] = spec
+        checkpoints["verified:" + chunk["id"]] = {
+            "run_id": run_id, "head": head, "number": pr["number"],
+            "store_path": str(store.path), "checks_digest": digest(checks)}
+        members.append({"chunk_id": chunk["id"], "head": head, "number": pr["number"],
+                        "base_branch": spec["publication_base_ref"]})
+        transports[run_id] = NativeHosted(
+            spec, head=head, tree=tree, checkout=f"hosted-{index}", index=index,
+            hosted_base=f"hosted-{index - 1}" if index else "trunk",
+            base_tree=f"tree-{index - 1}" if index else "trunk-tree")
+    store.effective_spec = specs.__getitem__
+    record = {"manifest": {"plan": value, "publication": {"stack_id": 42, "members": members}}}
+    live = [transports[key].found for key in specs]
+    if change == "foreign_parent":
+        transports["worker-2"].hosted["parents"][0]["sha"] = "foreign-same-tree-parent"
+    elif change == "merged_prefix":
+        live[0] = {**live[0], "merged": True}
+    monkeypatch.setattr(merger, "current_checkpoints", lambda _: checkpoints)
+    monkeypatch.setattr(merger, "observe_finalized_resources", lambda _: None)
+    monkeypatch.setattr(MergeBroker, "api", lambda self, endpoint, **kwargs:
+                        transports[self.spec["run_id"]].api(endpoint, **kwargs))
+    monkeypatch.setattr(MergeBroker, "require_base_enforcement", lambda _: None)
+    gh = SimpleNamespace(api=lambda endpoint: {"tree": {"sha":
+        "tree-" + endpoint.rsplit("-", 1)[-1]}})
+    parent = {"github_repo": "owner/repo", "state_dir": str(tmp_path / "parent")}
+    if change:
+        with pytest.raises((ValueError, OwnershipConflict)):
+            merger.evidence(store, parent, record, live, gh)
+    else:
+        assert merger.evidence(store, parent, record, live, gh) == [
+            "tree-0", "tree-1", "tree-2"]
+        assert all(transport.log_reads == 1 for transport in transports.values())

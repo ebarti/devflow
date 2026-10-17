@@ -122,7 +122,7 @@ def merge_evidence(monkeypatch, store, parent, child, output):
                            if any(chunk["id"] == chunk_id for chunk in stream["chunks"])]
     member = {"chunk_id": chunk_id, "number": pr["number"], "head": pr["head"],
               "base_branch": "main"}
-    record = {"manifest": {"plan": plan, "publication": {"members": [member]}}}
+    record = {"manifest": {"plan": plan, "publication": {"stack_id": None, "members": [member]}}}
     seen = {}
 
     def gates(_spec, _candidate, _pr, _checks, attempts, _publication):
@@ -134,7 +134,7 @@ def merge_evidence(monkeypatch, store, parent, child, output):
         def __init__(self, *_args):
             pass
 
-        def live_ci(self, *_args):
+        def live_ci(self, *_args, **_kwargs):
             pass
 
         def require_base_enforcement(self):

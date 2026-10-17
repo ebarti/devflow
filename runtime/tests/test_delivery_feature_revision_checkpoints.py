@@ -101,3 +101,38 @@ def test_journalled_plain_proof_after_its_revision_stays_current(tmp_path):
     stale_pass["verified:A"] = stale_pass["pass:1:verified:A"]
     stale_pass["integration-pass"] = {"number": 1}
     assert "verified:A" not in revisions.revision_checkpoints({}, stale_pass)
+
+
+def test_new_integration_pass_requires_fresh_revision_proofs_and_assignments(tmp_path, monkeypatch):
+    from devflow_temporal import delivery_feature_pass as passes
+
+    shared = ExecutionRegistry(tmp_path / "control" / "execution.sqlite3")
+    issue = {"id": "I_feature", "repository_id": "R_fixture", "url": "https://example.invalid/1"}
+    token = shared.claim({"issue": issue}, "feature-run", str(tmp_path / "local.sqlite3"))
+    chunks = ["api1", "sql1", "web1"]
+    shared.checkpoint(token, PREFIX + "adopted:revision-2", receipt(2, chunks, chunks))
+    shared.checkpoint(token, "revision:2:build:api1", {"sha256": "preserved-build"})
+    for chunk in chunks:
+        shared.checkpoint(token, "revision:2:verified:" + chunk, {"run_id": "old-" + chunk})
+        shared.checkpoint(token, "revision:2:assignment:" + chunk + ":chunk",
+                          {"run_id": "old-" + chunk})
+    previous = shared.checkpoints(issue["id"])
+    spec = {"feature_delivery": {"owner": token}, "feature_plan_revision": {"plan_revision": 2}}
+    monkeypatch.setattr(passes, "registry", lambda _: shared)
+    monkeypatch.setattr(revisions, "_values", lambda *_: shared.checkpoints(issue["id"]))
+    assert passes.checkpoints(spec)["verified:web1"] == {"run_id": "old-web1"}
+    shared.checkpoint(token, "integration-pass:1", {"number": 1, "target": "current-trunk"})
+    visible = passes.checkpoints(spec)
+    for chunk in chunks:
+        assert "verified:" + chunk not in visible
+        assert "assignment:" + chunk + ":chunk" not in visible
+        for alias in ("verified:" + chunk, "assignment:" + chunk + ":chunk"):
+            key = passes.checkpoint_key(spec, alias)
+            assert key == "revision:2:pass:1:" + alias
+            shared.checkpoint(token, key, {"run_id": "current-" + chunk})
+    visible = passes.checkpoints(spec)
+    assert visible["build:api1"] == {"sha256": "preserved-build"}
+    for chunk in chunks:
+        assert visible["verified:" + chunk] == {"run_id": "current-" + chunk}
+        assert visible["assignment:" + chunk + ":chunk"] == {"run_id": "current-" + chunk}
+    assert all(shared.checkpoints(issue["id"])[key] == value for key, value in previous.items())

@@ -202,15 +202,34 @@ class MergeBroker:
                 "actual_merge_base": actual_base,
                 "merged_commit": commit["sha"], "merged_at": found["merged_at"]}
 
-    def live_ci(self, pr, found, head_tree):
+    def live_ci(self, pr, found, head_tree, *, native_stack=False, predecessor=None):
         repo = self.spec["github_repo"]
         if found["state"] != "open" or found["merged"]:
             raise ValueError("merge preflight requires the owned open PR")
-        if found["base"]["sha"] != self.spec["base_sha"]:
+        base = self.spec["base_sha"]
+        if native_stack:
+            # Native PR payloads can lag. The owned base branch must still be
+            # exactly the direct prerequisite this worker was verified against.
+            branch = self.spec["publication_base_ref"]
+            current = self.api(f"repos/{repo}/git/ref/heads/{branch}")["object"]["sha"]
+        else:
+            current = found["base"]["sha"]
+        if current != base:
             raise ValueError("upstream moved; a new verified integration candidate is required")
+        hosted_base = base
+        if predecessor is not None:
+            if not native_stack or predecessor.get("head") != base:
+                raise ValueError("native stack predecessor differs from the verified base")
+            hosted_base = predecessor["hosted_checkout"]
+            direct = self.api(f"repos/{repo}/git/commits/{base}")
+            previous = self.api(f"repos/{repo}/git/commits/{hosted_base}")
+            if (direct["sha"] != base or previous["sha"] != hosted_base
+                    or direct["tree"]["sha"] != predecessor["hosted_tree"]
+                    or previous["tree"]["sha"] != direct["tree"]["sha"]):
+                raise ValueError("native hosted predecessor differs from the verified base tree")
         hosted = self.api(f"repos/{repo}/git/commits/" + found["merge_commit_sha"])
         if (hosted["tree"]["sha"] != head_tree
-                or [p["sha"] for p in hosted["parents"]] != [self.spec["base_sha"], pr["head"]]):
+                or [p["sha"] for p in hosted["parents"]] != [hosted_base, pr["head"]]):
             raise ValueError("hosted checkout differs from the verified candidate/base")
         checks = self.api(f"repos/{repo}/commits/{pr['head']}/check-runs?per_page=100")
         if checks["total_count"] > 100:
@@ -244,12 +263,12 @@ class MergeBroker:
             if (retained["job_id"] != job["id"]
                     or retained["sha256"] != hashlib.sha256(log.encode()).hexdigest()
                     or hosted["sha"] not in log
-                    or "Merge " + pr["head"] + " into " + self.spec["base_sha"] not in log):
+                    or "Merge " + pr["head"] + " into " + hosted_base not in log):
                 raise ValueError("required CI checkout log differs from the frozen whole tree")
             observed.append({"name": name, "check_id": check["id"], "run_id": run["id"],
                              "job_id": job["id"], "attempt": 1,
                              "log_sha256": retained["sha256"], "log": str(log_path)})
-        return {"head": pr["head"], "base": self.spec["base_sha"],
+        return {"head": pr["head"], "base": base, "hosted_base": hosted_base,
                 "hosted_checkout": hosted["sha"], "hosted_tree": head_tree, "jobs": observed}
 
     def require_base_enforcement(self):
