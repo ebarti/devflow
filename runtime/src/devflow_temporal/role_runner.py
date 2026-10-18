@@ -334,6 +334,9 @@ def _task(request: dict[str, Any]) -> AgentTask:
         + "\nInspect the manifest hashes and relevant artifacts, "
         "including each required page image. "
         "Test exit/count alone is not visual QA. Report missing or uninspected evidence honestly.\n"
+        "Use passing controller receipts for already-covered mandatory checks. Do not rerun an "
+        "identical broad suite unless its inputs changed or a targeted investigation requires it. "
+        "Independently inspect the source and exercise uncovered behavior with focused probes.\n"
         if role in {"review", "verify"} and check_evidence else ""
     )
     if spec["policy"].get("host_sandbox") == "trusted-local":

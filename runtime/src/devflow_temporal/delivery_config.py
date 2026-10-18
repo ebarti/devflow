@@ -103,6 +103,9 @@ class DeliveryConfig:
         ci_wait = value.get("ci_wait_seconds", 10800)
         if type(ci_wait) is not int or not 60 <= ci_wait <= 43200:
             raise ValueError("ci_wait_seconds must be between 60 and 43200")
+        from .delivery_limits import policy as delivery_limit_policy
+
+        delivery_limit_policy(value)
         if value.get("feature_delivery_version") not in (None, 1):
             raise ValueError("unsupported feature delivery protocol")
         repairs = value.get("max_repairs", 10 if value.get("feature_delivery_version") == 1 else 2)
@@ -164,6 +167,8 @@ class DeliveryConfig:
             "max_repairs": self.raw.get(
                 "max_repairs", 10 if self.raw.get("feature_delivery_version") == 1 else 2),
             "feature_delivery_version": self.raw.get("feature_delivery_version"),
+            "delivery_limits": {k: self.raw[k] for k in (
+                "delivery_timeout_seconds", "no_progress_timeout_seconds") if k in self.raw},
             **({"feature_plan_versions": [1, 2], "feature_plan_revision_version": 1,
                 "revise_feature_plan": True}
                if self.raw.get("feature_delivery_version") == 1 else {}),
@@ -341,6 +346,10 @@ class DeliveryConfig:
             if self.raw.get("provider") == "fake"
             else [],
         }
+        from .delivery_limits import policy as delivery_limit_policy
+
+        time_limits = delivery_limit_policy(self.raw)
+        policy.update(time_limits)
         if repository.get("source_scope") is not None:
             policy["source_scope"] = deepcopy(repository["source_scope"])
         source_authority = validate_authority(policy)
@@ -591,6 +600,10 @@ class DeliveryConfig:
             "policy": policy,
             "policy_digest": digest(policy),
             "workflow_failure_boundary_version": 1,
+            "assessment_batch_version": 1,
+            "validation_schedule_version": 1,
+            "merge_reconciliation_version": 1,
+            **({"delivery_limits_version": 1} if time_limits else {}),
             "config_digest": digest(self.raw),
             "config_path": str(self.path),
         }
@@ -686,7 +699,10 @@ def scope_amended_spec(
     if "blocking_questions_version" not in original:
         effective.pop("blocking_questions_version")
     for marker in ("automatic_retry_version", "retry_budget_version", "baseline_checks_version",
-                   "merge_version", "workflow_failure_boundary_version"):
+                   "merge_version", "workflow_failure_boundary_version",
+                   "assessment_batch_version", "validation_schedule_version",
+                   "merge_reconciliation_version",
+                   "delivery_limits_version", "delivery_admitted_at"):
         if marker in original:
             effective[marker] = original[marker]
         else:
@@ -712,6 +728,11 @@ def scope_amended_spec(
         effective["policy"]["tracker_retry_seconds"] = original["policy"]["tracker_retry_seconds"]
     else:
         effective["policy"].pop("tracker_retry_seconds", None)
+    for key in ("delivery_timeout_seconds", "no_progress_timeout_seconds"):
+        if key in original["policy"]:
+            effective["policy"][key] = original["policy"][key]
+        else:
+            effective["policy"].pop(key, None)
     effective["policy_digest"] = digest(effective["policy"])
     for key in ("publication_readback_version", "publication_readback_seconds"):
         if key in original:

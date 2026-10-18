@@ -521,6 +521,8 @@ async def _coordinate_pass(controller, spec, active, builds):
                     controller.state["checks"]["feature_merge"] = merged
                     if merged["state"] == "confirmed":
                         break
+                    if merged["state"] == "decision_required":
+                        raise RuntimeError(merged.get("instruction") or merged["reason"])
                     if merged["state"] == "needs_integration":
                         await controller._activity("delivery_feature_begin_integration", {
                             "spec": spec, "target": merged["target"],

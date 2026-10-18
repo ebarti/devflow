@@ -457,6 +457,10 @@ class RunResources:
             os.close(descriptor)
 
     def _allowed(self, path: Path, kind: str, *, finalizing: bool = False) -> None:
+        installed = Path(__file__).resolve().parents[3]
+        resolved = path.resolve()
+        if resolved.is_relative_to(installed) or installed.is_relative_to(resolved):
+            raise ValueError("temporary resource cleanup cannot own the installed runtime")
         short = Path("/private/tmp") / ("dfqa-" + digest(str(self.state))[:20])
         valid = path == self.state / "transient" or path == short
         if kind == "execution-scratch":

@@ -35,6 +35,10 @@ def require_merge_gates(spec, candidate, pr, checks, attempts, publication):
                 or result.get("candidate_id") != (origin_id if stage == "prepublish"
                                                  else candidate["id"])):
             raise ValueError(stage + " has not passed for this candidate")
+    if spec.get("validation_schedule_version") == 1:
+        from .delivery_validation_schedule import require_deferred_checks
+
+        require_deferred_checks(spec, checks["prepublish"], checks["local"])
     if spec["policy"].get("browser_qa"):
         result = checks.get("browser_qa", {})
         if (result.get("state") != "passed" or result.get("cleanup") != "confirmed"
@@ -210,7 +214,7 @@ class MergeBroker:
         if found["state"] != "open" or found["merged"]:
             raise ValueError("merge preflight requires the owned open PR")
         base = self.spec["base_sha"]
-        if native_stack:
+        if native_stack or self.spec.get("merge_reconciliation_version") == 1:
             # Native PR payloads can lag. The owned base branch must still be
             # exactly the direct prerequisite this worker was verified against.
             branch = self.spec["publication_base_ref"]
@@ -240,6 +244,12 @@ class MergeBroker:
         observed = []
         for name in self.spec["policy"]["required_ci"]:
             matches = [c for c in checks["check_runs"] if c["name"] == name]
+            if self.spec.get("merge_reconciliation_version") == 1 and (
+                not matches or (len(matches) == 1 and matches[0]["status"] != "completed")
+            ):
+                from .delivery_merge_reconciliation import MergeChecksPending
+
+                raise MergeChecksPending("waiting for current-target CI: " + name)
             if len(matches) != 1:
                 raise ValueError("required CI is missing or ambiguous: " + name)
             check = matches[0]
@@ -369,11 +379,22 @@ def merge_verified(store, spec, request, cancel_event=None):
                        json.loads(publication["request_json"]))
     resources = observe_finalized_resources(spec)
     broker = MergeBroker(store, spec, cancel_event)
+    reconciliation = None
+    if spec.get("merge_reconciliation_version") == 1:
+        from .delivery_merge_reconciliation import reconcile
+
+        raw = broker.api(f"repos/{spec['github_repo']}/pulls/{pr['number']}")
+        reconciliation = reconcile(broker, pr, raw)
+        if reconciliation["state"] != "ready":
+            return reconciliation
+        pr = reconciliation["pr"]
+        broker = MergeBroker(store, {**spec, "base_sha": reconciliation["base"]}, cancel_event)
     head = broker.api(f"repos/{spec['github_repo']}/git/commits/{pr['head']}")
     head_tree = head["tree"]["sha"]
     found = broker.publication(pr)
     key = "merge:" + spec["run_id"]
-    intent = {"candidate": candidate, "pr": pr, "base": spec["base_sha"], "tree": head_tree,
+    intent = {"candidate": candidate, "pr": pr, "base": broker.spec["base_sha"], "tree": head_tree,
+              **({"reconciliation_sha256": digest(reconciliation)} if reconciliation else {}),
               "policy_digest": spec["policy_digest"], "checks_sha256": digest({
                   k: saved.get(k) for k in (
                       "prepublish", "local", "review", "qa", "ci", "browser_qa")})}
@@ -384,7 +405,12 @@ def merge_verified(store, spec, request, cancel_event=None):
         if not prior or prior["request_json"] != canonical_json(intent):
             raise ValueError("merged PR has no matching original owned merge intent")
     else:
-        ci = broker.live_ci(pr, found, head_tree)
+        from .delivery_merge_reconciliation import MergeChecksPending
+
+        try:
+            ci = broker.live_ci(pr, found, head_tree)
+        except MergeChecksPending as exc:
+            return {"state": "pending", "reason": str(exc), "head": pr["head"]}
         write_private(broker.root / "ci.json", ci)
         enforcement = broker.require_base_enforcement()
         write_private(broker.root / "base-enforcement.json", enforcement)
@@ -395,7 +421,9 @@ def merge_verified(store, spec, request, cancel_event=None):
         found = broker.publication(pr)
     merged = broker.merged(pr, found, head_tree)
     closure = broker.close_issue(merged)
-    result = {**merged, "issue": closure, "resources": resources, "candidate_id": candidate["id"]}
+    result = {**merged, "issue": closure, "resources": resources, "candidate_id": candidate["id"],
+              **({"source_head": candidate["head"], "reconciliation": reconciliation}
+                 if reconciliation else {})}
     write_private(broker.root / "receipt.json", result)
     broker.finish(key, result)
     return result
@@ -404,8 +432,19 @@ def merge_verified(store, spec, request, cancel_event=None):
 def merged_readback(store, spec, candidate, pr):
     broker = MergeBroker(store, spec)
     receipt = read_private(broker.root / "receipt.json")
-    if receipt["candidate_id"] != candidate["id"] or receipt["head"] != candidate["head"]:
+    if receipt["candidate_id"] != candidate["id"]:
         raise ValueError("merged terminal candidate changed")
+    if spec.get("merge_reconciliation_version") == 1 and receipt.get("reconciliation"):
+        from .delivery_merge_reconciliation import reconcile
+
+        raw = broker.api(f"repos/{spec['github_repo']}/pulls/{pr['number']}")
+        current = reconcile(broker, pr, raw)
+        if (current != receipt["reconciliation"] or receipt["source_head"] != candidate["head"]):
+            raise ValueError("merged target reconciliation changed")
+        pr = current["pr"]
+        broker = MergeBroker(store, {**spec, "base_sha": current["base"]})
+    elif receipt["head"] != candidate["head"]:
+        raise ValueError("merged terminal head changed")
     found = broker.publication(pr)
     current = broker.merged(pr, found, receipt["tree"])
     if any(current[k] != receipt[k] for k in current):

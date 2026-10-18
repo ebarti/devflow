@@ -145,6 +145,9 @@ def submit_historical_admission(store, request, monkeypatch):
     spec = store.config.admit(request)
     spec.pop("automatic_retry_version", None)
     spec.pop("retry_budget_version", None)
+    spec.pop("assessment_batch_version", None)
+    spec.pop("validation_schedule_version", None)
+    spec.pop("merge_reconciliation_version", None)
     spec["policy"].pop("max_attempts", None)
     spec["policy_digest"] = digest(spec["policy"])
     with monkeypatch.context() as historical:
