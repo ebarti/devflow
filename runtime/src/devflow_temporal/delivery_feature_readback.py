@@ -16,6 +16,19 @@ def settle_one(store, spec, entry, gh):
     token = spec["feature_delivery"]["owner"]
     issue = spec["feature_delivery"]["snapshot"]["issue"]
     kind, key, request = entry["kind"], entry["effect_key"], json.loads(entry["request_json"])
+    if kind == "merge_reconcile":
+        from .delivery_merge import MergeBroker
+        from .delivery_merge_reconciliation import settle_update
+
+        broker = MergeBroker(store, spec)
+        raw = gh.api(f"repos/{spec['github_repo']}/pulls/{request['number']}")
+        try:
+            settled = settle_update(broker, entry, raw)
+        except ValueError as exc:
+            raise OwnershipConflict(str(exc)) from exc
+        if not settled:
+            raise UnresolvedEffect("original target update remains unconfirmed")
+        return
     if kind == "publish_chunk":
         from .delivery_broker import DeliveryBroker
         from .delivery_feature_publication import publish

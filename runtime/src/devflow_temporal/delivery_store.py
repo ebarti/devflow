@@ -614,6 +614,13 @@ class DeliveryStore:
             admission["_feature_base"] = retained
         spec = self.config.admit(supplied, **admission)
         spec["request_digest"] = request_digest
+        if spec.get("delivery_limits_version") == 1:
+            prior_spec = retained
+            if prior_spec is None and _automatic is not None:
+                prior_spec = json.loads(_automatic["row"]["request_json"])
+            if prior_spec is None and supplied.get("supersedes_run_id"):
+                prior_spec = self.effective_spec(supplied["supersedes_run_id"])
+            spec["delivery_admitted_at"] = (prior_spec or {}).get("delivery_admitted_at") or _now()
         if spec.get("feature_predecessor"):
             from .delivery_feature_revisions import authenticate_continued_plan
 

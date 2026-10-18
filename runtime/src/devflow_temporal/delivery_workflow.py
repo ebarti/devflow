@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import re
@@ -12,8 +13,10 @@ from typing import Any
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, ServerError
+from temporalio.exceptions import CancelledError as ActivityCancelledError
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
+from . import delivery_limits
 from .contracts import digest
 from .delivery_baseline_contract import preparation_failure as _preparation_failure
 from .delivery_baseline_contract import repairable_baseline
@@ -315,6 +318,11 @@ class DeliveryWorkflow:
         self.feature_liveness_v1 = False
         self.controller_spec = None
         self.launch_window_v1 = False
+        self.delivery_clock = None
+        self.delivery_limit_policy = {}
+        self.delivery_limit_reached = False
+        self.delivery_limits_closing = False
+        self.delivery_active_activities = {}
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
         if self.controller_only_resource_closure and name not in {
@@ -515,11 +523,32 @@ class DeliveryWorkflow:
                     "NativeProcessUnknown",
                 ],
             )
+        if getattr(self, "delivery_clock", None) is not None:
+            from .delivery_limits import SETTLEMENT, expire, remaining
+
+            if name not in SETTLEMENT and not self.delivery_limits_closing:
+                delay, kind, deadline = remaining(self)
+                if delay <= 0:
+                    await expire(self, request["spec"], kind, deadline)
+                    raise asyncio.CancelledError()
+                options["cancellation_type"] = (
+                    workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED)
+                handle = workflow.start_activity(
+                    name, request, start_to_close_timeout=timeout, **options)
+                self.delivery_active_activities[handle] = None
+                try:
+                    return await handle
+                except ActivityError as exc:
+                    if (self.delivery_limit_reached
+                            and isinstance(exc.cause, ActivityCancelledError)):
+                        # WAIT_CANCELLATION_COMPLETED joined this owned activity. Actual
+                        # native journals are still checked by resource finalization.
+                        raise asyncio.CancelledError from exc
+                    raise
+                finally:
+                    self.delivery_active_activities.pop(handle, None)
         return await workflow.execute_activity(
-            name,
-            request,
-            start_to_close_timeout=timeout,
-            **options,
+            name, request, start_to_close_timeout=timeout, **options,
         )
 
     async def _wait_repair_readback(self, delay: int) -> None:
@@ -568,6 +597,16 @@ class DeliveryWorkflow:
             delay = min(delay * 2, 30)
 
     async def _project(self, spec: dict[str, Any], event: str, message: str) -> None:
+        if getattr(self, "delivery_clock", None) is not None:
+            from .delivery_limits import observe
+
+            if (event in {"delivered", "blocked", "cancelled"} and not (
+                event == "delivered" and spec.get("merge_version") == 1
+                and spec.get("merge_reconciliation_version") == 1
+            )):
+                self.delivery_limits_closing = True
+            if not self.delivery_limit_reached:
+                observe(self)
         # A bounded terminal projection makes the readback projections nested in
         # it (tracker_pending inside the terminal tracker loop) non-fatal, so a
         # stop never ends unproven. Recorded histories keep raising.
@@ -631,19 +670,59 @@ class DeliveryWorkflow:
         if (event == "delivered" and spec.get("merge_version") == 1
                 and not self.terminal_reconciliation_only):
             try:
-                merged = await self._activity("delivery_merge", {
-                    "spec": spec, "candidate": self.state.get("candidate"),
-                    "pull_request": self.state.get("pull_request"),
-                    "checks": self.state["checks"],
-                })
+                merge_deadline = workflow.now() + timedelta(
+                    seconds=spec["policy"].get("ci_wait_seconds", 1800))
+                while True:
+                    if (spec.get("merge_reconciliation_version") == 1
+                            and self.cancel_requested):
+                        pending = self.state["checks"].get("merge", {})
+                        uncertain = pending.get("reason") in {
+                            "original_target_update_readback", "target_update_submitted"}
+                        merged = {"state": "unknown" if uncertain else "cancelled",
+                                  "reason": self.state.get("error")
+                                  or "cancelled while waiting for merge"}
+                        break
+                    merged = await self._activity("delivery_merge", {
+                        "spec": spec, "candidate": self.state.get("candidate"),
+                        "pull_request": self.state.get("pull_request"),
+                        "checks": self.state["checks"],
+                    })
+                    self.state["checks"]["merge"] = merged
+                    if (spec.get("merge_reconciliation_version") != 1
+                            or merged.get("state") != "pending"):
+                        break
+                    if workflow.now() >= merge_deadline:
+                        # An unconfirmed remote write retains ownership. A CI-only
+                        # wait can stop with all local and remote effects settled.
+                        uncertain = merged.get("reason") in {
+                            "original_target_update_readback", "target_update_submitted"}
+                        merged = {"state": "unknown" if uncertain else "blocked",
+                                  "reason": "final current-target CI/readback deadline reached"}
+                        break
+                    self.state.update(phase="merging", execution_state="running", outcome=None)
+                    self.state["revision"] += 1
+                    await self._project(
+                        spec, "merge_pending", merged.get("reason", "Merge pending"))
+                    await workflow.sleep(timedelta(seconds=30))
             except Exception as exc:
                 merged = {"state": "unknown", "reason": type(exc).__name__}
             self.state["checks"]["merge"] = merged
-            if merged.get("state") != "confirmed":
+            self.delivery_limits_closing = True
+            if merged.get("state") == "cancelled":
+                self.state.update(phase="cancelled", execution_state="terminal",
+                                  outcome="cancelled", error=merged["reason"])
+                event, message = "cancelled", merged["reason"]
+            elif merged.get("state") != "confirmed":
+                reason = (merged.get("reason", "merge endpoint is unconfirmed")
+                          if spec.get("merge_reconciliation_version") == 1
+                          else "merge endpoint is unconfirmed")
                 self.state.update(phase="blocked", execution_state="blocked", outcome="blocked",
-                                  error="merge endpoint is unconfirmed")
-                event, message = "blocked", "Merge requires authenticated recovery"
+                                  error=reason)
+                event, message = "blocked", (reason if spec.get("merge_reconciliation_version") == 1
+                                              else "Merge requires authenticated recovery")
             else:
+                self.state.update(phase="delivered", execution_state="terminal",
+                                  outcome="delivered")
                 message = "Verified candidate merged and its issue closed"
         if (event in {"delivered", "blocked", "cancelled"}
                 and spec.get("terminal_tracker_version") == 1
@@ -1327,6 +1406,11 @@ class DeliveryWorkflow:
 
     @workflow.run
     async def run(
+        self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return await delivery_limits.run(self, spec, recovery, self._run_recorded)
+
+    async def _run_recorded(
         self, spec: dict[str, Any], recovery: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         # Marker for this change set's bounded-stop commands only, evaluated before

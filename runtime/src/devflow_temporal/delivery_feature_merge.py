@@ -11,7 +11,7 @@ from .contracts import canonical_json, digest
 from .delivery_execution_registry import OwnershipConflict, UnresolvedEffect
 from .delivery_feature_execution import registry
 from .delivery_feature_pass import checkpoints as current_checkpoints
-from .delivery_feature_publication import current_record, live_members
+from .delivery_feature_publication import current_record, live_members, observe_members
 from .delivery_feature_workflow import publication
 from .delivery_github_contract import GitHubDelivery, ordered_chunks
 from .delivery_merge import MergeBroker, native_implementation_output, require_merge_gates
@@ -56,7 +56,7 @@ def authorize(store, spec, requested, command, *, settlement=False):
         return {"kind": "explicit_instruction", "command": command, "publication": requested}
 
 
-def evidence(store, parent, record, live, gh):
+def evidence(store, parent, record, live, gh, *, original_only=False):
     checkpoints = current_checkpoints(parent)
     members = record["manifest"]["publication"]["members"]
     if len(members) != len(ordered_chunks(record["manifest"]["plan"])):
@@ -114,7 +114,7 @@ def evidence(store, parent, record, live, gh):
         observe_finalized_resources(spec)
         commit = gh.api(f"repos/{spec['github_repo']}/git/commits/{member['head']}")
         tree = commit["tree"]["sha"]
-        if not remote["merged"]:
+        if not remote["merged"] and not original_only:
             if native_stack and index and predecessor is None:
                 raise OwnershipConflict("native stack predecessor has no current hosted CI binding")
             predecessor = MergeBroker(store, spec).live_ci(
@@ -233,13 +233,20 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
     with shared.mutation(token):
         hierarchy(spec, record, gh)
         # Closed, moved, retargeted or out-of-order merged layers stop here by name.
-        live = live_members(spec, record, gh)
+        reconciling = spec.get("merge_reconciliation_version") == 1
+        live = (observe_members(spec, record, gh)[0] if reconciling
+                else live_members(spec, record, gh))
         members = record["manifest"]["publication"]["members"]
         prior = shared.effect(token["issue_id"], key)
         if prior:
             if prior["kind"] != "feature_merge" or prior["request"]["authority"] != authority:
                 raise OwnershipConflict("original merge authority changed")
             trees = prior["request"]["trees"]
+            if reconciling:
+                members = prior["request"]["members"]
+                if any(raw["head"]["sha"] != member["head"]
+                       for member, raw in zip(members, live, strict=True)):
+                    raise OwnershipConflict("submitted merge lost its qualified final heads")
             intent = {"fresh": False, "state": prior["state"]}
             submissions = (prior["result"] or {}).get("submissions", [])
         else:
@@ -255,14 +262,30 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
                 waiting = _drafts(members, live)
                 if waiting:
                     return waiting
-                target = _moved_target(store, spec, members, live, gh)
-                if target:
-                    return {"state": "needs_integration", "target": target}
-            trees = evidence(store, spec, record, live, gh)
+                if not reconciling:
+                    target = _moved_target(store, spec, members, live, gh)
+                    if target:
+                        return {"state": "needs_integration", "target": target}
+            if reconciling:
+                from .delivery_merge_reconciliation import feature as qualify_final_stack
+
+                # Original local/role evidence stays tied to its unchanged source.
+                # Current-target CI then qualifies the mechanically combined stack.
+                evidence(store, spec, record, live, gh, original_only=True)
+                qualified = qualify_final_stack(store, spec, record, live)
+                if qualified["state"] != "ready":
+                    return qualified
+                members, trees = qualified["members"], qualified["trees"]
+            else:
+                trees = evidence(store, spec, record, live, gh)
             if cancelled and cancelled.is_set():
                 raise OwnershipConflict("merge cancelled before submission")
             intent = shared.intent(
-                token, key, "feature_merge", {"authority": authority, "trees": trees}
+                token, key, "feature_merge", {
+                    "authority": authority, "trees": trees,
+                    **({"members": members, "reconciliation": qualified["bindings"]}
+                       if reconciling else {}),
+                }
             )
             submissions = []
         if not all(item["merged"] for item in live):
@@ -284,7 +307,7 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
                 waiting = _drafts(members, live)
                 if waiting:
                     return waiting
-                if _moved_target(store, spec, members, live, gh):
+                if not reconciling and _moved_target(store, spec, members, live, gh):
                     raise OwnershipConflict(
                         _refused(submissions) + "; the trunk has moved since, so the stack "
                         "needs re-integration")
@@ -336,7 +359,11 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
                                "exit_code": result.returncode,
                                "stderr": (getattr(result, "stderr", None) or "")[-2000:]}
             shared.note_effect(token, key, {"submissions": submissions})
-            live = live_members(spec, record, gh)
+            live = (observe_members(spec, record, gh)[0] if reconciling
+                    else live_members(spec, record, gh))
+            if reconciling and any(raw["head"]["sha"] != member["head"]
+                                   for member, raw in zip(members, live, strict=True)):
+                raise OwnershipConflict("merge readback differs from the final qualified heads")
             if not all(item["merged"] for item in live):
                 return {
                     "state": "pending",

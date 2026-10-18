@@ -772,3 +772,16 @@ def test_native_prechecks_preserve_unregistered_historical_workspace_modules(tmp
     assert (destination / 'preserved').read_text() == 'historical ignored modules'
     assert str(destination) not in read_private(resources.manifest)['roots']
     assert broker.candidate() == candidate
+
+
+@pytest.mark.parametrize('relative', ['.', 'runtime/src', '..'])
+def test_temporary_cleanup_cannot_register_installed_controller(tmp_path, relative):
+    from devflow_temporal import delivery_resources
+
+    installed = Path(delivery_resources.__file__).resolve().parents[3]
+    protected = (installed / relative).resolve()
+    owned = spec(tmp_path, 'protected-runtime')
+    owned['checkout'] = str(protected)
+    with pytest.raises(ValueError, match='cannot own the installed runtime'):
+        RunResources(owned).register(protected, 'checkout')
+    assert installed.is_dir() and (installed / 'runtime/src').is_dir()

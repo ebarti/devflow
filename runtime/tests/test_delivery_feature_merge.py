@@ -83,6 +83,18 @@ class Remote(GitHubDelivery):
 
 def setup_feature(service, monkeypatch):
     store, request, snapshot = feature_service(service, monkeypatch)
+    # These fixtures qualify the retained per-layer protocol. New final-target
+    # reconciliation has real Git and effect-journal coverage in its own module.
+    from devflow_temporal.delivery_config import DeliveryConfig
+
+    admitted = DeliveryConfig.admit
+
+    def historical(self, request, **kwargs):
+        spec = admitted(self, request, **kwargs)
+        spec.pop("merge_reconciliation_version", None)
+        return spec
+
+    monkeypatch.setattr(DeliveryConfig, "admit", historical)
     store.submit(request)
     spec = store.effective_spec(request["run_id"])
     value = json.loads(request["accepted_plan"])

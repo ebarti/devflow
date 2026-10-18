@@ -54,7 +54,12 @@ that wait. A cancellation still settles the original operation before handoff.
 
 ## Controls and states
 
-Enable new admissions with `feature_delivery_version: 1` after custody migration.
+Ordinary issue execution is the default. Leave `feature_delivery_version` absent
+or null to deliver one issue as one PR. Enable decomposition explicitly with
+`feature_delivery_version: 1` only for a large issue that benefits from workstreams
+and chunks, after custody migration. The current installed service leaves it off.
+See [delivery corrective actions](delivery-corrective-actions.md) for timing,
+assessment batching, merge reconciliation and real-work trial limits.
 `max_repairs` defaults to 10 and is shared by all workstreams and plan corrections.
 A supported **Continue this feature** admission grants one fresh configured allowance
 when the server authenticates a new installed runtime payload descending from the
@@ -141,20 +146,22 @@ chunk of a child with several required chunks. The runtime closes the child afte
 all its required chunks merge and closes the parent after the whole accepted
 feature merges. See [GitHub's documented linking semantics](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue).
 
-If the target advances, the coordinator creates a new integration pass and
-rechecks every layer in dependency order. Unique local branches preserve earlier
-worker artifacts. Each new candidate incorporates its existing PR head and the
-updated preceding layer, then advances the same remote branch without a force
-push. The stack ID and PR numbers remain unchanged. Earlier verification remains
-immutable and only the new pass qualifies for merging. This consumes one repair
-cycle for the integration pass, plus any product repairs its gates require. A
-changed publication receives a fresh merge decision unless the admitted endpoint
-already authorizes merging. Issue identities and parent links are checked again
-before merge and closure. Confirmed PR observations update locally immediately.
-An imported complete chunk may pass implementation without further edits when it
-matches its authenticated preparation receipt; every normal verification gate
-still runs. Stopped integration workers retain both their private local branch
-and the exact original PR binding when they resume.
+New admissions carry `merge_reconciliation_version: 1`. If main advances, merge
+qualification keeps the accepted plan, PRs, stack and original role evidence. The
+controller uses GitHub's expected-head branch update to combine the target with
+each published layer. It authenticates the resulting parents and tree against the
+exact prior GitHub test merge, then requires fresh current-target CI through the
+final whole-feature layer. It does not reopen chunk workers or charge a product
+repair just because main moved. The original source heads stay in the accepted
+publication; merge receipts bind them to the mechanically combined heads and trees.
+An unconfirmed update is read back under the original ownership and never blindly
+resubmitted. A conflicting merge retains both sides and surfaces the conflict;
+choosing an opposing product direction requires the user. Merge and closure still
+check issue identities, parent links, strict branch rules and actual merged trees.
+
+Retained executions without that marker keep their recorded per-layer integration
+protocol for replay. Earlier verification and implementation artifacts remain
+immutable. Confirmed PR observations update locally immediately.
 
 Feature and workstream status changes are projected through the existing
 transactional outbox and independent Project synchronizer. A Project outage leaves
