@@ -158,3 +158,90 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         assert seen == [(factory, config) for factory in (
             "read", "write", "write", "read", "write", "read",
         )]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('tool', 'method'), [
+    ('start_service', 'service'), ('submit_run', 'submit'),
+    ('answer_decision', 'decision'), ('continue_feature', 'continue_feature'),
+    ('revise_feature_plan', 'revise_feature_plan'), ('merge_feature', 'decision'),
+    ('cancel_run', 'cancel'), ('reconcile_tracker', 'reconcile_tracker'),
+    ('admit_gates_only', 'admit_gates_only'), ('continue_repair', 'continue_repair'),
+])
+async def test_mutations_start_and_forward_off_the_mcp_loop_once(monkeypatch, tool, method):
+    calls = []
+    payload = {'command_id': 'same-authority', 'expected_revision': 13, 'answer': 'merge'}
+
+    def startup(path):
+        calls.append(('startup', path))
+        # The real lifecycle readiness helpers use asyncio.run too. Close the
+        # coroutine if the old on-loop adapter rejects it before execution.
+        readiness = asyncio.sleep(0)
+        try:
+            asyncio.run(readiness)
+        finally:
+            readiness.close()
+
+        def forward(*args):
+            with pytest.raises(RuntimeError, match='no running event loop'):
+                asyncio.get_running_loop()
+            calls.append((method, args))
+            return {'forwarded': method}
+
+        return SimpleNamespace(**{method: forward})
+
+    monkeypatch.setattr('devflow_temporal.delivery_mcp.client', startup)
+    args = {} if tool == 'start_service' else {'request_json': json.dumps(payload)}
+    if tool not in {'start_service', 'submit_run'}:
+        args['run_id'] = 'same-run'
+    async with create_connected_server_and_client_session(build_server(Path('/fixture/config'))) as session:
+        result = await session.call_tool(tool, args)
+        assert not result.isError, result.content
+        assert json.loads(result.content[0].text) == {'forwarded': method}
+    expected = (() if tool == 'start_service' else (payload,) if tool == 'submit_run'
+                else ('same-run', payload))
+    assert calls == [('startup', Path('/fixture/config')), (method, expected)]
+
+
+@pytest.mark.asyncio
+async def test_uncertain_mcp_mutation_is_not_replayed(monkeypatch):
+    calls = []
+
+    def startup(_path):
+        calls.append('startup')
+
+        def uncertain(*_args):
+            calls.append('mutation')
+            raise RuntimeError('response lost after external effect')
+
+        return SimpleNamespace(continue_repair=uncertain)
+
+    monkeypatch.setattr('devflow_temporal.delivery_mcp.client', startup)
+    async with create_connected_server_and_client_session(build_server(Path('/fixture/config'))) as session:
+        result = await session.call_tool('continue_repair', {
+            'run_id': 'same-run', 'request_json': '{"command_id":"stable"}',
+        })
+        assert result.isError
+    assert calls == ['startup', 'mutation']
+
+
+@pytest.mark.asyncio
+async def test_async_submission_keeps_per_request_origin_and_rejects_mismatch(monkeypatch):
+    first = '11111111-1111-4111-8111-111111111111'
+    second = '22222222-2222-4222-8222-222222222222'
+    monkeypatch.setenv('CODEX_THREAD_ID', '33333333-3333-4333-8333-333333333333')
+    seen = []
+    monkeypatch.setattr('devflow_temporal.delivery_mcp.client', lambda _: SimpleNamespace(
+        submit=lambda request: (seen.append(request.copy()) or request)))
+    async with create_connected_server_and_client_session(build_server(Path('/fixture/config'))) as session:
+        for origin in (first, second):
+            result = await session.call_tool('submit_run', {
+                'request_json': '{"command_id":"per-request"}',
+            }, meta={'threadId': origin})
+            assert not result.isError
+            assert json.loads(result.content[0].text)['origin_thread_id'] == origin
+        mismatch = await session.call_tool('submit_run', {
+            'request_json': json.dumps({'command_id': 'no-write', 'origin_thread_id': first}),
+        }, meta={'threadId': second})
+        assert mismatch.isError
+    assert [request['origin_thread_id'] for request in seen] == [first, second]

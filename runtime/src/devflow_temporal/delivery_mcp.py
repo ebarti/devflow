@@ -46,18 +46,26 @@ def build_server(config_path: Path) -> FastMCP:
         readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
     )
 
+    async def forward_write(method: str, *args) -> dict:
+        # Startup performs synchronous Temporal readiness work using asyncio.run.
+        # Both client creation and its one mutation belong outside the MCP loop.
+        def invoke() -> dict:
+            return getattr(client(config_path), method)(*args)
+
+        return await asyncio.to_thread(invoke)
+
     @server.tool(annotations=read)
     def get_service() -> dict:
         """Read local health and public policy; report unavailable if stopped."""
         return read_only_client(config_path).service()
 
     @server.tool(annotations=write)
-    def start_service() -> dict:
+    async def start_service() -> dict:
         """Start for an authorized delivery or mutation; may activate pending work."""
-        return client(config_path).service()
+        return await forward_write("service")
 
     @server.tool(annotations=write)
-    def submit_run(request_json: str, ctx: Context) -> dict:
+    async def submit_run(request_json: str, ctx: Context) -> dict:
         """Submit a goal with publication_summary for detailed execution instructions.
 
         Preserve the original goal; detailed or multi-sentence instructions require
@@ -73,7 +81,7 @@ def build_server(config_path: Path) -> FastMCP:
             raise ValueError("submit request must be a JSON object")
         meta = ctx.request_context.meta
         metadata = meta.model_dump(by_alias=True) if meta is not None else None
-        return client(config_path).submit(bind_origin(value, metadata_origin(metadata)))
+        return await forward_write("submit", bind_origin(value, metadata_origin(metadata)))
 
     @server.tool(annotations=read)
     def list_runs(limit: int = 50, cursor: str | None = None, archived: bool = False) -> dict:
@@ -91,12 +99,12 @@ def build_server(config_path: Path) -> FastMCP:
         return read_only_client(config_path).evidence(run_id, evidence_id)
 
     @server.tool(annotations=write)
-    def answer_decision(run_id: str, request_json: str) -> dict:
+    async def answer_decision(run_id: str, request_json: str) -> dict:
         """Answer a question, review a plan, or authorize the recorded feature merge."""
-        return client(config_path).decision(run_id, json.loads(request_json))
+        return await forward_write("decision", run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
-    def continue_feature(run_id: str, request_json: str) -> dict:
+    async def continue_feature(run_id: str, request_json: str) -> dict:
         """Continue a stopped feature's exact plan and stack under a successor run.
 
         Supply command_id and expected_revision from the current projection.
@@ -106,10 +114,10 @@ def build_server(config_path: Path) -> FastMCP:
         files with added_paths, amended_config_path and amended_config_sha256;
         the private config must change only that exact appended file list.
         """
-        return client(config_path).continue_feature(run_id, json.loads(request_json))
+        return await forward_write("continue_feature", run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
-    def revise_feature_plan(run_id: str, request_json: str) -> dict:
+    async def revise_feature_plan(run_id: str, request_json: str) -> dict:
         """Request native investigation and review of a stopped feature's planning defect.
 
         Supply command_id, expected_revision from feature_plan.expected_revision
@@ -126,10 +134,10 @@ def build_server(config_path: Path) -> FastMCP:
         before admission. Normal approval and adoption checks still apply.
         Keep the full request stable after an uncertain response.
         """
-        return client(config_path).revise_feature_plan(run_id, json.loads(request_json))
+        return await forward_write("revise_feature_plan", run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
-    def merge_feature(run_id: str, request_json: str) -> dict:
+    async def merge_feature(run_id: str, request_json: str) -> dict:
         """Merge on explicit user instruction using the pending merge decision's revisions.
 
         Read get_run and copy decision_id, decision_revision, candidate_revision,
@@ -139,14 +147,14 @@ def build_server(config_path: Path) -> FastMCP:
         request = json.loads(request_json)
         if request.get("answer") != "merge":
             raise ValueError("merge_feature requires the explicit merge decision")
-        return client(config_path).decision(run_id, request)
+        return await forward_write("decision", run_id, request)
 
     @server.tool(annotations=ToolAnnotations(
         readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
     ))
-    def cancel_run(run_id: str, request_json: str) -> dict:
+    async def cancel_run(run_id: str, request_json: str) -> dict:
         """Request a role-boundary cancellation with command ID and expected revision."""
-        return client(config_path).cancel(run_id, json.loads(request_json))
+        return await forward_write("cancel", run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
     async def disable_delivery_limits(run_id: str, request_json: str) -> dict:
@@ -162,9 +170,9 @@ def build_server(config_path: Path) -> FastMCP:
         )
 
     @server.tool(annotations=write)
-    def reconcile_tracker(run_id: str, request_json: str) -> dict:
+    async def reconcile_tracker(run_id: str, request_json: str) -> dict:
         """Resume three terminal readback attempts; no candidate or model authority changes."""
-        return client(config_path).reconcile_tracker(run_id, json.loads(request_json))
+        return await forward_write("reconcile_tracker", run_id, json.loads(request_json))
 
 
     @server.tool(annotations=read)
@@ -173,9 +181,9 @@ def build_server(config_path: Path) -> FastMCP:
         return read_only_client(config_path).gates_only_preflight(run_id)
 
     @server.tool(annotations=write)
-    def admit_gates_only(run_id: str, request_json: str) -> dict:
+    async def admit_gates_only(run_id: str, request_json: str) -> dict:
         """One explicit investigation admission: same iteration, all gates, no implementation."""
-        return client(config_path).admit_gates_only(run_id, json.loads(request_json))
+        return await forward_write("admit_gates_only", run_id, json.loads(request_json))
 
     @server.tool(annotations=read)
     def repair_admission_preflight(run_id: str, request_json: str) -> dict:
@@ -184,9 +192,9 @@ def build_server(config_path: Path) -> FastMCP:
             run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
-    def continue_repair(run_id: str, request_json: str) -> dict:
+    async def continue_repair(run_id: str, request_json: str) -> dict:
         """Admit the existing one-time stopped-run repair with its exact command identity."""
-        return client(config_path).continue_repair(run_id, json.loads(request_json))
+        return await forward_write("continue_repair", run_id, json.loads(request_json))
 
     return server
 
