@@ -1385,8 +1385,9 @@ class DeliveryBroker:
             native_projects=[c['cwd'] for c in checks if c['id'].startswith('planned-vitest-')],
         )
 
-    def run_browser_qa(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
-        return execute_browser_qa(self, iteration, candidate)
+    def run_browser_qa(self, iteration: int, candidate: dict[str, Any], *,
+                       reconcile_only: bool = False) -> dict[str, Any]:
+        return execute_browser_qa(self, iteration, candidate, reconcile_only=reconcile_only)
 
     def _legacy_published_base(self, found: dict[str, Any], *, read_only: bool = False) -> str:
         """Authenticate an unchanged published target independently of its tip."""

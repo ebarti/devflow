@@ -20,6 +20,12 @@ from .delivery_output import observed_test_count, rejection_causes, visible_outp
 from .delivery_sandbox import prepare_browser_qa, trusted_local
 
 
+# Full, every-page PDF evidence has many small files. Bound the aggregate bytes
+# as well as the entry count, instead of treating 128 files as a failed runtime.
+MAX_BROWSER_ARTIFACTS = 2048
+MAX_BROWSER_ARTIFACT_BYTES = 50 * 1024 * 1024
+
+
 def _hash(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -46,6 +52,7 @@ def _ports_free(ports: tuple[int, int]) -> None:
 
 def _artifacts(checkout: Path, configured: list[str]) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
+    total_bytes = 0
     for relative in configured:
         root = checkout / relative
         if not root.exists():
@@ -57,9 +64,12 @@ def _artifacts(checkout: Path, configured: list[str]) -> list[dict[str, Any]]:
                 raise ValueError("browser QA artifact follows a symlink")
             if not path.is_file():
                 continue
-            if len(found) >= 128 or path.stat().st_size > 50 * 1024 * 1024:
+            size = path.stat().st_size
+            if (len(found) >= MAX_BROWSER_ARTIFACTS
+                    or size > MAX_BROWSER_ARTIFACT_BYTES - total_bytes):
                 raise ValueError("browser QA artifact set exceeds the evidence bound")
-            found.append({"path": str(path), "sha256": _hash(path), "size": path.stat().st_size})
+            total_bytes += size
+            found.append({"path": str(path), "sha256": _hash(path), "size": size})
     return found
 
 
@@ -93,7 +103,8 @@ def _playwright_evidence(qa: dict, checkout: Path) -> tuple[list[str], dict[str,
             {"PLAYWRIGHT_JUNIT_OUTPUT_FILE": str(root / "junit.xml")})
 
 
-def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
+def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any], *,
+                   reconcile_only: bool = False) -> dict[str, Any]:
     from .delivery_native_guard import validate_native_turn
     from .delivery_native_process import NativeProcess
     from .delivery_preparation import verify_prepared_spec
@@ -114,6 +125,14 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "ports": qa["ports"],
         "argv": qa["argv"],
     }
+    folder = broker.evidence_dir / "browser-qa" / str(iteration)
+    if reconcile_only:
+        original = read_private(folder / "native" / "native-process.json")
+        if (original.get("phase") != "finished"
+                or original.get("monitoring_complete") is not True
+                or not isinstance(original.get("result"), dict)
+                or original["result"].get("interrupted_monitor") is True):
+            raise ValueError("browser reconciliation requires a completed native verdict")
     selector_sources = []
     if qa.get("required_selectors"):
         checkout = broker.gate_checkout("verify", iteration, candidate).resolve(strict=True)
@@ -132,7 +151,6 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     cwd = (checkout / qa.get("cwd", ".")).resolve(strict=True)
     if checkout not in (cwd, *cwd.parents):
         raise ValueError("browser QA cwd escaped the gate checkout")
-    folder = broker.evidence_dir / "browser-qa" / str(iteration)
     private_directory(folder)
     receipt = folder / "receipt.json"
     if receipt.exists():
@@ -173,7 +191,16 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "cwd": cwd, "environment": environment, "timeout": qa["timeout_seconds"],
         "ports": ports, "cancelled": broker._native_cancelled,
     }
-    process = broker._run_native_check(NativeProcess(spec, folder / "native", **options))
+    native = NativeProcess(spec, folder / "native", **options)
+    if reconcile_only:
+        if read_private(native.journal)["intent"] != native._intent():
+            raise ValueError("completed browser native authority changed")
+        observed = broker._reconcile_native_check(native.journal)
+        if observed["cleanup"] != "observed-native-confirmed":
+            raise ValueError("completed browser cleanup remains unknown")
+        process = read_private(native.journal)["result"]
+    else:
+        process = broker._run_native_check(native)
     interrupted = []
     if process.get("interrupted_monitor") is True:
         # A lost monitor yields no verdict. One fresh invocation re-runs the
@@ -216,15 +243,21 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
     ], test_results=True)
     rejected = bool(causes)
     artifacts = []
-    for index, item in enumerate(_artifacts(checkout, qa.get("artifact_paths", []))):
-        original = Path(item["path"])
-        destination = folder / "artifacts" / str(index) / original.name
-        private_directory(destination.parent)
-        if not destination.exists():
-            _write_new(destination, original.read_bytes())
-        if _hash(destination) != item["sha256"]:
-            raise ValueError("native browser artifact changed while preserving evidence")
-        artifacts.append({**item, "source": str(original), "path": str(destination)})
+    evidence_failures = []
+    try:
+        for index, item in enumerate(_artifacts(checkout, qa.get("artifact_paths", []))):
+            original = Path(item["path"])
+            destination = folder / "artifacts" / str(index) / original.name
+            private_directory(destination.parent)
+            if not destination.exists():
+                _write_new(destination, original.read_bytes())
+            if _hash(destination) != item["sha256"]:
+                raise ValueError("native browser artifact changed while preserving evidence")
+            artifacts.append({**item, "source": str(original), "path": str(destination)})
+    except (ValueError, OSError) as exc:
+        # Supervision already established cleanup above. A rejected evidence
+        # set fails this gate; it cannot erase the completed process result.
+        evidence_failures.append(f"browser artifact collection failed: {exc}")
     selector_receipts = None
     selector_failure = None
     if selector_sources:
@@ -232,6 +265,8 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
             selector_receipts = selector_evidence(qa, checkout, selector_sources, playwright=output)
         except (ValueError, OSError) as exc:
             selector_failure = str(exc)
+    if selector_failure:
+        evidence_failures.append(selector_failure)
     unchanged = candidate_for(checkout)["id"] == candidate["id"]
     passed = (
         process["exit_code"] == 0
@@ -241,7 +276,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         and set(process["observed_listeners"]) == {str(port) for port in ports}
         and count >= qa["min_tests"]
         and not rejected
-        and selector_failure is None
+        and not evidence_failures
         and unchanged
     )
     result = {
@@ -255,7 +290,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "exit_code": process["exit_code"],
         "test_count": count,
         **({"selectors": selector_receipts} if selector_receipts is not None else {}),
-        **({"evidence_failure": selector_failure} if selector_failure else {}),
+        **({"evidence_failure": "; ".join(evidence_failures)} if evidence_failures else {}),
         "rejected_output": rejected,
         "rejection_causes": causes,
         "log": str(log),
@@ -267,12 +302,97 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any]) -> di
         "native_process": process,
         **({"interrupted_native_processes": interrupted} if interrupted else {}),
         "scratch": str(scratch),
-        "diagnostic": output[-2000:] if not passed else None,
+        "diagnostic": "\n".join([*evidence_failures, output[-2000:]]) if not passed else None,
     }
     write_private(receipt, result)
     result.update(receipt=str(receipt), receipt_sha256=_hash(receipt))
     broker._finish_effect(key, result)
     return result
+
+
+def reconcile_browser_attempt(store, run_id: str, iteration: int) -> dict[str, Any]:
+    """Finish evidence for one closed browser invocation, without executing it again."""
+    from .delivery_automatic_retry import _close_cleanup
+    from .delivery_broker import DeliveryBroker
+    from .delivery_interrupted_recovery import installation_recovery_lease
+    from .delivery_policy_recovery import reconciled_cleanup
+
+    with installation_recovery_lease(store.config):
+        with store._connect() as db:
+            saved = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+        if saved is None:
+            raise ValueError("browser reconciliation run is absent")
+        row = dict(saved)
+        spec = store.effective_spec(run_id)
+        checks = json.loads(row["checks_json"] or "{}")
+        historical = checks.get("browser_qa") or {}
+        if (spec.get("provider") != "codex" or not store.owns_execution(spec)
+                or spec.get("feature_worker") or spec.get("feature_delivery")
+                or row["phase"] != row["outcome"] or row["phase"] != "blocked"
+                or row["execution_state"] != "blocked"
+                or type(iteration) is not int or row["iteration"] != iteration
+                or row["error"] != "browser QA child cleanup is unknown"
+                or historical.get("state") != historical.get("cleanup")
+                or historical.get("state") != "unknown"
+                or historical.get("reason") != "ValueError" or not row["pr_json"]):
+            raise ValueError("browser reconciliation requires its closed postprocessing failure")
+        closed = store._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+        state = closed["result"]
+        recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        if (closed["workflow_id"] != row["workflow_id"]
+                or not closed["execution_run_id"] or not closed["closed_at"]
+                or closed["request_digest"] != row["request_digest"]
+                or closed["recovery_digest"] != (digest(recovery) if recovery else None)
+                or state.get("run_id") != run_id or state.get("revision") != row["protocol_revision"]
+                or any(state.get(key) != row[key] for key in
+                       ("phase", "outcome", "execution_state", "iteration", "error"))
+                or {k: v for k, v in state.get("checks", {}).items() if k != "resource_cleanup"}
+                != {k: v for k, v in checks.items() if k != "resource_cleanup"}
+                or state.get("candidate") != json.loads(row["candidate_json"])
+                or state.get("pull_request") != json.loads(row["pr_json"])
+                or state.get("tracker") != json.loads(row["tracker_json"] or "null")):
+            raise ValueError("browser reconciliation lost its exact closed execution")
+        broker = DeliveryBroker(store, spec)
+        if broker.evidence_dir != broker.state_dir:
+            namespace = str(broker.evidence_dir.relative_to(broker.state_dir).parent)
+            broker.effect_namespace = ":" + namespace
+        key = f"browser_qa:{run_id}:{iteration}" + broker.effect_namespace
+        with store._connect() as db:
+            effect = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?", (key,)).fetchone()
+            busy = (
+                db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND effect_key!=? "
+                           "AND state!='complete'", (run_id, key)).fetchone()
+                or db.execute("SELECT 1 FROM delivery_attempts WHERE run_id=? AND state!='finished'",
+                              (run_id,)).fetchone()
+                or db.execute("SELECT 1 FROM delivery_mutations WHERE run_id=? AND "
+                              "(state!='complete' OR kind='cancel')", (run_id,)).fetchone()
+            )
+        candidate = state["candidate"]
+        if (busy or effect is None or effect["run_id"] != run_id or effect["kind"] != "browser_qa"
+                or effect["state"] not in {"pending", "complete"}
+                or broker.candidate() != candidate):
+            raise ValueError("browser reconciliation has changed ownership or candidate")
+        if row["cleanup"] == "confirmed":
+            if (effect["state"] != "complete"
+                    or reconciled_cleanup(store, row, state, closed=closed) is None):
+                raise ValueError("browser cleanup has no authenticated later observation")
+            result = json.loads(effect["observed_json"])
+            if _hash(Path(result["receipt"])) != result["receipt_sha256"]:
+                raise ValueError("reconciled browser receipt changed")
+            return {"state": "finished", "cleanup": "confirmed", "changed": False,
+                    "run_id": run_id, "iteration": iteration, "gate_state": result["state"]}
+        if row["cleanup"] != "unknown":
+            raise ValueError("browser reconciliation has an unexpected cleanup state")
+        gate = broker._gate_path("verify", iteration)
+        if (not gate.is_dir() or gate.resolve(strict=True) != gate
+                or candidate_for(gate)["id"] != candidate["id"]):
+            raise ValueError("browser reconciliation lost the original gate checkout")
+        result = broker.run_browser_qa(iteration, candidate, reconcile_only=True)
+        updated = _close_cleanup(store, row, spec, closed, lambda: False, published=True)
+        return {"state": "finished", "cleanup": updated["cleanup"], "changed": True,
+                "run_id": run_id, "iteration": iteration, "gate_state": result["state"],
+                "test_count": result["test_count"], "receipt": result["receipt"],
+                "receipt_sha256": result["receipt_sha256"]}
 
 
 def browser_artifact_possible(store, spec, row):
