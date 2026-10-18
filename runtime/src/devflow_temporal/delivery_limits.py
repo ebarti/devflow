@@ -52,6 +52,9 @@ def _progress(state):
 
 
 def observe(controller):
+    control = getattr(controller, "delivery_limits_control", None)
+    if control:
+        controller.state.setdefault("checks", {})["delivery_limits_control"] = dict(control)
     if controller.delivery_clock is None:
         return
     signature = _progress(controller.state)
@@ -95,11 +98,13 @@ async def disable(controller, request):
         raise ApplicationError("command ID and bounded disable reason are required",
                                non_retryable=True)
     controller.delivery_limits_disabled = True
-    controller.state.setdefault("checks", {})["delivery_limits_control"] = {
+    controller.delivery_limits_control = {
         "disabled": True, "command_id": command, "reason": reason.strip(),
         "recorded_at": workflow.now().isoformat(),
         "protocol_revision": controller.state["revision"] + 1,
     }
+    controller.state.setdefault("checks", {})["delivery_limits_control"] = dict(
+        controller.delivery_limits_control)
     controller.state["revision"] += 1
     return controller.state
 
@@ -166,13 +171,13 @@ async def _watch(controller, spec):
 
 
 async def run(controller, spec, recovery, operation):
+    control = (((recovery or {}).get("state") or {}).get("checks", {})
+               .get("delivery_limits_control", {}))
+    controller.delivery_limits_control = dict(control) if control.get("disabled") is True else None
+    controller.delivery_limits_disabled = controller.delivery_limits_control is not None
     if spec.get("delivery_limits_version") != 1:
         return await operation(spec, recovery)
     controller.delivery_limit_policy = policy(spec["policy"])
-    controller.delivery_limits_disabled = bool(
-        ((recovery or {}).get("state") or {}).get("checks", {})
-        .get("delivery_limits_control", {}).get("disabled")
-    )
     if not controller.delivery_limit_policy and not controller.delivery_limits_disabled:
         raise ValueError("bounded delivery requires its frozen time policy")
     admitted = spec["delivery_admitted_at"]

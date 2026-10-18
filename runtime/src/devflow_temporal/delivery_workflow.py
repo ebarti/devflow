@@ -323,6 +323,7 @@ class DeliveryWorkflow:
         self.delivery_limit_reached = False
         self.delivery_limits_closing = False
         self.delivery_limits_disabled = False
+        self.delivery_limits_control = None
         self.delivery_active_activities = {}
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
@@ -599,7 +600,8 @@ class DeliveryWorkflow:
             delay = min(delay * 2, 30)
 
     async def _project(self, spec: dict[str, Any], event: str, message: str) -> None:
-        if getattr(self, "delivery_clock", None) is not None:
+        if (getattr(self, "delivery_clock", None) is not None
+                or self.delivery_limits_disabled):
             from .delivery_limits import observe
 
             if (event in {"delivered", "blocked", "cancelled"} and not (

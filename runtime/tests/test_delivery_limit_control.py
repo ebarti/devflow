@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -135,6 +135,36 @@ async def test_disabled_control_survives_recovery_without_resetting_original_clo
         return "same retained work"
 
     assert await delivery_limits.run(controller, spec, recovery, operation) == "same retained work"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bounded", [True, False])
+async def test_new_stage_retains_disabled_control_in_workflow_recovery_state(monkeypatch, bounded):
+    receipt = {"disabled": True, "command_id": "keep-control", "protocol_revision": 5}
+    recovery = {"state": {"checks": {"delivery_limits_control": receipt}}}
+    spec = ({"delivery_limits_version": 1, "delivery_admitted_at": "2026-10-18T17:00:00+00:00",
+             "policy": {"delivery_timeout_seconds": 1}} if bounded else {})
+    controller = DeliveryWorkflow()
+    controller.state = {"phase": "repair", "revision": 6, "checks": {}}
+
+    async def wait_condition(predicate, **_kwargs):
+        assert predicate()
+
+    async def project_event(_spec, _event, _message):
+        assert controller.state["checks"]["delivery_limits_control"] == receipt
+
+    monkeypatch.setattr(delivery_limits.workflow, "wait_condition", wait_condition)
+    monkeypatch.setattr(delivery_limits.workflow, "now", lambda: datetime(2026, 10, 18, tzinfo=UTC))
+    monkeypatch.setattr(controller, "_project_event", project_event)
+
+    async def next_stage(_spec, _recovery):
+        # Implementation and recovery paths clear candidate checks between stages.
+        controller.state["checks"] = {}
+        await controller._project(spec, "role_started", "Repair role started")
+        return controller.state
+
+    result = await delivery_limits.run(controller, spec, recovery, next_stage)
+    assert result["checks"]["delivery_limits_control"] == receipt
 
 
 @pytest.mark.asyncio
