@@ -2641,6 +2641,7 @@ class DeliveryWorkflow:
                     spec, "published", "Regular pull request read back at candidate head"
                 )
             repair_findings = []
+            collect_assessments = spec.get("assessment_batch_version") == 1
             qa_evidence = None
             browser_before_review = workflow.patched("browser-qa-before-assessment-v1")
             checks_before_review = (workflow.patched("local-checks-before-review-v1")
@@ -2670,6 +2671,8 @@ class DeliveryWorkflow:
                             cause=exc,
                         )
                     self.state["checks"]["local"] = checked
+                    if collect_assessments and checked.get("source_unchanged") is False:
+                        return await self._stop(spec, "local checks changed the assessed source")
                     if checked.get("state") == "unknown" or checked.get("cleanup") == "unknown":
                         if self.launch_window_v1 and checked.get("cleanup") == "confirmed":
                             return await self._stop(spec, "local check gate produced no verdict")
@@ -2688,7 +2691,8 @@ class DeliveryWorkflow:
                         repair_findings.extend(
                             _broker_findings("local_checks", checked, iteration=iteration)
                         )
-                        break
+                        if not collect_assessments:
+                            break
                 if (role == ("review" if browser_before_review and not verify_only else "verify")
                         and spec["policy"].get("browser_qa")):
                     self.state["phase"] = "browser_qa"
@@ -2726,19 +2730,21 @@ class DeliveryWorkflow:
                         repair_findings.extend(
                             _broker_findings("browser_qa", browser_qa, iteration=iteration)
                         )
-                        break
-                    qa_evidence = {
-                        "path": browser_qa["receipt"],
-                        "sha256": browser_qa["receipt_sha256"],
-                        "log": browser_qa["log"],
-                        "log_sha256": browser_qa["log_sha256"],
-                        "candidate_id": self.state["candidate"]["id"],
-                        "iteration": iteration,
-                    }
-                    self.state["revision"] += 1
-                    await self._project(
-                        spec, "browser_qa_passed", "Owned browser/API QA receipt is ready"
-                    )
+                        if not collect_assessments:
+                            break
+                    else:
+                        qa_evidence = {
+                            "path": browser_qa["receipt"],
+                            "sha256": browser_qa["receipt_sha256"],
+                            "log": browser_qa["log"],
+                            "log_sha256": browser_qa["log_sha256"],
+                            "candidate_id": self.state["candidate"]["id"],
+                            "iteration": iteration,
+                        }
+                        self.state["revision"] += 1
+                        await self._project(
+                            spec, "browser_qa_passed", "Owned browser/API QA receipt is ready"
+                        )
                 self.state["phase"] = role
                 self.state["revision"] += 1
                 await self._project(spec, "role_started", role + " role started")
@@ -2773,6 +2779,9 @@ class DeliveryWorkflow:
                 self.state["usage"][f"{role}:{iteration}"] = result.get("usage")
                 if self.cancel_requested:
                     return await self._cancelled(spec)
+                if collect_assessments and result.get("cleanup") == "unknown":
+                    self.state["cleanup"] = "unknown"
+                    return await self._stop(spec, f"{role} cleanup is unknown")
                 if result.get("candidate", {}).get("id") != self.state["candidate"]["id"]:
                     return await self._stop(spec, f"{role} assessed a stale candidate")
                 if (
@@ -2789,7 +2798,8 @@ class DeliveryWorkflow:
                     if self._capture_planning_defect(spec, result):
                         return await self._stop(spec, role + " revealed a planning defect")
                     repair_findings.extend(result.get("findings") or [f"{role} did not pass"])
-                    break
+                    if not collect_assessments:
+                        break
             if repair_findings:
                 self.state["findings"].extend(repair_findings)
                 if self.post_publish_v1:

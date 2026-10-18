@@ -591,6 +591,8 @@ class DeliveryConfig:
             "policy": policy,
             "policy_digest": digest(policy),
             "workflow_failure_boundary_version": 1,
+            "assessment_batch_version": 1,
+            "validation_schedule_version": 1,
             "config_digest": digest(self.raw),
             "config_path": str(self.path),
         }
@@ -686,7 +688,8 @@ def scope_amended_spec(
     if "blocking_questions_version" not in original:
         effective.pop("blocking_questions_version")
     for marker in ("automatic_retry_version", "retry_budget_version", "baseline_checks_version",
-                   "merge_version", "workflow_failure_boundary_version"):
+                   "merge_version", "workflow_failure_boundary_version",
+                   "assessment_batch_version", "validation_schedule_version"):
         if marker in original:
             effective[marker] = original[marker]
         else:

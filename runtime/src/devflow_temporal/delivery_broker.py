@@ -1350,12 +1350,16 @@ class DeliveryBroker:
         if self.spec["provider"] == "codex" and not _git(
                 self.checkout, "status", "--porcelain=v1", "--untracked-files=all"):
             checkout = self.gate_checkout("verify", iteration, candidate)
-        return self._run_check_list(
-            checkout,
-            self.spec["policy"].get("prepublish_checks", []),
-            self.evidence_dir / "prechecks" / str(iteration),
-            candidate,
-        )
+        from .delivery_validation_schedule import prepublication
+
+        checks, deferred = prepublication(self.spec)
+        result = (self._run_check_list(
+            checkout, checks, self.evidence_dir / "prechecks" / str(iteration), candidate,
+        ) if checks else {"state": "passed", "results": [],
+                          "candidate_id": candidate["id"], "source_unchanged": True})
+        if deferred:
+            result["deferred_to_checks"] = deferred
+        return result
 
     def run_checks(self, iteration: int, candidate: dict[str, Any]) -> dict[str, Any]:
         checkout = self.gate_checkout("verify", iteration, candidate)

@@ -35,6 +35,10 @@ def require_merge_gates(spec, candidate, pr, checks, attempts, publication):
                 or result.get("candidate_id") != (origin_id if stage == "prepublish"
                                                  else candidate["id"])):
             raise ValueError(stage + " has not passed for this candidate")
+    if spec.get("validation_schedule_version") == 1:
+        from .delivery_validation_schedule import require_deferred_checks
+
+        require_deferred_checks(spec, checks["prepublish"], checks["local"])
     if spec["policy"].get("browser_qa"):
         result = checks.get("browser_qa", {})
         if (result.get("state") != "passed" or result.get("cleanup") != "confirmed"
