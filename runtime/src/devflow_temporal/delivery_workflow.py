@@ -322,6 +322,7 @@ class DeliveryWorkflow:
         self.delivery_limit_policy = {}
         self.delivery_limit_reached = False
         self.delivery_limits_closing = False
+        self.delivery_limits_disabled = False
         self.delivery_active_activities = {}
 
     async def _activity(self, name: str, request: dict[str, Any], *, hours: int = 2) -> Any:
@@ -523,7 +524,8 @@ class DeliveryWorkflow:
                     "NativeProcessUnknown",
                 ],
             )
-        if getattr(self, "delivery_clock", None) is not None:
+        if (getattr(self, "delivery_clock", None) is not None
+                and not self.delivery_limits_disabled):
             from .delivery_limits import SETTLEMENT, expire, remaining
 
             if name not in SETTLEMENT and not self.delivery_limits_closing:
@@ -2976,6 +2978,10 @@ class DeliveryWorkflow:
         self.state["cleanup"] = "pending_role_completion"
         self.state["revision"] += 1
         return self.state
+
+    @workflow.update(name="disable_delivery_limits")
+    async def disable_delivery_limits(self, request: dict[str, Any]) -> dict[str, Any]:
+        return await delivery_limits.disable(self, request)
 
     @workflow.update(name="reconcile_tracker")
     async def reconcile_tracker(self, request: dict[str, Any]) -> dict[str, Any]:

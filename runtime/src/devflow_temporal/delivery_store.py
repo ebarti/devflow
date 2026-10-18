@@ -612,6 +612,11 @@ class DeliveryStore:
             admission["_base_ref"] = reference
         if retained is not None:
             admission["_feature_base"] = retained
+        from .delivery_limits import require_supported_admission_limits
+
+        if (retained is None and _automatic is None and _feature_revision is None
+                and _feature_scope is None and _feature_allowance is None):
+            require_supported_admission_limits(self.config.raw)
         spec = self.config.admit(supplied, **admission)
         spec["request_digest"] = request_digest
         if spec.get("delivery_limits_version") == 1:
@@ -3402,6 +3407,17 @@ class DeliveryStore:
             candidate_revision = row["candidate_revision"]
             if candidate and candidate != current_candidate:
                 candidate_revision += 1
+            control = json.loads(row["checks_json"] or "{}").get("delivery_limits_control", {})
+            if control.get("disabled") is True and protocol_revision is not None:
+                protocol_revision = max(protocol_revision, row["protocol_revision"] or 0)
+            if checks is not None:
+                # A projection already in flight when the operator disables limits
+                # must not erase that monotonic control receipt.
+                incoming = checks.get("delivery_limits_control", {})
+                if (control.get("disabled") is True
+                        and control.get("protocol_revision", 0)
+                        >= incoming.get("protocol_revision", 0)):
+                    checks = {**checks, "delivery_limits_control": control}
             values = {
                 "phase": phase,
                 "execution_state": execution_state,
@@ -3550,6 +3566,38 @@ class DeliveryStore:
                 {**dict(row), "payload": json.loads(row["payload_json"]), "evidence_refs": []}
                 for row in rows
             ]
+
+    def record_delivery_limits_disabled(self, run_id, result, command_id):
+        """Merge only the accepted control receipt; never roll back concurrent work."""
+        receipt = result.get("checks", {}).get("delivery_limits_control", {})
+        if (receipt.get("disabled") is not True or receipt.get("command_id") != command_id
+                or type(receipt.get("protocol_revision")) is not int
+                or receipt["protocol_revision"] > result["revision"]):
+            raise ValueError("invalid workflow delivery-limit receipt")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            if row is None:
+                raise ValueError("run ID not found")
+            key = "disable-limits:" + command_id
+            if any(json.loads(item[0]).get("key") == key for item in db.execute(
+                "SELECT payload_json FROM delivery_events WHERE run_id=? "
+                "AND type='delivery_limits_disabled'", (run_id,),
+            )):
+                return
+            checks = json.loads(row["checks_json"] or "{}")
+            previous = checks.get("delivery_limits_control", {})
+            if previous.get("protocol_revision", 0) <= receipt["protocol_revision"]:
+                checks["delivery_limits_control"] = receipt
+            revision = row["revision"] + 1
+            db.execute(
+                "UPDATE delivery_runs SET checks_json=?,revision=?,protocol_revision=?,"
+                "updated_at=? WHERE run_id=?",
+                (canonical_json(checks), revision,
+                 max(row["protocol_revision"] or 0, receipt["protocol_revision"]), _now(), run_id),
+            )
+            self._event(db, run_id, revision, "delivery_limits_disabled",
+                        "Delivery limits disabled live", {"key": key, "control": receipt})
 
     def begin_mutation(
         self, run_id: str, command_id: str, kind: str, payload: dict[str, Any]
