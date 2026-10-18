@@ -480,6 +480,17 @@ class DeliveryStore:
         message: str,
         payload: dict[str, Any] | None = None,
     ) -> int:
+        observation = db.execute(
+            "SELECT phase,execution_state,workflow_id,iteration FROM delivery_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        payload = dict(payload or {})
+        if observation is not None:
+            payload["execution_observation"] = {
+                **dict(observation),
+                "workflow_id": observation["workflow_id"] or f"delivery-{run_id}",
+                "version": 1,
+            }
         cursor = db.execute(
             """INSERT INTO delivery_events
                (run_id, timestamp, type, message, run_revision, payload_json)
