@@ -593,6 +593,10 @@ def _held_locks(spec, job_key):
 
 def reconcile_attempt(store, *, job_key=None, run_id=None, role=None, iteration=None):
     """Reconcile one unfinished native attempt after verifying no owned process remains."""
+    if job_key is None and role == "cleanup":
+        from .delivery_cleanup_reconciliation import reconcile_stopped_cleanup
+
+        return reconcile_stopped_cleanup(store, run_id, iteration)
     if job_key is None and role == "browser_qa":
         from .delivery_browser_qa import reconcile_browser_attempt
 

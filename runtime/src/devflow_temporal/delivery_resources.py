@@ -512,7 +512,16 @@ class RunResources:
 
                     relative = path.relative_to(root).as_posix()
                     retained = ownership.get(str(path), {})
-                    if root.exists():
+                    if (finalizing and retained.get('kind') == 'generated'
+                            and 'workspace_declaration_sha256' in retained):
+                        # Source edits may change package scripts or workspace
+                        # discovery. Cleanup uses the declaration recorded before
+                        # creation; resource and parent identities still fence deletion.
+                        authority = retained['workspace_declaration_sha256']
+                        if (not isinstance(authority, str) or len(authority) != 64
+                                or any(c not in '0123456789abcdef' for c in authority)):
+                            raise ValueError('generated workspace recorded authority is invalid')
+                    elif root.exists():
                         authority = workspace_dependency_directories(root).get(relative)
                         if retained.get('workspace_declaration_sha256', authority) != authority:
                             raise ValueError('generated workspace declaration changed')

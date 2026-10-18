@@ -133,3 +133,27 @@ def require_authorized(policy: dict, paths, *, checkout: Path | None = None) -> 
     escaped = outside_scope(policy, paths, checkout=checkout)
     if escaped:
         raise ValueError("candidate changed outside allowed paths: " + ", ".join(sorted(escaped)))
+
+
+def amended_scope(policy: dict, added_paths: list[str]) -> dict:
+    """Grant exact files without unlocking any pre-existing protected authority."""
+    scope = authority(policy)
+    if (scope['version'] != 1 or not isinstance(added_paths, list)
+            or not 1 <= len(added_paths) <= 2 or added_paths != sorted(set(added_paths))):
+        raise ValueError('versioned scope amendment requires one or two exact files')
+    for name in added_paths:
+        source_path(name)
+    if outside_scope(policy, added_paths) != set(added_paths):
+        raise ValueError('scope amendment file is already authorized')
+    removed = [prefix for prefix in scope['protected_paths']
+               if any(_under(name, prefix) for name in added_paths)]
+    for prefix in removed:
+        if (any(_under(root, prefix) or _under(prefix, root) for root in scope['allowed_roots'])
+                or any(_under(name, prefix) for name in scope['allowed_files'])):
+            raise ValueError('protected prefix overlaps existing source authority')
+    scope['allowed_files'] = [*scope['allowed_files'], *added_paths]
+    scope['protected_paths'] = [p for p in scope['protected_paths'] if p not in removed]
+    result = {'allowed_paths': [], 'source_scope': scope}
+    validate_authority(result)
+    require_authorized(result, added_paths)
+    return scope

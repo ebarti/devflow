@@ -601,7 +601,12 @@ def custody(db, recovery, *, retained_memo=None):
             amended = scope_amendment_config(
                 recovery['predecessor_spec'], Path(scope['amended_config_path']),
                 scope['amended_config_sha256'], scope['added_paths'])
-            allowed = amended.raw['repositories'][spec['repository_key']]['allowed_paths']
+            repository = amended.raw['repositories'][spec['repository_key']]
+            allowed = repository['allowed_paths']
+            from .delivery_source_scope import authority
+
+            if authority(spec['policy']) != authority(repository):
+                raise ValueError('stopped scope resume changed its versioned source authority')
         if (spec['policy']['allowed_paths'] != allowed
                 or spec['config_digest'] != digest(amended.raw)):
             raise ValueError('stopped scope resume changed its sealed file authority')
