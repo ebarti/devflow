@@ -97,3 +97,28 @@ python3.12 "$DEVFLOW_STATE" import-legacy /path/to/old/state.sqlite3
 ```
 
 Import is one-time per canonical source path, not a live sync. It reads the old database without changing it, normalizes useful history and retains artifact references. Its report identifies skipped records by ID/count; retain the original archive for those records. The new default database has a different filename; an existing `state.sqlite3` is never implicitly migrated. Imported historical results do not establish current checks or authorization.
+
+
+## Temporal delivery timings
+
+The ordinary `state.py metrics --work-id ID --as-of 2026-10-18T01:05:35Z`
+command also reads the delivery ledger. It never starts a service, initializes a
+missing database, migrates tables, or takes a write transaction. The optional
+cutoff censors open delivery intervals; it does not time-filter legacy counts.
+
+`delivery_execution.works[ID].coordinator` measures issue wall time across
+successor coordinators, including blocked gaps. `worker` sums child execution
+time separately; concurrent child seconds are not additive to parent wall time
+and are not CPU time. `intervals` retains the ordered run/workflow/phase/iteration
+timeline. `coverage` reports missing histories and unknown intervals explicitly.
+`timing.delivery_phase_seconds` and `delivery_worker_seconds` expose the same
+results beside the legacy timing fields without changing those fields' meaning.
+
+The delivery_phase_events journal retains phase, iteration and workflow identity
+in the same transaction as the unchanged public event and projection. Existing
+event payloads and authenticated recovery receipts keep their original shape. Historical events are joined to authentic
+sealed Temporal histories using the existing installed runtime decoder and codec.
+That decoder only reads digest-verified closure files; it does not call Temporal,
+run recovery or backfill private state. The runtime virtual environment must be
+installed to decode old histories. Without it, history coverage is unavailable,
+not zero elapsed time. The standard-library reader still handles new events.

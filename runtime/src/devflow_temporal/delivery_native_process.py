@@ -204,7 +204,10 @@ def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) 
                       "stdio_drained": False, "observed_owned_pids": sorted(all_owned),
                       "journal": str(path), "cleanup_reconciliation": proof,
                       "native_teardown_scope":
-                          "observed identity-bound descendants and owned ports"}
+                          "observed identity-bound descendants and owned ports",
+                      # Teardown observed later cannot establish when execution ended.
+                      "started_at": journal.get("started_at"),
+                      "finished_at": None, "duration_seconds": None}
             journal.update(phase="finished", owned=final_owned, result=result,
                            cleanup_reconciliation=proof)
             write_private(path, journal)
@@ -548,6 +551,7 @@ class NativeProcess:
             owned: dict[int, dict] = {}
             timed_out = cancelled = conflict = False
             process = None
+            execution_started = None
             monitoring_complete = False
             observed_ports = {}
             pipe_eof = False
@@ -599,8 +603,10 @@ class NativeProcess:
                 if not entry or ready != {"pid": process.pid, "identity": entry["identity"]}:
                     raise RuntimeError("native process identity changed before authorization")
                 owned[process.pid] = entry
+                execution_started = time.monotonic()
                 journal.update(
-                    phase="authorized", owned={str(pid): value for pid, value in owned.items()}
+                    phase="authorized", owned={str(pid): value for pid, value in owned.items()},
+                    started_at=datetime.now(UTC).isoformat(),
                 )
                 write_private(self.journal, journal)
                 assert process.stdin is not None
@@ -672,8 +678,17 @@ class NativeProcess:
                 finalized_owned = dict(owned)
                 if "monitor" in journal:
                     finalized_owned[journal["monitor"]["pid"]] = journal["monitor"]
+                execution_finished = (
+                    execution_started is not None and stopped
+                    and process is not None and process.poll() is not None
+                )
                 result = {
                     "state": "finished" if cleanup != "unknown" else "unknown",
+                    "started_at": journal.get("started_at"),
+                    "finished_at": datetime.now(UTC).isoformat() if execution_finished else None,
+                    "duration_seconds": (
+                        time.monotonic() - execution_started if execution_finished else None
+                    ),
                     "runtime_identity": journal["runtime_identity"],
                     "exit_code": process.returncode if process else None,
                     "cleanup": cleanup,

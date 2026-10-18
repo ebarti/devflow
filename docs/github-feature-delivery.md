@@ -225,3 +225,19 @@ Normal hosted CI runs the native, Temporal, browser and process qualification.
 Upgrade readback checks installed payloads, service ownership, feature policy,
 Project consumer health and the unchanged daily schedule without starting product
 workflows.
+
+## Timing
+
+Normal `state.py metrics` reporting includes delivery phase intervals and command
+start/finish timestamps from sealed activity results. Native execution records
+`started_at` when authorizing the command and `finished_at` after observing the
+command and its descendants stopped; `duration_seconds` uses a monotonic clock.
+The start is durable while execution is running. Reattaching to a completed
+invocation keeps its original times. A lost monitor retains the observed start
+and leaves its unknown finish/duration null. Historical missing command times
+remain null; activity time is not substituted for command execution time.
+
+Disabling the service's `feature_delivery_version` option selects ordinary
+single-issue delivery for future submissions. Intake, independent code review,
+verification and configured checks remain enabled. Existing runs keep their
+frozen execution configuration.

@@ -426,7 +426,7 @@ def update(db, kind, supplied, event_id):
     return {"replayed": False, "record": row(db, TABLES[kind], identity)}
 
 
-def metrics(db, work_id=None):
+def metrics(db, work_id=None, as_of=None):
     where, args = (" WHERE work_id=?", (work_id,)) if work_id else ("", ())
     def counts(table, field, clause=where):
         return [dict(item) for item in db.execute(f'SELECT "{field}", COUNT(*) AS count FROM {table}{clause} GROUP BY "{field}"', args)]
@@ -443,6 +443,21 @@ def metrics(db, work_id=None):
     report["usage"]["basis"] = "allocated share" if work_id else "distinct observations, including unallocated usage"
     from measurements import summarize
     report.update(summarize(db, work_id))
+    from delivery_measurements import summarize as delivery_summary
+    delivery = delivery_summary(db, work_id, as_of)
+    if delivery is not None:
+        report["delivery_execution"] = delivery
+        report["timing"]["delivery_phase_seconds"] = {
+            identity: item["coordinator"] for identity, item in delivery["works"].items()
+        }
+        report["timing"]["delivery_worker_seconds"] = {
+            identity: item["worker"] for identity, item in delivery["works"].items()
+        }
+        report["timing"]["definition"] += (
+            " Legacy timings above exclude Temporal execution; delivery_phase_seconds "
+            "and delivery_worker_seconds measure the actual delivery lineage separately. "
+            "See delivery_execution.coverage before interpreting missing values."
+        )
     report["limitations"] = ["Missing observations cannot be counted; missing-field counts cover recorded observations only.",
                               "Run duration is summed agent time, not elapsed wall time; unfinished runs have no inferred duration.",
                               "Input/output totals already include cached/reasoning subsets. Cost and credits are supplied estimates."]
@@ -483,7 +498,9 @@ def parser():
     fields(finding.add_parser("update"), "finding", True)
     run = commands.add_parser("run").add_subparsers(dest="action", required=True)
     fields(run.add_parser("update"), "run", True)
-    commands.add_parser("metrics").add_argument("--work-id")
+    metrics_command = commands.add_parser("metrics")
+    metrics_command.add_argument("--work-id")
+    metrics_command.add_argument("--as-of", help="Timezone-qualified cutoff for delivery intervals")
     commands.add_parser("import-legacy").add_argument("source")
     return root
 
@@ -491,6 +508,16 @@ def parser():
 def main():
     args = parser().parse_args()
     try:
+        if args.command == "metrics":
+            # Reporting must not initialize/migrate a database or acquire a write lock.
+            uri = Path(args.db).expanduser().resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as db:
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                result = metrics(db, args.work_id, args.as_of)
+            print(encode(result))
+            return 0
         values = {}
         if getattr(args, "file", None):
             values = json.loads(Path(args.file).read_text())
@@ -503,9 +530,7 @@ def main():
                 values["blocker"] = None
         with closing(connect(args.db)) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            if args.command == "metrics":
-                result = metrics(db, args.work_id)
-            elif args.command == "import-legacy":
+            if args.command == "import-legacy":
                 from legacy import import_legacy
                 result = import_legacy(db, args.source, args.db)
             elif args.command == "work" and args.action == "list":

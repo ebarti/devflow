@@ -202,7 +202,17 @@ def test_implementation_prepares_configured_install_and_handoff_without_named_no
     assert result["state"] == "failed" and result["source_unchanged"] is True
     assert [item["id"] for item in result["results"]] == ["first", "second", "later"]
     assert [item["passed"] for item in result["results"]] == [False, False, True]
+    from datetime import datetime
+
+    previous_end = None
     for item in result["results"]:
+        started, finished = (datetime.fromisoformat(item[key])
+                             for key in ("started_at", "finished_at"))
+        assert started.tzinfo is not None and started <= finished
+        assert item["duration_seconds"] >= 0
+        if previous_end is not None:
+            assert started >= previous_end
+        previous_end = finished
         log = Path(item["log"])
         assert log.read_text().strip() == item["id"]
         assert hashlib.sha256(log.read_bytes()).hexdigest() == item["log_sha256"]
