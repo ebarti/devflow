@@ -36,12 +36,41 @@ async def read(item: dict) -> dict:
         if e.HasField("activity_task_completed_event_attributes")
     }
     projections = []
+    commands = []
+    command_stages = {
+        "delivery_checks": "checks", "delivery_precheck": "prepublish_checks",
+        "delivery_baseline_checks": "baseline_checks", "delivery_browser_qa": "browser_qa",
+    }
     failed = 0
     for event in events:
         if not event.HasField("activity_task_scheduled_event_attributes"):
             continue
         activity = event.activity_task_scheduled_event_attributes
-        if activity.activity_type.name != "delivery_project":
+        name = activity.activity_type.name
+        if name in command_stages and event.event_id in completed:
+            request = (await DELIVERY_DATA_CONVERTER.decode(activity.input.payloads))[0]
+            result = (await DELIVERY_DATA_CONVERTER.decode(
+                completed[event.event_id].activity_task_completed_event_attributes.result.payloads
+            ))[0]
+            checks = result.get("results")
+            for check in checks if isinstance(checks, list) else [result]:
+                if not isinstance(check, dict):
+                    continue
+                processes = [*(check.get("interrupted_native_processes") or []),
+                             check.get("native_process") or check]
+                for attempt, process in enumerate(processes, 1):
+                    commands.append({
+                        "stage": command_stages[name], "iteration": request.get("iteration"),
+                        "id": check.get("id", name), "argv": check.get("argv"),
+                        "candidate_id": result.get("candidate_id"), "attempt": attempt,
+                        "activity_started_at": event.event_time.ToDatetime(tzinfo=UTC).isoformat(),
+                        "passed": (None if process.get("interrupted_monitor")
+                                   else check.get("passed")),
+                        "journal": process.get("journal"),
+                        **{key: process.get(key)
+                           for key in ("started_at", "finished_at", "duration_seconds")},
+                    })
+        if name != "delivery_project":
             continue
         if event.event_id not in completed:
             failed += 1
@@ -67,6 +96,7 @@ async def read(item: dict) -> dict:
         "final_phase": (facts["result"] or {}).get("phase"),
         "transitions": projections,
         "failed_projections": failed,
+        "commands": commands,
     }
 
 

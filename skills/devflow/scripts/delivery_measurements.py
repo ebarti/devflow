@@ -298,8 +298,30 @@ def summarize(db, work_id=None, as_of=None):
         if "delivery_attempts" in tables
         else []
     )
+    commands = []
+    for execution in executions:
+        rid = execution["run_id"]
+        for command in execution.get("commands", []):
+            if (command.get("activity_started_at")
+                    and instant(command["activity_started_at"]) > cutoff):
+                continue
+            if command.get("started_at") and instant(command["started_at"]) > cutoff:
+                continue
+            row = {**command, "work_id": owners[rid], "run_id": rid,
+                   "workflow_id": execution["workflow_id"]}
+            if row.get("finished_at") and instant(row["finished_at"]) > cutoff:
+                row.update(finished_at=None, duration_seconds=None)
+            commands.append(row)
     return {
         "as_of": cutoff.isoformat(),
+        "commands": commands,
+        "command_timing_coverage": {
+            "records": len(commands),
+            "complete": sum(c.get("started_at") is not None
+                            and c.get("finished_at") is not None for c in commands),
+            "definition": "Observed command boundaries from sealed activity results; "
+                          "historical missing timestamps remain null. Not CPU time.",
+        },
         "works": by_work,
         "intervals": intervals,
         "coverage": {

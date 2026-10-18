@@ -207,9 +207,30 @@ def test_historical_compressed_payload_uses_public_clock_and_closed_result(servi
                     scheduled_event_id=2, result=await payload({})
                 ),
             ),
+            HistoryEvent(
+                event_id=4, event_time=t(19),
+                activity_task_scheduled_event_attributes=ActivityTaskScheduledEventAttributes(
+                    activity_type=ActivityType(name="delivery_checks"),
+                    input=await payload({"iteration": 0}),
+                ),
+            ),
+            HistoryEvent(
+                event_id=5, event_time=t(23),
+                activity_task_completed_event_attributes=ActivityTaskCompletedEventAttributes(
+                    scheduled_event_id=4,
+                    result=await payload({"candidate_id": "candidate-1", "results": [
+                        {"id": "timed-command", "argv": ["pytest", "test_example.py"],
+                         "passed": True, "started_at": stamp(20),
+                         "finished_at": stamp(22), "duration_seconds": 2.0,
+                         "interrupted_native_processes": [{"started_at": stamp(19),
+                             "interrupted_monitor": True, "journal": "original-attempt"}]},
+                        {"id": "older-command", "passed": True},
+                    ]}),
+                ),
+            ),
             # An uncompleted terminal projection cannot be counted as a successful transition.
             HistoryEvent(
-                event_id=4,
+                event_id=6,
                 event_time=t(25),
                 activity_task_scheduled_event_attributes=ActivityTaskScheduledEventAttributes(
                     activity_type=ActivityType(name="delivery_project"),
@@ -219,7 +240,7 @@ def test_historical_compressed_payload_uses_public_clock_and_closed_result(servi
                 ),
             ),
             HistoryEvent(
-                event_id=5,
+                event_id=7,
                 event_time=t(30),
                 workflow_execution_completed_event_attributes=WorkflowExecutionCompletedEventAttributes(
                     result=await payload({"phase": "blocked", "outcome": "blocked"})
@@ -244,7 +265,7 @@ def test_historical_compressed_payload_uses_public_clock_and_closed_result(servi
                 row["request_digest"],
                 None,
                 digest,
-                5,
+                7,
                 "temporal",
                 None,
                 stamp(31),
@@ -261,6 +282,20 @@ def test_historical_compressed_payload_uses_public_clock_and_closed_result(servi
         "blocked": 70,
     }
     assert result["works"]["work-1"]["coordinator_reconciliation_seconds"] == 0
+    assert result["command_timing_coverage"]["records"] == 3
+    assert result["command_timing_coverage"]["complete"] == 1
+    interrupted, timed, older = result["commands"]
+    assert interrupted["started_at"] == stamp(19) and interrupted["finished_at"] is None
+    assert interrupted["duration_seconds"] is None and interrupted["passed"] is None
+    assert interrupted["attempt"] == 1 and timed["attempt"] == 2
+    assert timed["work_id"] == "work-1" and timed["run_id"] == "run-1"
+    assert timed["started_at"] == stamp(20) and timed["finished_at"] == stamp(22)
+    assert timed["duration_seconds"] == 2 and timed["stage"] == "checks"
+    assert all(older[key] is None for key in ("started_at", "finished_at", "duration_seconds"))
+    with readonly(store) as db:
+        partial = state.metrics(db, "work-1", stamp(21))["delivery_execution"]["commands"][1]
+    assert partial["started_at"] == stamp(20)
+    assert partial["finished_at"] is None and partial["duration_seconds"] is None
     # Corrupt/missing evidence must remain a visible coverage failure.
     (root / (digest + ".json.xz")).unlink()
     with readonly(store) as db:

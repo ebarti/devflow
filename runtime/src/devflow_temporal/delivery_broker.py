@@ -747,6 +747,7 @@ class DeliveryBroker:
                 if check['id'] in (python_environments or {}):
                     check_env['UV_PROJECT_ENVIRONMENT'] = str(python_environments[check['id']])
                 command = argv
+                command_started_at, command_started = _now(), time.monotonic()
                 checked = subprocess.run(
                     command,
                     cwd=cwd,
@@ -756,6 +757,10 @@ class DeliveryBroker:
                     check=False,
                     timeout=int(check.get("timeout_seconds", 600)),
                 )
+                command_timing = {
+                    "started_at": command_started_at, "finished_at": _now(),
+                    "duration_seconds": time.monotonic() - command_started,
+                }
                 output = checked.stdout + checked.stderr
                 exit_code = checked.returncode
                 artifact = evidence_dir / f"{check['id']}.log"
@@ -835,6 +840,9 @@ class DeliveryBroker:
                     "argv": argv,
                     "cwd": str(cwd),
                     "exit_code": exit_code,
+                    **({key: native_result.get(key)
+                        for key in ("started_at", "finished_at", "duration_seconds")}
+                       if native_result else command_timing),
                     "test_count": count,
                     **({"junit": junit} if junit is not None else {}),
                     **({"selectors": selector_receipts} if selector_receipts is not None else {}),
