@@ -49,7 +49,13 @@ def _future_test(spec: dict, checkout: Path, name: str) -> Path:
 
     hints = (spec.get("expected_paths", []) if spec.get("gate_selections_version") == 2
              else spec.get('policy', {}).get('allowed_paths', []))
-    paths = [raw for raw in hints if isinstance(raw, str) and Path(raw).name == name]
+    if spec.get("gate_selections_version") != 2:
+        # Imported/new candidate tests need dependencies before implementation
+        # stages them. Discovery grants no authority: the frozen scope below
+        # still admits the unique file, and final verification stays tracked-only.
+        hints = [*hints, *_git(checkout, 'ls-files', '--others', '--exclude-standard',
+                              '--', '*.py', '*.test.*').splitlines()]
+    paths = sorted({raw for raw in hints if isinstance(raw, str) and Path(raw).name == name})
     if len(paths) != 1:
         raise ValueError(f'future planned test must have one authorized owner: {name}')
     raw = paths[0]
