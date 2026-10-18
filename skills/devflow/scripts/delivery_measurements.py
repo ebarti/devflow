@@ -1,7 +1,7 @@
 """Issue wall time and child execution time from the real delivery ledger.
 
-The stdlib reader never starts services or changes the database. For older events
-without phases, an isolated installed-runtime decoder reads authenticated sealed
+The stdlib reader never starts services or changes the database. For older executions
+without journal entries, an isolated installed-runtime decoder reads authenticated sealed
 histories. Missing history remains unknown, never inferred from today's phase.
 """
 
@@ -154,14 +154,17 @@ def summarize(db, work_id=None, as_of=None):
             else "accepted"
         )
     covered = {h["workflow_id"] for h in executions}
-    # New projections contain phase + execution identity; no Temporal query needed.
+    # New journal entries contain phase + execution identity; no Temporal query needed.
     for rid, row in selected.items():
         groups = defaultdict(list)
-        for event in events[rid]:
-            observation = event["payload"].get("execution_observation")
-            if observation:
-                groups[observation["workflow_id"] or row["workflow_id"] or rid].append(
-                    {**observation, "time": event["timestamp"], "clock": "public_event"}
+        if "delivery_phase_events" in tables:
+            for journal in db.execute(
+                "SELECT * FROM delivery_phase_events WHERE run_id=? ORDER BY event_sequence",
+                (rid,),
+            ):
+                observation = dict(journal)
+                groups[observation["workflow_id"]].append(
+                    {**observation, "time": observation["timestamp"], "clock": "phase_journal"}
                 )
         for workflow_id, transitions in groups.items():
             if workflow_id in covered:
@@ -312,7 +315,9 @@ def summarize(db, work_id=None, as_of=None):
             role: len({a["session_id"] for a in attempts if a["role"] == role and a["session_id"]})
             for role in {a["role"] for a in attempts}
         },
-        "definition": ("Coordinator wall time across successors, including blocked gaps. "
+        "definition": (
+            "Coordinator wall time across successors, including blocked gaps. "
             "Worker seconds are summed separately, may overlap and are not CPU time. "
-            "Open intervals end at as_of. Missing evidence is unknown."),
+            "Open intervals end at as_of. Missing evidence is unknown."
+        ),
     }

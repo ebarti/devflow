@@ -216,6 +216,22 @@ class DeliveryStore:
                 )"""
             )
             db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_phase_events (
+                    event_sequence INTEGER PRIMARY KEY
+                        REFERENCES delivery_events(sequence) ON DELETE CASCADE,
+                    run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
+                    workflow_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    execution_state TEXT NOT NULL,
+                    iteration INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL
+                )"""
+            )
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS delivery_phase_events_run
+                   ON delivery_phase_events(run_id,event_sequence)"""
+            )
+            db.execute(
                 """CREATE INDEX IF NOT EXISTS delivery_events_run
                    ON delivery_events(run_id, sequence)"""
             )
@@ -480,22 +496,21 @@ class DeliveryStore:
         message: str,
         payload: dict[str, Any] | None = None,
     ) -> int:
-        observation = db.execute(
-            "SELECT phase,execution_state,workflow_id,iteration FROM delivery_runs WHERE run_id=?",
-            (run_id,),
-        ).fetchone()
-        payload = dict(payload or {})
-        if observation is not None:
-            payload["execution_observation"] = {
-                **dict(observation),
-                "workflow_id": observation["workflow_id"] or f"delivery-{run_id}",
-                "version": 1,
-            }
+        timestamp = _now()
         cursor = db.execute(
             """INSERT INTO delivery_events
                (run_id, timestamp, type, message, run_revision, payload_json)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (run_id, _now(), event_type, message, revision, canonical_json(payload or {})),
+            (run_id, timestamp, event_type, message, revision, canonical_json(payload or {})),
+        )
+        # Recovery authenticates the exact event payload shape. Keep observations
+        # in a separate journal, atomically linked to the unchanged public receipt.
+        db.execute(
+            """INSERT INTO delivery_phase_events
+               (event_sequence,run_id,workflow_id,phase,execution_state,iteration,timestamp)
+               SELECT ?,run_id,COALESCE(workflow_id,?),phase,execution_state,iteration,?
+               FROM delivery_runs WHERE run_id=?""",
+            (cursor.lastrowid, f"delivery-{run_id}", timestamp, run_id),
         )
         from .delivery_features import record_projection, transition
 

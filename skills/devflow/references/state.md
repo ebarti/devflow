@@ -114,8 +114,9 @@ timeline. `coverage` reports missing histories and unknown intervals explicitly.
 `timing.delivery_phase_seconds` and `delivery_worker_seconds` expose the same
 results beside the legacy timing fields without changing those fields' meaning.
 
-New delivery events retain their phase, iteration and workflow identity in the
-same transaction as the projection. Historical events are joined to authentic
+The delivery_phase_events journal retains phase, iteration and workflow identity
+in the same transaction as the unchanged public event and projection. Existing
+event payloads and authenticated recovery receipts keep their original shape. Historical events are joined to authentic
 sealed Temporal histories using the existing installed runtime decoder and codec.
 That decoder only reads digest-verified closure files; it does not call Temporal,
 run recovery or backfill private state. The runtime virtual environment must be

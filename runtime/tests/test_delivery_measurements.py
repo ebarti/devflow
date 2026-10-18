@@ -48,6 +48,11 @@ def test_real_projection_and_cli_report_open_and_terminal_time_without_writes(se
     clock = [stamp(0)]
     monkeypatch.setattr(delivery_store, "_now", lambda: clock[0])
     store.submit(request)
+    with readonly(store) as db:
+        assert (
+            json.loads(db.execute("SELECT payload_json FROM delivery_events").fetchone()[0]) == {}
+        )
+        assert db.execute("SELECT count(*) FROM delivery_phase_events").fetchone()[0] == 1
     clock[0] = stamp(10)
     store.project(
         "run-1",
@@ -126,6 +131,7 @@ def test_missing_old_history_is_unknown_not_current_phase(service, monkeypatch):
     store.submit(request)
     with store._connect() as db:
         db.execute("UPDATE delivery_events SET payload_json='{}'")
+        db.execute("DELETE FROM delivery_phase_events")
     with readonly(store) as db:
         result = state.metrics(db, "work-1", stamp(100))["delivery_execution"]
     assert not result["coverage"]["complete"]
@@ -139,6 +145,7 @@ def test_historical_compressed_payload_uses_public_clock_and_closed_result(servi
     with store._connect() as db:
         row = dict(db.execute("SELECT * FROM delivery_runs").fetchone())
         db.execute("UPDATE delivery_events SET payload_json='{}'")
+        db.execute("DELETE FROM delivery_phase_events")
         db.execute(
             "INSERT INTO delivery_events(run_id,timestamp,type,message,"
             "run_revision,payload_json) "
@@ -302,7 +309,11 @@ def test_successor_gap_and_parallel_children_are_separate(service, monkeypatch):
                 "INSERT INTO delivery_events(run_id,timestamp,type,message,"
                 "run_revision,payload_json) "
                 "VALUES(?,?,?,?,?,?)",
-                (rid, stamp(start), "test", "test", 1, json.dumps({"execution_observation": obs})),
+                (rid, stamp(start), "test", "test", 1, "{}"),
+            )
+            db.execute(
+                "INSERT INTO delivery_phase_events VALUES(last_insert_rowid(),?,?,?,?,?,?)",
+                (rid, obs["workflow_id"], phase, obs["execution_state"], 0, stamp(start)),
             )
     with readonly(store) as db:
         result = state.metrics(db, "work-1", stamp(100))["delivery_execution"]
