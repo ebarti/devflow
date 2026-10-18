@@ -74,31 +74,41 @@ def _artifacts(checkout: Path, configured: list[str]) -> list[dict[str, Any]]:
 
 
 
-def _playwright_evidence(qa: dict, checkout: Path) -> tuple[list[str], dict[str, str]]:
-    """Generate real success evidence for selected recipes, including frozen v2 inputs."""
+def _playwright_evidence(qa: dict, checkout: Path, *,
+                         reconcile_argv: list[str] | None = None) -> tuple[list[str], dict[str, str]]:
+    """Retain real runner reports for owned Playwright recipes and frozen v2 inputs."""
     argv = list(qa["argv"])
-    if not qa.get("required_selectors"):
-        return argv, {}
     start = next((i + 2 for i in range(len(argv) - 1)
                   if argv[i:i + 2] == ["playwright", "test"]), None)
     if start is None:
         return argv, {}
+    selected = bool(qa.get('required_selectors'))
+    if (not selected and reconcile_argv is not None
+            and reconcile_argv[-len(argv):] == argv):
+        # Observe old completed invocations under the arguments they actually
+        # used. A new reporter cannot upgrade historical evidence or verdicts.
+        return argv, {}
     if not qa.get("artifact_paths"):
-        raise ValueError("selected Playwright QA requires an owned artifact directory")
+        if selected:
+            raise ValueError("selected Playwright QA requires an owned artifact directory")
+        return argv, {}
     # Registration pins this existing configured root. Reject earlier output
     # symlinks before the reporters or runner can write through them.
     _artifacts(checkout, qa["artifact_paths"])
     root = checkout / qa["artifact_paths"][0]
     clean, index = argv[:start], start
+    replaced = {'--reporter', '--output'} | ({'--trace'} if selected else set())
     while index < len(argv):
-        if argv[index] in {"--reporter", "--trace", "--output"}:
+        if argv[index] in replaced:
             index += 2
-        elif argv[index].split("=", 1)[0] in {"--reporter", "--trace", "--output"}:
+        elif argv[index].split("=", 1)[0] in replaced:
             index += 1
         else:
             clean.append(argv[index])
             index += 1
-    return ([*clean, "--reporter=line,json,junit", "--trace=on",
+    reporters = (["--reporter=line,json,junit", "--trace=on"] if selected
+                 else ["--reporter=line,junit"])
+    return ([*clean, *reporters,
              "--output=" + str(root / "test-results")],
             {"PLAYWRIGHT_JUNIT_OUTPUT_FILE": str(root / "junit.xml")})
 
@@ -183,7 +193,8 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any], *,
     scratch = RunResources(spec).browser_scratch()
     profile, environment = prepare_browser_qa(spec, checkout, folder, scratch, qa)
     generated = broker._register_generated(checkout, qa.get("artifact_paths", []))
-    argv, reporter_environment = _playwright_evidence(qa, checkout)
+    argv, reporter_environment = _playwright_evidence(
+        qa, checkout, reconcile_argv=original['intent']['argv'] if reconcile_only else None)
     environment.update(reporter_environment)
     options = {
         "argv": (argv if trusted_local(spec)
