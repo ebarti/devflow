@@ -170,7 +170,10 @@ def test_actual_native_preparation_cache_and_check_cleanup(native_store, monkeyp
     )
     broker = DeliveryBroker(store, first)
     candidate = broker.prepare()["candidate"]
-    checks = broker.run_prechecks(0, candidate)
+    prechecked = broker.run_prechecks(0, candidate)
+    assert prechecked["state"] == "passed" and prechecked["results"] == []
+    assert prechecked["deferred_to_checks"] == {"native-check": "native-check"}
+    checks = broker.run_checks(0, candidate)
     assert checks["state"] == "passed"
     assert checks["results"][0]["process_cleanup"] == "observed-native-confirmed"
     assert checks["results"][0]["test_count"] == 2

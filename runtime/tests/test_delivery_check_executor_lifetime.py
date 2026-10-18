@@ -1,4 +1,8 @@
-"""Actual native check/executor lifetime regressions on disposable macOS resources."""
+"""Actual postpublication check/executor lifetime on disposable macOS resources.
+
+Matching broad validation now executes at this mandatory later gate. Cancellation,
+slot custody and native descendant lifetime must still be exercised there.
+"""
 
 from __future__ import annotations
 
@@ -174,7 +178,7 @@ async def native_case(api_fixture, tmp_path, monkeypatch):
         return run
 
     def start(run):
-        task = asyncio.create_task(delivery_activities.delivery_precheck(run.request()))
+        task = asyncio.create_task(delivery_activities.delivery_checks(run.request()))
         tasks.append(task)
         return task
 
@@ -223,7 +227,7 @@ async def test_cancelled_executor_waiter_joins_actual_native_tree(native_case):
     run = case.new("executor-waiter", hold_check=True, ignore_term=True)
 
     async def probe(loop):
-        active = asyncio.create_task(delivery_activities.delivery_precheck(run.request()))
+        active = asyncio.create_task(delivery_activities.delivery_checks(run.request()))
         try:
             await wait_until(run.started)
             payload = read_private(run.journal())
@@ -280,7 +284,7 @@ async def test_queued_executor_cancellation_joins_before_possible_late_start(nat
             assert release.wait(10), "owned executor release deadline"
 
         blocker = loop.run_in_executor(None, hold_executor)
-        active = asyncio.create_task(delivery_activities.delivery_precheck(run.request()))
+        active = asyncio.create_task(delivery_activities.delivery_checks(run.request()))
         try:
             await wait_until(
                 lambda: (
@@ -360,7 +364,7 @@ async def test_queued_run_cancellation_preserves_known_prelaunch_cleanup(native_
     assert result["cleanup"] == "confirmed" and result["cancelled"] is True
     assert not second.started()
     assert not RunResources(second.spec).manifest.exists() or all(
-        "prechecks" not in journal
+        "checks" not in journal
         for journal in read_private(RunResources(second.spec).manifest)["processes"]
     )
     first.release()
@@ -375,7 +379,7 @@ async def test_original_context_reaches_real_executor_operation(native_case):
 
     def execute(broker):
         observed.append(EXECUTION_CONTEXT.get())
-        return broker.run_prechecks(0, run.candidate)
+        return broker.run_checks(0, run.candidate)
 
     token = EXECUTION_CONTEXT.set("owned-original-context")
     try:

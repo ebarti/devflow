@@ -686,8 +686,8 @@ async def test_stalled_repair_publication_heals_through_the_real_stop(service, m
     assert _git(run.broker.source, 'rev-list', '--count',
                 run.spec['base_sha'] + '..' + repaired) == '2'
     assert len(run.gh.creations()) == 1
-    assert run.seen['roles'] == [('implement', 0), ('review', 0), ('implement', 1),
-                                 ('review', 1), ('verify', 1)]
+    assert run.seen['roles'] == [('implement', 0), ('review', 0), ('verify', 0),
+                                 ('implement', 1), ('review', 1), ('verify', 1)]
     # CI only ever observed the gated candidate, which is the delivered head.
     assert run.seen['ci_heads'] == [repaired]
     assert recovery['kind'] == ('pending_publication_retry' if path == 'automatic'
