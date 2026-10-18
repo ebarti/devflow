@@ -107,6 +107,11 @@ class DeliveryClient:
     def cancel(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/cancel", payload)
 
+    def disable_delivery_limits(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/disable-limits", payload,
+        )
+
     def reconcile_tracker(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request(
             "POST", "/api/runs/" + quote(run_id, safe="") + "/reconcile-tracker", payload,

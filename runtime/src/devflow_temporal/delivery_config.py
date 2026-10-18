@@ -167,8 +167,13 @@ class DeliveryConfig:
             "max_repairs": self.raw.get(
                 "max_repairs", 10 if self.raw.get("feature_delivery_version") == 1 else 2),
             "feature_delivery_version": self.raw.get("feature_delivery_version"),
-            "delivery_limits": {k: self.raw[k] for k in (
-                "delivery_timeout_seconds", "no_progress_timeout_seconds") if k in self.raw},
+            "delivery_limits": {k: self.raw[k] for k in ("delivery_timeout_seconds",)
+                                if self.raw.get(k) is not None},
+            "delivery_limit_control": {"disable_live": True, "no_progress_supported": False},
+            "unsupported_delivery_limits": (
+                ["no_progress_timeout_seconds"]
+                if self.raw.get("no_progress_timeout_seconds") is not None else []
+            ),
             **({"feature_plan_versions": [1, 2], "feature_plan_revision_version": 1,
                 "revise_feature_plan": True}
                if self.raw.get("feature_delivery_version") == 1 else {}),

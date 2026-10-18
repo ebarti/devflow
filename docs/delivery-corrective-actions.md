@@ -28,14 +28,28 @@ a second write. Chunk implementation and review workers are not restarted just
 because main moved. Unresolvable or conflicting direction is surfaced with both
 source versions retained; the user decides an opposing product direction.
 
-`delivery_timeout_seconds` and `no_progress_timeout_seconds` are optional positive
-integers up to 86,400. Admission freezes them and the original `delivery_admitted_at`
-clock. Continuation, idempotent command replay and operational capacity changes do
-not give a new elapsed-time allowance. Workflow timers cancel active owned
-activities and join their cancellation before ordinary finalization. A changed
-candidate, completed role or gate verdict is progress; a phase change, status poll
-or another pending CI observation does not move the progress clock. Product repair
-counts remain independent of infrastructure recovery.
+Delivery has no automatic time limit by default. `delivery_timeout_seconds` is an
+explicitly configured elapsed limit, a positive integer up to 86,400. Admission
+freezes it and the original `delivery_admitted_at` clock. Continuation, idempotent
+command replay and operational capacity changes do not give a new elapsed-time
+allowance. Product repair counts remain independent of infrastructure recovery.
+
+New admissions reject `no_progress_timeout_seconds`: controller milestones cannot
+measure inactivity inside a productive native role. Historical policies and
+histories retain their recorded behavior for replay; no replacement inactivity
+heuristic is installed. Per-command and native role deadlines remain separate.
+
+An operator can disable an active run's delivery limits through MCP
+`disable_delivery_limits`, or `devflow-delivery --config CONFIG disable-limits
+--id RUN --request REQUEST.json`. The JSON contains `command_id`,
+`expected_revision` (the current `protocol_revision`), and a nonempty `reason`.
+The authenticated API is `POST /api/runs/{run_id}/disable-limits`. Read the run
+first, keep the same command and full request after uncertainty, and inspect the
+receipt at `checks.delivery_limits_control`. Disabling cancels only the delivery
+timer, preserves the same workflow and active activity, survives recovery and
+does not change source authority or repair accounting. It does not undo a stop
+that already occurred. The command requires an already running API and never
+starts, reloads or restarts a service. Ordinary cancellation still works.
 
 At the limit, stop launching work, settle existing native and GitHub effects, and
 retain dirty or unpublished source. The status includes the stopping reason,
@@ -57,9 +71,9 @@ worker and API, then independently read back readiness and configuration. Recove
 qualification covers the real maintenance, settlement and continuation paths with
 original candidate, session and repair accounting retained.
 
-Use bounded real issues for subsequent trials so completed and partial work is
-useful. Keep the timing limits active, retain the same work on fallback, and assess
-actual delivery outcomes. Do not resubmit work already transferred to a regular
+Use real issues for subsequent trials so completed and partial work is useful.
+Configure an elapsed limit only when authorized, retain the same work on fallback,
+and assess actual delivery outcomes. Do not resubmit work already transferred to a regular
 thread or restart a paused trial without the user's instruction. Controlled local
 Git and Temporal fixtures qualify failure handling; they do not replace real-work
 trials or claim a product outcome shipped.

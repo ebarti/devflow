@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timedelta
 
 from temporalio import workflow
+from temporalio.exceptions import ApplicationError
 
 from .contracts import digest
 
@@ -27,6 +28,15 @@ def policy(raw):
     return result
 
 
+def require_supported_admission_limits(raw):
+    # Frozen configurations remain readable and replayable; reject only new work.
+    if raw.get("no_progress_timeout_seconds") is not None:
+        raise ValueError(
+            "stage-based no-progress delivery timeout is not supported; remove "
+            "no_progress_timeout_seconds from the service configuration"
+        )
+
+
 def _progress(state):
     return digest({
         "candidate": (state.get("candidate") or {}).get("id"),
@@ -42,6 +52,9 @@ def _progress(state):
 
 
 def observe(controller):
+    control = getattr(controller, "delivery_limits_control", None)
+    if control:
+        controller.state.setdefault("checks", {})["delivery_limits_control"] = dict(control)
     if controller.delivery_clock is None:
         return
     signature = _progress(controller.state)
@@ -54,6 +67,8 @@ def observe(controller):
 
 
 def remaining(controller):
+    if getattr(controller, "delivery_limits_disabled", False):
+        return None
     clock = controller.delivery_clock
     limits = controller.delivery_limit_policy
     deadlines = []
@@ -65,6 +80,33 @@ def remaining(controller):
             end = datetime.fromisoformat(anchor) + timedelta(seconds=limits[key])
             deadlines.append(((end - workflow.now()).total_seconds(), kind, end.isoformat()))
     return min(deadlines)
+
+
+async def disable(controller, request):
+    """A recorded operator update removes timers without interrupting active work."""
+    await workflow.wait_condition(lambda: bool(controller.state))
+    if (controller.state.get("outcome") is not None or controller.cancel_requested
+            or controller.delivery_limit_reached or controller.delivery_limits_closing):
+        raise ApplicationError("delivery is already stopping or terminal", non_retryable=True)
+    if (type(request.get("expected_revision")) is not int
+            or request["expected_revision"] != controller.state["revision"]):
+        raise ApplicationError("stale run revision", non_retryable=True)
+    reason = request.get("reason")
+    command = request.get("command_id")
+    if (not isinstance(reason, str) or not reason.strip() or len(reason) > 4000
+            or not isinstance(command, str) or not command.strip() or len(command) > 128):
+        raise ApplicationError("command ID and bounded disable reason are required",
+                               non_retryable=True)
+    controller.delivery_limits_disabled = True
+    controller.delivery_limits_control = {
+        "disabled": True, "command_id": command, "reason": reason.strip(),
+        "recorded_at": workflow.now().isoformat(),
+        "protocol_revision": controller.state["revision"] + 1,
+    }
+    controller.state.setdefault("checks", {})["delivery_limits_control"] = dict(
+        controller.delivery_limits_control)
+    controller.state["revision"] += 1
+    return controller.state
 
 
 def handoff(spec, state):
@@ -108,7 +150,10 @@ async def expire(controller, spec, kind, deadline):
 async def _watch(controller, spec):
     await workflow.wait_condition(lambda: bool(controller.state))
     while not controller.cancel_requested and not controller.delivery_limits_closing:
-        delay, kind, deadline = remaining(controller)
+        pending = remaining(controller)
+        if pending is None:
+            return
+        delay, kind, deadline = pending
         if delay <= 0:
             await expire(controller, controller.controller_spec or spec, kind, deadline)
             return
@@ -117,6 +162,7 @@ async def _watch(controller, spec):
             await workflow.wait_condition(
                 lambda previous=prior: controller.cancel_requested
                 or controller.delivery_limits_closing
+                or controller.delivery_limits_disabled
                 or controller.delivery_clock["last_progress_at"] != previous,
                 timeout=timedelta(seconds=delay),
             )
@@ -125,10 +171,14 @@ async def _watch(controller, spec):
 
 
 async def run(controller, spec, recovery, operation):
+    control = (((recovery or {}).get("state") or {}).get("checks", {})
+               .get("delivery_limits_control", {}))
+    controller.delivery_limits_control = dict(control) if control.get("disabled") is True else None
+    controller.delivery_limits_disabled = controller.delivery_limits_control is not None
     if spec.get("delivery_limits_version") != 1:
         return await operation(spec, recovery)
     controller.delivery_limit_policy = policy(spec["policy"])
-    if not controller.delivery_limit_policy:
+    if not controller.delivery_limit_policy and not controller.delivery_limits_disabled:
         raise ValueError("bounded delivery requires its frozen time policy")
     admitted = spec["delivery_admitted_at"]
     previous = ((recovery or {}).get("state") or {}).get("checks", {}).get("delivery_clock", {})

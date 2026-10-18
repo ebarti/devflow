@@ -716,7 +716,7 @@ def create_app(config_path: Path) -> FastAPI:
         command_id = payload["command_id"]
         expected = (
             {"command_id", "expected_revision", "reason"}
-            if name == "cancel"
+            if name in {"cancel", "disable_delivery_limits"}
             else {"command_id", "expected_revision"} if name == "reconcile_tracker"
             else {
                 "command_id",
@@ -794,6 +794,11 @@ def create_app(config_path: Path) -> FastAPI:
                 await asyncio.to_thread(service.store.reject_mutation, command_id, str(exc))
             raise HTTPException(409, str(exc)) from exc
         response = {"run_id": run_id, "phase": result["phase"], "revision": result["revision"]}
+        if name == "disable_delivery_limits":
+            response["delivery_limits_disabled"] = True
+            await asyncio.to_thread(
+                service.store.record_delivery_limits_disabled, run_id, result, command_id,
+            )
         await asyncio.to_thread(service.store.finish_mutation, command_id, response)
         if name == "cancel":
             await asyncio.to_thread(
@@ -815,6 +820,10 @@ def create_app(config_path: Path) -> FastAPI:
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel(request: Request, run_id: str) -> dict[str, Any]:
         return await _update(request, run_id, "cancel")
+
+    @app.post("/api/runs/{run_id}/disable-limits")
+    async def disable_delivery_limits(request: Request, run_id: str) -> dict[str, Any]:
+        return await _update(request, run_id, "disable_delivery_limits")
 
     @app.post("/api/runs/{run_id}/reconcile-tracker")
     async def reconcile_tracker(request: Request, run_id: str) -> dict[str, Any]:

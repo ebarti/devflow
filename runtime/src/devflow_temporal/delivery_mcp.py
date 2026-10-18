@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from pathlib import Path
 
@@ -146,6 +147,19 @@ def build_server(config_path: Path) -> FastMCP:
     def cancel_run(run_id: str, request_json: str) -> dict:
         """Request a role-boundary cancellation with command ID and expected revision."""
         return client(config_path).cancel(run_id, json.loads(request_json))
+
+    @server.tool(annotations=write)
+    async def disable_delivery_limits(run_id: str, request_json: str) -> dict:
+        """Disable an active run's delivery timers without stopping or restarting it.
+
+        Read get_run first; supply command_id, expected_revision (protocol_revision),
+        and a nonempty reason. Keep the complete request stable after uncertainty.
+        Requires the API already running; never starts/reloads a service.
+        """
+        return await asyncio.to_thread(
+            read_only_client(config_path).disable_delivery_limits,
+            run_id, json.loads(request_json),
+        )
 
     @server.tool(annotations=write)
     def reconcile_tracker(run_id: str, request_json: str) -> dict:

@@ -1,5 +1,6 @@
 """Official MCP discovery and forwarding over the existing local client."""
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,33 @@ from mcp.shared.memory import create_connected_server_and_client_session
 
 from devflow_temporal.delivery_client import DeliveryClient
 from devflow_temporal.delivery_mcp import build_server
+
+
+@pytest.mark.asyncio
+async def test_live_disable_uses_existing_transport_off_loop_without_startup(monkeypatch):
+    config = Path("/fixture/service.json")
+    seen = []
+
+    def forbidden(*_args):
+        pytest.fail("live disable must not start or restart a service")
+
+    def disable(run_id, payload):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        seen.append((run_id, payload))
+        return {"delivery_limits_disabled": True}
+
+    monkeypatch.setattr("devflow_temporal.delivery_mcp.client", forbidden)
+    monkeypatch.setattr("devflow_temporal.delivery_mcp.read_only_client", lambda path:
+                        SimpleNamespace(disable_delivery_limits=disable))
+    payload = {"command_id": "disable-same", "expected_revision": 4, "reason": "user request"}
+    async with create_connected_server_and_client_session(build_server(config)) as session:
+        result = await session.call_tool("disable_delivery_limits", {
+            "run_id": "same-run", "request_json": json.dumps(payload),
+        })
+        assert not result.isError
+        assert json.loads(result.content[0].text) == {"delivery_limits_disabled": True}
+    assert seen == [("same-run", payload)]
 
 
 def test_client_service_uses_existing_policy_route(monkeypatch):
@@ -59,6 +87,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "revise_feature_plan",
             "merge_feature",
             "cancel_run",
+            "disable_delivery_limits",
             "reconcile_tracker",
             "gates_only_preflight",
             "admit_gates_only",
@@ -84,6 +113,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "revise_feature_plan",
             "merge_feature",
             "cancel_run",
+            "disable_delivery_limits",
             "reconcile_tracker",
             "admit_gates_only",
             "continue_repair",

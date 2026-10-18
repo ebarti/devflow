@@ -101,6 +101,8 @@ async def test_actual_timeout_cancels_then_finalizes_and_replays(
             return {**admitted(self, request), "resource_cleanup_version": 1}
 
         monkeypatch.setattr(DeliveryConfig, "admit", resource_aware_admission)
+        # Exercise a historical frozen no-progress policy, not a fresh admission.
+        monkeypatch.setattr(delivery_limits, "require_supported_admission_limits", lambda _: None)
         store, request = configured(service, key, 5)
         store.submit(request)
         spec = store.spec(request["run_id"])
@@ -132,16 +134,19 @@ async def test_actual_timeout_cancels_then_finalizes_and_replays(
         await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
 
 
+@pytest.mark.parametrize("key", ["delivery_timeout_seconds", "no_progress_timeout_seconds"])
 def test_capacity_change_and_feature_continuation_keep_original_elapsed_anchor(
-    service, monkeypatch,
+    service, monkeypatch, key,
 ):
     from test_delivery_feature_execution import feature_service
 
     from devflow_temporal.delivery_feature_execution import continue_feature, registry
 
-    configured_store, request = configured(service, "delivery_timeout_seconds", 3600)
+    configured_store, request = configured(service, key, 3600)
     store, request, _ = feature_service((configured_store, request), monkeypatch)
-    store.submit(request)
+    with monkeypatch.context() as old:
+        old.setattr(delivery_limits, "require_supported_admission_limits", lambda _: None)
+        store.submit(request)
     original = store.effective_spec(request["run_id"])
     registry(original).stop(original["feature_delivery"]["owner"], "stopped", {})
     with store._connect() as db:
@@ -159,6 +164,6 @@ def test_capacity_change_and_feature_continuation_keep_original_elapsed_anchor(
     result = continue_feature(store, original["run_id"], command)
     successor = store.effective_spec(result["run_id"])
     assert successor["delivery_admitted_at"] == original["delivery_admitted_at"]
-    assert successor["policy"]["delivery_timeout_seconds"] == 3600
+    assert successor["policy"][key] == 3600
     issue = successor["feature_delivery"]["owner"]["issue_id"]
     assert registry(successor).budget(issue)["used"] == 0

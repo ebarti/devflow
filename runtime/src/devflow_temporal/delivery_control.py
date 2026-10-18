@@ -802,6 +802,7 @@ _COMMANDS = (
     "evidence",
     "decision",
     "cancel",
+    "disable-limits",
     "reconcile-tracker",
     "recover-publication",
     "repair-admission-preflight",
@@ -854,7 +855,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     read_commands = {
         "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
     }
-    if args.command in read_commands | {"status", "token"}:
+    if args.command in read_commands | {"status", "token", "disable-limits"}:
         config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
     else:
         config = _config(args.config)
@@ -898,6 +899,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "evidence",
         "decision",
         "cancel",
+        "disable-limits",
         "reconcile-tracker",
         "recover-publication",
         "repair-admission-preflight",
@@ -914,6 +916,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "submit",
             "decision",
             "cancel",
+            "disable-limits",
             "reconcile-tracker",
             "recover-publication",
             "repair-admission-preflight",
@@ -932,6 +935,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "evidence",
                 "decision",
                 "cancel",
+                "disable-limits",
                 "reconcile-tracker",
                 "recover-publication",
                 "repair-admission-preflight",
@@ -953,7 +957,9 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 from .delivery_origin import bind_origin
 
                 request = bind_origin(request, os.environ.get("CODEX_THREAD_ID"))
-            factory = read_only_client if args.command in read_commands else api_client
+            # An active-run control must never start/reload a service as a side effect.
+            factory = (read_only_client if args.command in read_commands | {"disable-limits"}
+                       else api_client)
             caller = factory(config.path)
             result = {
                 "submit": lambda: caller.submit(request),
@@ -964,6 +970,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "evidence": lambda: caller.evidence(args.id, args.evidence_id),
                 "decision": lambda: caller.decision(args.id, request),
                 "cancel": lambda: caller.cancel(args.id, request),
+                "disable-limits": lambda: caller.disable_delivery_limits(args.id, request),
                 "reconcile-tracker": lambda: caller.reconcile_tracker(args.id, request),
                 "recover-publication": lambda: caller.recover_publication(args.id, request),
                 "repair-admission-preflight": lambda: caller.repair_admission_preflight(
