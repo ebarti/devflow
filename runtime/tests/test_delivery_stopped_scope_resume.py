@@ -385,7 +385,8 @@ def scope_stop(service, monkeypatch):
     source = owner.config.path.parent / 'source'
     (source / 'contract.test.ts').write_text(
         "expect(parseRequest({name: 'fixture'}).success).toBe(true)\n")
-    _git(source, 'add', 'contract.test.ts')
+    (source / 'another.test.ts').write_text('Existing second owning test\n')
+    _git(source, 'add', 'contract.test.ts', 'another.test.ts')
     _git(source, 'commit', '-qm', 'Existing contract test')
     config = copy.deepcopy(owner.config.raw)
     config['repositories']['fixture']['expected_base_sha'] = _git(source, 'rev-parse', 'HEAD')
@@ -558,7 +559,9 @@ def test_scope_config_drift_after_admission_is_rejected_at_readback(scope_stop):
         resume.readback(store, effective, recovery)
 
 
-def test_plain_successor_retains_inherited_scope_provenance_and_seal(scope_stop, monkeypatch):
+@pytest.mark.parametrize('amend_second', [False, True])
+def test_plain_successor_retains_inherited_scope_provenance_and_seal(scope_stop, monkeypatch,
+                                                                   amend_second):
     from pathlib import Path
 
     store, _, state, command = scope_stop
@@ -596,14 +599,28 @@ def test_plain_successor_retains_inherited_scope_provenance_and_seal(scope_stop,
     successor = {k: v for k, v in command.items() if k not in resume.SCOPE_FIELDS}
     successor.update(command_id='second-unused-original-turn', expected_revision=15,
                      expected_iteration=1, expected_candidate_id=candidate['id'])
+    if amend_second:
+        from devflow_temporal.delivery_execution_config import load_execution_config
+
+        amended = copy.deepcopy(load_execution_config(effective).raw)
+        amended['repositories']['fixture']['allowed_paths'].append('another.test.ts')
+        path = Path(effective['state_dir']).parents[1] / 'second-scope.json'
+        path.write_text(json.dumps(amended))
+        path.chmod(0o600)
+        successor.update(added_paths=['another.test.ts'], amended_config_path=str(path),
+                         amended_config_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
     store.continue_repair('run-1', successor)
 
     recovery, effective = saved(store), store.effective_spec('run-1')
     assert resume.readback(store, effective, recovery) == {'state': 'confirmed'}
-    assert store.detail('run-1')['scope_amendment'] == scope
+    if amend_second:
+        assert store.detail('run-1')['scope_amendment']['added_paths'] == ['another.test.ts']
+    else:
+        assert store.detail('run-1')['scope_amendment'] == scope
     assert recovery['original_recovery'] == first_recovery
     assert recovery['maximum_iteration'] == effective['policy']['max_repairs'] == 2
-    assert effective['policy']['allowed_paths'] == ['README.md', 'contract.test.ts']
+    assert effective['policy']['allowed_paths'] == [
+        'README.md', 'contract.test.ts', *(['another.test.ts'] if amend_second else [])]
     assert store.submitted_spec('run-1') == original
     # Displaying inherited authority must not replace or weaken its original seal.
     path = Path(command['amended_config_path'])

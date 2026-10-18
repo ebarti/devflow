@@ -76,7 +76,9 @@ def scope_spec(store, seal, command, *, _feature_scope=None):
             if not stat.S_ISDIR(parent.lstat().st_mode) or parent.is_symlink():
                 raise ValueError('scope amendment file has an unsafe ancestor')
             parent = parent.parent
-    amended = DeliveryBroker(store, effective).candidate()
+    # The delta is still a proposal. Keep source observation under the sealed
+    # predecessor custody until admission grants the new execution namespace.
+    amended = broker.candidate()
     if any(amended[key] != seal['candidate'][key] for key in (
             'id', 'head', 'content_sha256', 'base_sha', 'environment_digest')):
         raise ValueError('scope amendment changed stopped implementation bytes')
