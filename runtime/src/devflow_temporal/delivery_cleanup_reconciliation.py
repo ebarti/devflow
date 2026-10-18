@@ -55,9 +55,10 @@ def reconcile_stopped_cleanup(store, run_id: str, iteration: int) -> dict:
         outcome = {'state': 'finished', 'cleanup': 'confirmed', 'changed': False,
                    'run_id': run_id, 'iteration': iteration}
         if row['cleanup'] == 'confirmed':
-            if reconciled_cleanup(store, row, state, closed=closed) is None:
-                raise ValueError('cleanup has no authenticated later observation')
-            return outcome
+            if reconciled_cleanup(store, row, state, closed=closed) is not None:
+                return outcome
+            # Generic maintenance may have observed cleanup before binding its
+            # claim closure to this producer. Independently perform that closure.
         if state.get('tracker') != json.loads(row['tracker_json'] or 'null'):
             raise ValueError('cleanup reconciliation tracker changed before closure')
         updated = _close_cleanup(store, row, spec, closed, lambda: False, published=True)

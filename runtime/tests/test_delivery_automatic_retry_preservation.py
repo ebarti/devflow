@@ -106,3 +106,41 @@ def test_changed_original_during_readback_refuses_before_archive_effect(later_cl
     assert retry.retry_once(store) == []
     assert not any(item[0] in {'finalize', 'tracker'} for item in calls)
     assert not (root / 'predecessor-resources').exists()
+
+
+@pytest.mark.parametrize('drift', [None, 'producer_hash', 'latest_hash'])
+def test_published_cleanup_keeps_historical_bytes_after_owner_refresh(later_cleanup, drift):
+    store, request, historical, calls, external = later_cleanup
+    root, original = files(store, request)
+    old_receipt = {**json.loads(original['finalization.json']),
+                   'receipt': str(root / 'finalization.json'),
+                   'receipt_sha256': hashlib.sha256(original['finalization.json']).hexdigest()}
+    historical['result']['checks']['resource_cleanup'] = old_receipt
+    if drift == 'producer_hash':
+        old_receipt['receipt_sha256'] = '0' * 64
+    write_private(root / 'finalization.json', {'state': 'confirmed', 'outcome': 'blocked'})
+    latest = (root / 'finalization.json').read_bytes()
+    latest_hash = hashlib.sha256(latest).hexdigest()
+    current = {**json.loads(latest), 'receipt': str(root / 'finalization.json'),
+               'receipt_sha256': latest_hash if drift != 'latest_hash' else '1' * 64}
+    with store._connect() as db:
+        checks = json.loads(db.execute('SELECT checks_json FROM delivery_runs').fetchone()[0])
+        checks['resource_cleanup'] = current
+        db.execute('UPDATE delivery_runs SET checks_json=?', (json.dumps(checks),))
+        row = dict(db.execute('SELECT * FROM delivery_runs').fetchone())
+    external.update(ready=True, hash=latest_hash)
+    before = json.dumps(historical, sort_keys=True)
+    if drift:
+        with pytest.raises(ValueError):
+            retry._close_cleanup(store, row, store.spec(request['run_id']), historical,
+                                 lambda: False, published=True)
+        assert not any(item[0] in {'finalize', 'tracker'} for item in calls)
+        assert not (root / 'predecessor-resources').exists()
+    else:
+        result = retry._close_cleanup(store, row, store.spec(request['run_id']), historical,
+                                      lambda: False, published=True)
+        assert result['cleanup'] == 'confirmed'
+        archive = root / 'predecessor-resources'
+        assert (archive / 'finalization.json').read_bytes() == original['finalization.json']
+        assert (archive / 'observed-finalization.json').read_bytes() == latest
+    assert json.dumps(historical, sort_keys=True) == before

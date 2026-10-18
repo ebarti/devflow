@@ -70,16 +70,16 @@ def test_cleanup_refuses_changed_authority_before_effects(stopped, drift):
         assert db.serialize() == before
 
 
-def test_confirmed_cleanup_is_not_assumed_without_its_record(stopped, monkeypatch):
+def test_confirmed_cleanup_without_its_record_is_independently_closed(stopped, monkeypatch):
     from devflow_temporal import delivery_policy_recovery
     from devflow_temporal.delivery_cleanup_reconciliation import reconcile_stopped_cleanup
 
     with stopped.store._connect() as db:
         db.execute("UPDATE delivery_runs SET cleanup='confirmed'")
     monkeypatch.setattr(delivery_policy_recovery, 'reconciled_cleanup', lambda *a, **kw: None)
-    with pytest.raises(ValueError, match='authenticated later'):
-        reconcile_stopped_cleanup(stopped.store, 'run-owned', 2)
-    assert stopped.calls == []
+    result = reconcile_stopped_cleanup(stopped.store, 'run-owned', 2)
+    assert result['changed'] is True
+    assert stopped.calls == ['cleanup']
 
 
 def test_confirmed_cleanup_with_its_record_is_idempotent(stopped):
