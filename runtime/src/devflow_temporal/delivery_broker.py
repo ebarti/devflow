@@ -1154,7 +1154,8 @@ class DeliveryBroker:
         declared = declared_generated_directories(self.spec)
         browser = (self.spec['policy'].get('browser_qa') or {}).get('artifact_paths', [])
         if 'node_modules' in names:
-            names = list(dict.fromkeys([*names, *workspace_dependency_directories(checkout),
+            names = list(dict.fromkeys([*names, *workspace_dependency_directories(
+                checkout, policy=self.spec['policy']),
                                        *sorted(declared)]))
         roots = []
         for name in names:

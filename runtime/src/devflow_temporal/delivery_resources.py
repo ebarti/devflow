@@ -522,7 +522,8 @@ class RunResources:
                                 or any(c not in '0123456789abcdef' for c in authority)):
                             raise ValueError('generated workspace recorded authority is invalid')
                     elif root.exists():
-                        authority = workspace_dependency_directories(root).get(relative)
+                        authority = workspace_dependency_directories(
+                            root, policy=self.spec['policy']).get(relative)
                         if retained.get('workspace_declaration_sha256', authority) != authority:
                             raise ValueError('generated workspace declaration changed')
                     else:
@@ -635,7 +636,7 @@ class RunResources:
                     if (entry['kind'] in {'checkout', 'gate'} and path.is_relative_to(parent)
                             and path.parent != parent):
                         manifest['roots'][str(path)]['workspace_declaration_sha256'] = (
-                            workspace_dependency_directories(parent)[path.relative_to(
+                            workspace_dependency_directories(parent, policy=self.spec['policy'])[path.relative_to(
                                 parent).as_posix()])
                         break
             write_private(self.manifest, manifest)
@@ -682,7 +683,7 @@ class RunResources:
                        for key in ('id', 'head', 'content_sha256'))):
             raise ValueError('legacy modules lack their exact frozen implementation authority')
         self._allowed(checkout, 'checkout')
-        declarations = workspace_dependency_directories(checkout)
+        declarations = workspace_dependency_directories(checkout, policy=self.spec['policy'])
         preserved = []
         with self.locked() as manifest:
             parent = manifest['roots'].get(str(checkout), {})

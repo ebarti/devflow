@@ -46,6 +46,34 @@ def test_changed_metadata_still_cannot_register_dependencies(owned_workspace):
         resources.register(modules, 'generated')
 
 
+def test_authorized_scripts_can_reprepare_the_same_dependency_layout(owned_workspace):
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_configured_resources import workspace_dependency_directories
+
+    resources, root, _package, modules = owned_workspace
+    resources.spec['policy'].setdefault('allowed_paths', []).append('apps/web/package.json')
+    resources.spec['policy_digest'] = digest(resources.spec['policy'])
+    assert 'apps/web/node_modules' in workspace_dependency_directories(
+        root, policy=resources.spec['policy'])
+    resources.register(modules, 'generated')
+    assert resources.finalize('blocked')['state'] == 'confirmed'
+    resources.generated_directory(modules)
+    assert modules.is_dir()
+
+
+@pytest.mark.parametrize('field', ['dependencies', 'workspaces', 'name'])
+def test_authorized_scripts_do_not_admit_other_metadata_changes(owned_workspace, field):
+    from devflow_temporal.delivery_configured_resources import workspace_dependency_directories
+
+    resources, root, package, _modules = owned_workspace
+    resources.spec['policy'].setdefault('allowed_paths', []).append('apps/web/package.json')
+    value = json.loads(package.read_text())
+    value[field] = {'unreviewed': 'change'}
+    package.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match='tracked declaration'):
+        workspace_dependency_directories(root, policy=resources.spec['policy'])
+
+
 @pytest.mark.parametrize('replacement', ['directory', 'symlink'])
 def test_cleanup_does_not_adopt_replacement_dependencies(owned_workspace, tmp_path, replacement):
     resources, _root, _package, modules = owned_workspace
