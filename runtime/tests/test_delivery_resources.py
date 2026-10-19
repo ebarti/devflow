@@ -198,6 +198,9 @@ def test_resource_readback_reuses_only_one_observation_and_rechecks_authority(
     owned = spec(tmp_path)
     registry = RunResources(owned)
     registry.scratch("role", "implement")
+    gate = Path(owned["state_dir"]) / "gates/0/review"
+    gate.parent.mkdir(parents=True, mode=0o700)
+    registry.register(gate, "gate")
     registry.finalize("delivered")
     original = resources._gate_roots
     calls = []

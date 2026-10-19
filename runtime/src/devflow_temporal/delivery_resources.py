@@ -458,7 +458,11 @@ class RunResources:
 
     def _admitted_gate_roots(self):
         observed = getattr(self, "_observation_gate_roots", None)
-        return observed if observed is not None else _gate_roots(self.spec)
+        if observed is None:
+            observed = _gate_roots(self.spec)
+            if getattr(self, "_observing_gate_roots", False):
+                self._observation_gate_roots = observed
+        return observed
 
     def _allowed(self, path: Path, kind: str, *, finalizing: bool = False) -> None:
         installed = Path(__file__).resolve().parents[3]
@@ -1491,11 +1495,13 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
     # Finalizers publish intermediate manifests under this same exclusive lease.
     # Authenticate one complete generation, including the returned raw-byte hashes.
     with registry.locked(read_only=True) as manifest, ExitStack() as role_leases:
-        registry._observation_gate_roots = _gate_roots(spec)
+        registry._observing_gate_roots = True
+        registry._observation_gate_roots = None
         result = _observe_locked_resources(spec, registry, manifest, role_leases,
                                            unknown_allowed=unknown_allowed,
                                            freshly_completed=freshly_completed, attempts=attempts)
-        if _gate_roots(spec) != registry._observation_gate_roots:
+        if (registry._observation_gate_roots is not None
+                and _gate_roots(spec) != registry._observation_gate_roots):
             raise ValueError("resource execution authority changed during observation")
         return result
 
