@@ -77,12 +77,17 @@ def conflicted(delivered, monkeypatch, tmp_path):
 
     class Native:
         async def run(self, request):
+            from devflow_temporal.delivery_sandbox import _review_diff_path
+
             resolution.authenticate(request, d.store)
+            _review_diff_path(request)
             key = supervisor.DeliverySupervisor._job_key(request)
             if key in assessments:
                 return assessments[key]
             calls.append(request)
             workspace = Path(request["workspace"])
+            if request["role"] == "review" and state.get("review_prelaunch"):
+                raise RuntimeError("review failed before provider launch")
             result = {"status": "pass", "summary": "Both parent requirements preserved",
                       "findings": [], "merge_decision": None, "cleanup": "confirmed",
                       "process_cleanup": "observed-native-confirmed"}
@@ -157,6 +162,24 @@ async def test_lost_push_acknowledgement_is_reconciled_without_a_second_push(con
     result = reconcile(broker, c.pr, raw, resolve_conflicts=True)
     assert result["state"] == "ready" and result["pr"]["head"] == head
     assert c.state["pushes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_review_continuation_reuses_resolved_checkout_without_another_resolver(conflicted):
+    c = conflicted
+    c.state["review_prelaunch"] = True
+    with pytest.raises(RuntimeError, match="before provider launch"):
+        await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    original_workspace = c.calls[0]["workspace"]
+    with c.d.store._connect() as db:
+        db.execute("UPDATE delivery_merge_requests SET workflow_id=workflow_id || '-continued'")
+        db.execute("UPDATE delivery_effects SET state='complete',observed_json='{}' "
+                   "WHERE kind='merge_resolution' AND state='pending'")
+    c.state["review_prelaunch"] = False
+    result = await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    assert result["state"] == "pending" and c.state["pushes"] == 1
+    assert [r["role"] for r in c.calls] == ["implement", "review", "review"]
+    assert all(r["workspace"] == original_workspace for r in c.calls)
 
 
 def test_arbitrary_merge_context_cannot_launch_a_native_role(delivered):

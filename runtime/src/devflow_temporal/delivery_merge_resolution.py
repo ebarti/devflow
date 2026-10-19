@@ -162,6 +162,7 @@ def authenticate(request, store):
         or expected["job_key"] != DeliverySupervisor._job_key(request)
         or expected["candidate"] != request["candidate"]
         or expected["workspace"] != request["workspace"]
+        or expected.get("review_diff") != request.get("review_diff")
         or request.get("role") not in {"implement", "review"}
         or request.get("resume_session") is not None
         or not claim or claim["owner"] != "external:devflow:" + spec["run_id"]
@@ -209,9 +210,82 @@ def file_hashes(workspace):
             for p in _files(workspace)}
 
 
+def review_diff(request):
+    """Publish a private comparison against both parents for this exact resolved candidate."""
+    workspace, context = Path(request["workspace"]), request["merge_context"]
+    content = "\n".join(
+        "Parent " + head + "\n" + _git(workspace, "diff", "--binary", head, "--",
+                                        *context["conflicts"])
+        for head in (context["previous_head"], context["target"])
+    ).encode()
+    path = Path(context["evidence_path"]).parent / (request["candidate"]["id"] + ".patch")
+    if path.exists():
+        if path.read_bytes() != content:
+            raise ValueError("merge review comparison changed")
+    else:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+    return {"kind": "merge_resolution", "path": str(path),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "candidate_id": request["candidate"]["id"], "head": request["candidate"]["head"],
+            "base_sha": context["target"]}
+
+
+def review_diff_path(request):
+    from .delivery_resources import _ancestors
+
+    reference, context = request["review_diff"], request["merge_context"]
+    path = Path(reference["path"])
+    expected = Path(context["evidence_path"]).parent / (request["candidate"]["id"] + ".patch")
+    if (path != expected or reference.get("kind") != "merge_resolution"
+            or reference.get("candidate_id") != request["candidate"]["id"]
+            or reference.get("head") != context["previous_head"]
+            or reference.get("base_sha") != context["target"]):
+        raise ValueError("merge review lost its controller-bound comparison")
+    _ancestors(path)
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                or hashlib.file_digest(stream, "sha256").hexdigest() != reference["sha256"]):
+            raise ValueError("merge review comparison bytes changed")
+    return path
+
+
+def _retained_resolution(broker, spec, previous, target, authorization):
+    with broker.store._connect() as db:
+        effects = [dict(e) for e in db.execute(
+            "SELECT * FROM delivery_effects WHERE run_id=? AND kind='merge_resolution' "
+            "AND state='complete' ORDER BY rowid DESC", (spec["run_id"],),
+        )]
+    for effect in effects:
+        bound = json.loads(effect["request_json"])
+        observed = json.loads(effect["observed_json"] or "{}")
+        context = bound["merge_context"]
+        if (bound["merge_authorization"] != authorization
+                or bound["spec_sha256"] != digest(spec)
+                or context.get("previous_head") != previous or context.get("target") != target
+                or not effect["effect_key"].endswith(":implement")
+                or observed.get("assessment", {}).get("status") != "pass"):
+            continue
+        root = Path(spec["state_dir"]) / "merge-resolutions" / context["resolution_id"]
+        preparation = read_private(root / "preparation.json")
+        workspace = root / "checkout"
+        if (context != {**preparation, "effect_key": effect["effect_key"]}
+                or str(workspace) != bound["workspace"]
+                or candidate_for(workspace) != observed["candidate"]):
+            raise ValueError("retained merge resolution changed after its native assessment")
+        return workspace, preparation
+    return None
+
+
 def _prepare(broker, pr, conflict, authorization):
     spec = broker.store.effective_spec(broker.spec["run_id"])
     previous, target = conflict["previous_head"], conflict["target"]
+    retained = _retained_resolution(broker, spec, previous, target, authorization)
+    if retained is not None:
+        return spec, *retained
     from .delivery_merge_followup import current
 
     with broker.store._connect() as db:
@@ -268,20 +342,30 @@ async def _role(broker, spec, workspace, context, authorization, role):
 
     key = "merge-resolution:" + spec["run_id"] + ":" + context["resolution_id"] + ":" + role
     with broker.store._connect() as db:
+        if role == "review":
+            from .delivery_merge_followup import current
+
+            key += ":" + digest(current(db, spec["run_id"])["workflow_id"])[:16]
         saved = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?", (key,)).fetchone()
     if saved:
         bound = json.loads(saved["request_json"])
         request = {"spec": spec, "role": role, "iteration": 0,
                    "candidate": bound["candidate"], "workspace": bound["workspace"],
                    "merge_context": bound["merge_context"]}
+        if bound.get("review_diff"):
+            request["review_diff"] = bound["review_diff"]
     else:
         request = {"spec": spec, "role": role, "iteration": 0,
                    "candidate": candidate_for(workspace), "workspace": str(workspace),
                    "merge_context": {**context, "effect_key": key}}
+        if role == "review":
+            request["review_diff"] = review_diff(request)
         bound = {"merge_authorization": authorization, "spec_sha256": digest(spec),
                  "candidate": request["candidate"], "workspace": request["workspace"],
                  "merge_context": request["merge_context"],
                  "job_key": DeliverySupervisor._job_key(request)}
+        if request.get("review_diff"):
+            bound["review_diff"] = request["review_diff"]
         broker.intent(key, "merge_resolution", bound)
     result = await get_supervisor(broker.store).run(request)
     if result.get("cleanup") != "confirmed" or result.get("process_cleanup") != (

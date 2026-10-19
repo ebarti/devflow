@@ -537,6 +537,10 @@ def _review_diff_path(request: dict[str, Any]) -> Path | None:
         return None
     if not isinstance(review_diff, dict):
         raise ValueError('independent role requires the controller-bound diff')
+    if request.get('merge_context'):
+        from .delivery_merge_resolution import review_diff_path
+
+        return review_diff_path(request)
     if review_diff.get('kind') == 'plan_revision':
         return _revision_diff_path(request)
     if 'revision_context' in request or review_diff.get('kind') is not None:
