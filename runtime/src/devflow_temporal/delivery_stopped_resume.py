@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
 from pathlib import Path
@@ -462,6 +463,69 @@ def _interrupted_preparation(seal):
     return stage
 
 
+def _unlaunched_assessments(seal):
+    """Ordinary published work needs gates, not coding, after exact no-process launches."""
+    from .supervisor import DeliverySupervisor
+
+    spec, state, candidate = seal['predecessor_spec'], seal['state'], seal['candidate']
+    if (spec.get('feature_worker') or state.get('phase') != 'blocked'
+            or state.get('error') not in {'repair limit exhausted',
+                                         'independent assessment launch failed before provider'}
+            or (state.get('pull_request') or {}).get('head') != candidate['head']):
+        return False
+    roles = state.get('roles', [])
+    last = next((i for i in range(len(roles) - 1, -1, -1)
+                 if roles[i].get('role') == 'implement'), None)
+    later = roles[last + 1:] if last is not None else []
+    if not later or [r.get('role') for r in later] not in (
+            ['review'], ['review', 'verify']):
+        return False
+    checks = state.get('checks') or {}
+    for stage in ['local', *(['browser_qa'] if spec['policy'].get('browser_qa') else [])]:
+        checked = checks.get(stage, {})
+        if (checked.get('state') != 'passed' or checked.get('candidate_id') != candidate['id']
+                or checked.get('source_unchanged') is not True
+                or (stage == 'browser_qa' and checked.get('cleanup') != 'confirmed')):
+            return False
+    unlaunched = False
+    for role in later:
+        key = DeliverySupervisor._job_key({'spec': spec, 'role': role['role'],
+            'iteration': state['iteration'], 'candidate': candidate})
+        matches = [a for a in seal['attempts'] if a['job_key'] == key]
+        if len(matches) != 1:
+            return False
+        attempt = matches[0]
+        if (role.get('cleanup') != 'confirmed' or role.get('candidate') != candidate
+                or role.get('iteration') != state['iteration']
+                or attempt.get('role') != role['role']
+                or attempt.get('iteration') != state['iteration']
+                or attempt.get('state') != 'finished' or attempt.get('cleanup') != 'confirmed'
+                or not _implementation_receipt(spec, role, attempt)):
+            return False
+        if role.get('status') == 'pass':
+            if (not isinstance(role.get('session_id'), str) or not role['session_id']
+                    or attempt.get('session_id') != role['session_id'] or role.get('findings')):
+                return False
+            continue
+        folder = Path(spec['state_dir']) / 'attempts' / key
+        try:
+            info = folder.lstat()
+            absent = (folder.resolve(strict=True) == folder and stat.S_ISDIR(info.st_mode)
+                      and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
+                      and not any(folder.iterdir()))
+        except OSError:
+            return False
+        if (role.get('status') != 'blocked' or role.get('finish_reason') != 'prelaunch'
+                or role.get('summary') != 'role launch failed before any provider process started'
+                or role.get('session_id') is not None or role.get('usage') is not None
+                or any(attempt.get(k) is not None for k in ('pid', 'process_identity', 'session_id'))
+                or attempt.get('result_path') != str(folder / 'result.json')
+                or not absent):
+            return False
+        unlaunched = True
+    return unlaunched
+
+
 def interrupted_resume(seal):
     """Plan a stopped worker's continuation that needs no product repair, if any.
 
@@ -475,10 +539,13 @@ def interrupted_resume(seal):
     cleanup = (cleanup_only_build(spec, state) and completed_cleanup_binding(
         seal.get('cleanup_reconciliation'), seal.get('closed'), state))
     preparation = _interrupted_preparation(seal)
-    if (not spec.get('feature_worker')
-            or (state.get('phase') != 'cancelled' and not cleanup and not preparation)
+    assessments = _unlaunched_assessments(seal)
+    if ((not spec.get('feature_worker') and not assessments)
+            or (state.get('phase') != 'cancelled' and not cleanup and not preparation
+                and not assessments)
             or any(isinstance(check, dict) and check.get('state') == 'failed'
-                   and name != preparation for name, check in state.get('checks', {}).items())):
+                   and name != preparation and not (assessments and name in {'review', 'qa'})
+                   for name, check in state.get('checks', {}).items())):
         return None
     roles, iteration = state.get('roles', []), state['iteration']
     if not roles:
@@ -494,9 +561,10 @@ def interrupted_resume(seal):
             or attempt['iteration'] != roles[last]['iteration']
             # The iteration only advances past a passed implementation for a repair.
             or roles[last]['iteration'] != iteration
-            or any(role.get('status') != 'pass' for role in roles[last + 1:])):
+            or (not assessments and any(role.get('status') != 'pass'
+                                        for role in roles[last + 1:]))):
         return None
-    published = (spec['feature_worker'].get('kind') != 'build'
+    published = (spec.get('feature_worker', {}).get('kind') != 'build'
                  and (state.get('pull_request') or {}).get('head') == seal['candidate']['head']
                  and (not preparation
                       or state['pull_request'].get('candidate') == seal['candidate']))

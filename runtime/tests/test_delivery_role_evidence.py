@@ -397,6 +397,57 @@ def test_large_retained_history_stays_complete_without_overflowing_role_input(se
         _task(enriched)
 
 
+def test_rejected_same_iteration_artifacts_do_not_replace_the_accepted_producer(service):
+    from devflow_temporal.delivery_role_evidence import allocate, read_context, seal
+    from devflow_temporal.delivery_workflow import _implementation_artifacts
+
+    _, broker, request = setup(service)
+    rejected = allocate(request, '1' * 64)
+    stale = seal(rejected)['role_artifacts']
+    old_bytes = Path(stale['path']).read_bytes()
+    (broker.checkout / 'README.md').write_text('Actual accepted repair\n')
+    request = {**request, 'candidate': broker.candidate()}
+    accepted = allocate(request, '2' * 64)
+    (Path(accepted['artifact_directory']) / 'HANDOFF.md').write_text('Accepted repair evidence\n')
+    current = seal(accepted)['role_artifacts']
+    roles = [{'role': 'implement', 'iteration': 0, 'status': 'blocked', 'role_artifacts': stale},
+             {'role': 'implement', 'iteration': 0, 'status': 'pass', 'role_artifacts': current}]
+    review = {**request, 'role': 'review'}
+    # The actual old boundary fails when a rejected empty seal is marked current.
+    with pytest.raises(ValueError, match='another candidate content'):
+        allocate({**review, 'evidence_context': {'role_artifacts': [stale, current]}}, '3' * 64)
+    references = _implementation_artifacts(roles, 0)
+    handoff = allocate({**review, 'evidence_context': {'role_artifacts': references}}, '4' * 64)
+    assert references == [current]
+    assert read_context(handoff)['role_artifacts']
+    assert Path(stale['path']).read_bytes() == old_bytes
+    # Never silently fall back to older evidence if the accepted producer is corrupt.
+    bad = [*roles, {**roles[-1], 'role_artifacts': stale}]
+    with pytest.raises(ValueError, match='another candidate content'):
+        allocate({**review, 'evidence_context': {
+            'role_artifacts': _implementation_artifacts(bad, 0)}}, '5' * 64)
+
+
+@pytest.mark.parametrize('role', ['review', 'verify'])
+def test_separate_current_checks_are_in_the_authenticated_prompt_handoff(service, role):
+    from devflow_temporal.delivery_role_evidence import allocate, read_context
+    from devflow_temporal.role_runner import _task
+
+    _, _broker, request = setup(service)
+    checked = {'state': 'passed', 'candidate_id': request['candidate']['id'],
+               'results': [{'id': 'actual-local-check', 'passed': True,
+                            'diagnostic': 'complete current receipt'}]}
+    request = {**request, 'role': role, 'evidence_context': {'role_artifacts': []},
+               'check_evidence': checked}
+    enriched = allocate(request, 'b' * 64)
+    assert read_context(enriched)['checks']['local'] == checked
+    assert request['evidence_context'] == {'role_artifacts': []}
+    assert 'checks.local' in _task(enriched).goal
+    with pytest.raises(ValueError, match='conflicts'):
+        allocate({**request, 'evidence_context': {'checks': {'local': {
+            **checked, 'candidate_id': 'stale'}}}}, 'c' * 64)
+
+
 @pytest.fixture
 def dependency_handoff(service, monkeypatch):
     """Real receipt producer/store/checkpoints; modeled GitHub transport and role verdicts."""

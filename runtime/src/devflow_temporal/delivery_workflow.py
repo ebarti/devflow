@@ -68,6 +68,14 @@ def _implementation_passed(state: dict) -> bool:
     return bool(implementation and implementation.get("status") == "pass")
 
 
+def _implementation_artifacts(roles, iteration):
+    """The accepted producer owns current evidence; rejected retries stay historical."""
+    owner = next((role for role in reversed(roles)
+                  if role.get('role') == 'implement' and role.get('iteration') == iteration
+                  and role.get('status') == 'pass'), {})
+    return [owner['role_artifacts']] if owner.get('role_artifacts') else []
+
+
 def _candidate_published(state: dict, candidate: dict) -> bool:
     """The PR shows exactly this candidate: the same head and the same checked content."""
     published = state.get("pull_request") or {}
@@ -2729,6 +2737,7 @@ class DeliveryWorkflow:
                     spec, "published", "Regular pull request read back at candidate head"
                 )
             repair_findings = []
+            unlaunched_assessments = []
             collect_assessments = spec.get("assessment_batch_version") == 1
             qa_evidence = None
             browser_before_review = workflow.patched("browser-qa-before-assessment-v1")
@@ -2849,11 +2858,9 @@ class DeliveryWorkflow:
                             "resume_session": None,
                             "qa_evidence": (qa_evidence
                                             if role == "verify" or browser_before_review else None),
-                            **({"evidence_context": {"role_artifacts": [
-                                r["role_artifacts"] for r in self.state["roles"]
-                                if r.get("role_artifacts") and r.get("role") == "implement"
-                                and r.get("iteration") == iteration
-                            ]}} if workflow.patched("role-evidence-handoff-v1") else {}),
+                            **({"evidence_context": {"role_artifacts": _implementation_artifacts(
+                                self.state['roles'], iteration,
+                            )}} if workflow.patched("role-evidence-handoff-v1") else {}),
                             **({"check_evidence": self.state["checks"].get("local")}
                                if (role == "verify" or checks_before_review)
                                and spec["policy"].get("host_sandbox") == "trusted-local" else {}),
@@ -2883,11 +2890,18 @@ class DeliveryWorkflow:
                     "candidate_id": self.state["candidate"]["id"],
                 }
                 if result.get("status") != "pass":
+                    if (result.get('finish_reason') == 'prelaunch'
+                            and result.get('session_id') is None
+                            and result.get('cleanup') == 'confirmed'
+                            and workflow.patched('assessment-prelaunch-stop-v1')):
+                        unlaunched_assessments.append(role)
                     if self._capture_planning_defect(spec, result):
                         return await self._stop(spec, role + " revealed a planning defect")
                     repair_findings.extend(result.get("findings") or [f"{role} did not pass"])
                     if not collect_assessments:
                         break
+            if unlaunched_assessments:
+                return await self._stop(spec, 'independent assessment launch failed before provider')
             if repair_findings:
                 self.state["findings"].extend(repair_findings)
                 if self.post_publish_v1:

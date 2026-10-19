@@ -233,6 +233,14 @@ def allocate(request: dict, job_key: str, *, store=None) -> dict:
         enriched['artifact_directory'] = str(target)
         enriched['artifact_write_root'] = str(authoring)
     context = request.get('evidence_context')
+    checked = request.get('check_evidence')
+    if checked is not None and role in {'review', 'verify'}:
+        context = dict(context or {})
+        checks = dict(context.get('checks') or {})
+        if 'local' in checks and checks['local'] != checked:
+            raise ValueError('current check evidence conflicts with the role handoff')
+        checks['local'] = checked
+        context['checks'] = checks
     if context and role in {'review', 'verify'}:
         for reference in context.get('role_artifacts', []):
             manifest = validate_handoff(reference, root)
