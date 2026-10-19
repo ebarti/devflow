@@ -525,7 +525,12 @@ class RunResources:
                         authority = workspace_dependency_directories(
                             root, policy=self.spec['policy']).get(relative)
                         if retained.get('workspace_declaration_sha256', authority) != authority:
-                            raise ValueError('generated workspace declaration changed')
+                            renewed = (retained.get('kind') == 'generated'
+                                       and not os.path.lexists(path)
+                                       and retained.get('receipt', {}).get('state')
+                                       in {'removed', 'already_absent'})
+                            if not renewed:
+                                raise ValueError('generated workspace declaration changed')
                     else:
                         authority = retained.get('workspace_declaration_sha256')
                     if authority:
@@ -611,6 +616,16 @@ class RunResources:
                     old.pop("receipt", None)
                     old.pop('head', None)
                     old.pop('generated_output_preservation', None)
+                    if 'workspace_declaration_sha256' in old:
+                        from .delivery_configured_resources import workspace_dependency_directories
+
+                        for raw_root, parent_entry in manifest['roots'].items():
+                            parent = Path(raw_root)
+                            if (parent_entry['kind'] in {'checkout', 'gate'}
+                                    and path.is_relative_to(parent) and path.parent != parent):
+                                old['workspace_declaration_sha256'] = workspace_dependency_directories(
+                                    parent, policy=self.spec['policy'])[path.relative_to(parent).as_posix()]
+                                break
                     write_private(self.manifest, manifest)
                 return
             if os.path.lexists(path):

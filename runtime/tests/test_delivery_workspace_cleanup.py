@@ -74,6 +74,40 @@ def test_authorized_scripts_do_not_admit_other_metadata_changes(owned_workspace,
         workspace_dependency_directories(root, policy=resources.spec['policy'])
 
 
+def test_removed_dependency_generation_can_bind_newly_published_metadata(owned_workspace):
+    resources, root, package, modules = owned_workspace
+    assert resources.finalize('blocked')['state'] == 'confirmed'
+    _git(root, 'add', package.relative_to(root).as_posix())
+    _git(root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+         'commit', '-qm', 'Publish permitted package script')
+    with resources.locked() as manifest:
+        old = manifest['roots'][str(modules)]['workspace_declaration_sha256']
+    resources.generated_directory(modules)
+    with resources.locked() as manifest:
+        entry = manifest['roots'][str(modules)]
+        assert entry['workspace_declaration_sha256'] != old
+        assert entry['generation'] == 1
+    assert modules.is_dir()
+    assert resources.finalize('blocked')['state'] == 'confirmed'
+
+
+@pytest.mark.parametrize('state', ['live', 'missing_unconfirmed', 'replacement'])
+def test_changed_declaration_cannot_adopt_an_unconfirmed_generation(owned_workspace, state):
+    import shutil
+
+    resources, root, package, modules = owned_workspace
+    if state == 'replacement':
+        assert resources.finalize('blocked')['state'] == 'confirmed'
+        modules.mkdir()
+    elif state == 'missing_unconfirmed':
+        shutil.rmtree(modules)
+    _git(root, 'add', package.relative_to(root).as_posix())
+    _git(root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+         'commit', '-qm', 'Publish package script')
+    with pytest.raises(ValueError, match='declaration changed'):
+        resources.register(modules, 'generated')
+
+
 @pytest.mark.parametrize('replacement', ['directory', 'symlink'])
 def test_cleanup_does_not_adopt_replacement_dependencies(owned_workspace, tmp_path, replacement):
     resources, _root, _package, modules = owned_workspace
